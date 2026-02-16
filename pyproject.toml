@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-nio"
-version = "0.25.2"
+version = "0.26.0"
 description = "A Python Matrix client library, designed according to sans I/O principles."
 authors = [
     { name = "Damir Jelić", email = "poljar@termina.org.uk" },
@@ -12,7 +12,7 @@ authors = [
 ]
 license = { file = "LICENSE.md" }
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "aiohttp~=3.10",
     "aiofiles~=24.1",
@@ -31,7 +31,7 @@ e2e = [
     "cachetools>=5.3",
     "peewee~=3.14",
     #    "python-olm~=3.2",
-    "vodozemac>=0.9.0.post1",
+    "vodozemac>=0.9.0.post2",
 ]
 
 #dev = [
