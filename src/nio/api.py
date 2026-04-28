@@ -562,7 +562,11 @@ class Api:
             "new_password": new_password,
         }
 
-        return "POST", Api._build_path(path, query_parameters), Api.to_json(content_dict)
+        return (
+            "POST",
+            Api._build_path(path, query_parameters),
+            Api.to_json(content_dict),
+        )
 
     @staticmethod
     def sync(

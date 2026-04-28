@@ -249,9 +249,7 @@ _ProfileSetDisplayNameT = Union[
     ProfileSetDisplayNameResponse, ProfileSetDisplayNameError
 ]
 
-_ChangePasswordT = Union[
-    ChangePasswordResponse, ChangePasswordError
-]
+_ChangePasswordT = Union[ChangePasswordResponse, ChangePasswordError]
 
 DataProvider = Callable[[int, int], AsyncDataT]
 SynchronousFile = (
@@ -1202,9 +1200,7 @@ class AsyncClient(Client):
         Returns either a `ChangePasswordResponse` if the request was successful or
         a `ChangePasswordError` if there was an error with the request.
         """
-        method, path, data = Api.change_password(
-            self.access_token, auth, new_password
-        )
+        method, path, data = Api.change_password(self.access_token, auth, new_password)
 
         return await self._send(ChangePasswordResponse, method, path, data)
 
