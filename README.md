@@ -8,11 +8,14 @@ mindroom-nio
 [![Documentation Status](https://readthedocs.org/projects/matrix-nio/badge/?version=latest&style=flat-square)](https://matrix-nio.readthedocs.io/en/latest/?badge=latest)
 [![#nio](https://img.shields.io/badge/matrix-%23nio:matrix.org-blue.svg?style=flat-square)](https://matrix.to/#/!JiiOHXrIUCtcOJsZCa:matrix.org?via=matrix.org&via=maunium.net&via=t2l.io)
 
-This fork exists because I rely on nio heavily for
-[MindRoom](https://github.com/mindroom-ai/mindroom). It keeps a small set of
-useful pending upstream PRs available in a published package while upstream
-activity is quiet. I would be happy to see the upstream project become active
-again and reduce fork-specific maintenance over time.
+This fork exists primarily because I need vodozemac-backed E2EE support for
+[MindRoom](https://github.com/mindroom-ai/mindroom), which relies heavily on
+nio. libolm is officially deprecated, and the `python-olm` wheels currently stop
+at CPython 3.12, making the old dependency path a poor fit for newer Python
+versions. This fork keeps that support, plus a small set of other useful
+pending upstream PRs, available in a published package while upstream activity
+is quiet. I would be happy to see the upstream project become active again and
+reduce fork-specific maintenance over time.
 
 mindroom-nio is a fork of nio, a multilayered [Matrix](https://matrix.org/)
 client library. The distribution name is `mindroom-nio`; the Python import name
