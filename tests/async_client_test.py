@@ -2,7 +2,6 @@ import asyncio
 import json
 import math
 import re
-import sys
 import time
 from datetime import datetime, timedelta
 from os import path
@@ -15,14 +14,11 @@ from uuid import uuid4
 import aiofiles
 import pytest
 from aiohttp import (
-    ClientRequest,
     ClientSession,
-    ClientTimeout,
     TraceRequestChunkSentParams,
 )
 from aioresponses import CallbackResult, aioresponses
 from helpers import faker
-from yarl import URL
 
 from nio import (
     AsyncClient,
@@ -4194,7 +4190,7 @@ class TestClass:
         assert event.body == "It's a secret to everybody."
         assert cb_ran
 
-    async def test_connect_wrapper(self, async_client, aioresponse):
+    async def test_connect_wrapper(self, async_client, aioresponse, monkeypatch):
         aioresponse.post(
             f"{BASE_URL_V3}/login", status=200, payload=self.login_response
         )
@@ -4202,21 +4198,31 @@ class TestClass:
 
         assert async_client.client_session
 
-        conn = await connect_wrapper(
-            self=async_client.client_session.connector,
-            req=ClientRequest(method="GET", url=URL("https://example.org")),
-            traces=[],
-            timeout=ClientTimeout(),
-        )
+        class FakeTransport:
+            def __init__(self):
+                self._limits = (0, 0)
 
-        # Python 3.9 fixes [a bug](https://github.com/python/cpython/issues/90645) for correctly accessing buffer limits
-        # from SSL transport
-        ssl_transport = (
-            conn.transport
-            if sys.version_info[0:2] >= (3, 9)
-            else conn.transport._ssl_protocol._transport
-        )
-        assert ssl_transport.get_write_buffer_limits() == (4 * 1024, 16 * 1024)
+            def set_write_buffer_limits(self, high=None, low=None):
+                if low is None:
+                    low = high // 4
+                self._limits = (low, high)
+
+            def get_write_buffer_limits(self):
+                return self._limits
+
+        class FakeConnection:
+            def __init__(self):
+                self.transport = FakeTransport()
+
+        async def fake_connect(self, *args, **kwargs):
+            return FakeConnection()
+
+        connector = async_client.client_session.connector
+        monkeypatch.setattr(type(connector), "connect", fake_connect)
+
+        conn = await connect_wrapper(self=connector)
+
+        assert conn.transport.get_write_buffer_limits() == (4 * 1024, 16 * 1024)
 
     async def test_upload_filter(self, async_client, aioresponse):
         await async_client.receive_response(
