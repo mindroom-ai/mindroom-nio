@@ -1067,7 +1067,7 @@ wheels = [
 ]
 
 [[package]]
-name = "matrix-nio"
+name = "mindroom-nio"
 version = "0.26.0"
 source = { editable = "." }
 dependencies = [
@@ -1105,7 +1105,7 @@ dev = [
     { name = "hpack" },
     { name = "hyperframe" },
     { name = "hypothesis" },
-    { name = "matrix-nio", extra = ["e2e"] },
+    { name = "mindroom-nio", extra = ["e2e"] },
     { name = "mypy" },
     { name = "mypy-extensions" },
     { name = "pre-commit" },
@@ -1126,7 +1126,7 @@ requires-dist = [
     { name = "h11", specifier = ">=0.14" },
     { name = "h2", specifier = ">=4.0" },
     { name = "jsonschema", specifier = ">=4.14" },
-    { name = "matrix-nio", extras = ["dev"], marker = "extra == 'docs'" },
+    { name = "mindroom-nio", extras = ["dev"], marker = "extra == 'docs'" },
     { name = "peewee", marker = "extra == 'e2e'", specifier = "~=3.14" },
     { name = "pycryptodome", specifier = ">=3.10" },
     { name = "setuptools", marker = "extra == 'docs'", specifier = ">=61.0" },
@@ -1146,7 +1146,7 @@ dev = [
     { name = "hpack", specifier = ">=4.1.0" },
     { name = "hyperframe", specifier = ">=6.1.0" },
     { name = "hypothesis", specifier = ">=6.138.3" },
-    { name = "matrix-nio", extras = ["e2e"] },
+    { name = "mindroom-nio", extras = ["e2e"] },
     { name = "mypy", specifier = ">=1.17.1" },
     { name = "mypy-extensions", specifier = ">=1.1.0" },
     { name = "pre-commit", specifier = ">=4.3.0" },
