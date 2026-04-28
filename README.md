@@ -1,16 +1,23 @@
-nio
-===
+mindroom-nio
+============
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/matrix-nio/matrix-nio/tests.yml?branch=main&style=flat-square)](https://github.com/matrix-nio/matrix-nio/actions)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/matrix-nio?style=flat-square)](https://pypi.org/project/matrix-nio/)
-[![codecov](https://img.shields.io/codecov/c/github/matrix-nio/matrix-nio/master.svg?style=flat-square)](https://codecov.io/gh/matrix-nio/matrix-nio)
-[![license](https://img.shields.io/badge/license-ISC-blue.svg?style=flat-square)](https://github.com/matrix-nio/matrix-nio/blob/master/LICENSE.md)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/mindroom-ai/mindroom-nio/tests.yml?branch=main&style=flat-square)](https://github.com/mindroom-ai/mindroom-nio/actions)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mindroom-nio?style=flat-square)](https://pypi.org/project/mindroom-nio/)
+[![codecov](https://img.shields.io/codecov/c/github/mindroom-ai/mindroom-nio/main.svg?style=flat-square)](https://codecov.io/gh/mindroom-ai/mindroom-nio)
+[![license](https://img.shields.io/badge/license-ISC-blue.svg?style=flat-square)](https://github.com/mindroom-ai/mindroom-nio/blob/main/LICENSE.md)
 [![Documentation Status](https://readthedocs.org/projects/matrix-nio/badge/?version=latest&style=flat-square)](https://matrix-nio.readthedocs.io/en/latest/?badge=latest)
 [![#nio](https://img.shields.io/badge/matrix-%23nio:matrix.org-blue.svg?style=flat-square)](https://matrix.to/#/!JiiOHXrIUCtcOJsZCa:matrix.org?via=matrix.org&via=maunium.net&via=t2l.io)
 
-nio is a multilayered [Matrix](https://matrix.org/) client library. The
-underlying base layer doesn't do any network IO on its own, but on top of that
-is a full-fledged batteries-included asyncio layer using
+This fork exists because I rely on nio heavily for
+[MindRoom](https://github.com/mindroom-ai/mindroom). It keeps a small set of
+useful pending upstream PRs available in a published package while upstream
+activity is quiet. I would be happy to see the upstream project become active
+again and reduce fork-specific maintenance over time.
+
+mindroom-nio is a fork of nio, a multilayered [Matrix](https://matrix.org/)
+client library. The distribution name is `mindroom-nio`; the Python import name
+remains `nio`. The underlying base layer doesn't do any network IO on its own,
+but on top of that is a full-fledged batteries-included asyncio layer using
 [aiohttp](https://github.com/aio-libs/aiohttp/). File IO is only done if you
 enable end-to-end encryption (E2EE).
 
@@ -49,25 +56,17 @@ nio has most of the features you'd expect in a Matrix library, but it's still a 
 Installation
 ------------
 
-To install nio, simply use pip:
+To install mindroom-nio, simply use pip:
 
 ```bash
-$ pip install matrix-nio
+$ pip install mindroom-nio
 ```
 
-Note that this installs nio without end-to-end encryption support. For e2ee
-support, python-olm is needed which requires the
-[libolm](https://gitlab.matrix.org/matrix-org/olm) C library (version 3.x).
-On Debian and Ubuntu one can use `apt-get` to install package `libolm-dev`.
-On Fedora one can use `dnf` to install package `libolm-devel`.
-On MacOS one can use [brew](https://brew.sh/) to install package `libolm`.
-Make sure version 3 is installed.
-
-After libolm has been installed, the e2ee enabled version of nio can be
-installed using pip:
+Note that this installs mindroom-nio without end-to-end encryption support. The
+e2ee enabled version can be installed using pip:
 
 ```bash
-$ pip install matrix-nio[e2e]
+$ pip install "mindroom-nio[e2e]"
 ```
 
 Additionally, a docker image with the e2ee enabled version of nio is provided in
