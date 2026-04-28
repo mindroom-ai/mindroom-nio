@@ -85,7 +85,7 @@ class TestClass:
         auth_dict = {
             "type": "m.login.password",
             "identifier": {"type": "m.id.user", "user": "testuser"},
-            "password": "currentpassword"
+            "password": "currentpassword",
         }
         new_password = "newpassword"
 
@@ -96,8 +96,5 @@ class TestClass:
         assert resp[1] == expected_path
 
         data_dict = json.loads(resp[2])
-        expected_dict = {
-            "auth": auth_dict,
-            "new_password": new_password
-        }
+        expected_dict = {"auth": auth_dict, "new_password": new_password}
         assert data_dict == expected_dict

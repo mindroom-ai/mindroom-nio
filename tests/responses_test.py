@@ -84,10 +84,7 @@ class TestClass:
         assert isinstance(response, ChangePasswordResponse)
 
     def test_change_password_failure_parse(self):
-        parsed_dict = {
-            "errcode": "M_FORBIDDEN",
-            "error": "Current password incorrect"
-        }
+        parsed_dict = {"errcode": "M_FORBIDDEN", "error": "Current password incorrect"}
         response = ChangePasswordResponse.from_dict(parsed_dict)
         assert isinstance(response, ChangePasswordError)
         assert response.status_code == "M_FORBIDDEN"
