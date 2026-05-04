@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.3] - 2026-05-04
+
+### Features
+- [[#1]] Add low-level MSC4186 Simplified Sliding Sync support, including request
+  builders, async and HTTP client wrappers, typed response parsing, and stable
+  plus unstable endpoint coverage.
+
+### Bug Fixes
+- [[#1]] Convert malformed nested sliding sync list and room payloads into
+  `SlidingSyncError` instead of leaking parser exceptions.
+
+### Notes
+- Sliding sync responses are parsed as a separate low-level API and do not update
+  the existing `/v3/sync` room state loop or `sync_forever()`.
+
+[#1]: https://github.com/mindroom-ai/mindroom-nio/pull/1
+
 ## [0.25.2] - 2024-10-04
 
 ### Bug Fixes
