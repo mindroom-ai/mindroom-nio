@@ -212,6 +212,8 @@ from ..responses import (
     SetPushRuleResponse,
     ShareGroupSessionError,
     ShareGroupSessionResponse,
+    SlidingSyncError,
+    SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -1270,6 +1272,50 @@ class AsyncClient(Client):
             # 0 if full_state: server doesn't respect timeout if full_state
             # + 15: give server a chance to naturally return before we timeout
             timeout=0 if full_state else timeout / 1000 + 15 if timeout else timeout,
+        )
+
+        return response
+
+    @logged_in_async
+    async def sliding_sync(
+        self,
+        conn_id: Optional[str] = None,
+        pos: Optional[str] = None,
+        timeout: Optional[int] = 0,  # noqa: ASYNC109
+        set_presence: Optional[str] = None,
+        lists: Optional[Dict[str, Any]] = None,
+        room_subscriptions: Optional[Dict[str, Any]] = None,
+        extensions: Optional[Dict[str, Any]] = None,
+        unstable: bool = False,
+    ) -> Union[SlidingSyncResponse, SlidingSyncError]:
+        """Synchronise with MSC4186 Simplified Sliding Sync.
+
+        This method returns a typed sliding sync response but does not update
+        the client's v3 sync room state.
+        """
+        presence = set_presence or self._presence
+        method, path, data = Api.sliding_sync(
+            self.access_token,
+            conn_id=conn_id,
+            pos=pos,
+            timeout=(
+                int(self.config.request_timeout) * 1000
+                if timeout is None
+                else timeout
+            ),
+            set_presence=presence,
+            lists=lists,
+            room_subscriptions=room_subscriptions,
+            extensions=extensions,
+            unstable=unstable,
+        )
+
+        response = await self._send(
+            SlidingSyncResponse,
+            method,
+            path,
+            data,
+            timeout=timeout / 1000 + 15 if timeout else timeout,
         )
 
         return response

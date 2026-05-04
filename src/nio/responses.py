@@ -135,6 +135,12 @@ __all__ = [
     "SetPushRuleActionsResponse",
     "ShareGroupSessionResponse",
     "ShareGroupSessionError",
+    "SlidingSyncError",
+    "SlidingSyncHero",
+    "SlidingSyncList",
+    "SlidingSyncResponse",
+    "SlidingSyncRoom",
+    "SlidingSyncStateStub",
     "SyncResponse",
     "SyncError",
     "Timeline",
@@ -263,6 +269,124 @@ class RoomInfo:
     def parse_account_data(event_dict):
         """Parse the account data dictionary and produce a list of events."""
         return [AccountDataEvent.parse_event(event) for event in event_dict]
+
+
+@dataclass
+class SlidingSyncList:
+    count: int = field()
+
+    @classmethod
+    def from_dict(cls, parsed_dict: Dict[Any, Any]) -> SlidingSyncList:
+        return cls(parsed_dict["count"])
+
+
+@dataclass
+class SlidingSyncHero:
+    user_id: str = field()
+    displayname: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, parsed_dict: Dict[Any, Any]) -> SlidingSyncHero:
+        return cls(
+            parsed_dict["user_id"],
+            parsed_dict.get("displayname"),
+            parsed_dict.get("avatar_url"),
+        )
+
+
+@dataclass
+class SlidingSyncStateStub:
+    type: str = field()
+    state_key: str = field()
+
+    @classmethod
+    def from_dict(cls, parsed_dict: Dict[Any, Any]) -> SlidingSyncStateStub:
+        return cls(parsed_dict["type"], parsed_dict["state_key"])
+
+
+@dataclass
+class SlidingSyncRoom:
+    bump_stamp: Optional[int] = None
+    membership: Optional[str] = None
+    lists: Optional[List[str]] = None
+    name: Optional[str] = None
+    avatar: Optional[str] = None
+    heroes: List[SlidingSyncHero] = field(default_factory=list)
+    is_dm: Optional[bool] = None
+    initial: bool = False
+    expanded_timeline: bool = False
+    required_state: List[Union[Event, BadEventType, SlidingSyncStateStub]] = field(
+        default_factory=list
+    )
+    timeline_events: List[Union[Event, BadEventType]] = field(default_factory=list)
+    prev_batch: Optional[str] = None
+    limited: bool = False
+    num_live: Optional[int] = None
+    joined_count: Optional[int] = None
+    invited_count: Optional[int] = None
+    stripped_state: List[Union[InviteEvent, BadEventType]] = field(
+        default_factory=list
+    )
+
+    @staticmethod
+    def _get_required_state(
+        parsed_dicts: List[Dict[Any, Any]],
+    ) -> List[Union[Event, BadEventType, SlidingSyncStateStub]]:
+        events: List[Union[Event, BadEventType, SlidingSyncStateStub]] = []
+
+        for event_dict in parsed_dicts:
+            if "content" not in event_dict:
+                events.append(SlidingSyncStateStub.from_dict(event_dict))
+            else:
+                events.append(Event.parse_event(event_dict))
+
+        return events
+
+    @staticmethod
+    def _get_stripped_state(
+        parsed_dicts: List[Dict[Any, Any]],
+    ) -> List[Union[InviteEvent, BadEventType]]:
+        events: List[Union[InviteEvent, BadEventType]] = []
+
+        for event_dict in parsed_dicts:
+            event = InviteEvent.parse_event(event_dict)
+
+            if event:
+                events.append(event)
+
+        return events
+
+    @classmethod
+    def from_dict(cls, parsed_dict: Dict[Any, Any]) -> SlidingSyncRoom:
+        return cls(
+            bump_stamp=parsed_dict.get("bump_stamp"),
+            membership=parsed_dict.get("membership"),
+            lists=parsed_dict.get("lists"),
+            name=parsed_dict.get("name"),
+            avatar=parsed_dict.get("avatar"),
+            heroes=[
+                SlidingSyncHero.from_dict(hero)
+                for hero in parsed_dict.get("heroes", [])
+            ],
+            is_dm=parsed_dict.get("is_dm"),
+            initial=parsed_dict.get("initial", False),
+            expanded_timeline=parsed_dict.get("expanded_timeline", False),
+            required_state=cls._get_required_state(
+                parsed_dict.get("required_state", [])
+            ),
+            timeline_events=SyncResponse._get_room_events(
+                parsed_dict.get("timeline_events", parsed_dict.get("timeline", []))
+            ),
+            prev_batch=parsed_dict.get("prev_batch"),
+            limited=parsed_dict.get("limited", False),
+            num_live=parsed_dict.get("num_live"),
+            joined_count=parsed_dict.get("joined_count"),
+            invited_count=parsed_dict.get("invited_count"),
+            stripped_state=cls._get_stripped_state(
+                parsed_dict.get("stripped_state", [])
+            ),
+        )
 
 
 @dataclass
@@ -2147,6 +2271,40 @@ class SyncResponse(Response):
             to_device,
             presence_events,
             list(SyncResponse._get_account_data(parsed_dict)),
+        )
+
+
+class SlidingSyncError(SyncError):
+    pass
+
+
+@dataclass
+class SlidingSyncResponse(Response):
+    pos: str = field()
+    lists: Dict[str, SlidingSyncList] = field(default_factory=dict)
+    rooms: Dict[str, SlidingSyncRoom] = field(default_factory=dict)
+    extensions: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    @verify(Schemas.sliding_sync, SlidingSyncError, False)
+    def from_dict(
+        cls,
+        parsed_dict: Dict[Any, Any],
+    ) -> Union[SlidingSyncResponse, ErrorResponse]:
+        lists = {
+            list_name: SlidingSyncList.from_dict(list_dict)
+            for list_name, list_dict in parsed_dict.get("lists", {}).items()
+        }
+        rooms = {
+            room_id: SlidingSyncRoom.from_dict(room_dict)
+            for room_id, room_dict in parsed_dict.get("rooms", {}).items()
+        }
+
+        return cls(
+            parsed_dict["pos"],
+            lists,
+            rooms,
+            parsed_dict.get("extensions", {}),
         )
 
 

@@ -77,6 +77,7 @@ from ..responses import (
     RoomSendResponse,
     RoomTypingResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     ThumbnailResponse,
     ToDeviceResponse,
@@ -1092,6 +1093,41 @@ class HttpClient(Client):
         )
 
         return self._send(request, RequestInfo(SyncResponse))
+
+    @connected
+    @logged_in
+    def sliding_sync(
+        self,
+        conn_id: Optional[str] = None,
+        pos: Optional[str] = None,
+        timeout: Optional[int] = None,
+        set_presence: Optional[str] = None,
+        lists: Optional[Dict[str, Any]] = None,
+        room_subscriptions: Optional[Dict[str, Any]] = None,
+        extensions: Optional[Dict[str, Any]] = None,
+        unstable: bool = False,
+    ) -> Tuple[UUID, bytes]:
+        """Synchronise with MSC4186 Simplified Sliding Sync.
+
+        Returns a unique uuid that identifies the request and the bytes that
+        should be sent to the socket.
+        """
+        request = self._build_request(
+            Api.sliding_sync(
+                self.access_token,
+                conn_id=conn_id,
+                pos=pos,
+                timeout=timeout,
+                set_presence=set_presence,
+                lists=lists,
+                room_subscriptions=room_subscriptions,
+                extensions=extensions,
+                unstable=unstable,
+            ),
+            timeout,
+        )
+
+        return self._send(request, RequestInfo(SlidingSyncResponse))
 
     def parse_body(self, transport_response: TransportResponse) -> Dict[Any, Any]:
         """Parse the body of the response.

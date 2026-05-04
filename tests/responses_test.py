@@ -40,6 +40,9 @@ from nio.responses import (
     RoomMessagesResponse,
     RoomTypingResponse,
     SpaceGetHierarchyResponse,
+    SlidingSyncError,
+    SlidingSyncResponse,
+    SlidingSyncStateStub,
     SyncError,
     SyncResponse,
     ThumbnailError,
@@ -185,6 +188,124 @@ class TestClass:
         parsed_dict = _load_response("tests/data/sync.json")
         response = SyncResponse.from_dict(parsed_dict)
         assert isinstance(response, SyncResponse)
+
+    def test_sliding_sync_fail(self):
+        parsed_dict = {
+            "errcode": "M_UNKNOWN_POS",
+            "error": "Unknown sliding sync pos",
+        }
+        response = SlidingSyncResponse.from_dict(parsed_dict)
+        assert isinstance(response, SlidingSyncError)
+
+    def test_sliding_sync_minimal_response(self):
+        response = SlidingSyncResponse.from_dict({"pos": "s1"})
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.pos == "s1"
+        assert response.lists == {}
+        assert response.rooms == {}
+        assert response.extensions == {}
+
+    def test_sliding_sync_parse(self):
+        parsed_dict = {
+            "pos": "s58_224_0_13_10_1_1_16_0_1",
+            "lists": {"main": {"count": 1}},
+            "rooms": {
+                "!room:example.org": {
+                    "name": "Alice and Bob",
+                    "avatar": None,
+                    "heroes": [
+                        {
+                            "user_id": "@alice:example.org",
+                            "displayname": "Alice",
+                            "avatar_url": "mxc://example.org/alice",
+                        }
+                    ],
+                    "is_dm": True,
+                    "initial": True,
+                    "expanded_timeline": True,
+                    "required_state": [
+                        {"type": "m.room.name", "state_key": ""},
+                        {
+                            "event_id": "$create:example.org",
+                            "sender": "@alice:example.org",
+                            "type": "m.room.create",
+                            "state_key": "",
+                            "origin_server_ts": 1,
+                            "content": {"room_version": "12"},
+                        },
+                    ],
+                    "timeline_events": [
+                        {
+                            "event_id": "$message:example.org",
+                            "sender": "@alice:example.org",
+                            "type": "m.room.message",
+                            "origin_server_ts": 2,
+                            "content": {"msgtype": "m.text", "body": "hi"},
+                        }
+                    ],
+                    "prev_batch": "t111_222_333",
+                    "limited": True,
+                    "num_live": 1,
+                    "joined_count": 2,
+                    "invited_count": 0,
+                    "membership": "join",
+                    "lists": ["main"],
+                }
+            },
+            "extensions": {"account_data": {"foo": "bar"}},
+        }
+
+        response = SlidingSyncResponse.from_dict(parsed_dict)
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.pos == "s58_224_0_13_10_1_1_16_0_1"
+        assert response.lists["main"].count == 1
+        assert response.extensions == {"account_data": {"foo": "bar"}}
+
+        room = response.rooms["!room:example.org"]
+        assert room.name == "Alice and Bob"
+        assert room.avatar is None
+        assert room.heroes[0].user_id == "@alice:example.org"
+        assert room.is_dm
+        assert room.initial
+        assert room.expanded_timeline
+        assert room.membership == "join"
+        assert room.lists == ["main"]
+        assert isinstance(room.required_state[0], SlidingSyncStateStub)
+        assert room.required_state[0].type == "m.room.name"
+        assert room.timeline_events[0].source["content"]["body"] == "hi"
+        assert room.prev_batch == "t111_222_333"
+        assert room.limited
+        assert room.num_live == 1
+        assert room.joined_count == 2
+        assert room.invited_count == 0
+
+    def test_sliding_sync_parse_stripped_state(self):
+        parsed_dict = {
+            "pos": "s1",
+            "rooms": {
+                "!invited:example.org": {
+                    "membership": "invite",
+                    "stripped_state": [
+                        {
+                            "sender": "@alice:example.org",
+                            "state_key": "@bob:example.org",
+                            "type": "m.room.member",
+                            "content": {"membership": "invite"},
+                        }
+                    ],
+                }
+            },
+        }
+
+        response = SlidingSyncResponse.from_dict(parsed_dict)
+
+        assert isinstance(response, SlidingSyncResponse)
+        room = response.rooms["!invited:example.org"]
+        assert room.membership == "invite"
+        assert room.stripped_state[0].source["type"] == "m.room.member"
+        assert room.stripped_state[0].membership == "invite"
 
     def test_keyshare_request(self):
         parsed_dict = {

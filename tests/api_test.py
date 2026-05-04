@@ -14,7 +14,12 @@
 
 import json
 
-from nio.api import MATRIX_API_PATH_V3, Api
+from nio.api import (
+    MATRIX_API_PATH_UNSTABLE,
+    MATRIX_API_PATH_V3,
+    MATRIX_API_PATH_V4,
+    Api,
+)
 
 
 class TestClass:
@@ -98,3 +103,58 @@ class TestClass:
         data_dict = json.loads(resp[2])
         expected_dict = {"auth": auth_dict, "new_password": new_password}
         assert data_dict == expected_dict
+
+    def test_sliding_sync(self) -> None:
+        """Test that sliding_sync returns the MSC4186 request shape."""
+        api = Api()
+        token = "abcd"
+        lists = {
+            "main": {
+                "timeline_limit": 1,
+                "required_state": {
+                    "include": [{"type": "m.room.create", "state_key": ""}]
+                },
+                "range": [0, 19],
+            }
+        }
+        subscriptions = {
+            "!room:example.org": {
+                "timeline_limit": 20,
+                "required_state": {"include": [{}]},
+            }
+        }
+
+        method, path, data = api.sliding_sync(
+            token,
+            conn_id="main",
+            pos="s123",
+            timeout=0,
+            set_presence="offline",
+            lists=lists,
+            room_subscriptions=subscriptions,
+        )
+
+        assert method == "POST"
+        assert path == f"{MATRIX_API_PATH_V4}/sync?access_token={token}"
+        assert json.loads(data) == {
+            "conn_id": "main",
+            "pos": "s123",
+            "timeout": 0,
+            "set_presence": "offline",
+            "lists": lists,
+            "room_subscriptions": subscriptions,
+        }
+
+    def test_sliding_sync_unstable_path(self) -> None:
+        """Test that sliding_sync can target the MSC4186 unstable endpoint."""
+        api = Api()
+        token = "abcd"
+
+        method, path, data = api.sliding_sync(token, unstable=True)
+
+        assert method == "POST"
+        assert path == (
+            f"{MATRIX_API_PATH_UNSTABLE}/org.matrix.simplified_msc3575/sync"
+            f"?access_token={token}"
+        )
+        assert json.loads(data) == {}
