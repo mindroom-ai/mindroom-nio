@@ -334,6 +334,7 @@ class SlidingSyncRoom:
         events: List[Union[Event, BadEventType, SlidingSyncStateStub]] = []
 
         for event_dict in parsed_dicts:
+            # MSC4186 uses StateStub responses without content to signal deleted state.
             if "content" not in event_dict:
                 events.append(SlidingSyncStateStub.from_dict(event_dict))
             else:
@@ -374,6 +375,8 @@ class SlidingSyncRoom:
                 parsed_dict.get("required_state", [])
             ),
             timeline_events=SyncResponse._get_room_events(
+                # Current MSC4186 names this field timeline_events, but older
+                # server examples used timeline.
                 parsed_dict.get("timeline_events", parsed_dict.get("timeline", []))
             ),
             prev_batch=parsed_dict.get("prev_batch"),

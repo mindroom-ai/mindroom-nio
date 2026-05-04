@@ -1292,6 +1292,15 @@ class AsyncClient(Client):
 
         This method returns a typed sliding sync response but does not update
         the client's v3 sync room state.
+
+        Args:
+            timeout(int, optional): The maximum time that the server should
+                wait for new events before it should return the request,
+                in milliseconds. If ``0``, the server returns immediately and
+                the underlying request has no client-side timeout, matching
+                ``sync()``. If ``None``, use
+                ``AsyncClient.config.request_timeout`` for both the server
+                long-poll timeout and the client-side request timeout.
         """
         presence = set_presence or self._presence
         method, path, data = Api.sliding_sync(
