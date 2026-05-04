@@ -1299,9 +1299,7 @@ class AsyncClient(Client):
             conn_id=conn_id,
             pos=pos,
             timeout=(
-                int(self.config.request_timeout) * 1000
-                if timeout is None
-                else timeout
+                int(self.config.request_timeout) * 1000 if timeout is None else timeout
             ),
             set_presence=presence,
             lists=lists,

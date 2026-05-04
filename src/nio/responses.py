@@ -325,9 +325,7 @@ class SlidingSyncRoom:
     num_live: Optional[int] = None
     joined_count: Optional[int] = None
     invited_count: Optional[int] = None
-    stripped_state: List[Union[InviteEvent, BadEventType]] = field(
-        default_factory=list
-    )
+    stripped_state: List[Union[InviteEvent, BadEventType]] = field(default_factory=list)
 
     @staticmethod
     def _get_required_state(
