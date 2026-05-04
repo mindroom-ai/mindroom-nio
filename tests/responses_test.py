@@ -206,6 +206,26 @@ class TestClass:
         assert response.rooms == {}
         assert response.extensions == {}
 
+    def test_sliding_sync_malformed_list_returns_error(self):
+        response = SlidingSyncResponse.from_dict({"pos": "s1", "lists": {"main": {}}})
+
+        assert isinstance(response, SlidingSyncError)
+
+    def test_sliding_sync_malformed_room_returns_error(self):
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    "!room:example.org": {
+                        "required_state": [{"type": "m.room.name"}],
+                    },
+                },
+            }
+        )
+
+        assert isinstance(response, SlidingSyncError)
+        assert "!room:example.org" in response.message
+
     def test_sliding_sync_parse(self):
         parsed_dict = {
             "pos": "s58_224_0_13_10_1_1_16_0_1",

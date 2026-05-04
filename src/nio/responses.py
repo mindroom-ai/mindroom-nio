@@ -2283,20 +2283,49 @@ class SlidingSyncResponse(Response):
     rooms: Dict[str, SlidingSyncRoom] = field(default_factory=dict)
     extensions: Dict[str, Any] = field(default_factory=dict)
 
+    @staticmethod
+    def _parse_list(
+        list_name: str, list_dict: Dict[Any, Any]
+    ) -> Union[SlidingSyncList, SlidingSyncError]:
+        try:
+            return SlidingSyncList.from_dict(list_dict)
+        except (KeyError, TypeError, AttributeError) as exc:
+            return SlidingSyncError(
+                f"Invalid sliding sync list payload for {list_name!r}: {exc}"
+            )
+
+    @staticmethod
+    def _parse_room(
+        room_id: str, room_dict: Dict[Any, Any]
+    ) -> Union[SlidingSyncRoom, SlidingSyncError]:
+        try:
+            return SlidingSyncRoom.from_dict(room_dict)
+        except (KeyError, TypeError, AttributeError) as exc:
+            return SlidingSyncError(
+                f"Invalid sliding sync room payload for {room_id!r}: {exc}"
+            )
+
     @classmethod
     @verify(Schemas.sliding_sync, SlidingSyncError, False)
     def from_dict(
         cls,
         parsed_dict: Dict[Any, Any],
     ) -> Union[SlidingSyncResponse, ErrorResponse]:
-        lists = {
-            list_name: SlidingSyncList.from_dict(list_dict)
-            for list_name, list_dict in parsed_dict.get("lists", {}).items()
-        }
-        rooms = {
-            room_id: SlidingSyncRoom.from_dict(room_dict)
-            for room_id, room_dict in parsed_dict.get("rooms", {}).items()
-        }
+        lists: Dict[str, SlidingSyncList] = {}
+        for list_name, list_dict in parsed_dict.get("lists", {}).items():
+            sliding_sync_list = cls._parse_list(list_name, list_dict)
+            if isinstance(sliding_sync_list, SlidingSyncError):
+                return sliding_sync_list
+
+            lists[list_name] = sliding_sync_list
+
+        rooms: Dict[str, SlidingSyncRoom] = {}
+        for room_id, room_dict in parsed_dict.get("rooms", {}).items():
+            room = cls._parse_room(room_id, room_dict)
+            if isinstance(room, SlidingSyncError):
+                return room
+
+            rooms[room_id] = room
 
         return cls(
             parsed_dict["pos"],
