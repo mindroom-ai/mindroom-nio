@@ -53,6 +53,8 @@ except ImportError:
 
 MATRIX_API_PATH_V1: str = "/_matrix/client/v1"
 MATRIX_API_PATH_V3: str = "/_matrix/client/v3"
+MATRIX_API_PATH_V4: str = "/_matrix/client/v4"
+MATRIX_API_PATH_UNSTABLE: str = "/_matrix/client/unstable"
 MATRIX_MEDIA_API_PATH: str = "/_matrix/client/v1/media"
 MATRIX_LEGACY_MEDIA_API_PATH: str = "/_matrix/media/v3"
 
@@ -624,6 +626,61 @@ class Api:
             query_parameters["filter"] = filter
 
         return "GET", Api._build_path(path, query_parameters)
+
+    @staticmethod
+    def sliding_sync(
+        access_token: str,
+        conn_id: Optional[str] = None,
+        pos: Optional[str] = None,
+        timeout: Optional[int] = None,
+        set_presence: Optional[str] = None,
+        lists: Optional[Dict[str, Any]] = None,
+        room_subscriptions: Optional[Dict[str, Any]] = None,
+        extensions: Optional[Dict[str, Any]] = None,
+        unstable: bool = False,
+    ) -> Tuple[str, str, str]:
+        """Build a Simplified Sliding Sync request, as described by MSC4186.
+
+        Returns the HTTP method, HTTP path and JSON request body for the
+        request. By default this uses the proposed ``/_matrix/client/v4/sync``
+        path; set ``unstable`` to use the MSC unstable path.
+        """
+        query_parameters = {"access_token": access_token}
+        path = ["sync"]
+        base_path = MATRIX_API_PATH_V4
+
+        if unstable:
+            path = ["org.matrix.simplified_msc3575", "sync"]
+            base_path = MATRIX_API_PATH_UNSTABLE
+
+        body: Dict[str, Any] = {}
+
+        if conn_id is not None:
+            body["conn_id"] = conn_id
+
+        if pos is not None:
+            body["pos"] = pos
+
+        if timeout is not None:
+            body["timeout"] = timeout
+
+        if set_presence is not None:
+            body["set_presence"] = set_presence
+
+        if lists is not None:
+            body["lists"] = lists
+
+        if room_subscriptions is not None:
+            body["room_subscriptions"] = room_subscriptions
+
+        if extensions is not None:
+            body["extensions"] = extensions
+
+        return (
+            "POST",
+            Api._build_path(path, query_parameters, base_path),
+            Api.to_json(body),
+        )
 
     @staticmethod
     def room_send(

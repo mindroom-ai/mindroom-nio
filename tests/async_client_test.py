@@ -113,6 +113,7 @@ from nio import (
     SetPushRuleActionsResponse,
     SetPushRuleResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncResponse,
@@ -129,6 +130,7 @@ from nio import (
 from nio.api import (
     MATRIX_API_PATH_V1,
     MATRIX_API_PATH_V3,
+    MATRIX_API_PATH_V4,
     MATRIX_LEGACY_MEDIA_API_PATH,
     MATRIX_MEDIA_API_PATH,
     EventFormat,
@@ -144,6 +146,7 @@ from nio.responses import PublicRoom, PublicRoomsResponse
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
+BASE_URL_V4 = f"https://example.org{MATRIX_API_PATH_V4}"
 BASE_MEDIA_URL = f"https://example.org{MATRIX_MEDIA_API_PATH}"
 BASE_LEGACY_MEDIA_URL = f"https://example.org{MATRIX_LEGACY_MEDIA_API_PATH}"
 TEST_ROOM_ID = "!testroom:example.org"
@@ -886,6 +889,48 @@ class TestClass:
         assert user.last_active_ago == 1337
         assert user.presence == "online"
         assert user.status_msg == "I am here."
+
+    async def test_sliding_sync(self, async_client, aioresponse):
+        lists = {
+            "main": {
+                "timeline_limit": 1,
+                "required_state": {
+                    "include": [{"type": "m.room.create", "state_key": ""}]
+                },
+                "range": [0, 19],
+            }
+        }
+
+        def sliding_sync_cb(url, data, headers, **kwargs):
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+
+            assert headers["Authorization"] == f"Bearer {async_client.access_token}"
+            assert json.loads(data) == {
+                "conn_id": "main",
+                "timeout": 0,
+                "lists": lists,
+            }
+            return CallbackResult(
+                status=200,
+                payload={
+                    "pos": "s1",
+                    "lists": {"main": {"count": 1}},
+                    "rooms": {},
+                },
+            )
+
+        aioresponse.post(f"{BASE_URL_V4}/sync", callback=sliding_sync_cb)
+
+        resp = await async_client.sliding_sync(
+            conn_id="main",
+            timeout=0,
+            lists=lists,
+        )
+
+        assert isinstance(resp, SlidingSyncResponse)
+        assert resp.pos == "s1"
+        assert resp.lists["main"].count == 1
 
     async def test_sync_notification_counts(self, async_client, aioresponse):
         aioresponse.get(
