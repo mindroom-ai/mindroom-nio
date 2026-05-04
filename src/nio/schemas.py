@@ -531,6 +531,25 @@ class Schemas:
         "required": ["events"],
     }
 
+    sliding_sync = {
+        "type": "object",
+        "properties": {
+            "pos": {"type": "string"},
+            "lists": {
+                "type": "object",
+                "default": {},
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"],
+                },
+            },
+            "rooms": {"type": "object", "default": {}},
+            "extensions": {"type": "object", "default": {}},
+        },
+        "required": ["pos"],
+    }
+
     to_device = {
         "type": "object",
         "properties": {

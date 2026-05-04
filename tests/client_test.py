@@ -45,6 +45,7 @@ from nio import (
     RoomSummary,
     RoomTypingResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     TagEvent,
     ThumbnailResponse,
@@ -134,6 +135,28 @@ class TestClass:
         )
 
         body = Path("tests/data/sync.json").read_bytes()
+
+        data = frame_factory.build_data_frame(
+            data=body, stream_id=3, flags=["END_STREAM"]
+        )
+
+        return f.serialize() + data.serialize()
+
+    @property
+    def sliding_sync_byte_response(self):
+        frame_factory = FrameFactory()
+
+        f = frame_factory.build_headers_frame(
+            headers=self.example_response_headers, stream_id=3
+        )
+
+        body = json.dumps(
+            {
+                "pos": "s1",
+                "lists": {"main": {"count": 1}},
+                "rooms": {},
+            }
+        ).encode("utf-8")
 
         data = frame_factory.build_data_frame(
             data=body, stream_id=3, flags=["END_STREAM"]
@@ -810,6 +833,67 @@ class TestClass:
 
         assert isinstance(response, SyncResponse)
         assert http_client.access_token == "ABCD"
+
+    def test_http_client_sliding_sync(self, http_client):
+        http_client.connect(TransportType.HTTP2)
+
+        _, _ = http_client.login("1234")
+
+        http_client.receive(self.login_byte_response)
+        response = http_client.next_response()
+
+        assert isinstance(response, LoginResponse)
+        assert http_client.access_token == "ABCD"
+
+        _, _ = http_client.sliding_sync(
+            conn_id="main",
+            timeout=0,
+            lists={
+                "main": {
+                    "timeline_limit": 1,
+                    "required_state": [["m.room.create", ""]],
+                    "ranges": [[0, 19]],
+                }
+            },
+        )
+
+        http_client.receive(self.sliding_sync_byte_response)
+        response = http_client.next_response()
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.pos == "s1"
+        assert response.lists["main"].count == 1
+
+    def test_http_client_sliding_sync_stable(self, http_client):
+        http_client.connect(TransportType.HTTP2)
+
+        _, _ = http_client.login("1234")
+
+        http_client.receive(self.login_byte_response)
+        response = http_client.next_response()
+
+        assert isinstance(response, LoginResponse)
+        assert http_client.access_token == "ABCD"
+
+        _, _ = http_client.sliding_sync(
+            conn_id="main",
+            timeout=0,
+            lists={
+                "main": {
+                    "timeline_limit": 1,
+                    "required_state": [["m.room.create", ""]],
+                    "ranges": [[0, 19]],
+                }
+            },
+            unstable=False,
+        )
+
+        http_client.receive(self.sliding_sync_byte_response)
+        response = http_client.next_response()
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.pos == "s1"
+        assert response.lists["main"].count == 1
 
     def test_http_client_keys_query(self, http_client):
         http_client.connect(TransportType.HTTP2)

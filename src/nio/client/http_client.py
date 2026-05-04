@@ -77,6 +77,7 @@ from ..responses import (
     RoomSendResponse,
     RoomTypingResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     ThumbnailResponse,
     ToDeviceResponse,
@@ -1092,6 +1093,46 @@ class HttpClient(Client):
         )
 
         return self._send(request, RequestInfo(SyncResponse))
+
+    @connected
+    @logged_in
+    def sliding_sync(
+        self,
+        conn_id: str | None = None,
+        pos: str | None = None,
+        timeout: int | None = None,
+        set_presence: str | None = None,
+        lists: dict[str, Any] | None = None,
+        room_subscriptions: dict[str, Any] | None = None,
+        extensions: dict[str, Any] | None = None,
+        unstable: bool = True,
+    ) -> tuple[UUID, bytes]:
+        """Synchronise with MSC4186 Simplified Sliding Sync.
+
+        Returns a unique uuid that identifies the request and the bytes that
+        should be sent to the socket.
+
+        By default this targets the unstable
+        ``org.matrix.simplified_msc3575`` endpoint, the only one deployed
+        servers currently serve; set ``unstable`` to ``False`` to target the
+        proposed stable ``/_matrix/client/v4/sync`` path.
+        """
+        request = self._build_request(
+            Api.sliding_sync(
+                self.access_token,
+                conn_id=conn_id,
+                pos=pos,
+                timeout=timeout,
+                set_presence=set_presence,
+                lists=lists,
+                room_subscriptions=room_subscriptions,
+                extensions=extensions,
+                unstable=unstable,
+            ),
+            timeout,
+        )
+
+        return self._send(request, RequestInfo(SlidingSyncResponse))
 
     def parse_body(self, transport_response: TransportResponse) -> dict[Any, Any]:
         """Parse the body of the response.

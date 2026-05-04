@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Add low-level MSC4186 Simplified Sliding Sync support across `Api`,
+  `AsyncClient`, and `HttpClient`, including request builders and typed
+  response parsing. Requests use the query parameters, response keys, and
+  unstable endpoint served by deployed Synapse and Tuwunel homeservers.
+  Malformed nested list and room payloads produce `SlidingSyncError`.
+
 ## [0.26.0] - 2026-07-23
 
 ### Breaking Changes
