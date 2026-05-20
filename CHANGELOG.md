@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.4] - 2026-05-20
+
+### Bug Fixes
+- [[#2]] Persist vodozemac account state after inbound session creation consumes
+  one-time keys, and handle unknown one-time-key session creation failures as
+  recoverable decryption failures.
+
+[#2]: https://github.com/mindroom-ai/mindroom-nio/pull/2
+
 ## [0.25.3] - 2026-05-04
 
 ### Features

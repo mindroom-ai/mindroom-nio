@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindroom-nio"
-version = "0.25.3"
+version = "0.25.4"
 description = "A Python Matrix client library, designed according to sans I/O principles."
 authors = [
     { name = "Damir Jelić", email = "poljar@termina.org.uk" },
