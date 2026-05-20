@@ -1534,7 +1534,7 @@ class Olm:
                 vodozemac.DecodeException,
                 vodozemac.SessionCreationException,
             ) as e:
-                logger.error(
+                logger.exception(
                     f"Failed to create new session from prekeymessage: {str(e)}"
                 )
                 self._mark_device_for_unwedging(sender, sender_key)
