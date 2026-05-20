@@ -882,11 +882,6 @@ class Olm:
         # Let's create a new inbound session.
         session = InboundSession(self.account, message, sender_key)
         logger.info(f"Created Inbound session for {sender}")
-        # Remove the one time keys the session used so it can't be reused
-        # anymore.
-        self.account.remove_one_time_keys(session)
-        # Save the account now that we removed the one time key.
-        self.save_account()
 
         return session
 
@@ -1532,8 +1527,14 @@ class Olm:
                 # Store the new session
                 self.session_store.add(sender_key, s)
                 self.save_session(sender_key, s)
-            except (vodozemac.OlmDecryptionException, vodozemac.DecodeException) as e:
-                logger.error(
+                # Save the account after vodozemac consumed the one-time key.
+                self.save_account()
+            except (
+                vodozemac.OlmDecryptionException,
+                vodozemac.DecodeException,
+                vodozemac.SessionCreationException,
+            ) as e:
+                logger.exception(
                     f"Failed to create new session from prekeymessage: {str(e)}"
                 )
                 self._mark_device_for_unwedging(sender, sender_key)
