@@ -973,6 +973,75 @@ class TestClass:
         assert alice.outbound_group_sessions["!test:example.org"]
         assert alice.is_device_ignored(bob_device)
 
+    def test_inbound_session_persists_consumed_one_time_key(self, tempdir):
+        alice = Olm(AliceId, Alice_device, DefaultStore(AliceId, Alice_device, tempdir))
+        bob = Olm(BobId, Bob_device, DefaultStore(BobId, Bob_device, tempdir))
+
+        alice_device = OlmDevice(
+            alice.user_id, alice.device_id, alice.account.identity_keys
+        )
+        bob_device = OlmDevice(bob.user_id, bob.device_id, bob.account.identity_keys)
+
+        alice.device_store.add(bob_device)
+        bob.device_store.add(alice_device)
+
+        bob.account.generate_one_time_keys(1)
+        one_time = list(bob.account.one_time_keys["curve25519"].values())[0]
+        bob.account.mark_keys_as_published()
+        bob.save_account()
+
+        alice.create_session(one_time, bob_device.curve25519)
+        _, to_device = alice.share_group_session(
+            TEST_ROOM, [bob.user_id], ignore_unverified_devices=True
+        )
+
+        olm_message = self.olm_message_to_event(to_device, bob, alice)
+        event = ToDeviceEvent.parse_event(olm_message)
+        assert isinstance(event, OlmEvent)
+
+        assert bob.decrypt_event(event)
+
+        reloaded_account = DefaultStore(BobId, Bob_device, tempdir).load_account()
+        assert reloaded_account
+
+        own_ciphertext = event.ciphertext[bob_device.curve25519]
+        message = vodozemac.PreKeyMessage.from_base64(own_ciphertext["body"])
+
+        with pytest.raises(vodozemac.SessionCreationException):
+            reloaded_account.create_inbound_session(event.sender_key, message)
+
+    def test_unknown_one_time_key_does_not_escape_decrypt_event(self, tempdir):
+        alice = Olm(AliceId, Alice_device, DefaultStore(AliceId, Alice_device, tempdir))
+        bob = Olm(BobId, Bob_device, DefaultStore(BobId, Bob_device, tempdir))
+
+        alice_device = OlmDevice(
+            alice.user_id, alice.device_id, alice.account.identity_keys
+        )
+        bob_device = OlmDevice(bob.user_id, bob.device_id, bob.account.identity_keys)
+
+        alice.device_store.add(bob_device)
+        bob.device_store.add(alice_device)
+
+        bob.account.generate_one_time_keys(1)
+        one_time = list(bob.account.one_time_keys["curve25519"].values())[0]
+        bob.account.mark_keys_as_published()
+        bob.save_account()
+
+        alice.create_session(one_time, bob_device.curve25519)
+        _, to_device = alice.share_group_session(
+            TEST_ROOM, [bob.user_id], ignore_unverified_devices=True
+        )
+
+        olm_message = self.olm_message_to_event(to_device, bob, alice)
+        event = ToDeviceEvent.parse_event(olm_message)
+        assert isinstance(event, OlmEvent)
+
+        assert bob.decrypt_event(event)
+        bob.session_store = SessionStore()
+
+        assert bob.decrypt_event(event) is None
+        assert bob.wedged_devices == [alice_device]
+
     def test_session_unwedging(self, olm_account, bob_account):
         alice = olm_account
         bob = bob_account
