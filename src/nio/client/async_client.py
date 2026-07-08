@@ -1773,6 +1773,10 @@ class AsyncClient(Client):
             freshly_uploaded = True
 
         if self.device_id not in identity.signed_devices:
+            # The server can only sign a device whose own keys it already has,
+            # and this may run before the first sync uploads them.
+            if self.should_upload_keys:
+                await self.keys_upload()
             await self._upload_own_device_signature(identity)
             identity.signed_devices.append(self.device_id)
             identity.save(sidecar)
