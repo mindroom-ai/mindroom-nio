@@ -20,10 +20,35 @@ provided: text-mode writes with an ``overwrite`` flag.
 
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 from contextlib import contextmanager
 from typing import IO, Iterator, Union
+
+
+def _create_at(tmp_path: str, path: str) -> None:
+    """Move ``tmp_path`` to ``path``, raising ``FileExistsError`` if it exists.
+
+    Hard-linking raises ``FileExistsError`` atomically when the destination
+    exists, unlike ``os.replace()`` which would silently overwrite it. Some
+    filesystems (FAT32/exFAT, certain network or FUSE mounts) do not support
+    hard links at all; for those, fall back to an existence check followed by
+    ``os.replace()``, which is still atomic but has a small window in which a
+    concurrently created destination would be overwritten.
+    """
+    try:
+        os.link(tmp_path, path)
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.exists(path):
+            raise FileExistsError(
+                errno.EEXIST, os.strerror(errno.EEXIST), path
+            ) from None
+        os.replace(tmp_path, path)
+    else:
+        os.unlink(tmp_path)
 
 
 @contextmanager
@@ -35,6 +60,11 @@ def atomic_write(
     The temporary file is only moved into place after it has been fully
     written and flushed to disk, so readers never observe a partially
     written file.
+
+    The file is created with owner-only (0600) permissions, as
+    ``tempfile.mkstemp`` does; the old ``atomicwrites`` package behaved the
+    same way, and the callers in nio write key material where restrictive
+    permissions are desirable.
 
     Args:
         path: The destination file path.
@@ -55,10 +85,7 @@ def atomic_write(
         if overwrite:
             os.replace(tmp_path, path)
         else:
-            # Hard-linking raises FileExistsError if the destination exists,
-            # unlike os.replace() which would silently overwrite it.
-            os.link(tmp_path, path)
-            os.unlink(tmp_path)
+            _create_at(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)
