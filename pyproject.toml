@@ -34,9 +34,10 @@ e2e = [
 dev = [
     "mindroom-nio[e2e]",
     # aioresponses 0.7.x does not support aiohttp >= 3.14 (ClientResponse
-    # signature change); tests hang or fail with TypeError without this cap.
+    # signature change), and 0.7.9 broke URL matching for several mocked
+    # tests; without these caps the test suite fails or hangs.
     "aiohttp<3.14",
-    "aioresponses~=0.7",
+    "aioresponses>=0.7,<0.7.9",
     "hpack~=4.0",
     "hyperframe~=6.0",
     "hypothesis~=6.8",
