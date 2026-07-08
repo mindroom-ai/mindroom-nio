@@ -1637,19 +1637,23 @@ class AsyncClient(Client):
             ToDeviceResponse, method, path, data, response_data=(message,)
         )
 
-    @logged_in_async
-    @store_loaded
     @property
     def cross_signing_identity(self) -> Optional[CrossSigningIdentity]:
         """The persisted self-managed cross-signing identity, if any.
 
         This is a mindroom-nio fork feature; see crypto/cross_signing.py.
+        This accessor is best-effort for diagnostics and returns None when the
+        sidecar is absent or unreadable; ensure_cross_signing() is the path
+        that surfaces a corrupt identity.
         """
         if not self.store_path or not self.user_id:
             return None
-        return CrossSigningIdentity.load(
-            cross_signing_sidecar_path(self.store_path, self.user_id)
-        )
+        try:
+            return CrossSigningIdentity.load(
+                cross_signing_sidecar_path(self.store_path, self.user_id)
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def _own_device_keys_payload(self) -> Dict[str, Any]:
         """The unsigned device-keys object for this session's device."""
@@ -1692,13 +1696,15 @@ class AsyncClient(Client):
         if response.status == 200:
             return
         # Servers without MSC3967 demand user-interactive auth even for the
-        # first upload; retry once with password auth.
-        error_body = await response.json()
-        session = error_body.get("session")
+        # first upload; retry once with password auth. Only a 401 body is
+        # guaranteed JSON, so parse it after the status/password gate to avoid
+        # masking non-JSON gateway errors behind a ContentTypeError.
         if response.status != 401 or not password:
             raise LocalProtocolError(
-                f"Cross-signing key upload failed: {response.status} {error_body}"
+                f"Cross-signing key upload failed: {response.status} {await response.text()}"
             )
+        error_body = await response.json()
+        session = error_body.get("session")
         auth: Dict[str, Any] = {
             "type": "m.login.password",
             "identifier": {"type": "m.id.user", "user": self.user_id},
@@ -1783,6 +1789,8 @@ class AsyncClient(Client):
 
         return "uploaded_and_signed" if freshly_uploaded else "device_signed"
 
+    @logged_in_async
+    @store_loaded
     async def keys_upload(self) -> Union[KeysUploadResponse, KeysUploadError]:
         """Upload the E2E encryption keys.
 

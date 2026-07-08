@@ -67,7 +67,7 @@ class CrossSigningIdentity:
     signed_devices: List[str] = field(default_factory=list)
 
     @classmethod
-    def generate(cls, user_id: str) -> "CrossSigningIdentity":
+    def generate(cls, user_id: str) -> CrossSigningIdentity:
         """Create a fresh cross-signing identity for one account."""
         return cls(
             user_id=user_id,
@@ -76,26 +76,37 @@ class CrossSigningIdentity:
         )
 
     @classmethod
-    def load(cls, path: Path) -> Optional["CrossSigningIdentity"]:
-        """Load a persisted identity, or None when absent or unreadable."""
+    def load(cls, path: Path) -> Optional[CrossSigningIdentity]:
+        """Load a persisted identity, returning None only when truly absent.
+
+        A missing sidecar returns None so callers can generate a fresh
+        identity. A sidecar that exists but is unreadable or corrupt raises
+        instead: silently returning None would make callers rotate the
+        master/self-signing keys and invalidate existing signatures.
+        """
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return cls(
-                user_id=payload["user_id"],
-                master_seed=_b64_to_bytes(payload["master_seed"]),
-                self_signing_seed=_b64_to_bytes(payload["self_signing_seed"]),
-                uploaded=bool(payload.get("uploaded", False)),
-                signed_devices=[
-                    device
-                    for device in payload.get("signed_devices", [])
-                    if isinstance(device, str)
-                ],
-            )
-        except (OSError, ValueError, KeyError, TypeError):
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
+        payload = json.loads(raw)
+        return cls(
+            user_id=payload["user_id"],
+            master_seed=_b64_to_bytes(payload["master_seed"]),
+            self_signing_seed=_b64_to_bytes(payload["self_signing_seed"]),
+            uploaded=bool(payload.get("uploaded", False)),
+            signed_devices=[
+                device
+                for device in payload.get("signed_devices", [])
+                if isinstance(device, str)
+            ],
+        )
 
     def save(self, path: Path) -> None:
-        """Persist the identity with owner-only permissions."""
+        """Persist the identity, creating the file with owner-only permissions.
+
+        The file is opened with mode 0o600 from creation so the private key
+        seeds are never briefly world-readable under the process umask.
+        """
         payload = {
             "user_id": self.user_id,
             "master_seed": _unpadded_b64(self.master_seed),
@@ -104,8 +115,9 @@ class CrossSigningIdentity:
             "signed_devices": self.signed_devices,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        os.chmod(path, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
 
     @property
     def master_public_key(self) -> str:

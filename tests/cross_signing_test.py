@@ -1,5 +1,6 @@
 """Tests for the fork's self-managed cross-signing identities."""
 
+import pytest
 import vodozemac
 
 from nio.api import Api
@@ -89,10 +90,23 @@ class TestCrossSigning:
         assert loaded.signed_devices == ["DEVICEID"]
         assert loaded.master_public_key == identity.master_public_key
 
-    def test_load_missing_or_corrupt_returns_none(self, tmp_path):
+    def test_load_missing_returns_none(self, tmp_path):
         sidecar = cross_signing_sidecar_path(str(tmp_path), ALICE)
         assert CrossSigningIdentity.load(sidecar) is None
 
+    def test_load_corrupt_raises_instead_of_rotating(self, tmp_path):
+        # A corrupt existing sidecar must not look "absent"; returning None
+        # would make ensure_cross_signing rotate keys and break signatures.
+        sidecar = cross_signing_sidecar_path(str(tmp_path), ALICE)
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text("not json")
-        assert CrossSigningIdentity.load(sidecar) is None
+        with pytest.raises(ValueError):  # noqa: PT011
+            CrossSigningIdentity.load(sidecar)
+
+    def test_save_creates_owner_only_file(self, tmp_path):
+        identity = CrossSigningIdentity.generate(ALICE)
+        sidecar = cross_signing_sidecar_path(str(tmp_path), ALICE)
+
+        identity.save(sidecar)
+
+        assert (sidecar.stat().st_mode & 0o777) == 0o600
