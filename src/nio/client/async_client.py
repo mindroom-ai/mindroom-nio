@@ -1656,15 +1656,17 @@ class AsyncClient(Client):
             return None
 
     def _own_device_keys_payload(self) -> Dict[str, Any]:
-        """The unsigned device-keys object for this session's device."""
+        """The unsigned device-keys object for this session's device.
+
+        Built from the same source Olm.share_keys() uses to upload the device
+        keys, so the object this signature covers cannot drift from what the
+        server actually stores.
+        """
         assert self.olm
         assert self.user_id
         assert self.device_id
         return {
-            "algorithms": [
-                "m.olm.v1.curve25519-aes-sha2",
-                "m.megolm.v1.aes-sha2",
-            ],
+            "algorithms": list(self.olm._algorithms),
             "device_id": self.device_id,
             "user_id": self.user_id,
             "keys": {
