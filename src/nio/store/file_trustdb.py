@@ -3,8 +3,7 @@ from __future__ import annotations
 from functools import wraps
 from typing import Any, Iterator, List, Optional
 
-from atomicwrites import atomic_write
-
+from .._atomic_write import atomic_write
 from ..crypto import OlmDevice
 from ..exceptions import OlmTrustError
 from . import logger
