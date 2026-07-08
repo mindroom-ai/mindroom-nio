@@ -12,6 +12,15 @@ All notable changes to this project will be documented in this file.
   unstable endpoint served by deployed Synapse and Tuwunel homeservers.
   Malformed nested list and room payloads produce `SlidingSyncError`.
 
+### Dependencies
+
+- Drop the unmaintained `atomicwrites` dependency in favor of a small internal
+  stdlib-based atomic write helper with the same semantics
+  (matrix-nio/matrix-nio#566).
+- Allow peewee 4.x by relaxing the `e2e` extra constraint to
+  `peewee>=3.14,<5`; the test suite passes against peewee 4.1.1
+  (matrix-nio/matrix-nio#566).
+
 ## [0.26.0] - 2026-07-23
 
 ### Breaking Changes
