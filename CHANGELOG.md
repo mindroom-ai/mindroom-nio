@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
   response parsing. Requests use the query parameters, response keys, and
   unstable endpoint served by deployed Synapse and Tuwunel homeservers.
   Malformed nested list and room payloads produce `SlidingSyncError`.
+- Add self-managed cross-signing for bot-style clients:
+  `AsyncClient.ensure_cross_signing()` creates and persists master and
+  self-signing keys next to the encryption store, uploads them with an
+  MSC3967-first flow and password-based UIA retry, and signs the account's own
+  device so strict clients keep sharing room keys with it. Requires
+  `pycryptodome >=3.15` for Ed25519 signing.
 
 ### Dependencies
 

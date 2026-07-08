@@ -64,6 +64,10 @@ from ..crypto import (
     async_encrypt_attachment,
     async_generator_from_data,
 )
+from ..crypto.cross_signing import (
+    CrossSigningIdentity,
+    cross_signing_sidecar_path,
+)
 from ..event_builders import ToDeviceMessage
 from ..events import (
     AccountDataEvent,
@@ -1612,6 +1616,173 @@ class AsyncClient(Client):
         return await self._send(
             ToDeviceResponse, method, path, data, response_data=(message,)
         )
+
+    @property
+    def cross_signing_identity(self) -> CrossSigningIdentity | None:
+        """The persisted self-managed cross-signing identity, if any.
+
+        This is a mindroom-nio fork feature; see crypto/cross_signing.py.
+        This accessor is best-effort for diagnostics and returns None when the
+        sidecar is absent or unreadable; ensure_cross_signing() is the path
+        that surfaces a corrupt identity.
+        """
+        if not self.store_path or not self.user_id:
+            return None
+        try:
+            return CrossSigningIdentity.load(
+                cross_signing_sidecar_path(self.store_path, self.user_id)
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _own_device_keys_payload(self) -> dict[str, Any]:
+        """The unsigned device-keys object for this session's device.
+
+        Built from the same source Olm.share_keys() uses to upload the device
+        keys, so the object this signature covers cannot drift from what the
+        server actually stores.
+        """
+        assert self.olm
+        assert self.user_id
+        assert self.device_id
+        return {
+            "algorithms": list(self.olm._algorithms),
+            "device_id": self.device_id,
+            "user_id": self.user_id,
+            "keys": {
+                f"curve25519:{self.device_id}": self.olm.account.identity_keys[
+                    "curve25519"
+                ],
+                f"ed25519:{self.device_id}": self.olm.account.identity_keys["ed25519"],
+            },
+        }
+
+    async def _post_cross_signing(
+        self, path: str, body: dict[str, Any]
+    ) -> ClientResponse:
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        return await self.send("POST", path, Api.to_json(body), headers)
+
+    @staticmethod
+    async def _response_json_or_empty(response: ClientResponse) -> dict[str, Any]:
+        """Decode a response body as a JSON object, tolerating non-JSON bodies.
+
+        A WAF, proxy, or overloaded homeserver can return a plain-text or HTML
+        error body; ``content_type=None`` ignores the header and the guard turns
+        an undecodable body into an empty mapping instead of an escaping error.
+        """
+        try:
+            parsed = await response.json(content_type=None)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def _upload_cross_signing_keys(
+        self, identity: CrossSigningIdentity, password: str | None
+    ) -> None:
+        body: dict[str, Any] = {
+            "master_key": identity.master_key_payload(),
+            "self_signing_key": identity.self_signing_key_payload(),
+        }
+        path = "/_matrix/client/v3/keys/device_signing/upload"
+        response = await self._post_cross_signing(path, body)
+        if response.status == 200:
+            return
+        # Servers without MSC3967 demand user-interactive auth even for the
+        # first upload; retry once with password auth. Only a 401 body is
+        # guaranteed JSON, so parse it after the status/password gate to avoid
+        # masking non-JSON gateway errors behind a ContentTypeError.
+        if response.status != 401 or not password:
+            raise LocalProtocolError(
+                f"Cross-signing key upload failed: {response.status} {await response.text()}"
+            )
+        error_body = await self._response_json_or_empty(response)
+        session = error_body.get("session")
+        auth: dict[str, Any] = {
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": self.user_id},
+            "password": password,
+        }
+        if session:
+            auth["session"] = session
+        body["auth"] = auth
+        response = await self._post_cross_signing(path, body)
+        if response.status != 200:
+            raise LocalProtocolError(
+                f"Cross-signing key upload failed after auth: "
+                f"{response.status} {await response.text()}"
+            )
+
+    async def _upload_own_device_signature(
+        self, identity: CrossSigningIdentity
+    ) -> None:
+        assert self.user_id
+        assert self.device_id
+        signed_device = identity.signed_device_payload(self._own_device_keys_payload())
+        body = {self.user_id: {self.device_id: signed_device}}
+        response = await self._post_cross_signing(
+            "/_matrix/client/v3/keys/signatures/upload", body
+        )
+        response_body = await self._response_json_or_empty(response)
+        failures = response_body.get("failures") or {}
+        if response.status != 200 or failures:
+            raise LocalProtocolError(
+                f"Device signature upload failed: {response.status} "
+                f"{failures or await response.text()}"
+            )
+
+    @logged_in_async
+    async def ensure_cross_signing(self, password: str | None = None) -> str:
+        """Ensure this account is cross-signed and this device is self-signed.
+
+        This is a mindroom-nio fork feature for bot-style clients: it creates
+        a master and self-signing key on first use, persists their private
+        seeds next to the encryption store, uploads them (retrying with
+        password-based user-interactive auth when the server requires it),
+        and signs the current device with the self-signing key.
+
+        Returns one of "already_signed", "uploaded_and_signed", or
+        "device_signed".
+
+        Raises LocalProtocolError when encryption or the store is unavailable
+        or when the homeserver rejects an upload.
+        """
+        if not self.olm:
+            raise LocalProtocolError("Cross-signing requires encryption support.")
+        if not self.store_path:
+            raise LocalProtocolError("Cross-signing requires a store path.")
+        assert self.user_id
+        assert self.device_id
+
+        sidecar = cross_signing_sidecar_path(self.store_path, self.user_id)
+        identity = CrossSigningIdentity.load(sidecar)
+        if identity is None:
+            identity = CrossSigningIdentity.generate(self.user_id)
+            identity.save(sidecar)
+
+        if identity.uploaded and self.device_id in identity.signed_devices:
+            return "already_signed"
+
+        freshly_uploaded = False
+        if not identity.uploaded:
+            await self._upload_cross_signing_keys(identity, password)
+            identity.uploaded = True
+            identity.save(sidecar)
+            freshly_uploaded = True
+
+        if self.device_id not in identity.signed_devices:
+            # The server can only sign a device whose own keys it already has,
+            # and this may run before the first sync uploads them.
+            if self.should_upload_keys:
+                await self.keys_upload()
+            await self._upload_own_device_signature(identity)
+            identity.signed_devices.append(self.device_id)
+            identity.save(sidecar)
+
+        return "uploaded_and_signed" if freshly_uploaded else "device_signed"
 
     @logged_in_async
     @store_loaded
