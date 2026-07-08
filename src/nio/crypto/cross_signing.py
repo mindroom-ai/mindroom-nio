@@ -1,0 +1,159 @@
+"""Cross-signing identity management (mindroom-nio fork feature).
+
+Bot-style clients have no interactive verification flow, yet MSC4153-era
+clients exclude devices that are not cross-signed from encrypted rooms.
+This module holds a minimal self-managed cross-signing identity: a master
+key and a self-signing key whose private seeds are persisted next to the
+olm store, used to sign the account's own devices.
+
+A user-signing key is deliberately not created: bots never verify other
+users, and refusing cross-user trust keeps the surface small.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from Crypto.PublicKey import ECC
+from Crypto.Signature import eddsa
+
+from ..api import Api
+
+CROSS_SIGNING_SIDECAR_SUFFIX = "_cross_signing.json"
+
+
+def _unpadded_b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64_to_bytes(data: str) -> bytes:
+    return base64.b64decode(data + "=" * (-len(data) % 4))
+
+
+def _signing_key(seed: bytes) -> ECC.EccKey:
+    return ECC.construct(curve="Ed25519", seed=seed)
+
+
+def _public_key_b64(seed: bytes) -> str:
+    raw = _signing_key(seed).public_key().export_key(format="raw")
+    return _unpadded_b64(raw)
+
+
+def sign_json(seed: bytes, json_dict: Dict[str, Any]) -> str:
+    """Sign the canonical JSON of ``json_dict`` (without signatures/unsigned)."""
+    unsigned_dict = {
+        key: value
+        for key, value in json_dict.items()
+        if key not in ("signatures", "unsigned")
+    }
+    message = Api.to_canonical_json(unsigned_dict).encode("utf-8")
+    signer = eddsa.new(_signing_key(seed), "rfc8032")
+    return _unpadded_b64(signer.sign(message))
+
+
+@dataclass
+class CrossSigningIdentity:
+    """A self-managed cross-signing identity for one Matrix account."""
+
+    user_id: str
+    master_seed: bytes
+    self_signing_seed: bytes
+    uploaded: bool = False
+    signed_devices: List[str] = field(default_factory=list)
+
+    @classmethod
+    def generate(cls, user_id: str) -> "CrossSigningIdentity":
+        """Create a fresh cross-signing identity for one account."""
+        return cls(
+            user_id=user_id,
+            master_seed=os.urandom(32),
+            self_signing_seed=os.urandom(32),
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> Optional["CrossSigningIdentity"]:
+        """Load a persisted identity, or None when absent or unreadable."""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return cls(
+                user_id=payload["user_id"],
+                master_seed=_b64_to_bytes(payload["master_seed"]),
+                self_signing_seed=_b64_to_bytes(payload["self_signing_seed"]),
+                uploaded=bool(payload.get("uploaded", False)),
+                signed_devices=[
+                    device
+                    for device in payload.get("signed_devices", [])
+                    if isinstance(device, str)
+                ],
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def save(self, path: Path) -> None:
+        """Persist the identity with owner-only permissions."""
+        payload = {
+            "user_id": self.user_id,
+            "master_seed": _unpadded_b64(self.master_seed),
+            "self_signing_seed": _unpadded_b64(self.self_signing_seed),
+            "uploaded": self.uploaded,
+            "signed_devices": self.signed_devices,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    @property
+    def master_public_key(self) -> str:
+        """Unpadded base64 public master key."""
+        return _public_key_b64(self.master_seed)
+
+    @property
+    def self_signing_public_key(self) -> str:
+        """Unpadded base64 public self-signing key."""
+        return _public_key_b64(self.self_signing_seed)
+
+    def master_key_payload(self) -> Dict[str, Any]:
+        """The master key object for /keys/device_signing/upload."""
+        public = self.master_public_key
+        return {
+            "user_id": self.user_id,
+            "usage": ["master"],
+            "keys": {f"ed25519:{public}": public},
+        }
+
+    def self_signing_key_payload(self) -> Dict[str, Any]:
+        """The self-signing key object, signed by the master key."""
+        public = self.self_signing_public_key
+        payload: Dict[str, Any] = {
+            "user_id": self.user_id,
+            "usage": ["self_signing"],
+            "keys": {f"ed25519:{public}": public},
+        }
+        signature = sign_json(self.master_seed, payload)
+        payload["signatures"] = {
+            self.user_id: {f"ed25519:{self.master_public_key}": signature}
+        }
+        return payload
+
+    def signed_device_payload(self, device_keys: Dict[str, Any]) -> Dict[str, Any]:
+        """One device-keys object carrying our self-signing signature."""
+        signature = sign_json(self.self_signing_seed, device_keys)
+        signed = {
+            key: value
+            for key, value in device_keys.items()
+            if key not in ("signatures", "unsigned")
+        }
+        signed["signatures"] = {
+            self.user_id: {f"ed25519:{self.self_signing_public_key}": signature}
+        }
+        return signed
+
+
+def cross_signing_sidecar_path(store_path: str, user_id: str) -> Path:
+    """The on-disk location of one account's cross-signing identity."""
+    return Path(store_path) / f"{user_id}{CROSS_SIGNING_SIDECAR_SUFFIX}"
