@@ -103,6 +103,18 @@ class TestCrossSigning:
         with pytest.raises(ValueError):  # noqa: PT011
             CrossSigningIdentity.load(sidecar)
 
+    def test_sidecar_path_contains_user_id_traversal(self, tmp_path):
+        # A malicious homeserver could return a user_id with path separators;
+        # the sidecar path must never escape the store directory.
+        store = tmp_path / "store"
+        assert cross_signing_sidecar_path(str(store), ALICE).parent == store.resolve()
+
+        evil = cross_signing_sidecar_path(
+            str(store), "@alice/../../../tmp/evil:example.org"
+        )
+        assert evil.parent == store.resolve()
+        assert "/tmp/evil" not in str(evil)
+
     def test_save_creates_owner_only_file(self, tmp_path):
         identity = CrossSigningIdentity.generate(ALICE)
         sidecar = cross_signing_sidecar_path(str(tmp_path), ALICE)

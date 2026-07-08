@@ -166,6 +166,28 @@ class CrossSigningIdentity:
         return signed
 
 
+def _sanitize_user_id_for_filename(user_id: str) -> str:
+    """Reduce a Matrix user_id to a single safe path component.
+
+    The Matrix user_id schema (``^@.*:.+$``) does not forbid ``/`` or ``\\``, so a
+    malicious homeserver could return an id with path separators and redirect the
+    sidecar read/write outside the store. Collapse every separator so the result
+    is always one filename component.
+    """
+    return user_id.replace("/", "_").replace("\\", "_").replace("\0", "_")
+
+
 def cross_signing_sidecar_path(store_path: str, user_id: str) -> Path:
-    """The on-disk location of one account's cross-signing identity."""
-    return Path(store_path) / f"{user_id}{CROSS_SIGNING_SIDECAR_SUFFIX}"
+    """The on-disk location of one account's cross-signing identity.
+
+    Raises ValueError if the resolved path would escape ``store_path``.
+    """
+    root = Path(store_path).resolve()
+    path = (
+        root
+        / f"{_sanitize_user_id_for_filename(user_id)}{CROSS_SIGNING_SIDECAR_SUFFIX}"
+    ).resolve()
+    if root != path.parent:
+        msg = f"Refusing cross-signing sidecar path outside the store: {user_id!r}"
+        raise ValueError(msg)
+    return path

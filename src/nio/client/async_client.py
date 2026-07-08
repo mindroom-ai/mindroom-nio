@@ -1686,6 +1686,20 @@ class AsyncClient(Client):
         }
         return await self.send("POST", path, Api.to_json(body), headers)
 
+    @staticmethod
+    async def _response_json_or_empty(response: ClientResponse) -> Dict[str, Any]:
+        """Decode a response body as a JSON object, tolerating non-JSON bodies.
+
+        A WAF, proxy, or overloaded homeserver can return a plain-text or HTML
+        error body; ``content_type=None`` ignores the header and the guard turns
+        an undecodable body into an empty mapping instead of an escaping error.
+        """
+        try:
+            parsed = await response.json(content_type=None)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     async def _upload_cross_signing_keys(
         self, identity: CrossSigningIdentity, password: Optional[str]
     ) -> None:
@@ -1705,7 +1719,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 f"Cross-signing key upload failed: {response.status} {await response.text()}"
             )
-        error_body = await response.json()
+        error_body = await self._response_json_or_empty(response)
         session = error_body.get("session")
         auth: Dict[str, Any] = {
             "type": "m.login.password",
@@ -1717,10 +1731,9 @@ class AsyncClient(Client):
         body["auth"] = auth
         response = await self._post_cross_signing(path, body)
         if response.status != 200:
-            error_body = await response.json()
             raise LocalProtocolError(
                 f"Cross-signing key upload failed after auth: "
-                f"{response.status} {error_body}"
+                f"{response.status} {await response.text()}"
             )
 
     async def _upload_own_device_signature(
@@ -1733,7 +1746,7 @@ class AsyncClient(Client):
         response = await self._post_cross_signing(
             "/_matrix/client/v3/keys/signatures/upload", body
         )
-        response_body = await response.json() if response.status == 200 else {}
+        response_body = await self._response_json_or_empty(response)
         failures = response_body.get("failures") or {}
         if response.status != 200 or failures:
             raise LocalProtocolError(
