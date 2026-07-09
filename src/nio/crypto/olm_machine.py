@@ -1468,7 +1468,7 @@ class Olm:
         self,
         event: Union[EncryptedToDeviceEvent, MegolmEvent],
         room_id: Optional[str] = None,
-    ) -> Union[Event, RoomKeyEvent, BadEventType, None]:
+    ) -> Union[Event, RoomKeyEvent, UnknownToDeviceEvent, BadEventType, None]:
         logger.debug(f"Decrypting event of type {type(event).__name__}")
         if isinstance(event, OlmEvent):
             try:
