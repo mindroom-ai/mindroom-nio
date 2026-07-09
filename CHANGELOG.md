@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.27.0
+
+### Features
+
+- Surface unknown decrypted olm to-device events to client callbacks as
+  `UnknownToDeviceEvent` instead of silently dropping them, so clients can
+  receive custom encrypted to-device messages such as Element Call's
+  `io.element.call.encryption_keys` frame keys. `DecryptedOlmT` and
+  `Olm.decrypt_event` now include `UnknownToDeviceEvent` in their return
+  types.
+
 ## 0.26.0
 
 ### Features
