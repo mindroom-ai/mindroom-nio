@@ -48,6 +48,7 @@ from ..events import (
     RoomKeyRequest,
     RoomKeyRequestCancellation,
     UnknownBadEvent,
+    UnknownToDeviceEvent,
     validate_or_badevent,
 )
 from ..exceptions import (
@@ -83,7 +84,7 @@ from . import (
 from .key_export import decrypt_and_read, encrypt_and_save
 from .sas import Sas
 
-DecryptedOlmT = RoomKeyEvent | BadEvent | UnknownBadEvent | None
+DecryptedOlmT = RoomKeyEvent | BadEvent | UnknownBadEvent | UnknownToDeviceEvent | None
 
 
 def chunks(lst, n):
@@ -1251,8 +1252,14 @@ class Olm:
             return DummyEvent.from_dict(payload, sender, sender_key)
 
         else:
-            logger.warning(f"Received unsupported Olm event of type {payload['type']}")
-            return None
+            # Custom to-device event types (for example Element Call's
+            # io.element.call.encryption_keys) are passed through so client
+            # callbacks can consume them. The payload's sender, recipient, and
+            # recipient keys were already verified by _verify_olm_payload.
+            logger.info(
+                f"Passing through Olm event of unsupported type {payload['type']}"
+            )
+            return UnknownToDeviceEvent.from_dict(payload)
 
     def message_index_ok(self, message_index: int, event: MegolmEvent) -> bool:
         """Check that the message index corresponds to a known message.
@@ -1460,7 +1467,7 @@ class Olm:
         self,
         event: EncryptedToDeviceEvent | MegolmEvent,
         room_id: str | None = None,
-    ) -> Event | RoomKeyEvent | BadEventType | None:
+    ) -> Event | RoomKeyEvent | UnknownToDeviceEvent | BadEventType | None:
         logger.debug(f"Decrypting event of type {type(event).__name__}")
         if isinstance(event, OlmEvent):
             try:

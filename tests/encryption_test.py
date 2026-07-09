@@ -36,6 +36,7 @@ from nio.events import (
     RoomMessageText,
     ToDeviceEvent,
     UnknownBadEvent,
+    UnknownToDeviceEvent,
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
@@ -779,6 +780,28 @@ class TestClass:
         olm.outgoing_key_requests[session.id] = key_request
         event = olm._handle_olm_event(device.user_id, device.curve25519, payload)
         assert isinstance(event, ForwardedRoomKeyEvent)
+
+    def test_unknown_olm_event_passthrough(self, alice_account_pair):
+        olm, bob = alice_account_pair
+
+        device = olm.device_store[bob.user_id][bob.device_id]
+
+        payload = {
+            "sender": device.user_id,
+            "sender_device": device.device_id,
+            "type": "io.element.call.encryption_keys",
+            "content": {
+                "keys": {"index": 0, "key": "AAAAAAAAAAAAAAAAAAAAAA=="},
+                "room_id": TEST_ROOM,
+            },
+            "keys": {"ed25519": device.ed25519},
+        }
+
+        event = olm._handle_olm_event(device.user_id, device.curve25519, payload)
+        assert isinstance(event, UnknownToDeviceEvent)
+        assert event.sender == device.user_id
+        assert event.type == "io.element.call.encryption_keys"
+        assert event.source["content"]["keys"]["index"] == 0
 
     def test_user_verification_status(self, monkeypatch):
         def mocksave(self):
