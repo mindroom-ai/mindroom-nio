@@ -83,7 +83,9 @@ from . import (
 from .key_export import decrypt_and_read, encrypt_and_save
 from .sas import Sas
 
-DecryptedOlmT = Union[RoomKeyEvent, BadEvent, UnknownBadEvent, UnknownToDeviceEvent, None]
+DecryptedOlmT = Union[
+    RoomKeyEvent, BadEvent, UnknownBadEvent, UnknownToDeviceEvent, None
+]
 
 
 def chunks(lst, n):
