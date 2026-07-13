@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.27.1
+
+### Bug Fixes
+
+- Preserve an explicit zero signed Curve25519 one-time-key count from `/sync`
+  so clients replenish a fully drained Olm key pool.
+
 ## 0.27.0
 
 ### Features
