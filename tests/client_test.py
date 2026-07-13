@@ -573,6 +573,18 @@ class TestClass:
         client.receive_response(KeysUploadResponse(50, 50))
         assert not client.should_upload_keys
 
+    def test_sync_zero_one_time_key_count_requests_replenishment(self, client):
+        client.receive_response(self.login_response)
+        client.receive_response(KeysUploadResponse(50, 50))
+        assert not client.should_upload_keys
+
+        response = self.sync_response
+        response.device_key_count = DeviceOneTimeKeyCount(0, 0)
+        client.receive_response(response)
+
+        assert client.olm.uploaded_key_count == 0
+        assert client.should_upload_keys
+
     def test_client_room_creation(self, client):
         client.receive_response(self.login_response)
         client.receive_response(KeysUploadResponse(50, 50))
