@@ -87,6 +87,22 @@ from ..event_builders import ToDeviceMessage
 
 logger = logging.getLogger(__name__)
 
+_MINDROOM_STREAM_STATUS_KEY = "io.mindroom.stream_status"
+
+
+def _copy_mindroom_stream_push_metadata(
+    content: Dict[Any, Any], encrypted_content: Dict[str, str]
+) -> None:
+    """Expose only the coarse metadata needed for encrypted push decisions."""
+    stream_status = content.get(_MINDROOM_STREAM_STATUS_KEY)
+    if not isinstance(stream_status, str):
+        return
+
+    encrypted_content[_MINDROOM_STREAM_STATUS_KEY] = stream_status
+    msgtype = content.get("msgtype")
+    if isinstance(msgtype, str):
+        encrypted_content["msgtype"] = msgtype
+
 
 def logged_in(func):
     @wraps(func)
@@ -1252,6 +1268,8 @@ class Client:
         # unencrypted content.
         if "m.relates_to" in content:
             encrypted_content["m.relates_to"] = content["m.relates_to"]
+
+        _copy_mindroom_stream_push_metadata(content, encrypted_content)
 
         message_type = "m.room.encrypted"
 

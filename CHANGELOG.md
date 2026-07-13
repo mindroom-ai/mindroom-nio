@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.27.1
+
+### Bug Fixes
+
+- Expose only MindRoom stream status and message type alongside encrypted edit
+  events so homeservers can suppress progressive push notifications and notify
+  once when a stream reaches a terminal state. Message bodies and mentions
+  remain encrypted.
+
 ## 0.27.0
 
 ### Features
