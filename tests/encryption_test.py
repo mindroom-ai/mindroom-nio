@@ -530,7 +530,7 @@ class TestClass:
         alice.handle_response(bob_query_response())
         device = alice.device_store[BobId][Bob_device]
         old_ed25519 = device.ed25519
-        device.trust_state = TrustState.verified
+        alice.store.verify_device(device)
 
         # A rotated identity is ignored by default.
         rotated = bob_query_response()
@@ -551,11 +551,26 @@ class TestClass:
         assert device.curve25519 == new_keys[f"curve25519:{Bob_device}"]
         assert not device.deleted
         assert device.trust_state == TrustState.unset
+        assert Bob_device in rotated.changed[BobId]
 
-        # A blacklisted device stays blacklisted across a rotation.
-        device.trust_state = TrustState.blacklisted
+        # The replacement and the trust reset must survive a restart: a new
+        # machine on the same store must not resurrect the old identity or
+        # the verified state (sqlite stores key trust by device row, not by
+        # key material).
+        restarted = Olm(AliceId, Alice_device, alice.store)
+        device = restarted.device_store[BobId][Bob_device]
+        assert device.ed25519 == new_keys[f"ed25519:{Bob_device}"]
+        assert device.trust_state == TrustState.unset
+
+        # A blacklisted device stays blacklisted across a rotation, in
+        # memory and across a restart.
+        device = alice.device_store[BobId][Bob_device]
+        alice.store.blacklist_device(device)
         alice.handle_response(bob_query_response())
         device = alice.device_store[BobId][Bob_device]
+        assert device.trust_state == TrustState.blacklisted
+        restarted = Olm(AliceId, Alice_device, alice.store)
+        device = restarted.device_store[BobId][Bob_device]
         assert device.trust_state == TrustState.blacklisted
 
     def test_olm_inbound_session(self, monkeypatch):

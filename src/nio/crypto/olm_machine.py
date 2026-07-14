@@ -792,11 +792,25 @@ class Olm:
                             f"(old ed25519: {device.ed25519}, "
                             f"new ed25519: {signing_key})."
                         )
+                        # Un-persist earned trust while the device still
+                        # carries the old identity: sqlite stores key trust by
+                        # device row (it would survive a restart otherwise),
+                        # file stores key trust entries by the old ed25519
+                        # value.
+                        if device.trust_state == TrustState.verified:
+                            self.store.unverify_device(device)
+                        elif device.trust_state == TrustState.ignored:
+                            self.store.unignore_device(device)
                         device.ed25519 = signing_key
                         device.curve25519 = curve_key
                         device.display_name = display_name
                         device.deleted = False
-                        if device.trust_state != TrustState.blacklisted:
+                        if device.trust_state == TrustState.blacklisted:
+                            # Re-anchor the blacklist to the new identity so
+                            # it also survives in file-backed stores, which
+                            # key trust entries by ed25519 value.
+                            self.store.blacklist_device(device)
+                        else:
                             device.trust_state = TrustState.unset
 
                     elif (
