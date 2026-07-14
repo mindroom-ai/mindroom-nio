@@ -176,6 +176,17 @@ class ClientConfig:
         store_sync_tokens (bool, optional): Should the client store and restore
             sync tokens.
         custom_headers (Dict[str, str]): A dictionary of custom http headers.
+        replace_rotated_device_keys (bool, optional): What to do when a device
+            re-uploads different, validly self-signed identity keys under an
+            existing device id (e.g. a client that kept its access token but
+            lost its crypto store and re-registered its identity). If False
+            (default, matching upstream nio and matrix-rust-sdk) the update is
+            ignored and the stale identity is kept forever, which permanently
+            breaks olm-authenticated exchanges with that device. If True the
+            stored identity is replaced, any earned trust is reset to unset
+            (blacklists are kept), and the change is logged as a warning.
+            Only enable this for trust-on-first-use deployments that never
+            rely on device verification.
 
     Raises an ImportWarning if encryption_enabled is true but the dependencies
     for encryption aren't installed.
@@ -190,6 +201,7 @@ class ClientConfig:
     pickle_key: str = "DEFAULT_KEY"
     store_sync_tokens: bool = False
     custom_headers: Optional[Dict[str, str]] = None
+    replace_rotated_device_keys: bool = False
 
     def __post_init__(self):
         if not ENCRYPTION_ENABLED and self.encryption_enabled:
@@ -416,7 +428,12 @@ class Client:
                 )
             assert self.store
 
-            self.olm = Olm(self.user_id, self.device_id, self.store)
+            self.olm = Olm(
+                self.user_id,
+                self.device_id,
+                self.store,
+                replace_rotated_device_keys=self.config.replace_rotated_device_keys,
+            )
             self.encrypted_rooms = self.store.load_encrypted_rooms()
 
             if self.config.store_sync_tokens:
