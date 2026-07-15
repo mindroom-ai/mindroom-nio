@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.27.2
+
+### Features
+
+- Add an opt-in `ClientConfig.replace_rotated_device_keys` policy: when a
+  device re-uploads different, validly self-signed identity keys under an
+  existing device id (e.g. a client that kept its access token but lost its
+  crypto store), replace the stored identity and reset its earned trust
+  instead of ignoring the new keys forever. Blacklisted devices stay
+  blacklisted. Default off, preserving upstream behavior.
+
 ## 0.27.1
 
 ### Bug Fixes
