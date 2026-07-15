@@ -23,6 +23,7 @@ from nio.crypto import (
     OutgoingKeyRequest,
     Session,
     SessionStore,
+    TrustState,
 )
 from nio.crypto.sessions import derive_pickle_key
 from nio.events import (
@@ -40,7 +41,7 @@ from nio.events import (
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
-from nio.store import DefaultStore, Ed25519Key, Key, KeyStore
+from nio.store import DefaultStore, Ed25519Key, Key, KeyStore, SqliteMemoryStore
 
 AliceId = "@alice:example.org"
 Alice_device = "ALDEVICE"
@@ -509,6 +510,68 @@ class TestClass:
         response2 = copy.copy(response)
         olm.handle_response(response)
         assert response2.changed
+
+    def _memory_olm(self, user_id, device_id):
+        return Olm(user_id, device_id, SqliteMemoryStore(user_id, device_id))
+
+    def test_replace_rotated_device_keys(self):
+        alice = self._memory_olm(AliceId, Alice_device)
+
+        def bob_query_response():
+            # A fresh in-memory machine generates a new identity for the
+            # same user id/device id pair, like a client that kept its
+            # access token but lost its crypto store.
+            bob = self._memory_olm(BobId, Bob_device)
+            payload = bob.share_keys()["device_keys"]
+            return KeysQueryResponse.from_dict(
+                {"device_keys": {BobId: {Bob_device: payload}}, "failures": {}}
+            )
+
+        alice.handle_response(bob_query_response())
+        device = alice.device_store[BobId][Bob_device]
+        old_ed25519 = device.ed25519
+        alice.store.verify_device(device)
+
+        # A rotated identity is ignored by default.
+        rotated = bob_query_response()
+        alice.handle_response(rotated)
+        device = alice.device_store[BobId][Bob_device]
+        assert device.ed25519 == old_ed25519
+        assert device.verified
+
+        # With the opt-in policy the new identity replaces the stale one,
+        # the trust earned by the old identity is dropped, and a device
+        # that had been marked deleted comes back to life.
+        alice.replace_rotated_device_keys = True
+        device.deleted = True
+        alice.handle_response(rotated)
+        device = alice.device_store[BobId][Bob_device]
+        new_keys = rotated.device_keys[BobId][Bob_device]["keys"]
+        assert device.ed25519 == new_keys[f"ed25519:{Bob_device}"]
+        assert device.curve25519 == new_keys[f"curve25519:{Bob_device}"]
+        assert not device.deleted
+        assert device.trust_state == TrustState.unset
+        assert Bob_device in rotated.changed[BobId]
+
+        # The replacement and the trust reset must survive a restart: a new
+        # machine on the same store must not resurrect the old identity or
+        # the verified state (sqlite stores key trust by device row, not by
+        # key material).
+        restarted = Olm(AliceId, Alice_device, alice.store)
+        device = restarted.device_store[BobId][Bob_device]
+        assert device.ed25519 == new_keys[f"ed25519:{Bob_device}"]
+        assert device.trust_state == TrustState.unset
+
+        # A blacklisted device stays blacklisted across a rotation, in
+        # memory and across a restart.
+        device = alice.device_store[BobId][Bob_device]
+        alice.store.blacklist_device(device)
+        alice.handle_response(bob_query_response())
+        device = alice.device_store[BobId][Bob_device]
+        assert device.trust_state == TrustState.blacklisted
+        restarted = Olm(AliceId, Alice_device, alice.store)
+        device = restarted.device_store[BobId][Bob_device]
+        assert device.trust_state == TrustState.blacklisted
 
     def test_olm_inbound_session(self, monkeypatch):
         def mocksave(self):
