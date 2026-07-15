@@ -78,6 +78,7 @@ from . import (
     OutboundSession,
     OutgoingKeyRequest,
     SessionStore,
+    TrustState,
     logger,
 )
 from .key_export import decrypt_and_read, encrypt_and_save
@@ -128,11 +129,17 @@ class Olm:
         user_id: str,
         device_id: str,
         store: MatrixStore,
+        replace_rotated_device_keys: bool = False,
     ) -> None:
         # Our own user id and device id. A tuple of user_id/device_id is
         # guaranteed to be unique.
         self.user_id = user_id
         self.device_id = device_id
+
+        # Whether a device that re-uploads identity keys under an existing
+        # device id should have its stored identity replaced (trust is reset)
+        # instead of the update being ignored. See ClientConfig for details.
+        self.replace_rotated_device_keys = replace_rotated_device_keys
 
         # The number of one-time keys we have uploaded on the server. If this
         # is None no action will be taken. After a sync request the client will
@@ -767,13 +774,46 @@ class Olm:
                     )
                 else:
                     if device.ed25519 != signing_key:
-                        logger.warning(
-                            f"Ed25519 key has changed for device {device_id} "
-                            f"of user {user_id}."
-                        )
-                        continue
+                        if not self.replace_rotated_device_keys:
+                            logger.warning(
+                                f"Ed25519 key has changed for device {device_id} "
+                                f"of user {user_id}."
+                            )
+                            continue
 
-                    if (
+                        # The device re-uploaded a fresh, validly self-signed
+                        # identity (e.g. a client that kept its access token
+                        # but lost its crypto store). Replace the stored
+                        # identity and drop any trust the old one had earned;
+                        # a blacklist entry survives the rotation.
+                        logger.warning(
+                            f"Replacing rotated identity keys for device "
+                            f"{device_id} of user {user_id} "
+                            f"(old ed25519: {device.ed25519}, "
+                            f"new ed25519: {signing_key})."
+                        )
+                        # Un-persist earned trust while the device still
+                        # carries the old identity: sqlite stores key trust by
+                        # device row (it would survive a restart otherwise),
+                        # file stores key trust entries by the old ed25519
+                        # value.
+                        if device.trust_state == TrustState.verified:
+                            self.store.unverify_device(device)
+                        elif device.trust_state == TrustState.ignored:
+                            self.store.unignore_device(device)
+                        device.ed25519 = signing_key
+                        device.curve25519 = curve_key
+                        device.display_name = display_name
+                        device.deleted = False
+                        if device.trust_state == TrustState.blacklisted:
+                            # Re-anchor the blacklist to the new identity so
+                            # it also survives in file-backed stores, which
+                            # key trust entries by ed25519 value.
+                            self.store.blacklist_device(device)
+                        else:
+                            device.trust_state = TrustState.unset
+
+                    elif (
                         device.curve25519 == curve_key
                         and device.display_name == display_name
                     ):
