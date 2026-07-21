@@ -2257,7 +2257,10 @@ class TestClass:
                 "POST",
                 "/raw",
                 "{}",
-                {"Content-Type": "application/json"},
+                {
+                    "Content-Type": "application/json",
+                    "X-Proxy-Token": "caller-value",
+                },
             )
             await response.read()
         finally:

@@ -907,7 +907,8 @@ class AsyncClient(Client):
             path (str): The URL path of the request.
             data (str, optional): Data that will be posted with the request.
             headers (Dict[str,str] , optional): Additional request headers that
-                should be used with the request.
+                should be used with the request. ``custom_headers`` from the
+                client config are added afterward and override matching keys.
             trace_context (Any, optional): An object to use for the
                 ClientSession TraceConfig context
             timeout (int, optional): How many seconds the request has before
