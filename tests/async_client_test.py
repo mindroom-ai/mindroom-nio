@@ -2245,6 +2245,36 @@ class TestClass:
         assert monitor.transferred == 1
         self._verify_monitor_state_for_finished_transfer(monitor, 1)
 
+    async def test_raw_send_includes_custom_headers(self, tempdir, aioresponse):
+        config = AsyncClientConfig(custom_headers={"X-Proxy-Token": "secret"})
+        client = AsyncClient("https://example.org", config=config)
+        captured_headers = None
+
+        def callback(_url, **kwargs):
+            nonlocal captured_headers
+            captured_headers = kwargs["headers"]
+            return CallbackResult(status=200, payload={})
+
+        aioresponse.post("https://example.org/raw", callback=callback)
+        try:
+            response = await client.send(
+                "POST",
+                "/raw",
+                "{}",
+                {
+                    "Content-Type": "application/json",
+                    "X-Proxy-Token": "caller-value",
+                },
+            )
+            await response.read()
+        finally:
+            await client.close()
+
+        assert captured_headers == {
+            "Content-Type": "application/json",
+            "X-Proxy-Token": "secret",
+        }
+
     async def test_plain_data_generator(self, async_client):
         original_data = [b"123", b"456", b"789", b"0"]
         data_size = len(b"".join(original_data))

@@ -18,6 +18,12 @@ All notable changes to this project will be documented in this file.
   device so strict clients keep sharing room keys with it. Requires
   `pycryptodome >=3.15` for Ed25519 signing.
 
+### Bug Fixes
+
+- Apply `AsyncClientConfig.custom_headers` in the low-level `send()` transport
+  so direct request paths, including cross-signing uploads, receive the same
+  configured headers as high-level Matrix client methods.
+
 ### Dependencies
 
 - Drop the unmaintained `atomicwrites` dependency in favor of a small internal
