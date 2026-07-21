@@ -823,9 +823,6 @@ class AsyncClient(Client):
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
 
-        if self.config.custom_headers is not None:
-            headers.update(self.config.custom_headers)
-
         got_429 = 0
         max_429 = self.config.max_limit_exceeded
 
@@ -919,12 +916,16 @@ class AsyncClient(Client):
         """
         assert self.client_session
 
+        request_headers = dict(headers) if headers is not None else {}
+        if self.config.custom_headers is not None:
+            request_headers.update(self.config.custom_headers)
+
         return await self.client_session.request(
             method,
             self.homeserver + path,
             data=data,
             ssl=self.ssl,
-            headers=headers,
+            headers=request_headers,
             trace_request_ctx=trace_context,
             timeout=self.config.request_timeout if timeout is None else timeout,
         )

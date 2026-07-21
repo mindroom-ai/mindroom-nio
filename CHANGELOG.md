@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.27.3
+
+### Bug Fixes
+
+- Apply `AsyncClientConfig.custom_headers` in the low-level `send()` transport
+  so direct request paths, including cross-signing uploads, receive the same
+  configured headers as high-level Matrix client methods.
+
 ## 0.27.2
 
 ### Features
