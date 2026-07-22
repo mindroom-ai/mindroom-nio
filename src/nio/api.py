@@ -637,35 +637,44 @@ class Api:
         lists: Optional[Dict[str, Any]] = None,
         room_subscriptions: Optional[Dict[str, Any]] = None,
         extensions: Optional[Dict[str, Any]] = None,
-        unstable: bool = False,
+        unstable: bool = True,
     ) -> Tuple[str, str, str]:
         """Build a Simplified Sliding Sync request, as described by MSC4186.
 
         Returns the HTTP method, HTTP path and JSON request body for the
-        request. By default this uses the proposed ``/_matrix/client/v4/sync``
-        path; set ``unstable`` to use the MSC unstable path.
+        request. By default this uses the unstable
+        ``org.matrix.simplified_msc3575`` path, which is the only endpoint
+        deployed servers (Synapse, Tuwunel/conduwuit) currently serve; set
+        ``unstable`` to ``False`` to target the proposed stable
+        ``/_matrix/client/v4/sync`` path.
+
+        ``pos``, ``timeout`` and ``set_presence`` are sent as query
+        parameters because that is where deployed servers read them from.
+        The current MSC4186 text moves them into the request body, but no
+        server implements that revision yet; revisit when the endpoint
+        stabilises.
         """
         query_parameters = {"access_token": access_token}
-        path = ["sync"]
-        base_path = MATRIX_API_PATH_V4
+        path = ["org.matrix.simplified_msc3575", "sync"]
+        base_path = MATRIX_API_PATH_UNSTABLE
 
-        if unstable:
-            path = ["org.matrix.simplified_msc3575", "sync"]
-            base_path = MATRIX_API_PATH_UNSTABLE
+        if not unstable:
+            path = ["sync"]
+            base_path = MATRIX_API_PATH_V4
+
+        if pos is not None:
+            query_parameters["pos"] = pos
+
+        if timeout is not None:
+            query_parameters["timeout"] = str(timeout)
+
+        if set_presence:
+            query_parameters["set_presence"] = set_presence
 
         body: Dict[str, Any] = {}
 
         if conn_id is not None:
             body["conn_id"] = conn_id
-
-        if pos is not None:
-            body["pos"] = pos
-
-        if timeout is not None:
-            body["timeout"] = timeout
-
-        if set_presence is not None:
-            body["set_presence"] = set_presence
 
         if lists is not None:
             body["lists"] = lists

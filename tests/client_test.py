@@ -863,8 +863,8 @@ class TestClass:
             lists={
                 "main": {
                     "timeline_limit": 1,
-                    "required_state": {"include": []},
-                    "range": [0, 19],
+                    "required_state": [["m.room.create", ""]],
+                    "ranges": [[0, 19]],
                 }
             },
         )
@@ -876,7 +876,7 @@ class TestClass:
         assert response.pos == "s1"
         assert response.lists["main"].count == 1
 
-    def test_http_client_sliding_sync_unstable(self, http_client):
+    def test_http_client_sliding_sync_stable(self, http_client):
         http_client.connect(TransportType.HTTP2)
 
         _, _ = http_client.login("1234")
@@ -893,11 +893,11 @@ class TestClass:
             lists={
                 "main": {
                     "timeline_limit": 1,
-                    "required_state": {"include": []},
-                    "range": [0, 19],
+                    "required_state": [["m.room.create", ""]],
+                    "ranges": [[0, 19]],
                 }
             },
-            unstable=True,
+            unstable=False,
         )
 
         http_client.receive(self.sliding_sync_byte_response)

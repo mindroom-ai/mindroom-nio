@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Type
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from nio.responses import (
     ChangePasswordError,
@@ -243,7 +245,7 @@ class TestClass:
                     ],
                     "is_dm": True,
                     "initial": True,
-                    "expanded_timeline": True,
+                    "unstable_expanded_timeline": True,
                     "required_state": [
                         {"type": "m.room.name", "state_key": ""},
                         {
@@ -255,7 +257,7 @@ class TestClass:
                             "content": {"room_version": "12"},
                         },
                     ],
-                    "timeline_events": [
+                    "timeline": [
                         {
                             "event_id": "$message:example.org",
                             "sender": "@alice:example.org",
@@ -269,6 +271,8 @@ class TestClass:
                     "num_live": 1,
                     "joined_count": 2,
                     "invited_count": 0,
+                    "notification_count": 11,
+                    "highlight_count": 1,
                     "membership": "join",
                     "lists": ["main"],
                 }
@@ -294,38 +298,73 @@ class TestClass:
         assert room.lists == ["main"]
         assert isinstance(room.required_state[0], SlidingSyncStateStub)
         assert room.required_state[0].type == "m.room.name"
-        assert room.timeline_events[0].source["content"]["body"] == "hi"
+        assert room.timeline[0].source["content"]["body"] == "hi"
         assert room.prev_batch == "t111_222_333"
         assert room.limited
         assert room.num_live == 1
         assert room.joined_count == 2
         assert room.invited_count == 0
+        assert room.notification_count == 11
+        assert room.highlight_count == 1
+
+    _fuzz_json = st.recursive(
+        st.none()
+        | st.booleans()
+        | st.integers()
+        | st.floats(allow_nan=False)
+        | st.text(max_size=12),
+        lambda children: st.lists(children, max_size=4)
+        | st.dictionaries(st.text(max_size=8), children, max_size=4),
+        max_leaves=12,
+    )
+
+    @given(payload=st.dictionaries(st.text(max_size=12), _fuzz_json, max_size=6))
+    @settings(max_examples=300, deadline=None)
+    def test_sliding_sync_fuzz_never_raises(self, payload):
+        response = SlidingSyncResponse.from_dict(payload)
+        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
+
+    @given(room=_fuzz_json, sync_list=_fuzz_json, extensions=_fuzz_json)
+    @settings(max_examples=300, deadline=None)
+    def test_sliding_sync_fuzz_nested_never_raises(self, room, sync_list, extensions):
+        # A valid envelope forces parsing deep into rooms/lists/extensions.
+        payload = {
+            "pos": "p",
+            "rooms": {"!fuzz:example.org": room},
+            "lists": {"fuzz": sync_list},
+            "extensions": extensions,
+        }
+        response = SlidingSyncResponse.from_dict(payload)
+        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
 
     def test_sliding_sync_parse_stripped_state(self):
-        parsed_dict = {
-            "pos": "s1",
-            "rooms": {
-                "!invited:example.org": {
-                    "membership": "invite",
-                    "stripped_state": [
-                        {
-                            "sender": "@alice:example.org",
-                            "state_key": "@bob:example.org",
-                            "type": "m.room.member",
-                            "content": {"membership": "invite"},
-                        }
-                    ],
-                }
-            },
-        }
+        # Deployed servers send invite_state; the current MSC4186 text
+        # renamed it to stripped_state. Both must parse.
+        for wire_key in ("invite_state", "stripped_state"):
+            parsed_dict = {
+                "pos": "s1",
+                "rooms": {
+                    "!invited:example.org": {
+                        "membership": "invite",
+                        wire_key: [
+                            {
+                                "sender": "@alice:example.org",
+                                "state_key": "@bob:example.org",
+                                "type": "m.room.member",
+                                "content": {"membership": "invite"},
+                            }
+                        ],
+                    }
+                },
+            }
 
-        response = SlidingSyncResponse.from_dict(parsed_dict)
+            response = SlidingSyncResponse.from_dict(parsed_dict)
 
-        assert isinstance(response, SlidingSyncResponse)
-        room = response.rooms["!invited:example.org"]
-        assert room.membership == "invite"
-        assert room.stripped_state[0].source["type"] == "m.room.member"
-        assert room.stripped_state[0].membership == "invite"
+            assert isinstance(response, SlidingSyncResponse)
+            room = response.rooms["!invited:example.org"]
+            assert room.membership == "invite"
+            assert room.stripped_state[0].source["type"] == "m.room.member"
+            assert room.stripped_state[0].membership == "invite"
 
     def test_keyshare_request(self):
         parsed_dict = {

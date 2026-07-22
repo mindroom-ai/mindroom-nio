@@ -105,22 +105,20 @@ class TestClass:
         assert data_dict == expected_dict
 
     def test_sliding_sync(self) -> None:
-        """Test that sliding_sync returns the MSC4186 request shape."""
+        """Test that sliding_sync matches the deployed MSC4186 wire format."""
         api = Api()
         token = "abcd"
         lists = {
             "main": {
                 "timeline_limit": 1,
-                "required_state": {
-                    "include": [{"type": "m.room.create", "state_key": ""}]
-                },
-                "range": [0, 19],
+                "required_state": [["m.room.create", ""]],
+                "ranges": [[0, 19]],
             }
         }
         subscriptions = {
             "!room:example.org": {
                 "timeline_limit": 20,
-                "required_state": {"include": [{}]},
+                "required_state": [["*", "*"]],
             }
         }
 
@@ -135,26 +133,25 @@ class TestClass:
         )
 
         assert method == "POST"
-        assert path == f"{MATRIX_API_PATH_V4}/sync?access_token={token}"
+        # pos, timeout and set_presence are query parameters, not body
+        # fields: that is where Synapse and Tuwunel read them from.
+        assert path == (
+            f"{MATRIX_API_PATH_UNSTABLE}/org.matrix.simplified_msc3575/sync"
+            f"?access_token={token}&pos=s123&timeout=0&set_presence=offline"
+        )
         assert json.loads(data) == {
             "conn_id": "main",
-            "pos": "s123",
-            "timeout": 0,
-            "set_presence": "offline",
             "lists": lists,
             "room_subscriptions": subscriptions,
         }
 
-    def test_sliding_sync_unstable_path(self) -> None:
-        """Test that sliding_sync can target the MSC4186 unstable endpoint."""
+    def test_sliding_sync_stable_path(self) -> None:
+        """Test that sliding_sync can target the proposed stable endpoint."""
         api = Api()
         token = "abcd"
 
-        method, path, data = api.sliding_sync(token, unstable=True)
+        method, path, data = api.sliding_sync(token, unstable=False)
 
         assert method == "POST"
-        assert path == (
-            f"{MATRIX_API_PATH_UNSTABLE}/org.matrix.simplified_msc3575/sync"
-            f"?access_token={token}"
-        )
+        assert path == f"{MATRIX_API_PATH_V4}/sync?access_token={token}"
         assert json.loads(data) == {}
