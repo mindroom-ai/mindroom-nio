@@ -1037,6 +1037,78 @@ class TestLimitedTimelineBackfill:
         assert "budget is exhausted" in caplog.text
         await client.close()
 
+    async def test_hanging_callback_cannot_stall_dispatch(
+        self, tempdir, aioresponse, caplog
+    ):
+        """A callback that never returns is cancelled at the budget.
+
+        A deadline check between events cannot regain control once a hanging
+        callback is awaited, so the await itself must be bounded.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_timeout=0.2
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+
+        dispatched: List[str] = []
+
+        async def cb(_room, event):
+            dispatched.append(event.event_id)
+            if event.event_id.startswith("$gap"):
+                # Hang forever, but only for backfilled events, so the live
+                # dispatch of the sync's own events still completes.
+                await asyncio.Event().wait()
+
+        client.add_event_callback(cb, RoomMessageText)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [
+                        text_event("$gap1", ts=100),
+                        text_event("$gap2", ts=110),
+                        text_event("$new", ts=300),
+                    ],
+                    end="fwd2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(
+                client.receive_response(
+                    sync_response(
+                        "s2",
+                        TEST_ROOM_ID,
+                        [text_event("$new", ts=300)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                ),
+                timeout=5,
+            )
+
+        assert dispatched == ["$old", "$gap1", "$new"]
+        assert "inside an event callback" in caplog.text
+        await client.close()
+
     async def test_live_edge_does_not_close_the_gap(
         self, backfill_client, aioresponse, caplog
     ):

@@ -934,7 +934,8 @@ class AsyncClient(Client):
         # room's current state and feed stale membership into E2EE device
         # tracking.
         for event in recovered:
-            if asyncio.get_running_loop().time() >= deadline:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
                 logger.warning(
                     "Stopping backfill dispatch for room %s after %d of %d "
                     "event(s): the sync's backfill time budget is exhausted; "
@@ -951,7 +952,21 @@ class AsyncClient(Client):
                     # recording it from an old event cannot regress anything.
                     encrypted_rooms.add(room_id)
 
-                await self._on_event(event, room)
+                # The await itself is bounded as well: once a callback that
+                # never returns is awaited, the deadline check above could
+                # never regain control.
+                await asyncio.wait_for(self._on_event(event, room), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Stopping backfill dispatch for room %s after %d of %d "
+                    "event(s): the sync's backfill time budget is exhausted "
+                    "inside an event callback; the rest of the gap may be "
+                    "lost",
+                    room_id,
+                    dispatched,
+                    len(recovered),
+                )
+                break
             except Exception:
                 # Unlike the live sync path, where a raising callback
                 # propagates out of sync(), a backfill must never break the
