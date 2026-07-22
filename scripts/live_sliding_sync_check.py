@@ -13,6 +13,11 @@ msc3575_enabled: true`` or a Tuwunel/conduwuit with registration allowed.
 Usage:
     uv run python scripts/live_sliding_sync_check.py \
         --homeserver http://127.0.0.1:8008
+
+Pass ``--slam`` to additionally run a stress pass: two concurrent
+long-poll sync loops (one per user, separate conn_ids) while a writer
+floods rooms with messages, asserting no event is missed or duplicated
+and that the loop long-polls instead of busy-looping.
 """
 
 import argparse
@@ -56,9 +61,187 @@ async def register(homeserver: str, name: str) -> AsyncClient:
     return client
 
 
+SLAM_LISTS = {
+    "slam": {
+        "ranges": [[0, 30]],
+        "timeline_limit": 50,
+        "required_state": [["m.room.create", ""]],
+    }
+}
+
+
+async def slam_reader(
+    client: AsyncClient, name: str, sentinels: set, deadline: float
+) -> dict:
+    """Long-poll sliding sync until every sentinel body has been seen."""
+    stats = {
+        "name": name,
+        "polls": 0,
+        "events": 0,
+        "duplicates": 0,
+        "empty_fast": 0,
+        "limited": 0,
+        "errors": 0,
+    }
+    seen_event_ids = set()
+    waiting = set(sentinels)
+    pos = None
+
+    while waiting and time.monotonic() < deadline:
+        start = time.monotonic()
+        resp = await client.sliding_sync(
+            conn_id=f"slam-{name}", pos=pos, timeout=5_000, lists=SLAM_LISTS
+        )
+        elapsed = time.monotonic() - start
+        stats["polls"] += 1
+
+        if not isinstance(resp, SlidingSyncResponse):
+            stats["errors"] += 1
+            print(f"FAIL: {name} poll error: {resp}")
+            break
+
+        if not resp.rooms and elapsed < 0.2:
+            stats["empty_fast"] += 1
+
+        for room in resp.rooms.values():
+            if room.limited:
+                stats["limited"] += 1
+            for ev in room.timeline:
+                event_id = ev.source.get("event_id")
+                if event_id in seen_event_ids:
+                    stats["duplicates"] += 1
+                seen_event_ids.add(event_id)
+                body = getattr(ev, "body", None)
+                if body and body.lstrip("* ").startswith("slam-"):
+                    stats["events"] += 1
+                    waiting.discard(body)
+
+        pos = resp.pos
+
+    stats["converged"] = not waiting
+    return stats
+
+
+async def slam(
+    alice: AsyncClient,
+    bob: AsyncClient,
+    n_rooms: int,
+    n_messages: int,
+    n_edits: int,
+) -> None:
+    room_ids = []
+    for i in range(n_rooms):
+        room_resp = await alice.room_create(name=f"slam room {i}")
+        room_ids.append(room_resp.room_id)
+        await alice.room_invite(room_resp.room_id, bob.user_id)
+        await bob.join(room_resp.room_id)
+
+    sentinels = {f"slam-sentinel-{i}" for i in range(n_rooms)}
+    deadline = time.monotonic() + 600
+    readers = [
+        asyncio.create_task(slam_reader(alice, "alice", sentinels, deadline)),
+        asyncio.create_task(slam_reader(bob, "bob", sentinels, deadline)),
+    ]
+    # Let both readers establish their connections before the flood.
+    await asyncio.sleep(1)
+
+    send_failures = []
+    semaphore = asyncio.Semaphore(32)
+
+    async def send(room_id: str, content: dict) -> object:
+        async with semaphore:
+            resp = await alice.room_send(room_id, "m.room.message", content)
+            if not hasattr(resp, "event_id"):
+                send_failures.append(resp)
+            return resp
+
+    start = time.monotonic()
+    message_resps = await asyncio.gather(
+        *(
+            send(
+                room_ids[i % n_rooms],
+                {"msgtype": "m.text", "body": f"slam-m-{i}"},
+            )
+            for i in range(n_messages)
+        )
+    )
+
+    targets = [
+        (room_ids[i % n_rooms], resp.event_id)
+        for i, resp in enumerate(message_resps)
+        if hasattr(resp, "event_id")
+    ]
+    check(
+        "slam: messages were accepted",
+        bool(targets),
+        f"all {n_messages} message sends failed: {send_failures[:1]}",
+    )
+    await asyncio.gather(
+        *(
+            send(
+                targets[j % len(targets)][0],
+                {
+                    "msgtype": "m.text",
+                    "body": f"* slam-e-{j}",
+                    "m.new_content": {"msgtype": "m.text", "body": f"slam-e-{j}"},
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": targets[j % len(targets)][1],
+                    },
+                },
+            )
+            for j in range(n_edits)
+        )
+    )
+    write_seconds = time.monotonic() - start
+
+    for i, room_id in enumerate(room_ids):
+        await send(room_id, {"msgtype": "m.text", "body": f"slam-sentinel-{i}"})
+
+    total_sent = n_messages + n_edits + n_rooms
+    check(
+        "slam: all events sent",
+        not send_failures,
+        f"{len(send_failures)} failures, first: {send_failures[:1]}",
+    )
+    print(
+        f"slam: sent {total_sent} events over {n_rooms} rooms "
+        f"in {write_seconds:.1f}s ({total_sent / write_seconds:.0f}/s)"
+    )
+
+    for stats in await asyncio.gather(*readers):
+        name = stats["name"]
+        coverage = 100 * stats["events"] / total_sent
+        print(
+            f"slam: {name}: {stats['polls']} polls, {stats['events']} events "
+            f"({coverage:.0f}% coverage), {stats['limited']} limited gaps, "
+            f"{stats['empty_fast']} empty-fast polls"
+        )
+        check(f"slam: {name} has no poll errors", stats["errors"] == 0)
+        check(
+            f"slam: {name} converged on all sentinels",
+            stats["converged"],
+            "sentinel messages never arrived",
+        )
+        check(
+            f"slam: {name} saw no duplicate events",
+            stats["duplicates"] == 0,
+            f"{stats['duplicates']} duplicates: pos handling broken",
+        )
+        check(
+            f"slam: {name} long-polls instead of busy-looping",
+            stats["empty_fast"] <= 25,
+            f"{stats['empty_fast']} instant empty responses",
+        )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--homeserver", default="http://127.0.0.1:8008")
+    parser.add_argument("--slam", action="store_true")
+    parser.add_argument("--rooms", type=int, default=10)
+    parser.add_argument("--messages", type=int, default=2000)
+    parser.add_argument("--edits", type=int, default=10000)
     args = parser.parse_args()
 
     suffix = secrets.token_hex(4)
@@ -152,6 +335,9 @@ async def main() -> None:
             len(resp.rooms[room_id].stripped_state) > 0,
             "invite_state response key not parsed",
         )
+
+        if args.slam:
+            await slam(alice, bob, args.rooms, args.messages, args.edits)
 
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
     finally:
