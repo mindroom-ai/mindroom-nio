@@ -236,6 +236,112 @@ async def slam(
         )
 
 
+async def deep_checks(alice: AsyncClient, bob: AsyncClient) -> None:
+    """Exercise response features the basic functional checks don't reach."""
+    probe = await alice.sliding_sync(conn_id="deep-probe", timeout=0)
+    server = probe.transport_response.headers.get("Server", "")
+    is_synapse = "synapse" in server.lower()
+    print(f"deep: server identifies as {server or 'unknown'!r}")
+
+    # List windowing: a range smaller than the account's room count must
+    # truncate rooms while count reports the full list size.
+    room_ids = []
+    for i in range(8):
+        room_resp = await alice.room_create(name=f"window {i}")
+        room_ids.append(room_resp.room_id)
+    win_lists = {"win": {"ranges": [[0, 4]], "timeline_limit": 1, "required_state": []}}
+    resp = await alice.sliding_sync(conn_id="deep-window", timeout=0, lists=win_lists)
+    check(
+        "deep: list count reports all rooms",
+        "win" in resp.lists and resp.lists["win"].count >= 8,
+        repr(resp.lists),
+    )
+    check(
+        "deep: window truncates returned rooms",
+        0 < len(resp.rooms) <= 5,
+        f"{len(resp.rooms)} rooms for a 5-room window",
+    )
+
+    # Heroes: unnamed two-person room must surface the other member.
+    room_resp = await alice.room_create()
+    heroes_room = room_resp.room_id
+    await alice.room_invite(heroes_room, bob.user_id)
+    await bob.join(heroes_room)
+    lists = {"deep": {"ranges": [[0, 19]], "timeline_limit": 5, "required_state": []}}
+    resp = await alice.sliding_sync(conn_id="deep-heroes", timeout=0, lists=lists)
+    room = resp.rooms.get(heroes_room)
+    heroes_ok = room is not None and any(
+        hero.user_id == bob.user_id for hero in room.heroes
+    )
+    if is_synapse:
+        check("deep: heroes parsed", heroes_ok, repr(room and room.heroes))
+    else:
+        print(f"deep: heroes {'parsed' if heroes_ok else 'not sent by server'}")
+
+    # Expanded timeline: raising timeline_limit on a live connection makes
+    # Synapse resend the deeper timeline flagged unstable_expanded_timeline.
+    small = {"ex": {"ranges": [[0, 19]], "timeline_limit": 1, "required_state": []}}
+    big = {"ex": {"ranges": [[0, 19]], "timeline_limit": 20, "required_state": []}}
+    first = await alice.sliding_sync(conn_id="deep-expand", timeout=0, lists=small)
+    second = await alice.sliding_sync(
+        conn_id="deep-expand", pos=first.pos, timeout=0, lists=big
+    )
+    expanded = any(r.expanded_timeline for r in second.rooms.values())
+    if is_synapse:
+        check("deep: unstable_expanded_timeline parsed", expanded)
+    else:
+        print(
+            f"deep: expanded timeline {'parsed' if expanded else 'not sent by server'}"
+        )
+
+    # Extensions round-trip: account_data is the cheapest extension every
+    # server populates for a fresh user (push rules at minimum).
+    resp = await alice.sliding_sync(
+        conn_id="deep-ext",
+        timeout=0,
+        lists=win_lists,
+        extensions={"account_data": {"enabled": True}},
+    )
+    ext_ok = bool(resp.extensions.get("account_data"))
+    if is_synapse:
+        check("deep: account_data extension passes through", ext_ok)
+    else:
+        print(
+            "deep: account_data extension "
+            f"{'passes through' if ext_ok else 'not sent by server'}"
+        )
+
+    # Two connections for the same user advance independently.
+    conn1 = await alice.sliding_sync(conn_id="deep-c1", timeout=0, lists=win_lists)
+    conn2 = await alice.sliding_sync(conn_id="deep-c2", timeout=0, lists=win_lists)
+    check("deep: second conn gets its own snapshot", len(conn2.rooms) > 0)
+    await alice.room_send(
+        room_ids[0], "m.room.message", {"msgtype": "m.text", "body": "deep-conn"}
+    )
+    for conn_id, pos in (("deep-c1", conn1.pos), ("deep-c2", conn2.pos)):
+        resp = await alice.sliding_sync(
+            conn_id=conn_id, pos=pos, timeout=10_000, lists=win_lists
+        )
+        check(
+            f"deep: {conn_id} advances independently",
+            room_ids[0] in resp.rooms,
+            repr(resp.rooms.keys()),
+        )
+
+    # set_presence placement (informational: server support varies).
+    await alice.sliding_sync(
+        conn_id="deep-pres", timeout=0, set_presence="unavailable", lists=win_lists
+    )
+    try:
+        presence = await alice.get_presence(alice.user_id)
+        print(
+            "deep: set_presence via sliding sync -> server reports "
+            f"{getattr(presence, 'presence', presence)!r} (informational)"
+        )
+    except Exception as exc:  # presence support varies per server
+        print(f"deep: presence endpoint unavailable: {exc!r}")
+
+
 async def _timed(coro_factory, response_type, iterations: int):
     """Run coro_factory() `iterations` times, return (median s, body bytes)."""
     times = []
@@ -435,6 +541,8 @@ async def main() -> None:
             len(resp.rooms[room_id].stripped_state) > 0,
             "invite_state response key not parsed",
         )
+
+        await deep_checks(alice, bob)
 
         if args.slam:
             await slam(alice, bob, args.rooms, args.messages, args.edits)

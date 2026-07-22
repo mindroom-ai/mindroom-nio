@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Type
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from nio.responses import (
     ChangePasswordError,
@@ -304,6 +306,36 @@ class TestClass:
         assert room.invited_count == 0
         assert room.notification_count == 11
         assert room.highlight_count == 1
+
+    _fuzz_json = st.recursive(
+        st.none()
+        | st.booleans()
+        | st.integers()
+        | st.floats(allow_nan=False)
+        | st.text(max_size=12),
+        lambda children: st.lists(children, max_size=4)
+        | st.dictionaries(st.text(max_size=8), children, max_size=4),
+        max_leaves=12,
+    )
+
+    @given(payload=st.dictionaries(st.text(max_size=12), _fuzz_json, max_size=6))
+    @settings(max_examples=300, deadline=None)
+    def test_sliding_sync_fuzz_never_raises(self, payload):
+        response = SlidingSyncResponse.from_dict(payload)
+        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
+
+    @given(room=_fuzz_json, sync_list=_fuzz_json, extensions=_fuzz_json)
+    @settings(max_examples=300, deadline=None)
+    def test_sliding_sync_fuzz_nested_never_raises(self, room, sync_list, extensions):
+        # A valid envelope forces parsing deep into rooms/lists/extensions.
+        payload = {
+            "pos": "p",
+            "rooms": {"!fuzz:example.org": room},
+            "lists": {"fuzz": sync_list},
+            "extensions": extensions,
+        }
+        response = SlidingSyncResponse.from_dict(payload)
+        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
 
     def test_sliding_sync_parse_stripped_state(self):
         # Deployed servers send invite_state; the current MSC4186 text
