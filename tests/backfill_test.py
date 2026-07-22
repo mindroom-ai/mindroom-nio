@@ -1004,6 +1004,56 @@ class TestLimitedTimelineBackfill:
         assert pages.requested_tokens == ["tok0"]
         assert pages.requested_dir == ["f"]
 
+    async def test_forward_walk_discards_unverified_buffer(
+        self, tempdir, aioresponse, caplog
+    ):
+        """A forward walk cut off by a bound must not dispatch its buffer.
+
+        If the walk ends before reaching the sync window, a join of ours may
+        lie in the unwalked remainder — everything buffered would then be
+        pre-join history, visible under shared history visibility. The buffer
+        must be discarded, not dispatched, and the loss surfaced.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_max_pages=1
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        client.next_batch = "since_token"
+
+        # Page 1 buffers $prejoin and offers more pages; the page bound stops
+        # the walk before it can learn whether a join lies further ahead.
+        pages = PagedMessages(
+            {
+                "since_token": messages_payload(
+                    [text_event("$prejoin", ts=240)], end="fwd2"
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        assert dispatched == ["$new"]
+        assert "$prejoin" not in dispatched
+        assert "without fully closing the gap" in caplog.text
+        await client.close()
+
     async def test_repeated_end_token_leaves_gap_open(
         self, backfill_client, aioresponse, caplog
     ):

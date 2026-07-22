@@ -383,7 +383,11 @@ class AsyncClientConfig(ClientConfig):
             (e.g. via ``store_sync_tokens``): the gap is then paged forwards
             from that token instead of backwards to previously delivered event
             ids, so nothing delivered before it can ever be re-dispatched.
-            Rooms that were just joined are never backfilled past our own
+            Such a forward walk dispatches only when it verifiably reaches the
+            sync window; cut short by a bound or error, it discards what it
+            collected, since it cannot prove those events postdate our
+            membership. Rooms that were just joined are never backfilled past
+            our own
             join: a join of ours in the sync timeline skips the backfill
             entirely, and one encountered while paging stops the walk, so
             pre-join history is never dispatched. Disabled by default, in
@@ -885,8 +889,8 @@ class AsyncClient(Client):
         if not gap_closed:
             logger.warning(
                 "Limited-timeline backfill for room %s stopped after %d "
-                "page(s) without fully closing the gap; events older than "
-                "the recovered window may be lost",
+                "page(s) without fully closing the gap; some events in the "
+                "gap may not be delivered",
                 room_id,
                 pages,
             )
@@ -1071,8 +1075,12 @@ class AsyncClient(Client):
         of the gap), the live edge of the timeline, or a configured bound.
         Encountering our own join transition discards everything collected so
         far: events before it predate our membership and are not a delivery
-        gap. Returns the recovered events in chronological (oldest first)
-        order, the number of pages fetched, and whether the gap was closed.
+        gap. For the same reason, a walk that ends without closing the gap
+        (bound, error or stall) returns nothing at all — a join of ours could
+        lie in the unwalked remainder, which would make every buffered event
+        pre-join history (visible under shared history visibility). Returns
+        the recovered events in chronological (oldest first) order, the number
+        of pages fetched, and whether the gap was closed.
         """
         max_pages = self.config.backfill_max_pages
         max_events = self.config.backfill_max_events
@@ -1102,6 +1110,7 @@ class AsyncClient(Client):
                 break
 
             reached_window = False
+            bound_reached = False
             for event in response.chunk:
                 event_id = getattr(event, "event_id", None)
                 if not event_id:
@@ -1115,6 +1124,9 @@ class AsyncClient(Client):
                     continue
                 if event_id in seen_ids:
                     continue
+                if len(recovered) >= max_events:
+                    bound_reached = True
+                    break
                 seen_ids.add(event_id)
                 recovered.append(event)
 
@@ -1122,7 +1134,7 @@ class AsyncClient(Client):
                 gap_closed = True
                 break
 
-            if len(recovered) >= max_events:
+            if bound_reached:
                 break
 
             next_token = response.end
@@ -1137,12 +1149,19 @@ class AsyncClient(Client):
                 break
             token = next_token
 
-        if len(recovered) > max_events:
-            # Truncation drops the newest recovered events; the kept prefix
-            # stays contiguous with the since position, but the gap between it
-            # and the sync window is not closed.
-            gap_closed = False
-            del recovered[max_events:]
+        if not gap_closed and recovered:
+            # The walk ended before reaching the sync window, so nothing
+            # proves that a join of ours does not lie in the unwalked
+            # remainder — in which case everything buffered would predate our
+            # membership. Discard rather than risk dispatching pre-join
+            # history; the caller's warning surfaces the loss.
+            logger.warning(
+                "Discarding %d event(s) recovered for room %s: the forward "
+                "walk ended before reaching the sync window",
+                len(recovered),
+                room_id,
+            )
+            recovered = []
         return recovered, pages, gap_closed
 
     async def _handle_presence_events(self, response: SyncResponse):
