@@ -23,7 +23,6 @@ from asyncio import Event as AsyncioEvent
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial, wraps
-from itertools import chain
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from typing import (
@@ -383,10 +382,11 @@ class AsyncClientConfig(ClientConfig):
             recovered as well, provided the sync resumed from a sync token
             (e.g. via ``store_sync_tokens``): the walk is then bounded
             server-side by that token instead of by previously delivered event
-            ids. Rooms that were just joined (our own membership changed in
-            the sync response) are never backfilled, since their earlier
-            history is not a delivery gap. Disabled by default, in which case
-            behaviour is identical to upstream nio.
+            ids. Rooms that were just joined are never backfilled past our own
+            join: a join of ours in the sync timeline skips the backfill
+            entirely, and one encountered while paging stops the walk, so
+            pre-join history is never dispatched. Disabled by default, in
+            which case behaviour is identical to upstream nio.
 
         backfill_max_pages (int): The maximum number of ``/messages`` pages to
             fetch per limited room per sync when ``backfill_limited_timelines``
@@ -530,6 +530,11 @@ class AsyncClient(Client):
         # enabled. A room only appears here once its first sync has been handled,
         # which is what lets backfill tell an ongoing gap from an initial sync.
         self._backfill_delivered_ids: Dict[str, OrderedDict[str, None]] = {}
+
+        # The token the in-flight sync request resumed from, recorded by sync()
+        # so that limited-timeline backfill can bound its recovery window even
+        # when the caller passed an explicit `since`.
+        self._sync_since: Optional[str] = None
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -714,13 +719,14 @@ class AsyncClient(Client):
             # room already seen this run is paged back to an already-delivered
             # event. A room seen for the first time while resuming from a sync
             # token (e.g. the first sync after a restart) has no delivered ids;
-            # its walk is bounded by the since position instead — unless our
-            # own membership changed in this response, in which case the room
-            # was freshly joined and its earlier history is not a gap.
+            # its walk is bounded by the since position instead — unless the
+            # timeline carries our own join, in which case the room was freshly
+            # joined and its earlier history is not a gap. (A join that fell
+            # into the gap itself stops the history walk instead.)
             if backfill_enabled and join_info.timeline.limited:
                 if room_id in self._backfill_delivered_ids:
                     await self._backfill_limited_timeline(room_id, room, join_info)
-                elif since and not self._own_membership_event_in(join_info):
+                elif since and not self._own_join_in_timeline(join_info):
                     await self._backfill_limited_timeline(
                         room_id, room, join_info, end_token=since
                     )
@@ -784,19 +790,30 @@ class AsyncClient(Client):
         while len(delivered) > max_ids:
             delivered.popitem(last=False)
 
-    def _own_membership_event_in(self, join_info: RoomInfo) -> bool:
-        """Whether this room's sync info carries a membership event for us.
+    def _is_own_join_transition(self, event: Union[Event, BadEventType]) -> bool:
+        """Whether an event is us transitioning into the room (a fresh join)."""
+        return (
+            isinstance(event, RoomMemberEvent)
+            and event.state_key == self.user_id
+            and event.membership == "join"
+            and event.prev_membership != "join"
+        )
 
-        A previously unseen room whose sync response contains our own
-        membership change was just joined, so its earlier history is not a
-        delivery gap and must not be backfilled. A room resuming after a
-        restart, by contrast, arrives without any own-membership change,
-        because our join predates the since token.
+    def _own_join_in_timeline(self, join_info: RoomInfo) -> bool:
+        """Whether this room's sync timeline carries our own join transition.
+
+        A previously unseen room whose timeline contains the event of us
+        joining was just joined, so its earlier history is not a delivery gap
+        and must not be backfilled. A room resuming after a restart, by
+        contrast, never carries one, because our join predates the since token.
+        Only the timeline is consulted: the state block also carries our (old)
+        join event on a ``full_state`` sync, so it cannot tell the two cases
+        apart. A join whose event fell into the gap itself is handled by the
+        history walk instead, which stops at our join transition.
         """
-        for event in chain(join_info.state, join_info.timeline.events):
-            if isinstance(event, RoomMemberEvent) and event.state_key == self.user_id:
-                return True
-        return False
+        return any(
+            self._is_own_join_transition(event) for event in join_info.timeline.events
+        )
 
     async def _backfill_limited_timeline(
         self,
@@ -858,8 +875,8 @@ class AsyncClient(Client):
         if not gap_closed:
             logger.warning(
                 "Limited-timeline backfill for room %s stopped after %d "
-                "page(s) without reaching already-known history; events older "
-                "than the recovered window may be lost",
+                "page(s) without fully closing the gap; events older than "
+                "the recovered window may be lost",
                 room_id,
                 pages,
             )
@@ -944,15 +961,14 @@ class AsyncClient(Client):
 
         Walks ``/messages`` newest first from ``prev_batch`` until it reaches an
         event that was already delivered or is present in the sync response (the
-        far edge of the gap), exhausts the room's history (or the server-side
-        ``end_token`` bound, when given), or hits the page or event bounds from
-        the client config. Returns the recovered events in chronological
-        (oldest first) order, the number of pages fetched, and whether the gap
-        was closed — i.e. the walk reached already-known history, the
-        ``end_token`` bound or the start of the room's history, rather than
-        stopping at a client-side bound or on an error. Events already present
-        in the sync response or previously delivered act as boundaries and are
-        never returned.
+        far edge of the gap), reaches our own join into the room, exhausts the
+        room's history (or the server-side ``end_token`` bound, when given), or
+        hits the page or event bounds from the client config. Returns the
+        recovered events in chronological (oldest first) order, the number of
+        pages fetched, and whether the gap was closed — i.e. the walk reached a
+        boundary or the end of the pageable history, rather than stopping at a
+        client-side bound or on an error. Boundary events themselves are never
+        returned.
         """
         max_pages = self.config.backfill_max_pages
         max_events = self.config.backfill_max_events
@@ -982,18 +998,17 @@ class AsyncClient(Client):
                 )
                 break
 
-            if not response.chunk:
-                # Nothing older is available: the walk reached either the
-                # room's earliest history or the end_token bound.
-                gap_closed = True
-                break
-
             reached_boundary = False
             for event in response.chunk:
                 event_id = getattr(event, "event_id", None)
                 if not event_id:
                     continue
                 if event_id in present_in_sync or event_id in already_delivered:
+                    reached_boundary = True
+                    break
+                if self._is_own_join_transition(event):
+                    # Anything older than us joining the room is not a
+                    # delivery gap and must not be recovered.
                     reached_boundary = True
                     break
                 if event_id in seen_ids:
@@ -1010,13 +1025,19 @@ class AsyncClient(Client):
 
             next_token = response.end
             if not next_token or next_token == token:
-                # The room's history is exhausted: there is nothing older left
-                # to recover, so the gap is closed without a boundary hit.
+                # The server signalled the end of the walk: the room's earliest
+                # history or the end_token bound was reached, so the gap is
+                # closed. An empty chunk alone is no such signal — pagination
+                # must continue for as long as the end token keeps advancing.
                 gap_closed = True
                 break
             token = next_token
 
-        del recovered[max_events:]
+        if len(recovered) > max_events:
+            # Truncation drops the oldest recovered events, so the gap is not
+            # fully closed even if a boundary was reached.
+            gap_closed = False
+            del recovered[max_events:]
         recovered.reverse()
         return recovered, pages, gap_closed
 
@@ -1087,14 +1108,19 @@ class AsyncClient(Client):
             await cb.async_execute(response)
 
     async def _handle_sync(self, response: SyncResponse) -> None:
+        # The token this sync continued from. Limited-timeline backfill needs
+        # it to recover gaps for rooms whose first sync of this run this is,
+        # e.g. when resuming from a stored sync token after a restart. sync()
+        # records the exact request token; responses received directly fall
+        # back to the client's current position. Consume it before the
+        # duplicate check below so a stale token can never leak into a later,
+        # unrelated response.
+        since = self._sync_since or self.next_batch or self.loaded_sync_token or None
+        self._sync_since = None
+
         # We already received such a sync response, do nothing in that case.
         if self.next_batch == response.next_batch:
             return
-
-        # The token this sync continued from. Limited-timeline backfill needs
-        # it to recover gaps for rooms whose first sync of this run this is,
-        # e.g. when resuming from a stored sync token after a restart.
-        since = self.next_batch or self.loaded_sync_token or None
 
         self.next_batch = response.next_batch
 
@@ -1619,6 +1645,10 @@ class AsyncClient(Client):
 
         sync_token = since or self.next_batch
         presence = set_presence or self._presence
+        # Remember the token this request continues from; _handle_sync uses it
+        # to bound limited-timeline backfill for rooms it holds no delivered
+        # ids for (e.g. on the first sync after a restart).
+        self._sync_since = sync_token or self.loaded_sync_token or None
         method, path = Api.sync(
             self.access_token,
             since=sync_token or self.loaded_sync_token,

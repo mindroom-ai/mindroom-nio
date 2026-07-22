@@ -38,6 +38,7 @@ BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
 MESSAGES_URL = re.compile(
     rf"^https://example\.org{MATRIX_API_PATH_V3}/rooms/.+/messages"
 )
+SYNC_URL = re.compile(rf"^https://example\.org{MATRIX_API_PATH_V3}/sync")
 
 TEST_ROOM_ID = "!flooded:example.org"
 OTHER_ROOM_ID = "!second:example.org"
@@ -111,10 +112,11 @@ def sync_response(
     *,
     limited: bool,
     prev_batch: Optional[str],
+    state: Optional[list] = None,
 ) -> SyncResponse:
     """Build a sync response carrying one joined room with the given timeline."""
     timeline = Timeline(list(events), limited, prev_batch)
-    room_info = RoomInfo(timeline, [], [], [])
+    room_info = RoomInfo(timeline, list(state or []), [], [])
     rooms = Rooms({}, {room_id: room_info}, {})
     return SyncResponse(
         next_batch,
@@ -126,13 +128,54 @@ def sync_response(
     )
 
 
-def messages_payload(events: List[RoomMessageText], *, end: Optional[str]) -> dict:
-    """Build a /messages response body; the chunk is newest first as the server sends."""
+def sync_json(
+    next_batch: str,
+    room_id: str,
+    events: List[RoomMessageText],
+    *,
+    limited: bool,
+    prev_batch: Optional[str],
+) -> dict:
+    """Build a raw /sync body for tests that drive the real sync() request."""
     return {
+        "next_batch": next_batch,
+        "device_one_time_keys_count": {"signed_curve25519": 50},
+        "device_lists": {"changed": [], "left": []},
+        "rooms": {
+            "invite": {},
+            "leave": {},
+            "join": {
+                room_id: {
+                    "timeline": {
+                        "events": [event.source for event in events],
+                        "limited": limited,
+                        "prev_batch": prev_batch,
+                    },
+                    "state": {"events": []},
+                    "ephemeral": {"events": []},
+                    "account_data": {"events": []},
+                }
+            },
+        },
+        "to_device": {"events": []},
+        "presence": {"events": []},
+        "account_data": {"events": []},
+    }
+
+
+def messages_payload(events: List[RoomMessageText], *, end: Optional[str]) -> dict:
+    """Build a /messages response body; the chunk is newest first as the server sends.
+
+    ``end=None`` omits the key entirely, which is how a server signals that
+    the pagination walk has reached its end.
+    """
+    payload: dict = {
         "start": "start_token",
-        "end": end,
         "chunk": [event.source for event in events],
     }
+    if end is not None:
+        payload["end"] = end
+    return payload
 
 
 class PagedMessages:
@@ -421,7 +464,7 @@ class TestLimitedTimelineBackfill:
         assert counter["n"] == 3
         # Stopping at a bound means the gap was not verifiably closed, which
         # must be surfaced to operators rather than silently accepted.
-        assert "without reaching already-known history" in caplog.text
+        assert "without fully closing the gap" in caplog.text
         await client.close()
 
     async def test_event_bound_caps_recovered_events(self, tempdir, aioresponse):
@@ -691,8 +734,9 @@ class TestLimitedTimelineBackfill:
                     [text_event("$gap2", ts=200), text_event("$gap1", ts=100)],
                     end="p2",
                 ),
-                # The server returns an empty chunk once the `to` bound is hit.
-                "p2": messages_payload([], end="p3"),
+                # The server signals the end of the walk (the `to` bound was
+                # reached) by no longer returning an end token.
+                "p2": messages_payload([], end=None),
             }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
@@ -716,9 +760,10 @@ class TestLimitedTimelineBackfill:
     ):
         """A freshly joined room's history is not a gap, even on a since resume.
 
-        The discriminator is our own membership event in the sync response: a
+        The discriminator is our own join transition in the sync timeline: a
         genuinely resumed room never carries one (our join predates the since
-        token), while a fresh join always does.
+        token), while a fresh join always does — in the timeline if it survived
+        the window, otherwise in the gap, where it stops the history walk.
         """
         dispatched = self._record_callback(backfill_client)
         backfill_client.next_batch = "since_token"
@@ -746,6 +791,208 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$new"]
         assert calls["n"] == 0
+
+    async def test_full_state_resume_still_backfills(
+        self, backfill_client, aioresponse
+    ):
+        """Our old join in the state block must not defeat restart recovery.
+
+        A ``full_state=True`` resume (and lazy loading) re-sends our original
+        join event in the room's state block for every room, so only a join in
+        the timeline may mark a room as freshly joined.
+        """
+        dispatched = self._record_callback(backfill_client)
+        backfill_client.next_batch = "since_restart"
+
+        pages = PagedMessages(
+            {"p1": messages_payload([text_event("$gap1", ts=100)], end=None)}
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        old_join = member_event(
+            "$oldjoin", ts=10, membership="join", user_id=backfill_client.user_id
+        )
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+                state=[old_join],
+            )
+        )
+
+        assert dispatched == ["$gap1", "$new"]
+        assert pages.requested_to == ["since_restart"]
+
+    async def test_walk_stops_at_own_join(self, backfill_client, aioresponse):
+        """A fresh join whose join event fell into the gap recovers only
+        post-join events; pre-join history is never dispatched."""
+        dispatched = self._record_callback(backfill_client)
+        backfill_client.next_batch = "since_token"
+
+        own_join = member_event(
+            "$ownjoin", ts=250, membership="join", user_id=backfill_client.user_id
+        )
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [
+                        text_event("$post2", ts=260),
+                        text_event("$post1", ts=255),
+                        own_join,
+                        text_event("$prejoin", ts=240),
+                    ],
+                    end="p2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$post1", "$post2", "$new"]
+        assert "$prejoin" not in dispatched
+
+    async def test_empty_page_continues_pagination(self, backfill_client, aioresponse):
+        """An empty chunk with an advancing end token continues the walk."""
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                # An empty page mid-walk (e.g. filtered or purged history) is
+                # not the end of pagination while the end token advances.
+                "p1": messages_payload([], end="p2"),
+                "p2": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$old", ts=50)],
+                    end="p3",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$old", "$gap1", "$new"]
+        assert pages.requested_tokens == ["p1", "p2"]
+
+    async def test_truncation_with_boundary_warns(self, tempdir, aioresponse, caplog):
+        """Dropping recovered events at the event bound is never silent.
+
+        When the same page both reaches a boundary and overflows the event
+        bound, the oldest recovered events are dropped, so the gap must not be
+        reported as cleanly closed.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_max_events=2
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [
+                        text_event("$gap3", ts=300),
+                        text_event("$gap2", ts=200),
+                        text_event("$gap1", ts=100),
+                        text_event("$old", ts=50),
+                    ],
+                    end="p2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=400)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        # The newest two gap events survive the bound; $gap1 is dropped and
+        # that loss is surfaced.
+        assert dispatched == ["$old", "$gap2", "$gap3", "$new"]
+        assert "without fully closing the gap" in caplog.text
+        await client.close()
+
+    async def test_explicit_since_reaches_backfill(self, backfill_client, aioresponse):
+        """A caller-supplied sync(since=...) token bounds restart recovery.
+
+        This drives the real sync() request path, not receive_response(), so
+        it checks that the request's actual since token is the one handed to
+        the backfill as the server-side walk bound.
+        """
+        dispatched = self._record_callback(backfill_client)
+
+        pages = PagedMessages(
+            {"p1": messages_payload([text_event("$gap1", ts=100)], end=None)}
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        aioresponse.get(
+            SYNC_URL,
+            payload=sync_json(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            ),
+        )
+
+        response = await backfill_client.sync(since="tok0")
+
+        assert isinstance(response, SyncResponse)
+        assert dispatched == ["$gap1", "$new"]
+        assert pages.requested_to == ["tok0"]
 
     async def test_left_room_clears_delivered_ids(self, backfill_client, aioresponse):
         """Leaving a room forgets its delivered ids so a rejoin starts fresh."""
