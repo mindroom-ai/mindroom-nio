@@ -916,6 +916,127 @@ class TestLimitedTimelineBackfill:
         assert pages.requested_dir == ["f"]
         assert pages.requested_to == ["s2"]
 
+    async def test_straggler_already_delivered_is_not_redispatched(
+        self, backfill_client, aioresponse
+    ):
+        """An event delivered by an earlier sync never fires twice.
+
+        Federation ordering can place an already-delivered event inside a
+        later walked gap topologically (/sync uses stream order, /messages
+        topological order); the spec requires clients to de-duplicate the
+        overlap. The straggler is skipped, but it is not a boundary — the walk
+        continues past it.
+        """
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$straggler", ts=90)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [
+                        text_event("$straggler", ts=90),
+                        text_event("$gap1", ts=100),
+                        text_event("$new", ts=300),
+                    ],
+                    end="fwd2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$straggler", "$gap1", "$new"]
+
+    async def test_dispatch_respects_backfill_budget(
+        self, tempdir, aioresponse, caplog
+    ):
+        """A slow event callback cannot stall dispatch past the budget.
+
+        The budget covers not just the /messages walk but also handing the
+        recovered events to callbacks; a callback that is slow for each of
+        many recovered events would otherwise stall sync handling far beyond
+        backfill_timeout.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_timeout=0.3
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+
+        dispatched: List[str] = []
+
+        async def slow_cb(_room, event):
+            dispatched.append(event.event_id)
+            await asyncio.sleep(0.4)
+
+        client.add_event_callback(slow_cb, RoomMessageText)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [
+                        text_event("$gap1", ts=100),
+                        text_event("$gap2", ts=110),
+                        text_event("$gap3", ts=120),
+                        text_event("$new", ts=300),
+                    ],
+                    end="fwd2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        # The first gap event's slow callback exhausts the budget; dispatch
+        # stops instead of stalling through the remaining recovered events.
+        # The sync's own event is still delivered by the live path.
+        assert dispatched == ["$old", "$gap1", "$new"]
+        assert "budget is exhausted" in caplog.text
+        await client.close()
+
     async def test_live_edge_does_not_close_the_gap(
         self, backfill_client, aioresponse, caplog
     ):

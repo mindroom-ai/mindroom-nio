@@ -20,6 +20,7 @@ import logging
 import os
 import warnings
 from asyncio import Event as AsyncioEvent
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
@@ -280,6 +281,14 @@ AsyncFileType = Union[AsyncBufferedReader, AsyncTextIOWrapper]
 
 logger = logging.getLogger(__name__)
 
+# How many recently dispatched event ids to remember per room when
+# `backfill_limited_timelines` is enabled. The cache exists purely to
+# de-duplicate the /sync–/messages overlap the spec warns about (a federation
+# straggler can sit inside a walked gap topologically while its live delivery
+# already happened at an earlier stream position); it never decides where a
+# recovery walk starts or stops.
+_MAX_BACKFILL_DISPATCHED_IDS = 512
+
 
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
@@ -379,7 +388,14 @@ class AsyncClientConfig(ClientConfig):
             by a bound, an error, or the room's live edge, it discards what it
             collected and logs a warning — an unverified buffer could contain
             pre-join history or events newer than the sync response, which the
-            next sync would deliver again. Rooms that were
+            next sync would deliver again. Event ids already dispatched this
+            run are skipped (per room, bounded memory), de-duplicating the
+            ``/sync``–``/messages`` overlap; that memory is not persisted, so
+            a federation straggler delivered just before a restart may still
+            repeat. The walk is unfiltered: when syncing with a filter, gap
+            events the filter would exclude are still dispatched (callbacks
+            may see more than the filtered sync would show, never less).
+            Rooms that were
             just joined are never backfilled past our own join: a join of ours
             in the sync timeline skips the backfill entirely, and one
             encountered while paging discards everything collected before it,
@@ -410,9 +426,12 @@ class AsyncClientConfig(ClientConfig):
             (``room_messages()`` retries rate limits and timeouts internally,
             potentially forever with the default client config); a backfill
             that exhausts the budget is abandoned, and rooms whose turn comes
-            after it is spent skip theirs with a warning. Because recovery
-            runs before the sync response's own events are dispatched, this
-            also bounds how long live events can be delayed. Defaults to 30.
+            after it is spent skip theirs with a warning. The budget also
+            bounds the dispatch of recovered events, so a slow event callback
+            cannot stall sync handling indefinitely through a large recovery.
+            Because recovery runs before the sync response's own events are
+            dispatched, this also bounds how long live events can be delayed.
+            Defaults to 30.
     """
 
     max_limit_exceeded: Optional[int] = None
@@ -531,6 +550,13 @@ class AsyncClient(Client):
         # so that limited-timeline backfill knows where each room's gap starts
         # even when the caller passed an explicit `since`.
         self._sync_since: Optional[str] = None
+
+        # Per-room memory of recently dispatched timeline event ids, kept only
+        # when `backfill_limited_timelines` is enabled. Used purely to skip
+        # events a recovery walk returns that were already delivered by an
+        # earlier sync (the /sync–/messages overlap); never used to decide
+        # where recovery starts or stops.
+        self._backfill_dispatched_ids: Dict[str, OrderedDict[str, None]] = {}
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -749,6 +775,9 @@ class AsyncClient(Client):
             for index, event in decrypted_events:
                 join_info.timeline.events[index] = event
 
+            if self.config.backfill_limited_timelines:
+                self._record_dispatched_events(room_id, join_info.timeline.events)
+
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
                 await self._on_ephemeral(event, room)
@@ -764,6 +793,31 @@ class AsyncClient(Client):
 
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
+
+    def _record_dispatched_events(
+        self,
+        room_id: str,
+        events: List[Union[Event, BadEventType]],
+    ) -> None:
+        """Remember the ids of timeline events handed to the event callbacks.
+
+        Recovery walks skip ids in this per-room, bounded memory so that a
+        federation straggler — delivered live by an earlier sync but sitting
+        inside a later walked gap topologically — is not dispatched twice
+        (clients must de-duplicate the /sync–/messages overlap). The memory is
+        not persisted; after a restart the spec-permitted duplicate remains
+        possible for such stragglers.
+        """
+        dispatched = self._backfill_dispatched_ids.setdefault(room_id, OrderedDict())
+
+        for event in events:
+            event_id = getattr(event, "event_id", None)
+            if not event_id:
+                continue
+            dispatched[event_id] = dispatched.pop(event_id, None)
+
+        while len(dispatched) > _MAX_BACKFILL_DISPATCHED_IDS:
+            dispatched.popitem(last=False)
 
     def _is_own_join_transition(self, event: Union[Event, BadEventType]) -> bool:
         """Whether an event is us transitioning into the room (a fresh join)."""
@@ -812,9 +866,10 @@ class AsyncClient(Client):
         dispatched oldest first through the normal event callbacks, before the
         sync response's own events; they are decrypted like live events but
         never applied to room state, which is already newer than they are. Any
-        failure is logged and swallowed, and the walk must finish before
-        ``deadline`` (the sync response's shared backfill budget), so a
-        backfill can never break or stall the sync loop.
+        failure is logged and swallowed, and both the walk and the dispatch of
+        what it recovered must finish before ``deadline`` (the sync response's
+        shared backfill budget), so a backfill can never break or stall the
+        sync loop.
         """
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -831,9 +886,10 @@ class AsyncClient(Client):
             for event in join_info.timeline.events
             if getattr(event, "event_id", None)
         }
+        already_dispatched = self._backfill_dispatched_ids.get(room_id, OrderedDict())
 
         collect = self._collect_gap_events_forward(
-            room_id, since, present_in_sync, until
+            room_id, since, present_in_sync, already_dispatched, until
         )
 
         try:
@@ -868,13 +924,32 @@ class AsyncClient(Client):
         encrypted_rooms: Set[str] = set()
         dispatched = 0
 
+        # Recovered events are dispatched as returned: Megolm events in a
+        # /messages chunk were already decrypted (or failed to decrypt) by
+        # room_messages()'s response handling — a second attempt here could
+        # not succeed and would only double the failure logging. Room state is
+        # deliberately never touched: these events are older than the state
+        # the sync response already applied, so replaying them through
+        # room.handle_event()/room.handle_membership() would regress the
+        # room's current state and feed stale membership into E2EE device
+        # tracking.
         for event in recovered:
-            try:
-                decrypted = self._decrypt_backfilled_event(
-                    event, room_id, encrypted_rooms
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    "Stopping backfill dispatch for room %s after %d of %d "
+                    "event(s): the sync's backfill time budget is exhausted; "
+                    "the rest of the gap may be lost",
+                    room_id,
+                    dispatched,
+                    len(recovered),
                 )
-                if decrypted is not None:
-                    event = decrypted
+                break
+
+            try:
+                if isinstance(event, RoomEncryptionEvent):
+                    # Encryption can never be disabled again once enabled, so
+                    # recording it from an old event cannot regress anything.
+                    encrypted_rooms.add(room_id)
 
                 await self._on_event(event, room)
             except Exception:
@@ -888,6 +963,7 @@ class AsyncClient(Client):
                 )
                 continue
 
+            self._record_dispatched_events(room_id, [event])
             dispatched += 1
 
         self.encrypted_rooms.update(encrypted_rooms)
@@ -903,37 +979,12 @@ class AsyncClient(Client):
                 room_id,
             )
 
-    def _decrypt_backfilled_event(
-        self,
-        event: Union[Event, BadEventType],
-        room_id: str,
-        encrypted_rooms: Set[str],
-    ) -> Optional[Union[Event, BadEventType]]:
-        """Decrypt one backfilled event without touching room state.
-
-        This mirrors the decryption half of ``_handle_timeline_event`` but
-        deliberately skips its state handling: backfilled events are older than
-        the state the sync response already applied, so replaying them through
-        ``room.handle_event``/``room.handle_membership`` would regress the
-        room's current state and, for member events, feed stale membership into
-        E2EE device tracking.
-        """
-        if isinstance(event, MegolmEvent) and self.olm:
-            event.room_id = room_id
-            return self.olm._decrypt_megolm_no_error(event)
-
-        if isinstance(event, RoomEncryptionEvent):
-            # Encryption can never be disabled again once enabled, so recording
-            # it from an old event cannot regress anything.
-            encrypted_rooms.add(room_id)
-
-        return None
-
     async def _collect_gap_events_forward(
         self,
         room_id: str,
         since: str,
         present_in_sync: Set[str],
+        already_dispatched: "OrderedDict[str, None]",
         until: str,
     ) -> Tuple[List[Union[Event, BadEventType]], int, bool]:
         """Page forwards from the since position and collect the gap events.
@@ -1000,7 +1051,12 @@ class AsyncClient(Client):
                     recovered.clear()
                     seen_ids.clear()
                     continue
-                if event_id in seen_ids:
+                if event_id in seen_ids or event_id in already_dispatched:
+                    # already_dispatched holds events delivered by earlier
+                    # syncs: a federation straggler can sit inside the walked
+                    # gap topologically although its live delivery already
+                    # happened. Skip it — but keep walking; it is not a
+                    # boundary.
                     continue
                 if len(recovered) >= max_events:
                     bound_reached = True
