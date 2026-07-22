@@ -90,6 +90,7 @@ from ..events import (
     PresenceEvent,
     PushAction,
     PushCondition,
+    RoomEncryptionEvent,
     RoomKeyRequest,
     RoomKeyRequestCancellation,
     ToDeviceEvent,
@@ -369,11 +370,16 @@ class AsyncClientConfig(ClientConfig):
             limited sync timelines. When a room's timeline arrives with
             ``limited: true`` the homeserver truncated it, so the events between
             the previous sync position and the surviving window are never passed
-            to the event callbacks. When this is enabled ``sync_forever()`` pages
-            history backwards from the room's ``prev_batch`` token and dispatches
-            the recovered events through the normal event callbacks, in
-            chronological order. Disabled by default, in which case behaviour is
-            identical to upstream nio.
+            to the event callbacks. When this is enabled, sync handling pages
+            history backwards from the room's ``prev_batch`` token and
+            dispatches the recovered events through the normal event callbacks.
+            Recovered events are dispatched oldest first relative to each other,
+            but after the (newer) events of the sync response that revealed the
+            gap. They are decrypted like live events but never applied to the
+            ``MatrixRoom`` state, which is already newer than they are. The
+            per-room memory of delivered events is not persisted, so a gap that
+            spans a client restart is not recovered. Disabled by default, in
+            which case behaviour is identical to upstream nio.
 
         backfill_max_pages (int): The maximum number of ``/messages`` pages to
             fetch per limited room per sync when ``backfill_limited_timelines``
@@ -386,6 +392,15 @@ class AsyncClientConfig(ClientConfig):
         backfill_page_size (int): The number of events to request per
             ``/messages`` page when ``backfill_limited_timelines`` is enabled.
             Defaults to 50.
+
+        backfill_timeout (float): The total time budget, in seconds, that one
+            room's backfill (all of its ``/messages`` requests together) may
+            spend when ``backfill_limited_timelines`` is enabled. This bounds
+            how long sync handling can stall when the homeserver is slow or
+            rate-limits ``/messages`` (``room_messages()`` retries rate limits
+            and timeouts internally, potentially forever with the default
+            client config); on timeout the backfill is abandoned and sync
+            handling continues without the recovered events. Defaults to 30.
     """
 
     max_limit_exceeded: Optional[int] = None
@@ -398,6 +413,7 @@ class AsyncClientConfig(ClientConfig):
     backfill_max_pages: int = 10
     backfill_max_events: int = 200
     backfill_page_size: int = 50
+    backfill_timeout: float = 30.0
 
 
 class AsyncClient(Client):
@@ -677,7 +693,10 @@ class AsyncClient(Client):
             # response. This has to be read before the delivered ids are updated
             # below, because it decides whether a limited timeline is a gap to
             # backfill or just the room's (always limited) initial sync.
-            room_was_known = room_id in self._backfill_delivered_ids
+            backfill_enabled = self.config.backfill_limited_timelines
+            room_was_known = (
+                backfill_enabled and room_id in self._backfill_delivered_ids
+            )
 
             for index, event in enumerate(join_info.timeline.events):
                 decrypted_event = self._handle_timeline_event(
@@ -694,14 +713,11 @@ class AsyncClient(Client):
             for index, event in decrypted_events:
                 join_info.timeline.events[index] = event
 
-            self._record_delivered_events(room_id, join_info.timeline.events)
+            if backfill_enabled:
+                self._record_delivered_events(room_id, join_info.timeline.events)
 
-            if (
-                self.config.backfill_limited_timelines
-                and room_was_known
-                and join_info.timeline.limited
-            ):
-                await self._backfill_limited_timeline(room_id, room, join_info)
+                if room_was_known and join_info.timeline.limited:
+                    await self._backfill_limited_timeline(room_id, room, join_info)
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
@@ -757,8 +773,11 @@ class AsyncClient(Client):
         never handed to the event callbacks. Page ``/messages`` backwards from
         the timeline's ``prev_batch`` token until an already-delivered event or a
         configured bound is reached, then dispatch the recovered events oldest
-        first through the same code path as live timeline events. Any failure is
-        logged and swallowed so a backfill can never break the sync loop.
+        first through the normal event callbacks. Recovered events are decrypted
+        like live events but never applied to room state, which is already newer
+        than they are. Any failure is logged and swallowed, and the whole walk
+        is bounded by ``backfill_timeout``, so a backfill can never break or
+        stall the sync loop.
         """
         prev_batch = join_info.timeline.prev_batch
 
@@ -777,12 +796,32 @@ class AsyncClient(Client):
         }
 
         try:
-            recovered, pages = await self._collect_backfill_events(
-                room_id, prev_batch, already_delivered, present_in_sync
+            recovered, pages, gap_closed = await asyncio.wait_for(
+                self._collect_backfill_events(
+                    room_id, prev_batch, already_delivered, present_in_sync
+                ),
+                timeout=self.config.backfill_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out backfilling limited timeline for room %s after "
+                "%.1fs; events in the gap may be lost",
+                room_id,
+                self.config.backfill_timeout,
+            )
+            return
         except Exception:
             logger.exception("Failed to backfill limited timeline for room %s", room_id)
             return
+
+        if not gap_closed:
+            logger.warning(
+                "Limited-timeline backfill for room %s stopped after %d "
+                "page(s) without reaching already-known history; events older "
+                "than the recovered window may be lost",
+                room_id,
+                pages,
+            )
 
         if not recovered:
             return
@@ -791,15 +830,16 @@ class AsyncClient(Client):
         dispatched = 0
 
         for event in recovered:
-            prepared = self._handle_timeline_event(
-                event, room_id, room, encrypted_rooms
-            )
-            if prepared is not None:
-                event = prepared
+            decrypted = self._decrypt_backfilled_event(event, room_id, encrypted_rooms)
+            if decrypted is not None:
+                event = decrypted
 
             try:
                 await self._on_event(event, room)
             except Exception:
+                # Unlike the live sync path, where a raising callback
+                # propagates out of sync(), a backfill must never break the
+                # sync loop, so a crashing callback only skips this one event.
                 logger.exception(
                     "Failed to dispatch backfilled event %s in room %s",
                     getattr(event, "event_id", None),
@@ -823,21 +863,49 @@ class AsyncClient(Client):
                 room_id,
             )
 
+    def _decrypt_backfilled_event(
+        self,
+        event: Union[Event, BadEventType],
+        room_id: str,
+        encrypted_rooms: Set[str],
+    ) -> Optional[Union[Event, BadEventType]]:
+        """Decrypt one backfilled event without touching room state.
+
+        This mirrors the decryption half of ``_handle_timeline_event`` but
+        deliberately skips its state handling: backfilled events are older than
+        the state the sync response already applied, so replaying them through
+        ``room.handle_event``/``room.handle_membership`` would regress the
+        room's current state and, for member events, feed stale membership into
+        E2EE device tracking.
+        """
+        if isinstance(event, MegolmEvent) and self.olm:
+            event.room_id = room_id
+            return self.olm._decrypt_megolm_no_error(event)
+
+        if isinstance(event, RoomEncryptionEvent):
+            # Encryption can never be disabled again once enabled, so recording
+            # it from an old event cannot regress anything.
+            encrypted_rooms.add(room_id)
+
+        return None
+
     async def _collect_backfill_events(
         self,
         room_id: str,
         prev_batch: str,
         already_delivered: "OrderedDict[str, None]",
         present_in_sync: Set[str],
-    ) -> Tuple[List[Union[Event, BadEventType]], int]:
+    ) -> Tuple[List[Union[Event, BadEventType]], int, bool]:
         """Page a limited room's history backwards and collect the gap events.
 
         Walks ``/messages`` newest first from ``prev_batch`` until it reaches an
         event that was already delivered or is present in the sync response (the
         far edge of the gap), exhausts the room's history, or hits the page or
         event bounds from the client config. Returns the recovered events in
-        chronological (oldest first) order together with the number of pages
-        fetched. Events already present in the sync response or previously
+        chronological (oldest first) order, the number of pages fetched, and
+        whether the gap was closed — i.e. the walk reached already-known history
+        or the start of the room's history, rather than stopping at a bound or
+        on an error. Events already present in the sync response or previously
         delivered act as boundaries and are never returned.
         """
         max_pages = self.config.backfill_max_pages
@@ -848,6 +916,7 @@ class AsyncClient(Client):
         seen_ids: Set[str] = set()
         token: Optional[str] = prev_batch
         pages = 0
+        gap_closed = False
 
         while pages < max_pages and token:
             response = await self.room_messages(
@@ -879,17 +948,24 @@ class AsyncClient(Client):
                 seen_ids.add(event_id)
                 recovered.append(event)
 
-            if reached_boundary or len(recovered) >= max_events:
+            if reached_boundary:
+                gap_closed = True
+                break
+
+            if len(recovered) >= max_events:
                 break
 
             next_token = response.end
             if not next_token or next_token == token:
+                # The room's history is exhausted: there is nothing older left
+                # to recover, so the gap is closed without a boundary hit.
+                gap_closed = True
                 break
             token = next_token
 
         del recovered[max_events:]
         recovered.reverse()
-        return recovered, pages
+        return recovered, pages, gap_closed
 
     async def _handle_presence_events(self, response: SyncResponse):
         for event in response.presence_events:

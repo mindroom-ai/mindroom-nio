@@ -6,7 +6,9 @@ and dispatch the recovered events through the normal event callbacks, while a
 disabled client behaves exactly like upstream nio.
 """
 
+import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from typing import List, Optional
@@ -23,7 +25,9 @@ from nio import (
     DeviceOneTimeKeyCount,
     LoginResponse,
     RoomInfo,
+    RoomMemberEvent,
     RoomMessageText,
+    RoomNameEvent,
     Rooms,
     SyncResponse,
     Timeline,
@@ -57,6 +61,46 @@ def text_event(
         }
     )
     assert isinstance(event, RoomMessageText)
+    return event
+
+
+def member_event(
+    event_id: str,
+    *,
+    ts: int,
+    membership: str,
+    user_id: str = "@member:example.org",
+) -> RoomMemberEvent:
+    """Build a membership state event as it appears in timelines and /messages."""
+    event = RoomMemberEvent.from_dict(
+        {
+            "content": {"membership": membership, "displayname": "Member"},
+            "event_id": event_id,
+            "sender": user_id,
+            "state_key": user_id,
+            "origin_server_ts": ts,
+            "room_id": TEST_ROOM_ID,
+            "type": "m.room.member",
+        }
+    )
+    assert isinstance(event, RoomMemberEvent)
+    return event
+
+
+def name_event(event_id: str, *, ts: int, name: str) -> RoomNameEvent:
+    """Build a room name state event as it appears in timelines and /messages."""
+    event = RoomNameEvent.from_dict(
+        {
+            "content": {"name": name},
+            "event_id": event_id,
+            "sender": "@user:example.org",
+            "state_key": "",
+            "origin_server_ts": ts,
+            "room_id": TEST_ROOM_ID,
+            "type": "m.room.name",
+        }
+    )
+    assert isinstance(event, RoomNameEvent)
     return event
 
 
@@ -312,7 +356,7 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$gap1", "$new"]
 
-    async def test_pagination_stops_at_page_bound(self, tempdir, aioresponse):
+    async def test_pagination_stops_at_page_bound(self, tempdir, aioresponse, caplog):
         """A never-terminating history walk stops at the configured page bound."""
         client = AsyncClient(
             "https://example.org",
@@ -352,21 +396,25 @@ class TestLimitedTimelineBackfill:
 
         aioresponse.get(MESSAGES_URL, callback=endless, repeat=True)
 
-        await client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=10_000)],
-                limited=True,
-                prev_batch="p1",
+        with caplog.at_level(logging.WARNING):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=10_000)],
+                    limited=True,
+                    prev_batch="p1",
+                )
             )
-        )
 
         # $old and $new from the syncs, plus exactly three backfilled pages.
         # The walk fetches newest first ($gap1, $gap2, $gap3) and dispatches the
         # recovered events oldest first, reversing that order.
         assert dispatched == ["$old", "$new", "$gap3", "$gap2", "$gap1"]
         assert counter["n"] == 3
+        # Stopping at a bound means the gap was not verifiably closed, which
+        # must be surfaced to operators rather than silently accepted.
+        assert "without reaching already-known history" in caplog.text
         await client.close()
 
     async def test_event_bound_caps_recovered_events(self, tempdir, aioresponse):
@@ -481,3 +529,135 @@ class TestLimitedTimelineBackfill:
 
         delivered = backfill_client._backfill_delivered_ids[TEST_ROOM_ID]
         assert len(delivered) == _MAX_BACKFILL_DELIVERED_IDS
+
+    async def test_disabled_records_no_delivered_ids(
+        self, disabled_client, aioresponse
+    ):
+        """With the flag off, no per-room delivered-id memory accumulates."""
+        await disabled_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$a", ts=100)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        assert disabled_client._backfill_delivered_ids == {}
+
+    async def test_backfilled_state_events_do_not_regress_room_state(
+        self, backfill_client, aioresponse
+    ):
+        """Old state events in the gap are dispatched but never applied.
+
+        Backfilled events are older than the state the sync response already
+        applied, so replaying them into the room would roll back the current
+        name and membership (and feed stale members into E2EE tracking).
+        """
+        name_ids: List[str] = []
+
+        async def name_cb(_room, event):
+            name_ids.append(event.event_id)
+
+        backfill_client.add_event_callback(name_cb, RoomNameEvent)
+
+        # Live sync 1: @member joins and the room is named "Before".
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [
+                    text_event("$old", ts=50),
+                    member_event("$join1", ts=60, membership="join"),
+                    name_event("$name1", ts=70, name="Before"),
+                ],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        room = backfill_client.rooms[TEST_ROOM_ID]
+        assert "@member:example.org" in room.users
+        assert room.name == "Before"
+
+        # The gap holds an older rename and an older re-join that must lose
+        # against the state the limited sync below applies.
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [
+                        name_event("$name2", ts=200, name="Gap name"),
+                        member_event("$join2", ts=150, membership="join"),
+                        text_event("$old", ts=50),
+                    ],
+                    end="p2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        # Live sync 2 (limited): @member leaves and the room is renamed.
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [
+                    member_event("$leave", ts=400, membership="leave"),
+                    name_event("$name3", ts=500, name="After"),
+                ],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        # The gap's state events reached the callbacks...
+        assert "$name2" in name_ids
+        # ...but did not roll back the room's current state.
+        assert room.name == "After"
+        assert "@member:example.org" not in room.users
+
+    async def test_backfill_timeout_is_tolerated(self, tempdir, aioresponse):
+        """A hanging /messages request is abandoned at backfill_timeout."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_timeout=0.05
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        # The mocked homeserver never answers; only backfill_timeout can stop
+        # the backfill (room_messages retries rate limits and timeouts
+        # internally, so no error response ever surfaces).
+        async def hang(url, **kwargs) -> CallbackResult:
+            await asyncio.sleep(30)
+            return CallbackResult(status=200, payload=messages_payload([], end=None))
+
+        aioresponse.get(MESSAGES_URL, callback=hang, repeat=True)
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$old", "$new"]
+        await client.close()
