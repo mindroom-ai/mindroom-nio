@@ -23,11 +23,12 @@ and that the loop long-polls instead of busy-looping.
 import argparse
 import asyncio
 import secrets
+import statistics
 import sys
 import time
 
 from nio import AsyncClient
-from nio.responses import RegisterResponse, SlidingSyncResponse
+from nio.responses import RegisterResponse, SlidingSyncResponse, SyncResponse
 
 LISTS = {
     "main": {
@@ -235,10 +236,102 @@ async def slam(
         )
 
 
+async def _timed(coro_factory, response_type, iterations: int):
+    """Run coro_factory() `iterations` times, return (median s, body bytes)."""
+    times = []
+    size = 0
+    for _ in range(iterations):
+        start = time.monotonic()
+        resp = await coro_factory()
+        times.append(time.monotonic() - start)
+        check(
+            f"bench: {response_type.__name__} succeeds",
+            isinstance(resp, response_type),
+            repr(resp),
+        )
+        size = len(await resp.transport_response.read())
+    return statistics.median(times), size
+
+
+async def bench(client: AsyncClient, n_rooms: int, msgs_per_room: int = 5) -> None:
+    """Compare classic /v3/sync against sliding sync on the same account."""
+    semaphore = asyncio.Semaphore(8)
+
+    async def make_room(i: int) -> None:
+        async with semaphore:
+            resp = await client.room_create(name=f"bench room {i}")
+            for j in range(msgs_per_room):
+                await client.room_send(
+                    resp.room_id,
+                    "m.room.message",
+                    {"msgtype": "m.text", "body": f"bench-{i}-{j}"},
+                )
+
+    start = time.monotonic()
+    await asyncio.gather(*(make_room(i) for i in range(n_rooms)))
+    print(
+        f"bench: created {n_rooms} rooms x {msgs_per_room} msgs "
+        f"in {time.monotonic() - start:.0f}s"
+    )
+
+    iterations = 5
+    counter = iter(range(1000))
+
+    async def sliding_initial():
+        return await client.sliding_sync(
+            conn_id=f"bench-{next(counter)}", timeout=0, lists=SLAM_LISTS
+        )
+
+    async def v3_initial():
+        client.next_batch = None
+        return await client.sync(timeout=0)
+
+    s_time, s_size = await _timed(sliding_initial, SlidingSyncResponse, iterations)
+    v3_time, v3_size = await _timed(v3_initial, SyncResponse, iterations)
+
+    v3_batch = client.next_batch
+    inc = await client.sliding_sync(conn_id="bench-inc", timeout=0, lists=SLAM_LISTS)
+    pos = inc.pos
+
+    async def sliding_incremental():
+        nonlocal pos
+        resp = await client.sliding_sync(
+            conn_id="bench-inc", pos=pos, timeout=0, lists=SLAM_LISTS
+        )
+        pos = resp.pos
+        return resp
+
+    async def v3_incremental():
+        return await client.sync(timeout=0, since=v3_batch)
+
+    si_time, si_size = await _timed(
+        sliding_incremental, SlidingSyncResponse, iterations
+    )
+    v3i_time, v3i_size = await _timed(v3_incremental, SyncResponse, iterations)
+
+    top_n = SLAM_LISTS["slam"]["ranges"][0][1] + 1
+    print(
+        f"bench: initial sync, {n_rooms}+ rooms "
+        f"(medians of {iterations}, uncompressed bytes):\n"
+        f"bench:   /v3/sync (all rooms):      {v3_time * 1000:7.0f} ms  "
+        f"{v3_size:>12,} B\n"
+        f"bench:   sliding sync (top {top_n}):    {s_time * 1000:7.0f} ms  "
+        f"{s_size:>12,} B\n"
+        f"bench:   -> {v3_time / s_time:.1f}x faster, "
+        f"{v3_size / s_size:.1f}x less data\n"
+        f"bench: incremental sync (idle connection):\n"
+        f"bench:   /v3/sync:                  {v3i_time * 1000:7.0f} ms  "
+        f"{v3i_size:>12,} B\n"
+        f"bench:   sliding sync:              {si_time * 1000:7.0f} ms  "
+        f"{si_size:>12,} B"
+    )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--homeserver", default="http://127.0.0.1:8008")
     parser.add_argument("--slam", action="store_true")
+    parser.add_argument("--bench", action="store_true")
     parser.add_argument("--rooms", type=int, default=10)
     parser.add_argument("--messages", type=int, default=2000)
     parser.add_argument("--edits", type=int, default=10000)
@@ -257,7 +350,9 @@ async def main() -> None:
             repr(resp),
         )
         check("initial pos is set", bool(resp.pos))
-        check("list is parsed", "main" in resp.lists)
+        # NB: some servers (Tuwunel) omit `lists` entirely while the
+        # account has no rooms, so the list echo is asserted after a room
+        # exists instead of here.
 
         room_resp = await alice.room_create(name="sliding sync live check")
         room_id = room_resp.room_id
@@ -281,6 +376,11 @@ async def main() -> None:
         )
         check("pos advances", resp.pos != pos, f"pos stuck at {pos!r}")
         check("new room is in the response", room_id in resp.rooms)
+        check(
+            "list is parsed with room count",
+            "main" in resp.lists and resp.lists["main"].count >= 1,
+            repr(resp.lists),
+        )
 
         room = resp.rooms[room_id]
         check("room name parsed", room.name == "sliding sync live check", room.name)
@@ -338,6 +438,9 @@ async def main() -> None:
 
         if args.slam:
             await slam(alice, bob, args.rooms, args.messages, args.edits)
+
+        if args.bench:
+            await bench(alice, args.rooms)
 
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
     finally:
