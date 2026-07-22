@@ -1292,12 +1292,17 @@ class AsyncClient(Client):
         lists: Optional[Dict[str, Any]] = None,
         room_subscriptions: Optional[Dict[str, Any]] = None,
         extensions: Optional[Dict[str, Any]] = None,
-        unstable: bool = False,
+        unstable: bool = True,
     ) -> Union[SlidingSyncResponse, SlidingSyncError]:
         """Synchronise with MSC4186 Simplified Sliding Sync.
 
         This method returns a typed sliding sync response but does not update
         the client's v3 sync room state.
+
+        By default this targets the unstable
+        ``org.matrix.simplified_msc3575`` endpoint, the only one deployed
+        servers currently serve; set ``unstable`` to ``False`` to target the
+        proposed stable ``/_matrix/client/v4/sync`` path.
 
         Args:
             timeout(int, optional): The maximum time that the server should

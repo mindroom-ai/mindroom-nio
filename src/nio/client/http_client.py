@@ -1105,12 +1105,17 @@ class HttpClient(Client):
         lists: Optional[Dict[str, Any]] = None,
         room_subscriptions: Optional[Dict[str, Any]] = None,
         extensions: Optional[Dict[str, Any]] = None,
-        unstable: bool = False,
+        unstable: bool = True,
     ) -> Tuple[UUID, bytes]:
         """Synchronise with MSC4186 Simplified Sliding Sync.
 
         Returns a unique uuid that identifies the request and the bytes that
         should be sent to the socket.
+
+        By default this targets the unstable
+        ``org.matrix.simplified_msc3575`` endpoint, the only one deployed
+        servers currently serve; set ``unstable`` to ``False`` to target the
+        proposed stable ``/_matrix/client/v4/sync`` path.
         """
         request = self._build_request(
             Api.sliding_sync(

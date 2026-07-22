@@ -319,12 +319,14 @@ class SlidingSyncRoom:
     required_state: List[Union[Event, BadEventType, SlidingSyncStateStub]] = field(
         default_factory=list
     )
-    timeline_events: List[Union[Event, BadEventType]] = field(default_factory=list)
+    timeline: List[Union[Event, BadEventType]] = field(default_factory=list)
     prev_batch: Optional[str] = None
     limited: bool = False
     num_live: Optional[int] = None
     joined_count: Optional[int] = None
     invited_count: Optional[int] = None
+    notification_count: Optional[int] = None
+    highlight_count: Optional[int] = None
     stripped_state: List[Union[InviteEvent, BadEventType]] = field(default_factory=list)
 
     @staticmethod
@@ -370,22 +372,28 @@ class SlidingSyncRoom:
             ],
             is_dm=parsed_dict.get("is_dm"),
             initial=parsed_dict.get("initial", False),
-            expanded_timeline=parsed_dict.get("expanded_timeline", False),
+            # Synapse serialises this flag with an unstable prefix.
+            expanded_timeline=parsed_dict.get(
+                "unstable_expanded_timeline",
+                parsed_dict.get("expanded_timeline", False),
+            ),
             required_state=cls._get_required_state(
                 parsed_dict.get("required_state", [])
             ),
-            timeline_events=SyncResponse._get_room_events(
-                # Current MSC4186 names this field timeline_events, but older
-                # server examples used timeline.
-                parsed_dict.get("timeline_events", parsed_dict.get("timeline", []))
-            ),
+            timeline=SyncResponse._get_room_events(parsed_dict.get("timeline", [])),
             prev_batch=parsed_dict.get("prev_batch"),
             limited=parsed_dict.get("limited", False),
             num_live=parsed_dict.get("num_live"),
             joined_count=parsed_dict.get("joined_count"),
             invited_count=parsed_dict.get("invited_count"),
+            # The current MSC4186 text drops these counts, but deployed
+            # servers still include them on every room.
+            notification_count=parsed_dict.get("notification_count"),
+            highlight_count=parsed_dict.get("highlight_count"),
             stripped_state=cls._get_stripped_state(
-                parsed_dict.get("stripped_state", [])
+                # The MSC4186 text renamed invite_state to stripped_state;
+                # deployed servers still send invite_state.
+                parsed_dict.get("stripped_state", parsed_dict.get("invite_state", []))
             ),
         )
 

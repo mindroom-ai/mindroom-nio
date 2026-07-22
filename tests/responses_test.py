@@ -243,7 +243,7 @@ class TestClass:
                     ],
                     "is_dm": True,
                     "initial": True,
-                    "expanded_timeline": True,
+                    "unstable_expanded_timeline": True,
                     "required_state": [
                         {"type": "m.room.name", "state_key": ""},
                         {
@@ -255,7 +255,7 @@ class TestClass:
                             "content": {"room_version": "12"},
                         },
                     ],
-                    "timeline_events": [
+                    "timeline": [
                         {
                             "event_id": "$message:example.org",
                             "sender": "@alice:example.org",
@@ -269,6 +269,8 @@ class TestClass:
                     "num_live": 1,
                     "joined_count": 2,
                     "invited_count": 0,
+                    "notification_count": 11,
+                    "highlight_count": 1,
                     "membership": "join",
                     "lists": ["main"],
                 }
@@ -294,38 +296,43 @@ class TestClass:
         assert room.lists == ["main"]
         assert isinstance(room.required_state[0], SlidingSyncStateStub)
         assert room.required_state[0].type == "m.room.name"
-        assert room.timeline_events[0].source["content"]["body"] == "hi"
+        assert room.timeline[0].source["content"]["body"] == "hi"
         assert room.prev_batch == "t111_222_333"
         assert room.limited
         assert room.num_live == 1
         assert room.joined_count == 2
         assert room.invited_count == 0
+        assert room.notification_count == 11
+        assert room.highlight_count == 1
 
     def test_sliding_sync_parse_stripped_state(self):
-        parsed_dict = {
-            "pos": "s1",
-            "rooms": {
-                "!invited:example.org": {
-                    "membership": "invite",
-                    "stripped_state": [
-                        {
-                            "sender": "@alice:example.org",
-                            "state_key": "@bob:example.org",
-                            "type": "m.room.member",
-                            "content": {"membership": "invite"},
-                        }
-                    ],
-                }
-            },
-        }
+        # Deployed servers send invite_state; the current MSC4186 text
+        # renamed it to stripped_state. Both must parse.
+        for wire_key in ("invite_state", "stripped_state"):
+            parsed_dict = {
+                "pos": "s1",
+                "rooms": {
+                    "!invited:example.org": {
+                        "membership": "invite",
+                        wire_key: [
+                            {
+                                "sender": "@alice:example.org",
+                                "state_key": "@bob:example.org",
+                                "type": "m.room.member",
+                                "content": {"membership": "invite"},
+                            }
+                        ],
+                    }
+                },
+            }
 
-        response = SlidingSyncResponse.from_dict(parsed_dict)
+            response = SlidingSyncResponse.from_dict(parsed_dict)
 
-        assert isinstance(response, SlidingSyncResponse)
-        room = response.rooms["!invited:example.org"]
-        assert room.membership == "invite"
-        assert room.stripped_state[0].source["type"] == "m.room.member"
-        assert room.stripped_state[0].membership == "invite"
+            assert isinstance(response, SlidingSyncResponse)
+            room = response.rooms["!invited:example.org"]
+            assert room.membership == "invite"
+            assert room.stripped_state[0].source["type"] == "m.room.member"
+            assert room.stripped_state[0].membership == "invite"
 
     def test_keyshare_request(self):
         parsed_dict = {
