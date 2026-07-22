@@ -146,10 +146,13 @@ class PagedMessages:
     def __init__(self, pages: dict):
         self.pages = pages
         self.requested_tokens: List[Optional[str]] = []
+        self.requested_to: List[Optional[str]] = []
 
     def __call__(self, url, **kwargs) -> CallbackResult:
-        token = parse_qs(urlparse(str(url)).query).get("from", [None])[0]
+        query = parse_qs(urlparse(str(url)).query)
+        token = query.get("from", [None])[0]
         self.requested_tokens.append(token)
+        self.requested_to.append(query.get("to", [None])[0])
         return CallbackResult(status=200, payload=self.pages[token])
 
 
@@ -239,7 +242,11 @@ class TestLimitedTimelineBackfill:
     async def test_limited_timeline_recovers_gap_in_order(
         self, backfill_client, aioresponse
     ):
-        """A limited timeline backfills the gap and dispatches it oldest first."""
+        """A limited timeline backfills the gap and dispatches chronologically.
+
+        The recovered gap events are delivered before the sync response's own
+        (newer) events, so callbacks observe the room in chronological order.
+        """
         dispatched = self._record_callback(backfill_client)
 
         # First (non-limited) sync establishes the delivered position at $old.
@@ -279,7 +286,7 @@ class TestLimitedTimelineBackfill:
             )
         )
 
-        assert dispatched == ["$old", "$new", "$gap1", "$gap2"]
+        assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
         assert pages.requested_tokens == ["p1"]
 
     async def test_events_in_sync_response_are_not_redispatched(
@@ -320,7 +327,7 @@ class TestLimitedTimelineBackfill:
             )
         )
 
-        assert dispatched == ["$old", "$present", "$gap1"]
+        assert dispatched == ["$old", "$gap1", "$present"]
 
     async def test_already_delivered_events_are_not_redispatched(
         self, backfill_client, aioresponse
@@ -409,8 +416,8 @@ class TestLimitedTimelineBackfill:
 
         # $old and $new from the syncs, plus exactly three backfilled pages.
         # The walk fetches newest first ($gap1, $gap2, $gap3) and dispatches the
-        # recovered events oldest first, reversing that order.
-        assert dispatched == ["$old", "$new", "$gap3", "$gap2", "$gap1"]
+        # recovered events oldest first (reversing that order), before $new.
+        assert dispatched == ["$old", "$gap3", "$gap2", "$gap1", "$new"]
         assert counter["n"] == 3
         # Stopping at a bound means the gap was not verifiably closed, which
         # must be surfaced to operators rather than silently accepted.
@@ -661,3 +668,108 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$old", "$new"]
         await client.close()
+
+    async def test_restart_resume_backfills_first_limited_sync(
+        self, backfill_client, aioresponse
+    ):
+        """A since-token resume recovers a gap even with no delivered ids.
+
+        This is the restart scenario: the client continues from a stored sync
+        token, so a room's first (limited) sync of this run can still hide a
+        gap. The walk is bounded server-side by the since token instead of by
+        delivered event ids, so nothing delivered before the restart is
+        re-dispatched.
+        """
+        dispatched = self._record_callback(backfill_client)
+        # Simulate resuming from a stored token: no room has been seen yet,
+        # but the client knows the position the sync continued from.
+        backfill_client.next_batch = "since_restart"
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap2", ts=200), text_event("$gap1", ts=100)],
+                    end="p2",
+                ),
+                # The server returns an empty chunk once the `to` bound is hit.
+                "p2": messages_payload([], end="p3"),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$gap1", "$gap2", "$new"]
+        # Every page was bounded server-side by the resume position.
+        assert pages.requested_to == ["since_restart", "since_restart"]
+
+    async def test_newly_joined_room_is_not_backfilled(
+        self, backfill_client, aioresponse
+    ):
+        """A freshly joined room's history is not a gap, even on a since resume.
+
+        The discriminator is our own membership event in the sync response: a
+        genuinely resumed room never carries one (our join predates the since
+        token), while a fresh join always does.
+        """
+        dispatched = self._record_callback(backfill_client)
+        backfill_client.next_batch = "since_token"
+
+        calls = {"n": 0}
+
+        def spy(url, **kwargs) -> CallbackResult:
+            calls["n"] += 1
+            return CallbackResult(status=200, payload=messages_payload([], end=None))
+
+        aioresponse.get(MESSAGES_URL, callback=spy, repeat=True)
+
+        own_join = member_event(
+            "$ownjoin", ts=250, membership="join", user_id=backfill_client.user_id
+        )
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [own_join, text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$new"]
+        assert calls["n"] == 0
+
+    async def test_left_room_clears_delivered_ids(self, backfill_client, aioresponse):
+        """Leaving a room forgets its delivered ids so a rejoin starts fresh."""
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$a", ts=100)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        assert TEST_ROOM_ID in backfill_client._backfill_delivered_ids
+
+        left_info = RoomInfo(Timeline([], False, None), [], [], [])
+        await backfill_client.receive_response(
+            SyncResponse(
+                "s2",
+                Rooms({}, {}, {TEST_ROOM_ID: left_info}),
+                DeviceOneTimeKeyCount(49, 50),
+                DeviceList([], []),
+                [],
+                [],
+            )
+        )
+
+        assert TEST_ROOM_ID not in backfill_client._backfill_delivered_ids
