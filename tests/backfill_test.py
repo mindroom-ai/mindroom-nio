@@ -164,10 +164,12 @@ def sync_json(
 
 
 def messages_payload(events: List[RoomMessageText], *, end: Optional[str]) -> dict:
-    """Build a /messages response body; the chunk is newest first as the server sends.
+    """Build a /messages response body, ordered as the server sends it.
 
-    ``end=None`` omits the key entirely, which is how a server signals that
-    the pagination walk has reached its end.
+    The chunk follows the requested direction: newest first for ``dir=b``
+    walks, oldest first for ``dir=f``. ``end=None`` omits the key entirely,
+    which is how a server signals that the pagination walk has reached its
+    end.
     """
     payload: dict = {
         "start": "start_token",
@@ -189,13 +191,13 @@ class PagedMessages:
     def __init__(self, pages: dict):
         self.pages = pages
         self.requested_tokens: List[Optional[str]] = []
-        self.requested_to: List[Optional[str]] = []
+        self.requested_dir: List[Optional[str]] = []
 
     def __call__(self, url, **kwargs) -> CallbackResult:
         query = parse_qs(urlparse(str(url)).query)
         token = query.get("from", [None])[0]
         self.requested_tokens.append(token)
-        self.requested_to.append(query.get("to", [None])[0])
+        self.requested_dir.append(query.get("dir", [None])[0])
         return CallbackResult(status=200, payload=self.pages[token])
 
 
@@ -719,9 +721,10 @@ class TestLimitedTimelineBackfill:
 
         This is the restart scenario: the client continues from a stored sync
         token, so a room's first (limited) sync of this run can still hide a
-        gap. The walk is bounded server-side by the since token instead of by
-        delivered event ids, so nothing delivered before the restart is
-        re-dispatched.
+        gap. The gap is paged forwards from the since token instead of
+        backwards to delivered event ids, so nothing delivered before the
+        restart can be re-dispatched — verified live against Tuwunel, which
+        silently ignores backwards ``to`` bounds.
         """
         dispatched = self._record_callback(backfill_client)
         # Simulate resuming from a stored token: no room has been seen yet,
@@ -730,13 +733,14 @@ class TestLimitedTimelineBackfill:
 
         pages = PagedMessages(
             {
-                "p1": messages_payload(
-                    [text_event("$gap2", ts=200), text_event("$gap1", ts=100)],
-                    end="p2",
+                # Forward pages are chronological, starting at the since token.
+                "since_restart": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$gap2", ts=200)],
+                    end="fwd2",
                 ),
-                # The server signals the end of the walk (the `to` bound was
-                # reached) by no longer returning an end token.
-                "p2": messages_payload([], end=None),
+                # The next page reaches an event from the sync window, the
+                # near edge of the gap.
+                "fwd2": messages_payload([text_event("$new", ts=300)], end="fwd3"),
             }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
@@ -752,8 +756,9 @@ class TestLimitedTimelineBackfill:
         )
 
         assert dispatched == ["$gap1", "$gap2", "$new"]
-        # Every page was bounded server-side by the resume position.
-        assert pages.requested_to == ["since_restart", "since_restart"]
+        # The walk paged forwards from the resume position.
+        assert pages.requested_tokens == ["since_restart", "fwd2"]
+        assert pages.requested_dir == ["f", "f"]
 
     async def test_newly_joined_room_is_not_backfilled(
         self, backfill_client, aioresponse
@@ -763,7 +768,8 @@ class TestLimitedTimelineBackfill:
         The discriminator is our own join transition in the sync timeline: a
         genuinely resumed room never carries one (our join predates the since
         token), while a fresh join always does — in the timeline if it survived
-        the window, otherwise in the gap, where it stops the history walk.
+        the window, otherwise in the gap, where the forward walk discards
+        everything collected before it.
         """
         dispatched = self._record_callback(backfill_client)
         backfill_client.next_batch = "since_token"
@@ -805,7 +811,7 @@ class TestLimitedTimelineBackfill:
         backfill_client.next_batch = "since_restart"
 
         pages = PagedMessages(
-            {"p1": messages_payload([text_event("$gap1", ts=100)], end=None)}
+            {"since_restart": messages_payload([text_event("$gap1", ts=100)], end=None)}
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
@@ -824,7 +830,7 @@ class TestLimitedTimelineBackfill:
         )
 
         assert dispatched == ["$gap1", "$new"]
-        assert pages.requested_to == ["since_restart"]
+        assert pages.requested_dir == ["f"]
 
     async def test_walk_stops_at_own_join(self, backfill_client, aioresponse):
         """A fresh join whose join event fell into the gap recovers only
@@ -837,14 +843,16 @@ class TestLimitedTimelineBackfill:
         )
         pages = PagedMessages(
             {
-                "p1": messages_payload(
+                # Forward page from the since position: the walk collects
+                # $prejoin, then discards it when it reaches our own join.
+                "since_token": messages_payload(
                     [
-                        text_event("$post2", ts=260),
-                        text_event("$post1", ts=255),
-                        own_join,
                         text_event("$prejoin", ts=240),
+                        own_join,
+                        text_event("$post1", ts=255),
+                        text_event("$post2", ts=260),
                     ],
-                    end="p2",
+                    end=None,
                 ),
             }
         )
@@ -974,7 +982,7 @@ class TestLimitedTimelineBackfill:
         dispatched = self._record_callback(backfill_client)
 
         pages = PagedMessages(
-            {"p1": messages_payload([text_event("$gap1", ts=100)], end=None)}
+            {"tok0": messages_payload([text_event("$gap1", ts=100)], end=None)}
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
         aioresponse.get(
@@ -992,7 +1000,46 @@ class TestLimitedTimelineBackfill:
 
         assert isinstance(response, SyncResponse)
         assert dispatched == ["$gap1", "$new"]
-        assert pages.requested_to == ["tok0"]
+        # The forward walk starts exactly at the caller's since token.
+        assert pages.requested_tokens == ["tok0"]
+        assert pages.requested_dir == ["f"]
+
+    async def test_repeated_end_token_leaves_gap_open(
+        self, backfill_client, aioresponse, caplog
+    ):
+        """A page whose end token repeats the from token is a stall, not proof
+        that the history was exhausted; the gap must stay open and warn."""
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {"p1": messages_payload([text_event("$gap1", ts=100)], end="p1")}
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await backfill_client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        # What was recovered is still dispatched, but the stall is surfaced.
+        assert dispatched == ["$old", "$gap1", "$new"]
+        assert "without fully closing the gap" in caplog.text
 
     async def test_left_room_clears_delivered_ids(self, backfill_client, aioresponse):
         """Leaving a room forgets its delivered ids so a rejoin starts fresh."""

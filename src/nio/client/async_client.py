@@ -380,9 +380,10 @@ class AsyncClientConfig(ClientConfig):
             events but never applied to the ``MatrixRoom`` state, which is
             already newer than they are. A gap that spans a client restart is
             recovered as well, provided the sync resumed from a sync token
-            (e.g. via ``store_sync_tokens``): the walk is then bounded
-            server-side by that token instead of by previously delivered event
-            ids. Rooms that were just joined are never backfilled past our own
+            (e.g. via ``store_sync_tokens``): the gap is then paged forwards
+            from that token instead of backwards to previously delivered event
+            ids, so nothing delivered before it can ever be re-dispatched.
+            Rooms that were just joined are never backfilled past our own
             join: a join of ours in the sync timeline skips the backfill
             entirely, and one encountered while paging stops the walk, so
             pre-join history is never dispatched. Disabled by default, in
@@ -728,7 +729,7 @@ class AsyncClient(Client):
                     await self._backfill_limited_timeline(room_id, room, join_info)
                 elif since and not self._own_join_in_timeline(join_info):
                     await self._backfill_limited_timeline(
-                        room_id, room, join_info, end_token=since
+                        room_id, room, join_info, since=since
                     )
 
             for index, event in enumerate(join_info.timeline.events):
@@ -820,26 +821,30 @@ class AsyncClient(Client):
         room_id: str,
         room: MatrixRoom,
         join_info: RoomInfo,
-        end_token: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> None:
         """Recover and dispatch events dropped by one room's limited timeline.
 
         The homeserver truncated this room's timeline (``limited: true``), so the
         events between the last delivered position and the surviving window were
-        never handed to the event callbacks. Page ``/messages`` backwards from
-        the timeline's ``prev_batch`` token until an already-delivered event, the
-        optional ``end_token`` (the since position, for rooms without delivered
-        ids) or a configured bound is reached, then dispatch the recovered
-        events oldest first through the normal event callbacks, before the sync
-        response's own events. Recovered events are decrypted like live events
-        but never applied to room state, which is already newer than they are.
-        Any failure is logged and swallowed, and the whole walk is bounded by
+        never handed to the event callbacks. For a room with delivered-id
+        memory, page ``/messages`` backwards from the timeline's ``prev_batch``
+        token until an already-delivered event or a configured bound is
+        reached. For a room without one (its first sync of this run, resuming
+        from ``since``), page forwards from the since position instead — a
+        forward walk can only ever return events from inside the gap, so
+        nothing delivered before that position can be re-dispatched, regardless
+        of how the server interprets pagination bounds. Recovered events are
+        dispatched oldest first through the normal event callbacks, before the
+        sync response's own events; they are decrypted like live events but
+        never applied to room state, which is already newer than they are. Any
+        failure is logged and swallowed, and the whole walk is bounded by
         ``backfill_timeout``, so a backfill can never break or stall the sync
         loop.
         """
         prev_batch = join_info.timeline.prev_batch
 
-        if not prev_batch:
+        if since is None and not prev_batch:
             logger.warning(
                 "Skipping limited-timeline backfill for room %s: no prev_batch",
                 room_id,
@@ -853,11 +858,16 @@ class AsyncClient(Client):
             if getattr(event, "event_id", None)
         }
 
+        if since is None:
+            collect = self._collect_backfill_events(
+                room_id, prev_batch, already_delivered, present_in_sync
+            )
+        else:
+            collect = self._collect_gap_events_forward(room_id, since, present_in_sync)
+
         try:
             recovered, pages, gap_closed = await asyncio.wait_for(
-                self._collect_backfill_events(
-                    room_id, prev_batch, already_delivered, present_in_sync, end_token
-                ),
+                collect,
                 timeout=self.config.backfill_timeout,
             )
         except asyncio.TimeoutError:
@@ -955,20 +965,18 @@ class AsyncClient(Client):
         prev_batch: str,
         already_delivered: "OrderedDict[str, None]",
         present_in_sync: Set[str],
-        end_token: Optional[str] = None,
     ) -> Tuple[List[Union[Event, BadEventType]], int, bool]:
         """Page a limited room's history backwards and collect the gap events.
 
         Walks ``/messages`` newest first from ``prev_batch`` until it reaches an
         event that was already delivered or is present in the sync response (the
         far edge of the gap), reaches our own join into the room, exhausts the
-        room's history (or the server-side ``end_token`` bound, when given), or
-        hits the page or event bounds from the client config. Returns the
-        recovered events in chronological (oldest first) order, the number of
-        pages fetched, and whether the gap was closed — i.e. the walk reached a
-        boundary or the end of the pageable history, rather than stopping at a
-        client-side bound or on an error. Boundary events themselves are never
-        returned.
+        room's history, or hits the page or event bounds from the client
+        config. Returns the recovered events in chronological (oldest first)
+        order, the number of pages fetched, and whether the gap was closed —
+        i.e. the walk reached a boundary or the end of the pageable history,
+        rather than stopping at a client-side bound or on an error. Boundary
+        events themselves are never returned.
         """
         max_pages = self.config.backfill_max_pages
         max_events = self.config.backfill_max_events
@@ -984,7 +992,6 @@ class AsyncClient(Client):
             response = await self.room_messages(
                 room_id,
                 start=token,
-                end=end_token,
                 direction=MessageDirection.back,
                 limit=page_size,
             )
@@ -1024,12 +1031,16 @@ class AsyncClient(Client):
                 break
 
             next_token = response.end
-            if not next_token or next_token == token:
-                # The server signalled the end of the walk: the room's earliest
-                # history or the end_token bound was reached, so the gap is
-                # closed. An empty chunk alone is no such signal — pagination
-                # must continue for as long as the end token keeps advancing.
+            if not next_token:
+                # An absent end token is the server's signal that the room's
+                # earliest history was reached, so the gap is closed. An empty
+                # chunk alone is no such signal — pagination must continue for
+                # as long as the end token keeps advancing.
                 gap_closed = True
+                break
+            if next_token == token:
+                # A repeated end token only proves the walk made no progress,
+                # not that the history was exhausted; leave the gap open.
                 break
             token = next_token
 
@@ -1039,6 +1050,99 @@ class AsyncClient(Client):
             gap_closed = False
             del recovered[max_events:]
         recovered.reverse()
+        return recovered, pages, gap_closed
+
+    async def _collect_gap_events_forward(
+        self,
+        room_id: str,
+        since: str,
+        present_in_sync: Set[str],
+    ) -> Tuple[List[Union[Event, BadEventType]], int, bool]:
+        """Page forwards from the since position and collect the gap events.
+
+        Used for a room without delivered-id memory (its first sync of this
+        run, resuming from a stored or explicit since token). A forward walk
+        can only ever return events from after that position, so events
+        delivered before it can never be re-dispatched — unlike a backwards
+        walk bounded with ``to``, which some servers (Tuwunel) silently ignore.
+        Servers that cannot parse a sync token as a ``from`` position fail the
+        request, which degrades to skipping the backfill. The walk stops when
+        it reaches an event already present in the sync response (the near edge
+        of the gap), the live edge of the timeline, or a configured bound.
+        Encountering our own join transition discards everything collected so
+        far: events before it predate our membership and are not a delivery
+        gap. Returns the recovered events in chronological (oldest first)
+        order, the number of pages fetched, and whether the gap was closed.
+        """
+        max_pages = self.config.backfill_max_pages
+        max_events = self.config.backfill_max_events
+        page_size = self.config.backfill_page_size
+
+        recovered: List[Union[Event, BadEventType]] = []
+        seen_ids: Set[str] = set()
+        token: Optional[str] = since
+        pages = 0
+        gap_closed = False
+
+        while pages < max_pages and token:
+            response = await self.room_messages(
+                room_id,
+                start=token,
+                direction=MessageDirection.front,
+                limit=page_size,
+            )
+            pages += 1
+
+            if not isinstance(response, RoomMessagesResponse):
+                logger.warning(
+                    "Stopping limited-timeline backfill for room %s: %s",
+                    room_id,
+                    response,
+                )
+                break
+
+            reached_window = False
+            for event in response.chunk:
+                event_id = getattr(event, "event_id", None)
+                if not event_id:
+                    continue
+                if event_id in present_in_sync:
+                    reached_window = True
+                    break
+                if self._is_own_join_transition(event):
+                    recovered.clear()
+                    seen_ids.clear()
+                    continue
+                if event_id in seen_ids:
+                    continue
+                seen_ids.add(event_id)
+                recovered.append(event)
+
+            if reached_window:
+                gap_closed = True
+                break
+
+            if len(recovered) >= max_events:
+                break
+
+            next_token = response.end
+            if not next_token:
+                # An absent end token means the live edge of the timeline was
+                # reached.
+                gap_closed = True
+                break
+            if next_token == token:
+                # A repeated end token only proves the walk made no progress,
+                # not that the gap was covered; leave it open.
+                break
+            token = next_token
+
+        if len(recovered) > max_events:
+            # Truncation drops the newest recovered events; the kept prefix
+            # stays contiguous with the since position, but the gap between it
+            # and the sync window is not closed.
+            gap_closed = False
+            del recovered[max_events:]
         return recovered, pages, gap_closed
 
     async def _handle_presence_events(self, response: SyncResponse):
