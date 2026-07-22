@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -193,12 +194,14 @@ class PagedMessages:
         self.pages = pages
         self.requested_tokens: List[Optional[str]] = []
         self.requested_dir: List[Optional[str]] = []
+        self.requested_to: List[Optional[str]] = []
 
     def __call__(self, url, **kwargs) -> CallbackResult:
         query = parse_qs(urlparse(str(url)).query)
         token = query.get("from", [None])[0]
         self.requested_tokens.append(token)
         self.requested_dir.append(query.get("dir", [None])[0])
+        self.requested_to.append(query.get("to", [None])[0])
         return CallbackResult(status=200, payload=self.pages[token])
 
 
@@ -333,6 +336,8 @@ class TestLimitedTimelineBackfill:
         assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
         assert pages.requested_tokens == ["s1", "fwd2"]
         assert pages.requested_dir == ["f", "f"]
+        # The sync's next_batch clamps the walk on servers that honour `to`.
+        assert pages.requested_to == ["s2", "s2"]
 
     async def test_events_in_sync_response_are_not_redispatched(
         self, backfill_client, aioresponse
@@ -532,7 +537,12 @@ class TestLimitedTimelineBackfill:
         )
 
         pages = PagedMessages(
-            {"s1": messages_payload([text_event("$gap1", ts=100)], end=None)}
+            {
+                "s1": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
+                    end="fwd2",
+                )
+            }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
@@ -590,8 +600,9 @@ class TestLimitedTimelineBackfill:
                     [
                         member_event("$join2", ts=150, membership="join"),
                         name_event("$name2", ts=200, name="Gap name"),
+                        member_event("$leave", ts=400, membership="leave"),
                     ],
-                    end=None,
+                    end="fwd2",
                 ),
             }
         )
@@ -760,7 +771,12 @@ class TestLimitedTimelineBackfill:
         backfill_client.next_batch = "since_restart"
 
         pages = PagedMessages(
-            {"since_restart": messages_payload([text_event("$gap1", ts=100)], end=None)}
+            {
+                "since_restart": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
+                    end="fwd2",
+                )
+            }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
@@ -800,8 +816,9 @@ class TestLimitedTimelineBackfill:
                         own_join,
                         text_event("$post1", ts=255),
                         text_event("$post2", ts=260),
+                        text_event("$new", ts=300),
                     ],
-                    end=None,
+                    end="fwd2",
                 ),
             }
         )
@@ -839,7 +856,10 @@ class TestLimitedTimelineBackfill:
                 # An empty page mid-walk (e.g. filtered or purged history) is
                 # not the end of pagination while the end token advances.
                 "s1": messages_payload([], end="fwd2"),
-                "fwd2": messages_payload([text_event("$gap1", ts=100)], end=None),
+                "fwd2": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
+                    end="fwd3",
+                ),
             }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
@@ -867,7 +887,12 @@ class TestLimitedTimelineBackfill:
         dispatched = self._record_callback(backfill_client)
 
         pages = PagedMessages(
-            {"tok0": messages_payload([text_event("$gap1", ts=100)], end=None)}
+            {
+                "tok0": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
+                    end="fwd2",
+                )
+            }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
         aioresponse.get(
@@ -885,9 +910,122 @@ class TestLimitedTimelineBackfill:
 
         assert isinstance(response, SyncResponse)
         assert dispatched == ["$gap1", "$new"]
-        # The forward walk starts exactly at the caller's since token.
+        # The forward walk starts exactly at the caller's since token, clamped
+        # by the response's next_batch on servers that honour `to`.
         assert pages.requested_tokens == ["tok0"]
         assert pages.requested_dir == ["f"]
+        assert pages.requested_to == ["s2"]
+
+    async def test_live_edge_does_not_close_the_gap(
+        self, backfill_client, aioresponse, caplog
+    ):
+        """Reaching the live edge without meeting the sync window discards.
+
+        An absent end token proves the walk hit the room's *current* live
+        edge — not the sync position. Events that arrived after the sync
+        response was generated may sit in the buffer; dispatching them here
+        would deliver them again on the next sync.
+        """
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        # $future arrived during the backfill: it is newer than the sync
+        # window ($new) yet reachable by the walk; the window's own event
+        # never appears, so the gap is unverified.
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$future", ts=400)],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await backfill_client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        assert dispatched == ["$old", "$new"]
+        assert "$future" not in dispatched
+        assert "without fully closing the gap" in caplog.text
+
+    async def test_backfill_budget_is_shared_across_rooms(self, tempdir, aioresponse):
+        """Stalled rooms cannot stack timeouts; one budget covers the sync."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_timeout=0.2
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        client.next_batch = "since_x"
+
+        calls = {"n": 0}
+
+        async def hang(url, **kwargs) -> CallbackResult:
+            calls["n"] += 1
+            await asyncio.sleep(30)
+            return CallbackResult(status=200, payload=messages_payload([], end=None))
+
+        aioresponse.get(MESSAGES_URL, callback=hang, repeat=True)
+
+        rooms = Rooms(
+            {},
+            {
+                TEST_ROOM_ID: RoomInfo(
+                    Timeline([text_event("$a", ts=1)], True, "p1"), [], [], []
+                ),
+                OTHER_ROOM_ID: RoomInfo(
+                    Timeline(
+                        [text_event("$b", ts=2, room_id=OTHER_ROOM_ID)], True, "p2"
+                    ),
+                    [],
+                    [],
+                    [],
+                ),
+            },
+            {},
+        )
+        start = time.monotonic()
+        await client.receive_response(
+            SyncResponse(
+                "s2",
+                rooms,
+                DeviceOneTimeKeyCount(49, 50),
+                DeviceList([], []),
+                [],
+                [],
+            )
+        )
+        elapsed = time.monotonic() - start
+
+        # Both windows were still delivered; the first room consumed the whole
+        # budget, so the second room skipped its backfill without a request.
+        assert dispatched == ["$a", "$b"]
+        assert calls["n"] == 1
+        assert elapsed < 5
+        await client.close()
 
     async def test_forward_walk_discards_unverified_buffer(
         self, tempdir, aioresponse, caplog
