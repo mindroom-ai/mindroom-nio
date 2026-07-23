@@ -2,28 +2,6 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
-
-### Bug Fixes
-
-- Fix the MSC4186 sliding sync wire format to match deployed servers
-  (Synapse, Tuwunel/conduwuit): send `pos`, `timeout` and `set_presence` as
-  query parameters instead of body fields (previously servers silently
-  ignored them, so every request was treated as an initial sync with no
-  long-poll), default to the unstable `org.matrix.simplified_msc3575`
-  endpoint (the proposed stable `/_matrix/client/v4/sync` path is not served
-  by any homeserver yet), and parse the response keys servers actually emit:
-  `invite_state` (alongside the MSC's `stripped_state`),
-  `unstable_expanded_timeline`, and per-room `notification_count` /
-  `highlight_count`.
-
-### Breaking Changes
-
-- Rename `SlidingSyncRoom.timeline_events` to `timeline`, matching the wire
-  field name used by both the MSC text and deployed servers.
-- `Api.sliding_sync`, `AsyncClient.sliding_sync` and `HttpClient.sliding_sync`
-  now default to `unstable=True`.
-
 ## 0.27.4
 
 ### Features
