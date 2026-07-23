@@ -2289,10 +2289,43 @@ class SlidingSyncError(SyncError):
 
 @dataclass
 class SlidingSyncResponse(Response):
+    """A response for a MSC4186 Simplified Sliding Sync request.
+
+    Attributes:
+        pos (str): The position token to pass on the next request.
+        lists (Dict[str, SlidingSyncList]): The requested sliding window
+            lists, keyed by list name.
+        rooms (Dict[str, SlidingSyncRoom]): Room data, keyed by room id.
+        extensions (Dict[str, Any]): The raw extensions response object.
+        to_device_events (List[ToDeviceEvent]): Events parsed from the
+            ``to_device`` extension, mirroring
+            ``SyncResponse.to_device_events``.
+        to_device_next_batch (str, optional): The ``to_device`` extension's
+            delivery token; it must be sent back as ``extensions.to_device.
+            since`` on the next request, independently of ``pos``.
+        device_key_count (DeviceOneTimeKeyCount): One-time key counts from
+            the ``e2ee`` extension.
+        device_list (DeviceList): Users whose device lists changed, from the
+            ``e2ee`` extension.
+        account_data_events (List[AccountDataEvent]): Global account data
+            events from the ``account_data`` extension.
+        room_account_data (Dict[str, List[AccountDataEvent]]): Per-room
+            account data events from the ``account_data`` extension, keyed
+            by room id.
+    """
+
     pos: str = field()
     lists: Dict[str, SlidingSyncList] = field(default_factory=dict)
     rooms: Dict[str, SlidingSyncRoom] = field(default_factory=dict)
     extensions: Dict[str, Any] = field(default_factory=dict)
+    to_device_events: List[ToDeviceEvent] = field(default_factory=list)
+    to_device_next_batch: Optional[str] = None
+    device_key_count: DeviceOneTimeKeyCount = field(
+        default_factory=lambda: DeviceOneTimeKeyCount(None, None)
+    )
+    device_list: DeviceList = field(default_factory=lambda: DeviceList([], []))
+    account_data_events: List[AccountDataEvent] = field(default_factory=list)
+    room_account_data: Dict[str, List[AccountDataEvent]] = field(default_factory=dict)
 
     @staticmethod
     def _parse_list(
@@ -2338,11 +2371,50 @@ class SlidingSyncResponse(Response):
 
             rooms[room_id] = room
 
+        extensions = parsed_dict.get("extensions", {})
+
+        to_device_dict = extensions.get("to_device") or {}
+        to_device_events = [
+            event
+            for event in (
+                ToDeviceEvent.parse_event(event_dict)
+                for event_dict in to_device_dict.get("events", [])
+            )
+            if event is not None
+        ]
+
+        e2ee_dict = extensions.get("e2ee") or {}
+        key_count_dict = e2ee_dict.get("device_one_time_keys_count", {})
+        key_count = DeviceOneTimeKeyCount(
+            key_count_dict.get("curve25519"),
+            key_count_dict.get("signed_curve25519"),
+        )
+        device_list = DeviceList(
+            e2ee_dict.get("device_lists", {}).get("changed", []),
+            e2ee_dict.get("device_lists", {}).get("left", []),
+        )
+
+        account_data_dict = extensions.get("account_data") or {}
+        account_data_events = [
+            AccountDataEvent.parse_event(event_dict)
+            for event_dict in account_data_dict.get("global", [])
+        ]
+        room_account_data = {
+            room_id: [AccountDataEvent.parse_event(event_dict) for event_dict in events]
+            for room_id, events in (account_data_dict.get("rooms") or {}).items()
+        }
+
         return cls(
             parsed_dict["pos"],
             lists,
             rooms,
-            parsed_dict.get("extensions", {}),
+            extensions,
+            to_device_events,
+            to_device_dict.get("next_batch"),
+            key_count,
+            device_list,
+            account_data_events,
+            room_account_data,
         )
 
 

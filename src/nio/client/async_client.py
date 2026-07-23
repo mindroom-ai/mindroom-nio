@@ -206,6 +206,7 @@ from ..responses import (
     RoomResolveAliasResponse,
     RoomSendError,
     RoomSendResponse,
+    RoomSummary,
     RoomThreadsResponse,
     RoomTypingError,
     RoomTypingResponse,
@@ -222,6 +223,8 @@ from ..responses import (
     ShareGroupSessionResponse,
     SlidingSyncError,
     SlidingSyncResponse,
+    SlidingSyncRoom,
+    SlidingSyncStateStub,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -230,6 +233,7 @@ from ..responses import (
     ThumbnailResponse,
     ToDeviceError,
     ToDeviceResponse,
+    UnreadNotifications,
     UpdateDeviceError,
     UpdateDeviceResponse,
     UpdateReceiptMarkerError,
@@ -293,13 +297,15 @@ class _BackfillCallbackError(Exception):
     """
 
 
-# How many recently dispatched event ids to remember per room when
-# `backfill_limited_timelines` is enabled. The cache exists purely to
-# de-duplicate the /sync–/messages overlap the spec warns about (a federation
-# straggler can sit inside a walked gap topologically while its live delivery
-# already happened at an earlier stream position); it never decides where a
+# How many recently dispatched event ids to remember per room. The cache
+# exists purely to de-duplicate protocol-level re-delivery: the
+# /sync–/messages overlap the spec warns about when `backfill_limited_timelines`
+# is enabled (a federation straggler can sit inside a walked gap topologically
+# while its live delivery already happened at an earlier stream position), and
+# the re-sent timeline window a sliding sync connection produces whenever it
+# expires or a room re-enters the list window. It never decides where a
 # recovery walk starts or stops.
-_MAX_BACKFILL_DISPATCHED_IDS = 512
+_MAX_DISPATCHED_EVENT_IDS = 512
 
 
 async def on_request_chunk_sent(session, context, params):
@@ -563,12 +569,21 @@ class AsyncClient(Client):
         # even when the caller passed an explicit `since`.
         self._sync_since: Optional[str] = None
 
-        # Per-room memory of recently dispatched timeline event ids, kept only
-        # when `backfill_limited_timelines` is enabled. Used purely to skip
-        # events a recovery walk returns that were already delivered by an
-        # earlier sync (the /sync–/messages overlap); never used to decide
-        # where recovery starts or stops.
-        self._backfill_dispatched_ids: Dict[str, OrderedDict[str, None]] = {}
+        # Per-room memory of recently dispatched timeline event ids, kept
+        # when `backfill_limited_timelines` is enabled and by the sliding
+        # sync loop. Used purely to skip events the server re-delivers that
+        # were already handed to the event callbacks (the /sync–/messages
+        # overlap of a recovery walk, or the timeline window a sliding sync
+        # connection re-sends after expiring); never used to decide where
+        # recovery starts or stops.
+        self._dispatched_event_ids: Dict[str, OrderedDict[str, None]] = {}
+
+        # The delivery token of the sliding sync to_device extension. The
+        # token is device-scoped, not connection-scoped: sending it back as
+        # `extensions.to_device.since` acknowledges the messages delivered
+        # before it, so it outlives sliding sync connection expiry
+        # (M_UNKNOWN_POS) and is shared across conn_ids.
+        self._sliding_sync_to_device_since: Optional[str] = None
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -698,7 +713,9 @@ class AsyncClient(Client):
         resp.transport_response = transport_response
         return resp
 
-    async def _handle_to_device(self, response: SyncResponse):
+    async def _handle_to_device(
+        self, response: Union[SyncResponse, SlidingSyncResponse]
+    ):
         decrypted_to_device = []
 
         for index, to_device_event in enumerate(response.to_device_events):
@@ -829,14 +846,16 @@ class AsyncClient(Client):
     ) -> None:
         """Remember the ids of timeline events handed to the event callbacks.
 
-        Recovery walks skip ids in this per-room, bounded memory so that a
-        federation straggler — delivered live by an earlier sync but sitting
-        inside a later walked gap topologically — is not dispatched twice
-        (clients must de-duplicate the /sync–/messages overlap). The memory is
-        not persisted; after a restart the spec-permitted duplicate remains
-        possible for such stragglers.
+        Recovery walks and the sliding sync loop skip ids in this per-room,
+        bounded memory so that events the server re-delivers — a federation
+        straggler delivered live by an earlier sync but sitting inside a
+        later walked gap topologically (clients must de-duplicate the
+        /sync–/messages overlap), or the timeline window a sliding sync
+        connection re-sends after expiring — are not dispatched twice. The
+        memory is not persisted; after a restart the spec-permitted
+        duplicate remains possible.
         """
-        dispatched = self._backfill_dispatched_ids.setdefault(room_id, OrderedDict())
+        dispatched = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
 
         for event in events:
             event_id = getattr(event, "event_id", None)
@@ -844,7 +863,7 @@ class AsyncClient(Client):
                 continue
             dispatched[event_id] = dispatched.pop(event_id, None)
 
-        while len(dispatched) > _MAX_BACKFILL_DISPATCHED_IDS:
+        while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
             dispatched.popitem(last=False)
 
     def _is_own_join_transition(self, event: Union[Event, BadEventType]) -> bool:
@@ -914,7 +933,7 @@ class AsyncClient(Client):
             for event in join_info.timeline.events
             if getattr(event, "event_id", None)
         }
-        already_dispatched = self._backfill_dispatched_ids.get(room_id, OrderedDict())
+        already_dispatched = self._dispatched_event_ids.get(room_id, OrderedDict())
 
         collect = self._collect_gap_events_forward(
             room_id, since, present_in_sync, already_dispatched, until
@@ -1247,6 +1266,161 @@ class AsyncClient(Client):
         for event in events:
             await self._on_to_device(event)
 
+    async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
+        """Process a sliding sync response into client state.
+
+        The MSC4186 counterpart of ``_handle_sync``: to-device events are
+        decrypted and dispatched first (room keys must land before the
+        timelines that need them), then rooms are built from
+        ``required_state`` and their timelines dispatched through the event
+        callbacks, then account data and encryption bookkeeping run.
+        """
+        if response.to_device_next_batch:
+            self._sliding_sync_to_device_since = response.to_device_next_batch
+
+        await self._handle_to_device(response)
+
+        await self._handle_sliding_sync_rooms(response)
+
+        await self._handle_sliding_sync_account_data(response)
+
+        if self.olm:
+            await self._handle_expired_verifications()
+            self._handle_olm_events(response)
+            await self._collect_key_requests()
+
+    @staticmethod
+    def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
+        # Deployed servers mark invites with membership "invite"; the
+        # stripped state fallback covers servers that omit the membership
+        # field (rooms we are joined to never carry stripped state).
+        return room.membership == "invite" or (
+            room.membership is None and bool(room.stripped_state)
+        )
+
+    async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
+        encrypted_rooms: Set[str] = set()
+
+        for room_id, sliding_room in response.rooms.items():
+            if self._sliding_sync_room_is_invite(sliding_room):
+                room = self._get_invited_room(room_id)
+
+                for event in sliding_room.stripped_state:
+                    room.handle_event(event)
+
+                    await self._on_invited_rooms(event, room)
+
+                continue
+
+            # Parity with /v3/sync, which parses left rooms but never
+            # applies them to client state.
+            if sliding_room.membership in ("leave", "ban"):
+                continue
+
+            if room_id in self.invited_rooms:
+                del self.invited_rooms[room_id]
+
+            if room_id not in self.rooms:
+                logger.info(f"New joined room {room_id}")
+                self.rooms[room_id] = MatrixRoom(
+                    room_id, self.user_id, room_id in self.encrypted_rooms
+                )
+
+            room = self.rooms[room_id]
+
+            for event in sliding_room.required_state:
+                # State stubs signal deleted state, which the room model
+                # cannot represent; skip them.
+                if isinstance(event, SlidingSyncStateStub):
+                    continue
+
+                if isinstance(event, RoomEncryptionEvent):
+                    encrypted_rooms.add(room_id)
+
+                if isinstance(event, RoomMemberEvent):
+                    if room.handle_membership(event):
+                        self._invalidate_session_for_member_event(room_id)
+                else:
+                    room.handle_event(event)
+
+            heroes = (
+                [hero.user_id for hero in sliding_room.heroes]
+                if sliding_room.heroes
+                else None
+            )
+            if (
+                sliding_room.joined_count is not None
+                or sliding_room.invited_count is not None
+                or heroes is not None
+            ):
+                room.update_summary(
+                    RoomSummary(
+                        sliding_room.invited_count,
+                        sliding_room.joined_count,
+                        heroes,
+                    )
+                )
+
+            room.update_unread_notifications(
+                UnreadNotifications(
+                    sliding_room.notification_count,
+                    sliding_room.highlight_count,
+                )
+            )
+
+            # A sliding sync connection re-sends the recent timeline window
+            # whenever it expires (M_UNKNOWN_POS) or a room re-enters the
+            # list window. State above is re-applied (idempotent), but
+            # events already handed to the callbacks are not dispatched
+            # again.
+            dispatched = self._dispatched_event_ids.get(room_id, ())
+            decrypted_events: List[Tuple[int, Union[Event, BadEventType]]] = []
+
+            for index, event in enumerate(sliding_room.timeline):
+                decrypted_event = self._handle_timeline_event(
+                    event, room_id, room, encrypted_rooms
+                )
+
+                if decrypted_event:
+                    event = decrypted_event
+                    decrypted_events.append((index, decrypted_event))
+
+                if getattr(event, "event_id", None) in dispatched:
+                    continue
+
+                await self._on_event(event, room)
+
+            # Replace the Megolm events with decrypted ones
+            for index, event in decrypted_events:
+                sliding_room.timeline[index] = event
+
+            self._record_dispatched_events(room_id, sliding_room.timeline)
+
+            if room.encrypted and self.olm is not None:
+                self.olm.update_tracked_users(room)
+
+        self.encrypted_rooms.update(encrypted_rooms)
+
+        if self.store:
+            self.store.save_encrypted_rooms(encrypted_rooms)
+
+    async def _handle_sliding_sync_account_data(
+        self, response: SlidingSyncResponse
+    ) -> None:
+        for event in response.account_data_events:
+            await self._on_global_account_data(event)
+
+        for room_id, events in response.room_account_data.items():
+            room = self.rooms.get(room_id)
+
+            # Account data can reference rooms outside the sliding window.
+            if room is None:
+                continue
+
+            for event in events:
+                room.handle_account_data(event)
+                await self._on_room_account_data(event, room)
+
     async def receive_response(self, response: Response) -> None:
         """Receive a Matrix Response and change the client state accordingly.
 
@@ -1265,6 +1439,8 @@ class AsyncClient(Client):
 
         if isinstance(response, SyncResponse):
             await self._handle_sync(response)
+        elif isinstance(response, SlidingSyncResponse):
+            await self._handle_sliding_sync(response)
         else:
             super().receive_response(response)
 
@@ -1787,8 +1963,15 @@ class AsyncClient(Client):
     ) -> Union[SlidingSyncResponse, SlidingSyncError]:
         """Synchronise with MSC4186 Simplified Sliding Sync.
 
-        This method returns a typed sliding sync response but does not update
-        the client's v3 sync room state.
+        In general you should use ``sliding_sync_forever()`` which handles
+        position threading and additional tasks automatically (like sending
+        encryption keys among others).
+
+        Calls receive_response() to update the client state if necessary:
+        rooms are created and updated from ``required_state``, timelines are
+        decrypted and dispatched through the event callbacks, and the
+        ``to_device``, ``e2ee`` and ``account_data`` extension payloads are
+        processed like their /v3/sync counterparts.
 
         By default this targets the unstable
         ``org.matrix.simplified_msc3575`` endpoint, the only one deployed
@@ -1996,15 +2179,206 @@ class AsyncClient(Client):
                 raise
         self._stop_sync_forever = False
 
+    def _sliding_sync_request_extensions(
+        self, extensions: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Thread the tracked to-device token into a request's extensions.
+
+        The to_device extension carries its own ``since``/``next_batch``
+        token, independent of ``pos``: sending it back acknowledges the
+        to-device messages delivered before it (allowing the server to
+        delete them), so it is threaded into every request once known —
+        including the fresh-connection request after ``M_UNKNOWN_POS``.
+        The caller's dictionaries are copied, never mutated.
+        """
+        if self._sliding_sync_to_device_since is None:
+            return extensions
+
+        to_device = (extensions or {}).get("to_device")
+        if not isinstance(to_device, dict) or not to_device.get("enabled"):
+            return extensions
+
+        threaded = dict(extensions)
+        threaded["to_device"] = {
+            **to_device,
+            "since": self._sliding_sync_to_device_since,
+        }
+        return threaded
+
+    @logged_in_async
+    async def sliding_sync_forever(
+        self,
+        timeout: int = 30_000,  # noqa: ASYNC109
+        conn_id: str = "nio",
+        lists: Optional[Dict[str, Any]] = None,
+        room_subscriptions: Optional[Dict[str, Any]] = None,
+        extensions: Optional[Dict[str, Any]] = None,
+        set_presence: Optional[str] = None,
+        unstable: bool = True,
+        loop_sleep_time: Optional[int] = None,
+    ) -> None:
+        """Continuously sync with MSC4186 Simplified Sliding Sync.
+
+        The sliding sync counterpart of ``sync_forever``: this method calls
+        ``sliding_sync()`` in a loop, threading the connection position
+        (``pos``) and the to_device extension's ``since`` token between
+        requests. To react to events, event callbacks should be configured.
+
+        Like ``sync_forever``, the loop handles the other required requests
+        between syncs — outgoing to-device messages and encryption key
+        uploads, queries and claims — and runs the configured response
+        callbacks for every response, including ``SlidingSyncError``.
+
+        The connection always starts fresh (an initial request without
+        ``pos``); MSC4186 positions are connection-scoped and expire on the
+        server, so they are not meant to be persisted. When the server
+        expires the connection mid-loop (``M_UNKNOWN_POS``), the loop
+        transparently restarts it while keeping the to-device token. Since
+        the server re-sends each room's recent timeline window on such
+        restarts (and whenever a room re-enters a list window), the client
+        remembers recently dispatched event ids per room and does not
+        dispatch re-delivered events to the event callbacks again.
+
+        Args:
+            timeout (int): The maximum time that the server should wait for
+                new events before returning the request anyways, in
+                milliseconds. The first request always uses ``0`` so that
+                startup is not delayed; an initial sliding sync returns
+                immediately in any case once data exists.
+
+            conn_id (str): The sliding sync connection identifier. Each
+                conn_id maintains its own server-side position; use a stable
+                value per logical sync loop.
+
+            lists (Dict[str, Any], optional): The sliding window list
+                subscriptions, keyed by list name, as defined by MSC4186.
+
+            room_subscriptions (Dict[str, Any], optional): Explicit per-room
+                subscriptions, keyed by room id.
+
+            extensions (Dict[str, Any], optional): Extension subscriptions,
+                e.g. ``{"to_device": {"enabled": True}, "e2ee": {"enabled":
+                True}, "account_data": {"enabled": True}}``. When the
+                to_device extension is enabled, its delivery token is
+                threaded into ``extensions.to_device.since`` automatically.
+
+            set_presence (str, optional): The presence state to set on each
+                request. One of: ["online", "offline", "unavailable"].
+                Deployed servers vary in whether they honour this on the
+                sliding sync endpoint.
+
+            unstable (bool): Target the unstable
+                ``org.matrix.simplified_msc3575`` endpoint (the only one
+                deployed servers currently serve). Set to ``False`` for the
+                proposed stable ``/_matrix/client/v4/sync`` path.
+
+            loop_sleep_time (int, optional): The sleep time, if any, between
+                successful sync loop iterations in milliseconds.
+        """
+        first_sync = True
+        pos: Optional[str] = None
+
+        def track_position(response) -> None:
+            nonlocal pos
+
+            if isinstance(response, SlidingSyncResponse):
+                pos = response.pos
+            elif (
+                isinstance(response, SlidingSyncError)
+                and response.status_code == "M_UNKNOWN_POS"
+            ):
+                # The server expired this connection; the next request
+                # starts a new one. The to-device since token is
+                # independent of pos and is deliberately kept.
+                pos = None
+
+        while not self._stop_sync_forever:
+            try:
+                use_timeout = 0 if first_sync else timeout
+
+                tasks = []
+
+                # Make sure that if this is our first sync that the sync happens
+                # before the other requests, this helps to ensure that after one
+                # fired synced event the state is indeed fully synced.
+                if first_sync:
+                    response = await self.sliding_sync(
+                        conn_id=conn_id,
+                        pos=pos,
+                        timeout=use_timeout,
+                        set_presence=set_presence,
+                        lists=lists,
+                        room_subscriptions=room_subscriptions,
+                        extensions=self._sliding_sync_request_extensions(extensions),
+                        unstable=unstable,
+                    )
+                    track_position(response)
+                    await self.run_response_callbacks([response])
+                else:
+                    tasks = [
+                        asyncio.ensure_future(coro)
+                        for coro in (
+                            self.sliding_sync(
+                                conn_id=conn_id,
+                                pos=pos,
+                                timeout=use_timeout,
+                                set_presence=set_presence,
+                                lists=lists,
+                                room_subscriptions=room_subscriptions,
+                                extensions=self._sliding_sync_request_extensions(
+                                    extensions
+                                ),
+                                unstable=unstable,
+                            ),
+                            self.send_to_device_messages(),
+                        )
+                    ]
+
+                if self.should_upload_keys:
+                    tasks.append(asyncio.ensure_future(self.keys_upload()))
+
+                if self.should_query_keys:
+                    tasks.append(asyncio.ensure_future(self.keys_query()))
+
+                if self.should_claim_keys:
+                    tasks.append(
+                        asyncio.ensure_future(
+                            self.keys_claim(self.get_users_for_key_claiming()),
+                        )
+                    )
+
+                for future in asyncio.as_completed(tasks):
+                    response = await future
+                    track_position(response)
+                    await self.run_response_callbacks([response])
+
+                first_sync = False
+
+                self.synced.set()
+                self.synced.clear()
+
+                if loop_sleep_time:
+                    await asyncio.sleep(loop_sleep_time / 1000)
+
+            except asyncio.CancelledError:  # noqa: PERF203
+                for task in tasks:
+                    task.cancel()
+                self._stop_sync_forever = False
+                raise
+            except:
+                self._stop_sync_forever = False
+                raise
+        self._stop_sync_forever = False
+
     def stop_sync_forever(self):
-        """Request that a running `sync_forever` loop exits gracefully or the next call to `sync_forever()` returns
-        immediately without doing any sync.
+        """Request that a running `sync_forever` or `sliding_sync_forever` loop exits gracefully or the next call
+        to either method returns immediately without doing any sync.
 
-        As `sync_forever` fully shuts down, an internal flag will be reset, allowing `sync_forever` to be called again without shutting down.
-        Also each call to `sync_forever()` after the flag was set, resets the flag.
+        As the loop fully shuts down, an internal flag will be reset, allowing the loop to be started again without shutting down.
+        Also each call to `sync_forever()` or `sliding_sync_forever()` after the flag was set, resets the flag.
 
-        If a `sync_forever` function is running, it will finish its sync loop and exit, leaving this `AsyncClient` in
-        a consistent state. In particular, it will be possible to run `sync_forever` again at a later point.
+        If such a loop is running, it will finish its sync iteration and exit, leaving this `AsyncClient` in
+        a consistent state. In particular, it will be possible to run the loop again at a later point.
         """
         self._stop_sync_forever = True
 

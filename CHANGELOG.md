@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Add `AsyncClient.sliding_sync_forever()`, the MSC4186 Simplified Sliding
+  Sync counterpart of `sync_forever()`. The loop threads the connection
+  position and the to_device extension's `since` token between requests,
+  restarts the connection transparently on `M_UNKNOWN_POS` (keeping the
+  to-device token, which is independent of `pos`), sends outgoing to-device
+  messages, uploads/queries/claims encryption keys, runs response callbacks
+  for every response, and honours `stop_sync_forever()`, the `synced` event
+  and `loop_sleep_time` exactly like the /v3/sync loop. Re-sent timeline
+  windows (connection expiry, rooms re-entering a list window) are
+  de-duplicated against a bounded per-room memory of dispatched event ids,
+  so event callbacks never see the same event twice mid-run.
+- `AsyncClient.sliding_sync()` responses now update client state via
+  `receive_response()`, mirroring `sync()`: rooms are created and updated
+  from `required_state` (state events, membership, encryption flag) plus the
+  server-computed summary fields (heroes, joined/invited counts,
+  notification counts), invites appear in `client.invited_rooms` from
+  stripped state, timelines are decrypted and dispatched through the
+  registered event callbacks, and left/banned rooms are skipped like in
+  /v3/sync.
+- Parse the sliding sync `to_device`, `e2ee` and `account_data` extension
+  payloads into typed fields on `SlidingSyncResponse` (`to_device_events`,
+  `to_device_next_batch`, `device_key_count`, `device_list`,
+  `account_data_events`, `room_account_data`) and feed them through the
+  same handling as their /v3/sync counterparts: to-device decryption (room
+  keys land before the timelines that need them), one-time-key counts
+  (including an explicit zero for drained pools), device-list based key
+  query invalidation, and global/per-room account data callbacks. The raw
+  `extensions` dict remains available untouched.
+- Extend `scripts/live_sliding_sync_check.py` with `sliding_sync_forever`
+  checks: invites and live messages arriving through the loop, clean
+  shutdown, the `M_UNKNOWN_POS` rejection for unknown positions, and a full
+  encrypted round trip (room key over the to_device extension plus megolm
+  timeline decryption) between two store-backed clients. All checks pass
+  against Synapse 1.156 and Tuwunel, including the `--slam` stress pass
+  with state processing active.
+
 ## 0.27.4
 
 ### Features

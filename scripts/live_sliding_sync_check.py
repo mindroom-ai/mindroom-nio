@@ -14,6 +14,13 @@ Usage:
     uv run python scripts/live_sliding_sync_check.py \
         --homeserver http://127.0.0.1:8008
 
+Besides the single-shot wire format checks this also exercises
+``sliding_sync_forever``: invites and live messages arriving through the
+loop, clean shutdown, the ``M_UNKNOWN_POS`` rejection the loop recovers
+from, and a full encrypted round trip (room key over the to_device
+extension, megolm timeline decryption) between two fresh store-backed
+clients.
+
 Pass ``--slam`` to additionally run a stress pass: two concurrent
 long-poll sync loops (one per user, separate conn_ids) while a writer
 floods rooms with messages, asserting no event is missed or duplicated
@@ -25,10 +32,16 @@ import asyncio
 import secrets
 import statistics
 import sys
+import tempfile
 import time
 
-from nio import AsyncClient
-from nio.responses import RegisterResponse, SlidingSyncResponse, SyncResponse
+from nio import AsyncClient, InviteMemberEvent, RoomMessageText
+from nio.responses import (
+    RegisterResponse,
+    SlidingSyncError,
+    SlidingSyncResponse,
+    SyncResponse,
+)
 
 LISTS = {
     "main": {
@@ -52,14 +65,208 @@ def check(name: str, condition: bool, detail: str = "") -> None:
     print(f"ok: {name}")
 
 
-async def register(homeserver: str, name: str) -> AsyncClient:
-    client = AsyncClient(homeserver, f"@{name}:ignored")
+async def register(homeserver: str, name: str, store: bool = False) -> AsyncClient:
+    store_path = tempfile.mkdtemp(prefix=f"nio-live-{name}-") if store else ""
+    client = AsyncClient(homeserver, f"@{name}:ignored", store_path=store_path)
     resp = await client.register(name, "live-check-password")
     if not isinstance(resp, RegisterResponse):
         print(f"FAIL: could not register {name}: {resp}")
         sys.exit(1)
     client.user_id = resp.user_id
     return client
+
+
+async def _wait_for(predicate, timeout: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.2)
+    return predicate()
+
+
+async def forever_checks(alice: AsyncClient, bob: AsyncClient) -> None:
+    """Exercise sliding_sync_forever: invites, live events, clean shutdown."""
+    messages = {}
+    invited_rooms = []
+
+    async def message_cb(room, event):
+        messages.setdefault(event.body, room.room_id)
+
+    async def invite_cb(room, event):
+        invited_rooms.append(room.room_id)
+
+    bob.add_event_callback(message_cb, RoomMessageText)
+    bob.add_event_callback(invite_cb, InviteMemberEvent)
+
+    loop_task = asyncio.create_task(
+        bob.sliding_sync_forever(
+            timeout=30_000,
+            conn_id="forever-bob",
+            lists=LISTS,
+            extensions={"to_device": {"enabled": True}},
+        )
+    )
+    await asyncio.wait_for(bob.synced.wait(), 30)
+
+    room_resp = await alice.room_create(name="forever room")
+    room_id = room_resp.room_id
+    await alice.room_invite(room_id, bob.user_id)
+
+    check(
+        "forever: invite arrives through the loop",
+        await _wait_for(lambda: room_id in bob.invited_rooms),
+        f"invited_rooms={list(bob.invited_rooms)}",
+    )
+
+    await bob.join(room_id)
+    await alice.room_send(
+        room_id, "m.room.message", {"msgtype": "m.text", "body": "forever-hello"}
+    )
+
+    check(
+        "forever: live message dispatched by the loop",
+        await _wait_for(lambda: messages.get("forever-hello") == room_id),
+        repr(messages),
+    )
+    check(
+        "forever: room state built by the loop",
+        room_id in bob.rooms and bob.rooms[room_id].display_name == "forever room",
+        repr(bob.rooms.get(room_id)),
+    )
+
+    bob.stop_sync_forever()
+    await asyncio.wait_for(loop_task, 60)
+    check("forever: loop stops on request", loop_task.done())
+
+    # The recovery precondition the loop relies on: a well-formed position
+    # the connection does not know must be rejected with M_UNKNOWN_POS,
+    # which the loop answers by restarting the connection. Synapse tracks
+    # positions per conn_id, so replaying a real pos on a fresh conn_id is
+    # the deterministic way to trigger it; Tuwunel's positions are global,
+    # so it may accept the request instead (also fine for the loop).
+    probe = await alice.sliding_sync(conn_id="forever-pos-a", timeout=0, lists=LISTS)
+    resp = await alice.sliding_sync(
+        conn_id="forever-pos-b", pos=probe.pos, timeout=0, lists=LISTS
+    )
+    if isinstance(resp, SlidingSyncError):
+        check(
+            "forever: unknown pos rejected with M_UNKNOWN_POS",
+            resp.status_code == "M_UNKNOWN_POS",
+            repr(resp),
+        )
+    else:
+        print("forever: server accepts a foreign pos, no connection reset needed")
+
+
+async def encrypted_forever_checks(homeserver: str) -> None:
+    """Two fresh clients with stores: e2ee round trip over the loop."""
+    suffix = secrets.token_hex(4)
+    alice = await register(homeserver, f"ss-enc-alice-{suffix}", store=True)
+    bob = await register(homeserver, f"ss-enc-bob-{suffix}", store=True)
+
+    if alice.olm is None or bob.olm is None:
+        print("e2ee forever: encryption dependencies missing, skipping")
+        await alice.close()
+        await bob.close()
+        return
+
+    enc_lists = {
+        "main": {
+            "ranges": [[0, 19]],
+            "timeline_limit": 10,
+            "required_state": [
+                ["m.room.create", ""],
+                ["m.room.name", ""],
+                ["m.room.encryption", ""],
+                ["m.room.member", "$LAZY"],
+            ],
+        }
+    }
+    extensions = {
+        "to_device": {"enabled": True},
+        "e2ee": {"enabled": True},
+        "account_data": {"enabled": True},
+    }
+
+    decrypted = {}
+
+    async def message_cb(room, event):
+        decrypted[event.body] = (room.room_id, event.decrypted)
+
+    bob.add_event_callback(message_cb, RoomMessageText)
+
+    loop_task = asyncio.create_task(
+        bob.sliding_sync_forever(
+            timeout=30_000,
+            conn_id="enc-bob",
+            lists=enc_lists,
+            extensions=extensions,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(bob.synced.wait(), 30)
+
+        room_resp = await alice.room_create(
+            name="encrypted forever room",
+            initial_state=[
+                {
+                    "type": "m.room.encryption",
+                    "state_key": "",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                }
+            ],
+        )
+        room_id = room_resp.room_id
+        await alice.room_invite(room_id, bob.user_id)
+
+        check(
+            "e2ee forever: invite arrives through the loop",
+            await _wait_for(lambda: room_id in bob.invited_rooms),
+        )
+        await bob.join(room_id)
+
+        # Alice drives sending by hand, so give her the state and keys a
+        # sync loop would maintain: one sliding sync for the room state,
+        # one upload for her identity keys.
+        await alice.sliding_sync(
+            conn_id="enc-alice", timeout=0, lists=enc_lists, extensions=extensions
+        )
+        check(
+            "e2ee forever: sender sees the encrypted room",
+            room_id in alice.rooms and alice.rooms[room_id].encrypted,
+        )
+        if alice.should_upload_keys:
+            await alice.keys_upload()
+
+        sent = await alice.room_send(
+            room_id,
+            "m.room.message",
+            {"msgtype": "m.text", "body": "encrypted-forever"},
+            ignore_unverified_devices=True,
+        )
+        check(
+            "e2ee forever: encrypted event accepted",
+            hasattr(sent, "event_id"),
+            repr(sent),
+        )
+
+        check(
+            "e2ee forever: loop decrypted the message",
+            await _wait_for(
+                lambda: decrypted.get("encrypted-forever") == (room_id, True)
+            ),
+            f"decrypted={decrypted!r}",
+        )
+
+        bob.stop_sync_forever()
+        await asyncio.wait_for(loop_task, 60)
+    finally:
+        if not loop_task.done():
+            loop_task.cancel()
+        await alice.close()
+        await bob.close()
 
 
 SLAM_LISTS = {
@@ -543,6 +750,10 @@ async def main() -> None:
         )
 
         await deep_checks(alice, bob)
+
+        await forever_checks(alice, bob)
+
+        await encrypted_forever_checks(args.homeserver)
 
         if args.slam:
             await slam(alice, bob, args.rooms, args.messages, args.edits)
