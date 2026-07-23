@@ -452,6 +452,12 @@ class TestClass:
             {"e2ee": {"device_lists": {"changed": [42]}}},
             {"account_data": {"global": {"not": "a list"}}},
             {"account_data": {"rooms": {"!room:example.org": "junk"}}},
+            # Scalar items inside otherwise-valid arrays used to crash the
+            # event parsers with a TypeError.
+            {"to_device": {"events": [42]}},
+            {"to_device": {"events": ["junk"]}},
+            {"account_data": {"global": [42]}},
+            {"account_data": {"rooms": {"!room:example.org": [42]}}},
         ):
             response = SlidingSyncResponse.from_dict(
                 {"pos": "s1", "extensions": extensions}

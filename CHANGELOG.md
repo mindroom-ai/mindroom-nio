@@ -24,7 +24,9 @@ All notable changes to this project will be documented in this file.
   tracks are rebuilt from the snapshot rather than patched, so members and
   metadata removed while no connection was live cannot linger — the
   outbound group session is rotated so departed members stop receiving
-  room keys. Consecutive error responses back off exponentially (reusing
+  room keys, while data owned by other channels (tags, read markers,
+  receipts, typing) survives the rebuild. Consecutive error responses back
+  off exponentially (reusing
   the transport retry curve) instead of hot-looping, while the position is
   kept so a recovered server resumes where it left off. A failure in one
   of the loop's parallel requests cancels its siblings, so no orphaned
@@ -34,10 +36,15 @@ All notable changes to this project will be documented in this file.
   from `required_state` (state events, membership, encryption flag) plus the
   server-computed summary fields (heroes, joined/invited counts,
   notification counts), heroes unknown to lazy member loading are seeded as
-  members so display names and avatars resolve (skipped for otherwise-empty
-  rooms, whose heroes are members who left; an explicit empty heroes list
-  clears stale ones — `SlidingSyncRoom.heroes` is now `None` when the field
-  was absent), MSC4186 state deletion stubs are applied (room name,
+  members so display names and avatars resolve (marked invited when nobody
+  else has joined; skipped for otherwise-empty rooms, whose heroes are
+  members who left; an explicit empty heroes list clears stale ones —
+  `SlidingSyncRoom.heroes` is now `None` when the field was absent), the
+  server-computed top-level `name`/`avatar` are deliberately not applied to
+  room state (deployed servers disagree on their meaning: Synapse mirrors
+  the state events, Tuwunel sends calculated display values such as the DM
+  partner's profile avatar), MSC4186 state deletion stubs are applied (room
+  name,
   canonical alias, topic, avatar, join rules, guest access, history
   visibility, tombstone, power levels, space parent/child links, and member
   deletions — which also rotate the outbound session), invites appear in

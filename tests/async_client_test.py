@@ -1803,6 +1803,19 @@ class TestClass:
                         "timeline": [],
                     },
                 },
+                "extensions": {
+                    "account_data": {
+                        "rooms": {
+                            TEST_ROOM_ID: [
+                                {"type": "m.tag", "content": {"tags": {"u.keep": {}}}},
+                                {
+                                    "type": "m.fully_read",
+                                    "content": {"event_id": "$read:example.org"},
+                                },
+                            ],
+                        },
+                    },
+                },
             }
         )
         await async_client.receive_response(first)
@@ -1811,6 +1824,8 @@ class TestClass:
         assert room.encrypted
         assert room.name == "Before"
         assert CAROL_ID in room.users
+        assert room.tags == {"u.keep": {}}
+        room.typing_users = [ALICE_ID]
 
         async_client.olm.create_outbound_group_session(TEST_ROOM_ID)
         async_client.olm.outbound_group_sessions[TEST_ROOM_ID].shared = True
@@ -1841,6 +1856,35 @@ class TestClass:
         assert room.encrypted
         assert not room.members_synced
         assert TEST_ROOM_ID not in async_client.olm.outbound_group_sessions
+
+        # Data owned by other channels — account data, receipts, typing —
+        # is not part of the room render and survives the rebuild.
+        assert room.tags == {"u.keep": {}}
+        assert room.fully_read_marker == "$read:example.org"
+        assert room.typing_users == [ALICE_ID]
+
+    async def test_receive_sliding_sync_invited_heroes(self, async_client):
+        # Only we have joined, so the hero can only be an invited member.
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "joined_count": 1,
+                        "invited_count": 1,
+                        "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
+                        "required_state": [],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(response)
+
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert room.users[ALICE_ID].invited
+        assert ALICE_ID in room.invited_users
 
     async def test_receive_sliding_sync_pending_room_account_data(self, async_client):
         def account_data_response(pos, events):

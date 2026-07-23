@@ -1379,9 +1379,19 @@ class AsyncClient(Client):
 
         if room_id not in self.rooms:
             logger.info(f"New joined room {room_id}")
-            self.rooms[room_id] = MatrixRoom(
-                room_id, self.user_id, room_id in self.encrypted_rooms
-            )
+            room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
+
+            if existing_room is not None:
+                # The snapshot re-derives room state, but data owned by
+                # other channels — account data, receipts, typing — is not
+                # part of the room render and must survive the rebuild.
+                room.tags = existing_room.tags
+                room.fully_read_marker = existing_room.fully_read_marker
+                room.read_receipts = existing_room.read_receipts
+                room.threaded_read_receipts = existing_room.threaded_read_receipts
+                room.typing_users = existing_room.typing_users
+
+            self.rooms[room_id] = room
 
         room = self.rooms[room_id]
 
@@ -1442,6 +1452,15 @@ class AsyncClient(Client):
     def _apply_sliding_sync_summary(
         room: MatrixRoom, sliding_room: SlidingSyncRoom
     ) -> None:
+        # The response's top-level name/avatar are deliberately NOT applied
+        # to room state: deployed servers disagree about what they mean.
+        # Synapse mirrors m.room.name/m.room.avatar content (omitting the
+        # field for DMs and on removal), but Tuwunel sends calculated
+        # display values — a DM carries the partner's profile picture as
+        # `avatar` and a decorated hero name as `name` — which are not room
+        # state. Room state flows through required_state (live events and
+        # deletion stubs) and initial-snapshot rebuilds; the server-computed
+        # values remain available on the SlidingSyncRoom for display use.
         heroes = sliding_room.heroes
 
         if heroes:
@@ -1452,12 +1471,21 @@ class AsyncClient(Client):
                 sliding_room.invited_count or 0
             )
             if member_count > 1:
+                # When nobody but us has joined, every hero is an invited
+                # member; mixed lists are unknowable and default to joined.
+                all_invited = (sliding_room.joined_count or 0) <= 1
+
                 for hero in heroes:
                     # Seed unknown heroes as members so display name and
                     # avatar calculation can resolve them even when lazy
                     # member loading never delivers their member events.
                     if hero.user_id not in room.users:
-                        room.add_member(hero.user_id, hero.displayname, hero.avatar_url)
+                        room.add_member(
+                            hero.user_id,
+                            hero.displayname,
+                            hero.avatar_url,
+                            invited=all_invited,
+                        )
 
         if (
             sliding_room.joined_count is not None

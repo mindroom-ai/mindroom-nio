@@ -552,7 +552,10 @@ class Schemas:
                     "to_device": {
                         "type": "object",
                         "properties": {
-                            "events": {"type": "array"},
+                            "events": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
                             "next_batch": {"type": "string"},
                         },
                     },
@@ -584,10 +587,16 @@ class Schemas:
                     "account_data": {
                         "type": "object",
                         "properties": {
-                            "global": {"type": "array"},
+                            "global": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
                             "rooms": {
                                 "type": "object",
-                                "additionalProperties": {"type": "array"},
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {"type": "object"},
+                                },
                             },
                         },
                     },
