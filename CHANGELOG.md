@@ -2,21 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.29.0
+
+### Upstream Sync
+
+- Rebase the fork onto matrix-nio 0.26.0 and incorporate subsequent upstream
+  changes through room version 12 support. This brings in the vodozemac
+  migration, a Python 3.10 minimum, the password-change API, parsing of
+  unencrypted media in encrypted containers, flattened event helpers, and
+  corrected room-redaction transaction IDs. See the 0.26.0 section below for
+  its breaking changes and store-migration details.
+
+## 0.28.0
 
 ### Features
 
-- Add low-level MSC4186 Simplified Sliding Sync support across `Api`,
-  `AsyncClient`, and `HttpClient`, including request builders and typed
-  response parsing. Requests use the query parameters, response keys, and
-  unstable endpoint served by deployed Synapse and Tuwunel homeservers.
-  Malformed nested list and room payloads produce `SlidingSyncError`.
-- Add self-managed cross-signing for bot-style clients:
-  `AsyncClient.ensure_cross_signing()` creates and persists master and
-  self-signing keys next to the encryption store, uploads them with an
-  MSC3967-first flow and password-based UIA retry, and signs the account's own
-  device so strict clients keep sharing room keys with it. Requires
-  `pycryptodome >=3.15` for Ed25519 signing.
 - Add `AsyncClient.sliding_sync_forever()`, the MSC4186 Simplified Sliding
   Sync counterpart of `sync_forever()`. The loop threads the connection
   position and the to_device extension's `since` token between requests,
@@ -84,20 +84,70 @@ All notable changes to this project will be documented in this file.
   Synapse 1.156 and Tuwunel, including the `--slam` stress pass with state
   processing active.
 
+## 0.27.4
+
+### Features
+
+- Add opt-in recovery of events dropped by limited sync timelines
+  (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
+  timeline arrives with `limited: true`, the client pages `/messages`
+  forwards from the token the sync continued from and dispatches the
+  recovered gap through the normal event callbacks — oldest first, before
+  the sync response's own events, decrypted like live events but never
+  applied to room state. Gaps spanning a client restart are recovered when
+  resuming from a stored or explicit since token; freshly joined rooms are
+  never backfilled past our own join. Recovery dispatches only when the
+  walk verifiably reaches the sync window; anything less (bounds, errors,
+  stalls, the live edge) is discarded with a warning, so failure is always
+  loud loss, never duplicates. All backfill for one sync response shares a
+  single time budget (`backfill_timeout`) covering pagination and dispatch,
+  including hanging callbacks. Disabled by default; behaviour with the
+  flag off is identical to upstream nio.
+
+### Bug Fixes
+
+- Match sliding sync (simplified MSC4186) wire format to deployed servers:
+  `pos`/`timeout`/`set_presence` as query parameters, unstable endpoint by
+  default, `invite_state`/`unstable_expanded_timeline` response keys, and
+  per-room notification counts. Renames `SlidingSyncRoom.timeline_events`
+  to `timeline` (the wire name; nothing consumed the old attribute).
+
+## 0.27.3
+
 ### Bug Fixes
 
 - Apply `AsyncClientConfig.custom_headers` in the low-level `send()` transport
   so direct request paths, including cross-signing uploads, receive the same
   configured headers as high-level Matrix client methods.
 
-### Dependencies
+## 0.27.2
 
-- Drop the unmaintained `atomicwrites` dependency in favor of a small internal
-  stdlib-based atomic write helper with the same semantics
-  (matrix-nio/matrix-nio#566).
-- Allow peewee 4.x by relaxing the `e2e` extra constraint to
-  `peewee>=3.14,<5`; the test suite passes against peewee 4.1.1
-  (matrix-nio/matrix-nio#566).
+### Features
+
+- Add an opt-in `ClientConfig.replace_rotated_device_keys` policy: when a
+  device re-uploads different, validly self-signed identity keys under an
+  existing device id (e.g. a client that kept its access token but lost its
+  crypto store), replace the stored identity and reset its earned trust
+  instead of ignoring the new keys forever. Blacklisted devices stay
+  blacklisted. Default off, preserving upstream behavior.
+
+## 0.27.1
+
+### Bug Fixes
+
+- Preserve an explicit zero signed Curve25519 one-time-key count from `/sync`
+  so clients replenish a fully drained Olm key pool.
+
+## 0.27.0
+
+### Features
+
+- Surface unknown decrypted olm to-device events to client callbacks as
+  `UnknownToDeviceEvent` instead of silently dropping them, so clients can
+  receive custom encrypted to-device messages such as Element Call's
+  `io.element.call.encryption_keys` frame keys. `DecryptedOlmT` and
+  `Olm.decrypt_event` now include `UnknownToDeviceEvent` in their return
+  types.
 
 ## [0.26.0] - 2026-07-23
 
@@ -111,6 +161,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 - [[#540]] Add `unread_thread_notifications` to `SyncResponse`
+- Add self-managed cross-signing for bot-style clients: `AsyncClient.ensure_cross_signing()` creates and persists master and self-signing keys next to the encryption store, uploads them (with an MSC3967-first flow and password-based UIA retry), and signs the account's own device so MSC4153-era clients keep sharing room keys with it. Requires pycryptodome >= 3.15 for Ed25519 signing.
 
 ### Bug Fixes
 - [[#531]] Fix `get_openid_token`, the endpoint needs an empty JSON body
@@ -120,12 +171,47 @@ All notable changes to this project will be documented in this file.
 - [[#558]] Adopt `uv` for project management, apply `pyupgrade` and linting, and bump dependencies
 - [[#556]] Unpin dependencies
 
+### Dependencies
+
+- Drop the unmaintained `atomicwrites` dependency in favor of a small internal
+  stdlib-based atomic write helper with the same semantics
+  (matrix-nio/matrix-nio#566).
+- Allow peewee 4.x by relaxing the `e2e` extra constraint to
+  `peewee>=3.14,<5`; the test suite passes against peewee 4.1.1
+  (matrix-nio/matrix-nio#566).
+
 [#555]: https://github.com/matrix-nio/matrix-nio/pull/555
 [#558]: https://github.com/matrix-nio/matrix-nio/pull/558
 [#540]: https://github.com/matrix-nio/matrix-nio/pull/540
 [#531]: https://github.com/matrix-nio/matrix-nio/pull/531
 [#542]: https://github.com/matrix-nio/matrix-nio/pull/542
 [#556]: https://github.com/matrix-nio/matrix-nio/pull/556
+
+## [0.25.4] - 2026-05-20
+
+### Bug Fixes
+- [[#2]] Persist vodozemac account state after inbound session creation consumes
+  one-time keys, and handle unknown one-time-key session creation failures as
+  recoverable decryption failures.
+
+[#2]: https://github.com/mindroom-ai/mindroom-nio/pull/2
+
+## [0.25.3] - 2026-05-04
+
+### Features
+- [[#1]] Add low-level MSC4186 Simplified Sliding Sync support, including request
+  builders, async and HTTP client wrappers, typed response parsing, and stable
+  plus unstable endpoint coverage.
+
+### Bug Fixes
+- [[#1]] Convert malformed nested sliding sync list and room payloads into
+  `SlidingSyncError` instead of leaking parser exceptions.
+
+### Notes
+- Sliding sync responses are parsed as a separate low-level API and do not update
+  the existing `/v3/sync` room state loop or `sync_forever()`.
+
+[#1]: https://github.com/mindroom-ai/mindroom-nio/pull/1
 
 ## [0.25.2] - 2024-10-04
 
