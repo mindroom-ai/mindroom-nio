@@ -2,27 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.28.0
+## 0.27.4
+
+### Features
+
+- Add opt-in recovery of events dropped by limited sync timelines
+  (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
+  timeline arrives with `limited: true`, the client pages `/messages`
+  forwards from the token the sync continued from and dispatches the
+  recovered gap through the normal event callbacks — oldest first, before
+  the sync response's own events, decrypted like live events but never
+  applied to room state. Gaps spanning a client restart are recovered when
+  resuming from a stored or explicit since token; freshly joined rooms are
+  never backfilled past our own join. Recovery dispatches only when the
+  walk verifiably reaches the sync window; anything less (bounds, errors,
+  stalls, the live edge) is discarded with a warning, so failure is always
+  loud loss, never duplicates. All backfill for one sync response shares a
+  single time budget (`backfill_timeout`) covering pagination and dispatch,
+  including hanging callbacks. Disabled by default; behaviour with the
+  flag off is identical to upstream nio.
 
 ### Bug Fixes
 
-- Fix the MSC4186 sliding sync wire format to match deployed servers
-  (Synapse, Tuwunel/conduwuit): send `pos`, `timeout` and `set_presence` as
-  query parameters instead of body fields (previously servers silently
-  ignored them, so every request was treated as an initial sync with no
-  long-poll), default to the unstable `org.matrix.simplified_msc3575`
-  endpoint (the proposed stable `/_matrix/client/v4/sync` path is not served
-  by any homeserver yet), and parse the response keys servers actually emit:
-  `invite_state` (alongside the MSC's `stripped_state`),
-  `unstable_expanded_timeline`, and per-room `notification_count` /
-  `highlight_count`.
-
-### Breaking Changes
-
-- Rename `SlidingSyncRoom.timeline_events` to `timeline`, matching the wire
-  field name used by both the MSC text and deployed servers.
-- `Api.sliding_sync`, `AsyncClient.sliding_sync` and `HttpClient.sliding_sync`
-  now default to `unstable=True`.
+- Match sliding sync (simplified MSC4186) wire format to deployed servers:
+  `pos`/`timeout`/`set_presence` as query parameters, unstable endpoint by
+  default, `invite_state`/`unstable_expanded_timeline` response keys, and
+  per-room notification counts. Renames `SlidingSyncRoom.timeline_events`
+  to `timeline` (the wire name; nothing consumed the old attribute).
 
 ## 0.27.3
 
