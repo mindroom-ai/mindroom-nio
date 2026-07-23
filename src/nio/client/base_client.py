@@ -70,6 +70,7 @@ from ..responses import (
     RoomKeyRequestResponse,
     RoomMessagesResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     ToDeviceResponse,
     WhoamiResponse,
@@ -691,14 +692,14 @@ class Client:
     def _replace_decrypted_to_device(
         self,
         decrypted_events: List[Tuple[int, ToDeviceEvent]],
-        response: SyncResponse,
+        response: Union[SyncResponse, SlidingSyncResponse],
     ):
         # Replace the encrypted to_device events with decrypted ones
         for decrypted_event in decrypted_events:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
-    def _handle_to_device(self, response: SyncResponse):
+    def _handle_to_device(self, response: Union[SyncResponse, SlidingSyncResponse]):
         decrypted_to_device = []
 
         for index, to_device_event in enumerate(response.to_device_events):
@@ -866,7 +867,9 @@ class Client:
         for event in expired_verifications:
             self._on_expired_verifications(event)
 
-    def _handle_olm_events(self, response: SyncResponse):
+    def _handle_olm_events(
+        self, response: Union[SyncResponse, SlidingSyncResponse]
+    ) -> None:
         assert self.olm
 
         changed_users = set()

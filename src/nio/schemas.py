@@ -545,7 +545,63 @@ class Schemas:
                 },
             },
             "rooms": {"type": "object", "default": {}},
-            "extensions": {"type": "object", "default": {}},
+            "extensions": {
+                "type": "object",
+                "default": {},
+                "properties": {
+                    "to_device": {
+                        "type": "object",
+                        "properties": {
+                            "events": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                            "next_batch": {"type": "string"},
+                        },
+                    },
+                    "e2ee": {
+                        "type": "object",
+                        "properties": {
+                            "device_one_time_keys_count": {
+                                "type": "object",
+                                "properties": {
+                                    "curve25519": {"type": "integer"},
+                                    "signed_curve25519": {"type": "integer"},
+                                },
+                            },
+                            "device_lists": {
+                                "type": "object",
+                                "properties": {
+                                    "changed": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "left": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "account_data": {
+                        "type": "object",
+                        "properties": {
+                            "global": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                            "rooms": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {"type": "object"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
         },
         "required": ["pos"],
     }

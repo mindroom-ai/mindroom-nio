@@ -2,6 +2,77 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Add `AsyncClient.sliding_sync_forever()`, the MSC4186 Simplified Sliding
+  Sync counterpart of `sync_forever()`. The loop threads the connection
+  position and the to_device extension's `since` token between requests,
+  restarts the connection transparently on `M_UNKNOWN_POS` (keeping the
+  to-device token, which is independent of `pos`), sends outgoing to-device
+  messages, uploads/queries/claims encryption keys, runs response callbacks
+  for every response, and honours `stop_sync_forever()`, the `synced` event
+  and `loop_sleep_time` exactly like the /v3/sync loop. Re-sent timeline
+  windows (connection expiry, rooms re-entering a list window) are
+  de-duplicated against a bounded per-room memory of dispatched event ids,
+  so event callbacks never see the same event twice mid-run; the memory
+  records whether an event could only be dispatched encrypted, letting
+  exactly one decryptable replay through once the missing room key
+  arrives (the same upgrade rule now applies to limited-timeline backfill
+  recovery walks). Rooms flagged ``initial`` that the client already
+  tracks are rebuilt from the snapshot rather than patched, so members and
+  metadata removed while no connection was live cannot linger — the
+  outbound group session is rotated so departed members stop receiving
+  room keys, while data owned by other channels (tags, read markers,
+  receipts, typing) survives the rebuild. Consecutive error responses back
+  off exponentially (reusing
+  the transport retry curve) instead of hot-looping, while the position is
+  kept so a recovered server resumes where it left off. A failure in one
+  of the loop's parallel requests cancels its siblings, so no orphaned
+  long-poll can apply state after the loop has died.
+- `AsyncClient.sliding_sync()` responses now update client state via
+  `receive_response()`, mirroring `sync()`: rooms are created and updated
+  from `required_state` (state events, membership, encryption flag) plus the
+  server-computed summary fields (heroes, joined/invited counts,
+  notification counts), heroes unknown to lazy member loading are seeded as
+  members so display names and avatars resolve (marked invited when nobody
+  else has joined; skipped for otherwise-empty rooms, whose heroes are
+  members who left; an explicit empty heroes list clears stale ones —
+  `SlidingSyncRoom.heroes` is now `None` when the field was absent), the
+  server-computed top-level `name`/`avatar` are deliberately not applied to
+  room state (deployed servers disagree on their meaning: Synapse mirrors
+  the state events, Tuwunel sends calculated display values such as the DM
+  partner's profile avatar), MSC4186 state deletion stubs are applied (room
+  name,
+  canonical alias, topic, avatar, join rules, guest access, history
+  visibility, tombstone, power levels, space parent/child links, and member
+  deletions — which also rotate the outbound session), invites appear in
+  `client.invited_rooms` from stripped state, timelines are decrypted and
+  dispatched through the registered event callbacks, and left/banned rooms
+  are skipped like in /v3/sync.
+- Parse the sliding sync `to_device`, `e2ee` and `account_data` extension
+  payloads into typed fields on `SlidingSyncResponse` (`to_device_events`,
+  `to_device_next_batch`, `device_key_count`, `device_list`,
+  `account_data_events`, `room_account_data`) and feed them through the
+  same handling as their /v3/sync counterparts: to-device decryption (room
+  keys land before the timelines that need them), one-time-key counts
+  (including an explicit zero for drained pools), device-list based key
+  query invalidation, and global/per-room account data callbacks. Account
+  data for rooms outside the sliding window is buffered (newest event per
+  type, merged across responses) until the room appears. The raw
+  `extensions` dict remains available byte-for-byte untouched (event
+  parsers only ever see copies).
+- Extend `scripts/live_sliding_sync_check.py` with `sliding_sync_forever`
+  checks: invites and live messages arriving through the loop, clean
+  shutdown, the `M_UNKNOWN_POS` rejection for unknown positions, a full
+  encrypted round trip (room key over the to_device extension plus megolm
+  timeline decryption) between two store-backed clients, and an opt-in
+  `--restart-cmd` mode that restarts the homeserver under the running loop
+  and asserts recovery without duplicate dispatch. All checks pass against
+  Synapse 1.156 and Tuwunel, including the `--slam` stress pass with state
+  processing active.
+
 ## 0.27.4
 
 ### Features

@@ -25,7 +25,9 @@ from nio import (
     AsyncClientConfig,
     DeviceList,
     DeviceOneTimeKeyCount,
+    Event,
     LoginResponse,
+    MegolmEvent,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
@@ -87,6 +89,28 @@ def member_event(
         }
     )
     assert isinstance(event, RoomMemberEvent)
+    return event
+
+
+def megolm_event(event_id: str, *, ts: int) -> MegolmEvent:
+    """Build an undecryptable megolm event (no session for it exists)."""
+    event = Event.parse_event(
+        {
+            "event_id": event_id,
+            "sender": "@user:example.org",
+            "origin_server_ts": ts,
+            "room_id": TEST_ROOM_ID,
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "AwgAEnACgAkLmt6q",
+                "device_id": "DEVICEID",
+                "sender_key": "IlRMeOPX2e0MurIyfWEucYBRVOEEUMrOHqn/8mLqMjA",
+                "session_id": "X3lUlvLELLYxeTx4yOVu6UDpasGEVO0J",
+            },
+        }
+    )
+    assert isinstance(event, MegolmEvent)
     return event
 
 
@@ -964,6 +988,58 @@ class TestLimitedTimelineBackfill:
         )
 
         assert dispatched == ["$straggler", "$gap1", "$new"]
+
+    async def test_walk_upgrades_previously_encrypted_event(
+        self, backfill_client, aioresponse
+    ):
+        """A copy that decrypted is dispatched although the encrypted form was.
+
+        Mirrors the sliding sync loop's rule: an event that could only be
+        handed to the callbacks in encrypted form (its room key had not
+        arrived) goes through once more when a later copy of it — here
+        returned by the recovery walk — decrypts.
+        """
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [megolm_event("$enc", ts=90)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        # Only the encrypted form was dispatched (invisible to the
+        # RoomMessageText callback), and it was remembered as such.
+        assert dispatched == []
+
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [
+                        text_event("$enc", ts=90),
+                        text_event("$gap1", ts=100),
+                        text_event("$new", ts=300),
+                    ],
+                    end="fwd2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$enc", "$gap1", "$new"]
 
     async def test_dispatch_respects_backfill_budget(
         self, tempdir, aioresponse, caplog

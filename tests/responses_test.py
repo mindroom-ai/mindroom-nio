@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from typing import Type
@@ -365,6 +366,104 @@ class TestClass:
             assert room.membership == "invite"
             assert room.stripped_state[0].source["type"] == "m.room.member"
             assert room.stripped_state[0].membership == "invite"
+
+    def test_sliding_sync_extensions_parse(self):
+        parsed_dict = {
+            "pos": "s1",
+            "extensions": {
+                "to_device": {
+                    "next_batch": "td_token_1",
+                    "events": [
+                        {
+                            "sender": "@alice:example.org",
+                            "type": "org.example.custom",
+                            "content": {"body": "ping"},
+                        },
+                        # Empty content parses to None and is dropped.
+                        {
+                            "sender": "@alice:example.org",
+                            "type": "org.example.custom",
+                            "content": {},
+                        },
+                    ],
+                },
+                "e2ee": {
+                    # An explicit zero count must be preserved so a drained
+                    # key pool is replenished.
+                    "device_one_time_keys_count": {"signed_curve25519": 0},
+                    "device_lists": {
+                        "changed": ["@alice:example.org"],
+                        "left": ["@bob:example.org"],
+                    },
+                },
+                "account_data": {
+                    "global": [
+                        {"type": "m.direct", "content": {"@alice:example.org": []}},
+                    ],
+                    "rooms": {
+                        "!room:example.org": [
+                            {
+                                "type": "m.fully_read",
+                                "content": {"event_id": "$read:example.org"},
+                            },
+                        ],
+                    },
+                },
+            },
+        }
+
+        pristine = copy.deepcopy(parsed_dict["extensions"])
+
+        response = SlidingSyncResponse.from_dict(parsed_dict)
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.to_device_next_batch == "td_token_1"
+        assert len(response.to_device_events) == 1
+        assert response.to_device_events[0].source["type"] == "org.example.custom"
+        assert response.device_key_count.signed_curve25519 == 0
+        assert response.device_key_count.curve25519 is None
+        assert response.device_list.changed == ["@alice:example.org"]
+        assert response.device_list.left == ["@bob:example.org"]
+        assert len(response.account_data_events) == 1
+        room_events = response.room_account_data["!room:example.org"]
+        assert room_events[0].event_id == "$read:example.org"
+        # The raw extension payload stays available, byte-for-byte
+        # untouched: several event parsers pop() keys from their input and
+        # must only ever see copies.
+        assert response.extensions == pristine
+
+    def test_sliding_sync_extensions_absent(self):
+        response = SlidingSyncResponse.from_dict({"pos": "s1", "extensions": {}})
+
+        assert isinstance(response, SlidingSyncResponse)
+        assert response.to_device_events == []
+        assert response.to_device_next_batch is None
+        assert response.device_key_count.signed_curve25519 is None
+        assert response.device_list.changed == []
+        assert response.device_list.left == []
+        assert response.account_data_events == []
+        assert response.room_account_data == {}
+
+    def test_sliding_sync_malformed_extensions_return_error(self):
+        for extensions in (
+            {"to_device": {"events": "junk"}},
+            {"to_device": "junk"},
+            {"e2ee": {"device_one_time_keys_count": {"signed_curve25519": "50"}}},
+            {"e2ee": {"device_lists": {"changed": [42]}}},
+            {"account_data": {"global": {"not": "a list"}}},
+            {"account_data": {"rooms": {"!room:example.org": "junk"}}},
+            # Scalar items inside otherwise-valid arrays used to crash the
+            # event parsers with a TypeError.
+            {"to_device": {"events": [42]}},
+            {"to_device": {"events": ["junk"]}},
+            {"account_data": {"global": [42]}},
+            {"account_data": {"rooms": {"!room:example.org": [42]}}},
+        ):
+            response = SlidingSyncResponse.from_dict(
+                {"pos": "s1", "extensions": extensions}
+            )
+
+            assert isinstance(response, SlidingSyncError), repr(extensions)
 
     def test_keyshare_request(self):
         parsed_dict = {
