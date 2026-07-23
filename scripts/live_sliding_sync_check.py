@@ -19,7 +19,10 @@ Besides the single-shot wire format checks this also exercises
 loop, clean shutdown, the ``M_UNKNOWN_POS`` rejection the loop recovers
 from, and a full encrypted round trip (room key over the to_device
 extension, megolm timeline decryption) between two fresh store-backed
-clients.
+clients. Pass ``--restart-cmd`` (e.g. ``'docker restart <container>'``)
+to additionally restart the homeserver under a running loop, asserting
+the loop rides out the outage, recovers the connection and never
+re-dispatches events across the restart.
 
 Pass ``--slam`` to additionally run a stress pass: two concurrent
 long-poll sync loops (one per user, separate conn_ids) while a writer
@@ -83,6 +86,19 @@ async def _wait_for(predicate, timeout: float = 30.0) -> bool:
             return True
         await asyncio.sleep(0.2)
     return predicate()
+
+
+async def _wait_server_up(client: AsyncClient, timeout: float = 60.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = await client.send("GET", "/_matrix/client/versions", timeout=2)
+            if resp.status == 200:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
 
 
 async def forever_checks(alice: AsyncClient, bob: AsyncClient) -> None:
@@ -157,6 +173,94 @@ async def forever_checks(alice: AsyncClient, bob: AsyncClient) -> None:
         )
     else:
         print("forever: server accepts a foreign pos, no connection reset needed")
+
+
+async def restart_checks(
+    alice: AsyncClient, bob: AsyncClient, restart_cmd: str
+) -> None:
+    """Restart the homeserver under a running loop.
+
+    The loop must ride out the outage (transport retries), recover the
+    connection (M_UNKNOWN_POS on servers with in-memory sliding sync
+    state), keep delivering afterwards, and never re-dispatch events the
+    callbacks already saw even though the fresh connection re-sends each
+    room's recent timeline window.
+    """
+    counts = {}
+    errcodes = []
+
+    async def message_cb(room, event):
+        counts[event.body] = counts.get(event.body, 0) + 1
+
+    async def error_cb(response):
+        errcodes.append(response.status_code)
+
+    bob.add_event_callback(message_cb, RoomMessageText)
+    bob.add_response_callback(error_cb, SlidingSyncError)
+
+    loop_task = asyncio.create_task(
+        bob.sliding_sync_forever(
+            timeout=30_000,
+            conn_id="restart-bob",
+            lists=LISTS,
+            extensions={"to_device": {"enabled": True}},
+        )
+    )
+    await asyncio.wait_for(bob.synced.wait(), 30)
+
+    room_id = (await alice.room_create(name="restart room")).room_id
+    await alice.room_invite(room_id, bob.user_id)
+    check(
+        "restart: invite arrives before the restart",
+        await _wait_for(lambda: room_id in bob.invited_rooms),
+    )
+    await bob.join(room_id)
+    await alice.room_send(
+        room_id, "m.room.message", {"msgtype": "m.text", "body": "restart-before"}
+    )
+    check(
+        "restart: message delivered before the restart",
+        await _wait_for(lambda: counts.get("restart-before") == 1),
+        repr(counts),
+    )
+
+    print(f"restart: running {restart_cmd!r}")
+    proc = await asyncio.create_subprocess_shell(
+        restart_cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    check(
+        "restart: restart command succeeded",
+        proc.returncode == 0,
+        stderr.decode(errors="replace"),
+    )
+    check("restart: server back up", await _wait_server_up(alice))
+
+    await alice.room_send(
+        room_id, "m.room.message", {"msgtype": "m.text", "body": "restart-after"}
+    )
+    check(
+        "restart: loop recovers and delivers after the restart",
+        await _wait_for(lambda: counts.get("restart-after") == 1, timeout=90),
+        repr(counts),
+    )
+    check(
+        "restart: no message dispatched twice across the restart",
+        all(count == 1 for count in counts.values()),
+        repr({body: count for body, count in counts.items() if count != 1}),
+    )
+    if "M_UNKNOWN_POS" in errcodes:
+        check("restart: loop recovered from M_UNKNOWN_POS", True)
+    else:
+        print(
+            "restart: no M_UNKNOWN_POS observed; server kept the connection "
+            f"(errcodes seen: {errcodes!r})"
+        )
+
+    bob.stop_sync_forever()
+    await asyncio.wait_for(loop_task, 60)
 
 
 async def encrypted_forever_checks(homeserver: str) -> None:
@@ -643,6 +747,12 @@ async def bench(client: AsyncClient, n_rooms: int, msgs_per_room: int = 5) -> No
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--homeserver", default="http://127.0.0.1:8008")
+    parser.add_argument(
+        "--restart-cmd",
+        help="shell command that restarts the homeserver (e.g. 'docker "
+        "restart nio-live-synapse'); enables the mid-loop restart "
+        "recovery check",
+    )
     parser.add_argument("--slam", action="store_true")
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--rooms", type=int, default=10)
@@ -752,6 +862,9 @@ async def main() -> None:
         await deep_checks(alice, bob)
 
         await forever_checks(alice, bob)
+
+        if args.restart_cmd:
+            await restart_checks(alice, bob, args.restart_cmd)
 
         await encrypted_forever_checks(args.homeserver)
 

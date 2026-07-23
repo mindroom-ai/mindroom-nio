@@ -575,8 +575,15 @@ class AsyncClient(Client):
         # were already handed to the event callbacks (the /sync–/messages
         # overlap of a recovery walk, or the timeline window a sliding sync
         # connection re-sends after expiring); never used to decide where
-        # recovery starts or stops.
-        self._dispatched_event_ids: Dict[str, OrderedDict[str, None]] = {}
+        # recovery starts or stops. The value records whether the event was
+        # still encrypted when dispatched, so exactly one decryptable
+        # replay is let through once the room key arrives.
+        self._dispatched_event_ids: Dict[str, OrderedDict[str, bool]] = {}
+
+        # Per-room account data from the sliding sync account_data
+        # extension that referenced rooms outside the sliding window,
+        # kept (latest snapshot per room) until the room is known.
+        self._pending_sliding_room_account_data: Dict[str, List[AccountDataEvent]] = {}
 
         # The delivery token of the sliding sync to_device extension. The
         # token is device-scoped, not connection-scoped: sending it back as
@@ -854,6 +861,11 @@ class AsyncClient(Client):
         connection re-sends after expiring — are not dispatched twice. The
         memory is not persisted; after a restart the spec-permitted
         duplicate remains possible.
+
+        The stored value records whether the event was still encrypted when
+        dispatched. Once an event has been dispatched decrypted it can never
+        drop back to the encrypted marking, so replays stay suppressed even
+        if a later copy fails to decrypt.
         """
         dispatched = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
 
@@ -861,7 +873,13 @@ class AsyncClient(Client):
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            dispatched[event_id] = dispatched.pop(event_id, None)
+            was_encrypted = dispatched.pop(event_id, None)
+            still_encrypted = isinstance(event, MegolmEvent)
+            dispatched[event_id] = (
+                still_encrypted
+                if was_encrypted is None
+                else was_encrypted and still_encrypted
+            )
 
         while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
             dispatched.popitem(last=False)
@@ -1320,6 +1338,19 @@ class AsyncClient(Client):
             if room_id in self.invited_rooms:
                 del self.invited_rooms[room_id]
 
+            existing_room = self.rooms.get(room_id)
+            if sliding_room.initial and existing_room is not None:
+                # An initial room response is a full snapshot: state that
+                # disappeared while no connection was live (members who
+                # left, deleted metadata) is simply absent from it, so the
+                # room is rebuilt rather than patched. The outbound group
+                # session is invalidated so departed members stop receiving
+                # new room keys; membership is re-fetched on the next
+                # encrypted send.
+                if self.olm and existing_room.encrypted:
+                    self.invalidate_outbound_session(room_id)
+                del self.rooms[room_id]
+
             if room_id not in self.rooms:
                 logger.info(f"New joined room {room_id}")
                 self.rooms[room_id] = MatrixRoom(
@@ -1341,6 +1372,13 @@ class AsyncClient(Client):
                         self._invalidate_session_for_member_event(room_id)
                 else:
                     room.handle_event(event)
+
+            for hero in sliding_room.heroes:
+                # Heroes are room members; seed unknown ones so display
+                # name and avatar calculation can resolve them even when
+                # lazy member loading never delivers their member events.
+                if hero.user_id not in room.users:
+                    room.add_member(hero.user_id, hero.displayname, hero.avatar_url)
 
             heroes = (
                 [hero.user_id for hero in sliding_room.heroes]
@@ -1371,8 +1409,10 @@ class AsyncClient(Client):
             # whenever it expires (M_UNKNOWN_POS) or a room re-enters the
             # list window. State above is re-applied (idempotent), but
             # events already handed to the callbacks are not dispatched
-            # again.
-            dispatched = self._dispatched_event_ids.get(room_id, ())
+            # again — except the first decryptable replay of an event that
+            # could only be dispatched in encrypted form before its room
+            # key arrived.
+            dispatched = self._dispatched_event_ids.get(room_id, {})
             decrypted_events: List[Tuple[int, Union[Event, BadEventType]]] = []
 
             for index, event in enumerate(sliding_room.timeline):
@@ -1384,8 +1424,12 @@ class AsyncClient(Client):
                     event = decrypted_event
                     decrypted_events.append((index, decrypted_event))
 
-                if getattr(event, "event_id", None) in dispatched:
-                    continue
+                event_id = getattr(event, "event_id", None)
+                if event_id in dispatched:
+                    was_encrypted = dispatched[event_id]
+                    now_decrypted = not isinstance(event, MegolmEvent)
+                    if not (was_encrypted and now_decrypted):
+                        continue
 
                 await self._on_event(event, room)
 
@@ -1393,17 +1437,7 @@ class AsyncClient(Client):
             for index, event in decrypted_events:
                 sliding_room.timeline[index] = event
 
-            # Events that stayed encrypted are not remembered: if the
-            # server replays one after the missing room key has arrived,
-            # the decrypted event must still reach the callbacks.
-            self._record_dispatched_events(
-                room_id,
-                [
-                    event
-                    for event in sliding_room.timeline
-                    if not isinstance(event, MegolmEvent)
-                ],
-            )
+            self._record_dispatched_events(room_id, sliding_room.timeline)
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -1413,16 +1447,30 @@ class AsyncClient(Client):
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
 
-    @staticmethod
     def _handle_sliding_sync_state_stub(
-        room: MatrixRoom, stub: SlidingSyncStateStub
+        self, room: MatrixRoom, stub: SlidingSyncStateStub
     ) -> None:
         """Apply a MSC4186 state deletion stub to a room.
 
         Stubs carry only a type and state key and signal that the state
-        entry no longer exists. Only the room attributes that can represent
-        absence are reset; anything else is ignored.
+        entry no longer exists. Only the state the room model can represent
+        as absent is reset; anything else is ignored.
         """
+        if stub.type == "m.room.member" and stub.state_key:
+            # A deleted membership means the user is no longer in the room;
+            # rotate the outbound session so they stop receiving room keys.
+            if room.remove_member(stub.state_key):
+                self._invalidate_session_for_member_event(room.room_id)
+            return
+
+        if stub.type == "m.space.parent" and stub.state_key:
+            room.parents.discard(stub.state_key)
+            return
+
+        if stub.type == "m.space.child" and stub.state_key:
+            room.children.discard(stub.state_key)
+            return
+
         if stub.state_key != "":
             return
 
@@ -1441,11 +1489,27 @@ class AsyncClient(Client):
         for event in response.account_data_events:
             await self._on_global_account_data(event)
 
+        # Deliver account data that arrived before its room entered the
+        # sliding window, now that the room exists.
+        for room_id in [
+            room_id
+            for room_id in self._pending_sliding_room_account_data
+            if room_id in self.rooms
+        ]:
+            events = self._pending_sliding_room_account_data.pop(room_id)
+            room = self.rooms[room_id]
+
+            for event in events:
+                room.handle_account_data(event)
+                await self._on_room_account_data(event, room)
+
         for room_id, events in response.room_account_data.items():
             room = self.rooms.get(room_id)
 
-            # Account data can reference rooms outside the sliding window.
             if room is None:
+                # Account data can reference rooms outside the sliding
+                # window; keep the latest snapshot until the room is known.
+                self._pending_sliding_room_account_data[room_id] = list(events)
                 continue
 
             for event in events:

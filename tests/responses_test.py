@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from typing import Type
@@ -411,6 +412,8 @@ class TestClass:
             },
         }
 
+        pristine = copy.deepcopy(parsed_dict["extensions"])
+
         response = SlidingSyncResponse.from_dict(parsed_dict)
 
         assert isinstance(response, SlidingSyncResponse)
@@ -424,8 +427,10 @@ class TestClass:
         assert len(response.account_data_events) == 1
         room_events = response.room_account_data["!room:example.org"]
         assert room_events[0].event_id == "$read:example.org"
-        # The raw extension payload stays available untouched.
-        assert response.extensions["to_device"]["next_batch"] == "td_token_1"
+        # The raw extension payload stays available, byte-for-byte
+        # untouched: several event parsers pop() keys from their input and
+        # must only ever see copies.
+        assert response.extensions == pristine
 
     def test_sliding_sync_extensions_absent(self):
         response = SlidingSyncResponse.from_dict({"pos": "s1", "extensions": {}})

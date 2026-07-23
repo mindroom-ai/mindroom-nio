@@ -1267,6 +1267,11 @@ class TestClass:
                         "highlight_count": 1,
                         "heroes": [
                             {"user_id": ALICE_ID, "displayname": "Alice"},
+                            {
+                                "user_id": CAROL_ID,
+                                "displayname": "Carol",
+                                "avatar_url": "mxc://example.org/carol",
+                            },
                         ],
                         "required_state": [
                             {
@@ -1389,9 +1394,14 @@ class TestClass:
         assert ALICE_ID in room.users
         assert room.summary.joined_member_count == 2
         assert room.summary.invited_member_count == 1
-        assert room.summary.heroes == [ALICE_ID]
+        assert room.summary.heroes == [ALICE_ID, CAROL_ID]
         assert room.unread_notifications == 11
         assert room.unread_highlights == 1
+
+        # Heroes that lazy member loading never delivered are seeded as
+        # members so display names and avatars resolve.
+        assert room.users[CAROL_ID].display_name == "Carol"
+        assert room.users[CAROL_ID].avatar_url == "mxc://example.org/carol"
 
         # The undecryptable timeline event was dispatched as a MegolmEvent
         # with its room id attached.
@@ -1573,6 +1583,25 @@ class TestClass:
         assert len(undecryptable) == 1
         assert not messages
 
+        # A replay while the key is still missing is suppressed: the
+        # encrypted form was already dispatched once.
+        early_replay = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2b",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [],
+                        "timeline": [megolm_timeline_event],
+                    },
+                },
+            }
+        )
+        await alice.receive_response(early_replay)
+
+        assert len(undecryptable) == 1
+        assert not messages
+
         # The room key arrives in the to_device extension of a later
         # response that replays the same timeline event: to-device events
         # are processed before room timelines, and the now-decryptable
@@ -1653,6 +1682,14 @@ class TestClass:
                             state("m.room.name", {"name": "Named"}),
                             state("m.room.topic", {"topic": "Topical"}),
                             state("m.room.avatar", {"url": "mxc://example.org/a"}),
+                            {
+                                "event_id": "$alice:example.org",
+                                "sender": ALICE_ID,
+                                "type": "m.room.member",
+                                "state_key": ALICE_ID,
+                                "origin_server_ts": 2,
+                                "content": {"membership": "join"},
+                            },
                         ],
                         "timeline": [],
                     },
@@ -1665,6 +1702,7 @@ class TestClass:
         assert room.name == "Named"
         assert room.topic == "Topical"
         assert room.room_avatar_url == "mxc://example.org/a"
+        assert ALICE_ID in room.users
 
         # MSC4186 signals deleted state entries with content-less stubs.
         stub_response = SlidingSyncResponse.from_dict(
@@ -1677,6 +1715,7 @@ class TestClass:
                             {"type": "m.room.name", "state_key": ""},
                             {"type": "m.room.topic", "state_key": ""},
                             {"type": "m.room.avatar", "state_key": ""},
+                            {"type": "m.room.member", "state_key": ALICE_ID},
                         ],
                         "timeline": [],
                     },
@@ -1688,6 +1727,140 @@ class TestClass:
         assert room.name is None
         assert room.topic is None
         assert room.room_avatar_url is None
+        assert ALICE_ID not in room.users
+
+    async def test_receive_sliding_sync_initial_rebuild(self, async_client):
+        def member(user_id):
+            return {
+                "event_id": f"$member-{user_id}:example.org",
+                "sender": user_id,
+                "type": "m.room.member",
+                "state_key": user_id,
+                "origin_server_ts": 1,
+                "content": {"membership": "join"},
+            }
+
+        encryption = {
+            "event_id": "$enc:example.org",
+            "sender": ALICE_ID,
+            "type": "m.room.encryption",
+            "state_key": "",
+            "origin_server_ts": 1,
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+        }
+        name = {
+            "event_id": "$name:example.org",
+            "sender": ALICE_ID,
+            "type": "m.room.name",
+            "state_key": "",
+            "origin_server_ts": 1,
+            "content": {"name": "Before"},
+        }
+
+        first = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "initial": True,
+                        "required_state": [
+                            encryption,
+                            name,
+                            member(ALICE_ID),
+                            member(CAROL_ID),
+                        ],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(first)
+
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert room.encrypted
+        assert room.name == "Before"
+        assert CAROL_ID in room.users
+
+        async_client.olm.create_outbound_group_session(TEST_ROOM_ID)
+        async_client.olm.outbound_group_sessions[TEST_ROOM_ID].shared = True
+
+        # The connection expired while carol left and the name was removed:
+        # the fresh connection's initial snapshot simply no longer contains
+        # them. The room must be rebuilt, not patched, and the outbound
+        # session rotated so carol stops receiving new room keys.
+        snapshot = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p2",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "initial": True,
+                        "required_state": [encryption, member(ALICE_ID)],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(snapshot)
+
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert ALICE_ID in room.users
+        assert CAROL_ID not in room.users
+        assert room.name is None
+        assert room.encrypted
+        assert not room.members_synced
+        assert TEST_ROOM_ID not in async_client.olm.outbound_group_sessions
+
+    async def test_receive_sliding_sync_pending_room_account_data(self, async_client):
+        received = []
+
+        async def account_data_cb(room, event):
+            received.append((room.room_id, event.event_id))
+
+        async_client.add_room_account_data_callback(account_data_cb, FullyReadEvent)
+
+        # Account data for a room outside the sliding window is buffered.
+        first = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "extensions": {
+                    "account_data": {
+                        "rooms": {
+                            TEST_ROOM_ID: [
+                                {
+                                    "type": "m.fully_read",
+                                    "content": {"event_id": "$mark:example.org"},
+                                },
+                            ],
+                        },
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(first)
+
+        assert received == []
+        assert TEST_ROOM_ID not in async_client.rooms
+
+        # Once the room enters the window, the buffered account data is
+        # applied and dispatched.
+        second = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p2",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(second)
+
+        assert received == [(TEST_ROOM_ID, "$mark:example.org")]
+        assert async_client.rooms[TEST_ROOM_ID].fully_read_marker == "$mark:example.org"
 
     async def test_sliding_sync_forever_cancels_siblings_on_error(
         self, async_client, aioresponse

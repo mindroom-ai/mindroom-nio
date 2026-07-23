@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from dataclasses import dataclass, field
@@ -2373,11 +2374,20 @@ class SlidingSyncResponse(Response):
 
         extensions = parsed_dict.get("extensions", {})
 
+        def copied(event_dict: Any) -> Any:
+            # Several event parsers pop() keys out of their input; parse
+            # copies so the raw extensions payload stays untouched.
+            return (
+                copy.deepcopy(event_dict)
+                if isinstance(event_dict, dict)
+                else event_dict
+            )
+
         to_device_dict = extensions.get("to_device") or {}
         to_device_events = [
             event
             for event in (
-                ToDeviceEvent.parse_event(event_dict)
+                ToDeviceEvent.parse_event(copied(event_dict))
                 for event_dict in to_device_dict.get("events", [])
             )
             if event is not None
@@ -2390,17 +2400,20 @@ class SlidingSyncResponse(Response):
             key_count_dict.get("signed_curve25519"),
         )
         device_list = DeviceList(
-            e2ee_dict.get("device_lists", {}).get("changed", []),
-            e2ee_dict.get("device_lists", {}).get("left", []),
+            list(e2ee_dict.get("device_lists", {}).get("changed", [])),
+            list(e2ee_dict.get("device_lists", {}).get("left", [])),
         )
 
         account_data_dict = extensions.get("account_data") or {}
         account_data_events = [
-            AccountDataEvent.parse_event(event_dict)
+            AccountDataEvent.parse_event(copied(event_dict))
             for event_dict in account_data_dict.get("global", [])
         ]
         room_account_data = {
-            room_id: [AccountDataEvent.parse_event(event_dict) for event_dict in events]
+            room_id: [
+                AccountDataEvent.parse_event(copied(event_dict))
+                for event_dict in events
+            ]
             for room_id, events in (account_data_dict.get("rooms") or {}).items()
         }
 
