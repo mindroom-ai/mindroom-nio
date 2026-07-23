@@ -1109,6 +1109,63 @@ class TestLimitedTimelineBackfill:
         assert "inside an event callback" in caplog.text
         await client.close()
 
+    async def test_callback_timeout_error_skips_only_that_event(
+        self, backfill_client, aioresponse, caplog
+    ):
+        """A callback raising TimeoutError is that event's failure alone.
+
+        It must not be mistaken for the dispatch budget expiring, which would
+        abort the remaining recovered events.
+        """
+        dispatched = self._record_callback(backfill_client)
+
+        async def flaky(_room, event):
+            if event.event_id == "$gap1":
+                raise asyncio.TimeoutError("the callback's own timeout")
+
+        backfill_client.add_event_callback(flaky, RoomMessageText)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "s1": messages_payload(
+                    [
+                        text_event("$gap1", ts=100),
+                        text_event("$gap2", ts=110),
+                        text_event("$new", ts=300),
+                    ],
+                    end="fwd2",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await backfill_client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        # $gap1's dispatch failed (and is logged), but $gap2 still arrived —
+        # the budget warning must not fire.
+        assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
+        assert "Failed to dispatch backfilled event $gap1" in caplog.text
+        assert "budget is exhausted" not in caplog.text
+
     async def test_live_edge_does_not_close_the_gap(
         self, backfill_client, aioresponse, caplog
     ):

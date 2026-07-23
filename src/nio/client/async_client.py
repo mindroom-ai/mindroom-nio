@@ -281,6 +281,18 @@ AsyncFileType = Union[AsyncBufferedReader, AsyncTextIOWrapper]
 
 logger = logging.getLogger(__name__)
 
+
+class _BackfillCallbackError(Exception):
+    """Wraps an exception raised by an event callback during backfill dispatch.
+
+    The dispatch await is bounded with ``asyncio.wait_for``, whose budget
+    expiry surfaces as ``TimeoutError`` — which a callback could also raise
+    itself (e.g. from its own bounded I/O). Wrapping callback exceptions keeps
+    the two apart: a ``TimeoutError`` escaping the wait can only be the
+    budget, and a wrapped error only ever skips its one event.
+    """
+
+
 # How many recently dispatched event ids to remember per room when
 # `backfill_limited_timelines` is enabled. The cache exists purely to
 # de-duplicate the /sync–/messages overlap the spec warns about (a federation
@@ -794,6 +806,22 @@ class AsyncClient(Client):
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
 
+    async def _dispatch_backfilled_event(
+        self, event: Union[Event, BadEventType], room: MatrixRoom
+    ) -> None:
+        """Fan one recovered event out to the callbacks, wrapping their errors.
+
+        A callback exception is re-raised as ``_BackfillCallbackError`` so the
+        dispatch loop can tell it apart from its own budget ``TimeoutError`` —
+        even when the callback itself raised a ``TimeoutError``. Cancellation
+        (how the budget interrupts a hanging callback) is not an ``Exception``
+        and passes through untouched.
+        """
+        try:
+            await self._on_event(event, room)
+        except Exception as exc:
+            raise _BackfillCallbackError from exc
+
     def _record_dispatched_events(
         self,
         room_id: str,
@@ -955,7 +983,10 @@ class AsyncClient(Client):
                 # The await itself is bounded as well: once a callback that
                 # never returns is awaited, the deadline check above could
                 # never regain control.
-                await asyncio.wait_for(self._on_event(event, room), timeout=remaining)
+                await asyncio.wait_for(
+                    self._dispatch_backfilled_event(event, room),
+                    timeout=remaining,
+                )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Stopping backfill dispatch for room %s after %d of %d "
@@ -967,7 +998,7 @@ class AsyncClient(Client):
                     len(recovered),
                 )
                 break
-            except Exception:
+            except _BackfillCallbackError:
                 # Unlike the live sync path, where a raising callback
                 # propagates out of sync(), a backfill must never break the
                 # sync loop, so a crashing callback only skips this one event.
