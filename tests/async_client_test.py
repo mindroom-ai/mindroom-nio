@@ -1534,33 +1534,58 @@ class TestClass:
                 "content": {"msgtype": "m.text", "body": "sliding secret"},
             },
         )
+        megolm_timeline_event = {
+            "event_id": "$secret:example.org",
+            "sender": bob.user_id,
+            "type": "m.room.encrypted",
+            "origin_server_ts": 3,
+            "content": encrypted_content,
+        }
 
         messages = []
+        undecryptable = []
 
         async def message_cb(room, event):
             messages.append((room.room_id, event))
 
-        alice.add_event_callback(message_cb, RoomMessageText)
+        async def megolm_cb(room, event):
+            undecryptable.append(event)
 
-        # The room key arrives in the to_device extension of the very same
-        # response as the megolm event that needs it: to-device events must
-        # be processed before the room timelines.
-        response = SlidingSyncResponse.from_dict(
+        alice.add_event_callback(message_cb, RoomMessageText)
+        alice.add_event_callback(megolm_cb, MegolmEvent)
+
+        # The event arrives before its room key and is dispatched in its
+        # encrypted form.
+        early = SlidingSyncResponse.from_dict(
             {
                 "pos": "s2",
                 "rooms": {
                     TEST_ROOM_ID: {
                         "membership": "join",
                         "required_state": [],
-                        "timeline": [
-                            {
-                                "event_id": "$secret:example.org",
-                                "sender": bob.user_id,
-                                "type": "m.room.encrypted",
-                                "origin_server_ts": 3,
-                                "content": encrypted_content,
-                            },
-                        ],
+                        "timeline": [megolm_timeline_event],
+                    },
+                },
+            }
+        )
+        await alice.receive_response(early)
+
+        assert len(undecryptable) == 1
+        assert not messages
+
+        # The room key arrives in the to_device extension of a later
+        # response that replays the same timeline event: to-device events
+        # are processed before room timelines, and the now-decryptable
+        # event must reach the callbacks despite its earlier encrypted
+        # dispatch.
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s3",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [],
+                        "timeline": [megolm_timeline_event],
                     },
                 },
                 "extensions": {
@@ -1588,6 +1613,127 @@ class TestClass:
         # their decrypted counterparts on the response object.
         assert isinstance(response.to_device_events[0], RoomKeyEvent)
         assert isinstance(response.rooms[TEST_ROOM_ID].timeline[0], RoomMessageText)
+
+        # Once dispatched decrypted, further replays are de-duplicated.
+        replay = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s4",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [],
+                        "timeline": [megolm_timeline_event],
+                    },
+                },
+            }
+        )
+        await alice.receive_response(replay)
+
+        assert len(messages) == 1
+        assert len(undecryptable) == 1
+
+    async def test_receive_sliding_sync_state_stub(self, async_client):
+        def state(type_, content):
+            return {
+                "event_id": f"${type_}:example.org",
+                "sender": ALICE_ID,
+                "type": type_,
+                "state_key": "",
+                "origin_server_ts": 1,
+                "content": content,
+            }
+
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [
+                            state("m.room.name", {"name": "Named"}),
+                            state("m.room.topic", {"topic": "Topical"}),
+                            state("m.room.avatar", {"url": "mxc://example.org/a"}),
+                        ],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(response)
+
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert room.name == "Named"
+        assert room.topic == "Topical"
+        assert room.room_avatar_url == "mxc://example.org/a"
+
+        # MSC4186 signals deleted state entries with content-less stubs.
+        stub_response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p2",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "required_state": [
+                            {"type": "m.room.name", "state_key": ""},
+                            {"type": "m.room.topic", "state_key": ""},
+                            {"type": "m.room.avatar", "state_key": ""},
+                        ],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(stub_response)
+
+        assert room.name is None
+        assert room.topic is None
+        assert room.room_avatar_url is None
+
+    async def test_sliding_sync_forever_cancels_siblings_on_error(
+        self, async_client, aioresponse
+    ):
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/upload",
+            status=200,
+            payload=self.final_keys_upload_response,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query",
+            status=200,
+            payload=self.keys_query_response,
+            repeat=True,
+        )
+
+        calls = 0
+        long_poll_started = asyncio.Event()
+        long_poll_cancelled = asyncio.Event()
+
+        async def fake_sliding_sync(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return SlidingSyncResponse.from_dict({"pos": "p1"})
+
+            long_poll_started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                long_poll_cancelled.set()
+                raise
+
+        async def failing_send_to_device_messages():
+            await long_poll_started.wait()
+            raise RuntimeError("to-device send blew up")
+
+        async_client.sliding_sync = fake_sliding_sync
+        async_client.send_to_device_messages = failing_send_to_device_messages
+
+        # A failing sibling request must not leave the long-poll running:
+        # its response would be applied to client state after the loop died.
+        with pytest.raises(RuntimeError, match="to-device send blew up"):
+            await asyncio.wait_for(async_client.sliding_sync_forever(), 30)
+
+        await asyncio.wait_for(long_poll_cancelled.wait(), 30)
 
     async def test_sync_notification_counts(self, async_client, aioresponse):
         aioresponse.get(

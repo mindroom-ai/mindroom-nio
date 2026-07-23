@@ -1329,9 +1329,8 @@ class AsyncClient(Client):
             room = self.rooms[room_id]
 
             for event in sliding_room.required_state:
-                # State stubs signal deleted state, which the room model
-                # cannot represent; skip them.
                 if isinstance(event, SlidingSyncStateStub):
+                    self._handle_sliding_sync_state_stub(room, event)
                     continue
 
                 if isinstance(event, RoomEncryptionEvent):
@@ -1394,7 +1393,17 @@ class AsyncClient(Client):
             for index, event in decrypted_events:
                 sliding_room.timeline[index] = event
 
-            self._record_dispatched_events(room_id, sliding_room.timeline)
+            # Events that stayed encrypted are not remembered: if the
+            # server replays one after the missing room key has arrived,
+            # the decrypted event must still reach the callbacks.
+            self._record_dispatched_events(
+                room_id,
+                [
+                    event
+                    for event in sliding_room.timeline
+                    if not isinstance(event, MegolmEvent)
+                ],
+            )
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -1403,6 +1412,28 @@ class AsyncClient(Client):
 
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
+
+    @staticmethod
+    def _handle_sliding_sync_state_stub(
+        room: MatrixRoom, stub: SlidingSyncStateStub
+    ) -> None:
+        """Apply a MSC4186 state deletion stub to a room.
+
+        Stubs carry only a type and state key and signal that the state
+        entry no longer exists. Only the room attributes that can represent
+        absence are reset; anything else is ignored.
+        """
+        if stub.state_key != "":
+            return
+
+        if stub.type == "m.room.name":
+            room.name = None
+        elif stub.type == "m.room.canonical_alias":
+            room.canonical_alias = None
+        elif stub.type == "m.room.topic":
+            room.topic = None
+        elif stub.type == "m.room.avatar":
+            room.room_avatar_url = None
 
     async def _handle_sliding_sync_account_data(
         self, response: SlidingSyncResponse
@@ -2360,12 +2391,12 @@ class AsyncClient(Client):
                 if loop_sleep_time:
                     await asyncio.sleep(loop_sleep_time / 1000)
 
-            except asyncio.CancelledError:  # noqa: PERF203
+            except BaseException:  # noqa: PERF203
+                # Cancel the sibling requests: a failed key request must
+                # not leave the long-poll running, or its response would
+                # still be applied to client state after the loop has died.
                 for task in tasks:
                     task.cancel()
-                self._stop_sync_forever = False
-                raise
-            except:
                 self._stop_sync_forever = False
                 raise
         self._stop_sync_forever = False

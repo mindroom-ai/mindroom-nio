@@ -16,15 +16,20 @@ All notable changes to this project will be documented in this file.
   and `loop_sleep_time` exactly like the /v3/sync loop. Re-sent timeline
   windows (connection expiry, rooms re-entering a list window) are
   de-duplicated against a bounded per-room memory of dispatched event ids,
-  so event callbacks never see the same event twice mid-run.
+  so event callbacks never see the same event twice mid-run; events that
+  stayed encrypted are not remembered, so a replay after the missing room
+  key arrives still delivers the decrypted event. A failure in one of the
+  loop's parallel requests cancels its siblings, so no orphaned long-poll
+  can apply state after the loop has died.
 - `AsyncClient.sliding_sync()` responses now update client state via
   `receive_response()`, mirroring `sync()`: rooms are created and updated
   from `required_state` (state events, membership, encryption flag) plus the
   server-computed summary fields (heroes, joined/invited counts,
-  notification counts), invites appear in `client.invited_rooms` from
-  stripped state, timelines are decrypted and dispatched through the
-  registered event callbacks, and left/banned rooms are skipped like in
-  /v3/sync.
+  notification counts), MSC4186 state deletion stubs reset the room name,
+  canonical alias, topic and avatar, invites appear in
+  `client.invited_rooms` from stripped state, timelines are decrypted and
+  dispatched through the registered event callbacks, and left/banned rooms
+  are skipped like in /v3/sync.
 - Parse the sliding sync `to_device`, `e2ee` and `account_data` extension
   payloads into typed fields on `SlidingSyncResponse` (`to_device_events`,
   `to_device_next_batch`, `device_key_count`, `device_list`,
