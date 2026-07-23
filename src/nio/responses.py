@@ -313,7 +313,9 @@ class SlidingSyncRoom:
     lists: Optional[List[str]] = None
     name: Optional[str] = None
     avatar: Optional[str] = None
-    heroes: List[SlidingSyncHero] = field(default_factory=list)
+    # None when the field was absent from the response; an explicit empty
+    # list means the server cleared the heroes.
+    heroes: Optional[List[SlidingSyncHero]] = None
     is_dm: Optional[bool] = None
     initial: bool = False
     expanded_timeline: bool = False
@@ -367,10 +369,11 @@ class SlidingSyncRoom:
             lists=parsed_dict.get("lists"),
             name=parsed_dict.get("name"),
             avatar=parsed_dict.get("avatar"),
-            heroes=[
-                SlidingSyncHero.from_dict(hero)
-                for hero in parsed_dict.get("heroes", [])
-            ],
+            heroes=(
+                [SlidingSyncHero.from_dict(hero) for hero in parsed_dict["heroes"]]
+                if parsed_dict.get("heroes") is not None
+                else None
+            ),
             is_dm=parsed_dict.get("is_dm"),
             initial=parsed_dict.get("initial", False),
             # Synapse serialises this flag with an unstable prefix.

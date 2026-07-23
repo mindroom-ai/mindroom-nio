@@ -582,7 +582,7 @@ async def deep_checks(alice: AsyncClient, bob: AsyncClient) -> None:
     resp = await alice.sliding_sync(conn_id="deep-heroes", timeout=0, lists=lists)
     room = resp.rooms.get(heroes_room)
     heroes_ok = room is not None and any(
-        hero.user_id == bob.user_id for hero in room.heroes
+        hero.user_id == bob.user_id for hero in room.heroes or []
     )
     if is_synapse:
         check("deep: heroes parsed", heroes_ok, repr(room and room.heroes))

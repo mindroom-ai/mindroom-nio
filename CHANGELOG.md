@@ -19,23 +19,31 @@ All notable changes to this project will be documented in this file.
   so event callbacks never see the same event twice mid-run; the memory
   records whether an event could only be dispatched encrypted, letting
   exactly one decryptable replay through once the missing room key
-  arrives. Rooms flagged ``initial`` that the client already tracks are
-  rebuilt from the snapshot rather than patched, so members and metadata
-  removed while no connection was live cannot linger — the outbound group
-  session is rotated so departed members stop receiving room keys. A
-  failure in one of the loop's parallel requests cancels its siblings, so
-  no orphaned long-poll can apply state after the loop has died.
+  arrives (the same upgrade rule now applies to limited-timeline backfill
+  recovery walks). Rooms flagged ``initial`` that the client already
+  tracks are rebuilt from the snapshot rather than patched, so members and
+  metadata removed while no connection was live cannot linger — the
+  outbound group session is rotated so departed members stop receiving
+  room keys. Consecutive error responses back off exponentially (reusing
+  the transport retry curve) instead of hot-looping, while the position is
+  kept so a recovered server resumes where it left off. A failure in one
+  of the loop's parallel requests cancels its siblings, so no orphaned
+  long-poll can apply state after the loop has died.
 - `AsyncClient.sliding_sync()` responses now update client state via
   `receive_response()`, mirroring `sync()`: rooms are created and updated
   from `required_state` (state events, membership, encryption flag) plus the
   server-computed summary fields (heroes, joined/invited counts,
   notification counts), heroes unknown to lazy member loading are seeded as
-  members so display names and avatars resolve, MSC4186 state deletion
-  stubs are applied (room name, canonical alias, topic, avatar, space
-  parent/child links, and member deletions — which also rotate the outbound
-  session), invites appear in `client.invited_rooms` from stripped state,
-  timelines are decrypted and dispatched through the registered event
-  callbacks, and left/banned rooms are skipped like in /v3/sync.
+  members so display names and avatars resolve (skipped for otherwise-empty
+  rooms, whose heroes are members who left; an explicit empty heroes list
+  clears stale ones — `SlidingSyncRoom.heroes` is now `None` when the field
+  was absent), MSC4186 state deletion stubs are applied (room name,
+  canonical alias, topic, avatar, join rules, guest access, history
+  visibility, tombstone, power levels, space parent/child links, and member
+  deletions — which also rotate the outbound session), invites appear in
+  `client.invited_rooms` from stripped state, timelines are decrypted and
+  dispatched through the registered event callbacks, and left/banned rooms
+  are skipped like in /v3/sync.
 - Parse the sliding sync `to_device`, `e2ee` and `account_data` extension
   payloads into typed fields on `SlidingSyncResponse` (`to_device_events`,
   `to_device_next_batch`, `device_key_count`, `device_list`,
@@ -44,9 +52,10 @@ All notable changes to this project will be documented in this file.
   keys land before the timelines that need them), one-time-key counts
   (including an explicit zero for drained pools), device-list based key
   query invalidation, and global/per-room account data callbacks. Account
-  data for rooms outside the sliding window is buffered until the room
-  appears. The raw `extensions` dict remains available byte-for-byte
-  untouched (event parsers only ever see copies).
+  data for rooms outside the sliding window is buffered (newest event per
+  type, merged across responses) until the room appears. The raw
+  `extensions` dict remains available byte-for-byte untouched (event
+  parsers only ever see copies).
 - Extend `scripts/live_sliding_sync_check.py` with `sliding_sync_forever`
   checks: invites and live messages arriving through the loop, clean
   shutdown, the `M_UNKNOWN_POS` rejection for unknown positions, a full

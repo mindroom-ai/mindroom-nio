@@ -119,6 +119,7 @@ from nio import (
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncResponse,
+    TagEvent,
     ThumbnailError,
     ThumbnailResponse,
     Timeline,
@@ -1682,6 +1683,20 @@ class TestClass:
                             state("m.room.name", {"name": "Named"}),
                             state("m.room.topic", {"topic": "Topical"}),
                             state("m.room.avatar", {"url": "mxc://example.org/a"}),
+                            state("m.room.join_rules", {"join_rule": "knock"}),
+                            state("m.room.guest_access", {"guest_access": "can_join"}),
+                            state(
+                                "m.room.history_visibility",
+                                {"history_visibility": "world_readable"},
+                            ),
+                            state(
+                                "m.room.tombstone",
+                                {
+                                    "body": "upgraded",
+                                    "replacement_room": "!new:example.org",
+                                },
+                            ),
+                            state("m.room.power_levels", {"users": {ALICE_ID: 100}}),
                             {
                                 "event_id": "$alice:example.org",
                                 "sender": ALICE_ID,
@@ -1702,6 +1717,11 @@ class TestClass:
         assert room.name == "Named"
         assert room.topic == "Topical"
         assert room.room_avatar_url == "mxc://example.org/a"
+        assert room.join_rule == "knock"
+        assert room.guest_access == "can_join"
+        assert room.history_visibility == "world_readable"
+        assert room.replacement_room == "!new:example.org"
+        assert room.power_levels.users[ALICE_ID] == 100
         assert ALICE_ID in room.users
 
         # MSC4186 signals deleted state entries with content-less stubs.
@@ -1715,6 +1735,11 @@ class TestClass:
                             {"type": "m.room.name", "state_key": ""},
                             {"type": "m.room.topic", "state_key": ""},
                             {"type": "m.room.avatar", "state_key": ""},
+                            {"type": "m.room.join_rules", "state_key": ""},
+                            {"type": "m.room.guest_access", "state_key": ""},
+                            {"type": "m.room.history_visibility", "state_key": ""},
+                            {"type": "m.room.tombstone", "state_key": ""},
+                            {"type": "m.room.power_levels", "state_key": ""},
                             {"type": "m.room.member", "state_key": ALICE_ID},
                         ],
                         "timeline": [],
@@ -1727,6 +1752,11 @@ class TestClass:
         assert room.name is None
         assert room.topic is None
         assert room.room_avatar_url is None
+        assert room.join_rule == "invite"
+        assert room.guest_access == "forbidden"
+        assert room.history_visibility == "shared"
+        assert room.replacement_room is None
+        assert ALICE_ID not in room.power_levels.users
         assert ALICE_ID not in room.users
 
     async def test_receive_sliding_sync_initial_rebuild(self, async_client):
@@ -1813,41 +1843,51 @@ class TestClass:
         assert TEST_ROOM_ID not in async_client.olm.outbound_group_sessions
 
     async def test_receive_sliding_sync_pending_room_account_data(self, async_client):
+        def account_data_response(pos, events):
+            return SlidingSyncResponse.from_dict(
+                {
+                    "pos": pos,
+                    "extensions": {"account_data": {"rooms": {TEST_ROOM_ID: events}}},
+                }
+            )
+
         received = []
 
         async def account_data_cb(room, event):
-            received.append((room.room_id, event.event_id))
+            received.append((room.room_id, event))
 
-        async_client.add_room_account_data_callback(account_data_cb, FullyReadEvent)
+        async_client.add_room_account_data_callback(
+            account_data_cb, (FullyReadEvent, TagEvent)
+        )
 
         # Account data for a room outside the sliding window is buffered.
-        first = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "extensions": {
-                    "account_data": {
-                        "rooms": {
-                            TEST_ROOM_ID: [
-                                {
-                                    "type": "m.fully_read",
-                                    "content": {"event_id": "$mark:example.org"},
-                                },
-                            ],
-                        },
-                    },
-                },
-            }
+        await async_client.receive_response(
+            account_data_response(
+                "p1", [{"type": "m.tag", "content": {"tags": {"u.work": {}}}}]
+            )
         )
-        await async_client.receive_response(first)
+        # A later delta carrying a different type must not clobber it:
+        # account data is type-keyed state.
+        await async_client.receive_response(
+            account_data_response(
+                "p2",
+                [
+                    {
+                        "type": "m.fully_read",
+                        "content": {"event_id": "$mark:example.org"},
+                    }
+                ],
+            )
+        )
 
         assert received == []
         assert TEST_ROOM_ID not in async_client.rooms
 
-        # Once the room enters the window, the buffered account data is
+        # Once the room enters the window, all buffered account data is
         # applied and dispatched.
-        second = SlidingSyncResponse.from_dict(
+        third = SlidingSyncResponse.from_dict(
             {
-                "pos": "p2",
+                "pos": "p3",
                 "rooms": {
                     TEST_ROOM_ID: {
                         "membership": "join",
@@ -1857,10 +1897,145 @@ class TestClass:
                 },
             }
         )
-        await async_client.receive_response(second)
+        await async_client.receive_response(third)
 
-        assert received == [(TEST_ROOM_ID, "$mark:example.org")]
-        assert async_client.rooms[TEST_ROOM_ID].fully_read_marker == "$mark:example.org"
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert {type(event) for _, event in received} == {FullyReadEvent, TagEvent}
+        assert room.fully_read_marker == "$mark:example.org"
+        assert room.tags == {"u.work": {}}
+
+    async def test_sliding_sync_forever_error_backoff(self, async_client, aioresponse):
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/upload",
+            status=200,
+            payload=self.final_keys_upload_response,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query",
+            status=200,
+            payload=self.keys_query_response,
+            repeat=True,
+        )
+
+        request_times = []
+
+        def callback(url, data, **kwargs):
+            request_times.append((time.monotonic(), dict(url.query)))
+
+            if len(request_times) in (2, 3, 4):
+                return CallbackResult(
+                    status=500,
+                    payload={"errcode": "M_UNKNOWN", "error": "boom"},
+                )
+
+            return CallbackResult(
+                status=200, payload={"pos": f"p{len(request_times)}", "rooms": {}}
+            )
+
+        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
+
+        successes = []
+
+        async def response_cb(response):
+            successes.append(response)
+            if len(successes) >= 2:
+                async_client.stop_sync_forever()
+
+        async_client.add_response_callback(response_cb, SlidingSyncResponse)
+
+        await asyncio.wait_for(
+            async_client.sliding_sync_forever(timeout=30_000, conn_id="backoff"),
+            60,
+        )
+
+        assert len(request_times) == 5
+
+        # Errors other than M_UNKNOWN_POS retry with the same position...
+        assert [query.get("pos") for _, query in request_times] == [
+            None,
+            "p1",
+            "p1",
+            "p1",
+            "p1",
+        ]
+
+        # ...but consecutive errors back off exponentially instead of
+        # hot-looping (0s, then 0.2s, 0.4s with the default backoff factor;
+        # the first error retries immediately).
+        gaps = [
+            request_times[i + 1][0] - request_times[i][0]
+            for i in range(len(request_times) - 1)
+        ]
+        assert gaps[2] >= 0.15
+        assert gaps[3] >= 0.3
+
+    async def test_receive_sliding_sync_left_heroes_not_seeded(self, async_client):
+        # In an otherwise-empty room the server's heroes list falls back to
+        # members who left; they must not be resurrected as joined members.
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "rooms": {
+                    TEST_ROOM_ID: {
+                        "membership": "join",
+                        "joined_count": 1,
+                        "invited_count": 0,
+                        "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
+                        "required_state": [],
+                        "timeline": [],
+                    },
+                },
+            }
+        )
+        await async_client.receive_response(response)
+
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert ALICE_ID not in room.users
+        # The summary still records them, so "Empty Room (had Alice)" style
+        # display names keep working.
+        assert room.summary.heroes == [ALICE_ID]
+
+    async def test_receive_sliding_sync_heroes_cleared(self, async_client):
+        def response(pos, room):
+            return SlidingSyncResponse.from_dict(
+                {"pos": pos, "rooms": {TEST_ROOM_ID: {"membership": "join", **room}}}
+            )
+
+        await async_client.receive_response(
+            response(
+                "p1",
+                {
+                    "joined_count": 2,
+                    "invited_count": 0,
+                    "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
+                    "required_state": [],
+                    "timeline": [],
+                },
+            )
+        )
+        room = async_client.rooms[TEST_ROOM_ID]
+        assert room.summary.heroes == [ALICE_ID]
+
+        # An explicit empty list clears stale heroes...
+        await async_client.receive_response(
+            response(
+                "p2",
+                {
+                    "joined_count": 1,
+                    "invited_count": 0,
+                    "heroes": [],
+                    "required_state": [],
+                    "timeline": [],
+                },
+            )
+        )
+        assert room.summary.heroes == []
+
+        # ...while an omitted field leaves them untouched.
+        await async_client.receive_response(
+            response("p3", {"required_state": [], "timeline": []})
+        )
+        assert room.summary.heroes == []
 
     async def test_sliding_sync_forever_cancels_siblings_on_error(
         self, async_client, aioresponse
