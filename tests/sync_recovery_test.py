@@ -229,7 +229,7 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
 
 
 @pytest.mark.asyncio
-async def test_room_rotation_progresses_after_another_room_times_out():
+async def test_slow_room_does_not_consume_another_rooms_budget():
     state = RecoveryState(
         gaps={
             ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")],
@@ -259,11 +259,35 @@ async def test_room_rotation_progresses_after_another_room_times_out():
         "store": None,
     }
     await pump_recovery(state, **kwargs)
-    assert seen == []
-    await pump_recovery(state, **kwargs)
     assert seen == ["$other"]
     assert ROOM in state.gaps
     assert ROOM_B not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
+    corrupt = PendingTimelineEvent(ROOM, 1, 0, "$bad", "{", False, True)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "", None)]},
+        events={(ROOM, 1): [corrupt]},
+    )
+
+    async def unused_fetch(*args):
+        raise AssertionError("closed gap must not fetch")
+
+    async def unused_dispatch(*args):
+        raise AssertionError("corrupt event must not dispatch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=unused_dispatch,
+        store=None,
+    )
+    assert not state.gaps
+    assert state.completed[ROOM] == {"$bad": True}
 
 
 @pytest.mark.asyncio

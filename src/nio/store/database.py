@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING
 
-from peewee import EXCLUDED, DoesNotExist, SqliteDatabase
+from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -585,7 +585,11 @@ class MatrixStore:
             .order_by(
                 PendingTimelineEvents.room_id,
                 PendingTimelineEvents.generation,
-                PendingTimelineEvents.is_live,
+                Case(
+                    PendingTimelineEvents.generation,
+                    ((0, PendingTimelineEvents.id),),
+                    PendingTimelineEvents.is_live,
+                ),
                 PendingTimelineEvents.sequence,
             )
         )
@@ -607,14 +611,16 @@ class MatrixStore:
             PendingTimelineEvents.generation == generation,
         )
         if event_id:
-            PendingTimelineEvents.update(
-                generation=0,
-                is_live=False,
-                was_encrypted=was_encrypted,
-            ).where(
+            pending = PendingTimelineEvents.get(
                 *event_filter,
                 PendingTimelineEvents.event_id == event_id,
-            ).execute()
+            )
+            pending.delete_instance()
+            pending.id = None
+            pending.generation = 0
+            pending.is_live = False
+            pending.was_encrypted = was_encrypted
+            pending.save(force_insert=True)
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)
                 .where(

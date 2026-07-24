@@ -640,6 +640,28 @@ class TestClass:
         assert len(events) == 1
         assert events[0].generation == 0
 
+    def test_completed_upgrade_refreshes_pruning_recency(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "", None)
+
+        def complete(event_id, was_encrypted):
+            event = PendingTimelineEvent(
+                TEST_ROOM, 1, 0, event_id, "{}", False, was_encrypted
+            )
+            sqlstore.save_recovery(None, set(), [gap], [event], None)
+            sqlstore.finish_recovery(TEST_ROOM, 1, event_id, was_encrypted)
+
+        complete("$same", True)
+        for index in range(1, 512):
+            complete(f"${index}", False)
+        complete("$same", False)
+        complete("$new", False)
+
+        _, events = sqlstore.load_sync_recovery()
+        event_ids = [event.event_id for event in events]
+        assert len(event_ids) == 512
+        assert "$same" in event_ids
+        assert "$1" not in event_ids
+
     def test_sqlitestore_verification(self, sqlstore):
         devices = self.example_devices
         bob_device = devices[BOB_ID][BOB_DEVICE]

@@ -28,6 +28,7 @@ from nio import (
     SlidingSyncResponse,
     SyncResponse,
     Timeline,
+    UnknownBadEvent,
 )
 from nio.api import MATRIX_API_PATH_V3
 from nio.client.sync_recovery import (
@@ -327,6 +328,23 @@ class TestRoomLocalRecovery:
         assert seen == ["$a"]
         assert not client._recovery.gaps
 
+    async def test_enabled_dispatches_no_id_bad_event_after_commit(self, client):
+        seen: list[UnknownBadEvent] = []
+
+        async def record(_room, event):
+            seen.append(event)
+
+        client.add_event_callback(record, UnknownBadEvent)
+        malformed = Event.parse_event({"type": "broken"})
+        assert isinstance(malformed, UnknownBadEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([malformed], limited=False, prev_batch="p0")},
+            )
+        )
+        assert seen == [malformed]
+
     async def test_gap_and_live_window_dispatch_in_order(self, client, aioresponse):
         seen = record_events(client)
         await client.receive_response(
@@ -494,7 +512,9 @@ class TestRoomLocalRecovery:
         assert seen == ["$old"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
 
-    async def test_repeated_end_token_keeps_gap_pending(self, client, aioresponse):
+    async def test_repeated_end_token_abandons_gap_and_releases_live(
+        self, client, aioresponse
+    ):
         seen = record_events(client)
         await client.receive_response(
             sync_response(
@@ -520,8 +540,8 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old"]
-        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
 
     async def test_missing_prev_batch_uses_response_target(self, client, aioresponse):
         seen = record_events(client)
@@ -687,7 +707,9 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
 
-    async def test_ignored_to_future_is_not_dispatched(self, client, aioresponse):
+    async def test_ignored_to_abandons_untrusted_page_and_releases_live(
+        self, client, aioresponse
+    ):
         seen = record_events(client)
         await client.receive_response(
             sync_response(
@@ -720,8 +742,9 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old"]
-        assert client._recovery.gaps.get(ROOM_A)
+        assert seen == ["$old", "$held"]
+        assert "$future" not in seen
+        assert not client._recovery.gaps
 
     async def test_target_page_recovers_concurrent_dag_branches(
         self, client, aioresponse
@@ -895,6 +918,29 @@ class TestRoomLocalRecovery:
         )
         clear = text_event("$encrypted", 4)
         assert should_dispatch_timeline_event(client._recovery, ROOM_A, clear)
+
+    async def test_live_decryption_upgrades_completed_encrypted_event(
+        self, client, monkeypatch
+    ):
+        seen = record_events(client)
+        encrypted = megolm_event("$encrypted", 1)
+        clear = text_event("$encrypted", 1)
+        record_completed_timeline_event(
+            client._recovery, ROOM_A, encrypted.event_id, True
+        )
+
+        def decrypt(event, *_args):
+            return clear if event.event_id == encrypted.event_id else None
+
+        monkeypatch.setattr(client, "_handle_timeline_event", decrypt)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
+        assert seen == ["$encrypted"]
+        assert client._recovery.completed[ROOM_A]["$encrypted"] is False
 
     async def test_restart_resumes_room_without_replaying_response_surfaces(
         self, tempdir, aioresponse
@@ -1686,6 +1732,55 @@ class TestRoomLocalRecovery:
         assert seen == ["$after"]
         assert not client._recovery.gaps
 
+    async def test_sliding_initial_historical_join_keeps_classic_gap(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more"),
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more2"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "initial": True,
+                        "membership": "join",
+                        "num_live": 1,
+                        "timeline": [
+                            member_event("$join", 2, "join").source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        assert seen == []
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more2"
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$gap",
+            "$held",
+            "$after",
+        ]
+
     @pytest.mark.parametrize("membership", ["leave", "ban", "invite"])
     async def test_sliding_membership_reset_clears_classic_recovery_durably(
         self, tempdir, aioresponse, membership
@@ -1942,6 +2037,14 @@ class TestRoomLocalRecovery:
         def fail(*args, **kwargs):
             raise RuntimeError("commit failed")
 
+        prepared = []
+        original_prepare = client._prepare_to_device
+
+        def prepare(response):
+            prepared.append(response)
+            return original_prepare(response)
+
+        monkeypatch.setattr(client, "_prepare_to_device", prepare)
         monkeypatch.setattr(client.store, "save_recovery", fail)
         with pytest.raises(RuntimeError, match="commit failed"):
             await client.receive_response(
@@ -1956,6 +2059,55 @@ class TestRoomLocalRecovery:
             )
         assert client.next_batch == "s1"
         assert client.store.load_sync_token() == "s1"
+        assert not client._recovery.gaps
+        assert prepared == []
+        await client.close()
+
+    async def test_failed_sliding_plan_commit_keeps_to_device_cursor(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client._sliding_sync_to_device_since = "td0"
+        prepared = []
+        monkeypatch.setattr(
+            client,
+            "_prepare_to_device",
+            lambda response: prepared.append(response) or [],
+        )
+
+        def fail(*_args):
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(client.store, "save_recovery", fail)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$held", 1).source],
+                    }
+                },
+                "extensions": {
+                    "to_device": {"next_batch": "td1", "events": []},
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await client.receive_response(response)
+        assert client._sliding_sync_to_device_since == "td0"
+        assert prepared == []
         assert not client._recovery.gaps
         await client.close()
 

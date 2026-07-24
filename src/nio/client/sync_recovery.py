@@ -8,34 +8,20 @@ import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from ..api import MessageDirection
 from ..events import BadEventType, Event, MegolmEvent, RoomMemberEvent
 from ..responses import RoomMessagesResponse
+
+if TYPE_CHECKING:
+    from ..store.database import MatrixStore
 
 logger = logging.getLogger(__name__)
 
 
 class CommittedCancellation(asyncio.CancelledError):
     pass
-
-
-class RecoveryStore(Protocol):
-    supports_threaded_writes: bool
-
-    def save_recovery(
-        self,
-        token: str | None,
-        clear_rooms: set[str],
-        gaps: Sequence[RecoveryGap],
-        events: Sequence[PendingTimelineEvent],
-        clear_recovered: RecoveryGap | None,
-    ) -> None: ...
-
-    def finish_recovery(
-        self, room_id: str, generation: int, event_id: str | None, was_encrypted: bool
-    ) -> None: ...
 
 
 FetchMessages = Callable[
@@ -102,6 +88,7 @@ class RecoveryPlan:
     clear_rooms: frozenset[str] = frozenset()
     gaps: tuple[RecoveryGap, ...] = ()
     events: tuple[PendingTimelineEvent, ...] = ()
+    clear_recovered: RecoveryGap | None = None
 
 
 @dataclass
@@ -215,13 +202,14 @@ def plan_room_timeline(
     timeline_events: Sequence[Event | BadEventType],
     user_id: str | None,
     membership: str,
+    live_event_count: int | None = None,
     cursor_token: str | None = None,
     target_token: str = "",
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return RecoveryPlan(clear_rooms=frozenset({room_id}))
 
-    start = 1 + max(
+    last_join = max(
         (
             index
             for index, event in enumerate(timeline_events)
@@ -229,7 +217,13 @@ def plan_room_timeline(
         ),
         default=-1,
     )
-    clear = bool(start)
+    start = last_join + 1
+    live_start = (
+        0
+        if live_event_count is None
+        else max(0, len(timeline_events) - live_event_count)
+    )
+    clear = last_join >= live_start
     existing = () if clear else state.gaps.get(room_id, ())
     new_gap = cursor_token is not None and not clear
     generation = existing[-1].generation if existing else 0
@@ -263,11 +257,15 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     clear_rooms: set[str] = set()
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
+    clear_recovered = None
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
-    return RecoveryPlan(frozenset(clear_rooms), tuple(gaps), tuple(events))
+        clear_recovered = plan.clear_recovered or clear_recovered
+    return RecoveryPlan(
+        frozenset(clear_rooms), tuple(gaps), tuple(events), clear_recovered
+    )
 
 
 def plan_sync_response(
@@ -279,7 +277,7 @@ def plan_sync_response(
     joined_rooms: Mapping[str, Any],
     reset_room_ids: Iterable[str] = (),
 ) -> RecoveryPlan:
-    plans = [
+    plan = merge_recovery_plans(
         plan_room_timeline(
             state,
             room_id=room_id,
@@ -292,18 +290,12 @@ def plan_sync_response(
             target_token=room_info.timeline.prev_batch or response_token,
         )
         for room_id, room_info in joined_rooms.items()
-    ]
-    plans.extend(
-        plan_room_timeline(
-            state,
-            room_id=room_id,
-            timeline_events=(),
-            user_id=user_id,
-            membership="leave",
-        )
-        for room_id in reset_room_ids
     )
-    return merge_recovery_plans(plans)
+    return RecoveryPlan(
+        plan.clear_rooms | frozenset(reset_room_ids),
+        plan.gaps,
+        plan.events,
+    )
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
@@ -312,14 +304,27 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
             state.events.pop((room_id, gap.generation), None)
 
     for gap in plan.gaps:
-        state.gaps.setdefault(gap.room_id, []).append(gap)
+        gaps = state.gaps.setdefault(gap.room_id, [])
+        existing = next(
+            (item for item in gaps if item.generation == gap.generation), None
+        )
+        if existing:
+            gaps[gaps.index(existing)] = gap
+        else:
+            gaps.append(gap)
         state.events.setdefault((gap.room_id, gap.generation), [])
+
+    if plan.clear_recovered:
+        key = (plan.clear_recovered.room_id, plan.clear_recovered.generation)
+        state.events[key][:] = [event for event in state.events[key] if event.is_live]
 
     for event in plan.events:
         state.completed.get(event.room_id, {}).pop(event.event_id, None)
         key = (event.room_id, event.generation)
         queued = state.events.setdefault(key, [])
         _merge_event(queued, event)
+    for key in {(event.room_id, event.generation) for event in plan.events}:
+        state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
 
 
 def _merge_event(
@@ -375,7 +380,7 @@ def load_recovery_state(
 
 async def _commit(
     state: RecoveryState,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
     operation: Callable[..., None] | None,
     apply: Callable[[], None],
     *args: Any,
@@ -400,7 +405,7 @@ async def _commit(
 
 async def persist_response_plan(
     state: RecoveryState,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
     *,
     token: str | None,
     plan: RecoveryPlan,
@@ -414,47 +419,7 @@ async def persist_response_plan(
         set(plan.clear_rooms),
         plan.gaps,
         plan.events,
-        None,
-    )
-
-
-def _merge_recovered(
-    state: RecoveryState,
-    gap: RecoveryGap,
-    events: Sequence[PendingTimelineEvent],
-    *,
-    clear_recovered: bool,
-) -> None:
-    key = (gap.room_id, gap.generation)
-    queued = state.events.setdefault(key, [])
-    if clear_recovered:
-        queued[:] = [event for event in queued if event.is_live]
-    for event in events:
-        _merge_event(queued, event)
-    queued.sort(key=lambda event: (event.is_live, event.sequence))
-    gaps = state.gaps[gap.room_id]
-    index = next(i for i, item in enumerate(gaps) if item.generation == gap.generation)
-    gaps[index] = gap
-
-
-async def _persist_progress(
-    state: RecoveryState,
-    store: RecoveryStore | None,
-    gap: RecoveryGap,
-    events: Sequence[PendingTimelineEvent],
-    *,
-    clear_recovered: bool,
-) -> None:
-    await _commit(
-        state,
-        store,
-        store.save_recovery if store else None,
-        lambda: _merge_recovered(state, gap, events, clear_recovered=clear_recovered),
-        None,
-        set(),
-        [gap],
-        events,
-        gap if clear_recovered else None,
+        plan.clear_recovered,
     )
 
 
@@ -480,7 +445,7 @@ def _finish_memory(
 
 async def _finish(
     state: RecoveryState,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
     gap: RecoveryGap,
     event: PendingTimelineEvent | None = None,
     was_encrypted: bool = False,
@@ -504,7 +469,7 @@ async def _collect_slice(
     user_id: str | None,
     options: RecoveryOptions,
     fetch_messages: FetchMessages,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
     deadline: float,
 ) -> RecoveryGap:
     if gap.cursor_token is None:
@@ -584,23 +549,26 @@ async def _collect_slice(
             next_cursor = None
         elif truncated:
             break
+        elif response.end is None or response.end == cursor:
+            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
+            recovered.clear()
+            clear_recovered = True
+            next_cursor = None
         else:
             next_cursor = response.end
-            if next_cursor is None:
-                logger.warning("Unverified limited-timeline edge in %s", gap.room_id)
-                break
-            if next_cursor == cursor:
-                break
 
         updated = replace(gap, cursor_token=next_cursor)
         if deadline - asyncio.get_running_loop().time() <= 0:
             break
-        await _persist_progress(
+        await persist_response_plan(
             state,
             store,
-            updated,
-            recovered,
-            clear_recovered=clear_recovered,
+            token=None,
+            plan=RecoveryPlan(
+                gaps=(updated,),
+                events=tuple(recovered),
+                clear_recovered=updated if clear_recovered else None,
+            ),
         )
         gap = updated
         recovered_count += len(recovered)
@@ -617,14 +585,19 @@ async def _drain_gap(
     gap: RecoveryGap,
     *,
     dispatch_event: DispatchEvent,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
     deadline: float | None,
 ) -> None:
     if gap.cursor_token is not None:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
-        event = pending.parse()
+        try:
+            event = pending.parse()
+        except Exception:
+            logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
+            await _finish(state, store, gap, pending, pending.was_encrypted)
+            continue
         try:
             dispatch = dispatch_event(gap.room_id, event)
             delivered = (
@@ -658,7 +631,7 @@ async def pump_recovery(
     options: RecoveryOptions,
     fetch_messages: FetchMessages,
     dispatch_event: DispatchEvent,
-    store: RecoveryStore | None,
+    store: MatrixStore | None,
 ) -> None:
     room_ids = list(state.gaps)
     if not room_ids:
@@ -666,31 +639,36 @@ async def pump_recovery(
     offset = state.room_offset % len(room_ids)
     room_ids = room_ids[offset:] + room_ids[:offset]
     state.room_offset = (offset + 1) % len(room_ids)
+    room_ids.sort(key=lambda room_id: state.gaps[room_id][0].cursor_token is not None)
+    recovering = sum(
+        state.gaps[room_id][0].cursor_token is not None for room_id in room_ids
+    )
     deadline = asyncio.get_running_loop().time() + options.timeout
-
     for room_id in room_ids:
         gaps = state.gaps.get(room_id)
         if not gaps:
             continue
         gap = gaps[0]
-        if (
-            gap.cursor_token is not None
-            and deadline - asyncio.get_running_loop().time() <= 0
-        ):
-            continue
-        gap = await _collect_slice(
-            state,
-            gap,
-            user_id=user_id,
-            options=options,
-            fetch_messages=fetch_messages,
-            store=store,
-            deadline=deadline,
-        )
+        room_deadline = deadline
+        if gap.cursor_token is not None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                continue
+            room_deadline = asyncio.get_running_loop().time() + remaining / recovering
+            recovering -= 1
+            gap = await _collect_slice(
+                state,
+                gap,
+                user_id=user_id,
+                options=options,
+                fetch_messages=fetch_messages,
+                store=store,
+                deadline=room_deadline,
+            )
         await _drain_gap(
             state,
             gap,
             dispatch_event=dispatch_event,
             store=store,
-            deadline=None if not gap.target_token else deadline,
+            deadline=None if not gap.target_token else room_deadline,
         )
