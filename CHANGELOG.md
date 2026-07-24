@@ -91,23 +91,25 @@ All notable changes to this project will be documented in this file.
 - Add opt-in recovery of events dropped by limited sync timelines
   (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
   timeline arrives with `limited: true`, the client pages `/messages`
-  backwards from the timeline's `prev_batch` token to the last contiguous
-  callback checkpoint and dispatches the recovered gap through the normal
+  forwards from the last contiguous callback checkpoint toward the current
+  response token and dispatches the recovered gap through the normal
   event callbacks — oldest first, before the sync response's own events,
   decrypted like live events but never applied to room state. Gaps spanning
   a client restart are recovered when resuming from a stored or explicit
   since token; freshly joined rooms are never backfilled past our own join.
-  Page and event bounds default to unlimited; explicitly configured bounds,
-  errors, stalls, and timeouts discard incomplete recovery with a warning.
-  The in-memory and stored callback checkpoint does not advance across an
-  incomplete collection or dispatch, so a later token reset or process
-  restart can retry from the safe boundary. Callback deliveries reachable
-  from that durable checkpoint are journaled with their encryption state, so
-  restart recovery neither duplicates them nor suppresses a later decrypted
-  form. All backfill for one sync response shares a single time budget
-  (`backfill_timeout`) covering pagination and dispatch, including hanging
-  callbacks. Disabled by default; behaviour with the flag off is identical
-  to upstream nio.
+  The event bound defaults to 200 per room per response; incomplete recovery
+  dispatches its safe prefix, holds newer live events, and automatically
+  retries from the same checkpoint in bounded slices. The page bound remains
+  optional. The callback checkpoint and sticky gap marker are stored together,
+  while terminally dispatched event IDs and encryption state are journaled
+  durably. This prevents cross-process duplicate delivery of completed events,
+  while still allowing one later decrypted form. Every matching callback is
+  attempted before an event is terminally journaled. All backfill for one sync
+  response shares a rotating multi-room time budget (`backfill_timeout`)
+  covering pagination and dispatch, including hanging callbacks. The forward
+  lower bound also prevents old-history replay from homeservers that silently
+  ignore a backward `to` token. Disabled by default; behaviour with the flag
+  off is identical to upstream nio.
 
 ### Bug Fixes
 

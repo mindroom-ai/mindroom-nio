@@ -374,51 +374,53 @@ class AsyncClientConfig(ClientConfig):
             ``limited: true`` the homeserver truncated it, so the events between
             the previous sync position and the surviving window are never passed
             to the event callbacks. When this is enabled, sync handling pages
-            ``/messages`` backwards from the limited timeline's
-            ``prev_batch`` to the sync request's ``since`` token. If a caller
-            clears the public ``next_batch`` to force a full-state resync,
-            recovery instead uses the last sync token whose callbacks fully
-            completed. Both boundaries are valid ``/messages`` positions, so
-            this collects exactly the missing interval even when the room-DAG
-            ordering differs from ``/sync`` ordering under concurrent writers.
+            ``/messages`` forwards from the last sync token whose callbacks
+            completed to the current response token. The safe checkpoint is
+            always the ``from`` boundary because some homeservers silently
+            ignore a backward walk's ``to`` token. A server that ignores the
+            forward ``to`` boundary may return newer events, but it cannot
+            return pre-checkpoint history; the callback journal suppresses
+            those events when ``/sync`` later repeats them.
             Recovered events are dispatched through the normal event callbacks,
             oldest first and before the (newer) events of the sync response
             that revealed the gap, so callbacks observe the room in
             chronological order.
-            A walk cut short by an explicitly configured bound, an error, a
-            pagination stall, or an unverified boundary discards what it
-            collected and logs a warning. The in-memory and persisted sync
-            checkpoints then remain at the last fully dispatched position
-            until a recovery from that position completes.
-            Event ids already dispatched this run are skipped (per room,
-            bounded memory), de-duplicating the
-            ``/sync``–``/messages`` overlap; that memory is not persisted, so
-            a federation straggler delivered just before a restart may still
-            repeat. The walk is unfiltered: when syncing with a filter, gap
-            events the filter would exclude are still dispatched (callbacks
-            may see more than the filtered sync would show, never less).
-            Rooms that were
-            just joined are never backfilled past our own join: a join of ours
-            in the sync timeline skips the backfill entirely, and one
-            encountered while paging discards everything collected before it,
-            so pre-join history is never dispatched. Recovered events are
-            decrypted like live events but never applied to the ``MatrixRoom``
-            state, which is already newer than they are. Restart recovery
-            requires the server to accept sync tokens as ``/messages`` ``to``
-            positions; servers that reject them fail the request and the
-            backfill degrades to a logged warning. Disabled by default, in
-            which case behaviour is identical to upstream nio.
+            A configured bound, error, pagination stall, callback cancellation,
+            or timeout pauses recovery after its terminally dispatched forward
+            prefix. The public sync cursor resets to the safe checkpoint and
+            the room's live timeline stays held until a later limited response
+            closes the gap. Retry order rotates across rooms, and an in-memory
+            pagination cursor avoids rescanning completed pages. With stored
+            sync tokens enabled, the safe checkpoint, sticky gap marker, and
+            callback event journal survive process restart. One abrupt process
+            kill can still replay the event whose callback fan-out was active,
+            because callback side effects and SQLite cannot share a
+            transaction; every earlier completed event is durable.
+            Every matching callback is attempted even if another callback
+            raises. Such an event is terminally journaled after the complete
+            fan-out, while callback cancellation or timeout leaves it pending.
+            The walk is unfiltered: when syncing with a filter, gap events the
+            filter would exclude are still dispatched (callbacks may see more
+            than the filtered sync would show, never less). Freshly joined
+            rooms whose timeline contains our own join are not backfilled.
+            Recovered events are decrypted like live events but never applied
+            to the ``MatrixRoom`` state, which is already newer than they are.
+            Restart recovery requires the server to accept sync tokens as
+            ``/messages`` ``from`` positions; rejection pauses recovery with a
+            warning. Disabled by default, in which case behaviour is identical
+            to upstream nio.
 
         backfill_max_pages (int, optional): The maximum number of ``/messages``
             pages to fetch per limited room per sync when
             ``backfill_limited_timelines`` is enabled. Defaults to no page
-            bound. Setting a bound permits event loss when a gap exceeds it.
+            bound. An incomplete walk resumes after its completed page prefix
+            on the next limited response.
 
         backfill_max_events (int, optional): The maximum number of events to
             recover per limited room per sync when
             ``backfill_limited_timelines`` is enabled, independent of the page
-            count. Defaults to no event bound. Setting a bound permits event
-            loss when a gap exceeds it.
+            count. Defaults to 200. An incomplete gap is recovered in
+            automatic slices without advancing the safe checkpoint.
 
         backfill_page_size (int): The number of events to request per
             ``/messages`` page when ``backfill_limited_timelines`` is enabled.
@@ -430,10 +432,11 @@ class AsyncClientConfig(ClientConfig):
             the homeserver is slow or rate-limits ``/messages``
             (``room_messages()`` retries rate limits and timeouts internally,
             potentially forever with the default client config); a backfill
-            that exhausts the budget is abandoned, and rooms whose turn comes
-            after it is spent skip theirs with a warning. The budget also
-            bounds the dispatch of recovered events, so a slow event callback
-            cannot stall sync handling indefinitely through a large recovery.
+            that exhausts the budget is paused, and rooms whose turn comes
+            after it is spent skip theirs until the next rotated attempt. The
+            budget also bounds the dispatch of recovered events, so a slow
+            event callback cannot stall sync handling indefinitely through a
+            large recovery.
             Because recovery runs before the sync response's own events are
             dispatched, this also bounds how long live events can be delayed.
             Defaults to 30.
@@ -447,7 +450,7 @@ class AsyncClientConfig(ClientConfig):
     io_chunk_size: int = 64 * 1024
     backfill_limited_timelines: bool = False
     backfill_max_pages: int | None = None
-    backfill_max_events: int | None = None
+    backfill_max_events: int | None = 200
     backfill_page_size: int = 50
     backfill_timeout: float = 30.0
 
@@ -562,6 +565,8 @@ class AsyncClient(Client):
         # that response still needs the last completed callback-delivery
         # position as its exact /messages lower bound.
         self._last_processed_sync_token: str | None = None
+        self._has_unrecovered_sync_gap = False
+        self._loaded_unrecovered_sync_gap = False
 
         # Per-room memory of dispatched timeline event ids. Recovery-enabled
         # clients with a stored sync token persist every id still reachable
@@ -572,9 +577,25 @@ class AsyncClient(Client):
         self._dispatched_event_ids: dict[str, OrderedDict[str, bool]] = {}
 
         # Sliding sync has no durable callback checkpoint or token compatible
-        # with /sync recovery. Keep its re-sent-window de-duplication separate
-        # and bounded even when the /sync journal above must remain unbounded.
+        # with /sync recovery. Keep a bounded cross-protocol recent window so
+        # a sliding window cannot replay an event just pruned from the durable
+        # /sync journal, while the durable journal above remains unbounded.
         self._sliding_dispatched_event_ids: dict[str, OrderedDict[str, bool]] = {}
+
+        # Durable journal rows retain the response token that owns them. A
+        # decrypted sliding-sync replay must update the matching durable row
+        # without moving it to a token from the incompatible sliding protocol.
+        self._dispatched_event_tokens: dict[str, dict[str, str]] = {}
+
+        # Rotate joined-room processing after an incomplete recovery so one
+        # consistently slow room cannot consume every retry's shared budget.
+        self._backfill_room_offset = 0
+
+        # Resume bounded forward walks after their last completed page. The
+        # durable event journal makes a lost in-memory cursor safe to rebuild
+        # after restart; keeping it in memory avoids rescanning an ever-growing
+        # prefix on every automatic retry.
+        self._backfill_room_cursors: dict[str, tuple[str, str]] = {}
 
         # Per-room account data from the sliding sync account_data
         # extension that referenced rooms outside the sliding window, kept
@@ -597,6 +618,9 @@ class AsyncClient(Client):
         """Load encryption state plus the durable callback-overlap journal."""
         super().load_store()
         if self._durable_dispatch_journal_enabled():
+            assert self.store
+            self._has_unrecovered_sync_gap = self.store.load_sync_recovery_pending()
+            self._loaded_unrecovered_sync_gap = self._has_unrecovered_sync_gap
             self._load_dispatched_event_journal()
 
     def _durable_dispatch_journal_enabled(self) -> bool:
@@ -610,15 +634,17 @@ class AsyncClient(Client):
         """Restore event ids that the persisted callback checkpoint may replay."""
         assert self.store
         self._dispatched_event_ids.clear()
+        self._dispatched_event_tokens.clear()
         for (
             room_id,
             event_id,
             was_encrypted,
-            _sync_token,
+            sync_token,
         ) in self.store.load_dispatched_events():
             self._dispatched_event_ids.setdefault(room_id, OrderedDict())[
                 event_id
             ] = was_encrypted
+            self._dispatched_event_tokens.setdefault(room_id, {})[event_id] = sync_token
 
     def add_response_callback(
         self,
@@ -779,32 +805,49 @@ class AsyncClient(Client):
 
     async def _handle_joined_rooms(
         self, response: SyncResponse, since: str | None = None
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         encrypted_rooms: set[str] = set()
         backfill_complete = True
+        backfill_attempted = False
 
         # All backfill for one sync response shares a single time budget, so
         # many stalled rooms cannot stack their timeouts into a long sync
         # delay. The deadline is set when the first limited room needs it.
         backfill_deadline: float | None = None
 
-        for room_id, join_info in response.rooms.join.items():
+        joined_rooms = list(response.rooms.join.items())
+        if (
+            self.config.backfill_limited_timelines
+            and since
+            and any(info.timeline.limited for _room_id, info in joined_rooms)
+        ):
+            offset = self._backfill_room_offset % len(joined_rooms)
+            joined_rooms = joined_rooms[offset:] + joined_rooms[:offset]
+            self._backfill_room_offset = (offset + 1) % len(joined_rooms)
+
+        for room_id, join_info in joined_rooms:
             self._handle_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
             decrypted_events: list[tuple[int, Event | BadEventType]] = []
+            # A normal sync after an incomplete recovery still resumed from
+            # the speculative transport cursor. Hold its timelines until a
+            # limited response closes the sticky gap from the safe callback
+            # checkpoint; otherwise a newer event could overtake the gap.
+            room_backfill_complete = not self._has_unrecovered_sync_gap
 
             # Recover a limited timeline's gap before the live events are
             # dispatched, so callbacks see the room in chronological order.
-            # The room walk runs backwards from prev_batch to this request's
-            # since token. The timeline's own-join event still marks a fresh
-            # join whose earlier history is not a delivery gap.
+            # The room walk runs forwards from this request's safe since token.
+            # The timeline's own-join event still marks a fresh join whose
+            # earlier history is not a delivery gap.
             if (
                 self.config.backfill_limited_timelines
                 and join_info.timeline.limited
                 and since
                 and not self._own_join_in_timeline(join_info)
             ):
+                backfill_attempted = True
                 if backfill_deadline is None:
                     backfill_deadline = (
                         asyncio.get_running_loop().time() + self.config.backfill_timeout
@@ -819,47 +862,53 @@ class AsyncClient(Client):
                 )
                 backfill_complete = room_backfill_complete and backfill_complete
 
-            pending_journal: list[tuple[str, bool]] = []
-            try:
-                for index, event in enumerate(join_info.timeline.events):
-                    decrypted_event = self._handle_timeline_event(
-                        event, room_id, room, encrypted_rooms
-                    )
-
-                    if decrypted_event:
-                        event = decrypted_event
-                        decrypted_events.append((index, decrypted_event))
-
-                    if (
-                        self.config.backfill_limited_timelines
-                        and not self._should_dispatch_timeline_event(room_id, event)
-                    ):
-                        pending_journal.extend(
-                            self._record_dispatched_events(
-                                room_id,
-                                [event],
-                                response.next_batch,
-                                persist=False,
-                            )
-                        )
-                        continue
-
-                    await self._on_event(event, room)
-                    if self.config.backfill_limited_timelines:
-                        pending_journal.extend(
-                            self._record_dispatched_events(
-                                room_id,
-                                [event],
-                                response.next_batch,
-                                persist=False,
-                            )
-                        )
-            finally:
-                self._persist_dispatched_events(
-                    room_id,
-                    response.next_batch,
-                    pending_journal,
+            for index, event in enumerate(join_info.timeline.events):
+                decrypted_event = self._handle_timeline_event(
+                    event, room_id, room, encrypted_rooms
                 )
+
+                if decrypted_event:
+                    event = decrypted_event
+                    decrypted_events.append((index, decrypted_event))
+
+                if not room_backfill_complete:
+                    # The safe-token retry will redeliver this room's live
+                    # window. Hold it until every earlier gap slice has reached
+                    # callbacks, preserving chronological callback order.
+                    continue
+
+                if (
+                    self.config.backfill_limited_timelines
+                    and not self._should_dispatch_timeline_event(room_id, event)
+                ):
+                    await self._record_dispatched_event(
+                        room_id,
+                        event,
+                        response.next_batch,
+                    )
+                    continue
+
+                try:
+                    await self._on_event(event, room)
+                except Exception:
+                    if self.config.backfill_limited_timelines:
+                        # _on_event attempts every matching callback before
+                        # raising. The event is therefore terminally attempted;
+                        # remembering it prevents successful callbacks earlier
+                        # in the fan-out from repeating on recovery.
+                        await self._record_dispatched_event(
+                            room_id,
+                            event,
+                            response.next_batch,
+                        )
+                    raise
+
+                if self.config.backfill_limited_timelines:
+                    await self._record_dispatched_event(
+                        room_id,
+                        event,
+                        response.next_batch,
+                    )
 
             # Replace the Megolm events with decrypted ones
             for index, event in decrypted_events:
@@ -881,7 +930,7 @@ class AsyncClient(Client):
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
 
-        return backfill_complete
+        return backfill_complete, backfill_attempted
 
     async def _dispatch_backfilled_event(
         self, event: Event | BadEventType, room: MatrixRoom
@@ -898,6 +947,32 @@ class AsyncClient(Client):
             await self._on_event(event, room)
         except Exception as exc:
             raise _BackfillCallbackError from exc
+
+    async def _record_dispatched_event(
+        self,
+        room_id: str,
+        event: Event | BadEventType,
+        sync_token: str | None = None,
+    ) -> None:
+        """Remember and durably commit one terminal callback fan-out.
+
+        The external callback and local SQLite journal cannot share a
+        transaction, so an abrupt kill between them can still replay the
+        current event. Committing after every completed event keeps that
+        unavoidable window to one event. The synchronous store work runs in a
+        worker thread so large timelines do not block the asyncio loop.
+        """
+        persisted = self._record_dispatched_events(
+            room_id,
+            [event],
+            sync_token,
+            persist=False,
+        )
+        await self._persist_dispatched_events_async(
+            room_id,
+            sync_token,
+            persisted,
+        )
 
     def _record_dispatched_events(
         self,
@@ -923,12 +998,8 @@ class AsyncClient(Client):
         drop back to the encrypted marking, so replays stay suppressed even
         if a later copy fails to decrypt.
         """
-        event_cache = (
-            self._dispatched_event_ids
-            if sync_token is not None
-            else self._sliding_dispatched_event_ids
-        )
-        dispatched = event_cache.setdefault(room_id, OrderedDict())
+        recent = self._sliding_dispatched_event_ids.setdefault(room_id, OrderedDict())
+        durable = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
         persisted: list[tuple[str, bool]] = []
 
         for event in events:
@@ -936,20 +1007,38 @@ class AsyncClient(Client):
             if not event_id:
                 continue
             was_encrypted = self._dispatched_event_state(room_id, event_id)
-            dispatched.pop(event_id, None)
             still_encrypted = isinstance(event, MegolmEvent)
-            dispatched[event_id] = (
+            new_state = (
                 still_encrypted
                 if was_encrypted is None
                 else was_encrypted and still_encrypted
             )
-            persisted.append((event_id, dispatched[event_id]))
+
+            recent.pop(event_id, None)
+            recent[event_id] = new_state
+
+            if sync_token is not None:
+                durable.pop(event_id, None)
+                durable[event_id] = new_state
+                self._dispatched_event_tokens.setdefault(room_id, {})[
+                    event_id
+                ] = sync_token
+                persisted.append((event_id, new_state))
+            elif event_id in durable and durable[event_id] and not new_state:
+                durable[event_id] = False
+                persisted.append((event_id, False))
 
         if persist:
             self._persist_dispatched_events(room_id, sync_token, persisted)
-        if sync_token is None or not self._durable_dispatch_journal_enabled():
-            while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
-                dispatched.popitem(last=False)
+        while len(recent) > _MAX_DISPATCHED_EVENT_IDS:
+            recent.popitem(last=False)
+        if (
+            not self._durable_dispatch_journal_enabled()
+            and not self._has_unrecovered_sync_gap
+        ):
+            while len(durable) > _MAX_DISPATCHED_EVENT_IDS:
+                event_id, _ = durable.popitem(last=False)
+                self._dispatched_event_tokens.get(room_id, {}).pop(event_id, None)
         return persisted
 
     def _persist_dispatched_events(
@@ -959,9 +1048,36 @@ class AsyncClient(Client):
         events: list[tuple[str, bool]],
     ) -> None:
         """Write one room's pending durable callback journal as a batch."""
-        if sync_token and events and self._durable_dispatch_journal_enabled():
+        if events and self._durable_dispatch_journal_enabled():
             assert self.store
-            self.store.save_dispatched_events(room_id, sync_token, events)
+            token = sync_token
+            if token is None:
+                tokens = {
+                    self._dispatched_event_tokens.get(room_id, {}).get(event_id)
+                    for event_id, _was_encrypted in events
+                }
+                tokens.discard(None)
+                if len(tokens) != 1:
+                    return
+                token = tokens.pop()
+            assert token
+            self.store.save_dispatched_events(room_id, token, events)
+
+    async def _persist_dispatched_events_async(
+        self,
+        room_id: str,
+        sync_token: str | None,
+        events: list[tuple[str, bool]],
+    ) -> None:
+        """Persist callback journal rows without blocking the asyncio loop."""
+        if not events or not self._durable_dispatch_journal_enabled():
+            return
+        await asyncio.to_thread(
+            self._persist_dispatched_events,
+            room_id,
+            sync_token,
+            events,
+        )
 
     def _dispatched_event_state(self, room_id: str, event_id: str) -> bool | None:
         """Return the combined encrypted state from /sync and sliding sync."""
@@ -985,6 +1101,15 @@ class AsyncClient(Client):
             for event_id, was_encrypted in cache.get(room_id, {}).items():
                 combined[event_id] = combined.get(event_id, True) and was_encrypted
         return combined
+
+    def _trim_transient_dispatched_events(self) -> None:
+        """Restore the normal memory bound after a non-durable gap closes."""
+        if self._durable_dispatch_journal_enabled():
+            return
+        for room_id, events in self._dispatched_event_ids.items():
+            while len(events) > _MAX_DISPATCHED_EVENT_IDS:
+                event_id, _ = events.popitem(last=False)
+                self._dispatched_event_tokens.get(room_id, {}).pop(event_id, None)
 
     def _should_dispatch_timeline_event(
         self,
@@ -1038,10 +1163,9 @@ class AsyncClient(Client):
 
         The homeserver truncated this room's timeline (``limited: true``), so
         the events between the since position and the surviving window were
-        never handed to the event callbacks. The walk starts at the limited
-        timeline's ``prev_batch`` token and is bounded by the sync request's
-        ``since`` token, collecting exactly the missing interval in the
-        room-DAG order exposed by ``/messages``. Recovered events are
+        never handed to the event callbacks. The walk starts at the safe
+        callback checkpoint and moves forward toward the current response
+        token in the room-DAG order exposed by ``/messages``. Recovered events are
         dispatched oldest first through the normal event callbacks, before the
         sync response's own events; they are decrypted like live events but
         never applied to room state, which is already newer than they are. Any
@@ -1053,8 +1177,8 @@ class AsyncClient(Client):
         if remaining <= 0:
             logger.warning(
                 "Skipping limited-timeline backfill for room %s: the sync's "
-                "backfill time budget is exhausted; events in the gap may be "
-                "lost",
+                "backfill time budget is exhausted; recovery will retry from "
+                "the safe checkpoint",
                 room_id,
             )
             return False
@@ -1066,16 +1190,8 @@ class AsyncClient(Client):
         }
         already_dispatched = self._room_dispatched_events(room_id)
 
-        if not join_info.timeline.prev_batch:
-            logger.warning(
-                "Skipping limited-timeline backfill for room %s: no prev_batch",
-                room_id,
-            )
-            return False
-
-        collect = self._collect_gap_events_backward(
+        collect = self._collect_gap_events_forward(
             room_id,
-            join_info.timeline.prev_batch,
             since,
             present_in_sync,
             already_dispatched,
@@ -1083,14 +1199,17 @@ class AsyncClient(Client):
         )
 
         try:
-            recovered, overlap_journal, pages, gap_closed = await asyncio.wait_for(
-                collect,
-                timeout=remaining,
-            )
+            (
+                recovered,
+                overlap_journal,
+                pages,
+                gap_closed,
+                resume_token,
+            ) = await asyncio.wait_for(collect, timeout=remaining)
         except asyncio.TimeoutError:
             logger.warning(
                 "Timed out backfilling limited timeline for room %s after "
-                "%.1fs; events in the gap may be lost",
+                "%.1fs; recovery will retry from the safe checkpoint",
                 room_id,
                 remaining,
             )
@@ -1100,20 +1219,33 @@ class AsyncClient(Client):
             return False
 
         if not gap_closed:
+            self._has_unrecovered_sync_gap = True
             logger.warning(
                 "Limited-timeline backfill for room %s stopped after %d "
-                "page(s) without fully closing the gap; some events in the "
-                "gap may not be delivered",
+                "page(s) without fully closing the gap; remaining events will "
+                "retry from the safe checkpoint",
                 room_id,
                 pages,
             )
 
+        # Retag overlap before any early return. Once the checkpoint advances,
+        # pruning must not erase an event that a later /messages DAG walk can
+        # overlap again.
+        await self._persist_dispatched_events_async(
+            room_id,
+            response_token,
+            overlap_journal,
+        )
+
         if not recovered:
+            if gap_closed:
+                self._backfill_room_cursors.pop(room_id, None)
+            elif resume_token:
+                self._backfill_room_cursors[room_id] = (since, resume_token)
             return gap_closed
 
         encrypted_rooms: set[str] = set()
         dispatched = 0
-        pending_journal = list(overlap_journal)
 
         # Recovered events are dispatched as returned: Megolm events in a
         # /messages chunk were already decrypted (or failed to decrypt) by
@@ -1124,82 +1256,65 @@ class AsyncClient(Client):
         # room.handle_event()/room.handle_membership() would regress the
         # room's current state and feed stale membership into E2EE device
         # tracking.
-        try:
-            for event in recovered:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    logger.warning(
-                        "Stopping backfill dispatch for room %s after %d of %d "
-                        "event(s): the sync's backfill time budget is exhausted; "
-                        "the rest of the gap may be lost",
-                        room_id,
-                        dispatched,
-                        len(recovered),
-                    )
-                    break
+        for event in recovered:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                logger.warning(
+                    "Stopping backfill dispatch for room %s after %d of %d "
+                    "event(s): the sync's backfill time budget is exhausted; "
+                    "the rest of the gap will retry",
+                    room_id,
+                    dispatched,
+                    len(recovered),
+                )
+                break
 
-                try:
-                    if isinstance(event, RoomEncryptionEvent):
-                        # Encryption can never be disabled again once enabled, so
-                        # recording it from an old event cannot regress anything.
-                        encrypted_rooms.add(room_id)
+            try:
+                if isinstance(event, RoomEncryptionEvent):
+                    # Encryption can never be disabled again once enabled, so
+                    # recording it from an old event cannot regress anything.
+                    encrypted_rooms.add(room_id)
 
-                    # The await itself is bounded as well: once a callback that
-                    # never returns is awaited, the deadline check above could
-                    # never regain control.
-                    await asyncio.wait_for(
-                        self._dispatch_backfilled_event(event, room),
-                        timeout=remaining,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Stopping backfill dispatch for room %s after %d of %d "
-                        "event(s): the sync's backfill time budget is exhausted "
-                        "inside an event callback; the rest of the gap may be "
-                        "lost",
-                        room_id,
-                        dispatched,
-                        len(recovered),
-                    )
-                    break
-                except _BackfillCallbackError:
-                    # Unlike the live sync path, where a raising callback
-                    # propagates out of sync(), a backfill must never break the
-                    # sync loop, so a crashing callback terminally skips this
-                    # one event. Some earlier callbacks may already have
-                    # completed; remember the event so a recovery retry cannot
-                    # invoke them again.
-                    logger.exception(
-                        "Failed to dispatch backfilled event %s in room %s",
-                        getattr(event, "event_id", None),
-                        room_id,
-                    )
-                    pending_journal.extend(
-                        self._record_dispatched_events(
-                            room_id,
-                            [event],
-                            response_token,
-                            persist=False,
-                        )
-                    )
-                    dispatched += 1
-                    continue
-
-                pending_journal.extend(
-                    self._record_dispatched_events(
-                        room_id,
-                        [event],
-                        response_token,
-                        persist=False,
-                    )
+                # The await itself is bounded as well: once a callback that
+                # never returns is awaited, the deadline check above could
+                # never regain control.
+                await asyncio.wait_for(
+                    self._dispatch_backfilled_event(event, room),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Stopping backfill dispatch for room %s after %d of %d "
+                    "event(s): the sync's backfill time budget is exhausted "
+                    "inside an event callback; the rest of the gap will retry",
+                    room_id,
+                    dispatched,
+                    len(recovered),
+                )
+                break
+            except _BackfillCallbackError:
+                # _dispatch_backfilled_event attempts every callback before it
+                # reports an error. Terminally remember the event so callbacks
+                # that did succeed do not repeat on recovery.
+                logger.exception(
+                    "Failed to dispatch backfilled event %s in room %s",
+                    getattr(event, "event_id", None),
+                    room_id,
+                )
+                await self._record_dispatched_event(
+                    room_id,
+                    event,
+                    response_token,
                 )
                 dispatched += 1
-        finally:
-            self._persist_dispatched_events(
+                continue
+
+            await self._record_dispatched_event(
                 room_id,
+                event,
                 response_token,
-                pending_journal,
             )
+            dispatched += 1
 
         self.encrypted_rooms.update(encrypted_rooms)
         if self.store and encrypted_rooms:
@@ -1214,12 +1329,18 @@ class AsyncClient(Client):
                 room_id,
             )
 
-        return gap_closed and dispatched == len(recovered)
+        slice_complete = dispatched == len(recovered)
+        if slice_complete:
+            if gap_closed:
+                self._backfill_room_cursors.pop(room_id, None)
+            elif resume_token:
+                self._backfill_room_cursors[room_id] = (since, resume_token)
 
-    async def _collect_gap_events_backward(
+        return gap_closed and slice_complete
+
+    async def _collect_gap_events_forward(
         self,
         room_id: str,
-        prev_batch: str,
         since: str,
         present_in_sync: set[str],
         already_dispatched: "OrderedDict[str, bool]",
@@ -1229,8 +1350,18 @@ class AsyncClient(Client):
         list[tuple[str, bool]],
         int,
         bool,
+        str | None,
     ]:
-        """Collect a limited gap backwards to its server-bounded start."""
+        """Collect a gap forwards from the safe callback checkpoint.
+
+        The lower bound is the request's ``since`` position, so a homeserver
+        that silently ignores ``to`` can never return pre-checkpoint history.
+        The walk continues to the pagination end even after sync-window
+        overlap, because concurrent room-DAG branches may appear after that
+        overlap. If ``to`` is ignored this can reach the live edge, but all
+        returned events are still after the safe lower bound and the durable
+        dispatch journal suppresses their later /sync delivery.
+        """
         max_pages = self.config.backfill_max_pages
         max_events = self.config.backfill_max_events
         page_size = self.config.backfill_page_size
@@ -1238,16 +1369,17 @@ class AsyncClient(Client):
         recovered: list[Event | BadEventType] = []
         pending_journal: list[tuple[str, bool]] = []
         seen_ids: set[str] = set()
-        token: str | None = prev_batch
+        cursor = self._backfill_room_cursors.get(room_id)
+        token: str | None = cursor[1] if cursor and cursor[0] == since else since
+        resume_token = token
         pages = 0
         gap_closed = False
-
         while (max_pages is None or pages < max_pages) and token:
             response = await self.room_messages(
                 room_id,
                 start=token,
-                end=since,
-                direction=MessageDirection.back,
+                end=response_token,
+                direction=MessageDirection.front,
                 limit=page_size,
             )
             pages += 1
@@ -1269,11 +1401,12 @@ class AsyncClient(Client):
                 if event_id in present_in_sync:
                     continue
                 if self._is_own_join_transition(event):
-                    # The room was joined inside the omitted interval.
-                    # Everything collected so far is post-join; older history
-                    # is not a delivery gap.
-                    gap_closed = True
-                    break
+                    # A leave/rejoin inside the interval makes earlier events
+                    # belong to the prior membership. Forward order lets us
+                    # discard that prefix and keep collecting post-join.
+                    recovered.clear()
+                    pending_journal.clear()
+                    continue
                 if event_id in already_dispatched:
                     was_encrypted = already_dispatched[event_id]
                     if not (was_encrypted and not isinstance(event, MegolmEvent)):
@@ -1292,26 +1425,28 @@ class AsyncClient(Client):
                 recovered.append(event)
 
             if gap_closed or bound_reached:
+                resume_token = token
                 break
 
             next_token = response.end
             if not next_token:
                 gap_closed = True
+                resume_token = None
                 break
             if next_token == token:
+                resume_token = token
                 break
             token = next_token
+            resume_token = token
 
         if not gap_closed and recovered:
             logger.warning(
-                "Discarding %d event(s) recovered for room %s: the backward "
-                "walk ended before reaching the since bound",
+                "Pausing after %d recovered event(s) for room %s: the forward "
+                "walk has not reached its pagination boundary",
                 len(recovered),
                 room_id,
             )
-            recovered = []
-        recovered.reverse()
-        return recovered, pending_journal, pages, gap_closed
+        return recovered, pending_journal, pages, gap_closed, resume_token
 
     async def _handle_presence_events(self, response: SyncResponse):
         for event in response.presence_events:
@@ -1352,8 +1487,15 @@ class AsyncClient(Client):
             await cb.async_execute(event, room)
 
     async def _on_event(self, event: Event, room: MatrixRoom):
+        first_error: Exception | None = None
         for cb in self.event_callbacks:
-            await cb.async_execute(event, room)
+            try:
+                await cb.async_execute(event, room)
+            except Exception as exc:  # noqa: PERF203
+                if first_error is None:
+                    first_error = exc
+        if first_error:
+            raise first_error
 
     async def _on_ephemeral(self, event: EphemeralEvent, room: MatrixRoom):
         for cb in self.ephemeral_callbacks:
@@ -1379,21 +1521,43 @@ class AsyncClient(Client):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
-    def _persist_processed_sync_token(self, *, prune_journal: bool = True) -> None:
-        """Persist the contiguous callback checkpoint when it changes."""
+    async def _persist_processed_sync_token(
+        self, *, prune_journal: bool = True
+    ) -> None:
+        """Persist the contiguous callback checkpoint without blocking asyncio."""
         token = self._last_processed_sync_token
         if (
             token
             and self.config.store_sync_tokens
             and self.store
-            and token != self.loaded_sync_token
+            and (
+                token != self.loaded_sync_token
+                or self._has_unrecovered_sync_gap != self._loaded_unrecovered_sync_gap
+            )
         ):
-            if prune_journal and self._durable_dispatch_journal_enabled():
-                self.store.save_sync_token_and_prune_dispatched_events(token)
-                self._load_dispatched_event_journal()
+            if (
+                prune_journal
+                and not self._has_unrecovered_sync_gap
+                and self._durable_dispatch_journal_enabled()
+            ):
+                await asyncio.to_thread(
+                    self.store.save_sync_token_and_prune_dispatched_events,
+                    token,
+                )
+                for room_id, events in self._dispatched_event_ids.items():
+                    event_tokens = self._dispatched_event_tokens.get(room_id, {})
+                    for event_id in list(events):
+                        if event_tokens.get(event_id) != token:
+                            events.pop(event_id)
+                            event_tokens.pop(event_id, None)
             else:
-                self.store.save_sync_token(token)
+                await asyncio.to_thread(
+                    self.store.save_sync_token,
+                    token,
+                    gap_pending=self._has_unrecovered_sync_gap,
+                )
             self.loaded_sync_token = token
+            self._loaded_unrecovered_sync_gap = self._has_unrecovered_sync_gap
 
     async def _handle_sync(self, response: SyncResponse) -> None:
         # The callback-delivery position preceding this response. sync()
@@ -1402,7 +1566,7 @@ class AsyncClient(Client):
         # resync, so the final fallback is the last response whose callbacks
         # completed. Consume the request token before the duplicate check below
         # so it can never leak into a later, unrelated response.
-        since = (
+        request_since = (
             self._sync_since
             or self.next_batch
             or self._last_processed_sync_token
@@ -1410,6 +1574,14 @@ class AsyncClient(Client):
             or None
         )
         self._sync_since = None
+        since = (
+            self._last_processed_sync_token or self.loaded_sync_token
+            if (
+                self.config.backfill_limited_timelines
+                and self._has_unrecovered_sync_gap
+            )
+            else request_since
+        )
 
         # We already received such a sync response, do nothing in that case.
         if self.next_batch == response.next_batch:
@@ -1434,32 +1606,56 @@ class AsyncClient(Client):
             # A stored or explicit since token is the only safe restart point
             # if this first response fails or only partly recovers its gap.
             self._last_processed_sync_token = since
-            self._persist_processed_sync_token(prune_journal=False)
+            await self._persist_processed_sync_token(prune_journal=False)
 
-        await self._handle_to_device(response)
+        try:
+            await self._handle_to_device(response)
 
-        await self._handle_invited_rooms(response)
+            await self._handle_invited_rooms(response)
 
-        backfill_complete = await self._handle_joined_rooms(response, since)
+            backfill_complete, backfill_attempted = await self._handle_joined_rooms(
+                response, since
+            )
 
-        await self._handle_presence_events(response)
+            await self._handle_presence_events(response)
 
-        await self._handle_global_account_data_events(response)
+            await self._handle_global_account_data_events(response)
 
-        if self.olm:
-            await self._handle_expired_verifications()
-            self._handle_olm_events(response)
-            await self._collect_key_requests()
+            if self.olm:
+                await self._handle_expired_verifications()
+                self._handle_olm_events(response)
+                await self._collect_key_requests()
+        except BaseException:
+            if self.config.backfill_limited_timelines and since:
+                # Any callback error or cancellation leaves this response
+                # uncertified. Keep the public transport cursor on the same
+                # safe boundary so a caller that catches it retries.
+                self.next_batch = since
+            raise
 
-        if backfill_complete and (
-            not self.config.backfill_limited_timelines
-            or self._last_processed_sync_token is None
-            or since == self._last_processed_sync_token
+        if backfill_attempted:
+            self._has_unrecovered_sync_gap = not backfill_complete
+            if backfill_complete:
+                self._trim_transient_dispatched_events()
+
+        if (
+            backfill_complete
+            and not self._has_unrecovered_sync_gap
+            and (
+                not self.config.backfill_limited_timelines
+                or self._last_processed_sync_token is None
+                or since == self._last_processed_sync_token
+            )
         ):
             self._last_processed_sync_token = response.next_batch
+        elif self.config.backfill_limited_timelines and since:
+            # Automatically retry an incomplete gap from the callback-
+            # contiguous boundary. The durable event journal suppresses live
+            # timeline events that this response already delivered.
+            self.next_batch = self._last_processed_sync_token or since
 
         if self.config.backfill_limited_timelines:
-            self._persist_processed_sync_token()
+            await self._persist_processed_sync_token()
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -1602,15 +1798,22 @@ class AsyncClient(Client):
                 decrypted_events.append((index, decrypted_event))
 
             if not self._should_dispatch_timeline_event(room_id, event):
+                await self._record_dispatched_event(room_id, event)
                 continue
 
-            await self._on_event(event, room)
+            try:
+                await self._on_event(event, room)
+            except Exception:
+                # Every matching callback was attempted. Keep successful
+                # callbacks from repeating when this sliding window replays.
+                await self._record_dispatched_event(room_id, event)
+                raise
+
+            await self._record_dispatched_event(room_id, event)
 
         # Replace the Megolm events with decrypted ones
         for index, event in decrypted_events:
             sliding_room.timeline[index] = event
-
-        self._record_dispatched_events(room_id, sliding_room.timeline)
 
         if room.encrypted and self.olm is not None:
             self.olm.update_tracked_users(room)

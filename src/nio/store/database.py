@@ -99,7 +99,7 @@ class MatrixStore:
         SyncTokens,
         DispatchedEvents,
     ]
-    store_version = 3
+    store_version = 4
 
     user_id: str = field()
     device_id: str = field()
@@ -137,6 +137,14 @@ class MatrixStore:
             self.database.create_tables([DispatchedEvents])
         self._update_version(3)
 
+    def upgrade_to_v4(self):
+        with self.database.bind_ctx([SyncTokens]):
+            self.database.execute_sql(
+                'ALTER TABLE "synctokens" '
+                'ADD COLUMN "gap_pending" INTEGER NOT NULL DEFAULT 0'
+            )
+        self._update_version(4)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -151,6 +159,9 @@ class MatrixStore:
             store_version = 2
         if store_version == 2:
             self.upgrade_to_v3()
+            store_version = 3
+        if store_version == 3:
+            self.upgrade_to_v4()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -478,13 +489,17 @@ class MatrixStore:
                 rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
             ).on_conflict_ignore().execute()
 
-    @use_database
-    def save_sync_token(self, token: str) -> None:
-        """Save the given token"""
+    @use_database_atomic
+    def save_sync_token(self, token: str, gap_pending: bool = False) -> None:
+        """Save the callback checkpoint and whether recovery is still pending."""
         account = self._get_account()
         assert account
 
-        SyncTokens.replace(account=account, token=token).execute()
+        SyncTokens.replace(
+            account=account,
+            token=token,
+            gap_pending=gap_pending,
+        ).execute()
 
     @use_database
     def load_sync_token(self) -> str | None:
@@ -500,6 +515,16 @@ class MatrixStore:
             return token.token
 
         return None
+
+    @use_database
+    def load_sync_recovery_pending(self) -> bool:
+        """Load whether the stored callback checkpoint still owns a gap."""
+        account = self._get_account()
+        if not account:
+            return False
+
+        token = SyncTokens.get_or_none(SyncTokens.account == account.id)
+        return bool(token and token.gap_pending)
 
     @use_database_atomic
     def save_dispatched_events(
@@ -563,7 +588,11 @@ class MatrixStore:
         account = self._get_account()
         assert account
 
-        SyncTokens.replace(account=account, token=token).execute()
+        SyncTokens.replace(
+            account=account,
+            token=token,
+            gap_pending=False,
+        ).execute()
         DispatchedEvents.delete().where(
             DispatchedEvents.account == account,
             DispatchedEvents.sync_token != token,

@@ -203,6 +203,7 @@ class OutgoingKeyRequests(Model):
 
 class SyncTokens(Model):
     token = TextField()
+    gap_pending = BooleanField(default=False)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

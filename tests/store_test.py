@@ -531,7 +531,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 3
+        assert version == 4
 
     def test_v2_store_migrates_dispatched_event_journal(self, tempdir):
         store = MatrixStore(
@@ -544,6 +544,9 @@ class TestClass:
         store.save_sync_token("safe-token")
         with store.database.bind_ctx(store.models):
             store.database.drop_tables([DispatchedEvents])
+            store.database.execute_sql(
+                'ALTER TABLE "synctokens" DROP COLUMN "gap_pending"'
+            )
         store._update_version(2)
         store.database.close()
 
@@ -554,10 +557,49 @@ class TestClass:
             database_name="migration.db",
         )
 
-        assert migrated._get_store_version() == 3
+        assert migrated._get_store_version() == 4
         assert migrated.load_sync_token() == "safe-token"
+        assert not migrated.load_sync_recovery_pending()
         with migrated.database.bind_ctx(migrated.models):
             assert DispatchedEvents.table_exists()
+
+    def test_v3_store_migrates_sync_recovery_marker(self, tempdir):
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token")
+        with store.database.bind_ctx(store.models):
+            store.database.execute_sql(
+                'ALTER TABLE "synctokens" DROP COLUMN "gap_pending"'
+            )
+        store._update_version(3)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 4
+        assert migrated.load_sync_token() == "safe-token"
+        assert not migrated.load_sync_recovery_pending()
+
+    def test_sync_recovery_marker_round_trip(self, store):
+        store.save_sync_token("safe-token", gap_pending=True)
+
+        assert store.load_sync_token() == "safe-token"
+        assert store.load_sync_recovery_pending()
+
+        store.save_sync_token_and_prune_dispatched_events("complete-token")
+
+        assert store.load_sync_token() == "complete-token"
+        assert not store.load_sync_recovery_pending()
 
     def test_dispatched_event_journal_bulk_upsert(self, store):
         store.save_dispatched_events(
