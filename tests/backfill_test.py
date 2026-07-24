@@ -1554,6 +1554,15 @@ class TestLimitedTimelineBackfill:
         )
         await restarted.receive_response(LoginResponse.from_dict(login_response))
         restarted.add_event_callback(record, RoomMessageText)
+        assert restarted.store
+        journal_batch_sizes: List[int] = []
+        save_dispatched_events = restarted.store.save_dispatched_events
+
+        def record_journal_batch(room_id, sync_token, events):
+            journal_batch_sizes.append(len(events))
+            save_dispatched_events(room_id, sync_token, events)
+
+        restarted.store.save_dispatched_events = record_journal_batch
         await restarted.receive_response(
             sync_response(
                 "s4",
@@ -1573,6 +1582,7 @@ class TestLimitedTimelineBackfill:
         ]
         assert dispatched == expected
         assert len(dispatched) == len(set(dispatched))
+        assert journal_batch_sizes == [603, 1]
         await restarted.close()
 
     async def test_restart_journal_allows_one_decrypted_upgrade(
@@ -1703,6 +1713,53 @@ class TestLimitedTimelineBackfill:
             event_id
             for _room_id, event_id, _encrypted, _token in client.store.load_dispatched_events()
         ] == ["$durable"]
+        await client.close()
+
+    async def test_live_timeline_batches_durable_journal_writes(
+        self, tempdir, monkeypatch
+    ):
+        """One large room timeline uses one durable journal store call."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        assert client.store
+        journal_batch_sizes: List[int] = []
+        save_dispatched_events = client.store.save_dispatched_events
+
+        def record_journal_batch(room_id, sync_token, events):
+            journal_batch_sizes.append(len(events))
+            save_dispatched_events(room_id, sync_token, events)
+
+        monkeypatch.setattr(
+            client.store,
+            "save_dispatched_events",
+            record_journal_batch,
+        )
+        events = [
+            text_event(f"$live-{index}", ts=index)
+            for index in range(_MAX_DISPATCHED_EVENT_IDS + 100)
+        ]
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                events,
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        assert journal_batch_sizes == [len(events)]
+        assert len(client._dispatched_event_ids[TEST_ROOM_ID]) == len(events)
         await client.close()
 
     async def test_straggler_already_delivered_is_not_redispatched(

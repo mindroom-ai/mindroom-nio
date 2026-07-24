@@ -17,7 +17,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from functools import wraps
 
-from peewee import DoesNotExist, SqliteDatabase
+from peewee import EXCLUDED, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -509,24 +509,34 @@ class MatrixStore:
         account = self._get_account()
         assert account
 
+        merged: dict[str, bool] = {}
         for event_id, was_encrypted in events:
-            stored = DispatchedEvents.get_or_none(
-                DispatchedEvents.account == account,
-                DispatchedEvents.room_id == room_id,
-                DispatchedEvents.event_id == event_id,
-            )
-            if stored is None:
-                DispatchedEvents.create(
-                    account=account,
-                    room_id=room_id,
-                    event_id=event_id,
-                    was_encrypted=was_encrypted,
-                    sync_token=sync_token,
-                )
-            else:
-                stored.was_encrypted = stored.was_encrypted and was_encrypted
-                stored.sync_token = sync_token
-                stored.save()
+            merged[event_id] = merged.get(event_id, True) and was_encrypted
+
+        rows = [
+            {
+                "account": account,
+                "room_id": room_id,
+                "event_id": event_id,
+                "was_encrypted": was_encrypted,
+                "sync_token": sync_token,
+            }
+            for event_id, was_encrypted in merged.items()
+        ]
+        for index in range(0, len(rows), 100):
+            DispatchedEvents.insert_many(rows[index : index + 100]).on_conflict(
+                conflict_target=[
+                    DispatchedEvents.account,
+                    DispatchedEvents.room_id,
+                    DispatchedEvents.event_id,
+                ],
+                update={
+                    DispatchedEvents.was_encrypted: (
+                        DispatchedEvents.was_encrypted & EXCLUDED.was_encrypted
+                    ),
+                    DispatchedEvents.sync_token: EXCLUDED.sync_token,
+                },
+            ).execute()
 
     @use_database
     def load_dispatched_events(self) -> list[tuple[str, str, bool, str]]:

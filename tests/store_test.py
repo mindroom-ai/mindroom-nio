@@ -559,6 +559,32 @@ class TestClass:
         with migrated.database.bind_ctx(migrated.models):
             assert DispatchedEvents.table_exists()
 
+    def test_dispatched_event_journal_bulk_upsert(self, store):
+        store.save_dispatched_events(
+            TEST_ROOM,
+            "s1",
+            [
+                ("$encrypted", True),
+                ("$plain", False),
+            ],
+        )
+        store.save_dispatched_events(
+            TEST_ROOM,
+            "s2",
+            [
+                ("$encrypted", True),
+                ("$encrypted", False),
+                ("$plain", True),
+                ("$new", True),
+            ],
+        )
+
+        assert store.load_dispatched_events() == [
+            (TEST_ROOM, "$encrypted", False, "s2"),
+            (TEST_ROOM, "$plain", False, "s2"),
+            (TEST_ROOM, "$new", True, "s2"),
+        ]
+
     def test_sqlitestore_verification(self, sqlstore):
         devices = self.example_devices
         bob_device = devices[BOB_ID][BOB_DEVICE]

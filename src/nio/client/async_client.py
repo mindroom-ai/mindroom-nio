@@ -819,29 +819,47 @@ class AsyncClient(Client):
                 )
                 backfill_complete = room_backfill_complete and backfill_complete
 
-            for index, event in enumerate(join_info.timeline.events):
-                decrypted_event = self._handle_timeline_event(
-                    event, room_id, room, encrypted_rooms
+            pending_journal: list[tuple[str, bool]] = []
+            try:
+                for index, event in enumerate(join_info.timeline.events):
+                    decrypted_event = self._handle_timeline_event(
+                        event, room_id, room, encrypted_rooms
+                    )
+
+                    if decrypted_event:
+                        event = decrypted_event
+                        decrypted_events.append((index, decrypted_event))
+
+                    if (
+                        self.config.backfill_limited_timelines
+                        and not self._should_dispatch_timeline_event(room_id, event)
+                    ):
+                        pending_journal.extend(
+                            self._record_dispatched_events(
+                                room_id,
+                                [event],
+                                response.next_batch,
+                                persist=False,
+                            )
+                        )
+                        continue
+
+                    await self._on_event(event, room)
+                    if self.config.backfill_limited_timelines:
+                        pending_journal.extend(
+                            self._record_dispatched_events(
+                                room_id,
+                                [event],
+                                response.next_batch,
+                                persist=False,
+                            )
+                        )
+            finally:
+                self._persist_dispatched_events(
+                    room_id,
+                    response.next_batch,
+                    pending_journal,
                 )
-
-                if decrypted_event:
-                    event = decrypted_event
-                    decrypted_events.append((index, decrypted_event))
-
-                if (
-                    self.config.backfill_limited_timelines
-                    and not self._should_dispatch_timeline_event(room_id, event)
-                ):
-                    self._record_dispatched_events(
-                        room_id, [event], response.next_batch
-                    )
-                    continue
-
-                await self._on_event(event, room)
-                if self.config.backfill_limited_timelines:
-                    self._record_dispatched_events(
-                        room_id, [event], response.next_batch
-                    )
 
             # Replace the Megolm events with decrypted ones
             for index, event in decrypted_events:
@@ -886,7 +904,9 @@ class AsyncClient(Client):
         room_id: str,
         events: list[Event | BadEventType],
         sync_token: str | None = None,
-    ) -> None:
+        *,
+        persist: bool = True,
+    ) -> list[tuple[str, bool]]:
         """Remember the ids of timeline events handed to the event callbacks.
 
         Recovery walks and the sliding sync loop skip ids in this per-room
@@ -925,12 +945,23 @@ class AsyncClient(Client):
             )
             persisted.append((event_id, dispatched[event_id]))
 
-        if sync_token and persisted and self._durable_dispatch_journal_enabled():
-            assert self.store
-            self.store.save_dispatched_events(room_id, sync_token, persisted)
-        elif sync_token is None or not self._durable_dispatch_journal_enabled():
+        if persist:
+            self._persist_dispatched_events(room_id, sync_token, persisted)
+        if sync_token is None or not self._durable_dispatch_journal_enabled():
             while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
                 dispatched.popitem(last=False)
+        return persisted
+
+    def _persist_dispatched_events(
+        self,
+        room_id: str,
+        sync_token: str | None,
+        events: list[tuple[str, bool]],
+    ) -> None:
+        """Write one room's pending durable callback journal as a batch."""
+        if sync_token and events and self._durable_dispatch_journal_enabled():
+            assert self.store
+            self.store.save_dispatched_events(room_id, sync_token, events)
 
     def _dispatched_event_state(self, room_id: str, event_id: str) -> bool | None:
         """Return the combined encrypted state from /sync and sliding sync."""
@@ -1052,7 +1083,7 @@ class AsyncClient(Client):
         )
 
         try:
-            recovered, pages, gap_closed = await asyncio.wait_for(
+            recovered, overlap_journal, pages, gap_closed = await asyncio.wait_for(
                 collect,
                 timeout=remaining,
             )
@@ -1082,6 +1113,7 @@ class AsyncClient(Client):
 
         encrypted_rooms: set[str] = set()
         dispatched = 0
+        pending_journal = list(overlap_journal)
 
         # Recovered events are dispatched as returned: Megolm events in a
         # /messages chunk were already decrypted (or failed to decrypt) by
@@ -1092,61 +1124,82 @@ class AsyncClient(Client):
         # room.handle_event()/room.handle_membership() would regress the
         # room's current state and feed stale membership into E2EE device
         # tracking.
-        for event in recovered:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                logger.warning(
-                    "Stopping backfill dispatch for room %s after %d of %d "
-                    "event(s): the sync's backfill time budget is exhausted; "
-                    "the rest of the gap may be lost",
-                    room_id,
-                    dispatched,
-                    len(recovered),
-                )
-                break
+        try:
+            for event in recovered:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    logger.warning(
+                        "Stopping backfill dispatch for room %s after %d of %d "
+                        "event(s): the sync's backfill time budget is exhausted; "
+                        "the rest of the gap may be lost",
+                        room_id,
+                        dispatched,
+                        len(recovered),
+                    )
+                    break
 
-            try:
-                if isinstance(event, RoomEncryptionEvent):
-                    # Encryption can never be disabled again once enabled, so
-                    # recording it from an old event cannot regress anything.
-                    encrypted_rooms.add(room_id)
+                try:
+                    if isinstance(event, RoomEncryptionEvent):
+                        # Encryption can never be disabled again once enabled, so
+                        # recording it from an old event cannot regress anything.
+                        encrypted_rooms.add(room_id)
 
-                # The await itself is bounded as well: once a callback that
-                # never returns is awaited, the deadline check above could
-                # never regain control.
-                await asyncio.wait_for(
-                    self._dispatch_backfilled_event(event, room),
-                    timeout=remaining,
+                    # The await itself is bounded as well: once a callback that
+                    # never returns is awaited, the deadline check above could
+                    # never regain control.
+                    await asyncio.wait_for(
+                        self._dispatch_backfilled_event(event, room),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Stopping backfill dispatch for room %s after %d of %d "
+                        "event(s): the sync's backfill time budget is exhausted "
+                        "inside an event callback; the rest of the gap may be "
+                        "lost",
+                        room_id,
+                        dispatched,
+                        len(recovered),
+                    )
+                    break
+                except _BackfillCallbackError:
+                    # Unlike the live sync path, where a raising callback
+                    # propagates out of sync(), a backfill must never break the
+                    # sync loop, so a crashing callback terminally skips this
+                    # one event. Some earlier callbacks may already have
+                    # completed; remember the event so a recovery retry cannot
+                    # invoke them again.
+                    logger.exception(
+                        "Failed to dispatch backfilled event %s in room %s",
+                        getattr(event, "event_id", None),
+                        room_id,
+                    )
+                    pending_journal.extend(
+                        self._record_dispatched_events(
+                            room_id,
+                            [event],
+                            response_token,
+                            persist=False,
+                        )
+                    )
+                    dispatched += 1
+                    continue
+
+                pending_journal.extend(
+                    self._record_dispatched_events(
+                        room_id,
+                        [event],
+                        response_token,
+                        persist=False,
+                    )
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Stopping backfill dispatch for room %s after %d of %d "
-                    "event(s): the sync's backfill time budget is exhausted "
-                    "inside an event callback; the rest of the gap may be "
-                    "lost",
-                    room_id,
-                    dispatched,
-                    len(recovered),
-                )
-                break
-            except _BackfillCallbackError:
-                # Unlike the live sync path, where a raising callback
-                # propagates out of sync(), a backfill must never break the
-                # sync loop, so a crashing callback terminally skips this one
-                # event. Some earlier callbacks may already have completed;
-                # remember the event so a recovery retry cannot invoke them
-                # again.
-                logger.exception(
-                    "Failed to dispatch backfilled event %s in room %s",
-                    getattr(event, "event_id", None),
-                    room_id,
-                )
-                self._record_dispatched_events(room_id, [event], response_token)
                 dispatched += 1
-                continue
-
-            self._record_dispatched_events(room_id, [event], response_token)
-            dispatched += 1
+        finally:
+            self._persist_dispatched_events(
+                room_id,
+                response_token,
+                pending_journal,
+            )
 
         self.encrypted_rooms.update(encrypted_rooms)
         if self.store and encrypted_rooms:
@@ -1171,13 +1224,19 @@ class AsyncClient(Client):
         present_in_sync: set[str],
         already_dispatched: "OrderedDict[str, bool]",
         response_token: str,
-    ) -> tuple[list[Event | BadEventType], int, bool]:
+    ) -> tuple[
+        list[Event | BadEventType],
+        list[tuple[str, bool]],
+        int,
+        bool,
+    ]:
         """Collect a limited gap backwards to its server-bounded start."""
         max_pages = self.config.backfill_max_pages
         max_events = self.config.backfill_max_events
         page_size = self.config.backfill_page_size
 
         recovered: list[Event | BadEventType] = []
+        pending_journal: list[tuple[str, bool]] = []
         seen_ids: set[str] = set()
         token: str | None = prev_batch
         pages = 0
@@ -1218,7 +1277,14 @@ class AsyncClient(Client):
                 if event_id in already_dispatched:
                     was_encrypted = already_dispatched[event_id]
                     if not (was_encrypted and not isinstance(event, MegolmEvent)):
-                        self._record_dispatched_events(room_id, [event], response_token)
+                        pending_journal.extend(
+                            self._record_dispatched_events(
+                                room_id,
+                                [event],
+                                response_token,
+                                persist=False,
+                            )
+                        )
                         continue
                 if max_events is not None and len(recovered) >= max_events:
                     bound_reached = True
@@ -1245,7 +1311,7 @@ class AsyncClient(Client):
             )
             recovered = []
         recovered.reverse()
-        return recovered, pages, gap_closed
+        return recovered, pending_journal, pages, gap_closed
 
     async def _handle_presence_events(self, response: SyncResponse):
         for event in response.presence_events:
