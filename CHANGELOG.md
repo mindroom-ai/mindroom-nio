@@ -91,18 +91,20 @@ All notable changes to this project will be documented in this file.
 - Add opt-in recovery of events dropped by limited sync timelines
   (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
   timeline arrives with `limited: true`, the client pages `/messages`
-  forwards from the token the sync continued from and dispatches the
-  recovered gap through the normal event callbacks — oldest first, before
-  the sync response's own events, decrypted like live events but never
-  applied to room state. Gaps spanning a client restart are recovered when
-  resuming from a stored or explicit since token; freshly joined rooms are
-  never backfilled past our own join. Recovery dispatches only when the
-  walk verifiably reaches the sync window; anything less (bounds, errors,
-  stalls, the live edge) is discarded with a warning, so failure is always
-  loud loss, never duplicates. All backfill for one sync response shares a
-  single time budget (`backfill_timeout`) covering pagination and dispatch,
-  including hanging callbacks. Disabled by default; behaviour with the
-  flag off is identical to upstream nio.
+  backwards from the timeline's `prev_batch` token to the last contiguous
+  callback checkpoint and dispatches the recovered gap through the normal
+  event callbacks — oldest first, before the sync response's own events,
+  decrypted like live events but never applied to room state. Gaps spanning
+  a client restart are recovered when resuming from a stored or explicit
+  since token; freshly joined rooms are never backfilled past our own join.
+  Page and event bounds default to unlimited; explicitly configured bounds,
+  errors, stalls, and timeouts discard incomplete recovery with a warning.
+  The in-memory and stored callback checkpoint does not advance across an
+  incomplete collection or dispatch, so a later token reset or process
+  restart can retry from the safe boundary. All backfill for one sync
+  response shares a single time budget (`backfill_timeout`) covering
+  pagination and dispatch, including hanging callbacks. Disabled by default;
+  behaviour with the flag off is identical to upstream nio.
 
 ### Bug Fixes
 
