@@ -1515,6 +1515,60 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$enc", "$gap1", "$new"]
 
+    async def test_event_bound_counts_decrypted_replay(
+        self, tempdir, aioresponse, caplog
+    ):
+        """A decrypted replay cannot bypass the configured event cap."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_max_events=1
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [megolm_event("$enc", ts=90)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [
+                        text_event("$gap1", ts=100),
+                        text_event("$enc", ts=90),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        with caplog.at_level(logging.WARNING):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    TEST_ROOM_ID,
+                    [text_event("$new", ts=300)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            )
+
+        assert dispatched == ["$new"]
+        assert "without fully closing the gap" in caplog.text
+        await client.close()
+
     async def test_dispatch_respects_backfill_budget(
         self, tempdir, aioresponse, caplog
     ):

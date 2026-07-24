@@ -1141,9 +1141,8 @@ class AsyncClient(Client):
                     break
                 if event_id in already_dispatched:
                     was_encrypted = already_dispatched[event_id]
-                    if was_encrypted and not isinstance(event, MegolmEvent):
-                        recovered.append(event)
-                    continue
+                    if not (was_encrypted and not isinstance(event, MegolmEvent)):
+                        continue
                 if max_events is not None and len(recovered) >= max_events:
                     bound_reached = True
                     break
