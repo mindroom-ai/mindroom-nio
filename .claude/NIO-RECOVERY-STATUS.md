@@ -4,8 +4,10 @@
 
 Branch `fix/limited-sync-recovery-loss-v2` is published as PR #20.
 The rejected predecessor is `af585b42c590dd7ef9e8bda54bc0647e9c055a3f`.
-The tested recovery-transaction implementation is commit `ac3f0215bf3f49f0577e6dea2c33a18b1a52ef49`.
-Local HEAD, the remote branch, and PR #20 all equal that implementation commit before this living-status refresh.
+The recovery-transaction implementation is commit `ac3f0215bf3f49f0577e6dea2c33a18b1a52ef49`.
+The tested current-context review follow-up is commit `57fb428b5dbbb7c3a854071a42ce289437749cc3`.
+This living-status refresh is the only change after that tested code head.
+The external `MERGE-GATES.md` records the exact status-commit SHA after push because a commit cannot contain its own hash.
 This candidate is not merge-ready until all exact-head review and live gates pass.
 
 ## Accepted Findings Resolved in the Working Candidate
@@ -90,8 +92,8 @@ Replay suppression for event types without Matrix event IDs lives only for the u
 
 ## Next Steps
 
-1. Commit and push the tested current-context review follow-up that prevents identical ancillary events from collapsing and updates the public recovery documentation.
-2. Record both the implementation commit and new branch head explicitly.
-3. Freeze the corrected candidate and obtain fresh Codex approval, fresh Claude Fable approval, and real-Tuwunel PASS on the same exact head.
+1. Commit and push this living-status-only refresh.
+2. Record the exact resulting local, remote, and PR head in the external gate ledger.
+3. Obtain fresh Codex approval, fresh Claude Fable approval, and real-Tuwunel PASS on that same exact head.
 4. Resume MindRoom PR #1640 only after nio PR #20 passes those gates.
 5. Remove this handoff only immediately before merge, then revalidate the final documentation-only removal head.
