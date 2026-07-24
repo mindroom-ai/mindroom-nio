@@ -445,8 +445,8 @@ class AsyncClientConfig(ClientConfig):
     request_timeout: float = 60
     io_chunk_size: int = 64 * 1024
     backfill_limited_timelines: bool = False
-    backfill_max_pages: Optional[int] = None
-    backfill_max_events: Optional[int] = None
+    backfill_max_pages: int | None = None
+    backfill_max_events: int | None = None
     backfill_page_size: int = 50
     backfill_timeout: float = 30.0
 
