@@ -571,6 +571,11 @@ class AsyncClient(Client):
         # through once the room key arrives.
         self._dispatched_event_ids: dict[str, OrderedDict[str, bool]] = {}
 
+        # Sliding sync has no durable callback checkpoint or token compatible
+        # with /sync recovery. Keep its re-sent-window de-duplication separate
+        # and bounded even when the /sync journal above must remain unbounded.
+        self._sliding_dispatched_event_ids: dict[str, OrderedDict[str, bool]] = {}
+
         # Per-room account data from the sliding sync account_data
         # extension that referenced rooms outside the sliding window, kept
         # (newest event per type, merged across responses) until the room
@@ -898,14 +903,20 @@ class AsyncClient(Client):
         drop back to the encrypted marking, so replays stay suppressed even
         if a later copy fails to decrypt.
         """
-        dispatched = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
+        event_cache = (
+            self._dispatched_event_ids
+            if sync_token is not None
+            else self._sliding_dispatched_event_ids
+        )
+        dispatched = event_cache.setdefault(room_id, OrderedDict())
         persisted: list[tuple[str, bool]] = []
 
         for event in events:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            was_encrypted = dispatched.pop(event_id, None)
+            was_encrypted = self._dispatched_event_state(room_id, event_id)
+            dispatched.pop(event_id, None)
             still_encrypted = isinstance(event, MegolmEvent)
             dispatched[event_id] = (
                 still_encrypted
@@ -917,9 +928,32 @@ class AsyncClient(Client):
         if sync_token and persisted and self._durable_dispatch_journal_enabled():
             assert self.store
             self.store.save_dispatched_events(room_id, sync_token, persisted)
-        elif not self._durable_dispatch_journal_enabled():
+        elif sync_token is None or not self._durable_dispatch_journal_enabled():
             while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
                 dispatched.popitem(last=False)
+
+    def _dispatched_event_state(self, room_id: str, event_id: str) -> bool | None:
+        """Return the combined encrypted state from /sync and sliding sync."""
+        states = [
+            events[event_id]
+            for cache in (
+                self._dispatched_event_ids,
+                self._sliding_dispatched_event_ids,
+            )
+            if (events := cache.get(room_id)) and event_id in events
+        ]
+        return all(states) if states else None
+
+    def _room_dispatched_events(self, room_id: str) -> OrderedDict[str, bool]:
+        """Combine durable and bounded ids for one recovery walk."""
+        combined: OrderedDict[str, bool] = OrderedDict()
+        for cache in (
+            self._dispatched_event_ids,
+            self._sliding_dispatched_event_ids,
+        ):
+            for event_id, was_encrypted in cache.get(room_id, {}).items():
+                combined[event_id] = combined.get(event_id, True) and was_encrypted
+        return combined
 
     def _should_dispatch_timeline_event(
         self,
@@ -930,7 +964,7 @@ class AsyncClient(Client):
         event_id = getattr(event, "event_id", None)
         if not event_id:
             return True
-        was_encrypted = self._dispatched_event_ids.get(room_id, {}).get(event_id)
+        was_encrypted = self._dispatched_event_state(room_id, event_id)
         if was_encrypted is None:
             return True
         return was_encrypted and not isinstance(event, MegolmEvent)
@@ -999,7 +1033,7 @@ class AsyncClient(Client):
             for event in join_info.timeline.events
             if getattr(event, "event_id", None)
         }
-        already_dispatched = self._dispatched_event_ids.get(room_id, OrderedDict())
+        already_dispatched = self._room_dispatched_events(room_id)
 
         if not join_info.timeline.prev_batch:
             logger.warning(

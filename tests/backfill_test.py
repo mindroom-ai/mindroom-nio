@@ -37,6 +37,7 @@ from nio import (
     Timeline,
 )
 from nio.api import MATRIX_API_PATH_V3
+from nio.client.async_client import _MAX_DISPATCHED_EVENT_IDS
 
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
 MESSAGES_URL = re.compile(
@@ -1668,6 +1669,41 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$enc", "$gap1", "$new", "$latest"]
         await third.close()
+
+    async def test_sliding_sync_dedup_stays_bounded_with_durable_journal(self, tempdir):
+        """Sliding replays cannot disable their bound through /sync persistence."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        durable = text_event("$durable", ts=1)
+        client._record_dispatched_events(TEST_ROOM_ID, [durable], "s1")
+
+        sliding = [
+            text_event(f"$sliding-{index}", ts=index + 2)
+            for index in range(_MAX_DISPATCHED_EVENT_IDS + 100)
+        ]
+        client._record_dispatched_events(TEST_ROOM_ID, sliding)
+
+        assert len(client._sliding_dispatched_event_ids[TEST_ROOM_ID]) == (
+            _MAX_DISPATCHED_EVENT_IDS
+        )
+        assert list(client._dispatched_event_ids[TEST_ROOM_ID]) == ["$durable"]
+        assert not client._should_dispatch_timeline_event(TEST_ROOM_ID, sliding[-1])
+        assert not client._should_dispatch_timeline_event(TEST_ROOM_ID, durable)
+        assert client.store
+        assert [
+            event_id
+            for _room_id, event_id, _encrypted, _token in client.store.load_dispatched_events()
+        ] == ["$durable"]
+        await client.close()
 
     async def test_straggler_already_delivered_is_not_redispatched(
         self, backfill_client, aioresponse
