@@ -64,8 +64,9 @@ class PendingTimelineEvent:
         sequence: int,
         event: Event | BadEventType,
         is_live: bool,
+        fallback_event_id: str | None = None,
     ) -> PendingTimelineEvent | None:
-        event_id = getattr(event, "event_id", None)
+        event_id = getattr(event, "event_id", None) or fallback_event_id
         if not event_id:
             return None
         source = json.dumps(event.source, sort_keys=True, separators=(",", ":"))
@@ -148,6 +149,7 @@ def _plan_live_events(
     timeline_events: Iterable[Event | BadEventType],
     *,
     include_pending: bool,
+    batch_id: str | None,
 ) -> list[PendingTimelineEvent]:
     known = (
         {
@@ -168,10 +170,12 @@ def _plan_live_events(
         default=-1,
     )
     planned = []
-    for event in timeline_events:
-        event_id = getattr(event, "event_id", None)
+    for index, event in enumerate(timeline_events):
+        event_id = getattr(event, "event_id", None) or (
+            f"~{batch_id}:{index}" if batch_id is not None else None
+        )
         pending = PendingTimelineEvent.from_event(
-            room_id, generation, sequence, event, True
+            room_id, generation, sequence, event, True, event_id
         )
         if not event_id or not pending:
             continue
@@ -187,7 +191,10 @@ def _plan_live_events(
                     )
                 )
             continue
-        if not should_dispatch_timeline_event(state, room_id, event):
+        if (
+            not getattr(event, "event_id", None)
+            and event_id in state.completed.get(room_id, ())
+        ) or not should_dispatch_timeline_event(state, room_id, event):
             continue
         planned.append(pending)
         known[event_id] = pending
@@ -205,6 +212,7 @@ def plan_room_timeline(
     live_event_count: int | None = None,
     cursor_token: str | None = None,
     target_token: str = "",
+    batch_id: str | None = None,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return RecoveryPlan(clear_rooms=frozenset({room_id}))
@@ -217,7 +225,7 @@ def plan_room_timeline(
         ),
         default=-1,
     )
-    start = last_join + 1
+    start = max(last_join, 0)
     live_start = (
         0
         if live_event_count is None
@@ -235,6 +243,7 @@ def plan_room_timeline(
         generation,
         timeline_events[start:],
         include_pending=not clear,
+        batch_id=batch_id,
     )
     gap = (
         RecoveryGap(
@@ -288,6 +297,7 @@ def plan_sync_response(
                 request_since if room_info.timeline.limited and request_since else None
             ),
             target_token=room_info.timeline.prev_batch or response_token,
+            batch_id=response_token,
         )
         for room_id, room_info in joined_rooms.items()
     )
@@ -528,14 +538,13 @@ async def _collect_slice(
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if event_id in pending_ids or not should_dispatch_timeline_event(
-                state, gap.room_id, event
-            ):
-                continue
             if _is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
                 next_sequence = 0
+            if event_id in pending_ids or not should_dispatch_timeline_event(
+                state, gap.room_id, event
+            ):
                 continue
             pending = PendingTimelineEvent.from_event(
                 gap.room_id, gap.generation, next_sequence, event, False
@@ -632,13 +641,21 @@ async def pump_recovery(
     fetch_messages: FetchMessages,
     dispatch_event: DispatchEvent,
     store: MatrixStore | None,
+    ready_room_id: str | None = None,
 ) -> None:
-    room_ids = list(state.gaps)
+    if ready_room_id is not None:
+        gaps = state.gaps.get(ready_room_id)
+        if not gaps or gaps[0].cursor_token is not None:
+            return
+        room_ids = [ready_room_id]
+    else:
+        room_ids = list(state.gaps)
     if not room_ids:
         return
-    offset = state.room_offset % len(room_ids)
-    room_ids = room_ids[offset:] + room_ids[:offset]
-    state.room_offset = (offset + 1) % len(room_ids)
+    if ready_room_id is None:
+        offset = state.room_offset % len(room_ids)
+        room_ids = room_ids[offset:] + room_ids[:offset]
+        state.room_offset = (offset + 1) % len(room_ids)
     room_ids.sort(key=lambda room_id: state.gaps[room_id][0].cursor_token is not None)
     recovering = sum(
         state.gaps[room_id][0].cursor_token is not None for room_id in room_ids

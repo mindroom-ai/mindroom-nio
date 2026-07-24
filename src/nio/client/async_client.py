@@ -364,22 +364,11 @@ class AsyncClientConfig(ClientConfig):
             streams when saving files to disk.
             Defaults to 64 KiB.
 
-        backfill_limited_timelines (bool): Whether to recover events dropped by
-            limited timelines with monotonic transport and durable room-local
-            queues. Recovery is bounded, fair, restart-safe with stored tokens,
-            own-join safe, and oldest-first. Disabled by default.
-
-        backfill_max_pages (int): The maximum number of ``/messages``
-            pages per room per pump. Defaults to 10.
-
-        backfill_max_events (int): The maximum number of events to
-            recover per room per pump. Defaults to 200.
-
-        backfill_page_size (int): The number of events to request per
-            ``/messages`` page. Defaults to 50.
-
-        backfill_timeout (float): The total time budget, in seconds, for all
-            recovery network and callback work in one pump. Defaults to 30.
+        backfill_limited_timelines (bool): Recover limited timelines durably.
+        backfill_max_pages (int): Maximum pages per room per pump.
+        backfill_max_events (int): Maximum events per room per pump.
+        backfill_page_size (int): Events requested per page.
+        backfill_timeout (float): Seconds available to one recovery pump.
     """
 
     max_limit_exceeded: int | None = None
@@ -494,28 +483,17 @@ class AsyncClient(Client):
         # The flag used to gracefully stop `sync_forever`.
         self._stop_sync_forever = False
 
-        # The token the in-flight sync request resumed from, recorded by sync()
-        # so that limited-timeline backfill knows where each room's gap starts
-        # even when the caller passed an explicit `since`.
+        # The token the in-flight sync request resumed from.
         self._sync_since: str | None = None
 
-        # Room-local limited-timeline obligations are independent from the
-        # monotonic public /sync transport cursor.
         self._recovery = RecoveryState()
 
-        # Per-room account data from the sliding sync account_data
-        # extension that referenced rooms outside the sliding window, kept
-        # (newest event per type, merged across responses) until the room
-        # is known.
+        # Sliding account data retained until its room is known.
         self._pending_sliding_room_account_data: dict[
             str, dict[tuple[str, str | None], AccountDataEvent]
         ] = {}
 
-        # The delivery token of the sliding sync to_device extension. The
-        # token is device-scoped, not connection-scoped: sending it back as
-        # `extensions.to_device.since` acknowledges the messages delivered
-        # before it, so it outlives sliding sync connection expiry
-        # (M_UNKNOWN_POS) and is shared across conn_ids.
+        # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
 
         super().__init__(user, device_id, store_path, self.config)
@@ -527,7 +505,6 @@ class AsyncClient(Client):
             and self.config.store_sync_tokens
             and self.store
         ):
-            assert self.store
             load_recovery_state(
                 self._recovery,
                 *self.store.load_sync_recovery(),
@@ -712,6 +689,13 @@ class AsyncClient(Client):
                 room_id, room, join_info.timeline.events, encrypted_rooms
             )
 
+        await self._persist_recovery_timelines(
+            (room_id, info.timeline.events, "join", None)
+            for room_id, info in response.rooms.join.items()
+        )
+        for room_id, join_info in response.rooms.join.items():
+            room = self.rooms[room_id]
+            await self._pump_sync_recovery(room_id)
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
                 await self._on_ephemeral(event, room)
@@ -742,11 +726,9 @@ class AsyncClient(Client):
             )
             if decrypted:
                 event = timeline[index] = decrypted
-            if self.config.backfill_limited_timelines:
-                if not getattr(event, "event_id", None):
-                    await self._on_event(event, room)
-            elif not deduplicate or should_dispatch_timeline_event(
-                self._recovery, room_id, event
+            if not self.config.backfill_limited_timelines and (
+                not deduplicate
+                or should_dispatch_timeline_event(self._recovery, room_id, event)
             ):
                 await self._on_event(event, room)
 
@@ -778,7 +760,7 @@ class AsyncClient(Client):
                 logger.exception("Timeline event callback failed")
         return event
 
-    async def _pump_sync_recovery(self) -> None:
+    async def _pump_sync_recovery(self, ready_room_id: str | None = None) -> None:
         if not (self.config.backfill_limited_timelines and self._recovery.gaps):
             return
         await pump_recovery(
@@ -793,11 +775,14 @@ class AsyncClient(Client):
             fetch_messages=self.room_messages,
             dispatch_event=self._dispatch_timeline_event,
             store=(self.store if self.config.store_sync_tokens else None),
+            ready_room_id=ready_room_id,
         )
 
     async def _persist_recovery_timelines(
         self,
         timelines: Iterable[_RecoveryTimeline],
+        *,
+        batch_id: str | None = None,
     ) -> None:
         if not self.config.backfill_limited_timelines:
             return
@@ -813,6 +798,7 @@ class AsyncClient(Client):
                     user_id=self.user_id,
                     membership=membership,
                     live_event_count=live_event_count,
+                    batch_id=batch_id,
                 )
                 for room_id, timeline, membership, live_event_count in timelines
             ),
@@ -931,10 +917,6 @@ class AsyncClient(Client):
 
         await self._handle_invited_rooms(response)
         await self._handle_joined_rooms(response)
-        await self._persist_recovery_timelines(
-            (room_id, info.timeline.events, "join", None)
-            for room_id, info in response.rooms.join.items()
-        )
         await self._handle_presence_events(response)
         await self._handle_global_account_data_events(response)
 
@@ -950,26 +932,22 @@ class AsyncClient(Client):
             await self._on_to_device(event)
 
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
-        """Process a sliding sync response into client state.
-
-        The MSC4186 counterpart of ``_handle_sync``: to-device events are
-        decrypted and dispatched first (room keys must land before the
-        timelines that need them), then rooms are built from
-        ``required_state`` and their timelines dispatched through the event
-        callbacks, then account data and encryption bookkeeping run.
-        """
+        """Process a sliding sync response into client state."""
         await self._persist_recovery_timelines(
             (
-                room_id,
-                room.timeline,
                 (
-                    "invite"
-                    if self._sliding_sync_room_is_invite(room)
-                    else room.membership or "join"
-                ),
-                (room.num_live or 0) if room.initial else None,
-            )
-            for room_id, room in response.rooms.items()
+                    room_id,
+                    room.timeline,
+                    (
+                        "invite"
+                        if self._sliding_sync_room_is_invite(room)
+                        else room.membership or "join"
+                    ),
+                    (room.num_live or 0) if room.initial else None,
+                )
+                for room_id, room in response.rooms.items()
+            ),
+            batch_id=response.pos,
         )
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
@@ -987,9 +965,6 @@ class AsyncClient(Client):
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
-        # Deployed servers mark invites with membership "invite"; the
-        # stripped state fallback covers servers that omit the membership
-        # field (rooms we are joined to never carry stripped state).
         return room.membership == "invite" or (
             room.membership is None and bool(room.stripped_state)
         )
@@ -1024,6 +999,12 @@ class AsyncClient(Client):
             if not self._sliding_sync_room_is_invite(room)
             and room.membership not in ("leave", "ban")
         )
+        for room_id, room in response.rooms.items():
+            if not self._sliding_sync_room_is_invite(room) and room.membership not in (
+                "leave",
+                "ban",
+            ):
+                await self._pump_sync_recovery(room_id)
 
     async def _handle_sliding_sync_invited_room(
         self, room_id: str, sliding_room: SlidingSyncRoom
@@ -1046,13 +1027,7 @@ class AsyncClient(Client):
 
         existing_room = self.rooms.get(room_id)
         if sliding_room.initial and existing_room is not None:
-            # An initial room response is a full snapshot: state that
-            # disappeared while no connection was live (members who
-            # left, deleted metadata) is simply absent from it, so the
-            # room is rebuilt rather than patched. The outbound group
-            # session is invalidated so departed members stop receiving
-            # new room keys; membership is re-fetched on the next
-            # encrypted send.
+            # Rebuild full snapshots and rotate encrypted membership.
             if self.olm and existing_room.encrypted:
                 self.invalidate_outbound_session(room_id)
             del self.rooms[room_id]
@@ -1062,9 +1037,7 @@ class AsyncClient(Client):
             room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
 
             if existing_room is not None:
-                # The snapshot re-derives room state, but data owned by
-                # other channels — account data, receipts, typing — is not
-                # part of the room render and must survive the rebuild.
+                # Preserve data owned by channels outside the snapshot.
                 room.tags = existing_room.tags
                 room.fully_read_marker = existing_room.fully_read_marker
                 room.read_receipts = existing_room.read_receipts

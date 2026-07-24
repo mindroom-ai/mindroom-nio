@@ -16,6 +16,7 @@ from nio.client.sync_recovery import (
     pump_recovery,
 )
 from nio.responses import RoomMessagesResponse
+from nio.store import MatrixStore
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
@@ -317,9 +318,10 @@ async def test_hanging_callback_leaves_active_row_pending():
 
 
 @pytest.mark.asyncio
-async def test_memory_store_commit_stays_on_event_loop_thread():
+async def test_default_store_commit_stays_on_event_loop_thread():
     state = RecoveryState()
     store = InlineStore()
+    store.supports_threaded_writes = MatrixStore.supports_threaded_writes
     thread_id = threading.get_ident()
     await persist_response_plan(
         state,

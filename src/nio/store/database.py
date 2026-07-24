@@ -106,7 +106,7 @@ class MatrixStore:
         PendingTimelineEvents,
     ]
     store_version = 3
-    supports_threaded_writes = True
+    supports_threaded_writes = False
 
     user_id: str = field()
     device_id: str = field()
@@ -1166,8 +1166,6 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
-
-    supports_threaded_writes = False
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

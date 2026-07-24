@@ -16,6 +16,7 @@ from nio import (
     DeviceList,
     DeviceOneTimeKeyCount,
     Event,
+    FullyReadEvent,
     InviteInfo,
     LoginResponse,
     MegolmEvent,
@@ -28,6 +29,7 @@ from nio import (
     SlidingSyncResponse,
     SyncResponse,
     Timeline,
+    TypingNoticeEvent,
     UnknownBadEvent,
 )
 from nio.api import MATRIX_API_PATH_V3
@@ -328,22 +330,63 @@ class TestRoomLocalRecovery:
         assert seen == ["$a"]
         assert not client._recovery.gaps
 
-    async def test_enabled_dispatches_no_id_bad_event_after_commit(self, client):
-        seen: list[UnknownBadEvent] = []
+    async def test_no_id_bad_event_keeps_timeline_position(self, client):
+        seen: list[str] = []
 
         async def record(_room, event):
-            seen.append(event)
+            seen.append(getattr(event, "event_id", None) or "bad")
 
+        client.add_event_callback(record, RoomMessageText)
         client.add_event_callback(record, UnknownBadEvent)
         malformed = Event.parse_event({"type": "broken"})
         assert isinstance(malformed, UnknownBadEvent)
         await client.receive_response(
             sync_response(
                 "s1",
-                {ROOM_A: room_info([malformed], limited=False, prev_batch="p0")},
+                {
+                    ROOM_A: room_info(
+                        [
+                            text_event("$before", 1),
+                            malformed,
+                            text_event("$after", 2),
+                        ],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
             )
         )
-        assert seen == [malformed]
+        assert seen == ["$before", "bad", "$after"]
+
+    async def test_complete_timeline_precedes_other_sync_surfaces(self, client):
+        seen: list[str] = []
+
+        async def room_callback(_room, event):
+            seen.append(type(event).__name__)
+
+        async def presence_callback(event):
+            seen.append(type(event).__name__)
+
+        client.add_event_callback(room_callback, RoomMessageText)
+        client.add_ephemeral_callback(room_callback, TypingNoticeEvent)
+        client.add_room_account_data_callback(room_callback, FullyReadEvent)
+        client.add_presence_callback(presence_callback, PresenceEvent)
+        info = room_info([text_event("$event", 1)], limited=False, prev_batch="p0")
+        info.ephemeral.append(TypingNoticeEvent([OWN_ID]))
+        info.account_data.append(FullyReadEvent(event_id="$event"))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: info},
+                presence=[PresenceEvent(OWN_ID, "online")],
+            )
+        )
+        assert seen == [
+            "RoomMessageText",
+            "TypingNoticeEvent",
+            "FullyReadEvent",
+            "PresenceEvent",
+        ]
 
     async def test_gap_and_live_window_dispatch_in_order(self, client, aioresponse):
         seen = record_events(client)
@@ -819,6 +862,9 @@ class TestRoomLocalRecovery:
 
     async def test_own_rejoin_discards_prejoin_history(self, client, aioresponse):
         seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
         client.next_batch = "s1"
         aioresponse.get(
             MESSAGES_URL,
@@ -842,10 +888,13 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$after", "$live"]
+        assert seen == ["$join", "$after", "$live"]
 
     async def test_bounded_prefix_waits_for_later_own_join(self, client, aioresponse):
         seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
         client.next_batch = "s1"
         pages = Pages(
             {
@@ -877,7 +926,7 @@ class TestRoomLocalRecovery:
         ]
 
         await client.receive_response(limited)
-        assert seen == ["$after", "$held"]
+        assert seen == ["$join", "$after", "$held"]
         assert "$prejoin" not in seen
         assert not client._recovery.gaps
 
@@ -1694,6 +1743,9 @@ class TestRoomLocalRecovery:
         self, client, aioresponse
     ):
         seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
         client.next_batch = "s1"
         aioresponse.get(
             MESSAGES_URL,
@@ -1729,7 +1781,7 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
-        assert seen == ["$after"]
+        assert seen == ["$join", "$after"]
         assert not client._recovery.gaps
 
     async def test_sliding_initial_historical_join_keeps_classic_gap(
@@ -1778,6 +1830,7 @@ class TestRoomLocalRecovery:
         assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
             "$gap",
             "$held",
+            "$join",
             "$after",
         ]
 
@@ -2131,8 +2184,11 @@ class TestRoomLocalRecovery:
         assert seen == ["$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_current_timeline_suppresses_rows_before_last_own_join(self, client):
+    async def test_current_timeline_starts_at_last_own_join(self, client):
         seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
         client.next_batch = "s1"
         await client.receive_response(
             sync_response(
@@ -2150,5 +2206,5 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$after"]
+        assert seen == ["$join", "$after"]
         assert not client._recovery.gaps
