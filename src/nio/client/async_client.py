@@ -563,15 +563,12 @@ class AsyncClient(Client):
         # position as its exact /messages lower bound.
         self._last_processed_sync_token: str | None = None
 
-        # Per-room memory of recently dispatched timeline event ids, kept
-        # when `backfill_limited_timelines` is enabled and by the sliding
-        # sync loop. Used purely to skip events the server re-delivers that
-        # were already handed to the event callbacks (the /sync–/messages
-        # overlap of a recovery walk, or the timeline window a sliding sync
-        # connection re-sends after expiring); never used to decide where
-        # recovery starts or stops. The value records whether the event was
-        # still encrypted when dispatched, so exactly one decryptable
-        # replay is let through once the room key arrives.
+        # Per-room memory of dispatched timeline event ids. Recovery-enabled
+        # clients with a stored sync token persist every id still reachable
+        # from that checkpoint; other clients retain the bounded upstream
+        # overlap window. The value records whether the event was still
+        # encrypted when dispatched, so exactly one decryptable replay is let
+        # through once the room key arrives.
         self._dispatched_event_ids: dict[str, OrderedDict[str, bool]] = {}
 
         # Per-room account data from the sliding sync account_data
@@ -590,6 +587,33 @@ class AsyncClient(Client):
         self._sliding_sync_to_device_since: str | None = None
 
         super().__init__(user, device_id, store_path, self.config)
+
+    def load_store(self):
+        """Load encryption state plus the durable callback-overlap journal."""
+        super().load_store()
+        if self._durable_dispatch_journal_enabled():
+            self._load_dispatched_event_journal()
+
+    def _durable_dispatch_journal_enabled(self) -> bool:
+        return bool(
+            self.config.backfill_limited_timelines
+            and self.config.store_sync_tokens
+            and self.store
+        )
+
+    def _load_dispatched_event_journal(self) -> None:
+        """Restore event ids that the persisted callback checkpoint may replay."""
+        assert self.store
+        self._dispatched_event_ids.clear()
+        for (
+            room_id,
+            event_id,
+            was_encrypted,
+            _sync_token,
+        ) in self.store.load_dispatched_events():
+            self._dispatched_event_ids.setdefault(room_id, OrderedDict())[
+                event_id
+            ] = was_encrypted
 
     def add_response_callback(
         self,
@@ -786,6 +810,7 @@ class AsyncClient(Client):
                     join_info,
                     since,
                     backfill_deadline,
+                    response.next_batch,
                 )
                 backfill_complete = room_backfill_complete and backfill_complete
 
@@ -802,11 +827,16 @@ class AsyncClient(Client):
                     self.config.backfill_limited_timelines
                     and not self._should_dispatch_timeline_event(room_id, event)
                 ):
+                    self._record_dispatched_events(
+                        room_id, [event], response.next_batch
+                    )
                     continue
 
                 await self._on_event(event, room)
                 if self.config.backfill_limited_timelines:
-                    self._record_dispatched_events(room_id, [event])
+                    self._record_dispatched_events(
+                        room_id, [event], response.next_batch
+                    )
 
             # Replace the Megolm events with decrypted ones
             for index, event in decrypted_events:
@@ -850,17 +880,18 @@ class AsyncClient(Client):
         self,
         room_id: str,
         events: list[Event | BadEventType],
+        sync_token: str | None = None,
     ) -> None:
         """Remember the ids of timeline events handed to the event callbacks.
 
-        Recovery walks and the sliding sync loop skip ids in this per-room,
-        bounded memory so that events the server re-delivers — a federation
-        straggler delivered live by an earlier sync but sitting inside a
-        later walked gap topologically (clients must de-duplicate the
-        /sync–/messages overlap), or the timeline window a sliding sync
-        connection re-sends after expiring — are not dispatched twice. The
-        memory is not persisted; after a restart the spec-permitted
-        duplicate remains possible.
+        Recovery walks and the sliding sync loop skip ids in this per-room
+        memory so that events the server re-delivers — a federation straggler
+        delivered live by an earlier sync but sitting inside a later walked
+        gap topologically, or the timeline window a sliding sync connection
+        re-sends after expiring — are not dispatched twice. With recovery and
+        stored sync tokens enabled, ids reachable from the durable checkpoint
+        are journaled without the normal 512-entry eviction and restored after
+        restart.
 
         The stored value records whether the event was still encrypted when
         dispatched. Once an event has been dispatched decrypted it can never
@@ -868,6 +899,7 @@ class AsyncClient(Client):
         if a later copy fails to decrypt.
         """
         dispatched = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
+        persisted: list[tuple[str, bool]] = []
 
         for event in events:
             event_id = getattr(event, "event_id", None)
@@ -880,9 +912,14 @@ class AsyncClient(Client):
                 if was_encrypted is None
                 else was_encrypted and still_encrypted
             )
+            persisted.append((event_id, dispatched[event_id]))
 
-        while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
-            dispatched.popitem(last=False)
+        if sync_token and persisted and self._durable_dispatch_journal_enabled():
+            assert self.store
+            self.store.save_dispatched_events(room_id, sync_token, persisted)
+        elif not self._durable_dispatch_journal_enabled():
+            while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
+                dispatched.popitem(last=False)
 
     def _should_dispatch_timeline_event(
         self,
@@ -930,6 +967,7 @@ class AsyncClient(Client):
         join_info: RoomInfo,
         since: str,
         deadline: float,
+        response_token: str,
     ) -> bool:
         """Recover and dispatch events dropped by one room's limited timeline.
 
@@ -976,6 +1014,7 @@ class AsyncClient(Client):
             since,
             present_in_sync,
             already_dispatched,
+            response_token,
         )
 
         try:
@@ -1067,7 +1106,7 @@ class AsyncClient(Client):
                 )
                 continue
 
-            self._record_dispatched_events(room_id, [event])
+            self._record_dispatched_events(room_id, [event], response_token)
             dispatched += 1
 
         self.encrypted_rooms.update(encrypted_rooms)
@@ -1092,6 +1131,7 @@ class AsyncClient(Client):
         since: str,
         present_in_sync: set[str],
         already_dispatched: "OrderedDict[str, bool]",
+        response_token: str,
     ) -> tuple[list[Event | BadEventType], int, bool]:
         """Collect a limited gap backwards to its server-bounded start."""
         max_pages = self.config.backfill_max_pages
@@ -1139,6 +1179,7 @@ class AsyncClient(Client):
                 if event_id in already_dispatched:
                     was_encrypted = already_dispatched[event_id]
                     if not (was_encrypted and not isinstance(event, MegolmEvent)):
+                        self._record_dispatched_events(room_id, [event], response_token)
                         continue
                 if max_events is not None and len(recovered) >= max_events:
                     bound_reached = True
@@ -1233,7 +1274,7 @@ class AsyncClient(Client):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
-    def _persist_processed_sync_token(self) -> None:
+    def _persist_processed_sync_token(self, *, prune_journal: bool = True) -> None:
         """Persist the contiguous callback checkpoint when it changes."""
         token = self._last_processed_sync_token
         if (
@@ -1242,7 +1283,11 @@ class AsyncClient(Client):
             and self.store
             and token != self.loaded_sync_token
         ):
-            self.store.save_sync_token(token)
+            if prune_journal and self._durable_dispatch_journal_enabled():
+                self.store.save_sync_token_and_prune_dispatched_events(token)
+                self._load_dispatched_event_journal()
+            else:
+                self.store.save_sync_token(token)
             self.loaded_sync_token = token
 
     async def _handle_sync(self, response: SyncResponse) -> None:
@@ -1284,7 +1329,7 @@ class AsyncClient(Client):
             # A stored or explicit since token is the only safe restart point
             # if this first response fails or only partly recovers its gap.
             self._last_processed_sync_token = since
-            self._persist_processed_sync_token()
+            self._persist_processed_sync_token(prune_journal=False)
 
         await self._handle_to_device(response)
 

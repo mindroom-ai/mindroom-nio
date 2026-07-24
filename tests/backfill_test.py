@@ -1373,6 +1373,12 @@ class TestLimitedTimelineBackfill:
             config=config,
         )
         await first.receive_response(LoginResponse.from_dict(login_response))
+        dispatched: List[str] = []
+
+        async def record(_room, event):
+            dispatched.append(event.event_id)
+
+        first.add_event_callback(record, RoomMessageText)
 
         await first.receive_response(
             sync_response(
@@ -1442,7 +1448,7 @@ class TestLimitedTimelineBackfill:
             config=config,
         )
         await restarted.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(restarted)
+        restarted.add_event_callback(record, RoomMessageText)
 
         assert restarted.loaded_sync_token == "s1"
 
@@ -1457,12 +1463,211 @@ class TestLimitedTimelineBackfill:
         )
 
         assert pages.requested_to == ["s1", "s1"]
-        assert dispatched == ["$old", "$gap1", "$new", "$newer", "$latest"]
+        assert dispatched == ["$old", "$new", "$newer", "$gap1", "$latest"]
         assert restarted.store
         assert restarted._last_processed_sync_token == "s4"
         assert restarted.loaded_sync_token == "s4"
         assert restarted.store.load_sync_token() == "s4"
         await restarted.close()
+
+    async def test_restart_journal_exceeds_memory_dedup_limit(
+        self, tempdir, aioresponse
+    ):
+        """A held durable checkpoint retains every delivered id, not only 512."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+        dispatched: List[str] = []
+
+        async def record(_room, event):
+            dispatched.append(event.event_id)
+
+        first.add_event_callback(record, RoomMessageText)
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        later_events = [
+            text_event(f"$later-{index}", ts=300 + index) for index in range(600)
+        ]
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap1", ts=100)],
+                    end="more",
+                ),
+                "p-reset": messages_payload(
+                    [
+                        *reversed(later_events),
+                        text_event("$new", ts=200),
+                        text_event("$gap1", ts=100),
+                        text_event("$old", ts=50),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await first.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=200)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+        await first.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                later_events,
+                limited=False,
+                prev_batch="p2",
+            )
+        )
+        await first.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        restarted.add_event_callback(record, RoomMessageText)
+        await restarted.receive_response(
+            sync_response(
+                "s4",
+                TEST_ROOM_ID,
+                [text_event("$latest", ts=1000)],
+                limited=True,
+                prev_batch="p-reset",
+            )
+        )
+
+        expected = [
+            "$old",
+            "$new",
+            *(event.event_id for event in later_events),
+            "$gap1",
+            "$latest",
+        ]
+        assert dispatched == expected
+        assert len(dispatched) == len(set(dispatched))
+        await restarted.close()
+
+    async def test_restart_journal_allows_one_decrypted_upgrade(
+        self, tempdir, aioresponse
+    ):
+        """A persisted encrypted delivery upgrades once, then remains deduplicated."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [megolm_event("$enc", ts=90)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        await first.close()
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [
+                        text_event("$gap1", ts=100),
+                        text_event("$enc", ts=90),
+                    ],
+                    end=None,
+                ),
+                "p2": messages_payload(
+                    [
+                        text_event("$new", ts=300),
+                        text_event("$gap1", ts=100),
+                        text_event("$enc", ts=90),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        dispatched: List[str] = []
+
+        async def record(_room, event):
+            dispatched.append(event.event_id)
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        restarted.add_event_callback(record, RoomMessageText)
+        await restarted.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+        assert dispatched == ["$enc", "$gap1", "$new"]
+        await restarted.close()
+
+        third = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await third.receive_response(LoginResponse.from_dict(login_response))
+        third.add_event_callback(record, RoomMessageText)
+        await third.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$latest", ts=400)],
+                limited=True,
+                prev_batch="p2",
+            )
+        )
+
+        assert dispatched == ["$enc", "$gap1", "$new", "$latest"]
+        await third.close()
 
     async def test_straggler_already_delivered_is_not_redispatched(
         self, backfill_client, aioresponse

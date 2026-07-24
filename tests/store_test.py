@@ -17,6 +17,7 @@ from nio.crypto import (
 from nio.exceptions import OlmTrustError
 from nio.store import (
     DefaultStore,
+    DispatchedEvents,
     Ed25519Key,
     Key,
     KeyStore,
@@ -530,7 +531,33 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 2
+        assert version == 3
+
+    def test_v2_store_migrates_dispatched_event_journal(self, tempdir):
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token")
+        with store.database.bind_ctx(store.models):
+            store.database.drop_tables([DispatchedEvents])
+        store._update_version(2)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 3
+        assert migrated.load_sync_token() == "safe-token"
+        with migrated.database.bind_ctx(migrated.models):
+            assert DispatchedEvents.table_exists()
 
     def test_sqlitestore_verification(self, sqlstore):
         devices = self.example_devices

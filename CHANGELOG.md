@@ -101,10 +101,13 @@ All notable changes to this project will be documented in this file.
   errors, stalls, and timeouts discard incomplete recovery with a warning.
   The in-memory and stored callback checkpoint does not advance across an
   incomplete collection or dispatch, so a later token reset or process
-  restart can retry from the safe boundary. All backfill for one sync
-  response shares a single time budget (`backfill_timeout`) covering
-  pagination and dispatch, including hanging callbacks. Disabled by default;
-  behaviour with the flag off is identical to upstream nio.
+  restart can retry from the safe boundary. Callback deliveries reachable
+  from that durable checkpoint are journaled with their encryption state, so
+  restart recovery neither duplicates them nor suppresses a later decrypted
+  form. All backfill for one sync response shares a single time budget
+  (`backfill_timeout`) covering pagination and dispatch, including hanging
+  callbacks. Disabled by default; behaviour with the flag off is identical
+  to upstream nio.
 
 ### Bug Fixes
 

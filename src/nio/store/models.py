@@ -213,6 +213,21 @@ class SyncTokens(Model):
         constraints = [SQL("UNIQUE(account_id)")]
 
 
+class DispatchedEvents(Model):
+    room_id = TextField()
+    event_id = TextField()
+    was_encrypted = BooleanField()
+    sync_token = TextField()
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="dispatched_events",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id,event_id)")]
+
+
 class TrackedUsers(Model):
     user_id = TextField()
     account = ForeignKeyField(

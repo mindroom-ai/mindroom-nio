@@ -24,6 +24,7 @@ if package_installed("vodozemac"):
         DeviceKeys_v1,
         DeviceTrustField,
         DeviceTrustState,
+        DispatchedEvents,
         EncryptedRooms,
         ForwardedChains,
         Keys,
