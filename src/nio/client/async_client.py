@@ -385,11 +385,12 @@ class AsyncClientConfig(ClientConfig):
             before its starting position, so they are not dispatched again.
             The walk dispatches only when it reaches an event of the sync
             window, which proves the buffer covers exactly the gap; cut short
-            by a bound, an error, or the room's live edge, it discards what it
-            collected and logs a warning — an unverified buffer could contain
-            pre-join history or events newer than the sync response, which the
-            next sync would deliver again. Event ids already dispatched this
-            run are skipped (per room, bounded memory), de-duplicating the
+            by an explicitly configured bound, an error, or the room's live
+            edge, it discards what it collected and logs a warning — an
+            unverified buffer could contain pre-join history or events newer
+            than the sync response, which the next sync would deliver again.
+            Event ids already dispatched this run are skipped (per room,
+            bounded memory), de-duplicating the
             ``/sync``–``/messages`` overlap; that memory is not persisted, so
             a federation straggler delivered just before a restart may still
             repeat. The walk is unfiltered: when syncing with a filter, gap
@@ -407,13 +408,16 @@ class AsyncClientConfig(ClientConfig):
             request and the backfill degrades to a logged warning. Disabled by
             default, in which case behaviour is identical to upstream nio.
 
-        backfill_max_pages (int): The maximum number of ``/messages`` pages to
-            fetch per limited room per sync when ``backfill_limited_timelines``
-            is enabled. Defaults to 10.
+        backfill_max_pages (int, optional): The maximum number of ``/messages``
+            pages to fetch per limited room per sync when
+            ``backfill_limited_timelines`` is enabled. Defaults to no page
+            bound. Setting a bound permits event loss when a gap exceeds it.
 
-        backfill_max_events (int): The maximum number of events to recover per
-            limited room per sync when ``backfill_limited_timelines`` is enabled,
-            independent of the page count. Defaults to 200.
+        backfill_max_events (int, optional): The maximum number of events to
+            recover per limited room per sync when
+            ``backfill_limited_timelines`` is enabled, independent of the page
+            count. Defaults to no event bound. Setting a bound permits event
+            loss when a gap exceeds it.
 
         backfill_page_size (int): The number of events to request per
             ``/messages`` page when ``backfill_limited_timelines`` is enabled.
@@ -441,8 +445,8 @@ class AsyncClientConfig(ClientConfig):
     request_timeout: float = 60
     io_chunk_size: int = 64 * 1024
     backfill_limited_timelines: bool = False
-    backfill_max_pages: int = 10
-    backfill_max_events: int = 200
+    backfill_max_pages: Optional[int] = None
+    backfill_max_events: Optional[int] = None
     backfill_page_size: int = 50
     backfill_timeout: float = 30.0
 
@@ -1086,7 +1090,7 @@ class AsyncClient(Client):
         pages = 0
         gap_closed = False
 
-        while pages < max_pages and token:
+        while (max_pages is None or pages < max_pages) and token:
             response = await self.room_messages(
                 room_id,
                 start=token,
@@ -1130,7 +1134,7 @@ class AsyncClient(Client):
                     was_encrypted = already_dispatched[event_id]
                     if not (was_encrypted and not isinstance(event, MegolmEvent)):
                         continue
-                if len(recovered) >= max_events:
+                if max_events is not None and len(recovered) >= max_events:
                     bound_reached = True
                     break
                 seen_ids.add(event_id)
