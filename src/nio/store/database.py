@@ -17,7 +17,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from functools import wraps
 
-from peewee import DoesNotExist, SqliteDatabase
+from peewee import EXCLUDED, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -36,6 +36,7 @@ from . import (
     DeviceKeys,
     DeviceKeys_v1,
     DeviceTrustState,
+    DispatchedEvents,
     EncryptedRooms,
     ForwardedChains,
     Key,
@@ -96,8 +97,10 @@ class MatrixStore:
         StoreVersion,
         Keys,
         SyncTokens,
+        DispatchedEvents,
     ]
-    store_version = 2
+    store_version = 4
+    supports_threaded_writes = True
 
     user_id: str = field()
     device_id: str = field()
@@ -130,6 +133,26 @@ class MatrixStore:
             self.database.create_tables([DeviceKeys, DeviceTrustState])
         self._update_version(2)
 
+    def upgrade_to_v3(self):
+        with self.database.bind_ctx(self.models):
+            self.database.create_tables([DispatchedEvents])
+        self._update_version(3)
+
+    def upgrade_to_v4(self):
+        with self.database.bind_ctx([SyncTokens]):
+            columns = {
+                row[1]
+                for row in self.database.execute_sql(
+                    'PRAGMA table_info("synctokens")'
+                ).fetchall()
+            }
+            if "gap_pending" not in columns:
+                self.database.execute_sql(
+                    'ALTER TABLE "synctokens" '
+                    'ADD COLUMN "gap_pending" INTEGER NOT NULL DEFAULT 0'
+                )
+        self._update_version(4)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -141,6 +164,12 @@ class MatrixStore:
         # Update the store if it's an old version here.
         if store_version == 1:
             self.upgrade_to_v2()
+            store_version = 2
+        if store_version == 2:
+            self.upgrade_to_v3()
+            store_version = 3
+        if store_version == 3:
+            self.upgrade_to_v4()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -468,13 +497,17 @@ class MatrixStore:
                 rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
             ).on_conflict_ignore().execute()
 
-    @use_database
-    def save_sync_token(self, token: str) -> None:
-        """Save the given token"""
+    @use_database_atomic
+    def save_sync_token(self, token: str, gap_pending: bool = False) -> None:
+        """Save the callback checkpoint and whether recovery is still pending."""
         account = self._get_account()
         assert account
 
-        SyncTokens.replace(account=account, token=token).execute()
+        SyncTokens.replace(
+            account=account,
+            token=token,
+            gap_pending=gap_pending,
+        ).execute()
 
     @use_database
     def load_sync_token(self) -> str | None:
@@ -490,6 +523,88 @@ class MatrixStore:
             return token.token
 
         return None
+
+    @use_database
+    def load_sync_recovery_pending(self) -> bool:
+        """Load whether the stored callback checkpoint still owns a gap."""
+        account = self._get_account()
+        if not account:
+            return False
+
+        token = SyncTokens.get_or_none(SyncTokens.account == account.id)
+        return bool(token and token.gap_pending)
+
+    @use_database_atomic
+    def save_dispatched_events(
+        self, room_id: str, sync_token: str, events: list[tuple[str, bool]]
+    ) -> None:
+        """Persist timeline callback deliveries that a safe-token rewind may replay."""
+        account = self._get_account()
+        assert account
+
+        merged: dict[str, bool] = {}
+        for event_id, was_encrypted in events:
+            merged[event_id] = merged.get(event_id, True) and was_encrypted
+
+        rows = [
+            {
+                "account": account,
+                "room_id": room_id,
+                "event_id": event_id,
+                "was_encrypted": was_encrypted,
+                "sync_token": sync_token,
+            }
+            for event_id, was_encrypted in merged.items()
+        ]
+        for index in range(0, len(rows), 100):
+            DispatchedEvents.insert_many(rows[index : index + 100]).on_conflict(
+                conflict_target=[
+                    DispatchedEvents.account,
+                    DispatchedEvents.room_id,
+                    DispatchedEvents.event_id,
+                ],
+                update={
+                    DispatchedEvents.was_encrypted: (
+                        DispatchedEvents.was_encrypted & EXCLUDED.was_encrypted
+                    ),
+                    DispatchedEvents.sync_token: EXCLUDED.sync_token,
+                },
+            ).execute()
+
+    @use_database
+    def load_dispatched_events(self) -> list[tuple[str, str, bool, str]]:
+        """Load callback deliveries not yet covered by the stored sync token."""
+        account = self._get_account()
+        if not account:
+            return []
+
+        return [
+            (
+                event.room_id,
+                event.event_id,
+                event.was_encrypted,
+                event.sync_token,
+            )
+            for event in DispatchedEvents.select()
+            .where(DispatchedEvents.account == account)
+            .order_by(DispatchedEvents.id)
+        ]
+
+    @use_database_atomic
+    def save_sync_token_and_prune_dispatched_events(self, token: str) -> None:
+        """Advance the checkpoint and retain only its overlapping response."""
+        account = self._get_account()
+        assert account
+
+        SyncTokens.replace(
+            account=account,
+            token=token,
+            gap_pending=False,
+        ).execute()
+        DispatchedEvents.delete().where(
+            DispatchedEvents.account == account,
+            DispatchedEvents.sync_token != token,
+        ).execute()
 
     @use_database
     def delete_encrypted_room(self, room: str) -> None:
@@ -1015,6 +1130,8 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
+
+    supports_threaded_writes = False
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

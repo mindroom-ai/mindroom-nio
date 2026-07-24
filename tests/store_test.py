@@ -17,6 +17,7 @@ from nio.crypto import (
 from nio.exceptions import OlmTrustError
 from nio.store import (
     DefaultStore,
+    DispatchedEvents,
     Ed25519Key,
     Key,
     KeyStore,
@@ -530,7 +531,143 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 2
+        assert version == 4
+
+    def test_v2_store_migrates_dispatched_event_journal(self, tempdir):
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token")
+        with store.database.bind_ctx(store.models):
+            store.database.drop_tables([DispatchedEvents])
+            store.database.execute_sql(
+                'ALTER TABLE "synctokens" DROP COLUMN "gap_pending"'
+            )
+        store._update_version(2)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 4
+        assert migrated.load_sync_token() == "safe-token"
+        assert not migrated.load_sync_recovery_pending()
+        with migrated.database.bind_ctx(migrated.models):
+            assert DispatchedEvents.table_exists()
+
+    def test_upgrade_to_v3_creates_journal_before_final_table_creation(self, tempdir):
+        """The dedicated migration owns the journal table creation."""
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        with store.database.bind_ctx(store.models):
+            store.database.drop_tables([DispatchedEvents])
+        store._update_version(2)
+
+        store.upgrade_to_v3()
+
+        assert store._get_store_version() == 3
+        with store.database.bind_ctx(store.models):
+            assert DispatchedEvents.table_exists()
+
+    def test_v3_store_migrates_sync_recovery_marker(self, tempdir):
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token")
+        with store.database.bind_ctx(store.models):
+            store.database.execute_sql(
+                'ALTER TABLE "synctokens" DROP COLUMN "gap_pending"'
+            )
+        store._update_version(3)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 4
+        assert migrated.load_sync_token() == "safe-token"
+        assert not migrated.load_sync_recovery_pending()
+
+    def test_interrupted_v4_migration_is_restart_safe(self, tempdir):
+        """A prior column add can be retried before the version update."""
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token", gap_pending=True)
+        store._update_version(3)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 4
+        assert migrated.load_sync_token() == "safe-token"
+        assert migrated.load_sync_recovery_pending()
+
+    def test_sync_recovery_marker_round_trip(self, store):
+        store.save_sync_token("safe-token", gap_pending=True)
+
+        assert store.load_sync_token() == "safe-token"
+        assert store.load_sync_recovery_pending()
+
+        store.save_sync_token_and_prune_dispatched_events("complete-token")
+
+        assert store.load_sync_token() == "complete-token"
+        assert not store.load_sync_recovery_pending()
+
+    def test_dispatched_event_journal_bulk_upsert(self, store):
+        store.save_dispatched_events(
+            TEST_ROOM,
+            "s1",
+            [
+                ("$encrypted", True),
+                ("$plain", False),
+            ],
+        )
+        store.save_dispatched_events(
+            TEST_ROOM,
+            "s2",
+            [
+                ("$encrypted", True),
+                ("$encrypted", False),
+                ("$plain", True),
+                ("$new", True),
+            ],
+        )
+
+        assert store.load_dispatched_events() == [
+            (TEST_ROOM, "$encrypted", False, "s2"),
+            (TEST_ROOM, "$plain", False, "s2"),
+            (TEST_ROOM, "$new", True, "s2"),
+        ]
 
     def test_sqlitestore_verification(self, sqlstore):
         devices = self.example_devices
