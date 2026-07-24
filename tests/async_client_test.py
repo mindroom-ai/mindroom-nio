@@ -944,6 +944,21 @@ class TestClass:
         assert resp.pos == "s1"
         assert resp.lists["main"].count == 1
 
+    async def test_new_sliding_connection_rotates_recovery_scope(
+        self, async_client, monkeypatch
+    ):
+        async def send(*args, **kwargs):
+            return SlidingSyncResponse.from_dict({"pos": "p1"})
+
+        monkeypatch.setattr(async_client, "_send", send)
+        previous = async_client._sliding_sync_recovery_scope
+        await async_client.sliding_sync(pos=None)
+        current = async_client._sliding_sync_recovery_scope
+        assert current != previous
+
+        await async_client.sliding_sync(pos="p1")
+        assert async_client._sliding_sync_recovery_scope == current
+
     sliding_sync_url = re.compile(
         rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"
         r"/org\.matrix\.simplified_msc3575/sync.*$"

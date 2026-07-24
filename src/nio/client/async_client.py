@@ -1805,6 +1805,8 @@ class AsyncClient(Client):
                 ``AsyncClient.config.request_timeout`` for both the server
                 long-poll timeout and the client-side request timeout.
         """
+        if pos is None:
+            self._sliding_sync_recovery_scope = uuid4().hex
         presence = set_presence or self._presence
         method, path, data = Api.sliding_sync(
             self.access_token,
@@ -2091,7 +2093,6 @@ class AsyncClient(Client):
             loop_sleep_time (int, optional): The sleep time, if any, between
                 successful sync loop iterations in milliseconds.
         """
-        self._sliding_sync_recovery_scope = uuid4().hex
         first_sync = True
         pos: str | None = None
         consecutive_errors = 0
@@ -2109,7 +2110,6 @@ class AsyncClient(Client):
                     # starts a new one. The to-device since token is
                     # independent of pos and is deliberately kept.
                     pos = None
-                    self._sliding_sync_recovery_scope = uuid4().hex
 
         while not self._stop_sync_forever:
             try:
