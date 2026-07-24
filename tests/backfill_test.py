@@ -296,6 +296,37 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$a", "$b"]
 
+    async def test_disabled_keeps_eager_store_token_on_callback_error(self, tempdir):
+        """Backfill-disabled persistence remains identical to upstream nio."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store_sync_tokens=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+
+        async def fail(_room, _event):
+            raise RuntimeError("callback failed")
+
+        client.add_event_callback(fail, RoomMessageText)
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    TEST_ROOM_ID,
+                    [text_event("$event", ts=100)],
+                    limited=False,
+                    prev_batch="p0",
+                )
+            )
+
+        assert client.store
+        assert client.store.load_sync_token() == "s1"
+        await client.close()
+
     async def test_first_sync_is_skipped(self, backfill_client, aioresponse):
         """A room's first (always limited) sync must not trigger backfill."""
         dispatched = self._record_callback(backfill_client)
@@ -1143,6 +1174,59 @@ class TestLimitedTimelineBackfill:
         assert pages.requested_dir == ["b"]
         assert pages.requested_to == ["tok0"]
 
+    async def test_explicit_since_is_persisted_before_callback_failure(
+        self, tempdir, aioresponse
+    ):
+        """An explicit safe boundary survives failure in its first response."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=1,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+
+        async def fail(_room, event):
+            if event.event_id == "$new":
+                raise RuntimeError("callback failed")
+
+        client.add_event_callback(fail, RoomMessageText)
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap1", ts=100)],
+                    end="more",
+                )
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        aioresponse.get(
+            SYNC_URL,
+            payload=sync_json(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.sync(since="explicit-since")
+
+        assert client.next_batch == "s2"
+        assert client._last_processed_sync_token == "explicit-since"
+        assert client.loaded_sync_token == "explicit-since"
+        assert client.store
+        assert client.store.load_sync_token() == "explicit-since"
+        await client.close()
+
     async def test_public_token_reset_preserves_recovery_bound(
         self, backfill_client, aioresponse
     ):
@@ -1308,6 +1392,7 @@ class TestLimitedTimelineBackfill:
                 ),
                 "p-reset": messages_payload(
                     [
+                        text_event("$newer", ts=400),
                         text_event("$new", ts=300),
                         text_event("$gap1", ts=100),
                         text_event("$old", ts=50),
@@ -1328,6 +1413,24 @@ class TestLimitedTimelineBackfill:
         )
 
         assert first.store
+        assert first.next_batch == "s2"
+        assert first._last_processed_sync_token == "s1"
+        assert first.loaded_sync_token == "s1"
+        assert first.store.load_sync_token() == "s1"
+
+        await first.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$newer", ts=400)],
+                limited=False,
+                prev_batch="p2",
+            )
+        )
+
+        assert first.next_batch == "s3"
+        assert first._last_processed_sync_token == "s1"
+        assert first.loaded_sync_token == "s1"
         assert first.store.load_sync_token() == "s1"
         await first.close()
 
@@ -1345,18 +1448,20 @@ class TestLimitedTimelineBackfill:
 
         await restarted.receive_response(
             sync_response(
-                "s3",
+                "s4",
                 TEST_ROOM_ID,
-                [text_event("$latest", ts=400)],
+                [text_event("$latest", ts=500)],
                 limited=True,
                 prev_batch="p-reset",
             )
         )
 
         assert pages.requested_to == ["s1", "s1"]
-        assert dispatched == ["$old", "$gap1", "$new", "$latest"]
+        assert dispatched == ["$old", "$gap1", "$new", "$newer", "$latest"]
         assert restarted.store
-        assert restarted.store.load_sync_token() == "s3"
+        assert restarted._last_processed_sync_token == "s4"
+        assert restarted.loaded_sync_token == "s4"
+        assert restarted.store.load_sync_token() == "s4"
         await restarted.close()
 
     async def test_straggler_already_delivered_is_not_redispatched(

@@ -556,15 +556,12 @@ class AsyncClient(Client):
         # even when the caller passed an explicit `since`.
         self._sync_since: str | None = None
 
-        # The newest sync token whose response was fully processed. Keep this
-        # separate from the public next_batch: callers may clear next_batch to
-        # force a full-state resync, but a limited timeline in that response
-        # still needs the last completed callback-delivery position as its
-        # exact /messages lower bound.
+        # The newest sync token through which callback delivery is contiguous.
+        # Keep this separate from the public next_batch: callers may clear
+        # next_batch to force a full-state resync, but a limited timeline in
+        # that response still needs the last completed callback-delivery
+        # position as its exact /messages lower bound.
         self._last_processed_sync_token: str | None = None
-        # Once recovery is incomplete, later syncs from the newer public token
-        # cannot leapfrog the gap and certify a newer checkpoint.
-        self._has_unrecovered_sync_gap = False
 
         # Per-room memory of recently dispatched timeline event ids, kept
         # when `backfill_limited_timelines` is enabled and by the sliding
@@ -1236,6 +1233,18 @@ class AsyncClient(Client):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
+    def _persist_processed_sync_token(self) -> None:
+        """Persist the contiguous callback checkpoint when it changes."""
+        token = self._last_processed_sync_token
+        if (
+            token
+            and self.config.store_sync_tokens
+            and self.store
+            and token != self.loaded_sync_token
+        ):
+            self.store.save_sync_token(token)
+            self.loaded_sync_token = token
+
     async def _handle_sync(self, response: SyncResponse) -> None:
         # The callback-delivery position preceding this response. sync()
         # records the exact request token; direct responses fall back to the
@@ -1258,6 +1267,25 @@ class AsyncClient(Client):
 
         self.next_batch = response.next_batch
 
+        if (
+            self.config.store_sync_tokens
+            and self.store
+            and not self.config.backfill_limited_timelines
+        ):
+            # Preserve upstream's eager transport-token persistence when
+            # callback-contiguous recovery is not enabled.
+            self.store.save_sync_token(self.next_batch)
+
+        if (
+            self.config.backfill_limited_timelines
+            and self._last_processed_sync_token is None
+            and since
+        ):
+            # A stored or explicit since token is the only safe restart point
+            # if this first response fails or only partly recovers its gap.
+            self._last_processed_sync_token = since
+            self._persist_processed_sync_token()
+
         await self._handle_to_device(response)
 
         await self._handle_invited_rooms(response)
@@ -1273,23 +1301,15 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
 
-        if not backfill_complete:
-            if self._last_processed_sync_token is None and since:
-                self._last_processed_sync_token = since
-            self._has_unrecovered_sync_gap = True
-        elif (
-            not self._has_unrecovered_sync_gap
+        if backfill_complete and (
+            not self.config.backfill_limited_timelines
+            or self._last_processed_sync_token is None
             or since == self._last_processed_sync_token
         ):
             self._last_processed_sync_token = response.next_batch
-            self._has_unrecovered_sync_gap = False
 
-        if (
-            self.config.store_sync_tokens
-            and self.store
-            and self._last_processed_sync_token
-        ):
-            self.store.save_sync_token(self._last_processed_sync_token)
+        if self.config.backfill_limited_timelines:
+            self._persist_processed_sync_token()
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
