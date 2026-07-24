@@ -1098,12 +1098,17 @@ class AsyncClient(Client):
             except _BackfillCallbackError:
                 # Unlike the live sync path, where a raising callback
                 # propagates out of sync(), a backfill must never break the
-                # sync loop, so a crashing callback only skips this one event.
+                # sync loop, so a crashing callback terminally skips this one
+                # event. Some earlier callbacks may already have completed;
+                # remember the event so a recovery retry cannot invoke them
+                # again.
                 logger.exception(
                     "Failed to dispatch backfilled event %s in room %s",
                     getattr(event, "event_id", None),
                     room_id,
                 )
+                self._record_dispatched_events(room_id, [event], response_token)
+                dispatched += 1
                 continue
 
             self._record_dispatched_events(room_id, [event], response_token)

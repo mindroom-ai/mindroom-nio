@@ -2081,12 +2081,107 @@ class TestLimitedTimelineBackfill:
                 )
             )
 
-        # $gap1's dispatch failed (and is logged), but $gap2 still arrived —
-        # the budget warning must not fire.
+        # $gap1 is terminally skipped (and logged), but $gap2 still arrived —
+        # the budget warning must not fire and the completed gap advances.
         assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
         assert "Failed to dispatch backfilled event $gap1" in caplog.text
         assert "budget is exhausted" not in caplog.text
-        assert backfill_client._last_processed_sync_token == "s1"
+        assert backfill_client._last_processed_sync_token == "s2"
+
+    async def test_callback_fanout_failure_is_terminal_across_restart(
+        self, tempdir, aioresponse
+    ):
+        """A later callback failure cannot replay an earlier successful callback."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+        dispatched: List[str] = []
+
+        async def record(_room, event):
+            dispatched.append(event.event_id)
+
+        async def fail_after_record(_room, event):
+            if event.event_id == "$gap1":
+                raise RuntimeError("second callback failed")
+
+        first.add_event_callback(record, RoomMessageText)
+        first.add_event_callback(fail_after_record, RoomMessageText)
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap1", ts=100), text_event("$old", ts=50)],
+                    end=None,
+                ),
+                "p-reset": messages_payload(
+                    [
+                        text_event("$new", ts=300),
+                        text_event("$gap1", ts=100),
+                        text_event("$old", ts=50),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        await first.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert first.store
+        assert first.store.load_sync_token() == "s2"
+        assert {
+            event_id
+            for _room_id, event_id, _encrypted, _token in first.store.load_dispatched_events()
+        } == {"$old", "$gap1", "$new"}
+        await first.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        restarted.add_event_callback(record, RoomMessageText)
+        await restarted.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$latest", ts=400)],
+                limited=True,
+                prev_batch="p-reset",
+            )
+        )
+
+        assert dispatched == ["$old", "$gap1", "$new", "$latest"]
+        assert len(dispatched) == len(set(dispatched))
+        await restarted.close()
 
     async def test_since_bound_closes_without_delivered_event(
         self, backfill_client, aioresponse
