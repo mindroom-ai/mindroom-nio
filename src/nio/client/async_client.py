@@ -374,21 +374,19 @@ class AsyncClientConfig(ClientConfig):
             ``limited: true`` the homeserver truncated it, so the events between
             the previous sync position and the surviving window are never passed
             to the event callbacks. When this is enabled, sync handling pages
-            ``/messages`` forwards from the token the sync continued from and
-            dispatches the recovered events through the normal event callbacks,
-            oldest first and before the (newer) events of the sync response
-            that revealed the gap, so callbacks observe the room in
-            chronological order. Everything before that token was delivered by
-            earlier syncs (or, when resuming via ``store_sync_tokens`` or an
-            explicit since, by the previous run — gaps spanning a restart are
-            recovered too), and a forward walk never returns events from
-            before its starting position, so they are not dispatched again.
-            The walk dispatches only when it reaches an event of the sync
-            window, which proves the buffer covers exactly the gap; cut short
-            by an explicitly configured bound, an error, or the room's live
-            edge, it discards what it collected and logs a warning — an
-            unverified buffer could contain pre-join history or events newer
-            than the sync response, which the next sync would deliver again.
+            ``/messages`` backwards from the limited timeline's
+            ``prev_batch`` until an event already dispatched this run. This
+            follows the same room-DAG ordering as the missing window, even when
+            it differs from ``/sync`` ordering under concurrent writers. On
+            the first limited sync after a restart, where no delivered ids are
+            available, recovery instead walks forwards from the stored sync
+            token until it reaches the sync window. Recovered events are
+            dispatched through the normal event callbacks, oldest first and
+            before the (newer) events of the sync response that revealed the
+            gap, so callbacks observe the room in chronological order.
+            A walk cut short by an explicitly configured bound, an error, a
+            pagination stall, or an unverified boundary discards what it
+            collected and logs a warning.
             Event ids already dispatched this run are skipped (per room,
             bounded memory), de-duplicating the
             ``/sync``–``/messages`` overlap; that memory is not persisted, so
@@ -402,11 +400,11 @@ class AsyncClientConfig(ClientConfig):
             encountered while paging discards everything collected before it,
             so pre-join history is never dispatched. Recovered events are
             decrypted like live events but never applied to the ``MatrixRoom``
-            state, which is already newer than they are. Requires the server
-            to accept sync tokens as ``/messages`` ``from`` positions, which
-            the Matrix spec mandates; servers that reject them fail the
-            request and the backfill degrades to a logged warning. Disabled by
-            default, in which case behaviour is identical to upstream nio.
+            state, which is already newer than they are. Restart recovery
+            requires the server to accept sync tokens as ``/messages`` ``from``
+            positions; servers that reject them fail the request and the
+            backfill degrades to a logged warning. Disabled by default, in
+            which case behaviour is identical to upstream nio.
 
         backfill_max_pages (int, optional): The maximum number of ``/messages``
             pages to fetch per limited room per sync when
@@ -758,12 +756,10 @@ class AsyncClient(Client):
 
             # Recover a limited timeline's gap before the live events are
             # dispatched, so callbacks see the room in chronological order.
-            # Everything before the since position was delivered by earlier
-            # syncs (or, when resuming from a stored token, by the previous
-            # run), so the gap is paged forwards from there — unless the
-            # timeline carries our own join, in which case the room was
-            # freshly joined and its earlier history is not a gap. (A join
-            # that fell into the gap itself resets the walk instead.)
+            # Ongoing rooms walk backwards to ids delivered this run; a
+            # resumed room without such ids walks forwards from its stored
+            # sync token. The timeline's own-join event still marks a fresh
+            # join whose earlier history is not a delivery gap.
             if (
                 self.config.backfill_limited_timelines
                 and join_info.timeline.limited
@@ -792,14 +788,19 @@ class AsyncClient(Client):
                     event = decrypted_event
                     decrypted_events.append((index, decrypted_event))
 
+                if (
+                    self.config.backfill_limited_timelines
+                    and not self._should_dispatch_timeline_event(room_id, event)
+                ):
+                    continue
+
                 await self._on_event(event, room)
+                if self.config.backfill_limited_timelines:
+                    self._record_dispatched_events(room_id, [event])
 
             # Replace the Megolm events with decrypted ones
             for index, event in decrypted_events:
                 join_info.timeline.events[index] = event
-
-            if self.config.backfill_limited_timelines:
-                self._record_dispatched_events(room_id, join_info.timeline.events)
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
@@ -871,6 +872,20 @@ class AsyncClient(Client):
         while len(dispatched) > _MAX_DISPATCHED_EVENT_IDS:
             dispatched.popitem(last=False)
 
+    def _should_dispatch_timeline_event(
+        self,
+        room_id: str,
+        event: Event | BadEventType,
+    ) -> bool:
+        """Return whether one timeline replay should reach callbacks."""
+        event_id = getattr(event, "event_id", None)
+        if not event_id:
+            return True
+        was_encrypted = self._dispatched_event_ids.get(room_id, {}).get(event_id)
+        if was_encrypted is None:
+            return True
+        return was_encrypted and not isinstance(event, MegolmEvent)
+
     def _is_own_join_transition(self, event: Event | BadEventType) -> bool:
         """Whether an event is us transitioning into the room (a fresh join)."""
         return (
@@ -909,19 +924,16 @@ class AsyncClient(Client):
 
         The homeserver truncated this room's timeline (``limited: true``), so
         the events between the since position and the surviving window were
-        never handed to the event callbacks. Page ``/messages`` forwards from
-        the since position to collect them — a forward walk never returns
-        events from before that position, so previously delivered events are
-        not dispatched again, regardless of how the server interprets
-        pagination bounds. ``until`` (the sync's ``next_batch``) additionally
-        clamps the walk on servers that honour ``to``. Recovered events are
-        dispatched oldest first through the normal event callbacks, before the
-        sync response's own events; they are decrypted like live events but
-        never applied to room state, which is already newer than they are. Any
-        failure is logged and swallowed, and both the walk and the dispatch of
-        what it recovered must finish before ``deadline`` (the sync response's
-        shared backfill budget), so a backfill can never break or stall the
-        sync loop.
+        never handed to the event callbacks. Ongoing clients page backwards
+        from ``prev_batch`` until already-dispatched history, matching the
+        room-DAG order used by ``/messages``. A resumed client without
+        delivered ids pages forwards from ``since`` instead. Recovered events
+        are dispatched oldest first through the normal event callbacks, before
+        the sync response's own events; they are decrypted like live events
+        but never applied to room state, which is already newer than they are.
+        Any failure is logged and swallowed, and both collection and dispatch
+        must finish before ``deadline`` (the sync response's shared backfill
+        budget), so backfill cannot break or indefinitely stall the sync loop.
         """
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -940,9 +952,17 @@ class AsyncClient(Client):
         }
         already_dispatched = self._dispatched_event_ids.get(room_id, OrderedDict())
 
-        collect = self._collect_gap_events_forward(
-            room_id, since, present_in_sync, already_dispatched, until
-        )
+        if already_dispatched and join_info.timeline.prev_batch:
+            collect = self._collect_gap_events_backward(
+                room_id,
+                join_info.timeline.prev_batch,
+                present_in_sync,
+                already_dispatched,
+            )
+        else:
+            collect = self._collect_gap_events_forward(
+                room_id, since, present_in_sync, already_dispatched, until
+            )
 
         try:
             recovered, pages, gap_closed = await asyncio.wait_for(
@@ -1048,6 +1068,82 @@ class AsyncClient(Client):
                 pages,
                 room_id,
             )
+
+    async def _collect_gap_events_backward(
+        self,
+        room_id: str,
+        prev_batch: str,
+        present_in_sync: set[str],
+        already_dispatched: "OrderedDict[str, bool]",
+    ) -> tuple[list[Event | BadEventType], int, bool]:
+        """Collect an ongoing gap backwards to known delivered history."""
+        max_pages = self.config.backfill_max_pages
+        max_events = self.config.backfill_max_events
+        page_size = self.config.backfill_page_size
+
+        recovered: list[Event | BadEventType] = []
+        seen_ids: set[str] = set()
+        token: str | None = prev_batch
+        pages = 0
+        gap_closed = False
+
+        while (max_pages is None or pages < max_pages) and token:
+            response = await self.room_messages(
+                room_id,
+                start=token,
+                direction=MessageDirection.back,
+                limit=page_size,
+            )
+            pages += 1
+
+            if not isinstance(response, RoomMessagesResponse):
+                logger.warning(
+                    "Stopping limited-timeline backfill for room %s: %s",
+                    room_id,
+                    response,
+                )
+                break
+
+            bound_reached = False
+            for event in response.chunk:
+                event_id = getattr(event, "event_id", None)
+                if not event_id or event_id in seen_ids:
+                    continue
+                if event_id in present_in_sync:
+                    continue
+                if self._is_own_join_transition(event):
+                    gap_closed = True
+                    break
+                if event_id in already_dispatched:
+                    was_encrypted = already_dispatched[event_id]
+                    if was_encrypted and not isinstance(event, MegolmEvent):
+                        recovered.append(event)
+                    gap_closed = True
+                    break
+                if max_events is not None and len(recovered) >= max_events:
+                    bound_reached = True
+                    break
+                seen_ids.add(event_id)
+                recovered.append(event)
+
+            if gap_closed or bound_reached:
+                break
+
+            next_token = response.end
+            if not next_token or next_token == token:
+                break
+            token = next_token
+
+        if not gap_closed and recovered:
+            logger.warning(
+                "Discarding %d event(s) recovered for room %s: the backward "
+                "walk ended before reaching delivered history",
+                len(recovered),
+                room_id,
+            )
+            recovered = []
+        recovered.reverse()
+        return recovered, pages, gap_closed
 
     async def _collect_gap_events_forward(
         self,
@@ -1401,7 +1497,6 @@ class AsyncClient(Client):
         # again — except the first decryptable replay of an event that
         # could only be dispatched in encrypted form before its room
         # key arrived.
-        dispatched = self._dispatched_event_ids.get(room_id, {})
         decrypted_events: list[tuple[int, Event | BadEventType]] = []
 
         for index, event in enumerate(sliding_room.timeline):
@@ -1413,12 +1508,8 @@ class AsyncClient(Client):
                 event = decrypted_event
                 decrypted_events.append((index, decrypted_event))
 
-            event_id = getattr(event, "event_id", None)
-            if event_id in dispatched:
-                was_encrypted = dispatched[event_id]
-                now_decrypted = not isinstance(event, MegolmEvent)
-                if not (was_encrypted and now_decrypted):
-                    continue
+            if not self._should_dispatch_timeline_event(room_id, event):
+                continue
 
             await self._on_event(event, room)
 
