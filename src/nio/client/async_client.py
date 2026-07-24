@@ -409,21 +409,25 @@ class AsyncClientConfig(ClientConfig):
             A configured bound, error, pagination stall, callback cancellation,
             or timeout pauses recovery after its terminally dispatched forward
             prefix. The public sync cursor resets to the safe checkpoint and
-            the room's live timeline stays held until a later limited response
-            closes the gap. Retry order rotates across rooms, and an in-memory
-            pagination cursor avoids rescanning completed pages. With stored
-            sync tokens enabled, the safe checkpoint, sticky gap marker, and
-            callback event journal survive process restart. One abrupt process
-            kill can still replay the event whose callback fan-out was active,
-            because callback side effects and SQLite cannot share a
-            transaction; every earlier completed event is durable.
+            the room's live timeline stays held until a later response from
+            that checkpoint closes the gap. A complete non-limited retry is
+            sufficient; a limited retry resumes the forward walk. Retry order
+            rotates across rooms, and an in-memory pagination cursor avoids
+            rescanning completed pages. With stored sync tokens enabled, the
+            safe checkpoint, sticky gap marker, and callback event journal
+            survive process restart. One abrupt process kill can still replay
+            the event whose callback fan-out was active, because callback side
+            effects and SQLite cannot share a transaction; every earlier
+            completed event is durable.
             Every matching callback is attempted even if another callback
             raises. Such an event is terminally journaled after the complete
             fan-out, while callback cancellation or timeout leaves it pending.
             The walk is unfiltered: when syncing with a filter, gap events the
             filter would exclude are still dispatched (callbacks may see more
             than the filtered sync would show, never less). Freshly joined
-            rooms whose timeline contains our own join are not backfilled.
+            rooms whose timeline contains our own join are not backfilled, and
+            a bounded prefix is held until the remaining membership interval
+            proves no later own-join boundary exists.
             Recovered events are decrypted like live events but never applied
             to the ``MatrixRoom`` state, which is already newer than they are.
             Restart recovery requires the server to accept sync tokens as
@@ -802,9 +806,11 @@ class AsyncClient(Client):
         deadline: float | None = None,
     ) -> None:
         decrypted_to_device = []
+        delivery_ids = self._callback_delivery_ids(response.to_device_events)
 
-        for index, to_device_event in enumerate(response.to_device_events):
-            delivery_id = self._callback_delivery_id(to_device_event)
+        for index, (to_device_event, delivery_id) in enumerate(
+            zip(response.to_device_events, delivery_ids)
+        ):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
@@ -843,7 +849,10 @@ class AsyncClient(Client):
         for room_id, info in response.rooms.invite.items():
             room = self._get_invited_room(room_id)
 
-            for event in info.invite_state:
+            for event, delivery_id in zip(
+                info.invite_state,
+                self._callback_delivery_ids(info.invite_state),
+            ):
                 room.handle_event(event)
 
                 await self._dispatch_sync_callback(
@@ -852,6 +861,7 @@ class AsyncClient(Client):
                     callback_journal_token,
                     lambda event=event, room=room: self._on_invited_rooms(event, room),
                     deadline,
+                    delivery_id,
                 )
 
     async def _handle_joined_rooms(
@@ -963,7 +973,10 @@ class AsyncClient(Client):
             for index, event in decrypted_events:
                 join_info.timeline.events[index] = event
 
-            for event in join_info.ephemeral:
+            for event, delivery_id in zip(
+                join_info.ephemeral,
+                self._callback_delivery_ids(join_info.ephemeral),
+            ):
                 room.handle_ephemeral_event(event)
                 await self._dispatch_sync_callback(
                     self._callback_delivery_scope("ephemeral", room_id),
@@ -971,9 +984,13 @@ class AsyncClient(Client):
                     callback_journal_token,
                     lambda event=event, room=room: self._on_ephemeral(event, room),
                     backfill_deadline,
+                    delivery_id,
                 )
 
-            for event in join_info.account_data:
+            for event, delivery_id in zip(
+                join_info.account_data,
+                self._callback_delivery_ids(join_info.account_data),
+            ):
                 room.handle_account_data(event)
                 await self._dispatch_sync_callback(
                     self._callback_delivery_scope("room_account_data", room_id),
@@ -984,6 +1001,7 @@ class AsyncClient(Client):
                         room,
                     ),
                     backfill_deadline,
+                    delivery_id,
                 )
 
             if room.encrypted and self.olm is not None:
@@ -1194,16 +1212,28 @@ class AsyncClient(Client):
     @staticmethod
     def _callback_delivery_id(event: Any) -> str:
         event_data = vars(event)
-        event_id = event_data.get("event_id")
-        if event_id:
-            return event_id
         source = json.dumps(
-            event_data.get("source", event_data),
+            {
+                "class": f"{type(event).__module__}.{type(event).__qualname__}",
+                "fields": event_data,
+            },
             sort_keys=True,
             separators=(",", ":"),
             default=str,
         )
         return hashlib.sha256(source.encode()).hexdigest()
+
+    @classmethod
+    def _callback_delivery_ids(cls, events: Iterable[Any]) -> list[str]:
+        """Identify repeated content by stable occurrence within one surface."""
+        occurrences: dict[str, int] = {}
+        identifiers: list[str] = []
+        for event in events:
+            base = cls._callback_delivery_id(event)
+            occurrence = occurrences.get(base, 0)
+            occurrences[base] = occurrence + 1
+            identifiers.append(f"{base}:{occurrence}")
+        return identifiers
 
     async def _dispatch_sync_callback(
         self,
@@ -1819,7 +1849,10 @@ class AsyncClient(Client):
         callback_journal_token: str | None = None,
     ) -> None:
         callback_journal_token = callback_journal_token or response.next_batch
-        for event in response.presence_events:
+        for event, delivery_id in zip(
+            response.presence_events,
+            self._callback_delivery_ids(response.presence_events),
+        ):
             for room_id in self.rooms.keys():
                 if event.user_id not in self.rooms[room_id].users:
                     continue
@@ -1839,6 +1872,7 @@ class AsyncClient(Client):
                 callback_journal_token,
                 lambda event=event: self._on_presence(event),
                 deadline,
+                delivery_id,
             )
 
     async def _handle_global_account_data_events(  # type: ignore
@@ -1848,13 +1882,17 @@ class AsyncClient(Client):
         callback_journal_token: str | None = None,
     ) -> None:
         callback_journal_token = callback_journal_token or response.next_batch
-        for event in response.account_data_events:
+        for event, delivery_id in zip(
+            response.account_data_events,
+            self._callback_delivery_ids(response.account_data_events),
+        ):
             await self._dispatch_sync_callback(
                 self._callback_delivery_scope("global_account_data"),
                 event,
                 callback_journal_token,
                 lambda event=event: self._on_global_account_data(event),
                 deadline,
+                delivery_id,
             )
 
     async def _handle_expired_verifications(self):

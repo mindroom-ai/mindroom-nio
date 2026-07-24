@@ -100,16 +100,20 @@ All notable changes to this project will be documented in this file.
   The event bound defaults to 200 per room per response; incomplete recovery
   dispatches its safe prefix, holds newer live events, and automatically
   retries from the same checkpoint in bounded slices. The page bound remains
-  optional. The callback checkpoint and sticky gap marker are stored together,
-  while terminally dispatched event IDs and encryption state are journaled
-  durably. This prevents cross-process duplicate delivery of completed events,
-  while still allowing one later decrypted form. Every matching callback is
-  attempted before an event is terminally journaled. All backfill for one sync
-  response shares a rotating multi-room time budget (`backfill_timeout`)
-  covering pagination and dispatch, including hanging callbacks. The forward
-  lower bound also prevents old-history replay from homeservers that silently
-  ignore a backward `to` token. Disabled by default; behaviour with the flag
-  off is identical to upstream nio.
+  optional. A complete non-limited retry from the safe checkpoint also closes
+  a sticky gap. The callback checkpoint and sticky gap marker are stored
+  together, while terminally dispatched event IDs and encryption state are
+  journaled durably. Callback surfaces without Matrix event IDs use durable
+  identities scoped to the uncertified response interval. This prevents
+  cross-process duplicate delivery of completed callbacks, while still
+  allowing one later decrypted timeline event. Every matching callback is
+  attempted before an event is terminally journaled. A bounded data prefix is
+  held until the remaining interval proves that no later own-join boundary
+  exists. All backfill for one sync response shares a rotating multi-room time
+  budget (`backfill_timeout`) covering pagination and dispatch, including
+  hanging callbacks. The forward lower bound also prevents old-history replay
+  from homeservers that silently ignore a backward `to` token. Disabled by
+  default; behaviour with the flag off is identical to upstream nio.
 
 ### Bug Fixes
 

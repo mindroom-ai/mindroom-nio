@@ -3,10 +3,10 @@
 ## Current Head
 
 Branch `fix/limited-sync-recovery-loss-v2` is published as PR #20.
-The last published local, remote, and PR head is `af585b42c590dd7ef9e8bda54bc0647e9c055a3f`.
-That head is rejected and must not be merged.
-The worktree currently contains the tested recovery-transaction redesign that will become the next candidate commit.
-Record the resulting commit SHA here and in the external gate ledger immediately after commit and push.
+The rejected predecessor is `af585b42c590dd7ef9e8bda54bc0647e9c055a3f`.
+The tested recovery-transaction implementation is commit `ac3f0215bf3f49f0577e6dea2c33a18b1a52ef49`.
+Local HEAD, the remote branch, and PR #20 all equal that implementation commit before this living-status refresh.
+This candidate is not merge-ready until all exact-head review and live gates pass.
 
 ## Accepted Findings Resolved in the Working Candidate
 
@@ -19,6 +19,7 @@ Record the resulting commit SHA here and in the external gate ledger immediately
 - To-device, invite, ephemeral, room-account-data, global-account-data, and presence callbacks now use interval-scoped durable replay identities.
 - To-device replay identity is captured before decryption so a decrypt-once replay cannot change its durable identity.
 - Interval-scoped callback identities are cleared after checkpoint certification, so an identical legitimate event in a later response is delivered again.
+- Repeated identical no-ID events inside one response use stable occurrence identities, so none are collapsed and a restart replay suppresses each prior occurrence.
 - File-backed store work runs off the event loop under the recovery deadline, while `SqliteMemoryStore` writes stay on their owning connection.
 - The v4 `gap_pending` migration is restart-safe after the column add and before the version update.
 - Attempt-all fanout remains limited to recovery-enabled clients, and disabled mode keeps upstream short-circuit behavior.
@@ -63,8 +64,8 @@ Record the resulting commit SHA here and in the external gate ledger immediately
 
 ## Working Candidate Validation
 
-- Focused `tests/backfill_test.py tests/store_test.py`: `112 passed in 5.17s`.
-- Full suite: `561 passed, 3 skipped, 2 warnings in 34.76s`.
+- Focused `tests/backfill_test.py tests/store_test.py`: `112 passed in 7.64s`.
+- Full suite: `561 passed, 3 skipped, 2 warnings in 42.29s`.
 - All-file pre-commit: passed.
 - The full suite's known mutation of `tests/data/encryption/example_DEVICEID.db` was restored and no other test artifact was reset.
 - Git author is `Bas Nijholt <bas@nijho.lt>`.
@@ -89,9 +90,8 @@ Replay suppression for event types without Matrix event IDs lives only for the u
 
 ## Next Steps
 
-1. Commit and push this tested candidate without amend or force.
-2. Record the exact pushed SHA in this handoff and the external gate ledger.
-3. Run a current-context review against the exact pushed head and fix every valid blocker.
-4. Freeze the corrected candidate and obtain fresh Codex approval, fresh Claude Fable approval, and real-Tuwunel PASS on the same exact head.
-5. Resume MindRoom PR #1640 only after nio PR #20 passes those gates.
-6. Remove this handoff only immediately before merge, then revalidate the final documentation-only removal head.
+1. Commit and push the tested current-context review follow-up that prevents identical ancillary events from collapsing and updates the public recovery documentation.
+2. Record both the implementation commit and new branch head explicitly.
+3. Freeze the corrected candidate and obtain fresh Codex approval, fresh Claude Fable approval, and real-Tuwunel PASS on the same exact head.
+4. Resume MindRoom PR #1640 only after nio PR #20 passes those gates.
+5. Remove this handoff only immediately before merge, then revalidate the final documentation-only removal head.

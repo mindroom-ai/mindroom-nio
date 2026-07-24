@@ -720,10 +720,10 @@ class TestLimitedTimelineBackfill:
             limited=True,
             prev_batch="p1",
         )
-        incomplete.account_data_events = [account_data]
+        incomplete.account_data_events = [account_data, account_data]
         await first.receive_response(incomplete)
 
-        assert callbacks == ["once"]
+        assert callbacks == ["once", "once"]
         assert first.next_batch == "s1"
         await first.close()
 
@@ -746,10 +746,10 @@ class TestLimitedTimelineBackfill:
             limited=False,
             prev_batch="p2",
         )
-        complete.account_data_events = [account_data]
+        complete.account_data_events = [account_data, account_data]
         await restarted.receive_response(complete)
 
-        assert callbacks == ["once"]
+        assert callbacks == ["once", "once"]
         assert restarted.store
         assert restarted.store.load_sync_token() == "s3"
         await restarted.close()
@@ -793,13 +793,16 @@ class TestLimitedTimelineBackfill:
                 limited=False,
                 prev_batch="p0",
             )
-            result.to_device_events = [UnknownToDeviceEvent.from_dict(dict(raw_source))]
+            result.to_device_events = [
+                UnknownToDeviceEvent.from_dict(dict(raw_source)),
+                UnknownToDeviceEvent.from_dict(dict(raw_source)),
+            ]
             return result
 
         await backfill_client._handle_to_device(response(), "s1")
         await backfill_client._handle_to_device(response(), "s1")
 
-        assert callbacks == ["m.decrypted"]
+        assert callbacks == ["m.decrypted", "m.raw"]
 
     async def test_limited_timeline_recovers_gap_in_order(
         self, backfill_client, aioresponse
