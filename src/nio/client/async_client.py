@@ -495,6 +495,7 @@ class AsyncClient(Client):
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
+        self._sliding_sync_recovery_scope = uuid4().hex
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -947,7 +948,7 @@ class AsyncClient(Client):
                 )
                 for room_id, room in response.rooms.items()
             ),
-            batch_id=response.pos,
+            batch_id=f"sliding:{self._sliding_sync_recovery_scope}:{response.pos}",
         )
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
@@ -2090,6 +2091,7 @@ class AsyncClient(Client):
             loop_sleep_time (int, optional): The sleep time, if any, between
                 successful sync loop iterations in milliseconds.
         """
+        self._sliding_sync_recovery_scope = uuid4().hex
         first_sync = True
         pos: str | None = None
         consecutive_errors = 0
@@ -2107,6 +2109,7 @@ class AsyncClient(Client):
                     # starts a new one. The to-device since token is
                     # independent of pos and is deliberately kept.
                     pos = None
+                    self._sliding_sync_recovery_scope = uuid4().hex
 
         while not self._stop_sync_forever:
             try:

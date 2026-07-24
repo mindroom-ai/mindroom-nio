@@ -356,7 +356,25 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$before", "bad", "$after"]
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [malformed.source],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        await client.receive_response(sliding)
+        assert seen == ["$before", "bad", "$after", "bad", "bad"]
+        assert all(
+            not event_id.startswith("~")
+            for event_id in client._recovery.completed[ROOM_A]
+        )
 
     async def test_complete_timeline_precedes_other_sync_surfaces(self, client):
         seen: list[str] = []

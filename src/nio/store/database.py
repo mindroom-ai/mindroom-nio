@@ -616,6 +616,8 @@ class MatrixStore:
                 PendingTimelineEvents.event_id == event_id,
             )
             pending.delete_instance()
+            if event_id.startswith("~"):
+                return
             pending.id = None
             pending.generation = 0
             pending.is_live = False

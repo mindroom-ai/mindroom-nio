@@ -191,10 +191,7 @@ def _plan_live_events(
                     )
                 )
             continue
-        if (
-            not getattr(event, "event_id", None)
-            and event_id in state.completed.get(room_id, ())
-        ) or not should_dispatch_timeline_event(state, room_id, event):
+        if not should_dispatch_timeline_event(state, room_id, event):
             continue
         planned.append(pending)
         known[event_id] = pending
@@ -297,7 +294,7 @@ def plan_sync_response(
                 request_since if room_info.timeline.limited and request_since else None
             ),
             target_token=room_info.timeline.prev_batch or response_token,
-            batch_id=response_token,
+            batch_id=f"sync:{response_token}",
         )
         for room_id, room_info in joined_rooms.items()
     )
@@ -442,9 +439,10 @@ def _finish_memory(
     key = (gap.room_id, gap.generation)
     if event:
         state.events[key].remove(event)
-        record_completed_timeline_event(
-            state, gap.room_id, event.event_id, was_encrypted
-        )
+        if not event.event_id.startswith("~"):
+            record_completed_timeline_event(
+                state, gap.room_id, event.event_id, was_encrypted
+            )
         return
     state.events.pop(key, None)
     gaps = state.gaps[gap.room_id]

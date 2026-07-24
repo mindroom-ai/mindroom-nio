@@ -5,14 +5,16 @@ import threading
 
 import pytest
 
-from nio import RoomMessageText
+from nio import Event, RoomMessageText
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
     RecoveryGap,
     RecoveryOptions,
     RecoveryPlan,
     RecoveryState,
+    apply_plan,
     persist_response_plan,
+    plan_room_timeline,
     pump_recovery,
 )
 from nio.responses import RoomMessagesResponse
@@ -43,6 +45,29 @@ def pending(event_id: str, sequence: int) -> PendingTimelineEvent:
     )
     assert value
     return value
+
+
+def test_no_id_keys_are_scoped_to_the_sliding_connection():
+    state = RecoveryState()
+    bad = Event.parse_event({"type": "broken"})
+    first = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[bad],
+        user_id="@me:example.org",
+        membership="join",
+        batch_id="sliding:first:pos",
+    )
+    apply_plan(state, first)
+    second = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[bad],
+        user_id="@me:example.org",
+        membership="join",
+        batch_id="sliding:second:pos",
+    )
+    assert first.events[0].event_id != second.events[0].event_id
 
 
 class BlockingStore:

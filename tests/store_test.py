@@ -640,6 +640,18 @@ class TestClass:
         assert len(events) == 1
         assert events[0].generation == 0
 
+    def test_synthetic_recovery_key_is_deleted_after_callback(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "", None)
+        event = PendingTimelineEvent(
+            TEST_ROOM, 1, 0, "~sliding:scope:pos:0", "{}", True, False
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert len(gaps) == 1
+        assert events == []
+
     def test_completed_upgrade_refreshes_pruning_recency(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "", None)
 
