@@ -363,6 +363,50 @@ class TestLimitedTimelineBackfill:
         # The sync's next_batch clamps the walk on servers that honour `to`.
         assert pages.requested_to == ["s2", "s2"]
 
+    async def test_default_recovery_has_no_page_or_event_loss_bound(
+        self, backfill_client, aioresponse
+    ):
+        """Default recovery closes gaps beyond the former hard bounds."""
+        dispatched = self._record_callback(backfill_client)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=1)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        gap = [text_event(f"$gap{i}", ts=1000 + i) for i in range(525)]
+        payloads = {}
+        for page in range(10):
+            start = "s1" if page == 0 else f"fwd{page}"
+            payloads[start] = messages_payload(
+                gap[page * 50 : (page + 1) * 50],
+                end=f"fwd{page + 1}",
+            )
+        payloads["fwd10"] = messages_payload(
+            [*gap[500:], text_event("$new", ts=10_000)],
+            end="fwd11",
+        )
+        pages = PagedMessages(payloads)
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await backfill_client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=10_000)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$old", *(event.event_id for event in gap), "$new"]
+        assert len(pages.requested_tokens) == 11
+
     async def test_events_in_sync_response_are_not_redispatched(
         self, backfill_client, aioresponse
     ):
