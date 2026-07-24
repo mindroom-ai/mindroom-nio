@@ -526,6 +526,7 @@ class MatrixStore:
             PendingTimelineEvents.delete().where(
                 PendingTimelineEvents.account == account,
                 PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.generation > 0,
             ).execute()
             SyncRecoveryGaps.delete().where(
                 SyncRecoveryGaps.account == account,

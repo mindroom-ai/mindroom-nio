@@ -3,9 +3,8 @@
 ## Current Candidate
 
 Branch `fix/limited-sync-recovery-loss-v2` is published as PR #20.
-The committed head before this uncommitted rewrite is `aafe34b72a842e39d8c594382900e06d4f44c574`.
-The rejected response-transaction architecture ends at that head.
-The replacement and this handoff will be committed together.
+The rejected response-transaction architecture ends at `aafe34b72a842e39d8c594382900e06d4f44c574`.
+The one-source replacement is published on this branch.
 The external `MERGE-GATES.md` records the exact resulting SHA because a commit cannot contain its own hash.
 This candidate is not merge-ready until fresh Codex, Claude Fable, and real-Tuwunel gates pass on one exact head.
 
@@ -38,6 +37,7 @@ This candidate is not merge-ready until fresh Codex, Claude Fable, and real-Tuwu
 - Legal concurrent-DAG ordering no longer depends on a live-event echo.
 - Classic-to-Sliding and Sliding-to-classic restart replay use the same completed-ID source of truth.
 - Sliding leave, ban, invite, and own-join transitions clear classic obligations through the common planner.
+- Membership reset clears active work while preserving durable generation-zero completed IDs in memory and SQLite.
 - Feature-enabled classic and Sliding Sync timelines use one terminal all-callback fan-out path.
 - Dead `RecoveryGap.from_token` and `own_join_event_id` metadata were removed from values, schema, store, and tests.
 - Duplicate recovery imports and redundant fetch, completion, and shutdown adapters were removed.
@@ -106,12 +106,12 @@ Production size accounting excludes all tests.
 
 ## Validation
 
-- Focused recovery/store suite: `95 passed in 32.21s`.
-- Exact new bidirectional restart, encrypted upgrade, and membership-reset regressions: `7 passed in 0.33s`.
-- Full suite: `544 passed, 3 skipped, 2 warnings in 62.77s`.
+- Focused recovery/store suite: `95 passed in 39.15s`.
+- Exact membership-reset consistency and storage regressions: `6 passed in 1.46s`.
+- Full suite: `544 passed, 3 skipped, 2 warnings in 70.22s`.
 - The known full-suite mutation of `tests/data/encryption/example_DEVICEID.db` was restored.
 - Generated `src/mindroom_nio.egg-info` was moved to Trash and is absent from the worktree.
-- Production diff against `origin/main`: `+1073/-533`, net `+540`, including the 696-line recovery module.
+- Production diff against `origin/main`: `+1074/-533`, net `+541`, including the 696-line recovery module.
 - Focused Black, Ruff, Python compilation, and `git diff --check` passed.
 - All-file pre-commit passed.
 - Same-head live/review gates remain pending.

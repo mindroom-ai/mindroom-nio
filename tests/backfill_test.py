@@ -1703,7 +1703,18 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        client.next_batch = "s1"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$seen", 0)],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
         aioresponse.get(
             MESSAGES_URL,
             payload=messages([text_event("$gap", 1)], "more"),
@@ -1732,7 +1743,10 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
-        assert all(event.generation == 0 for event in events)
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen"]
+        assert [(event.event_id, event.generation) for event in events] == [
+            ("$seen", 0)
+        ]
         await client.close()
         client.store.database.close()
 
@@ -1745,6 +1759,7 @@ class TestRoomLocalRecovery:
         )
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         assert not restarted._recovery.gaps
+        assert list(restarted._recovery.completed[ROOM_A]) == ["$seen"]
         await restarted.close()
 
     @pytest.mark.parametrize("membership", ["leave", "invite"])
@@ -1764,7 +1779,18 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        client.next_batch = "s1"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$seen", 0)],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
         aioresponse.get(
             MESSAGES_URL,
             payload=messages([text_event("$gap", 1)], "more"),
@@ -1799,7 +1825,10 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
-        assert all(event.generation == 0 for event in events)
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen"]
+        assert [(event.event_id, event.generation) for event in events] == [
+            ("$seen", 0)
+        ]
         await client.close()
 
     async def test_sliding_callback_failure_is_terminal(self, client):
