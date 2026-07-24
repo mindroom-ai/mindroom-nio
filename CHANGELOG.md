@@ -90,30 +90,21 @@ All notable changes to this project will be documented in this file.
 
 - Add opt-in recovery of events dropped by limited sync timelines
   (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
-  timeline arrives with `limited: true`, the client pages `/messages`
-  forwards from the last contiguous callback checkpoint toward the current
-  response token and dispatches the recovered gap through the normal
-  event callbacks — oldest first, before the sync response's own events,
-  decrypted like live events but never applied to room state. Gaps spanning
-  a client restart are recovered when resuming from a stored or explicit
-  since token; freshly joined rooms are never backfilled past our own join.
-  The event bound defaults to 200 per room per response; incomplete recovery
-  dispatches its safe prefix, holds newer live events, and automatically
-  retries from the same checkpoint in bounded slices. The page bound remains
-  optional. A complete non-limited retry from the safe checkpoint also closes
-  a sticky gap. The callback checkpoint and sticky gap marker are stored
-  together, while terminally dispatched event IDs and encryption state are
-  journaled durably. Callback surfaces without Matrix event IDs use durable
-  identities scoped to the uncertified response interval. This prevents
-  cross-process duplicate delivery of completed callbacks, while still
-  allowing one later decrypted timeline event. Every matching callback is
-  attempted before an event is terminally journaled. A bounded data prefix is
-  held until the remaining interval proves that no later own-join boundary
-  exists. All backfill for one sync response shares a rotating multi-room time
-  budget (`backfill_timeout`) covering pagination and dispatch, including
-  hanging callbacks. The forward lower bound also prevents old-history replay
-  from homeservers that silently ignore a backward `to` token. Disabled by
-  default; behaviour with the flag off is identical to upstream nio.
+  timeline arrives with `limited: true`, its `next_batch` remains the
+  monotonic transport cursor while a durable room-local obligation records
+  the private forward `/messages` cursor and held live timeline. Complete
+  rooms and ancillary callback surfaces continue once; only the affected
+  room waits. Recovery runs oldest first in fair, bounded slices, survives
+  process restart when sync-token storage is enabled, and never dispatches
+  pre-join history. A server that ignores the requested upper bound cannot
+  expose unknown future events, while reaching the requested target token
+  closes the slice without requiring a repeated live event. Event IDs
+  de-duplicate `/sync`, `/messages`, and sliding-sync overlap and allow one
+  encrypted event to replay after decryption. Recovery-only dispatch attempts
+  every matching callback before acknowledging the row; a hard kill can
+  replay at most the active row. File-backed correctness writes are serialized
+  and awaited to completion. Disabled behaviour remains identical to upstream
+  nio.
 
 ### Bug Fixes
 

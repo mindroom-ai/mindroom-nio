@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
+from typing import TYPE_CHECKING
 
 from peewee import EXCLUDED, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
@@ -36,7 +37,6 @@ from . import (
     DeviceKeys,
     DeviceKeys_v1,
     DeviceTrustState,
-    DispatchedEvents,
     EncryptedRooms,
     ForwardedChains,
     Key,
@@ -45,9 +45,14 @@ from . import (
     MegolmInboundSessions,
     OlmSessions,
     OutgoingKeyRequests,
+    PendingTimelineEvents,
     StoreVersion,
+    SyncRecoveryGaps,
     SyncTokens,
 )
+
+if TYPE_CHECKING:
+    from ..client.sync_recovery import PendingTimelineEvent, RecoveryGap
 
 
 def use_database(fn):
@@ -97,9 +102,10 @@ class MatrixStore:
         StoreVersion,
         Keys,
         SyncTokens,
-        DispatchedEvents,
+        SyncRecoveryGaps,
+        PendingTimelineEvents,
     ]
-    store_version = 4
+    store_version = 3
     supports_threaded_writes = True
 
     user_id: str = field()
@@ -135,23 +141,8 @@ class MatrixStore:
 
     def upgrade_to_v3(self):
         with self.database.bind_ctx(self.models):
-            self.database.create_tables([DispatchedEvents])
+            self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
-
-    def upgrade_to_v4(self):
-        with self.database.bind_ctx([SyncTokens]):
-            columns = {
-                row[1]
-                for row in self.database.execute_sql(
-                    'PRAGMA table_info("synctokens")'
-                ).fetchall()
-            }
-            if "gap_pending" not in columns:
-                self.database.execute_sql(
-                    'ALTER TABLE "synctokens" '
-                    'ADD COLUMN "gap_pending" INTEGER NOT NULL DEFAULT 0'
-                )
-        self._update_version(4)
 
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
@@ -167,9 +158,6 @@ class MatrixStore:
             store_version = 2
         if store_version == 2:
             self.upgrade_to_v3()
-            store_version = 3
-        if store_version == 3:
-            self.upgrade_to_v4()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -497,17 +485,13 @@ class MatrixStore:
                 rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
             ).on_conflict_ignore().execute()
 
-    @use_database_atomic
-    def save_sync_token(self, token: str, gap_pending: bool = False) -> None:
-        """Save the callback checkpoint and whether recovery is still pending."""
+    @use_database
+    def save_sync_token(self, token: str) -> None:
+        """Save the current Matrix transport token."""
         account = self._get_account()
         assert account
 
-        SyncTokens.replace(
-            account=account,
-            token=token,
-            gap_pending=gap_pending,
-        ).execute()
+        SyncTokens.replace(account=account, token=token).execute()
 
     @use_database
     def load_sync_token(self) -> str | None:
@@ -524,86 +508,131 @@ class MatrixStore:
 
         return None
 
-    @use_database
-    def load_sync_recovery_pending(self) -> bool:
-        """Load whether the stored callback checkpoint still owns a gap."""
-        account = self._get_account()
-        if not account:
-            return False
-
-        token = SyncTokens.get_or_none(SyncTokens.account == account.id)
-        return bool(token and token.gap_pending)
-
     @use_database_atomic
-    def save_dispatched_events(
-        self, room_id: str, sync_token: str, events: list[tuple[str, bool]]
+    def save_recovery(
+        self,
+        token: str | None,
+        clear_rooms: set[str],
+        gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
+        events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
+        clear_recovered: RecoveryGap | None,
     ) -> None:
-        """Persist timeline callback deliveries that a safe-token rewind may replay."""
         account = self._get_account()
         assert account
 
-        merged: dict[str, bool] = {}
-        for event_id, was_encrypted in events:
-            merged[event_id] = merged.get(event_id, True) and was_encrypted
-
-        rows = [
-            {
-                "account": account,
-                "room_id": room_id,
-                "event_id": event_id,
-                "was_encrypted": was_encrypted,
-                "sync_token": sync_token,
-            }
-            for event_id, was_encrypted in merged.items()
-        ]
-        for index in range(0, len(rows), 100):
-            DispatchedEvents.insert_many(rows[index : index + 100]).on_conflict(
-                conflict_target=[
-                    DispatchedEvents.account,
-                    DispatchedEvents.room_id,
-                    DispatchedEvents.event_id,
-                ],
-                update={
-                    DispatchedEvents.was_encrypted: (
-                        DispatchedEvents.was_encrypted & EXCLUDED.was_encrypted
-                    ),
-                    DispatchedEvents.sync_token: EXCLUDED.sync_token,
-                },
+        if token:
+            SyncTokens.replace(account=account, token=token).execute()
+        if clear_rooms:
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id.in_(clear_rooms),
             ).execute()
+            SyncRecoveryGaps.delete().where(
+                SyncRecoveryGaps.account == account,
+                SyncRecoveryGaps.room_id.in_(clear_rooms),
+            ).execute()
+        if clear_recovered:
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id == clear_recovered.room_id,
+                PendingTimelineEvents.generation == clear_recovered.generation,
+                PendingTimelineEvents.is_live == False,  # noqa: E712
+            ).execute()
+        rows = [{"account": account, **asdict(gap)} for gap in gaps]
+        if rows:
+            SyncRecoveryGaps.replace_many(rows).execute()
+        self._upsert_pending_events(account, events)
+
+    @staticmethod
+    def _upsert_pending_events(account, events) -> None:
+        rows = [{"account": account, **asdict(event)} for event in events]
+        if not rows:
+            return
+        PendingTimelineEvents.insert_many(rows).on_conflict(
+            conflict_target=[
+                PendingTimelineEvents.account,
+                PendingTimelineEvents.room_id,
+                PendingTimelineEvents.event_id,
+            ],
+            preserve=[
+                PendingTimelineEvents.generation,
+                PendingTimelineEvents.sequence,
+                PendingTimelineEvents.source_json,
+                PendingTimelineEvents.is_live,
+                PendingTimelineEvents.was_encrypted,
+            ],
+            where=(PendingTimelineEvents.was_encrypted & ~EXCLUDED.was_encrypted),
+        ).execute()
 
     @use_database
-    def load_dispatched_events(self) -> list[tuple[str, str, bool, str]]:
-        """Load callback deliveries not yet covered by the stored sync token."""
+    def load_sync_recovery(
+        self,
+    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvents]]:
+        """Load room obligations and their ordered pending callbacks."""
         account = self._get_account()
         if not account:
-            return []
+            return [], []
 
-        return [
-            (
-                event.room_id,
-                event.event_id,
-                event.was_encrypted,
-                event.sync_token,
+        gaps = list(
+            SyncRecoveryGaps.select()
+            .where(SyncRecoveryGaps.account == account)
+            .order_by(SyncRecoveryGaps.room_id, SyncRecoveryGaps.generation)
+        )
+        events = list(
+            PendingTimelineEvents.select()
+            .where(PendingTimelineEvents.account == account)
+            .order_by(
+                PendingTimelineEvents.room_id,
+                PendingTimelineEvents.generation,
+                PendingTimelineEvents.is_live,
+                PendingTimelineEvents.sequence,
             )
-            for event in DispatchedEvents.select()
-            .where(DispatchedEvents.account == account)
-            .order_by(DispatchedEvents.id)
-        ]
+        )
+        return gaps, events
 
     @use_database_atomic
-    def save_sync_token_and_prune_dispatched_events(self, token: str) -> None:
-        """Advance the checkpoint and retain only its overlapping response."""
+    def finish_recovery(
+        self,
+        room_id: str,
+        generation: int,
+        event_id: str | None,
+        was_encrypted: bool,
+    ) -> None:
         account = self._get_account()
         assert account
-
-        SyncTokens.replace(
-            account=account,
-            token=token,
-            gap_pending=False,
-        ).execute()
-        DispatchedEvents.delete().where(
-            DispatchedEvents.account == account,
-            DispatchedEvents.sync_token != token,
+        event_filter = (
+            PendingTimelineEvents.account == account,
+            PendingTimelineEvents.room_id == room_id,
+            PendingTimelineEvents.generation == generation,
+        )
+        if event_id:
+            PendingTimelineEvents.update(
+                generation=0,
+                is_live=False,
+                was_encrypted=was_encrypted,
+            ).where(
+                *event_filter,
+                PendingTimelineEvents.event_id == event_id,
+            ).execute()
+            stale = (
+                PendingTimelineEvents.select(PendingTimelineEvents.id)
+                .where(
+                    PendingTimelineEvents.account == account,
+                    PendingTimelineEvents.room_id == room_id,
+                    PendingTimelineEvents.generation == 0,
+                )
+                .order_by(PendingTimelineEvents.id.desc())
+                .offset(512)
+            )
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.id.in_(stale)
+            ).execute()
+            return
+        PendingTimelineEvents.delete().where(*event_filter).execute()
+        SyncRecoveryGaps.delete().where(
+            SyncRecoveryGaps.account == account,
+            SyncRecoveryGaps.room_id == room_id,
+            SyncRecoveryGaps.generation == generation,
         ).execute()
 
     @use_database

@@ -203,7 +203,6 @@ class OutgoingKeyRequests(Model):
 
 class SyncTokens(Model):
     token = TextField()
-    gap_pending = BooleanField(default=False)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",
@@ -214,15 +213,33 @@ class SyncTokens(Model):
         constraints = [SQL("UNIQUE(account_id)")]
 
 
-class DispatchedEvents(Model):
+class SyncRecoveryGaps(Model):
     room_id = TextField()
-    event_id = TextField()
-    was_encrypted = BooleanField()
-    sync_token = TextField()
+    generation = IntegerField()
+    target_token = TextField()
+    cursor_token = TextField(null=True)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",
-        backref="dispatched_events",
+        backref="sync_recovery_gaps",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id,generation)")]
+
+
+class PendingTimelineEvents(Model):
+    room_id = TextField()
+    generation = IntegerField()
+    sequence = IntegerField()
+    event_id = TextField()
+    source_json = TextField()
+    is_live = BooleanField()
+    was_encrypted = BooleanField()
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="pending_timeline_events",
     )
 
     class Meta:
