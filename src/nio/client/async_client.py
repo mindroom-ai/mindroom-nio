@@ -14,6 +14,7 @@
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -279,6 +280,24 @@ class _BackfillCallbackError(Exception):
     """
 
 
+@dataclass(frozen=True)
+class _BackfillCursor:
+    """One room's resumable forward data-walk position."""
+
+    since: str
+    token: str
+    own_join_event_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _MembershipScanCursor:
+    """One room's resumable membership-boundary scan."""
+
+    since: str
+    token: str
+    own_join_event_id: str | None = None
+
+
 # How many recently dispatched event ids to remember per room. The cache
 # exists purely to de-duplicate protocol-level re-delivery: the
 # /sync–/messages overlap the spec warns about when `backfill_limited_timelines`
@@ -288,6 +307,8 @@ class _BackfillCallbackError(Exception):
 # expires or a room re-enters the list window. It never decides where a
 # recovery walk starts or stops.
 _MAX_DISPATCHED_EVENT_IDS = 512
+_CALLBACK_SCOPE_PREFIX = "\x01nio.callback:"
+_INITIAL_CALLBACK_JOURNAL_TOKEN = "\x01nio.callback:first"
 
 
 async def on_request_chunk_sent(session, context, params):
@@ -595,7 +616,8 @@ class AsyncClient(Client):
         # durable event journal makes a lost in-memory cursor safe to rebuild
         # after restart; keeping it in memory avoids rescanning an ever-growing
         # prefix on every automatic retry.
-        self._backfill_room_cursors: dict[str, tuple[str, str]] = {}
+        self._backfill_room_cursors: dict[str, _BackfillCursor] = {}
+        self._backfill_membership_cursors: dict[str, _MembershipScanCursor] = {}
 
         # Per-room account data from the sliding sync account_data
         # extension that referenced rooms outside the sliding window, kept
@@ -619,6 +641,7 @@ class AsyncClient(Client):
         super().load_store()
         if self._durable_dispatch_journal_enabled():
             assert self.store
+            self._last_processed_sync_token = self.loaded_sync_token or None
             self._has_unrecovered_sync_gap = self.store.load_sync_recovery_pending()
             self._loaded_unrecovered_sync_gap = self._has_unrecovered_sync_gap
             self._load_dispatched_event_journal()
@@ -772,10 +795,16 @@ class AsyncClient(Client):
         resp.transport_response = transport_response
         return resp
 
-    async def _handle_to_device(self, response: SyncResponse | SlidingSyncResponse):
+    async def _handle_to_device(
+        self,
+        response: SyncResponse | SlidingSyncResponse,
+        sync_token: str | None = None,
+        deadline: float | None = None,
+    ) -> None:
         decrypted_to_device = []
 
         for index, to_device_event in enumerate(response.to_device_events):
+            delivery_id = self._callback_delivery_id(to_device_event)
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
@@ -790,30 +819,52 @@ class AsyncClient(Client):
             ):
                 continue
 
-            await self._on_to_device(to_device_event)
+            if sync_token is None:
+                await self._on_to_device(to_device_event)
+            else:
+                await self._dispatch_sync_callback(
+                    self._callback_delivery_scope("to_device"),
+                    to_device_event,
+                    sync_token,
+                    lambda event=to_device_event: self._on_to_device(event),
+                    deadline,
+                    delivery_id,
+                )
 
         self._replace_decrypted_to_device(decrypted_to_device, response)
 
-    async def _handle_invited_rooms(self, response: SyncResponse):
+    async def _handle_invited_rooms(
+        self,
+        response: SyncResponse,
+        deadline: float | None = None,
+        callback_journal_token: str | None = None,
+    ) -> None:
+        callback_journal_token = callback_journal_token or response.next_batch
         for room_id, info in response.rooms.invite.items():
             room = self._get_invited_room(room_id)
 
             for event in info.invite_state:
                 room.handle_event(event)
 
-                await self._on_invited_rooms(event, room)
+                await self._dispatch_sync_callback(
+                    self._callback_delivery_scope("invite", room_id),
+                    event,
+                    callback_journal_token,
+                    lambda event=event, room=room: self._on_invited_rooms(event, room),
+                    deadline,
+                )
 
     async def _handle_joined_rooms(
-        self, response: SyncResponse, since: str | None = None
+        self,
+        response: SyncResponse,
+        since: str | None = None,
+        backfill_deadline: float | None = None,
+        callback_journal_token: str | None = None,
     ) -> tuple[bool, bool]:
         encrypted_rooms: set[str] = set()
         backfill_complete = True
         backfill_attempted = False
-
-        # All backfill for one sync response shares a single time budget, so
-        # many stalled rooms cannot stack their timeouts into a long sync
-        # delay. The deadline is set when the first limited room needs it.
-        backfill_deadline: float | None = None
+        callback_journal_token = callback_journal_token or response.next_batch
 
         joined_rooms = list(response.rooms.join.items())
         if (
@@ -830,11 +881,9 @@ class AsyncClient(Client):
 
             room = self.rooms[room_id]
             decrypted_events: list[tuple[int, Event | BadEventType]] = []
-            # A normal sync after an incomplete recovery still resumed from
-            # the speculative transport cursor. Hold its timelines until a
-            # limited response closes the sticky gap from the safe callback
-            # checkpoint; otherwise a newer event could overtake the gap.
-            room_backfill_complete = not self._has_unrecovered_sync_gap
+            # A non-limited room returned from the preserved safe cursor is
+            # already complete. Only this room's own limited walk can hold it.
+            room_backfill_complete = True
 
             # Recover a limited timeline's gap before the live events are
             # dispatched, so callbacks see the room in chronological order.
@@ -848,10 +897,7 @@ class AsyncClient(Client):
                 and not self._own_join_in_timeline(join_info)
             ):
                 backfill_attempted = True
-                if backfill_deadline is None:
-                    backfill_deadline = (
-                        asyncio.get_running_loop().time() + self.config.backfill_timeout
-                    )
+                assert backfill_deadline is not None
                 room_backfill_complete = await self._backfill_limited_timeline(
                     room_id,
                     room,
@@ -885,6 +931,7 @@ class AsyncClient(Client):
                         room_id,
                         event,
                         response.next_batch,
+                        backfill_deadline,
                     )
                     continue
 
@@ -900,6 +947,7 @@ class AsyncClient(Client):
                             room_id,
                             event,
                             response.next_batch,
+                            backfill_deadline,
                         )
                     raise
 
@@ -908,6 +956,7 @@ class AsyncClient(Client):
                         room_id,
                         event,
                         response.next_batch,
+                        backfill_deadline,
                     )
 
             # Replace the Megolm events with decrypted ones
@@ -916,11 +965,26 @@ class AsyncClient(Client):
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
-                await self._on_ephemeral(event, room)
+                await self._dispatch_sync_callback(
+                    self._callback_delivery_scope("ephemeral", room_id),
+                    event,
+                    callback_journal_token,
+                    lambda event=event, room=room: self._on_ephemeral(event, room),
+                    backfill_deadline,
+                )
 
             for event in join_info.account_data:
                 room.handle_account_data(event)
-                await self._on_room_account_data(event, room)
+                await self._dispatch_sync_callback(
+                    self._callback_delivery_scope("room_account_data", room_id),
+                    event,
+                    callback_journal_token,
+                    lambda event=event, room=room: self._on_room_account_data(
+                        event,
+                        room,
+                    ),
+                    backfill_deadline,
+                )
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -953,6 +1017,7 @@ class AsyncClient(Client):
         room_id: str,
         event: Event | BadEventType,
         sync_token: str | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Remember and durably commit one terminal callback fan-out.
 
@@ -972,6 +1037,7 @@ class AsyncClient(Client):
             room_id,
             sync_token,
             persisted,
+            deadline,
         )
 
     def _record_dispatched_events(
@@ -998,16 +1064,34 @@ class AsyncClient(Client):
         drop back to the encrypted marking, so replays stay suppressed even
         if a later copy fails to decrypt.
         """
-        recent = self._sliding_dispatched_event_ids.setdefault(room_id, OrderedDict())
-        durable = self._dispatched_event_ids.setdefault(room_id, OrderedDict())
+        identifiers = [
+            (event_id, isinstance(event, MegolmEvent))
+            for event in events
+            if (event_id := getattr(event, "event_id", None))
+        ]
+        persisted = self._record_dispatched_identifiers(
+            room_id,
+            identifiers,
+            sync_token,
+        )
+
+        if persist:
+            self._persist_dispatched_events(room_id, sync_token, persisted)
+        return persisted
+
+    def _record_dispatched_identifiers(
+        self,
+        scope: str,
+        identifiers: list[tuple[str, bool]],
+        sync_token: str | None,
+    ) -> list[tuple[str, bool]]:
+        """Remember concrete delivery identifiers and return durable changes."""
+        recent = self._sliding_dispatched_event_ids.setdefault(scope, OrderedDict())
+        durable = self._dispatched_event_ids.setdefault(scope, OrderedDict())
         persisted: list[tuple[str, bool]] = []
 
-        for event in events:
-            event_id = getattr(event, "event_id", None)
-            if not event_id:
-                continue
-            was_encrypted = self._dispatched_event_state(room_id, event_id)
-            still_encrypted = isinstance(event, MegolmEvent)
+        for event_id, still_encrypted in identifiers:
+            was_encrypted = self._dispatched_event_state(scope, event_id)
             new_state = (
                 still_encrypted
                 if was_encrypted is None
@@ -1020,7 +1104,7 @@ class AsyncClient(Client):
             if sync_token is not None:
                 durable.pop(event_id, None)
                 durable[event_id] = new_state
-                self._dispatched_event_tokens.setdefault(room_id, {})[
+                self._dispatched_event_tokens.setdefault(scope, {})[
                     event_id
                 ] = sync_token
                 persisted.append((event_id, new_state))
@@ -1028,8 +1112,6 @@ class AsyncClient(Client):
                 durable[event_id] = False
                 persisted.append((event_id, False))
 
-        if persist:
-            self._persist_dispatched_events(room_id, sync_token, persisted)
         while len(recent) > _MAX_DISPATCHED_EVENT_IDS:
             recent.popitem(last=False)
         if (
@@ -1038,7 +1120,7 @@ class AsyncClient(Client):
         ):
             while len(durable) > _MAX_DISPATCHED_EVENT_IDS:
                 event_id, _ = durable.popitem(last=False)
-                self._dispatched_event_tokens.get(room_id, {}).pop(event_id, None)
+                self._dispatched_event_tokens.get(scope, {}).pop(event_id, None)
         return persisted
 
     def _persist_dispatched_events(
@@ -1068,16 +1150,109 @@ class AsyncClient(Client):
         room_id: str,
         sync_token: str | None,
         events: list[tuple[str, bool]],
+        deadline: float | None = None,
     ) -> None:
         """Persist callback journal rows without blocking the asyncio loop."""
         if not events or not self._durable_dispatch_journal_enabled():
             return
-        await asyncio.to_thread(
+        await self._run_store_operation(
             self._persist_dispatched_events,
             room_id,
             sync_token,
             events,
+            deadline=deadline,
         )
+
+    async def _run_store_operation(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+        deadline: float | None = None,
+    ) -> Any:
+        """Run one store operation on its supported connection and time budget."""
+        assert self.store
+        if deadline is not None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+        else:
+            remaining = None
+
+        if not self.store.supports_threaded_writes:
+            return operation(*args)
+
+        pending = asyncio.to_thread(operation, *args)
+        if remaining is None:
+            return await pending
+        return await asyncio.wait_for(pending, timeout=remaining)
+
+    @staticmethod
+    def _callback_delivery_scope(kind: str, room_id: str | None = None) -> str:
+        suffix = f":{room_id}" if room_id else ""
+        return f"{_CALLBACK_SCOPE_PREFIX}{kind}{suffix}"
+
+    @staticmethod
+    def _callback_delivery_id(event: Any) -> str:
+        event_data = vars(event)
+        event_id = event_data.get("event_id")
+        if event_id:
+            return event_id
+        source = json.dumps(
+            event_data.get("source", event_data),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(source.encode()).hexdigest()
+
+    async def _dispatch_sync_callback(
+        self,
+        scope: str,
+        event: Any,
+        sync_token: str,
+        callback: Callable[[], Coroutine[Any, Any, Any]],
+        deadline: float | None = None,
+        delivery_id: str | None = None,
+    ) -> None:
+        """Dispatch one replayable sync callback exactly once per safe interval."""
+        if not self.config.backfill_limited_timelines:
+            await callback()
+            return
+
+        delivery_id = delivery_id or self._callback_delivery_id(event)
+        if delivery_id in self._room_dispatched_events(scope):
+            persisted = self._record_dispatched_identifiers(
+                scope,
+                [(delivery_id, False)],
+                sync_token,
+            )
+            await self._persist_dispatched_events_async(
+                scope,
+                sync_token,
+                persisted,
+                deadline,
+            )
+            return
+
+        error: Exception | None = None
+        try:
+            await callback()
+        except Exception as exc:
+            error = exc
+
+        persisted = self._record_dispatched_identifiers(
+            scope,
+            [(delivery_id, False)],
+            sync_token,
+        )
+        await self._persist_dispatched_events_async(
+            scope,
+            sync_token,
+            persisted,
+            deadline,
+        )
+        if error:
+            raise error
 
     def _dispatched_event_state(self, room_id: str, event_id: str) -> bool | None:
         """Return the combined encrypted state from /sync and sliding sync."""
@@ -1110,6 +1285,18 @@ class AsyncClient(Client):
             while len(events) > _MAX_DISPATCHED_EVENT_IDS:
                 event_id, _ = events.popitem(last=False)
                 self._dispatched_event_tokens.get(room_id, {}).pop(event_id, None)
+
+    def _clear_callback_dispatch_state(self) -> None:
+        """Forget replay suppression once its response interval is certified."""
+        for cache in (
+            self._dispatched_event_ids,
+            self._sliding_dispatched_event_ids,
+            self._dispatched_event_tokens,
+        ):
+            for scope in [
+                key for key in cache if key.startswith(_CALLBACK_SCOPE_PREFIX)
+            ]:
+                cache.pop(scope, None)
 
     def _should_dispatch_timeline_event(
         self,
@@ -1205,6 +1392,9 @@ class AsyncClient(Client):
                 pages,
                 gap_closed,
                 resume_token,
+                own_join_event_id,
+                later_own_join_event_id,
+                membership_tail_complete,
             ) = await asyncio.wait_for(collect, timeout=remaining)
         except asyncio.TimeoutError:
             logger.warning(
@@ -1217,6 +1407,70 @@ class AsyncClient(Client):
         except Exception:
             logger.exception("Failed to backfill limited timeline for room %s", room_id)
             return False
+
+        if not gap_closed and recovered:
+            membership_complete = membership_tail_complete
+            if not membership_complete:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                try:
+                    (
+                        membership_complete,
+                        scanned_own_join_event_id,
+                    ) = await asyncio.wait_for(
+                        self._scan_own_join_forward(
+                            room_id,
+                            since,
+                            resume_token or since,
+                            response_token,
+                            later_own_join_event_id or own_join_event_id,
+                        ),
+                        timeout=remaining,
+                    )
+                    later_own_join_event_id = (
+                        scanned_own_join_event_id
+                        if scanned_own_join_event_id != own_join_event_id
+                        else None
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out proving the membership boundary for room %s; "
+                        "the collected prefix remains undispatched",
+                        room_id,
+                    )
+                    return False
+                except Exception:
+                    logger.exception(
+                        "Failed to prove the membership boundary for room %s",
+                        room_id,
+                    )
+                    return False
+
+            if not membership_complete:
+                logger.warning(
+                    "Pausing limited-timeline backfill for room %s until the "
+                    "remaining membership boundary is known",
+                    room_id,
+                )
+                return False
+
+            if later_own_join_event_id:
+                # The bounded prefix belongs to a membership interval before
+                # our latest join. Restart the data walk with that proven
+                # boundary so no pre-join event can reach callbacks.
+                self._backfill_room_cursors[room_id] = _BackfillCursor(
+                    since,
+                    resume_token or since,
+                    later_own_join_event_id,
+                )
+                logger.warning(
+                    "Discarding a bounded pre-join prefix in room %s; recovery "
+                    "will resume after own join %s",
+                    room_id,
+                    later_own_join_event_id,
+                )
+                return False
 
         if not gap_closed:
             self._has_unrecovered_sync_gap = True
@@ -1235,13 +1489,19 @@ class AsyncClient(Client):
             room_id,
             response_token,
             overlap_journal,
+            deadline,
         )
 
         if not recovered:
             if gap_closed:
                 self._backfill_room_cursors.pop(room_id, None)
+                self._backfill_membership_cursors.pop(room_id, None)
             elif resume_token:
-                self._backfill_room_cursors[room_id] = (since, resume_token)
+                self._backfill_room_cursors[room_id] = _BackfillCursor(
+                    since,
+                    resume_token,
+                    own_join_event_id,
+                )
             return gap_closed
 
         encrypted_rooms: set[str] = set()
@@ -1305,6 +1565,7 @@ class AsyncClient(Client):
                     room_id,
                     event,
                     response_token,
+                    deadline,
                 )
                 dispatched += 1
                 continue
@@ -1313,6 +1574,7 @@ class AsyncClient(Client):
                 room_id,
                 event,
                 response_token,
+                deadline,
             )
             dispatched += 1
 
@@ -1333,8 +1595,13 @@ class AsyncClient(Client):
         if slice_complete:
             if gap_closed:
                 self._backfill_room_cursors.pop(room_id, None)
+                self._backfill_membership_cursors.pop(room_id, None)
             elif resume_token:
-                self._backfill_room_cursors[room_id] = (since, resume_token)
+                self._backfill_room_cursors[room_id] = _BackfillCursor(
+                    since,
+                    resume_token,
+                    own_join_event_id,
+                )
 
         return gap_closed and slice_complete
 
@@ -1351,6 +1618,9 @@ class AsyncClient(Client):
         int,
         bool,
         str | None,
+        str | None,
+        str | None,
+        bool,
     ]:
         """Collect a gap forwards from the safe callback checkpoint.
 
@@ -1370,10 +1640,17 @@ class AsyncClient(Client):
         pending_journal: list[tuple[str, bool]] = []
         seen_ids: set[str] = set()
         cursor = self._backfill_room_cursors.get(room_id)
-        token: str | None = cursor[1] if cursor and cursor[0] == since else since
+        token: str | None = cursor.token if cursor and cursor.since == since else since
+        walk_start_token = token
+        own_join_event_id = (
+            cursor.own_join_event_id if cursor and cursor.since == since else None
+        )
+        past_own_join = own_join_event_id is None
         resume_token = token
         pages = 0
         gap_closed = False
+        later_own_join_event_id: str | None = None
+        membership_tail_complete = False
         while (max_pages is None or pages < max_pages) and token:
             response = await self.room_messages(
                 room_id,
@@ -1393,11 +1670,18 @@ class AsyncClient(Client):
                 break
 
             bound_reached = False
-            for event in response.chunk:
+            for index, event in enumerate(response.chunk):
                 event_id = getattr(event, "event_id", None)
                 if not event_id or event_id in seen_ids:
                     continue
                 seen_ids.add(event_id)
+                if not past_own_join:
+                    if event_id == own_join_event_id or self._is_own_join_transition(
+                        event
+                    ):
+                        own_join_event_id = event_id
+                        past_own_join = True
+                    continue
                 if event_id in present_in_sync:
                     continue
                 if self._is_own_join_transition(event):
@@ -1406,6 +1690,8 @@ class AsyncClient(Client):
                     # discard that prefix and keep collecting post-join.
                     recovered.clear()
                     pending_journal.clear()
+                    own_join_event_id = event_id
+                    past_own_join = True
                     continue
                 if event_id in already_dispatched:
                     was_encrypted = already_dispatched[event_id]
@@ -1421,16 +1707,21 @@ class AsyncClient(Client):
                         continue
                 if max_events is not None and len(recovered) >= max_events:
                     bound_reached = True
+                    for remaining_event in response.chunk[index:]:
+                        if self._is_own_join_transition(remaining_event):
+                            later_own_join_event_id = remaining_event.event_id
                     break
                 recovered.append(event)
 
-            if gap_closed or bound_reached:
+            if bound_reached:
+                membership_tail_complete = response.end is None
                 resume_token = token
                 break
 
             next_token = response.end
             if not next_token:
                 gap_closed = True
+                membership_tail_complete = True
                 resume_token = None
                 break
             if next_token == token:
@@ -1439,6 +1730,14 @@ class AsyncClient(Client):
             token = next_token
             resume_token = token
 
+        if own_join_event_id and not past_own_join:
+            # The membership-only proof found a join that the data walk did
+            # not reproduce. Do not certify or expose either side of an
+            # unstable pagination boundary.
+            gap_closed = False
+            membership_tail_complete = False
+            resume_token = walk_start_token
+
         if not gap_closed and recovered:
             logger.warning(
                 "Pausing after %d recovered event(s) for room %s: the forward "
@@ -1446,9 +1745,80 @@ class AsyncClient(Client):
                 len(recovered),
                 room_id,
             )
-        return recovered, pending_journal, pages, gap_closed, resume_token
+        return (
+            recovered,
+            pending_journal,
+            pages,
+            gap_closed,
+            resume_token,
+            own_join_event_id,
+            later_own_join_event_id,
+            membership_tail_complete,
+        )
 
-    async def _handle_presence_events(self, response: SyncResponse):
+    async def _scan_own_join_forward(
+        self,
+        room_id: str,
+        since: str,
+        start_token: str,
+        response_token: str,
+        own_join_event_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """Prove the remainder contains no later own-join boundary."""
+        max_pages = self.config.backfill_max_pages
+        cursor = self._backfill_membership_cursors.get(room_id)
+        if cursor and cursor.since == since:
+            token: str | None = cursor.token
+            own_join_event_id = cursor.own_join_event_id or own_join_event_id
+        else:
+            token = start_token
+
+        pages = 0
+        while (max_pages is None or pages < max_pages) and token:
+            response = await self.room_messages(
+                room_id,
+                start=token,
+                end=response_token,
+                direction=MessageDirection.front,
+                limit=self.config.backfill_page_size,
+                message_filter={"types": ["m.room.member"]},
+            )
+            pages += 1
+            if not isinstance(response, RoomMessagesResponse):
+                return False, own_join_event_id
+
+            for event in response.chunk:
+                if self._is_own_join_transition(event):
+                    own_join_event_id = event.event_id
+
+            next_token = response.end
+            if not next_token:
+                self._backfill_membership_cursors.pop(room_id, None)
+                return True, own_join_event_id
+            if next_token == token:
+                break
+            token = next_token
+            self._backfill_membership_cursors[room_id] = _MembershipScanCursor(
+                since,
+                token,
+                own_join_event_id,
+            )
+
+        if token:
+            self._backfill_membership_cursors[room_id] = _MembershipScanCursor(
+                since,
+                token,
+                own_join_event_id,
+            )
+        return False, own_join_event_id
+
+    async def _handle_presence_events(
+        self,
+        response: SyncResponse,
+        deadline: float | None = None,
+        callback_journal_token: str | None = None,
+    ) -> None:
+        callback_journal_token = callback_journal_token or response.next_batch
         for event in response.presence_events:
             for room_id in self.rooms.keys():
                 if event.user_id not in self.rooms[room_id].users:
@@ -1463,14 +1833,29 @@ class AsyncClient(Client):
                 ].currently_active = event.currently_active
                 self.rooms[room_id].users[event.user_id].status_msg = event.status_msg
 
-            await self._on_presence(event)
+            await self._dispatch_sync_callback(
+                self._callback_delivery_scope("presence"),
+                event,
+                callback_journal_token,
+                lambda event=event: self._on_presence(event),
+                deadline,
+            )
 
     async def _handle_global_account_data_events(  # type: ignore
         self,
         response: SyncResponse,
+        deadline: float | None = None,
+        callback_journal_token: str | None = None,
     ) -> None:
+        callback_journal_token = callback_journal_token or response.next_batch
         for event in response.account_data_events:
-            await self._on_global_account_data(event)
+            await self._dispatch_sync_callback(
+                self._callback_delivery_scope("global_account_data"),
+                event,
+                callback_journal_token,
+                lambda event=event: self._on_global_account_data(event),
+                deadline,
+            )
 
     async def _handle_expired_verifications(self):
         expired_verifications = self.olm.clear_verifications()
@@ -1478,51 +1863,60 @@ class AsyncClient(Client):
         for event in expired_verifications:
             await self._on_expired_verifications(event)
 
-    async def _on_to_device(self, event: ToDeviceEvent):
-        for cb in self.to_device_callbacks:
-            await cb.async_execute(event)
+    async def _execute_callbacks(
+        self,
+        callbacks: Iterable[ClientCallback],
+        *args: Any,
+    ) -> None:
+        """Run callback fanout, preserving upstream behavior when disabled."""
+        if not self.config.backfill_limited_timelines:
+            for callback in callbacks:
+                await callback.async_execute(*args)
+            return
 
-    async def _on_invited_rooms(self, event: Event, room: MatrixRoom):
-        for cb in self.event_callbacks:
-            await cb.async_execute(event, room)
-
-    async def _on_event(self, event: Event, room: MatrixRoom):
         first_error: Exception | None = None
-        for cb in self.event_callbacks:
+        for callback in callbacks:
             try:
-                await cb.async_execute(event, room)
+                await callback.async_execute(*args)
             except Exception as exc:  # noqa: PERF203
                 if first_error is None:
                     first_error = exc
         if first_error:
             raise first_error
 
+    async def _on_to_device(self, event: ToDeviceEvent):
+        await self._execute_callbacks(self.to_device_callbacks, event)
+
+    async def _on_invited_rooms(self, event: Event, room: MatrixRoom):
+        await self._execute_callbacks(self.event_callbacks, event, room)
+
+    async def _on_event(self, event: Event, room: MatrixRoom):
+        await self._execute_callbacks(self.event_callbacks, event, room)
+
     async def _on_ephemeral(self, event: EphemeralEvent, room: MatrixRoom):
-        for cb in self.ephemeral_callbacks:
-            await cb.async_execute(event, room)
+        await self._execute_callbacks(self.ephemeral_callbacks, event, room)
 
     async def _on_room_account_data(self, event: AccountDataEvent, room: MatrixRoom):
-        for cb in self.room_account_data_callbacks:
-            await cb.async_execute(event, room)
+        await self._execute_callbacks(self.room_account_data_callbacks, event, room)
 
     async def _on_presence(self, event: PresenceEvent):
-        for cb in self.presence_callbacks:
-            await cb.async_execute(event)
+        await self._execute_callbacks(self.presence_callbacks, event)
 
     async def _on_global_account_data(self, event: AccountDataEvent):
-        for cb in self.global_account_data_callbacks:
-            await cb.async_execute(event)
+        await self._execute_callbacks(self.global_account_data_callbacks, event)
 
     async def _on_expired_verifications(self, event: ToDeviceEvent):
-        for cb in self.to_device_callbacks:
-            await cb.async_execute(event)
+        await self._execute_callbacks(self.to_device_callbacks, event)
 
     async def _on_response(self, response: Response | ErrorResponse):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
     async def _persist_processed_sync_token(
-        self, *, prune_journal: bool = True
+        self,
+        *,
+        prune_journal: bool = True,
+        deadline: float | None = None,
     ) -> None:
         """Persist the contiguous callback checkpoint without blocking asyncio."""
         token = self._last_processed_sync_token
@@ -1540,9 +1934,10 @@ class AsyncClient(Client):
                 and not self._has_unrecovered_sync_gap
                 and self._durable_dispatch_journal_enabled()
             ):
-                await asyncio.to_thread(
+                await self._run_store_operation(
                     self.store.save_sync_token_and_prune_dispatched_events,
                     token,
+                    deadline=deadline,
                 )
                 for room_id, events in self._dispatched_event_ids.items():
                     event_tokens = self._dispatched_event_tokens.get(room_id, {})
@@ -1551,10 +1946,11 @@ class AsyncClient(Client):
                             events.pop(event_id)
                             event_tokens.pop(event_id, None)
             else:
-                await asyncio.to_thread(
+                await self._run_store_operation(
                     self.store.save_sync_token,
                     token,
-                    gap_pending=self._has_unrecovered_sync_gap,
+                    self._has_unrecovered_sync_gap,
+                    deadline=deadline,
                 )
             self.loaded_sync_token = token
             self._loaded_unrecovered_sync_gap = self._has_unrecovered_sync_gap
@@ -1587,6 +1983,29 @@ class AsyncClient(Client):
         if self.next_batch == response.next_batch:
             return
 
+        recovery_active = bool(
+            self.config.backfill_limited_timelines
+            and (
+                self._has_unrecovered_sync_gap
+                or (
+                    since
+                    and any(
+                        info.timeline.limited for info in response.rooms.join.values()
+                    )
+                )
+            )
+        )
+        recovery_deadline = (
+            asyncio.get_running_loop().time() + self.config.backfill_timeout
+            if recovery_active
+            else None
+        )
+        recovering_gap = bool(
+            self.config.backfill_limited_timelines
+            and self._has_unrecovered_sync_gap
+            and request_since
+            and request_since == self._last_processed_sync_token
+        )
         self.next_batch = response.next_batch
 
         if (
@@ -1598,64 +2017,102 @@ class AsyncClient(Client):
             # callback-contiguous recovery is not enabled.
             self.store.save_sync_token(self.next_batch)
 
-        if (
-            self.config.backfill_limited_timelines
-            and self._last_processed_sync_token is None
-            and since
-        ):
-            # A stored or explicit since token is the only safe restart point
-            # if this first response fails or only partly recovers its gap.
-            self._last_processed_sync_token = since
-            await self._persist_processed_sync_token(prune_journal=False)
-
         try:
-            await self._handle_to_device(response)
+            if (
+                self.config.backfill_limited_timelines
+                and self._last_processed_sync_token is None
+                and since
+            ):
+                # A stored or explicit since token is the only safe restart point
+                # if this first response fails or only partly recovers its gap.
+                self._last_processed_sync_token = since
+                await self._persist_processed_sync_token(
+                    prune_journal=False,
+                    deadline=recovery_deadline,
+                )
 
-            await self._handle_invited_rooms(response)
-
-            backfill_complete, backfill_attempted = await self._handle_joined_rooms(
-                response, since
+            callback_journal_token = since or _INITIAL_CALLBACK_JOURNAL_TOKEN
+            await self._handle_to_device(
+                response,
+                (
+                    callback_journal_token
+                    if self.config.backfill_limited_timelines
+                    else None
+                ),
+                recovery_deadline,
             )
 
-            await self._handle_presence_events(response)
+            if self.config.backfill_limited_timelines:
+                callback_token = callback_journal_token
+            else:
+                callback_token = response.next_batch
 
-            await self._handle_global_account_data_events(response)
+            await self._handle_invited_rooms(
+                response,
+                recovery_deadline,
+                callback_token,
+            )
+
+            backfill_complete, backfill_attempted = await self._handle_joined_rooms(
+                response,
+                since,
+                recovery_deadline,
+                callback_token,
+            )
+
+            await self._handle_presence_events(
+                response,
+                recovery_deadline,
+                callback_token,
+            )
+
+            await self._handle_global_account_data_events(
+                response,
+                recovery_deadline,
+                callback_token,
+            )
 
             if self.olm:
                 await self._handle_expired_verifications()
                 self._handle_olm_events(response)
                 await self._collect_key_requests()
+
+            if backfill_attempted or recovering_gap:
+                self._has_unrecovered_sync_gap = not backfill_complete
+                if backfill_complete:
+                    self._trim_transient_dispatched_events()
+
+            checkpoint_advanced = False
+            if (
+                backfill_complete
+                and not self._has_unrecovered_sync_gap
+                and (
+                    not self.config.backfill_limited_timelines
+                    or self._last_processed_sync_token is None
+                    or since == self._last_processed_sync_token
+                )
+            ):
+                self._last_processed_sync_token = response.next_batch
+                checkpoint_advanced = True
+            elif self.config.backfill_limited_timelines and since:
+                # Automatically retry an incomplete gap from the callback-
+                # contiguous boundary. The durable callback journal suppresses
+                # every response surface already delivered.
+                self.next_batch = self._last_processed_sync_token or since
+
+            if self.config.backfill_limited_timelines:
+                await self._persist_processed_sync_token(
+                    deadline=recovery_deadline,
+                )
+                if checkpoint_advanced:
+                    self._clear_callback_dispatch_state()
         except BaseException:
-            if self.config.backfill_limited_timelines and since:
-                # Any callback error or cancellation leaves this response
-                # uncertified. Keep the public transport cursor on the same
-                # safe boundary so a caller that catches it retries.
+            if self.config.backfill_limited_timelines:
+                # Roll back even a since-less first response. The durable
+                # callback journal suppresses the terminal fan-outs that
+                # completed before the failure when the response is retried.
                 self.next_batch = since
             raise
-
-        if backfill_attempted:
-            self._has_unrecovered_sync_gap = not backfill_complete
-            if backfill_complete:
-                self._trim_transient_dispatched_events()
-
-        if (
-            backfill_complete
-            and not self._has_unrecovered_sync_gap
-            and (
-                not self.config.backfill_limited_timelines
-                or self._last_processed_sync_token is None
-                or since == self._last_processed_sync_token
-            )
-        ):
-            self._last_processed_sync_token = response.next_batch
-        elif self.config.backfill_limited_timelines and since:
-            # Automatically retry an incomplete gap from the callback-
-            # contiguous boundary. The durable event journal suppresses live
-            # timeline events that this response already delivered.
-            self.next_batch = self._last_processed_sync_token or since
-
-        if self.config.backfill_limited_timelines:
-            await self._persist_processed_sync_token()
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -4024,7 +4481,7 @@ class AsyncClient(Client):
 
         if event.session_id in self.outgoing_key_requests:
             raise LocalProtocolError(
-                "A key sharing request is already sent" " out for this session id."
+                "A key sharing request is already sent out for this session id."
             )
 
         assert self.user_id

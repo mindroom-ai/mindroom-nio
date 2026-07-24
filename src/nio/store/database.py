@@ -100,6 +100,7 @@ class MatrixStore:
         DispatchedEvents,
     ]
     store_version = 4
+    supports_threaded_writes = True
 
     user_id: str = field()
     device_id: str = field()
@@ -139,10 +140,17 @@ class MatrixStore:
 
     def upgrade_to_v4(self):
         with self.database.bind_ctx([SyncTokens]):
-            self.database.execute_sql(
-                'ALTER TABLE "synctokens" '
-                'ADD COLUMN "gap_pending" INTEGER NOT NULL DEFAULT 0'
-            )
+            columns = {
+                row[1]
+                for row in self.database.execute_sql(
+                    'PRAGMA table_info("synctokens")'
+                ).fetchall()
+            }
+            if "gap_pending" not in columns:
+                self.database.execute_sql(
+                    'ALTER TABLE "synctokens" '
+                    'ADD COLUMN "gap_pending" INTEGER NOT NULL DEFAULT 0'
+                )
         self._update_version(4)
 
     def __post_init__(self):
@@ -1122,6 +1130,8 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
+
+    supports_threaded_writes = False
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

@@ -563,6 +563,24 @@ class TestClass:
         with migrated.database.bind_ctx(migrated.models):
             assert DispatchedEvents.table_exists()
 
+    def test_upgrade_to_v3_creates_journal_before_final_table_creation(self, tempdir):
+        """The dedicated migration owns the journal table creation."""
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        with store.database.bind_ctx(store.models):
+            store.database.drop_tables([DispatchedEvents])
+        store._update_version(2)
+
+        store.upgrade_to_v3()
+
+        assert store._get_store_version() == 3
+        with store.database.bind_ctx(store.models):
+            assert DispatchedEvents.table_exists()
+
     def test_v3_store_migrates_sync_recovery_marker(self, tempdir):
         store = MatrixStore(
             "migration-user",
@@ -589,6 +607,30 @@ class TestClass:
         assert migrated._get_store_version() == 4
         assert migrated.load_sync_token() == "safe-token"
         assert not migrated.load_sync_recovery_pending()
+
+    def test_interrupted_v4_migration_is_restart_safe(self, tempdir):
+        """A prior column add can be retried before the version update."""
+        store = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+        store.save_account(OlmAccount())
+        store.save_sync_token("safe-token", gap_pending=True)
+        store._update_version(3)
+        store.database.close()
+
+        migrated = MatrixStore(
+            "migration-user",
+            "DEVICEID",
+            tempdir,
+            database_name="migration.db",
+        )
+
+        assert migrated._get_store_version() == 4
+        assert migrated.load_sync_token() == "safe-token"
+        assert migrated.load_sync_recovery_pending()
 
     def test_sync_recovery_marker_round_trip(self, store):
         store.save_sync_token("safe-token", gap_pending=True)

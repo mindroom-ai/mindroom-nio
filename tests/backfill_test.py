@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -37,9 +38,13 @@ from nio import (
     SlidingSyncResponse,
     SyncResponse,
     Timeline,
+    ToDeviceEvent,
+    UnknownToDeviceEvent,
 )
 from nio.api import MATRIX_API_PATH_V3
 from nio.client.async_client import _MAX_DISPATCHED_EVENT_IDS
+from nio.events import AccountDataEvent, UnknownAccountDataEvent
+from nio.store import SqliteMemoryStore
 
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
 MESSAGES_URL = re.compile(
@@ -226,6 +231,7 @@ class PagedMessages:
         self.requested_tokens: List[Optional[str]] = []
         self.requested_dir: List[Optional[str]] = []
         self.requested_to: List[Optional[str]] = []
+        self.membership_requested_tokens: List[Optional[str]] = []
 
     def __call__(self, url, **kwargs) -> CallbackResult:
         query = parse_qs(urlparse(str(url)).query)
@@ -235,9 +241,12 @@ class PagedMessages:
         token = query.get("from", [None])[0]
         direction = query.get("dir", [None])[0]
         end = query.get("to", [None])[0]
-        self.requested_tokens.append(token)
-        self.requested_dir.append(direction)
-        self.requested_to.append(end)
+        if "filter" in query:
+            self.membership_requested_tokens.append(token)
+        else:
+            self.requested_tokens.append(token)
+            self.requested_dir.append(direction)
+            self.requested_to.append(end)
 
         if (
             direction == "f"
@@ -399,6 +408,34 @@ class TestLimitedTimelineBackfill:
         assert client.store.load_sync_token() == "s1"
         await client.close()
 
+    async def test_disabled_callback_error_keeps_upstream_short_circuit(
+        self, disabled_client
+    ):
+        """Attempt-all fanout is scoped to recovery-enabled clients."""
+        later_callbacks: List[str] = []
+
+        async def fail_first(_room, _event):
+            raise RuntimeError("first callback failed")
+
+        async def record_later(_room, event):
+            later_callbacks.append(event.event_id)
+
+        disabled_client.add_event_callback(fail_first, RoomMessageText)
+        disabled_client.add_event_callback(record_later, RoomMessageText)
+
+        with pytest.raises(RuntimeError, match="first callback failed"):
+            await disabled_client.receive_response(
+                sync_response(
+                    "s1",
+                    TEST_ROOM_ID,
+                    [text_event("$event", ts=100)],
+                    limited=False,
+                    prev_batch="p0",
+                )
+            )
+
+        assert later_callbacks == []
+
     async def test_first_sync_is_skipped(self, backfill_client, aioresponse):
         """A room's first (always limited) sync must not trigger backfill."""
         dispatched = self._record_callback(backfill_client)
@@ -414,6 +451,355 @@ class TestLimitedTimelineBackfill:
         )
 
         assert dispatched == ["$a"]
+        assert not aioresponse.requests
+
+    async def test_ordinary_sync_is_not_subject_to_backfill_deadline(self, tempdir):
+        """The recovery budget cannot time out an ordinary callback commit."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_timeout=0,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$event", ts=100)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        assert dispatched == ["$event"]
+        assert client.store
+        assert client.store.load_sync_token() == "s1"
+        await client.close()
+
+    async def test_since_less_callback_error_restores_full_sync_cursor(
+        self, backfill_client
+    ):
+        """A failed first response retries instead of losing untouched events."""
+        dispatched = self._record_callback(backfill_client)
+        failed = False
+
+        async def fail_once(_room, event):
+            nonlocal failed
+            if event.event_id == "$a" and not failed:
+                failed = True
+                raise RuntimeError("first response failed")
+
+        backfill_client.add_event_callback(fail_once, RoomMessageText)
+        response = sync_response(
+            "s1",
+            TEST_ROOM_ID,
+            [text_event("$a", ts=100), text_event("$b", ts=200)],
+            limited=False,
+            prev_batch="p0",
+        )
+
+        with pytest.raises(RuntimeError, match="first response failed"):
+            await backfill_client.receive_response(response)
+
+        assert backfill_client.next_batch is None
+        assert dispatched == ["$a"]
+
+        await backfill_client.receive_response(response)
+
+        assert dispatched == ["$a", "$b"]
+        assert backfill_client.next_batch == "s1"
+
+    async def test_sticky_gap_closes_on_non_limited_retry(self, tempdir, aioresponse):
+        """A complete safe-cursor retry needs no extra /messages walk."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        account_data_callbacks: List[str] = []
+
+        async def record_account_data(event):
+            account_data_callbacks.append(event.content["value"])
+
+        client.add_global_account_data_callback(
+            record_account_data,
+            UnknownAccountDataEvent,
+        )
+        account_data = AccountDataEvent.parse_event(
+            {"type": "m.test", "content": {"value": "once"}}
+        )
+        assert isinstance(account_data, UnknownAccountDataEvent)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        incomplete = sync_response(
+            "s2",
+            TEST_ROOM_ID,
+            [text_event("$new", ts=300)],
+            limited=True,
+            prev_batch="p1",
+        )
+        incomplete.account_data_events = [account_data]
+        await client.receive_response(incomplete)
+
+        assert client.next_batch == "s1"
+        assert client._has_unrecovered_sync_gap
+        assert account_data_callbacks == ["once"]
+
+        complete = sync_response(
+            "s3",
+            TEST_ROOM_ID,
+            [
+                text_event("$gap", ts=100),
+                text_event("$new", ts=300),
+                text_event("$newer", ts=400),
+            ],
+            limited=False,
+            prev_batch="p2",
+        )
+        complete.account_data_events = [account_data]
+        await client.receive_response(complete)
+
+        assert dispatched == ["$old", "$gap", "$new", "$newer"]
+        assert account_data_callbacks == ["once"]
+        assert client.next_batch == "s3"
+        assert client._last_processed_sync_token == "s3"
+        assert not client._has_unrecovered_sync_gap
+        assert client.store
+        assert client.store.load_sync_token() == "s3"
+        assert not client.store.load_sync_recovery_pending()
+
+        # Replay suppression belongs only to the uncertified interval. The
+        # same state payload in a later certified response is a new callback.
+        later = sync_response(
+            "s4",
+            TEST_ROOM_ID,
+            [text_event("$later", ts=500)],
+            limited=False,
+            prev_batch="p3",
+        )
+        later.account_data_events = [account_data]
+        await client.receive_response(later)
+
+        assert account_data_callbacks == ["once", "once"]
+        await client.close()
+
+    async def test_live_callback_error_is_terminal_across_process_restart(
+        self, tempdir
+    ):
+        """A restarted safe-cursor retry resumes after attempted fan-out."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+        dispatched: List[str] = []
+
+        async def record(_room, event):
+            dispatched.append(event.event_id)
+
+        async def fail_on_bad(_room, event):
+            if event.event_id == "$bad":
+                raise RuntimeError("callback failed")
+
+        first.add_event_callback(record, RoomMessageText)
+        first.add_event_callback(fail_on_bad, RoomMessageText)
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        retry = sync_response(
+            "s2",
+            TEST_ROOM_ID,
+            [text_event("$bad", ts=100), text_event("$later", ts=200)],
+            limited=False,
+            prev_batch="p1",
+        )
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await first.receive_response(retry)
+
+        assert dispatched == ["$old", "$bad"]
+        assert first.next_batch == "s1"
+        assert first.store
+        assert first.store.load_sync_token() == "s1"
+        await first.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        restarted.add_event_callback(record, RoomMessageText)
+        await restarted.receive_response(retry)
+
+        assert dispatched == ["$old", "$bad", "$later"]
+        assert restarted.next_batch == "s2"
+        assert restarted.store
+        assert restarted.store.load_sync_token() == "s2"
+        await restarted.close()
+
+    async def test_ancillary_callback_is_terminal_across_process_restart(
+        self, tempdir, aioresponse
+    ):
+        """A safe-cursor retry cannot repeat non-timeline callback delivery."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+        callbacks: List[str] = []
+
+        async def record(event):
+            callbacks.append(event.content["value"])
+
+        account_data = AccountDataEvent.parse_event(
+            {"type": "m.test", "content": {"value": "once"}}
+        )
+        assert isinstance(account_data, UnknownAccountDataEvent)
+        first.add_global_account_data_callback(record, UnknownAccountDataEvent)
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        incomplete = sync_response(
+            "s2",
+            TEST_ROOM_ID,
+            [text_event("$new", ts=300)],
+            limited=True,
+            prev_batch="p1",
+        )
+        incomplete.account_data_events = [account_data]
+        await first.receive_response(incomplete)
+
+        assert callbacks == ["once"]
+        assert first.next_batch == "s1"
+        await first.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        restarted.add_global_account_data_callback(record, UnknownAccountDataEvent)
+        complete = sync_response(
+            "s3",
+            TEST_ROOM_ID,
+            [
+                text_event("$gap", ts=100),
+                text_event("$new", ts=300),
+            ],
+            limited=False,
+            prev_batch="p2",
+        )
+        complete.account_data_events = [account_data]
+        await restarted.receive_response(complete)
+
+        assert callbacks == ["once"]
+        assert restarted.store
+        assert restarted.store.load_sync_token() == "s3"
+        await restarted.close()
+
+    async def test_to_device_replay_uses_pre_decryption_identity(
+        self, backfill_client, monkeypatch
+    ):
+        """A replay stays suppressed when only the first copy decrypts."""
+        callbacks: List[str] = []
+        decryptions = 0
+
+        async def record(event):
+            callbacks.append(event.type)
+
+        raw_source = {
+            "type": "m.raw",
+            "sender": "@sender:example.org",
+            "content": {"value": "ciphertext"},
+        }
+        decrypted_source = {
+            "type": "m.decrypted",
+            "sender": "@sender:example.org",
+            "content": {"value": "plaintext"},
+        }
+
+        def decrypt(_event):
+            nonlocal decryptions
+            decryptions += 1
+            if decryptions == 1:
+                return UnknownToDeviceEvent.from_dict(dict(decrypted_source))
+            return None
+
+        backfill_client.add_to_device_callback(record, ToDeviceEvent)
+        monkeypatch.setattr(backfill_client, "_handle_decrypt_to_device", decrypt)
+
+        def response() -> SyncResponse:
+            result = sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [],
+                limited=False,
+                prev_batch="p0",
+            )
+            result.to_device_events = [UnknownToDeviceEvent.from_dict(dict(raw_source))]
+            return result
+
+        await backfill_client._handle_to_device(response(), "s1")
+        await backfill_client._handle_to_device(response(), "s1")
+
+        assert callbacks == ["m.decrypted"]
 
     async def test_limited_timeline_recovers_gap_in_order(
         self, backfill_client, aioresponse
@@ -603,8 +989,8 @@ class TestLimitedTimelineBackfill:
         )
 
         # /sync and /messages may order concurrent room-DAG branches
-        # differently. Backward recovery ignores sync overlap and continues to
-        # the server-provided since bound.
+        # differently. Forward recovery ignores sync overlap and continues to
+        # the server-provided pagination boundary.
         pages = PagedMessages(
             {
                 "p1": messages_payload(
@@ -733,6 +1119,12 @@ class TestLimitedTimelineBackfill:
         counter = {"n": 0}
 
         def endless(url, **kwargs) -> CallbackResult:
+            query = parse_qs(urlparse(str(url)).query)
+            if "filter" in query:
+                return CallbackResult(
+                    status=200,
+                    payload=messages_payload([], end=None),
+                )
             counter["n"] += 1
             n = counter["n"]
             return CallbackResult(
@@ -798,8 +1190,10 @@ class TestLimitedTimelineBackfill:
         }
 
         def paged(url, **kwargs) -> CallbackResult:
-            token = parse_qs(urlparse(str(url)).query)["from"][0]
-            requested_tokens.append(token)
+            query = parse_qs(urlparse(str(url)).query)
+            token = query["from"][0]
+            if "filter" not in query:
+                requested_tokens.append(token)
             return CallbackResult(status=200, payload=responses[token])
 
         aioresponse.get(MESSAGES_URL, callback=paged, repeat=True)
@@ -860,7 +1254,10 @@ class TestLimitedTimelineBackfill:
 
         huge = [text_event(f"$gap{i}", ts=1000 + i) for i in range(20)]
         pages = PagedMessages(
-            {"p1": messages_payload(list(reversed(huge)), end="back2")}
+            {
+                "p1": messages_payload(list(reversed(huge)), end="back2"),
+                "back2": messages_payload([], end=None),
+            }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
@@ -918,7 +1315,8 @@ class TestLimitedTimelineBackfill:
                         text_event("$gap1", ts=100),
                     ],
                     end="back2",
-                )
+                ),
+                "back2": messages_payload([], end=None),
             }
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
@@ -1254,8 +1652,8 @@ class TestLimitedTimelineBackfill:
         )
         pages = PagedMessages(
             {
-                # Backward page from prev_batch sees post-join events before
-                # the join boundary and never reaches pre-join history.
+                # The forward walk discards history before our own join and
+                # retains only the events that follow it.
                 "p1": messages_payload(
                     [
                         text_event("$post2", ts=260),
@@ -1281,6 +1679,94 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$post1", "$post2", "$new"]
         assert "$prejoin" not in dispatched
+
+    async def test_bounded_prefix_waits_for_later_own_join(self, tempdir, aioresponse):
+        """A page bound cannot expose pre-join history before a later page."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=1,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        client.next_batch = "since_token"
+        own_join = member_event(
+            "$ownjoin",
+            ts=250,
+            membership="join",
+            user_id=client.user_id,
+        )
+        post_join_data_calls = 0
+
+        def paged(url, **kwargs) -> CallbackResult:
+            nonlocal post_join_data_calls
+            query = parse_qs(urlparse(str(url)).query)
+            token = query["from"][0]
+            is_membership_scan = "filter" in query
+            if token == "since_token":
+                events = [text_event("$prejoin", ts=200)]
+                end = "after-prejoin"
+            elif is_membership_scan:
+                events = [own_join]
+                end = None
+            else:
+                post_join_data_calls += 1
+                events = [text_event("$postjoin", ts=260), text_event("$new", ts=300)]
+                if post_join_data_calls > 1:
+                    events.insert(0, own_join)
+                end = None
+            return CallbackResult(
+                status=200,
+                payload=messages_payload(events, end=end),
+            )
+
+        aioresponse.get(MESSAGES_URL, callback=paged, repeat=True)
+        limited = sync_response(
+            "s2",
+            TEST_ROOM_ID,
+            [text_event("$new", ts=300)],
+            limited=True,
+            prev_batch="p1",
+        )
+
+        await client.receive_response(limited)
+
+        assert dispatched == []
+        assert client.next_batch == "since_token"
+
+        await client.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        # The membership-only page found the join, but an unstable first data
+        # retry omitted it. That response still cannot certify the interval.
+        assert dispatched == []
+        assert client.next_batch == "since_token"
+
+        await client.receive_response(
+            sync_response(
+                "s4",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert dispatched == ["$postjoin", "$new"]
+        assert "$prejoin" not in dispatched
+        await client.close()
 
     async def test_empty_page_continues_pagination(self, backfill_client, aioresponse):
         """An empty chunk with an advancing end token continues the walk."""
@@ -1513,6 +1999,10 @@ class TestLimitedTimelineBackfill:
 
         assert client._last_processed_sync_token == "s1"
 
+        # This response was already in flight from the speculative transport
+        # cursor when the earlier limited response pinned the safe checkpoint.
+        # Its non-limited timeline cannot certify the missing interval.
+        client._sync_since = "s2"
         await client.receive_response(
             sync_response(
                 "s3",
@@ -1537,7 +2027,8 @@ class TestLimitedTimelineBackfill:
         )
 
         assert pages.requested_to == ["s2", "s4"]
-        assert dispatched == ["$old", "$gap1", "$new", "$newer", "$latest"]
+        assert dispatched == ["$old", "$newer", "$gap1", "$new", "$latest"]
+        assert len(dispatched) == len(set(dispatched))
         assert client._last_processed_sync_token == "s4"
         await client.close()
 
@@ -1624,6 +2115,9 @@ class TestLimitedTimelineBackfill:
         assert restarted.loaded_sync_token == "s1"
         assert restarted._has_unrecovered_sync_gap
 
+        # Model a response that was already in flight from the speculative
+        # cursor when the prior process established the durable gap marker.
+        restarted._sync_since = "s2"
         await restarted.receive_response(
             sync_response(
                 "s3",
@@ -1656,7 +2150,8 @@ class TestLimitedTimelineBackfill:
 
         assert pages.requested_to == ["s2", "s4"]
         assert pages.requested_tokens == ["s1", "s1"]
-        assert dispatched == ["$old", "$gap1", "$new", "$newer", "$latest"]
+        assert dispatched == ["$old", "$newer", "$gap1", "$new", "$latest"]
+        assert len(dispatched) == len(set(dispatched))
         assert restarted.store
         assert restarted._last_processed_sync_token == "s4"
         assert restarted.loaded_sync_token == "s4"
@@ -1728,6 +2223,7 @@ class TestLimitedTimelineBackfill:
                 prev_batch="p1",
             )
         )
+        first._sync_since = "s2"
         await first.receive_response(
             sync_response(
                 "s3",
@@ -1769,14 +2265,16 @@ class TestLimitedTimelineBackfill:
 
         expected = [
             "$old",
+            *(event.event_id for event in later_events),
             "$gap1",
             "$new",
-            *(event.event_id for event in later_events),
             "$latest",
         ]
         assert dispatched == expected
         assert len(dispatched) == len(set(dispatched))
-        assert set(journal_batch_sizes) == {1}
+        # Callback completion is journaled one event at a time; already
+        # journaled overlap is safely retagged in one bulk write.
+        assert set(journal_batch_sizes) == {1, len(later_events)}
         await restarted.close()
 
     async def test_restart_journal_allows_one_decrypted_upgrade(
@@ -1912,6 +2410,60 @@ class TestLimitedTimelineBackfill:
         ] == ["$durable"]
         await client.close()
 
+    async def test_sliding_sync_call_path_keeps_dedup_bounded(self, tempdir):
+        """The public sliding response path enforces the 512-event bound."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        events = [
+            text_event(f"$sliding-{index}", ts=index)
+            for index in range(_MAX_DISPATCHED_EVENT_IDS + 100)
+        ]
+
+        def sliding(pos: str, timeline: List[RoomMessageText]) -> SlidingSyncResponse:
+            return SlidingSyncResponse.from_dict(
+                {
+                    "pos": pos,
+                    "rooms": {
+                        TEST_ROOM_ID: {
+                            "membership": "join",
+                            "required_state": [],
+                            "timeline": [event.source for event in timeline],
+                        }
+                    },
+                }
+            )
+
+        await client.receive_response(sliding("p1", events))
+
+        assert len(client._sliding_dispatched_event_ids[TEST_ROOM_ID]) == (
+            _MAX_DISPATCHED_EVENT_IDS
+        )
+        await client.receive_response(sliding("p2", [events[-1]]))
+
+        assert dispatched.count(events[-1].event_id) == 1
+        await client.close()
+
+    async def test_cross_cache_plaintext_state_wins(self, backfill_client):
+        """A stale encrypted recent entry cannot override durable plaintext."""
+        backfill_client._dispatched_event_ids[TEST_ROOM_ID] = OrderedDict(
+            [("$same", False)]
+        )
+        backfill_client._sliding_dispatched_event_ids[TEST_ROOM_ID] = OrderedDict(
+            [("$same", True)]
+        )
+
+        assert not backfill_client._dispatched_event_state(TEST_ROOM_ID, "$same")
+
     async def test_live_timeline_commits_each_durable_journal_event(
         self, tempdir, monkeypatch
     ):
@@ -1957,6 +2509,106 @@ class TestLimitedTimelineBackfill:
 
         assert journal_batch_sizes == [1] * len(events)
         assert len(client._dispatched_event_ids[TEST_ROOM_ID]) == len(events)
+        await client.close()
+
+    async def test_memory_store_journal_stays_on_owning_connection(self):
+        """In-memory SQLite writes cannot move to a worker connection."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+                store=SqliteMemoryStore,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$event", ts=1)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        assert client.store
+        assert client.store.load_sync_token() == "s1"
+        assert client.store.load_dispatched_events() == [
+            (TEST_ROOM_ID, "$event", False, "s1")
+        ]
+        await client.close()
+
+    @pytest.mark.parametrize(
+        "failed_operation",
+        ["event-journal", "checkpoint"],
+    )
+    async def test_store_write_failure_keeps_response_retryable(
+        self, tempdir, monkeypatch, failed_operation
+    ):
+        """A failed durable write cannot lose or duplicate a callback."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        assert client.store
+        failures = 0
+
+        if failed_operation == "event-journal":
+            original = client.store.save_dispatched_events
+
+            def fail_once(*args):
+                nonlocal failures
+                failures += 1
+                if failures == 1:
+                    raise RuntimeError("journal write failed")
+                return original(*args)
+
+            monkeypatch.setattr(client.store, "save_dispatched_events", fail_once)
+        else:
+            original = client.store.save_sync_token_and_prune_dispatched_events
+
+            def fail_once(*args):
+                nonlocal failures
+                failures += 1
+                if failures == 1:
+                    raise RuntimeError("checkpoint write failed")
+                return original(*args)
+
+            monkeypatch.setattr(
+                client.store,
+                "save_sync_token_and_prune_dispatched_events",
+                fail_once,
+            )
+
+        response = sync_response(
+            "s1",
+            TEST_ROOM_ID,
+            [text_event("$event", ts=1)],
+            limited=False,
+            prev_batch="p0",
+        )
+        with pytest.raises(RuntimeError, match="write failed"):
+            await client.receive_response(response)
+
+        assert client.next_batch is None
+
+        await client.receive_response(response)
+
+        assert dispatched == ["$event"]
+        assert client.next_batch == "s1"
+        assert client.store.load_sync_token() == "s1"
         await client.close()
 
     async def test_straggler_already_delivered_is_not_redispatched(
@@ -3234,14 +3886,123 @@ class TestLimitedTimelineBackfill:
             )
         )
 
-        assert dispatched == ["$gap-a", "$live-a", "$gap-b"]
+        assert dispatched == ["$gap-a", "$live-a"]
         assert client._last_processed_sync_token == "since_x"
         await client.close()
 
-    async def test_restart_walk_dispatches_safe_incomplete_prefix(
+    async def test_incomplete_room_does_not_block_complete_room_retry(
+        self, tempdir, aioresponse
+    ):
+        """One limited room cannot lose or duplicate another complete room."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        client.next_batch = "since_x"
+
+        aioresponse.get(MESSAGES_URL, status=500)
+        first_rooms = Rooms(
+            {},
+            {
+                TEST_ROOM_ID: RoomInfo(
+                    Timeline([text_event("$live-a", ts=300)], True, "p1"),
+                    [],
+                    [],
+                    [],
+                ),
+                OTHER_ROOM_ID: RoomInfo(
+                    Timeline(
+                        [
+                            text_event(
+                                "$complete-b",
+                                ts=200,
+                                room_id=OTHER_ROOM_ID,
+                            )
+                        ],
+                        False,
+                        "p2",
+                    ),
+                    [],
+                    [],
+                    [],
+                ),
+            },
+            {},
+        )
+        await client.receive_response(
+            SyncResponse(
+                "s2",
+                first_rooms,
+                DeviceOneTimeKeyCount(49, 50),
+                DeviceList([], []),
+                [],
+                [],
+            )
+        )
+
+        assert dispatched == ["$complete-b"]
+        assert client.next_batch == "since_x"
+
+        retry_rooms = Rooms(
+            {},
+            {
+                TEST_ROOM_ID: RoomInfo(
+                    Timeline(
+                        [
+                            text_event("$gap-a", ts=100),
+                            text_event("$live-a", ts=300),
+                        ],
+                        False,
+                        "p3",
+                    ),
+                    [],
+                    [],
+                    [],
+                ),
+                OTHER_ROOM_ID: RoomInfo(
+                    Timeline(
+                        [
+                            text_event(
+                                "$complete-b",
+                                ts=200,
+                                room_id=OTHER_ROOM_ID,
+                            )
+                        ],
+                        False,
+                        "p4",
+                    ),
+                    [],
+                    [],
+                    [],
+                ),
+            },
+            {},
+        )
+        await client.receive_response(
+            SyncResponse(
+                "s3",
+                retry_rooms,
+                DeviceOneTimeKeyCount(49, 50),
+                DeviceList([], []),
+                [],
+                [],
+            )
+        )
+
+        assert dispatched == ["$complete-b", "$gap-a", "$live-a"]
+        assert client.next_batch == "s3"
+        assert not client._has_unrecovered_sync_gap
+        await client.close()
+
+    async def test_restart_walk_holds_prefix_until_membership_is_known(
         self, tempdir, aioresponse, caplog
     ):
-        """A bounded forward walk dispatches its verified prefix then retries."""
+        """A bounded walk cannot expose history before a possible later join."""
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
@@ -3255,8 +4016,8 @@ class TestLimitedTimelineBackfill:
         dispatched = self._record_callback(client)
         client.next_batch = "since_token"
 
-        # Page 1 yields one event and offers more pages. The event is after the
-        # safe lower bound, so it can be dispatched before the walk closes.
+        # Page 1 yields one event and offers more pages. A later page may still
+        # contain our own join, so this prefix is not safe to expose yet.
         pages = PagedMessages(
             {"p1": messages_payload([text_event("$prejoin", ts=240)], end="back2")}
         )
@@ -3273,9 +4034,9 @@ class TestLimitedTimelineBackfill:
                 )
             )
 
-        assert dispatched == ["$prejoin"]
+        assert dispatched == []
         assert "$new" not in dispatched
-        assert "without fully closing the gap" in caplog.text
+        assert "remaining membership boundary is known" in caplog.text
         await client.close()
 
     async def test_repeated_end_token_leaves_gap_open(
@@ -3311,7 +4072,7 @@ class TestLimitedTimelineBackfill:
                 )
             )
 
-        # Forward lower bound proves the prefix safe, but live delivery waits
-        # because the repeated token cannot prove the walk complete.
-        assert dispatched == ["$old", "$gap1"]
-        assert "without fully closing the gap" in caplog.text
+        # The repeated token cannot prove either the membership boundary or
+        # the data walk complete, so both the prefix and live delivery wait.
+        assert dispatched == ["$old"]
+        assert "remaining membership boundary is known" in caplog.text
