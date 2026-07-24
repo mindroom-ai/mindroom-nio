@@ -906,6 +906,7 @@ class TestLimitedTimelineBackfill:
         )
 
         assert dispatched == ["$old", "$new"]
+        assert client._last_processed_sync_token == "s1"
         await client.close()
 
     async def test_restart_resume_backfills_first_limited_sync(
@@ -1186,6 +1187,178 @@ class TestLimitedTimelineBackfill:
         assert dispatched == ["$old", "$gap1", "$new"]
         assert pages.requested_to == ["s1"]
 
+    async def test_incomplete_backfill_keeps_checkpoint_until_recovered(
+        self, tempdir, aioresponse
+    ):
+        """Later syncs cannot certify a checkpoint past an unrecovered gap."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_max_pages=1
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap1", ts=100)],
+                    end="more",
+                ),
+                "p-reset": messages_payload(
+                    [
+                        text_event("$newer", ts=400),
+                        text_event("$new", ts=300),
+                        text_event("$gap1", ts=100),
+                        text_event("$old", ts=50),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert client._last_processed_sync_token == "s1"
+
+        await client.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$newer", ts=400)],
+                limited=False,
+                prev_batch="p2",
+            )
+        )
+
+        assert client._last_processed_sync_token == "s1"
+
+        client.next_batch = ""
+        await client.receive_response(
+            sync_response(
+                "s4",
+                TEST_ROOM_ID,
+                [text_event("$latest", ts=500)],
+                limited=True,
+                prev_batch="p-reset",
+            )
+        )
+
+        assert pages.requested_to == ["s1", "s1"]
+        assert dispatched == ["$old", "$new", "$newer", "$gap1", "$latest"]
+        assert client._last_processed_sync_token == "s4"
+        await client.close()
+
+    async def test_restart_loads_checkpoint_before_incomplete_backfill(
+        self, tempdir, aioresponse
+    ):
+        """A process restart must resume before an incompletely recovered gap."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(login_response))
+
+        await first.receive_response(
+            sync_response(
+                "s1",
+                TEST_ROOM_ID,
+                [text_event("$old", ts=50)],
+                limited=False,
+                prev_batch="p0",
+            )
+        )
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap1", ts=100)],
+                    end="more",
+                ),
+                "p-reset": messages_payload(
+                    [
+                        text_event("$new", ts=300),
+                        text_event("$gap1", ts=100),
+                        text_event("$old", ts=50),
+                    ],
+                    end=None,
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await first.receive_response(
+            sync_response(
+                "s2",
+                TEST_ROOM_ID,
+                [text_event("$new", ts=300)],
+                limited=True,
+                prev_batch="p1",
+            )
+        )
+
+        assert first.store
+        assert first.store.load_sync_token() == "s1"
+        await first.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(restarted)
+
+        assert restarted.loaded_sync_token == "s1"
+
+        await restarted.receive_response(
+            sync_response(
+                "s3",
+                TEST_ROOM_ID,
+                [text_event("$latest", ts=400)],
+                limited=True,
+                prev_batch="p-reset",
+            )
+        )
+
+        assert pages.requested_to == ["s1", "s1"]
+        assert dispatched == ["$old", "$gap1", "$new", "$latest"]
+        assert restarted.store
+        assert restarted.store.load_sync_token() == "s3"
+        await restarted.close()
+
     async def test_straggler_already_delivered_is_not_redispatched(
         self, backfill_client, aioresponse
     ):
@@ -1412,6 +1585,7 @@ class TestLimitedTimelineBackfill:
         # The sync's own event is still delivered by the live path.
         assert dispatched == ["$old", "$gap1", "$new"]
         assert "budget is exhausted" in caplog.text
+        assert client._last_processed_sync_token == "s1"
         await client.close()
 
     async def test_hanging_callback_cannot_stall_dispatch(
@@ -1484,21 +1658,27 @@ class TestLimitedTimelineBackfill:
 
         assert dispatched == ["$old", "$gap1", "$new"]
         assert "inside an event callback" in caplog.text
+        assert client._last_processed_sync_token == "s1"
         await client.close()
 
-    async def test_callback_timeout_error_skips_only_that_event(
-        self, backfill_client, aioresponse, caplog
+    @pytest.mark.parametrize(
+        "error_type",
+        [asyncio.TimeoutError, RuntimeError],
+        ids=["timeout-error", "runtime-error"],
+    )
+    async def test_callback_error_skips_only_that_event(
+        self, backfill_client, aioresponse, caplog, error_type
     ):
-        """A callback raising TimeoutError is that event's failure alone.
+        """A callback error is that event's failure alone.
 
-        It must not be mistaken for the dispatch budget expiring, which would
-        abort the remaining recovered events.
+        TimeoutError in particular must not be mistaken for the dispatch
+        budget expiring, which would abort the remaining recovered events.
         """
         dispatched = self._record_callback(backfill_client)
 
         async def flaky(_room, event):
             if event.event_id == "$gap1":
-                raise asyncio.TimeoutError("the callback's own timeout")
+                raise error_type("the callback failed")
 
         backfill_client.add_event_callback(flaky, RoomMessageText)
 
@@ -1542,6 +1722,7 @@ class TestLimitedTimelineBackfill:
         assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
         assert "Failed to dispatch backfilled event $gap1" in caplog.text
         assert "budget is exhausted" not in caplog.text
+        assert backfill_client._last_processed_sync_token == "s1"
 
     async def test_since_bound_closes_without_delivered_event(
         self, backfill_client, aioresponse
@@ -1641,6 +1822,75 @@ class TestLimitedTimelineBackfill:
         assert dispatched == ["$a", "$b"]
         assert calls["n"] == 1
         assert elapsed < 5
+        assert client._last_processed_sync_token == "since_x"
+        await client.close()
+
+    async def test_one_incomplete_room_keeps_multi_room_checkpoint(
+        self, tempdir, aioresponse
+    ):
+        """Every limited room must complete before the sync is certified."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True, backfill_max_pages=1
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(login_response))
+        dispatched = self._record_callback(client)
+        client.next_batch = "since_x"
+
+        pages = PagedMessages(
+            {
+                "p1": messages_payload(
+                    [text_event("$gap-a", ts=100)],
+                    end=None,
+                ),
+                "p2": messages_payload(
+                    [text_event("$gap-b", ts=110, room_id=OTHER_ROOM_ID)],
+                    end="more",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        rooms = Rooms(
+            {},
+            {
+                TEST_ROOM_ID: RoomInfo(
+                    Timeline([text_event("$live-a", ts=300)], True, "p1"),
+                    [],
+                    [],
+                    [],
+                ),
+                OTHER_ROOM_ID: RoomInfo(
+                    Timeline(
+                        [text_event("$live-b", ts=310, room_id=OTHER_ROOM_ID)],
+                        True,
+                        "p2",
+                    ),
+                    [],
+                    [],
+                    [],
+                ),
+            },
+            {},
+        )
+        await client.receive_response(
+            SyncResponse(
+                "s2",
+                rooms,
+                DeviceOneTimeKeyCount(49, 50),
+                DeviceList([], []),
+                [],
+                [],
+            )
+        )
+
+        assert dispatched == ["$gap-a", "$live-a", "$live-b"]
+        assert client._last_processed_sync_token == "since_x"
         await client.close()
 
     async def test_restart_walk_discards_incomplete_buffer(

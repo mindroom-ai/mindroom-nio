@@ -387,7 +387,9 @@ class AsyncClientConfig(ClientConfig):
             chronological order.
             A walk cut short by an explicitly configured bound, an error, a
             pagination stall, or an unverified boundary discards what it
-            collected and logs a warning.
+            collected and logs a warning. The in-memory and persisted sync
+            checkpoints then remain at the last fully dispatched position
+            until a recovery from that position completes.
             Event ids already dispatched this run are skipped (per room,
             bounded memory), de-duplicating the
             ``/sync``–``/messages`` overlap; that memory is not persisted, so
@@ -560,6 +562,9 @@ class AsyncClient(Client):
         # still needs the last completed callback-delivery position as its
         # exact /messages lower bound.
         self._last_processed_sync_token: str | None = None
+        # Once recovery is incomplete, later syncs from the newer public token
+        # cannot leapfrog the gap and certify a newer checkpoint.
+        self._has_unrecovered_sync_gap = False
 
         # Per-room memory of recently dispatched timeline event ids, kept
         # when `backfill_limited_timelines` is enabled and by the sliding
@@ -748,8 +753,9 @@ class AsyncClient(Client):
 
     async def _handle_joined_rooms(
         self, response: SyncResponse, since: str | None = None
-    ) -> None:
+    ) -> bool:
         encrypted_rooms: set[str] = set()
+        backfill_complete = True
 
         # All backfill for one sync response shares a single time budget, so
         # many stalled rooms cannot stack their timeouts into a long sync
@@ -777,13 +783,14 @@ class AsyncClient(Client):
                     backfill_deadline = (
                         asyncio.get_running_loop().time() + self.config.backfill_timeout
                     )
-                await self._backfill_limited_timeline(
+                room_backfill_complete = await self._backfill_limited_timeline(
                     room_id,
                     room,
                     join_info,
                     since,
                     backfill_deadline,
                 )
+                backfill_complete = room_backfill_complete and backfill_complete
 
             for index, event in enumerate(join_info.timeline.events):
                 decrypted_event = self._handle_timeline_event(
@@ -823,6 +830,8 @@ class AsyncClient(Client):
 
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
+
+        return backfill_complete
 
     async def _dispatch_backfilled_event(
         self, event: Event | BadEventType, room: MatrixRoom
@@ -924,7 +933,7 @@ class AsyncClient(Client):
         join_info: RoomInfo,
         since: str,
         deadline: float,
-    ) -> None:
+    ) -> bool:
         """Recover and dispatch events dropped by one room's limited timeline.
 
         The homeserver truncated this room's timeline (``limited: true``), so
@@ -948,7 +957,7 @@ class AsyncClient(Client):
                 "lost",
                 room_id,
             )
-            return
+            return False
 
         present_in_sync = {
             event.event_id
@@ -962,7 +971,7 @@ class AsyncClient(Client):
                 "Skipping limited-timeline backfill for room %s: no prev_batch",
                 room_id,
             )
-            return
+            return False
 
         collect = self._collect_gap_events_backward(
             room_id,
@@ -984,10 +993,10 @@ class AsyncClient(Client):
                 room_id,
                 remaining,
             )
-            return
+            return False
         except Exception:
             logger.exception("Failed to backfill limited timeline for room %s", room_id)
-            return
+            return False
 
         if not gap_closed:
             logger.warning(
@@ -999,7 +1008,7 @@ class AsyncClient(Client):
             )
 
         if not recovered:
-            return
+            return gap_closed
 
         encrypted_rooms: set[str] = set()
         dispatched = 0
@@ -1076,6 +1085,8 @@ class AsyncClient(Client):
                 pages,
                 room_id,
             )
+
+        return gap_closed and dispatched == len(recovered)
 
     async def _collect_gap_events_backward(
         self,
@@ -1236,8 +1247,8 @@ class AsyncClient(Client):
         since = (
             self._sync_since
             or self.next_batch
-            or self.loaded_sync_token
             or self._last_processed_sync_token
+            or self.loaded_sync_token
             or None
         )
         self._sync_since = None
@@ -1248,14 +1259,11 @@ class AsyncClient(Client):
 
         self.next_batch = response.next_batch
 
-        if self.config.store_sync_tokens and self.store:
-            self.store.save_sync_token(self.next_batch)
-
         await self._handle_to_device(response)
 
         await self._handle_invited_rooms(response)
 
-        await self._handle_joined_rooms(response, since)
+        backfill_complete = await self._handle_joined_rooms(response, since)
 
         await self._handle_presence_events(response)
 
@@ -1266,7 +1274,23 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
 
-        self._last_processed_sync_token = response.next_batch
+        if not backfill_complete:
+            if self._last_processed_sync_token is None and since:
+                self._last_processed_sync_token = since
+            self._has_unrecovered_sync_gap = True
+        elif (
+            not self._has_unrecovered_sync_gap
+            or since == self._last_processed_sync_token
+        ):
+            self._last_processed_sync_token = response.next_batch
+            self._has_unrecovered_sync_gap = False
+
+        if (
+            self.config.store_sync_tokens
+            and self.store
+            and self._last_processed_sync_token
+        ):
+            self.store.save_sync_token(self._last_processed_sync_token)
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
