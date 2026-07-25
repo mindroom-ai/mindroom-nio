@@ -1152,6 +1152,97 @@ class TestClass:
 
         assert not async_client.should_upload_keys
 
+    async def test_sliding_sync_forever_seeds_room_tokens(
+        self, async_client, aioresponse
+    ):
+        """The first request widens its ranges, the rest do not.
+
+        A room outside the list window never hands the client a token, so
+        a limited window it later arrives with cannot be recovered. The
+        connection's first request covers every room to collect those
+        tokens; the configured window applies from then on.
+        """
+        async_client.config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_sliding_seed_rooms=500,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/upload",
+            status=200,
+            payload=self.final_keys_upload_response,
+            repeat=True,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query",
+            status=200,
+            payload=self.keys_query_response,
+            repeat=True,
+        )
+        requests = []
+
+        def callback(url, data, **kwargs):
+            requests.append(json.loads(data))
+            if len(requests) >= 2:
+                async_client.stop_sync_forever()
+            return CallbackResult(
+                status=200, payload={"pos": f"p{len(requests)}", "rooms": {}}
+            )
+
+        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
+
+        lists = {"main": {"ranges": [[0, 9]], "timeline_limit": 5}}
+        await asyncio.wait_for(
+            async_client.sliding_sync_forever(
+                timeout=30_000, conn_id="seed", lists=lists
+            ),
+            60,
+        )
+
+        assert requests[0]["lists"]["main"]["ranges"] == [[0, 499]]
+        assert requests[1]["lists"]["main"]["ranges"] == [[0, 9]]
+        # Widening is a copy; the caller's lists are untouched.
+        assert lists["main"]["ranges"] == [[0, 9]]
+        assert requests[0]["lists"]["main"]["timeline_limit"] == 5
+
+    async def test_sliding_sync_forever_without_backfill_keeps_ranges(
+        self, async_client, aioresponse
+    ):
+        """Widening is a backfill concern; plain loops are unchanged."""
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/upload",
+            status=200,
+            payload=self.final_keys_upload_response,
+            repeat=True,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query",
+            status=200,
+            payload=self.keys_query_response,
+            repeat=True,
+        )
+        requests = []
+
+        def callback(url, data, **kwargs):
+            requests.append(json.loads(data))
+            if len(requests) >= 2:
+                async_client.stop_sync_forever()
+            return CallbackResult(
+                status=200, payload={"pos": f"p{len(requests)}", "rooms": {}}
+            )
+
+        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
+
+        await asyncio.wait_for(
+            async_client.sliding_sync_forever(
+                timeout=30_000,
+                conn_id="plain",
+                lists={"main": {"ranges": [[0, 9]], "timeline_limit": 5}},
+            ),
+            60,
+        )
+
+        assert requests[0]["lists"]["main"]["ranges"] == [[0, 9]]
+
     async def test_sliding_sync_forever_unknown_pos(self, async_client, aioresponse):
         def message(event_id, body):
             return {

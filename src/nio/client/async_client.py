@@ -396,6 +396,12 @@ class AsyncClientConfig(ClientConfig):
             Exceeding either bound abandons unverified history.
         backfill_page_size (int): Events requested per page.
         backfill_timeout (float): Seconds available to one recovery pump.
+        backfill_sliding_seed_rooms (int): How many rooms the first request
+            of a Simplified Sliding Sync connection widens its list ranges
+            to, so that rooms outside the configured window still hand back
+            a token to recover from. Only applies while
+            backfill_limited_timelines is on; 0 disables the widening and
+            leaves rooms unrecoverable until they first enter the window.
     """
 
     max_limit_exceeded: int | None = None
@@ -409,6 +415,7 @@ class AsyncClientConfig(ClientConfig):
     backfill_max_events: int = 200
     backfill_page_size: int = 50
     backfill_timeout: float = 30.0
+    backfill_sliding_seed_rooms: int = 1000
 
 
 class AsyncClient(Client):
@@ -1097,6 +1104,31 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+
+    def _sliding_seed_lists(
+        self, lists: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Widen the first request's ranges so every room hands back a token.
+
+        A limited window is only recoverable from a token the client
+        already holds for that room, and the server only hands one out
+        when it sends the room. A list window narrower than the account's
+        room count therefore leaves the rooms outside it unrecoverable
+        until they first bump into view — every event written to them
+        before that is unreachable, silently.
+
+        Widening the ranges for the connection's first request alone gives
+        every room a token up front, at the cost of one larger response
+        per connection. The configured ranges apply from the next request
+        on, so the steady-state window is unchanged.
+        """
+        limit = self.config.backfill_sliding_seed_rooms
+        if not (self.config.backfill_limited_timelines and limit and lists):
+            return lists
+        return {
+            name: {**spec, "ranges": [[0, limit - 1]]} if spec.get("ranges") else spec
+            for name, spec in lists.items()
+        }
 
     def _sliding_recovery_cursor(
         self, room_id: str, room: SlidingSyncRoom
@@ -2388,7 +2420,7 @@ class AsyncClient(Client):
                         pos=pos,
                         timeout=use_timeout,
                         set_presence=set_presence,
-                        lists=lists,
+                        lists=self._sliding_seed_lists(lists),
                         room_subscriptions=room_subscriptions,
                         extensions=self._sliding_sync_request_extensions(extensions),
                         unstable=unstable,
