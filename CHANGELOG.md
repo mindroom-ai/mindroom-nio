@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Recover limited timelines on the Simplified Sliding Sync transport too.
+  `backfill_limited_timelines` previously only planned a walk for `/v3/sync`
+  gaps, so `sliding_sync_forever()` dropped the events a limited window left
+  behind with no walk and no warning (measured with a one-event window and
+  200 concurrent writes: 10/40 lost serially, 170/200 concurrently). A
+  sliding `pos` is a connection cursor rather than a `/messages` token, but
+  each room's `prev_batch` is one, so consecutive windows now bound an
+  ordinary forward walk: from the token held for the room to the one this
+  window carries. The overlap that leaves is dropped by the existing
+  de-duplication. `initial` rooms the client already tracks are walked the
+  same way, which covers a room re-entering a list window and a connection
+  the server expired. The token is per-process, so the first discontinuity
+  after a client restart still has no baseline to walk from and is not
+  recovered; the `/v3/sync` transport keeps recovering across restarts
+  through its stored sync token.
+- Widen the list ranges of a sliding connection's first request to
+  `AsyncClientConfig.backfill_sliding_seed_rooms` (default 1000, 0 disables)
+  while `backfill_limited_timelines` is on. A room outside the configured
+  window is never sent, so the client holds no token for it and cannot
+  recover the limited window it eventually arrives with: everything written
+  to it before its first delivery is unreachable. Collecting a token for
+  every room up front costs one larger response per connection and closes
+  that hole — under a chaos pass with 20 rooms behind an 8-room window,
+  4320 events, eight writers and a connection reset every round, the two
+  sliding readers went from 267 and 269 events lost to none. The configured
+  ranges apply from the second request on, so the steady-state window is
+  unchanged.
+
 ## 0.30.1
 
 ### Bug Fixes

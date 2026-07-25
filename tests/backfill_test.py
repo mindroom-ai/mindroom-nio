@@ -3226,6 +3226,121 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$gap2", "$held", "$slide"]
         assert not client._recovery.gaps
 
+    @staticmethod
+    def _sliding(
+        pos: str,
+        events: list,
+        *,
+        limited: bool = False,
+        prev_batch: str | None = None,
+        initial: bool = False,
+        membership: str = "join",
+    ) -> SlidingSyncResponse:
+        room: dict = {
+            "membership": membership,
+            "timeline": [event.source for event in events],
+            "limited": limited,
+        }
+        if prev_batch is not None:
+            room["prev_batch"] = prev_batch
+        if initial:
+            room["initial"] = True
+        response = SlidingSyncResponse.from_dict({"pos": pos, "rooms": {ROOM_A: room}})
+        assert isinstance(response, SlidingSyncResponse)
+        return response
+
+    async def test_limited_sliding_window_walks_between_prev_batches(
+        self, client, aioresponse
+    ):
+        """Consecutive window tokens bound a forward walk over the gap.
+
+        A sliding `pos` is not a /messages token, but `prev_batch` is, so
+        the walk runs from the previous window's token to this one's.
+        """
+        seen = record_events(client)
+        await client.receive_response(
+            self._sliding("s1", [text_event("$first", 1)], prev_batch="w1")
+        )
+        assert seen == ["$first"]
+
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            self._sliding("s2", [text_event("$held", 3)], limited=True, prev_batch="w2")
+        )
+
+        assert seen == ["$first", "$gap", "$held"]
+        assert pages.from_tokens == ["w1"]
+        assert pages.to_tokens == ["w2"]
+        assert not client._recovery.gaps
+
+    async def test_first_sliding_window_plans_no_walk(self, client, aioresponse):
+        """Without a previous window there is no token to walk from."""
+        seen = record_events(client)
+        await client.receive_response(
+            self._sliding("s1", [text_event("$held", 1)], limited=True, prev_batch="w1")
+        )
+        assert seen == ["$held"]
+        assert not client._recovery.gaps
+
+    async def test_initial_sliding_room_walks_from_the_held_token(
+        self, client, aioresponse
+    ):
+        """A snapshot for a known room is a discontinuity like `limited`.
+
+        A room re-entering a list window, or arriving on a connection the
+        server expired, comes back flagged `initial`; the events since the
+        held token are just as gone as after a limited window.
+        """
+        seen = record_events(client)
+        await client.receive_response(
+            self._sliding("s1", [text_event("$first", 1)], prev_batch="w1")
+        )
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            self._sliding(
+                "s2",
+                [text_event("$held", 3)],
+                prev_batch="w2",
+                initial=True,
+            )
+        )
+        assert seen == ["$first", "$gap", "$held"]
+        assert pages.from_tokens == ["w1"]
+        assert not client._recovery.gaps
+
+    async def test_initial_sliding_room_without_baseline_plans_no_walk(
+        self, client, aioresponse
+    ):
+        """A room seen for the first time has no token to walk from."""
+        seen = record_events(client)
+        await client.receive_response(
+            self._sliding(
+                "s1",
+                [text_event("$held", 1)],
+                prev_batch="w1",
+                initial=True,
+            )
+        )
+        assert seen == ["$held"]
+        assert not client._recovery.gaps
+
+    async def test_left_room_drops_the_sliding_walk_token(self, client, aioresponse):
+        """A stale token must not make a rejoin walk pre-departure history."""
+        seen = record_events(client)
+        await client.receive_response(
+            self._sliding("s1", [text_event("$first", 1)], prev_batch="w1")
+        )
+        await client.receive_response(
+            self._sliding("s2", [], membership="leave", prev_batch="w2")
+        )
+        await client.receive_response(
+            self._sliding("s3", [text_event("$held", 3)], limited=True, prev_batch="w3")
+        )
+        assert seen == ["$first", "$held"]
+        assert not client._recovery.gaps
+
     async def test_sliding_own_join_resets_classic_history_not_current_timeline(
         self, client, aioresponse
     ):

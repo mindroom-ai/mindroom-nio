@@ -60,6 +60,7 @@ from nio import (
     MegolmEvent,
     MessageDirection,
     RoomMessageText,
+    RoomPreset,
 )
 from nio.responses import (
     RegisterResponse,
@@ -725,7 +726,7 @@ async def flood(
         if event_id
     ]
     check(
-        f"recovery slam: message flood accepted ({label})",
+        f"flood accepted ({label})",
         len(targets) == n_messages,
         f"{n_messages - len(targets)} sends failed, first: {failures[:1]}",
     )
@@ -831,7 +832,7 @@ async def recovery_slam(
     n_messages: int,
     n_edits: int,
     n_writers: int,
-    allow_sliding_gap: bool = False,
+    restart: bool = True,
 ) -> None:
     """Flood rooms with a one-event sync window and assert exactly-once.
 
@@ -899,31 +900,32 @@ async def recovery_slam(
         # Restart the sliding reader mid-flood, from its store, while the
         # writers keep going: durable recovery state has to survive the
         # process boundary without losing or replaying events.
-        restart_credentials = (
-            sliding.user_id,
-            sliding.device_id,
-            sliding.access_token,
-            sliding.store_path,
-        )
-        sliding.stop_sync_forever()
-        await asyncio.wait_for(sliding_task, 120)
-        await sliding.close()
-
-        user_id, device_id, access_token, store_path = restart_credentials
-        sliding = AsyncClient(
-            homeserver, user_id, device_id, store_path, recovery_config(budget)
-        )
-        sliding.restore_login(user_id, device_id, access_token)
-        sliding.add_event_callback(sliding_recorder, Event)
-        readers[0] = sliding
-        sliding_task = asyncio.create_task(
-            sliding.sliding_sync_forever(
-                timeout=10_000,
-                conn_id=f"rslam-restarted-{suffix}",
-                lists=RECOVERY_LISTS,
-                extensions={"to_device": {"enabled": True}},
+        if restart:
+            restart_credentials = (
+                sliding.user_id,
+                sliding.device_id,
+                sliding.access_token,
+                sliding.store_path,
             )
-        )
+            sliding.stop_sync_forever()
+            await asyncio.wait_for(sliding_task, 120)
+            await sliding.close()
+
+            user_id, device_id, access_token, store_path = restart_credentials
+            sliding = AsyncClient(
+                homeserver, user_id, device_id, store_path, recovery_config(budget)
+            )
+            sliding.restore_login(user_id, device_id, access_token)
+            sliding.add_event_callback(sliding_recorder, Event)
+            readers[0] = sliding
+            sliding_task = asyncio.create_task(
+                sliding.sliding_sync_forever(
+                    timeout=10_000,
+                    conn_id=f"rslam-restarted-{suffix}",
+                    lists=RECOVERY_LISTS,
+                    extensions={"to_device": {"enabled": True}},
+                )
+            )
 
         # Second half, against the restarted reader.
         second, more_failures = await flood(
@@ -966,13 +968,12 @@ async def recovery_slam(
             sent[room_id].add(resp.event_id)
             sent_ids.add(resp.event_id)
 
-        # Waiting on a reader that is known not to recover only burns the
-        # deadline, so a waived sliding gap drops out of the convergence
-        # condition (its counts are still reported and asserted below).
+        # The sliding reader holds its walk baseline in memory, so a
+        # restart costs it the first discontinuity per room afterwards.
+        # Waiting on a reader that cannot converge only burns the deadline;
+        # its counts are still reported and bounded below.
         awaited = (
-            (classic_recorder,)
-            if allow_sliding_gap
-            else (sliding_recorder, classic_recorder)
+            (classic_recorder,) if restart else (sliding_recorder, classic_recorder)
         )
         deadline = time.monotonic() + 900
         last_report = 0.0
@@ -993,14 +994,22 @@ async def recovery_slam(
         # its verdict is the one that proves the walk works.
         for recorder in (classic_recorder, sliding_recorder):
             missing_ids = sent_ids - recorder.seen()
-            if missing_ids and recorder is sliding_recorder and allow_sliding_gap:
-                # `_handle_sliding_sync` never opens a recovery gap, so a
-                # limited sliding window drops events with no walk and no
-                # warning. Known hole, reported rather than asserted.
+            if missing_ids and recorder is sliding_recorder and restart:
+                # The sliding walk baseline is per-process, so the first
+                # discontinuity after the restart has nothing to walk from.
+                # That is bounded by one window per room; anything larger is
+                # a regression in the steady-state path, not this hole.
+                budget_lost = 4 * n_rooms + len(sent_ids) // 20
                 print(
-                    f"recovery slam: KNOWN GAP: sliding lost "
-                    f"{len(missing_ids)}/{len(sent_ids)} events "
-                    f"(sliding sync plans no recovery gap)"
+                    f"recovery slam: sliding lost {len(missing_ids)}/"
+                    f"{len(sent_ids)} events across its restart "
+                    f"(in-memory walk baseline, bound {budget_lost})"
+                )
+                check(
+                    "recovery slam: sliding restart loss stays bounded",
+                    len(missing_ids) <= budget_lost,
+                    f"{len(missing_ids)} lost exceeds the {budget_lost} a "
+                    f"restart can explain: steady-state recovery regressed",
                 )
             else:
                 check(
@@ -1074,7 +1083,6 @@ async def encrypted_recovery_slam(
     homeserver: str,
     n_messages: int,
     window: int = 1,
-    allow_sliding_gap: bool = False,
 ) -> None:
     """Flood an encrypted room with a one-event window and assert decryption."""
     suffix = secrets.token_hex(4)
@@ -1191,21 +1199,11 @@ async def encrypted_recovery_slam(
             600,
         )
         missing = sent_ids - set(recorder.decrypted)
-        if missing and allow_sliding_gap and window <= 1:
-            # This pass reads through sliding sync only, which plans no
-            # recovery gap, so a one-event window loses events before
-            # decryption ever gets a say. Raise --recovery-encrypted-window
-            # to tell a decryption failure apart from that hole.
-            print(
-                f"encrypted recovery slam: KNOWN GAP: {len(missing)}/"
-                f"{len(sent_ids)} events lost to the sliding backfill gap"
-            )
-        else:
-            check(
-                "encrypted recovery slam: every event was decrypted and dispatched",
-                converged and not missing,
-                f"{len(missing)} never arrived decrypted",
-            )
+        check(
+            "encrypted recovery slam: every event was decrypted and dispatched",
+            converged and not missing,
+            f"{len(missing)} never arrived decrypted",
+        )
         check(
             "encrypted recovery slam: no event decrypted twice",
             not [event_id for event_id in sent_ids if recorder.decrypted[event_id] > 1],
@@ -1224,6 +1222,557 @@ async def encrypted_recovery_slam(
             loop_task.cancel()
         await alice.close()
         await bob.close()
+
+
+async def stream_chaos(
+    homeserver: str,
+    n_rooms: int,
+    streams_per_room: int,
+    n_edits: int,
+    n_writers: int,
+    redact_every: int,
+    window: int,
+) -> None:
+    """The MindRoom traffic profile: one message, then edits, forever.
+
+    An agent streaming an LLM reply posts a message and then replaces it
+    over and over, so the overwhelming majority of events are edits of a
+    single event, arriving as a dense run in one room. That shape is what
+    makes a sync window `limited`, which means nearly all of it reaches
+    callbacks through the recovery walk rather than the live window.
+
+    The general chaos pass spreads a quarter of an edit over each of
+    hundreds of targets and never edits the same event twice. This runs
+    many chains at once instead and adds the assertion that shape needs:
+    every chain has to be dispatched in the server's order for that target,
+    since edit order is what decides the text a client finally renders.
+    """
+    suffix = secrets.token_hex(4)
+    total = n_rooms * streams_per_room * (n_edits + 1)
+    budget = total * 4 + 5000
+    lists = chaos_lists(window)
+
+    writers = [
+        await register(homeserver, f"st-w{i}-{suffix}") for i in range(n_writers)
+    ]
+    sliding = await register_configured(
+        homeserver, f"st-slide-{suffix}", recovery_config(budget)
+    )
+    classic = await register_configured(
+        homeserver, f"st-classic-{suffix}", recovery_config(budget)
+    )
+    readers = [sliding, classic]
+    recorders = {
+        id(sliding): Recorder("sliding"),
+        id(classic): Recorder("classic"),
+    }
+    for reader in readers:
+        reader.add_event_callback(recorders[id(reader)], Event)
+
+    sliding_task: asyncio.Task | None = None
+    classic_task: asyncio.Task | None = None
+    try:
+        room_ids = []
+        for i in range(n_rooms):
+            resp = await writers[0].room_create(
+                name=f"stream {i}", preset=RoomPreset.public_chat
+            )
+            room_ids.append(resp.room_id)
+            for member in writers[1:] + readers:
+                await member.join(resp.room_id)
+
+        sliding_task = await restart_sliding_loop(
+            sliding, None, f"stream-{suffix}", lists
+        )
+        classic_task = asyncio.create_task(
+            classic.sync_forever(timeout=10_000, sync_filter=RECOVERY_SYNC_FILTER)
+        )
+        for reader in readers:
+            await asyncio.wait_for(reader.synced.wait(), 120)
+
+        sent: dict[str, set[str]] = defaultdict(set)
+        # root event id -> (room, its edits in the order the server took them)
+        chains: dict[str, tuple[str, list[str]]] = {}
+        redacted: list[str] = []
+        failures: list[object] = []
+
+        async def stream(index: int) -> None:
+            """One streamed reply: post once, then replace it repeatedly."""
+            writer = writers[index % len(writers)]
+            room_id = room_ids[index % n_rooms]
+            resp = await writer.room_send(
+                room_id,
+                "m.room.message",
+                {"msgtype": "m.text", "body": f"stream-{index} ..."},
+            )
+            root = getattr(resp, "event_id", None)
+            if not root:
+                failures.append(resp)
+                return
+            sent[room_id].add(root)
+            chains[root] = (room_id, [])
+
+            for step in range(n_edits):
+                body = f"stream-{index} {'.' * (step % 40)}"
+                # Sequential within a chain, exactly like a token stream:
+                # each replacement follows the one before it.
+                resp = await writer.room_send(
+                    room_id,
+                    "m.room.message",
+                    {
+                        "msgtype": "m.text",
+                        "body": f"* {body}",
+                        "m.new_content": {"msgtype": "m.text", "body": body},
+                        "m.relates_to": {"rel_type": "m.replace", "event_id": root},
+                    },
+                )
+                event_id = getattr(resp, "event_id", None)
+                if not event_id:
+                    failures.append(resp)
+                    return
+                sent[room_id].add(event_id)
+                chains[root][1].append(event_id)
+
+                # Deleting a reply while it is still streaming: the edits
+                # that follow land on a redacted target.
+                if redact_every and step == n_edits // 2 and index % redact_every == 0:
+                    resp = await writers[0].room_redact(room_id, root, "streaming")
+                    event_id = getattr(resp, "event_id", None)
+                    if event_id:
+                        sent[room_id].add(event_id)
+                        redacted.append(root)
+                    else:
+                        failures.append(resp)
+
+        start = time.monotonic()
+        await asyncio.gather(*(stream(i) for i in range(n_rooms * streams_per_room)))
+        elapsed = time.monotonic() - start
+        sent_ids = {event_id for ids in sent.values() for event_id in ids}
+        check(
+            "stream: every write was accepted",
+            not failures,
+            f"{len(failures)} failures, first: {failures[:1]}",
+        )
+        print(
+            f"stream: {len(chains)} concurrent streams over {n_rooms} rooms, "
+            f"{len(sent_ids)} events ({n_edits} edits per stream, "
+            f"{len(redacted)} roots redacted mid-stream) in {elapsed:.1f}s "
+            f"({len(sent_ids) / elapsed:.0f}/s)"
+        )
+
+        for i, room_id in enumerate(room_ids):
+            resp = await writers[0].room_send(
+                room_id,
+                "m.room.message",
+                {"msgtype": "m.text", "body": f"stream-sentinel-{i}"},
+            )
+            sent[room_id].add(resp.event_id)
+            sent_ids.add(resp.event_id)
+
+        deadline = time.monotonic() + 900
+        last_report = 0.0
+        while time.monotonic() < deadline:
+            missing = {
+                recorder.name: len(sent_ids - recorder.seen())
+                for recorder in recorders.values()
+            }
+            if not any(missing.values()):
+                break
+            now = time.monotonic()
+            if now - last_report > 20:
+                last_report = now
+                print(f"stream: waiting, missing {missing}")
+            await asyncio.sleep(1)
+
+        canonical: dict[str, list[str]] = {}
+        for room_id in room_ids:
+            canonical[room_id] = [
+                event_id
+                for event_id in await canonical_order(writers[0], room_id)
+                if event_id in sent[room_id]
+            ]
+
+        for recorder in recorders.values():
+            missing_ids = sent_ids - recorder.seen()
+            check(
+                f"stream: {recorder.name} lost no events",
+                not missing_ids,
+                f"{len(missing_ids)}/{len(sent_ids)} never dispatched, "
+                f"e.g. {list(missing_ids)[:3]}",
+            )
+            duplicates = recorder.duplicates(sent_ids)
+            check(
+                f"stream: {recorder.name} dispatched each event once",
+                not duplicates,
+                f"{len(duplicates)} duplicated, e.g. {list(duplicates.items())[:3]}",
+            )
+
+            # Per-target order: the replacements of one event have to reach
+            # callbacks in the order the server accepted them, or the text
+            # the client ends up rendering is not the last one sent.
+            for root, (room_id, edits) in chains.items():
+                chain = set(edits) | {root}
+                expected = [
+                    event_id for event_id in canonical[room_id] if event_id in chain
+                ]
+                got = [
+                    event_id
+                    for event_id in recorder.order[room_id]
+                    if event_id in chain
+                ]
+                if got != expected:
+                    first_bad = next(
+                        (i for i, (a, b) in enumerate(zip(got, expected)) if a != b),
+                        min(len(got), len(expected)),
+                    )
+                    check(
+                        f"stream: {recorder.name} kept every edit chain in order",
+                        False,
+                        f"chain {root} in {room_id} diverges at {first_bad}: "
+                        f"got {got[first_bad : first_bad + 3]} "
+                        f"expected {expected[first_bad : first_bad + 3]}",
+                    )
+            check(f"stream: {recorder.name} kept every edit chain in order", True)
+
+            for room_id in room_ids:
+                expected = [
+                    event_id
+                    for event_id in canonical[room_id]
+                    if event_id in recorder.seen()
+                ]
+                got = [
+                    event_id
+                    for event_id in recorder.order[room_id]
+                    if event_id in sent[room_id]
+                ]
+                check(
+                    f"stream: {recorder.name} preserved room order",
+                    got == expected,
+                    f"{room_id} order diverges",
+                )
+
+        for reader in readers:
+            reader.stop_sync_forever()
+        await asyncio.wait_for(asyncio.gather(sliding_task, classic_task), 180)
+    finally:
+        for task in (sliding_task, classic_task):
+            if task is not None and not task.done():
+                task.cancel()
+        for client in writers + readers:
+            await client.close()
+
+
+def chaos_lists(window: int, timeline_limit: int = 1) -> dict:
+    return {
+        "chaos": {
+            "ranges": [[0, max(0, window - 1)]],
+            "timeline_limit": timeline_limit,
+            "required_state": [
+                ["m.room.create", ""],
+                ["m.room.member", "$LAZY"],
+            ],
+        }
+    }
+
+
+async def restart_sliding_loop(
+    client: AsyncClient,
+    task: asyncio.Task | None,
+    conn_id: str,
+    lists: dict,
+) -> asyncio.Task:
+    """Drop the sliding connection and start a fresh one on the same client.
+
+    The client keeps its in-memory walk baseline, so this is the connection
+    expiry case rather than the process restart case: every tracked room
+    comes back flagged ``initial`` and has to be walked from the token held
+    for it.
+    """
+    if task is not None:
+        client.stop_sync_forever()
+        await asyncio.wait_for(task, 180)
+    client.synced.clear()
+    return asyncio.create_task(
+        client.sliding_sync_forever(
+            timeout=10_000,
+            conn_id=conn_id,
+            lists=lists,
+            extensions={"to_device": {"enabled": True}},
+        )
+    )
+
+
+async def chaos_slam(
+    homeserver: str,
+    n_rooms: int,
+    n_writers: int,
+    n_rounds: int,
+    n_messages: int,
+    window: int,
+) -> None:
+    """Sustained mixed load through a list window too small to hold it.
+
+    The recovery slam floods once, with every room inside the list window
+    and one connection per reader. This runs the paths that leaves out:
+    rooms constantly falling out of and re-entering the window (which
+    arrive flagged ``initial`` and must be walked from the held token),
+    sliding connections dropped and rebuilt between rounds, membership
+    churn, and several rounds of writers racing each other rather than one
+    burst. Two sliding readers and one classic reader must still each
+    dispatch every accepted write exactly once, in the server's order.
+    """
+    suffix = secrets.token_hex(4)
+    budget = n_rounds * n_messages * 8 + 5000
+    flood_lists = chaos_lists(window)
+
+    writers = [
+        await register(homeserver, f"ch-w{i}-{suffix}") for i in range(n_writers)
+    ]
+    churn = await register(homeserver, f"ch-churn-{suffix}")
+    sliding_a = await register_configured(
+        homeserver, f"ch-slide-a-{suffix}", recovery_config(budget)
+    )
+    sliding_b = await register_configured(
+        homeserver, f"ch-slide-b-{suffix}", recovery_config(budget)
+    )
+    classic = await register_configured(
+        homeserver, f"ch-classic-{suffix}", recovery_config(budget)
+    )
+    readers = [sliding_a, sliding_b, classic]
+    recorders = {
+        id(sliding_a): Recorder("sliding-a"),
+        id(sliding_b): Recorder("sliding-b"),
+        id(classic): Recorder("classic"),
+    }
+    for reader in readers:
+        reader.add_event_callback(recorders[id(reader)], Event)
+
+    task_a: asyncio.Task | None = None
+    task_b: asyncio.Task | None = None
+    classic_task: asyncio.Task | None = None
+    room_ids: list[str] = []
+    try:
+        for i in range(n_rooms):
+            # Public rooms so the churn user can leave and rejoin freely.
+            resp = await writers[0].room_create(
+                name=f"chaos {i}", preset=RoomPreset.public_chat
+            )
+            room_ids.append(resp.room_id)
+            for member in writers[1:] + readers:
+                await member.join(resp.room_id)
+
+        task_a = await restart_sliding_loop(
+            sliding_a, None, f"chaos-a-{suffix}-0", flood_lists
+        )
+        task_b = await restart_sliding_loop(
+            sliding_b, None, f"chaos-b-{suffix}-0", flood_lists
+        )
+        classic_task = asyncio.create_task(
+            classic.sync_forever(timeout=10_000, sync_filter=RECOVERY_SYNC_FILTER)
+        )
+        for reader in readers:
+            await asyncio.wait_for(reader.synced.wait(), 120)
+
+        sent: dict[str, set[str]] = defaultdict(set)
+        failures: list[object] = []
+        start = time.monotonic()
+        for round_index in range(n_rounds):
+            produced, round_failures = await flood(
+                writers,
+                room_ids,
+                n_messages,
+                n_messages // 2,
+                n_messages // 4,
+                n_rooms // 2,
+                n_rooms // 2,
+                label=f"chaos round {round_index}",
+            )
+            for room_id, ids in produced.items():
+                sent[room_id] |= ids
+            failures.extend(round_failures)
+
+            # Membership churn against a slice of the rooms, concurrent
+            # with the next round's writes.
+            for room_id in room_ids[round_index % 2 :: 4]:
+                await churn.join(room_id)
+                await churn.room_leave(room_id)
+
+            # Alternate which reader loses its connection, so one of them
+            # is always mid-flight while the other re-establishes.
+            if round_index % 2 == 0:
+                task_a = await restart_sliding_loop(
+                    sliding_a,
+                    task_a,
+                    f"chaos-a-{suffix}-{round_index + 1}",
+                    flood_lists,
+                )
+            else:
+                task_b = await restart_sliding_loop(
+                    sliding_b,
+                    task_b,
+                    f"chaos-b-{suffix}-{round_index + 1}",
+                    flood_lists,
+                )
+
+        sent_ids = {event_id for ids in sent.values() for event_id in ids}
+        elapsed = time.monotonic() - start
+        check(
+            "chaos: every write was accepted",
+            not failures,
+            f"{len(failures)} failures, first: {failures[:1]}",
+        )
+        print(
+            f"chaos: wrote {len(sent_ids)} events over {n_rooms} rooms from "
+            f"{n_writers} writers in {n_rounds} rounds through a {window}-room "
+            f"window in {elapsed:.1f}s ({len(sent_ids) / elapsed:.0f}/s)"
+        )
+
+        # Settle with a window wide enough for every room, so rooms that
+        # were evicted during the flood come back and drain. They arrive
+        # `initial`, which is itself the path under test.
+        settle_lists = chaos_lists(n_rooms + 5)
+        task_a = await restart_sliding_loop(
+            sliding_a, task_a, f"chaos-a-{suffix}-settle", settle_lists
+        )
+        task_b = await restart_sliding_loop(
+            sliding_b, task_b, f"chaos-b-{suffix}-settle", settle_lists
+        )
+        for i, room_id in enumerate(room_ids):
+            resp = await writers[0].room_send(
+                room_id,
+                "m.room.message",
+                {"msgtype": "m.text", "body": f"chaos-sentinel-{i}"},
+            )
+            sent[room_id].add(resp.event_id)
+            sent_ids.add(resp.event_id)
+
+        deadline = time.monotonic() + 900
+        last_report = 0.0
+        stalled_since = time.monotonic()
+        previous: dict[str, int] = {}
+        while time.monotonic() < deadline:
+            missing = {
+                recorder.name: len(sent_ids - recorder.seen())
+                for recorder in recorders.values()
+            }
+            if not any(missing.values()):
+                break
+            now = time.monotonic()
+            if missing != previous:
+                previous = missing
+                stalled_since = now
+            elif now - stalled_since > 120:
+                # Rooms never delivered to a reader never converge; the
+                # classification below decides whether that is legitimate.
+                print(f"chaos: no progress for 120s, missing {missing}")
+                break
+            if now - last_report > 20:
+                last_report = now
+                print(f"chaos: waiting, missing {missing}")
+            await asyncio.sleep(1)
+
+        # Canonical order per room, fetched once and shared by every check.
+        canonical: dict[str, list[str]] = {}
+        for room_id in room_ids:
+            canonical[room_id] = [
+                event_id
+                for event_id in await canonical_order(writers[0], room_id)
+                if event_id in sent[room_id]
+            ]
+
+        # A room the reader has never been handed cannot be walked: there
+        # is no token for it, so its history up to the first delivery is
+        # out of reach. Everything from that point on must be complete —
+        # that is the invariant eviction and reconnects must not break,
+        # and it is asserted separately from the raw loss count.
+        for recorder in recorders.values():
+            missing_ids = sent_ids - recorder.seen()
+            before_first: list[str] = []
+            after_first: list[str] = []
+            for room_id, order in canonical.items():
+                delivered = [
+                    index
+                    for index, event_id in enumerate(order)
+                    if event_id in recorder.seen()
+                ]
+                first = delivered[0] if delivered else len(order)
+                for index, event_id in enumerate(order):
+                    if event_id in recorder.seen():
+                        continue
+                    (before_first if index < first else after_first).append(event_id)
+
+            if before_first:
+                print(
+                    f"chaos: {recorder.name} never saw {len(before_first)} events "
+                    f"written before a room's first delivery to it "
+                    f"(no walk baseline for a room the server has not sent yet)"
+                )
+            check(
+                f"chaos: {recorder.name} lost nothing after a room's first delivery",
+                not after_first,
+                f"{len(after_first)} events lost mid-stream, e.g. {after_first[:3]}",
+            )
+            if window >= n_rooms:
+                # With every room inside the window there is no unseen
+                # room to excuse, so the raw count has to be zero too.
+                check(
+                    f"chaos: {recorder.name} lost no events",
+                    not missing_ids,
+                    f"{len(missing_ids)}/{len(sent_ids)} never dispatched, "
+                    f"e.g. {list(missing_ids)[:3]}",
+                )
+            duplicates = recorder.duplicates(sent_ids)
+            check(
+                f"chaos: {recorder.name} dispatched each event once",
+                not duplicates,
+                f"{len(duplicates)} duplicated, e.g. {list(duplicates.items())[:3]}",
+            )
+            check(
+                f"chaos: {recorder.name} left nothing undecryptable",
+                not recorder.undecryptable,
+                f"{len(recorder.undecryptable)} events stuck encrypted",
+            )
+
+        for room_id in room_ids:
+            for recorder in recorders.values():
+                # Events the reader never received cannot break its
+                # ordering; it is compared against what it did receive.
+                expected = [
+                    event_id
+                    for event_id in canonical[room_id]
+                    if event_id in recorder.seen()
+                ]
+                got = [
+                    event_id
+                    for event_id in recorder.order[room_id]
+                    if event_id in sent[room_id]
+                ]
+                if got != expected:
+                    first_bad = next(
+                        (i for i, (a, b) in enumerate(zip(got, expected)) if a != b),
+                        min(len(got), len(expected)),
+                    )
+                    check(
+                        f"chaos: {recorder.name} preserved room order",
+                        False,
+                        f"{room_id} diverges at index {first_bad}: "
+                        f"got {got[first_bad : first_bad + 3]} "
+                        f"expected {expected[first_bad : first_bad + 3]}",
+                    )
+        check("chaos: every reader preserved per-room order", True)
+
+        for reader in readers:
+            reader.stop_sync_forever()
+        await asyncio.wait_for(
+            asyncio.gather(task_a, task_b, classic_task),
+            180,
+        )
+    finally:
+        for task in (task_a, task_b, classic_task):
+            if task is not None and not task.done():
+                task.cancel()
+        for client in writers + [churn] + readers:
+            await client.close()
 
 
 async def deep_checks(alice: AsyncClient, bob: AsyncClient) -> None:
@@ -1459,11 +2008,34 @@ async def main() -> None:
         action="store_true",
         help="run only the wire-format slam, not the backfill recovery slam",
     )
+    parser.add_argument("--stream-chaos", action="store_true")
+    parser.add_argument("--stream-rooms", type=int, default=6)
+    parser.add_argument("--stream-per-room", type=int, default=4)
+    parser.add_argument("--stream-edits", type=int, default=100)
+    parser.add_argument("--stream-writers", type=int, default=4)
+    parser.add_argument("--stream-redact-every", type=int, default=5)
+    parser.add_argument("--stream-window", type=int, default=8)
     parser.add_argument(
-        "--allow-sliding-backfill-gap",
+        "--only-stream-chaos",
         action="store_true",
-        help="report, instead of failing on, events the sliding transport "
-        "drops because it never opens a recovery gap",
+        help="skip every other check and run the streaming-edit pass alone",
+    )
+    parser.add_argument("--chaos", action="store_true")
+    parser.add_argument("--chaos-rooms", type=int, default=20)
+    parser.add_argument("--chaos-writers", type=int, default=8)
+    parser.add_argument("--chaos-rounds", type=int, default=5)
+    parser.add_argument("--chaos-messages", type=int, default=300)
+    parser.add_argument("--chaos-window", type=int, default=8)
+    parser.add_argument(
+        "--only-chaos",
+        action="store_true",
+        help="skip every other check and run the chaos pass alone",
+    )
+    parser.add_argument(
+        "--no-recovery-restart",
+        action="store_true",
+        help="skip the mid-flood sliding restart, which makes the sliding "
+        "reader's exactly-once assertion strict",
     )
     parser.add_argument(
         "--only-recovery-slam",
@@ -1472,12 +2044,36 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.only_stream_chaos:
+        await stream_chaos(
+            args.homeserver,
+            args.stream_rooms,
+            args.stream_per_room,
+            args.stream_edits,
+            args.stream_writers,
+            args.stream_redact_every,
+            args.stream_window,
+        )
+        print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
+        return
+
+    if args.only_chaos:
+        await chaos_slam(
+            args.homeserver,
+            args.chaos_rooms,
+            args.chaos_writers,
+            args.chaos_rounds,
+            args.chaos_messages,
+            args.chaos_window,
+        )
+        print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
+        return
+
     if args.only_encrypted_recovery_slam:
         await encrypted_recovery_slam(
             args.homeserver,
             args.recovery_encrypted_messages,
             args.recovery_encrypted_window,
-            args.allow_sliding_backfill_gap,
         )
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
         return
@@ -1489,7 +2085,7 @@ async def main() -> None:
             args.recovery_messages,
             args.recovery_edits,
             args.recovery_writers,
-            args.allow_sliding_backfill_gap,
+            not args.no_recovery_restart,
         )
         await encrypted_recovery_slam(args.homeserver, args.recovery_encrypted_messages)
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
@@ -1613,13 +2209,33 @@ async def main() -> None:
                     args.recovery_messages,
                     args.recovery_edits,
                     args.recovery_writers,
-                    args.allow_sliding_backfill_gap,
+                    not args.no_recovery_restart,
                 )
                 await encrypted_recovery_slam(
                     args.homeserver,
                     args.recovery_encrypted_messages,
                     args.recovery_encrypted_window,
-                    args.allow_sliding_backfill_gap,
+                )
+
+            if args.stream_chaos:
+                await stream_chaos(
+                    args.homeserver,
+                    args.stream_rooms,
+                    args.stream_per_room,
+                    args.stream_edits,
+                    args.stream_writers,
+                    args.stream_redact_every,
+                    args.stream_window,
+                )
+
+            if args.chaos:
+                await chaos_slam(
+                    args.homeserver,
+                    args.chaos_rooms,
+                    args.chaos_writers,
+                    args.chaos_rounds,
+                    args.chaos_messages,
+                    args.chaos_window,
                 )
 
         if args.bench:
