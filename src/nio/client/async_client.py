@@ -1230,14 +1230,11 @@ class AsyncClient(Client):
         """
         if not (room.limited or room.initial) or not room.prev_batch:
             return None
-        if any(
-            is_own_join(event, self.user_id)
-            for event in (*room.required_state, *room.timeline)
-            if not isinstance(event, SlidingSyncStateStub)
-        ):
-            # We joined inside this window, so anything the held token
-            # points at belongs to a membership that has since ended —
-            # possibly one that ended while this client was not running.
+        if any(is_own_join(event, self.user_id) for event in room.timeline):
+            # Joining inside this window ends whatever membership the held
+            # token was taken under. Only the timeline dates the join:
+            # required_state carries our membership on every snapshot,
+            # including the ones a plain restart produces.
             self._reset_sliding_room(room_id)
             if self.store:
                 self.store.forget_sliding_window_token(room_id)

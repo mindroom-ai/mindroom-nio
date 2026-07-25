@@ -3096,13 +3096,8 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
         await client.close()
 
-    async def test_rejoin_snapshot_discards_the_restored_token(self, tempdir):
-        """A join inside the window ends the membership the token described.
-
-        The account can leave and rejoin from another device while this
-        client is stopped, so a token restored from disk may predate a
-        membership that no longer exists.
-        """
+    async def test_rejoin_in_the_timeline_discards_the_restored_token(self, tempdir):
+        """A join inside the timeline ends the membership the token described."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
             store_sync_tokens=True,
@@ -3126,10 +3121,10 @@ class TestRoomLocalRecovery:
                         "initial": True,
                         "limited": True,
                         "prev_batch": "w2",
-                        "required_state": [
-                            member_event("$join", 2, "join", OWN_ID).source
+                        "timeline": [
+                            member_event("$join", 2, "join", OWN_ID).source,
+                            text_event("$after", 3).source,
                         ],
-                        "timeline": [text_event("$after", 3).source],
                     }
                 },
             }
@@ -3137,12 +3132,66 @@ class TestRoomLocalRecovery:
         assert isinstance(rejoin, SlidingSyncResponse)
         await client.receive_response(rejoin)
 
-        # No walk was planned from the pre-departure token; the snapshot's
-        # own token replaces it as the baseline for the new membership.
+        # No walk from the pre-departure token; the snapshot's own token
+        # becomes the baseline for the membership that exists now.
         assert seen == ["$after"]
         assert not client._recovery.gaps
         assert client.store.load_sliding_window_tokens() == {ROOM_A: "w2"}
         await client.close()
+
+    async def test_restart_snapshot_still_walks_from_the_stored_token(
+        self, tempdir, aioresponse
+    ):
+        """required_state carries our membership on every snapshot.
+
+        A restart re-enters every room `initial` with our own member event
+        in required_state. Reading that as a fresh membership would drop
+        the baseline and skip the walk the restart exists to perform.
+        """
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+
+        second = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await second.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(second)
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        snapshot = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "limited": True,
+                        "prev_batch": "w2",
+                        "required_state": [
+                            member_event("$join", 0, "join", OWN_ID).source
+                        ],
+                        "timeline": [text_event("$held", 3).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(snapshot, SlidingSyncResponse)
+        await second.receive_response(snapshot)
+
+        assert seen == ["$gap", "$held"]
+        assert pages.from_tokens == ["w1"]
+        await second.close()
 
     async def test_window_token_is_written_with_its_plan(self, tempdir):
         """The baseline and the plan it belongs to share one transaction.
