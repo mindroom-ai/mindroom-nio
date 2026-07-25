@@ -1203,9 +1203,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_empty_bounded_gap_closes_without_recovery(
-        self, client, aioresponse
-    ):
+    async def test_empty_bounded_gap_closes_without_recovery(self, client, aioresponse):
         """Nothing between the tokens is a complete walk, not a failure."""
         seen = record_events(client)
         await client.receive_response(
