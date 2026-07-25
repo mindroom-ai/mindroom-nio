@@ -514,15 +514,25 @@ class TestRoomLocalRecovery:
         client.add_room_account_data_callback(room_callback, FullyReadEvent)
         client.add_presence_callback(presence_callback, PresenceEvent)
         info = room_info([text_event("$event", 1)], limited=False, prev_batch="p0")
-        info.ephemeral.append(TypingNoticeEvent([OWN_ID]))
-        info.account_data.append(FullyReadEvent(event_id="$event"))
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {ROOM_A: info},
-                presence=[PresenceEvent(OWN_ID, "online")],
-            )
-        )
+        payload = sync_json("s1", {ROOM_A: info})
+        payload["rooms"]["join"][ROOM_A]["ephemeral"]["events"] = [
+            {"content": {"user_ids": [OWN_ID]}, "type": "m.typing"}
+        ]
+        payload["rooms"]["join"][ROOM_A]["account_data"]["events"] = [
+            {"content": {"event_id": "$event"}, "type": "m.fully_read"}
+        ]
+        payload["presence"] = {
+            "events": [
+                {
+                    "content": {"presence": "online"},
+                    "sender": OWN_ID,
+                    "type": "m.presence",
+                }
+            ]
+        }
+        response = SyncResponse.from_dict(payload)
+        assert isinstance(response, SyncResponse)
+        await client.receive_response(response)
         assert seen == [
             "RoomMessageText",
             "TypingNoticeEvent",
@@ -580,6 +590,41 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$live", "$newer"]
 
+    async def test_recovered_encryption_event_updates_room_and_store(
+        self, client, aioresponse
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [encryption_event(ROOM_A), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+
+        assert client.rooms[ROOM_A].encrypted
+        assert ROOM_A in client.encrypted_rooms
+        assert ROOM_A in client.store.load_encrypted_rooms()
+
     async def test_empty_page_and_page_bound_resume(self, client, aioresponse):
         seen = record_events(client)
         await client.receive_response(
@@ -618,6 +663,87 @@ class TestRoomLocalRecovery:
         await client.receive_response(limited)
         assert pages.from_tokens == ["s1", "more"]
         assert seen == ["$old", "$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_sliding_room_account_data_waits_for_pending_classic_gap(
+        self, client, aioresponse
+    ):
+        seen: list[str] = []
+
+        async def record(_room, event):
+            seen.append(
+                event.event_id
+                if isinstance(event, RoomMessageText)
+                else type(event).__name__
+            )
+
+        client.add_event_callback(record, RoomMessageText)
+        client.add_room_account_data_callback(record, FullyReadEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap", 2)], "more"),
+                "more": messages(
+                    [text_event("$gap2", 3), text_event("$held", 4)],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old"]
+
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [],
+                    }
+                },
+                "extensions": {
+                    "account_data": {
+                        "rooms": {
+                            ROOM_A: [
+                                {
+                                    "content": {"event_id": "$held"},
+                                    "type": "m.fully_read",
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+
+        assert seen == [
+            "$old",
+            "$gap",
+            "$gap2",
+            "$held",
+            "FullyReadEvent",
+        ]
         assert not client._recovery.gaps
 
     async def test_event_bound_abandons_prefix_at_room_wide_cap(
@@ -2111,15 +2237,21 @@ class TestRoomLocalRecovery:
         first_seen = record_events(first)
         presence_seen: list[str] = []
         response_seen: list[str] = []
+        room_surface_seen: list[str] = []
 
         async def on_presence(event):
             presence_seen.append(event.user_id)
+
+        async def on_room_surface(_room, event):
+            room_surface_seen.append(type(event).__name__)
 
         async def on_response(response):
             if isinstance(response, SyncResponse):
                 response_seen.append(response.next_batch)
 
         first.add_presence_callback(on_presence, PresenceEvent)
+        first.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
+        first.add_room_account_data_callback(on_room_surface, FullyReadEvent)
         first.add_response_callback(on_response, SyncResponse)
         await first.receive_response(
             sync_response(
@@ -2135,18 +2267,27 @@ class TestRoomLocalRecovery:
             MESSAGES_URL,
             payload=messages([text_event("$gap", 2)], "more"),
         )
-        limited = sync_response(
+        limited_payload = sync_json(
             "s2",
             {
                 ROOM_A: room_info(
                     [text_event("$held", 4)], limited=True, prev_batch="p1"
                 )
             },
-            presence=[PresenceEvent("@sender:example.org", "online")],
         )
+        limited_payload["rooms"]["join"][ROOM_A]["ephemeral"]["events"] = [
+            {"content": {"user_ids": [OWN_ID]}, "type": "m.typing"}
+        ]
+        limited_payload["rooms"]["join"][ROOM_A]["account_data"]["events"] = [
+            {"content": {"event_id": "$held"}, "type": "m.fully_read"}
+        ]
+        limited = SyncResponse.from_dict(limited_payload)
+        assert isinstance(limited, SyncResponse)
+        limited.presence_events = [PresenceEvent("@sender:example.org", "online")]
         await first.receive_response(limited)
         await first.run_response_callbacks([limited])
         assert first_seen == ["$old"]
+        assert room_surface_seen == []
         assert presence_seen == ["@sender:example.org"]
         assert response_seen == ["s2"]
         await first.close()
@@ -2161,6 +2302,8 @@ class TestRoomLocalRecovery:
         )
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         restarted_seen = record_events(restarted)
+        restarted.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
+        restarted.add_room_account_data_callback(on_room_surface, FullyReadEvent)
         assert restarted.loaded_sync_token == "s2"
         assert restarted._recovery.gaps.get(ROOM_A)
         aioresponse.get(
@@ -2181,6 +2324,7 @@ class TestRoomLocalRecovery:
             )
         )
         assert restarted_seen == ["$gap", "$gap2", "$held", "$later"]
+        assert room_surface_seen == ["TypingNoticeEvent", "FullyReadEvent"]
         assert presence_seen == ["@sender:example.org"]
         assert response_seen == ["s2"]
         assert not restarted._recovery.gaps

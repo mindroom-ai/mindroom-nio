@@ -23,6 +23,7 @@ Ephemeral events are used for typing notifications and read receipts.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 from ..api import ReceiptType
@@ -33,6 +34,8 @@ from .misc import verify_or_none
 @dataclass
 class EphemeralEvent:
     """Base class for ephemeral events."""
+
+    source: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @classmethod
     @verify_or_none(Schemas.ephemeral_event)
@@ -52,12 +55,15 @@ class EphemeralEvent:
             event_dict (dict): The dictionary representation of the event.
 
         """
+        source = copy.deepcopy(event_dict)
+        event = None
         if event_dict["type"] == "m.typing":
-            return TypingNoticeEvent.from_dict(event_dict)
-        if event_dict["type"] == "m.receipt":
-            return ReceiptEvent.from_dict(event_dict)
-
-        return None
+            event = TypingNoticeEvent.from_dict(event_dict)
+        elif event_dict["type"] == "m.receipt":
+            event = ReceiptEvent.from_dict(event_dict)
+        if event:
+            event.source = source
+        return event
 
     @classmethod
     def from_dict(cls, parsed_dict):

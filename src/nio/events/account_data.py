@@ -23,6 +23,7 @@ across installations on a particular device.
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -41,20 +42,27 @@ if TYPE_CHECKING:
 class AccountDataEvent:
     """Abstract class for account data events."""
 
+    source: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
     @classmethod
     @verify(Schemas.account_data)
     def parse_event(
         cls,
         event_dict: dict[Any, Any],
     ):
+        source = copy.deepcopy(event_dict)
         if event_dict["type"] == "m.fully_read":
-            return FullyReadEvent.from_dict(event_dict)
+            event = FullyReadEvent.from_dict(event_dict)
         elif event_dict["type"] == "m.tag":
-            return TagEvent.from_dict(event_dict)
+            event = TagEvent.from_dict(event_dict)
         elif event_dict["type"] == "m.push_rules":
-            return PushRulesEvent.from_dict(event_dict)
-
-        return UnknownAccountDataEvent.from_dict(event_dict)
+            event = PushRulesEvent.from_dict(event_dict)
+        else:
+            event = UnknownAccountDataEvent.from_dict(event_dict)
+        event.source = source
+        return event
 
 
 @dataclass

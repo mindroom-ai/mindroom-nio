@@ -481,6 +481,33 @@ async def test_room_cap_abandons_existing_unverified_prefix():
     assert not state.gaps
 
 
+@pytest.mark.parametrize("clear_mode", ["recovered", "room"])
+def test_abandonment_restores_promoted_completed_marker(clear_mode):
+    retry = PendingTimelineEvent.from_event(
+        ROOM,
+        1,
+        0,
+        event("$encrypted", 1),
+        False,
+        was_completed=True,
+    )
+    assert retry
+    gap = RecoveryGap(ROOM, 1, "target", "cursor")
+    state = RecoveryState(
+        gaps={ROOM: [gap]},
+        events={(ROOM, 1): [retry]},
+    )
+    plan = (
+        RecoveryPlan(clear_recovered=gap)
+        if clear_mode == "recovered"
+        else RecoveryPlan(clear_rooms=frozenset({ROOM}))
+    )
+
+    apply_plan(state, plan)
+
+    assert state.completed[ROOM]["$encrypted"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overlap_first", [False, True])
 async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):

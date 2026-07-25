@@ -8,10 +8,17 @@ import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..api import MessageDirection
-from ..events import BadEventType, Event, MegolmEvent, RoomMemberEvent
+from ..events import (
+    AccountDataEvent,
+    BadEventType,
+    EphemeralEvent,
+    Event,
+    MegolmEvent,
+    RoomMemberEvent,
+)
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -22,9 +29,10 @@ logger = logging.getLogger(__name__)
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
 DispatchEvent = Callable[
-    [str, Event | BadEventType, bool, bool],
-    Awaitable[Event | BadEventType | None],
+    [str, Event | BadEventType | EphemeralEvent | AccountDataEvent, bool, bool],
+    Awaitable[Event | BadEventType | EphemeralEvent | AccountDataEvent | None],
 ]
+PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
 
 
 class _LiveCallbackError(Exception):
@@ -60,6 +68,7 @@ class PendingTimelineEvent:
     is_live: bool
     was_encrypted: bool
     was_completed: bool = False
+    kind: PendingEventKind = "timeline"
 
     @classmethod
     def from_event(
@@ -71,6 +80,7 @@ class PendingTimelineEvent:
         is_live: bool,
         fallback_event_id: str | None = None,
         was_completed: bool = False,
+        kind: PendingEventKind = "timeline",
     ) -> PendingTimelineEvent | None:
         event_id = getattr(event, "event_id", None) or fallback_event_id
         if not event_id:
@@ -85,10 +95,21 @@ class PendingTimelineEvent:
             is_live,
             isinstance(event, MegolmEvent),
             was_completed,
+            kind,
         )
 
-    def parse(self) -> Event | BadEventType:
-        return Event.parse_event(json.loads(self.source_json))
+    def parse(
+        self,
+    ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent:
+        source = json.loads(self.source_json)
+        if self.kind == "ephemeral":
+            event = EphemeralEvent.parse_event(source)
+            if event is None:
+                raise ValueError("Invalid pending ephemeral event")
+            return event
+        if self.kind == "account_data":
+            return AccountDataEvent.parse_event(source)
+        return Event.parse_event(source)
 
 
 @dataclass(frozen=True)
@@ -201,6 +222,29 @@ def _plan_live_events(
     return planned
 
 
+def _plan_ancillary_events(
+    room_id: str,
+    generation: int,
+    sequence: int,
+    batch_id: str,
+    kind: Literal["ephemeral", "account_data"],
+    events: Iterable[EphemeralEvent | AccountDataEvent | BadEventType],
+) -> list[PendingTimelineEvent]:
+    return [
+        PendingTimelineEvent(
+            room_id,
+            generation,
+            sequence + index,
+            f"~{batch_id}:{kind}:{index}",
+            json.dumps(event.source, sort_keys=True, separators=(",", ":")),
+            True,
+            False,
+            kind=kind,
+        )
+        for index, event in enumerate(events)
+    ]
+
+
 def _plan_room_reset(
     state: RecoveryState,
     room_id: str,
@@ -235,6 +279,8 @@ def plan_room_timeline(
     cursor_token: str | None = None,
     target_token: str = "",
     batch_id: str | None = None,
+    ephemeral_events: Sequence[EphemeralEvent] = (),
+    account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
@@ -266,6 +312,39 @@ def plan_room_timeline(
         include_pending=not clear,
         batch_id=batch_id,
     )
+    if ephemeral_events or account_data_events:
+        if batch_id is None:
+            raise ValueError("Ancillary recovery events require a batch ID")
+        next_sequence = 1 + max(
+            (event.sequence for event in events),
+            default=max(
+                (
+                    event.sequence
+                    for event in state.events.get((room_id, generation), ())
+                    if event.is_live
+                ),
+                default=-1,
+            ),
+        )
+        deferred = _plan_ancillary_events(
+            room_id,
+            generation,
+            next_sequence,
+            batch_id,
+            "ephemeral",
+            ephemeral_events,
+        )
+        events.extend(deferred)
+        events.extend(
+            _plan_ancillary_events(
+                room_id,
+                generation,
+                next_sequence + len(deferred),
+                batch_id,
+                "account_data",
+                account_data_events,
+            )
+        )
     held_count = sum(
         event.is_live
         for gap in existing
@@ -323,6 +402,8 @@ def plan_sync_response(
             ),
             target_token=room_info.timeline.prev_batch or response_token,
             batch_id=f"sync:{response_token}",
+            ephemeral_events=room_info.ephemeral,
+            account_data_events=room_info.account_data,
         )
         for room_id, room_info in joined_rooms.items()
     ]
@@ -333,7 +414,11 @@ def plan_sync_response(
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     for room_id in plan.clear_rooms:
         for gap in state.gaps.pop(room_id, ()):
-            state.events.pop((room_id, gap.generation), None)
+            for event in state.events.pop((room_id, gap.generation), ()):
+                if event.was_completed and not event.event_id.startswith("~"):
+                    record_completed_timeline_event(
+                        state, room_id, event.event_id, True
+                    )
 
     for gap in plan.gaps:
         gaps = state.gaps.setdefault(gap.room_id, [])
@@ -348,6 +433,15 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
 
     if plan.clear_recovered:
         key = (plan.clear_recovered.room_id, plan.clear_recovered.generation)
+        for event in state.events[key]:
+            if (
+                not event.is_live
+                and event.was_completed
+                and not event.event_id.startswith("~")
+            ):
+                record_completed_timeline_event(
+                    state, plan.clear_recovered.room_id, event.event_id, True
+                )
         state.events[key][:] = [event for event in state.events[key] if event.is_live]
 
     for event in plan.events:
@@ -391,6 +485,7 @@ def load_recovery_state(
             row.is_live,
             row.was_encrypted,
             row.was_completed,
+            row.kind,
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():

@@ -890,6 +890,41 @@ class TestClass:
         assert not events[0].was_completed
         assert not events[0].was_encrypted
 
+    @pytest.mark.parametrize("clear_mode", ["recovered", "room"])
+    def test_abandonment_restores_completed_encrypted_marker(
+        self, sqlstore, clear_mode
+    ):
+        first_gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(TEST_ROOM, 1, 0, "$event", "{}", False, True)
+        sqlstore.save_recovery("s1", set(), [first_gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        retry_gap = RecoveryGap(TEST_ROOM, 2, "p2", "cursor")
+        retry = PendingTimelineEvent(
+            TEST_ROOM,
+            2,
+            0,
+            "$event",
+            "{}",
+            False,
+            False,
+            True,
+        )
+        sqlstore.save_recovery("s2", set(), [retry_gap], [retry], None)
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM} if clear_mode == "room" else set(),
+            [],
+            [],
+            retry_gap if clear_mode == "recovered" else None,
+        )
+
+        _, events = sqlstore.load_sync_recovery()
+        assert len(events) == 1
+        assert events[0].generation == 0
+        assert events[0].was_encrypted
+        assert not events[0].was_completed
+
     def test_synthetic_recovery_key_is_deleted_after_callback(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "", None)
         event = PendingTimelineEvent(
