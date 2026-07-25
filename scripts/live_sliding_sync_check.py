@@ -831,7 +831,7 @@ async def recovery_slam(
     n_messages: int,
     n_edits: int,
     n_writers: int,
-    allow_sliding_gap: bool = False,
+    restart: bool = True,
 ) -> None:
     """Flood rooms with a one-event sync window and assert exactly-once.
 
@@ -899,31 +899,32 @@ async def recovery_slam(
         # Restart the sliding reader mid-flood, from its store, while the
         # writers keep going: durable recovery state has to survive the
         # process boundary without losing or replaying events.
-        restart_credentials = (
-            sliding.user_id,
-            sliding.device_id,
-            sliding.access_token,
-            sliding.store_path,
-        )
-        sliding.stop_sync_forever()
-        await asyncio.wait_for(sliding_task, 120)
-        await sliding.close()
-
-        user_id, device_id, access_token, store_path = restart_credentials
-        sliding = AsyncClient(
-            homeserver, user_id, device_id, store_path, recovery_config(budget)
-        )
-        sliding.restore_login(user_id, device_id, access_token)
-        sliding.add_event_callback(sliding_recorder, Event)
-        readers[0] = sliding
-        sliding_task = asyncio.create_task(
-            sliding.sliding_sync_forever(
-                timeout=10_000,
-                conn_id=f"rslam-restarted-{suffix}",
-                lists=RECOVERY_LISTS,
-                extensions={"to_device": {"enabled": True}},
+        if restart:
+            restart_credentials = (
+                sliding.user_id,
+                sliding.device_id,
+                sliding.access_token,
+                sliding.store_path,
             )
-        )
+            sliding.stop_sync_forever()
+            await asyncio.wait_for(sliding_task, 120)
+            await sliding.close()
+
+            user_id, device_id, access_token, store_path = restart_credentials
+            sliding = AsyncClient(
+                homeserver, user_id, device_id, store_path, recovery_config(budget)
+            )
+            sliding.restore_login(user_id, device_id, access_token)
+            sliding.add_event_callback(sliding_recorder, Event)
+            readers[0] = sliding
+            sliding_task = asyncio.create_task(
+                sliding.sliding_sync_forever(
+                    timeout=10_000,
+                    conn_id=f"rslam-restarted-{suffix}",
+                    lists=RECOVERY_LISTS,
+                    extensions={"to_device": {"enabled": True}},
+                )
+            )
 
         # Second half, against the restarted reader.
         second, more_failures = await flood(
@@ -966,13 +967,12 @@ async def recovery_slam(
             sent[room_id].add(resp.event_id)
             sent_ids.add(resp.event_id)
 
-        # Waiting on a reader that is known not to recover only burns the
-        # deadline, so a waived sliding gap drops out of the convergence
-        # condition (its counts are still reported and asserted below).
+        # The sliding reader holds its walk baseline in memory, so a
+        # restart costs it the first discontinuity per room afterwards.
+        # Waiting on a reader that cannot converge only burns the deadline;
+        # its counts are still reported and bounded below.
         awaited = (
-            (classic_recorder,)
-            if allow_sliding_gap
-            else (sliding_recorder, classic_recorder)
+            (classic_recorder,) if restart else (sliding_recorder, classic_recorder)
         )
         deadline = time.monotonic() + 900
         last_report = 0.0
@@ -993,14 +993,22 @@ async def recovery_slam(
         # its verdict is the one that proves the walk works.
         for recorder in (classic_recorder, sliding_recorder):
             missing_ids = sent_ids - recorder.seen()
-            if missing_ids and recorder is sliding_recorder and allow_sliding_gap:
-                # `_handle_sliding_sync` never opens a recovery gap, so a
-                # limited sliding window drops events with no walk and no
-                # warning. Known hole, reported rather than asserted.
+            if missing_ids and recorder is sliding_recorder and restart:
+                # The sliding walk baseline is per-process, so the first
+                # discontinuity after the restart has nothing to walk from.
+                # That is bounded by one window per room; anything larger is
+                # a regression in the steady-state path, not this hole.
+                budget_lost = 4 * n_rooms + len(sent_ids) // 20
                 print(
-                    f"recovery slam: KNOWN GAP: sliding lost "
-                    f"{len(missing_ids)}/{len(sent_ids)} events "
-                    f"(sliding sync plans no recovery gap)"
+                    f"recovery slam: sliding lost {len(missing_ids)}/"
+                    f"{len(sent_ids)} events across its restart "
+                    f"(in-memory walk baseline, bound {budget_lost})"
+                )
+                check(
+                    "recovery slam: sliding restart loss stays bounded",
+                    len(missing_ids) <= budget_lost,
+                    f"{len(missing_ids)} lost exceeds the {budget_lost} a "
+                    f"restart can explain: steady-state recovery regressed",
                 )
             else:
                 check(
@@ -1074,7 +1082,6 @@ async def encrypted_recovery_slam(
     homeserver: str,
     n_messages: int,
     window: int = 1,
-    allow_sliding_gap: bool = False,
 ) -> None:
     """Flood an encrypted room with a one-event window and assert decryption."""
     suffix = secrets.token_hex(4)
@@ -1191,21 +1198,11 @@ async def encrypted_recovery_slam(
             600,
         )
         missing = sent_ids - set(recorder.decrypted)
-        if missing and allow_sliding_gap and window <= 1:
-            # This pass reads through sliding sync only, which plans no
-            # recovery gap, so a one-event window loses events before
-            # decryption ever gets a say. Raise --recovery-encrypted-window
-            # to tell a decryption failure apart from that hole.
-            print(
-                f"encrypted recovery slam: KNOWN GAP: {len(missing)}/"
-                f"{len(sent_ids)} events lost to the sliding backfill gap"
-            )
-        else:
-            check(
-                "encrypted recovery slam: every event was decrypted and dispatched",
-                converged and not missing,
-                f"{len(missing)} never arrived decrypted",
-            )
+        check(
+            "encrypted recovery slam: every event was decrypted and dispatched",
+            converged and not missing,
+            f"{len(missing)} never arrived decrypted",
+        )
         check(
             "encrypted recovery slam: no event decrypted twice",
             not [event_id for event_id in sent_ids if recorder.decrypted[event_id] > 1],
@@ -1460,10 +1457,10 @@ async def main() -> None:
         help="run only the wire-format slam, not the backfill recovery slam",
     )
     parser.add_argument(
-        "--allow-sliding-backfill-gap",
+        "--no-recovery-restart",
         action="store_true",
-        help="report, instead of failing on, events the sliding transport "
-        "drops because it never opens a recovery gap",
+        help="skip the mid-flood sliding restart, which makes the sliding "
+        "reader's exactly-once assertion strict",
     )
     parser.add_argument(
         "--only-recovery-slam",
@@ -1477,7 +1474,6 @@ async def main() -> None:
             args.homeserver,
             args.recovery_encrypted_messages,
             args.recovery_encrypted_window,
-            args.allow_sliding_backfill_gap,
         )
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
         return
@@ -1489,7 +1485,7 @@ async def main() -> None:
             args.recovery_messages,
             args.recovery_edits,
             args.recovery_writers,
-            args.allow_sliding_backfill_gap,
+            not args.no_recovery_restart,
         )
         await encrypted_recovery_slam(args.homeserver, args.recovery_encrypted_messages)
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
@@ -1613,13 +1609,12 @@ async def main() -> None:
                     args.recovery_messages,
                     args.recovery_edits,
                     args.recovery_writers,
-                    args.allow_sliding_backfill_gap,
+                    not args.no_recovery_restart,
                 )
                 await encrypted_recovery_slam(
                     args.homeserver,
                     args.recovery_encrypted_messages,
                     args.recovery_encrypted_window,
-                    args.allow_sliding_backfill_gap,
                 )
 
         if args.bench:

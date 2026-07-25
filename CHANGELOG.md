@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Recover limited timelines on the Simplified Sliding Sync transport too.
+  `backfill_limited_timelines` previously only planned a walk for `/v3/sync`
+  gaps, so `sliding_sync_forever()` dropped the events a limited window left
+  behind with no walk and no warning (measured with a one-event window and
+  200 concurrent writes: 10/40 lost serially, 170/200 concurrently). A
+  sliding `pos` is a connection cursor rather than a `/messages` token, but
+  each room's `prev_batch` is one, so consecutive windows now bound an
+  ordinary forward walk: from the token held for the room to the one this
+  window carries. The overlap that leaves is dropped by the existing
+  de-duplication. `initial` rooms the client already tracks are walked the
+  same way, which covers a room re-entering a list window and a connection
+  the server expired. The token is per-process, so the first discontinuity
+  after a client restart still has no baseline to walk from and is not
+  recovered; the `/v3/sync` transport keeps recovering across restarts
+  through its stored sync token.
+
 ## 0.30.1
 
 ### Bug Fixes

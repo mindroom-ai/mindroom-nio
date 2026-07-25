@@ -383,6 +383,12 @@ class AsyncClientConfig(ClientConfig):
             Live callback errors propagate after acknowledgement, while
             recovered-history callback errors fan out before acknowledgement.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
+            Both transports recover: /v3/sync walks from the token the sync
+            continued from, Simplified Sliding Sync between consecutive
+            window tokens. The sliding baseline is per-process, so the first
+            limited or initial window after a client restart is not
+            recovered, while /v3/sync recovers across restarts through its
+            stored sync token.
         backfill_max_pages (int): Maximum pages per room per pump.
         backfill_max_events (int): Maximum durable recovered-history events per
             room across every open generation, and separately the maximum live
@@ -515,6 +521,12 @@ class AsyncClient(Client):
         self._pending_sliding_room_account_data: dict[
             str, dict[tuple[str, str | None], AccountDataEvent]
         ] = {}
+
+        # Per-room /messages token from each room's last sliding window,
+        # used as the start of the next limited window's recovery walk.
+        # In-memory only: a restart has no baseline to walk from, so the
+        # first limited window after it cannot be recovered.
+        self._sliding_room_prev_batch: dict[str, str] = {}
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
@@ -1001,6 +1013,8 @@ class AsyncClient(Client):
                         live_event_count=(
                             (room.num_live or 0) if room.initial else None
                         ),
+                        cursor_token=self._sliding_recovery_cursor(room_id, room),
+                        target_token=room.prev_batch or "",
                         batch_id=(
                             f"sliding:{self._sliding_sync_recovery_scope}:"
                             f"{response.pos}"
@@ -1044,6 +1058,7 @@ class AsyncClient(Client):
                     token=None,
                     plan=merge_recovery_plans(plans),
                 )
+                self._record_sliding_prev_batches(response)
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
         if self.config.backfill_limited_timelines:
@@ -1082,6 +1097,55 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+
+    def _sliding_recovery_cursor(
+        self, room_id: str, room: SlidingSyncRoom
+    ) -> str | None:
+        """The token a limited sliding window's recovery walk starts from.
+
+        Simplified Sliding Sync has no equivalent of the ``since`` token a
+        /v3/sync gap walks forward from: a ``pos`` is a connection cursor,
+        not a /messages token. What it does give is ``prev_batch``, which
+        is one — it points into the window the server just sent. Chaining
+        it across responses turns two consecutive windows into an ordinary
+        forward walk: from the previous window's ``prev_batch`` to this
+        one's. The overlap that leaves (the tail of the previous window)
+        is re-fetched and dropped by the usual de-duplication, so the walk
+        covers the gap without needing a backwards pagination mode.
+
+        A walk is planned whenever the server signals a discontinuity for a
+        room already seen this run: ``limited``, or ``initial`` for a room
+        re-entering a list window or arriving on a connection the server
+        expired. Both leave the same hole, and the token held for the room
+        is the far side of it. A steady window continues the last one and
+        has no gap; a room seen for the first time this run has no token to
+        walk from.
+
+        The token lives in memory, so a connection reset is covered but a
+        process restart is not: the first discontinuity after one has no
+        baseline and its events are not recovered.
+        """
+        if not (room.limited or room.initial) or not room.prev_batch:
+            return None
+        if self._sliding_sync_room_is_invite(room) or room.membership in (
+            "leave",
+            "ban",
+        ):
+            return None
+        return self._sliding_room_prev_batch.get(room_id)
+
+    def _record_sliding_prev_batches(self, response: SlidingSyncResponse) -> None:
+        """Remember each room's window token for the next response's walk."""
+        for room_id, room in response.rooms.items():
+            if self._sliding_sync_room_is_invite(room) or room.membership in (
+                "leave",
+                "ban",
+            ):
+                # The room is no longer tracked; a stale token would make
+                # the next join walk history from before it.
+                self._sliding_room_prev_batch.pop(room_id, None)
+            elif room.prev_batch:
+                self._sliding_room_prev_batch[room_id] = room.prev_batch
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
