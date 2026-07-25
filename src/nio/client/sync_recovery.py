@@ -247,7 +247,6 @@ def plan_room_timeline(
         ),
         default=-1,
     )
-    start = max(last_join, 0)
     live_start = (
         0
         if live_event_count is None
@@ -263,7 +262,7 @@ def plan_room_timeline(
         state,
         room_id,
         generation,
-        timeline_events[start:],
+        timeline_events,
         include_pending=not clear,
         batch_id=batch_id,
     )
@@ -550,12 +549,14 @@ async def _collect_slice(
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        if truncated or response.end in (None, cursor):
+        if reached_window:
+            next_cursor = None
+        elif truncated or response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
             next_cursor = None
-        elif reached_window or response.end == gap.target_token:
+        elif response.end == gap.target_token:
             next_cursor = None
         else:
             next_cursor = response.end

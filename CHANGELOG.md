@@ -12,10 +12,10 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Preserve normal live callback exception propagation while recovered-history dispatch attempts every matching callback before acknowledgement.
-- Keep room sends fail closed while that room has an unresolved recovery lane.
+- Keep room sends fail closed while that room has an unresolved recovery lane, and serialize concurrent classic and Sliding Sync recovery pumps.
 - Treat HTTP 408, HTTP 429, and server errors as retryable recovery failures while terminal client errors release held live rows.
 - Close ignored-bound `/messages` walks at the first held live-window overlap while preserving the recovered prefix, and abandon only pages whose contents cannot prove a complete gap.
-- Apply every joined room's state before fallible callbacks, enforce held-live limits on the first limited window, and preserve per-event to-device callback ordering.
+- Apply every joined room's state before fallible callbacks, preserve the full current timeline across own-join resets, retry Sliding Sync decryption after same-response room keys, enforce held-live limits on the first limited window, and preserve per-event to-device callback ordering.
 - Remove delivered event bodies from durable de-duplication markers while retaining the event ID and encrypted-state bit required for replay suppression.
 
 ## 0.29.0

@@ -40,6 +40,8 @@ from nio import (
 )
 from nio.api import MATRIX_API_PATH_V3
 from nio.client.sync_recovery import (
+    PendingTimelineEvent,
+    RecoveryGap,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
@@ -961,6 +963,180 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("end", [None, "s1"])
+    async def test_live_overlap_closes_gap_without_end_progress(
+        self, client, aioresponse, end
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                end,
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_live_overlap_closes_truncated_page(self, tempdir, aioresponse):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$gap", 1),
+                    text_event("$held", 2),
+                    text_event("$overflow", 3),
+                ],
+                "more",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    @pytest.mark.parametrize("second_protocol", ["classic", "sliding"])
+    async def test_concurrent_response_pumps_dispatch_once(
+        self, client, second_protocol
+    ):
+        pending = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            text_event("$one", 1),
+            True,
+        )
+        assert pending is not None
+        client._recovery.gaps[ROOM_A] = [RecoveryGap(ROOM_A, 1, "", None)]
+        client._recovery.events[(ROOM_A, 1)] = [pending]
+        client.next_batch = "s1"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        seen = []
+
+        async def callback(_room, event):
+            seen.append(event.event_id)
+            entered.set()
+            await release.wait()
+
+        client.add_event_callback(callback, RoomMessageText)
+        first = asyncio.create_task(client.receive_response(sync_response("s1", {})))
+        await entered.wait()
+        if second_protocol == "classic":
+            second_response = sync_response("s1", {})
+        else:
+            second_response = SlidingSyncResponse.from_dict({"pos": "s2", "rooms": {}})
+        second = asyncio.create_task(client.receive_response(second_response))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        assert seen == ["$one"]
+        assert not client._recovery.gaps
+
+    async def test_room_send_linearizes_with_concurrent_gap_install(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        sent = object()
+
+        async def send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return sent
+
+        monkeypatch.setattr(client, "_send", send)
+        send_task = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+        )
+        await send_started.wait()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 2)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not client._recovery.gaps
+        release_send.set()
+        assert await send_task is sent
+        await response_task
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        await client.close()
 
     async def test_missing_prev_batch_uses_response_target(self, client, aioresponse):
         seen = record_events(client)
@@ -2423,7 +2599,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$gap2", "$held", "$slide"]
         assert not client._recovery.gaps
 
-    async def test_sliding_own_join_discards_classic_prejoin_rows(
+    async def test_sliding_own_join_resets_classic_history_not_current_timeline(
         self, client, aioresponse
     ):
         seen = record_events(client)
@@ -2465,7 +2641,7 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
-        assert seen == ["$join", "$after"]
+        assert seen == ["$prejoin2", "$join", "$after"]
         assert not client._recovery.gaps
 
     async def test_sliding_initial_historical_join_keeps_classic_gap(
@@ -2919,6 +3095,39 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
         await client.close()
 
+    async def test_sliding_timeline_retries_decryption_after_to_device(
+        self, client, monkeypatch
+    ):
+        ready = False
+        attempts = []
+
+        async def process(_room_id, _room, timeline, _encrypted_rooms, **_kwargs):
+            attempts.append(ready)
+            if ready:
+                timeline[:] = [text_event("$decrypted", 1)]
+
+        async def handle(_response):
+            nonlocal ready
+            ready = True
+
+        monkeypatch.setattr(client, "_process_timeline", process)
+        monkeypatch.setattr(client, "_handle_to_device", handle)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$encrypted", 1).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        await client.receive_response(response)
+        assert attempts == [False, True]
+        assert response.rooms[ROOM_A].timeline[0].event_id == "$decrypted"
+
     async def test_target_cursor_closes_without_live_echo(self, client, aioresponse):
         seen = record_events(client)
         client.next_batch = "s1"
@@ -2939,7 +3148,10 @@ class TestRoomLocalRecovery:
         assert seen == ["$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_current_timeline_starts_at_last_own_join(self, client):
+    @pytest.mark.parametrize("limited", [False, True])
+    async def test_current_timeline_preserves_events_before_own_join(
+        self, client, limited
+    ):
         seen = record_events(client)
         client.add_event_callback(
             lambda _room, event: seen.append(event.event_id), RoomMemberEvent
@@ -2955,11 +3167,11 @@ class TestRoomLocalRecovery:
                             member_event("$join", 2, "join"),
                             text_event("$after", 3),
                         ],
-                        limited=True,
+                        limited=limited,
                         prev_batch="p1",
                     )
                 },
             )
         )
-        assert seen == ["$join", "$after"]
+        assert seen == ["$prejoin", "$join", "$after"]
         assert not client._recovery.gaps

@@ -486,12 +486,12 @@ class AsyncClient(Client):
 
         self.config: AsyncClientConfig = config or AsyncClientConfig()
 
-        # The flag used to gracefully stop `sync_forever`.
         self._stop_sync_forever = False
 
-        # The token the in-flight sync request resumed from.
         self._sync_since: str | None = None
 
+        self._sync_response_lock = asyncio.Lock()
+        self._recovery_send_gate = asyncio.Lock()
         self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
 
         # Sliding account data retained until its room is known.
@@ -876,24 +876,26 @@ class AsyncClient(Client):
         self.next_batch = response.next_batch
 
         if self.config.backfill_limited_timelines:
-            plan = plan_sync_response(
-                self._recovery,
-                user_id=self.user_id,
-                request_since=request_since,
-                response_token=response.next_batch,
-                joined_rooms=response.rooms.join,
-                reset_room_ids=(set(response.rooms.leave) | set(response.rooms.invite)),
-            )
-            try:
-                persist_response_plan(
+            reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
+            async with self._recovery_send_gate:
+                plan = plan_sync_response(
                     self._recovery,
-                    (self.store if self.config.store_sync_tokens else None),
-                    token=response.next_batch,
-                    plan=plan,
+                    user_id=self.user_id,
+                    request_since=request_since,
+                    response_token=response.next_batch,
+                    joined_rooms=response.rooms.join,
+                    reset_room_ids=reset_rooms,
                 )
-            except BaseException:
-                self.next_batch = previous_batch
-                raise
+                try:
+                    persist_response_plan(
+                        self._recovery,
+                        (self.store if self.config.store_sync_tokens else None),
+                        token=response.next_batch,
+                        plan=plan,
+                    )
+                except BaseException:
+                    self.next_batch = previous_batch
+                    raise
             if self.config.store_sync_tokens and self.store:
                 self.loaded_sync_token = response.next_batch
             for room_id, join_info in response.rooms.join.items():
@@ -925,31 +927,32 @@ class AsyncClient(Client):
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
         if self.config.backfill_limited_timelines:
-            persist_response_plan(
-                self._recovery,
-                self.store if self.config.store_sync_tokens else None,
-                token=None,
-                plan=merge_recovery_plans(
-                    plan_room_timeline(
-                        self._recovery,
-                        room_id=room_id,
-                        timeline_events=room.timeline,
-                        user_id=self.user_id,
-                        membership=(
-                            "invite"
-                            if self._sliding_sync_room_is_invite(room)
-                            else room.membership or "join"
-                        ),
-                        live_event_count=(
-                            (room.num_live or 0) if room.initial else None
-                        ),
-                        batch_id=(
-                            f"sliding:{self._sliding_sync_recovery_scope}:{response.pos}"
-                        ),
-                    )
-                    for room_id, room in response.rooms.items()
-                ),
-            )
+            async with self._recovery_send_gate:
+                persist_response_plan(
+                    self._recovery,
+                    self.store if self.config.store_sync_tokens else None,
+                    token=None,
+                    plan=merge_recovery_plans(
+                        plan_room_timeline(
+                            self._recovery,
+                            room_id=room_id,
+                            timeline_events=room.timeline,
+                            user_id=self.user_id,
+                            membership=(
+                                "invite"
+                                if self._sliding_sync_room_is_invite(room)
+                                else room.membership or "join"
+                            ),
+                            live_event_count=(
+                                (room.num_live or 0) if room.initial else None
+                            ),
+                            batch_id=(
+                                f"sliding:{self._sliding_sync_recovery_scope}:{response.pos}"
+                            ),
+                        )
+                        for room_id, room in response.rooms.items()
+                    ),
+                )
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
         if self.config.backfill_limited_timelines:
@@ -965,6 +968,19 @@ class AsyncClient(Client):
             if self.store:
                 self.store.save_encrypted_rooms(self.encrypted_rooms)
         await self._handle_to_device(response)
+        if self.config.backfill_limited_timelines:
+            for room_id, room in response.rooms.items():
+                if self._sliding_sync_room_is_invite(room) or room.membership in (
+                    "leave",
+                    "ban",
+                ):
+                    continue
+                await self._process_timeline(
+                    room_id,
+                    self.rooms[room_id],
+                    room.timeline,
+                    self.encrypted_rooms,
+                )
 
         await self._handle_sliding_sync_rooms(response)
 
@@ -1261,10 +1277,12 @@ class AsyncClient(Client):
         if not isinstance(response, Response):
             raise ValueError("Invalid response received")
 
-        if isinstance(response, SyncResponse):
-            await self._handle_sync(response)
-        elif isinstance(response, SlidingSyncResponse):
-            await self._handle_sliding_sync(response)
+        if isinstance(response, (SyncResponse, SlidingSyncResponse)):
+            async with self._sync_response_lock:
+                if isinstance(response, SyncResponse):
+                    await self._handle_sync(response)
+                else:
+                    await self._handle_sliding_sync(response)
         else:
             super().receive_response(response)
 
@@ -2749,51 +2767,52 @@ class AsyncClient(Client):
         """
         uuid: str | UUID = tx_id or uuid4()
 
-        if any(
-            gap.cursor_token is not None or gap.target_token
-            for gap in self._recovery.gaps.get(room_id, ())
-        ):
-            raise SendRetryError("Room timeline recovery is still pending.")
+        send_gate = (
+            self._recovery_send_gate
+            if self.config.backfill_limited_timelines
+            else asyncio.Lock()
+        )
+        async with send_gate:
+            if any(
+                gap.cursor_token is not None or gap.target_token
+                for gap in self._recovery.gaps.get(room_id, ())
+            ):
+                raise SendRetryError("Room timeline recovery is still pending.")
 
-        if self.olm:
-            try:
-                room = self.rooms[room_id]
-            except KeyError:
-                raise LocalProtocolError(f"No such room with id {room_id} found.")
+            if self.olm:
+                try:
+                    room = self.rooms[room_id]
+                except KeyError:
+                    raise LocalProtocolError(f"No such room with id {room_id} found.")
 
-            if room.encrypted:
-                # Check if the members are synced, otherwise users might not get
-                # the megolm seession.
-                if not room.members_synced:
-                    responses = []
-                    responses.append(await self.joined_members(room_id))
+                if room.encrypted:
+                    if not room.members_synced:
+                        await self.joined_members(room_id)
+                        if self.should_query_keys:
+                            await self.keys_query()
 
-                    if self.should_query_keys:
-                        responses.append(await self.keys_query())
+                    if self.olm.should_share_group_session(room_id):
+                        try:
+                            event = self.sharing_session[room_id]
+                            await event.wait()
+                        except KeyError:
+                            await self.share_group_session(
+                                room_id,
+                                ignore_unverified_devices=ignore_unverified_devices,
+                            )
 
-                # Check if we need to share a group session, it might have been
-                # invalidated or expired.
-                if self.olm.should_share_group_session(room_id):
-                    try:
-                        event = self.sharing_session[room_id]
-                        await event.wait()
-                    except KeyError:
-                        await self.share_group_session(
-                            room_id,
-                            ignore_unverified_devices=ignore_unverified_devices,
+                    # Reactions do not support encryption yet.
+                    # https://github.com/matrix-org/matrix-doc/pull/1849
+                    if message_type != "m.reaction":
+                        message_type, content = self.encrypt(
+                            room_id, message_type, content
                         )
 
-                # Reactions as of yet don't support encryption.
-                # Relevant spec proposal https://github.com/matrix-org/matrix-doc/pull/1849
-                if message_type != "m.reaction":
-                    # Encrypt our content and change the message type.
-                    message_type, content = self.encrypt(room_id, message_type, content)
+            method, path, data = Api.room_send(
+                self.access_token, room_id, message_type, content, uuid
+            )
 
-        method, path, data = Api.room_send(
-            self.access_token, room_id, message_type, content, uuid
-        )
-
-        return await self._send(RoomSendResponse, method, path, data, (room_id,))
+            return await self._send(RoomSendResponse, method, path, data, (room_id,))
 
     @logged_in_async
     @client_session
