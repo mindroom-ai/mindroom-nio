@@ -28,6 +28,7 @@ from collections.abc import (
     MutableSequence,
     Sequence,
 )
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
@@ -284,6 +285,17 @@ AsyncFileType = AsyncBufferedReader | AsyncTextIOWrapper
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _SyncRequestContext:
+    request_since: str | None
+
+
+@dataclass(frozen=True)
+class _SyncResponseEnvelope:
+    response: SyncResponse
+    request_since: str | None
+
+
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -489,9 +501,11 @@ class AsyncClient(Client):
 
         self._stop_sync_forever = False
 
-        self._sync_since: str | None = None
-
         self._sync_response_lock = asyncio.Lock()
+        self._sync_executor_context: ContextVar[object | None] = ContextVar(
+            f"nio_sync_executor_{id(self)}", default=None
+        )
+        self._active_sync_executor_token: object | None = None
         self._recovery_send_gate = asyncio.Lock()
         self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
 
@@ -863,11 +877,9 @@ class AsyncClient(Client):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
-    async def _handle_sync(self, response: SyncResponse) -> None:
-        request_since = (
-            self._sync_since or self.next_batch or self.loaded_sync_token or None
-        )
-        self._sync_since = None
+    async def _handle_sync(self, envelope: _SyncResponseEnvelope) -> None:
+        response = envelope.response
+        request_since = envelope.request_since
 
         if self.next_batch == response.next_batch:
             await self._pump_sync_recovery()
@@ -1278,14 +1290,51 @@ class AsyncClient(Client):
         if not isinstance(response, Response):
             raise ValueError("Invalid response received")
 
-        if isinstance(response, (SyncResponse, SlidingSyncResponse)):
-            async with self._sync_response_lock:
-                if isinstance(response, SyncResponse):
+        if isinstance(response, SyncResponse):
+            await self._receive_sync_family(
+                _SyncResponseEnvelope(
+                    response,
+                    self.next_batch or self.loaded_sync_token or None,
+                )
+            )
+        elif isinstance(response, SlidingSyncResponse):
+            await self._receive_sync_family(response)
+        else:
+            super().receive_response(response)
+
+    def _raise_on_sync_reentry(self) -> None:
+        if not self.config.backfill_limited_timelines:
+            return
+        inherited = self._sync_executor_context.get()
+        if inherited is not None and inherited is self._active_sync_executor_token:
+            raise LocalProtocolError(
+                "Sync-family requests cannot run from a timeline callback."
+            )
+
+    async def _receive_sync_family(
+        self,
+        response: _SyncResponseEnvelope | SlidingSyncResponse,
+    ) -> None:
+        if not self.config.backfill_limited_timelines:
+            if isinstance(response, _SyncResponseEnvelope):
+                await self._handle_sync(response)
+            else:
+                await self._handle_sliding_sync(response)
+            return
+
+        self._raise_on_sync_reentry()
+        async with self._sync_response_lock:
+            executor = object()
+            self._active_sync_executor_token = executor
+            context_token = self._sync_executor_context.set(executor)
+            try:
+                if isinstance(response, _SyncResponseEnvelope):
                     await self._handle_sync(response)
                 else:
                     await self._handle_sliding_sync(response)
-        else:
-            super().receive_response(response)
+            finally:
+                self._active_sync_executor_token = None
+                self._sync_executor_context.reset(context_token)
 
     async def get_timeout_retry_wait_time(self, got_timeouts: int) -> float:
         if got_timeouts < 2:
@@ -1310,6 +1359,7 @@ class AsyncClient(Client):
         content_length: int | None = None,
         save_to: os.PathLike | None = None,
         process_response: bool = True,
+        sync_request_context: _SyncRequestContext | None = None,
     ):
         headers = (
             {"Content-Type": content_type}
@@ -1392,7 +1442,12 @@ class AsyncClient(Client):
                 await asyncio.sleep(wait)
 
         if process_response:
-            await self.receive_response(resp)
+            if isinstance(resp, SyncResponse) and sync_request_context is not None:
+                await self._receive_sync_family(
+                    _SyncResponseEnvelope(resp, sync_request_context.request_since)
+                )
+            else:
+                await self.receive_response(resp)
         return resp
 
     @client_session
@@ -1760,15 +1815,12 @@ class AsyncClient(Client):
         a `SyncError` if there was an error with the request.
         """
 
-        sync_token = since or self.next_batch
+        self._raise_on_sync_reentry()
+        sync_token = since or self.next_batch or self.loaded_sync_token or None
         presence = set_presence or self._presence
-        # Remember the token this request continues from; _handle_sync uses it
-        # to bound limited-timeline backfill for rooms it holds no delivered
-        # ids for (e.g. on the first sync after a restart).
-        self._sync_since = sync_token or self.loaded_sync_token or None
         method, path = Api.sync(
             self.access_token,
-            since=sync_token or self.loaded_sync_token,
+            since=sync_token,
             timeout=(
                 int(self.config.request_timeout) * 1000
                 if timeout is None
@@ -1786,6 +1838,7 @@ class AsyncClient(Client):
             # 0 if full_state: server doesn't respect timeout if full_state
             # + 15: give server a chance to naturally return before we timeout
             timeout=0 if full_state else timeout / 1000 + 15 if timeout else timeout,
+            sync_request_context=_SyncRequestContext(sync_token),
         )
 
         return response
@@ -1828,6 +1881,7 @@ class AsyncClient(Client):
                 ``AsyncClient.config.request_timeout`` for both the server
                 long-poll timeout and the client-side request timeout.
         """
+        self._raise_on_sync_reentry()
         if pos is None:
             self._sliding_sync_recovery_scope = uuid4().hex
         presence = set_presence or self._presence

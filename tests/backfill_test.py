@@ -19,6 +19,7 @@ from nio import (
     FullyReadEvent,
     InviteInfo,
     InviteNameEvent,
+    LocalProtocolError,
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
@@ -1075,6 +1076,177 @@ class TestRoomLocalRecovery:
         await asyncio.gather(first, second)
         assert seen == ["$one"]
         assert not client._recovery.gaps
+
+    async def test_concurrent_sync_requests_keep_their_own_cursors(
+        self, client, monkeypatch
+    ):
+        class Transport:
+            status = 200
+
+            def __init__(self, request_since):
+                self.request_since = request_since
+
+        responses = {
+            "a": sync_response(
+                "response-a",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=True, prev_batch="target-a"
+                    )
+                },
+            ),
+            "b": sync_response(
+                "response-b",
+                {
+                    ROOM_B: room_info(
+                        [text_event("$b", 2, ROOM_B)],
+                        limited=True,
+                        prev_batch="target-b",
+                    )
+                },
+            ),
+        }
+        b_processed = asyncio.Event()
+
+        async def send(_method, path, *_args, **_kwargs):
+            request_since = parse_qs(urlparse(path).query)["since"][0]
+            if request_since == "a":
+                await b_processed.wait()
+            return Transport(request_since)
+
+        async def create_matrix_response(*, transport_response, **_kwargs):
+            return responses[transport_response.request_since]
+
+        original_receive = client._receive_sync_family
+
+        async def receive(response):
+            await original_receive(response)
+            if ROOM_B in client._recovery.gaps:
+                b_processed.set()
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+        monkeypatch.setattr(client, "_receive_sync_family", receive)
+        first, second = await asyncio.gather(
+            client.sync(since="a"),
+            client.sync(since="b"),
+        )
+        assert {first.next_batch, second.next_batch} == {"response-a", "response-b"}
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "a"
+        assert client._recovery.gaps[ROOM_B][0].cursor_token == "b"
+
+    @pytest.mark.parametrize(
+        "nested_kind",
+        ["sync", "sliding_sync", "receive_sync", "receive_sliding"],
+    )
+    @pytest.mark.parametrize("outer_protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize("child_task", [False, True])
+    async def test_callback_sync_reentry_fails_before_io_or_mutation(
+        self, client, monkeypatch, nested_kind, outer_protocol, child_task
+    ):
+        async def unexpected_send(*_args, **_kwargs):
+            raise AssertionError("callback reentry must fail before HTTP")
+
+        monkeypatch.setattr(client, "_send", unexpected_send)
+        seen: list[str] = []
+        failures: list[str] = []
+
+        async def nested():
+            if nested_kind == "sync":
+                return await client.sync(since="nested")
+            if nested_kind == "sliding_sync":
+                return await client.sliding_sync(pos="nested")
+            if nested_kind == "receive_sync":
+                return await client.receive_response(
+                    timeline_response("classic", "nested", [text_event("$nested", 2)])
+                )
+            return await client.receive_response(
+                timeline_response("sliding", "nested", [text_event("$nested", 2)])
+            )
+
+        async def callback(_room, value):
+            seen.append(value.event_id)
+            if value.event_id != "$outer":
+                return
+            try:
+                operation = nested()
+                if child_task:
+                    await asyncio.create_task(operation)
+                else:
+                    await operation
+            except LocalProtocolError as error:
+                failures.append(str(error))
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response(
+                outer_protocol,
+                "outer",
+                [text_event("$outer", 1), text_event("$suffix", 3)],
+            )
+        )
+        assert failures == ["Sync-family requests cannot run from a timeline callback."]
+        assert seen == ["$outer", "$suffix"]
+        assert client.next_batch == ("outer" if outer_protocol == "classic" else "")
+
+    async def test_stale_inherited_executor_token_may_proceed(self, client):
+        release = asyncio.Event()
+        child: asyncio.Task | None = None
+        seen: list[str] = []
+
+        async def delayed_nested():
+            await release.wait()
+            await client.receive_response(
+                timeline_response("classic", "nested", [text_event("$nested", 2)])
+            )
+
+        async def callback(_room, value):
+            nonlocal child
+            seen.append(value.event_id)
+            if value.event_id == "$outer":
+                child = asyncio.create_task(delayed_nested())
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response("classic", "outer", [text_event("$outer", 1)])
+        )
+        assert child is not None
+        release.set()
+        await child
+        assert seen == ["$outer", "$nested"]
+        assert client.next_batch == "nested"
+
+    @pytest.mark.parametrize("nested_protocol", ["classic", "sliding"])
+    async def test_disabled_callback_sync_reentry_keeps_upstream_behavior(
+        self, tempdir, nested_protocol
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen: list[str] = []
+
+        async def callback(_room, value):
+            seen.append(value.event_id)
+            if value.event_id == "$outer":
+                await client.receive_response(
+                    timeline_response(
+                        nested_protocol,
+                        "nested",
+                        [text_event("$nested", 2)],
+                    )
+                )
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response("classic", "outer", [text_event("$outer", 1)])
+        )
+        assert seen == ["$outer", "$nested"]
+        await client.close()
 
     async def test_room_send_linearizes_with_concurrent_gap_install(
         self, tempdir, monkeypatch
