@@ -28,6 +28,7 @@ from collections.abc import (
     MutableSequence,
     Sequence,
 )
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -506,7 +507,7 @@ class AsyncClient(Client):
             f"nio_sync_executor_{id(self)}", default=None
         )
         self._active_sync_executor_token: object | None = None
-        self._recovery_send_gate = asyncio.Lock()
+        self._recovery_room_gates: dict[str, asyncio.Lock] = {}
         self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
 
         # Sliding account data retained until its room is known.
@@ -890,7 +891,9 @@ class AsyncClient(Client):
 
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
-            async with self._recovery_send_gate:
+            async with self._recovery_room_state(
+                set(response.rooms.join) | reset_rooms
+            ):
                 plan = plan_sync_response(
                     self._recovery,
                     user_id=self.user_id,
@@ -940,7 +943,7 @@ class AsyncClient(Client):
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
         if self.config.backfill_limited_timelines:
-            async with self._recovery_send_gate:
+            async with self._recovery_room_state(response.rooms):
                 persist_response_plan(
                     self._recovery,
                     self.store if self.config.store_sync_tokens else None,
@@ -1335,6 +1338,25 @@ class AsyncClient(Client):
             finally:
                 self._active_sync_executor_token = None
                 self._sync_executor_context.reset(context_token)
+
+    def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
+        return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _recovery_room_state(
+        self,
+        room_ids: Iterable[str],
+    ) -> AsyncIterator[None]:
+        acquired: list[asyncio.Lock] = []
+        try:
+            for room_id in sorted(set(room_ids)):
+                gate = self._recovery_room_gate(room_id)
+                await gate.acquire()
+                acquired.append(gate)
+            yield
+        finally:
+            for gate in reversed(acquired):
+                gate.release()
 
     async def get_timeout_retry_wait_time(self, got_timeouts: int) -> float:
         if got_timeouts < 2:
@@ -2822,52 +2844,69 @@ class AsyncClient(Client):
         """
         uuid: str | UUID = tx_id or uuid4()
 
-        send_gate = (
-            self._recovery_send_gate
-            if self.config.backfill_limited_timelines
-            else asyncio.Lock()
-        )
-        async with send_gate:
-            if any(
-                gap.cursor_token is not None or gap.target_token
-                for gap in self._recovery.gaps.get(room_id, ())
-            ):
-                raise SendRetryError("Room timeline recovery is still pending.")
-
-            if self.olm:
-                try:
-                    room = self.rooms[room_id]
-                except KeyError:
-                    raise LocalProtocolError(f"No such room with id {room_id} found.")
-
-                if room.encrypted:
-                    if not room.members_synced:
-                        await self.joined_members(room_id)
-                        if self.should_query_keys:
-                            await self.keys_query()
-
-                    if self.olm.should_share_group_session(room_id):
-                        try:
-                            event = self.sharing_session[room_id]
-                            await event.wait()
-                        except KeyError:
-                            await self.share_group_session(
-                                room_id,
-                                ignore_unverified_devices=ignore_unverified_devices,
-                            )
-
-                    # Reactions do not support encryption yet.
-                    # https://github.com/matrix-org/matrix-doc/pull/1849
-                    if message_type != "m.reaction":
-                        message_type, content = self.encrypt(
-                            room_id, message_type, content
-                        )
-
-            method, path, data = Api.room_send(
-                self.access_token, room_id, message_type, content, uuid
+        if self.config.backfill_limited_timelines:
+            async with self._recovery_room_state((room_id,)):
+                request = await self._prepare_room_send(
+                    room_id,
+                    message_type,
+                    content,
+                    uuid,
+                    ignore_unverified_devices,
+                )
+        else:
+            request = await self._prepare_room_send(
+                room_id,
+                message_type,
+                content,
+                uuid,
+                ignore_unverified_devices,
             )
 
-            return await self._send(RoomSendResponse, method, path, data, (room_id,))
+        method, path, data = request
+        return await self._send(RoomSendResponse, method, path, data, (room_id,))
+
+    async def _prepare_room_send(
+        self,
+        room_id: str,
+        message_type: str,
+        content: dict[Any, Any],
+        tx_id: str | UUID,
+        ignore_unverified_devices: bool,
+    ) -> tuple[str, str, str]:
+        if any(
+            gap.cursor_token is not None or gap.target_token
+            for gap in self._recovery.gaps.get(room_id, ())
+        ):
+            raise SendRetryError("Room timeline recovery is still pending.")
+
+        if self.olm:
+            try:
+                room = self.rooms[room_id]
+            except KeyError:
+                raise LocalProtocolError(f"No such room with id {room_id} found.")
+
+            if room.encrypted:
+                if not room.members_synced:
+                    await self.joined_members(room_id)
+                    if self.should_query_keys:
+                        await self.keys_query()
+
+                if self.olm.should_share_group_session(room_id):
+                    try:
+                        event = self.sharing_session[room_id]
+                        await event.wait()
+                    except KeyError:
+                        await self.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                        )
+
+                # Reactions do not support encryption yet.
+                # https://github.com/matrix-org/matrix-doc/pull/1849
+                if message_type != "m.reaction":
+                    message_type, content = self.encrypt(room_id, message_type, content)
+
+        return Api.room_send(self.access_token, room_id, message_type, content, tx_id)
 
     @logged_in_async
     @client_session

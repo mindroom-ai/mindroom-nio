@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -39,7 +40,7 @@ from nio import (
     UnknownBadEvent,
     UnknownToDeviceEvent,
 )
-from nio.api import MATRIX_API_PATH_V3
+from nio.api import MATRIX_API_PATH_V3, Api
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
     RecoveryGap,
@@ -1301,12 +1302,195 @@ class TestRoomLocalRecovery:
             )
         )
         await asyncio.sleep(0)
-        assert not client._recovery.gaps
+        await response_task
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert not send_task.done()
         release_send.set()
+        assert await send_task is sent
+        await client.close()
+
+    async def test_same_room_plan_waits_for_immutable_send_request(
+        self, client, monkeypatch
+    ):
+        client.config = replace(client.config, backfill_max_pages=0)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        prepare_started = asyncio.Event()
+        release_prepare = asyncio.Event()
+        sent = object()
+        original_prepare = client._prepare_room_send
+
+        async def prepare(*args, **kwargs):
+            prepare_started.set()
+            await release_prepare.wait()
+            return await original_prepare(*args, **kwargs)
+
+        async def send(*_args, **_kwargs):
+            assert not client._recovery_room_gate(ROOM_A).locked()
+            return sent
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        send_task = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+        )
+        await prepare_started.wait()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 2)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not client._recovery.gaps
+        assert not response_task.done()
+
+        release_prepare.set()
         assert await send_task is sent
         await response_task
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
-        await client.close()
+
+    async def test_blocked_room_preparation_does_not_block_other_room(
+        self, client, monkeypatch
+    ):
+        client.config = replace(client.config, backfill_max_pages=0)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info([], limited=False, prev_batch="a0"),
+                    ROOM_B: room_info([], limited=False, prev_batch="b0"),
+                },
+            )
+        )
+        room_a_started = asyncio.Event()
+        release_room_a = asyncio.Event()
+        room_b_sent = asyncio.Event()
+        original_prepare = client._prepare_room_send
+
+        async def prepare(room_id, *args, **kwargs):
+            if room_id == ROOM_A:
+                room_a_started.set()
+                await release_room_a.wait()
+            return await original_prepare(room_id, *args, **kwargs)
+
+        async def send(_response_class, _method, _path, _data, response_data):
+            if response_data == (ROOM_B,):
+                room_b_sent.set()
+            return object()
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        room_a_send = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "a", "msgtype": "m.text"},
+            )
+        )
+        await room_a_started.wait()
+        room_b_send = asyncio.create_task(
+            client.room_send(
+                ROOM_B,
+                "m.room.message",
+                {"body": "b", "msgtype": "m.text"},
+            )
+        )
+        await asyncio.wait_for(room_b_sent.wait(), 1)
+        await room_b_send
+
+        await asyncio.wait_for(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_B: room_info(
+                            [text_event("$held-b", 2, ROOM_B)],
+                            limited=True,
+                            prev_batch="b1",
+                        )
+                    },
+                )
+            ),
+            1,
+        )
+        assert client._recovery.gaps[ROOM_B][0].cursor_token == "s1"
+        assert not room_a_send.done()
+        release_room_a.set()
+        await room_a_send
+
+    async def test_multi_room_plan_acquires_gates_in_sorted_order(self, client):
+        client.next_batch = "s1"
+        room_a_gate = client._recovery_room_gate(ROOM_A)
+        room_b_gate = client._recovery_room_gate(ROOM_B)
+        await room_a_gate.acquire()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_B: room_info([], limited=False, prev_batch="b1"),
+                        ROOM_A: room_info([], limited=False, prev_batch="a1"),
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not response_task.done()
+        assert not room_b_gate.locked()
+        room_a_gate.release()
+        await response_task
+
+    async def test_room_send_builds_request_under_gate_and_sends_after(
+        self, client, monkeypatch
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        original_room_send = Api.room_send
+        built = False
+        sent = object()
+
+        def build(*args, **kwargs):
+            nonlocal built
+            assert client._recovery_room_gate(ROOM_A).locked()
+            built = True
+            return original_room_send(*args, **kwargs)
+
+        async def send(*_args, **_kwargs):
+            assert built
+            assert not client._recovery_room_gate(ROOM_A).locked()
+            return sent
+
+        monkeypatch.setattr(Api, "room_send", build)
+        monkeypatch.setattr(client, "_send", send)
+        assert (
+            await client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+            is sent
+        )
 
     async def test_missing_prev_batch_uses_response_target(self, client, aioresponse):
         seen = record_events(client)
