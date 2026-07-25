@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 _RECOVERY_PAYLOAD_VERSION = 1
 _RECOVERY_NONCE_SIZE = 12
 _RECOVERY_TAG_SIZE = 16
+_RECOVERY_WRITE_CHUNK_SIZE = 100
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
 
@@ -588,8 +589,10 @@ class MatrixStore:
                 PendingTimelineEvents.is_live == False,  # noqa: E712
             ).execute()
         rows = [{"account": account, **asdict(gap)} for gap in gaps]
-        if rows:
-            SyncRecoveryGaps.replace_many(rows).execute()
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryGaps.replace_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
         self._upsert_pending_events(account, events)
 
     def _recovery_payload_key(self) -> bytes:
@@ -684,28 +687,29 @@ class MatrixStore:
             }
             for event in events
         ]
-        if not rows:
-            return
-        PendingTimelineEvents.insert_many(rows).on_conflict(
-            conflict_target=[
-                PendingTimelineEvents.account,
-                PendingTimelineEvents.room_id,
-                PendingTimelineEvents.event_id,
-            ],
-            preserve=[
-                PendingTimelineEvents.generation,
-                PendingTimelineEvents.sequence,
-                PendingTimelineEvents.event_payload,
-                PendingTimelineEvents.is_live,
-                PendingTimelineEvents.was_encrypted,
-                PendingTimelineEvents.was_completed,
-            ],
-            where=(
-                (PendingTimelineEvents.generation == 0)
-                & PendingTimelineEvents.was_encrypted
-                & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
-            ),
-        ).execute()
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            PendingTimelineEvents.insert_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).on_conflict(
+                conflict_target=[
+                    PendingTimelineEvents.account,
+                    PendingTimelineEvents.room_id,
+                    PendingTimelineEvents.event_id,
+                ],
+                preserve=[
+                    PendingTimelineEvents.generation,
+                    PendingTimelineEvents.sequence,
+                    PendingTimelineEvents.event_payload,
+                    PendingTimelineEvents.is_live,
+                    PendingTimelineEvents.was_encrypted,
+                    PendingTimelineEvents.was_completed,
+                ],
+                where=(
+                    (PendingTimelineEvents.generation == 0)
+                    & PendingTimelineEvents.was_encrypted
+                    & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
+                ),
+            ).execute()
 
     @use_database
     def load_sync_recovery(

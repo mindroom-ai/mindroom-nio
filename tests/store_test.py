@@ -1,5 +1,6 @@
 import copy
 import os
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
@@ -936,6 +937,46 @@ class TestClass:
         gaps, events = sqlstore.load_sync_recovery()
         assert len(gaps) == 1
         assert events == []
+
+    def test_recovery_bulk_writes_respect_sqlite_bind_limit(self, sqlstore):
+        connection = sqlstore.database.connection()
+        can_set_limit = hasattr(connection, "setlimit")
+        row_count = 200 if can_set_limit else 3700
+        old_limit = (
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+            if can_set_limit
+            else None
+        )
+        gaps = [
+            RecoveryGap(f"!bulk-{index}:example.org", 1, "target", "cursor")
+            for index in range(row_count)
+        ]
+        events = [
+            PendingTimelineEvent(
+                gap.room_id,
+                1,
+                0,
+                f"$bulk-{index}",
+                "{}",
+                True,
+                False,
+            )
+            for index, gap in enumerate(gaps)
+        ]
+
+        try:
+            sqlstore.save_recovery("bulk-token", set(), gaps, events, None)
+        finally:
+            if old_limit is not None:
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                    old_limit,
+                )
+
+        loaded_gaps, loaded_events = sqlstore.load_sync_recovery()
+        assert sqlstore.load_sync_token() == "bulk-token"
+        assert len(loaded_gaps) == row_count
+        assert len(loaded_events) == row_count
 
     def test_completed_upgrade_refreshes_pruning_recency(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "", None)
