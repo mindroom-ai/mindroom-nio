@@ -30,7 +30,9 @@ if package_installed("vodozemac"):
         MegolmInboundSessions,
         OlmSessions,
         OutgoingKeyRequests,
+        PendingTimelineEvents,
         StoreVersion,
+        SyncRecoveryGaps,
         SyncTokens,
     )
     from .database import (

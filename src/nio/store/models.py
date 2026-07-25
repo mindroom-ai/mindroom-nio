@@ -213,6 +213,40 @@ class SyncTokens(Model):
         constraints = [SQL("UNIQUE(account_id)")]
 
 
+class SyncRecoveryGaps(Model):
+    room_id = TextField()
+    generation = IntegerField()
+    target_token = TextField()
+    cursor_token = TextField(null=True)
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="sync_recovery_gaps",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id,generation)")]
+
+
+class PendingTimelineEvents(Model):
+    room_id = TextField()
+    generation = IntegerField()
+    sequence = IntegerField()
+    event_id = TextField()
+    event_payload = ByteField()
+    is_live = BooleanField()
+    was_encrypted = BooleanField()
+    was_completed = BooleanField()
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="pending_timeline_events",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id,event_id)")]
+
+
 class TrackedUsers(Model):
     user_id = TextField()
     account = ForeignKeyField(

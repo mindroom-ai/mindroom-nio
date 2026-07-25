@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Make limited-timeline recovery durable per room with monotonic transport tokens, held live rows, restart resumption when encrypted sync-token storage is active, cross-transport event-ID de-duplication, and one later decrypted replay.
+- Migrate the encrypted client store from schema v2 to schema v3 for recovery gaps and pending timeline events, encrypt pending event bodies with authenticated row identity under the existing store secret, and export `SyncRecoveryGaps` and `PendingTimelineEvents` from `nio.store`.
+
+### Bug Fixes
+
+- Preserve normal live callback exception propagation while recovered-history dispatch attempts every matching callback before acknowledgement.
+- Keep room sends fail closed while that room has an unresolved recovery lane, and serialize concurrent classic and Sliding Sync recovery pumps.
+- Treat HTTP 408, HTTP 429, and server errors as retryable recovery failures while terminal client errors release held live rows.
+- Scan every accepted `/messages` page before using held live-window overlap as a boundary, cap durable recovered history across all open room generations, and atomically abandon only an unverified historical prefix that cannot fit before a complete boundary.
+- Apply every joined room's state before fallible callbacks, preserve the full current timeline across own-join resets, retry Sliding Sync decryption after same-response room keys, enforce held-live limits on the first limited window, and preserve per-event to-device callback ordering.
+- Remove delivered event bodies from durable de-duplication markers while retaining the event ID and encrypted-state bit required for replay suppression.
+
 ## 0.29.0
 
 ### Upstream Sync

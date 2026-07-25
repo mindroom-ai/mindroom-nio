@@ -1,6 +1,8 @@
 import copy
 import os
+import sqlite3
 from collections import defaultdict
+from pathlib import Path
 
 import pytest
 from helpers import ephemeral, ephemeral_dir, faker
@@ -15,6 +17,7 @@ from nio.crypto import (
     TrustState,
 )
 from nio.exceptions import OlmTrustError
+from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
 from nio.store import (
     DefaultStore,
     Ed25519Key,
@@ -23,6 +26,8 @@ from nio.store import (
     MatrixStore,
     SqliteMemoryStore,
     SqliteStore,
+    PendingTimelineEvents,
+    SyncRecoveryGaps,
 )
 
 BOB_ID = "@bob:example.org"
@@ -530,7 +535,470 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 2
+        assert version == 3
+
+    def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
+        sqlstore.save_sync_token("s1")
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$held",
+            '{"content":{},"event_id":"$held","sender":"@a:b","type":"m.test"}',
+            True,
+            False,
+        )
+
+        original = sqlstore._upsert_pending_events
+
+        def fail(*args):
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(sqlstore, "_upsert_pending_events", fail)
+        with pytest.raises(RuntimeError, match="write failed"):
+            sqlstore.save_recovery(
+                "s2",
+                set(),
+                [gap],
+                [event],
+                None,
+            )
+        assert sqlstore.load_sync_token() == "s1"
+        assert sqlstore.load_sync_recovery() == ([], [])
+
+        monkeypatch.setattr(sqlstore, "_upsert_pending_events", original)
+        sqlstore.save_recovery("s2", set(), [gap], [event], None)
+        assert sqlstore.load_sync_token() == "s2"
+        gaps, events = sqlstore.load_sync_recovery()
+        assert [
+            (gap.room_id, gap.generation, gap.target_token, gap.cursor_token)
+            for gap in gaps
+        ] == [(TEST_ROOM, 1, "p1", "s1")]
+        assert (
+            events[0].room_id,
+            events[0].generation,
+            events[0].sequence,
+            events[0].event_id,
+        ) == (TEST_ROOM, 1, 0, "$held")
+
+    def test_v2_store_creates_recovery_tables(self, sqlstore):
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables(
+                [PendingTimelineEvents, SyncRecoveryGaps],
+            )
+            sqlstore._update_version(2)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened._get_store_version() == 3
+        with reopened.database.bind_ctx(reopened.models):
+            assert PendingTimelineEvents.table_exists()
+            assert SyncRecoveryGaps.table_exists()
+            columns = {
+                row[1]: row[2]
+                for row in reopened.database.execute_sql(
+                    f'PRAGMA table_info("{PendingTimelineEvents._meta.table_name}")'
+                ).fetchall()
+            }
+        assert columns["event_payload"] == "BLOB"
+        assert "source_json" not in columns
+
+    def test_pending_recovery_payload_is_encrypted_at_rest(self, tempdir):
+        store = SqliteStore(
+            "@secure:example.org",
+            "DEVICEID",
+            tempdir,
+            pickle_key="recovery-secret",
+        )
+        store.save_account(OlmAccount())
+        marker = "PRIVATE-RECOVERY-MARKER"
+        source = (
+            '{"content":{"body":"PRIVATE-RECOVERY-MARKER","msgtype":"m.text"},'
+            '"event_id":"$event","sender":"@private:example.org",'
+            '"type":"m.room.message"}'
+        )
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+        event = PendingTimelineEvent(TEST_ROOM, 1, 0, "$event", source, False, False)
+        store.save_recovery("s2", set(), [gap], [event], None)
+        table = PendingTimelineEvents._meta.table_name
+        payload, storage_type = store.database.execute_sql(
+            f'SELECT event_payload, typeof(event_payload) FROM "{table}"'
+        ).fetchone()
+        assert storage_type == "blob"
+        assert marker.encode() not in payload
+        assert b"@private:example.org" not in payload
+        database_path = Path(store.database_path)
+        store.database.close()
+        assert marker.encode() not in database_path.read_bytes()
+        assert b"@private:example.org" not in database_path.read_bytes()
+
+        reopened = SqliteStore(
+            store.user_id,
+            store.device_id,
+            store.store_path,
+            pickle_key="recovery-secret",
+        )
+        _, events = reopened.load_sync_recovery()
+        assert events == [event]
+
+    def test_pending_recovery_payload_rejects_wrong_key(self, tempdir):
+        store = SqliteStore(
+            "@secure:example.org",
+            "DEVICEID",
+            tempdir,
+            pickle_key="correct-key",
+        )
+        store.save_account(OlmAccount())
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b","type":"m.test"}',
+            False,
+            False,
+        )
+        store.save_recovery(
+            "s2",
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "p1", "s1")],
+            [event],
+            None,
+        )
+        store.database.close()
+
+        wrong_key = SqliteStore(
+            store.user_id,
+            store.device_id,
+            store.store_path,
+            pickle_key="wrong-key",
+        )
+        with pytest.raises(ValueError, match="Invalid encrypted recovery payload"):
+            wrong_key.load_sync_recovery()
+
+    def test_pending_recovery_payload_rejects_tampering(self, sqlstore):
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b","type":"m.test"}',
+            False,
+            False,
+        )
+        sqlstore.save_recovery(
+            "s2",
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "p1", "s1")],
+            [event],
+            None,
+        )
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            row = PendingTimelineEvents.get(
+                PendingTimelineEvents.event_id == event.event_id
+            )
+            payload = bytearray(row.event_payload)
+            payload[-1] ^= 1
+            row.event_payload = bytes(payload)
+            row.save()
+
+        with pytest.raises(ValueError, match="Invalid encrypted recovery payload"):
+            sqlstore.load_sync_recovery()
+
+    def test_pending_recovery_payload_authenticates_row_identity(self, sqlstore):
+        events = [
+            PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                index,
+                event_id,
+                (
+                    f'{{"content":{{}},"event_id":"{event_id}",'
+                    '"sender":"@a:b","type":"m.test"}'
+                ),
+                False,
+                False,
+            )
+            for index, event_id in enumerate(("$one", "$two"))
+        ]
+        sqlstore.save_recovery(
+            "s2",
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "p1", "s1")],
+            events,
+            None,
+        )
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            first = PendingTimelineEvents.get(PendingTimelineEvents.event_id == "$one")
+            second = PendingTimelineEvents.get(PendingTimelineEvents.event_id == "$two")
+            first.event_payload = second.event_payload
+            first.save()
+
+        with pytest.raises(ValueError, match="Invalid encrypted recovery payload"):
+            sqlstore.load_sync_recovery()
+
+    def test_pending_recovery_payload_uses_fresh_nonces(self, sqlstore):
+        source = '{"content":{},"sender":"@a:b","type":"m.test"}'
+        events = [
+            PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                index,
+                event_id,
+                source,
+                False,
+                False,
+            )
+            for index, event_id in enumerate(("$one", "$two"))
+        ]
+        sqlstore.save_recovery(
+            "s2",
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "p1", "s1")],
+            events,
+            None,
+        )
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            payloads = [
+                bytes(row.event_payload)
+                for row in PendingTimelineEvents.select().order_by(
+                    PendingTimelineEvents.event_id
+                )
+            ]
+        assert payloads[0][1:13] != payloads[1][1:13]
+
+    def test_completed_recovery_row_has_no_payload(self, sqlstore):
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b","type":"m.test"}',
+            False,
+            False,
+        )
+        sqlstore.save_recovery(
+            "s2",
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "p1", None)],
+            [event],
+            None,
+        )
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            completed = PendingTimelineEvents.get(
+                PendingTimelineEvents.event_id == event.event_id
+            )
+        assert completed.generation == 0
+        assert completed.event_payload == b""
+
+    def test_pending_recovery_event_retains_encrypted_source(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b",'
+            '"type":"m.room.encrypted"}',
+            False,
+            True,
+        )
+        decrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{"body":"clear","msgtype":"m.text"},'
+            '"event_id":"$event","sender":"@a:b","type":"m.room.message"}',
+            False,
+            False,
+        )
+        sqlstore.save_recovery("s2", set(), [gap], [encrypted], None)
+        sqlstore.save_recovery(None, set(), [gap], [decrypted], None)
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert len(gaps) == 1
+        assert len(events) == 1
+        assert events[0].was_encrypted
+        assert '"type":"m.room.encrypted"' in events[0].source_json
+
+    def test_completed_encrypted_event_allows_plaintext_upgrade(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b",'
+            '"type":"m.room.encrypted"}',
+            False,
+            True,
+        )
+        decrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            2,
+            0,
+            "$event",
+            '{"content":{"body":"clear","msgtype":"m.text"},'
+            '"event_id":"$event","sender":"@a:b","type":"m.room.message"}',
+            False,
+            False,
+        )
+        sqlstore.save_recovery("s2", set(), [gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
+        sqlstore.save_recovery("s3", set(), [next_gap], [decrypted], None)
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert len(gaps) == 2
+        assert len(events) == 1
+        assert events[0].generation == 2
+        assert not events[0].was_encrypted
+        assert '"body":"clear"' in events[0].source_json
+
+        sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
+        sqlstore.finish_recovery(TEST_ROOM, 1, None, False)
+        sqlstore.finish_recovery(TEST_ROOM, 2, None, False)
+        gaps, events = sqlstore.load_sync_recovery()
+        assert gaps == []
+        assert len(events) == 1
+        assert events[0].generation == 0
+        assert events[0].source_json == ""
+
+    def test_completed_encrypted_event_allows_pending_retry(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(TEST_ROOM, 1, 0, "$event", "{}", False, True)
+        sqlstore.save_recovery("s1", set(), [gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        retry = PendingTimelineEvent(TEST_ROOM, 2, 0, "$event", "{}", False, True, True)
+        next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
+        sqlstore.save_recovery("s2", set(), [next_gap], [retry], None)
+
+        _, events = sqlstore.load_sync_recovery()
+        assert len(events) == 1
+        assert events[0].generation == 2
+        assert events[0].was_completed
+
+        sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
+        _, events = sqlstore.load_sync_recovery()
+        assert events[0].generation == 0
+        assert events[0].source_json == ""
+        assert not events[0].was_completed
+        assert not events[0].was_encrypted
+
+    @pytest.mark.parametrize("clear_mode", ["recovered", "room"])
+    def test_abandonment_restores_completed_encrypted_marker(
+        self, sqlstore, clear_mode
+    ):
+        first_gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(TEST_ROOM, 1, 0, "$event", "{}", False, True)
+        sqlstore.save_recovery("s1", set(), [first_gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        retry_gap = RecoveryGap(TEST_ROOM, 2, "p2", "cursor")
+        retry = PendingTimelineEvent(
+            TEST_ROOM,
+            2,
+            0,
+            "$event",
+            "{}",
+            False,
+            False,
+            True,
+        )
+        sqlstore.save_recovery("s2", set(), [retry_gap], [retry], None)
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM} if clear_mode == "room" else set(),
+            [],
+            [],
+            retry_gap if clear_mode == "recovered" else None,
+        )
+
+        _, events = sqlstore.load_sync_recovery()
+        assert len(events) == 1
+        assert events[0].generation == 0
+        assert events[0].was_encrypted
+        assert not events[0].was_completed
+
+    def test_synthetic_recovery_key_is_deleted_after_callback(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "", None)
+        event = PendingTimelineEvent(
+            TEST_ROOM, 1, 0, "~sliding:scope:pos:0", "{}", True, False
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert len(gaps) == 1
+        assert events == []
+
+    def test_recovery_bulk_writes_respect_sqlite_bind_limit(self, sqlstore):
+        connection = sqlstore.database.connection()
+        can_set_limit = hasattr(connection, "setlimit")
+        row_count = 200 if can_set_limit else 3700
+        old_limit = (
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+            if can_set_limit
+            else None
+        )
+        gaps = [
+            RecoveryGap(f"!bulk-{index}:example.org", 1, "target", "cursor")
+            for index in range(row_count)
+        ]
+        events = [
+            PendingTimelineEvent(
+                gap.room_id,
+                1,
+                0,
+                f"$bulk-{index}",
+                "{}",
+                True,
+                False,
+            )
+            for index, gap in enumerate(gaps)
+        ]
+
+        try:
+            sqlstore.save_recovery("bulk-token", set(), gaps, events, None)
+        finally:
+            if old_limit is not None:
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                    old_limit,
+                )
+
+        loaded_gaps, loaded_events = sqlstore.load_sync_recovery()
+        assert sqlstore.load_sync_token() == "bulk-token"
+        assert len(loaded_gaps) == row_count
+        assert len(loaded_events) == row_count
+
+    def test_completed_upgrade_refreshes_pruning_recency(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "", None)
+
+        def complete(event_id, was_encrypted):
+            event = PendingTimelineEvent(
+                TEST_ROOM, 1, 0, event_id, "{}", False, was_encrypted
+            )
+            sqlstore.save_recovery(None, set(), [gap], [event], None)
+            sqlstore.finish_recovery(TEST_ROOM, 1, event_id, was_encrypted)
+
+        complete("$same", True)
+        for index in range(1, 512):
+            complete(f"${index}", False)
+        complete("$same", False)
+        complete("$new", False)
+
+        _, events = sqlstore.load_sync_recovery()
+        event_ids = [event.event_id for event in events]
+        assert len(event_ids) == 512
+        assert "$same" in event_ids
+        assert "$1" not in event_ids
 
     def test_sqlitestore_verification(self, sqlstore):
         devices = self.example_devices

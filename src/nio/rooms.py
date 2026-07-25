@@ -21,6 +21,7 @@ from collections import defaultdict
 
 from .events import (
     AccountDataEvent,
+    BadEventType,
     EphemeralEvent,
     Event,
     FullyReadEvent,
@@ -447,7 +448,7 @@ class MatrixRoom:
             else:
                 self.children.discard(event.state_key)
 
-    def handle_account_data(self, event: AccountDataEvent) -> None:
+    def handle_account_data(self, event: AccountDataEvent | BadEventType) -> None:
         if isinstance(event, FullyReadEvent):
             self.fully_read_marker = event.event_id
 

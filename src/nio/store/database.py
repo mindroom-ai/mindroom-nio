@@ -12,12 +12,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
+from typing import TYPE_CHECKING
 
-from peewee import DoesNotExist, SqliteDatabase
+from Crypto.Cipher import AES
+from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -44,9 +48,36 @@ from . import (
     MegolmInboundSessions,
     OlmSessions,
     OutgoingKeyRequests,
+    PendingTimelineEvents,
     StoreVersion,
+    SyncRecoveryGaps,
     SyncTokens,
 )
+
+if TYPE_CHECKING:
+    from ..client.sync_recovery import (
+        PendingEventKind,
+        PendingTimelineEvent,
+        RecoveryGap,
+    )
+
+
+_RECOVERY_PAYLOAD_VERSION = 1
+_RECOVERY_NONCE_SIZE = 12
+_RECOVERY_TAG_SIZE = 16
+_RECOVERY_WRITE_CHUNK_SIZE = 100
+_RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
+
+
+def _recovery_payload_aad(
+    account_id: int,
+    room_id: str,
+    generation: int,
+    event_id: str,
+) -> bytes:
+    values = (str(account_id), room_id, str(generation), event_id)
+    encoded = (value.encode() for value in values)
+    return b"".join(len(value).to_bytes(4, "big") + value for value in encoded)
 
 
 def use_database(fn):
@@ -96,9 +127,10 @@ class MatrixStore:
         StoreVersion,
         Keys,
         SyncTokens,
+        SyncRecoveryGaps,
+        PendingTimelineEvents,
     ]
-    store_version = 2
-
+    store_version = 3
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -130,6 +162,11 @@ class MatrixStore:
             self.database.create_tables([DeviceKeys, DeviceTrustState])
         self._update_version(2)
 
+    def upgrade_to_v3(self):
+        with self.database.bind_ctx(self.models):
+            self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
+        self._update_version(3)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -141,6 +178,9 @@ class MatrixStore:
         # Update the store if it's an old version here.
         if store_version == 1:
             self.upgrade_to_v2()
+            store_version = 2
+        if store_version == 2:
+            self.upgrade_to_v3()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -470,7 +510,7 @@ class MatrixStore:
 
     @use_database
     def save_sync_token(self, token: str) -> None:
-        """Save the given token"""
+        """Save the current Matrix transport token."""
         account = self._get_account()
         assert account
 
@@ -490,6 +530,289 @@ class MatrixStore:
             return token.token
 
         return None
+
+    @staticmethod
+    def _restore_completed_markers(account, *conditions) -> None:
+        PendingTimelineEvents.update(
+            generation=0,
+            sequence=0,
+            event_payload=b"",
+            is_live=False,
+            was_encrypted=True,
+            was_completed=False,
+        ).where(
+            PendingTimelineEvents.account == account,
+            PendingTimelineEvents.generation > 0,
+            PendingTimelineEvents.was_completed == True,  # noqa: E712
+            *conditions,
+        ).execute()
+
+    @use_database_atomic
+    def save_recovery(
+        self,
+        token: str | None,
+        clear_rooms: set[str],
+        gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
+        events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
+        clear_recovered: RecoveryGap | None,
+    ) -> None:
+        account = self._get_account()
+        assert account
+
+        if token:
+            SyncTokens.replace(account=account, token=token).execute()
+        if clear_rooms:
+            self._restore_completed_markers(
+                account,
+                PendingTimelineEvents.room_id.in_(clear_rooms),
+            )
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.generation > 0,
+            ).execute()
+            SyncRecoveryGaps.delete().where(
+                SyncRecoveryGaps.account == account,
+                SyncRecoveryGaps.room_id.in_(clear_rooms),
+            ).execute()
+        if clear_recovered:
+            self._restore_completed_markers(
+                account,
+                PendingTimelineEvents.room_id == clear_recovered.room_id,
+                PendingTimelineEvents.generation == clear_recovered.generation,
+                PendingTimelineEvents.is_live == False,  # noqa: E712
+            )
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id == clear_recovered.room_id,
+                PendingTimelineEvents.generation == clear_recovered.generation,
+                PendingTimelineEvents.is_live == False,  # noqa: E712
+            ).execute()
+        rows = [{"account": account, **asdict(gap)} for gap in gaps]
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryGaps.replace_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+        self._upsert_pending_events(account, events)
+
+    def _recovery_payload_key(self) -> bytes:
+        return hashlib.sha256(_RECOVERY_KEY_DOMAIN + self.pickle_key.encode()).digest()
+
+    @staticmethod
+    def _encrypt_recovery_payload(
+        key: bytes,
+        account_id: int,
+        event: PendingTimelineEvent,
+    ) -> bytes:
+        nonce = os.urandom(_RECOVERY_NONCE_SIZE)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=_RECOVERY_TAG_SIZE)
+        header = bytes((_RECOVERY_PAYLOAD_VERSION,))
+        cipher.update(
+            header
+            + _recovery_payload_aad(
+                account_id,
+                event.room_id,
+                event.generation,
+                event.event_id,
+            )
+        )
+        payload = json.dumps(
+            {"kind": event.kind, "source": event.source_json},
+            separators=(",", ":"),
+        ).encode()
+        encrypted, tag = cipher.encrypt_and_digest(payload)
+        return header + nonce + tag + encrypted
+
+    @staticmethod
+    def _decrypt_recovery_payload(
+        key: bytes,
+        account_id: int,
+        row: PendingTimelineEvents,
+    ) -> tuple[str, PendingEventKind]:
+        payload = bytes(row.event_payload)
+        minimum_size = 1 + _RECOVERY_NONCE_SIZE + _RECOVERY_TAG_SIZE
+        if len(payload) < minimum_size or payload[0] != _RECOVERY_PAYLOAD_VERSION:
+            raise ValueError("Invalid encrypted recovery payload")
+        header = payload[:1]
+        nonce_end = 1 + _RECOVERY_NONCE_SIZE
+        tag_end = nonce_end + _RECOVERY_TAG_SIZE
+        cipher = AES.new(
+            key,
+            AES.MODE_GCM,
+            nonce=payload[1:nonce_end],
+            mac_len=_RECOVERY_TAG_SIZE,
+        )
+        cipher.update(
+            header
+            + _recovery_payload_aad(
+                account_id,
+                row.room_id,
+                row.generation,
+                row.event_id,
+            )
+        )
+        try:
+            decrypted = cipher.decrypt_and_verify(
+                payload[tag_end:],
+                payload[nonce_end:tag_end],
+            )
+            decoded = json.loads(decrypted)
+            kind = decoded["kind"]
+            source = decoded["source"]
+            if kind not in {"timeline", "ephemeral", "account_data"} or not isinstance(
+                source, str
+            ):
+                raise ValueError
+            return source, kind
+        except (KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
+            raise ValueError("Invalid encrypted recovery payload") from error
+
+    def _upsert_pending_events(self, account, events) -> None:
+        key = self._recovery_payload_key()
+        rows = [
+            {
+                "account": account,
+                "room_id": event.room_id,
+                "generation": event.generation,
+                "sequence": event.sequence,
+                "event_id": event.event_id,
+                "event_payload": (
+                    b""
+                    if event.generation == 0
+                    else self._encrypt_recovery_payload(key, account.id, event)
+                ),
+                "is_live": event.is_live,
+                "was_encrypted": event.was_encrypted,
+                "was_completed": event.was_completed,
+            }
+            for event in events
+        ]
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            PendingTimelineEvents.insert_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).on_conflict(
+                conflict_target=[
+                    PendingTimelineEvents.account,
+                    PendingTimelineEvents.room_id,
+                    PendingTimelineEvents.event_id,
+                ],
+                preserve=[
+                    PendingTimelineEvents.generation,
+                    PendingTimelineEvents.sequence,
+                    PendingTimelineEvents.event_payload,
+                    PendingTimelineEvents.is_live,
+                    PendingTimelineEvents.was_encrypted,
+                    PendingTimelineEvents.was_completed,
+                ],
+                where=(
+                    (PendingTimelineEvents.generation == 0)
+                    & PendingTimelineEvents.was_encrypted
+                    & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
+                ),
+            ).execute()
+
+    @use_database
+    def load_sync_recovery(
+        self,
+    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvent]]:
+        """Load room obligations and their ordered pending callbacks."""
+        from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
+
+        account = self._get_account()
+        if not account:
+            return [], []
+
+        gaps = list(
+            SyncRecoveryGaps.select()
+            .where(SyncRecoveryGaps.account == account)
+            .order_by(SyncRecoveryGaps.room_id, SyncRecoveryGaps.generation)
+        )
+        rows = list(
+            PendingTimelineEvents.select()
+            .where(PendingTimelineEvents.account == account)
+            .order_by(
+                PendingTimelineEvents.room_id,
+                PendingTimelineEvents.generation,
+                Case(
+                    PendingTimelineEvents.generation,
+                    ((0, PendingTimelineEvents.id),),
+                    PendingTimelineEvents.is_live,
+                ),
+                PendingTimelineEvents.sequence,
+            )
+        )
+        key = self._recovery_payload_key()
+        events = []
+        for row in rows:
+            source_json, kind = (
+                ("", "timeline")
+                if row.generation == 0
+                else self._decrypt_recovery_payload(key, account.id, row)
+            )
+            events.append(
+                PendingTimelineEvent(
+                    row.room_id,
+                    row.generation,
+                    row.sequence,
+                    row.event_id,
+                    source_json,
+                    row.is_live,
+                    row.was_encrypted,
+                    row.was_completed,
+                    kind,
+                )
+            )
+        return gaps, events
+
+    @use_database_atomic
+    def finish_recovery(
+        self,
+        room_id: str,
+        generation: int,
+        event_id: str | None,
+        was_encrypted: bool,
+    ) -> None:
+        account = self._get_account()
+        assert account
+        event_filter = (
+            PendingTimelineEvents.account == account,
+            PendingTimelineEvents.room_id == room_id,
+            PendingTimelineEvents.generation == generation,
+        )
+        if event_id:
+            pending = PendingTimelineEvents.get(
+                *event_filter,
+                PendingTimelineEvents.event_id == event_id,
+            )
+            pending.delete_instance()
+            if event_id.startswith("~"):
+                return
+            pending.id = None
+            pending.generation = 0
+            pending.event_payload = b""
+            pending.is_live = pending.was_completed = False
+            pending.was_encrypted = was_encrypted
+            pending.save(force_insert=True)
+            stale = (
+                PendingTimelineEvents.select(PendingTimelineEvents.id)
+                .where(
+                    PendingTimelineEvents.account == account,
+                    PendingTimelineEvents.room_id == room_id,
+                    PendingTimelineEvents.generation == 0,
+                )
+                .order_by(PendingTimelineEvents.id.desc())
+                .offset(512)
+            )
+            PendingTimelineEvents.delete().where(
+                PendingTimelineEvents.id.in_(stale)
+            ).execute()
+            return
+        PendingTimelineEvents.delete().where(*event_filter).execute()
+        SyncRecoveryGaps.delete().where(
+            SyncRecoveryGaps.account == account,
+            SyncRecoveryGaps.room_id == room_id,
+            SyncRecoveryGaps.generation == generation,
+        ).execute()
 
     @use_database
     def delete_encrypted_room(self, room: str) -> None:

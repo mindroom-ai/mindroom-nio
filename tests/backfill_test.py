@@ -1,19 +1,10 @@
-"""Tests for limited-timeline backfill in the async client.
-
-These exercise the opt-in ``backfill_limited_timelines`` behaviour end to end:
-a limited sync timeline should cause the client to page ``/messages`` forwards
-from the token the sync continued from and dispatch the recovered gap through
-the normal event callbacks, while a disabled client behaves exactly like
-upstream nio.
-"""
+"""Integration tests for durable room-local limited-sync recovery."""
 
 import asyncio
 import json
-import logging
 import re
-import time
+from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -26,40 +17,53 @@ from nio import (
     DeviceList,
     DeviceOneTimeKeyCount,
     Event,
+    FullyReadEvent,
+    InviteInfo,
+    InviteNameEvent,
+    LocalProtocolError,
     LoginResponse,
     MegolmEvent,
+    PresenceEvent,
+    RoomEncryptedImage,
+    RoomEncryptionEvent,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
     RoomNameEvent,
     Rooms,
+    SendRetryError,
+    SlidingSyncResponse,
     SyncResponse,
     Timeline,
+    ToDeviceEvent,
+    TypingNoticeEvent,
+    UnknownBadEvent,
+    UnknownToDeviceEvent,
 )
-from nio.api import MATRIX_API_PATH_V3
-
-BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
-MESSAGES_URL = re.compile(
-    rf"^https://example\.org{MATRIX_API_PATH_V3}/rooms/.+/messages"
+from nio.api import MATRIX_API_PATH_V3, Api
+from nio.client.sync_recovery import (
+    PendingTimelineEvent,
+    RecoveryGap,
+    record_completed_timeline_event,
+    should_dispatch_timeline_event,
 )
-SYNC_URL = re.compile(rf"^https://example\.org{MATRIX_API_PATH_V3}/sync")
 
-TEST_ROOM_ID = "!flooded:example.org"
-OTHER_ROOM_ID = "!second:example.org"
-OWN_ID = "@example:example.org"
+BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
+MESSAGES_URL = re.compile(rf"^{BASE_URL}/rooms/.+/messages")
+SEND_URL = re.compile(rf"^{BASE_URL}/rooms/.+/send/m.room.message/.+")
+SYNC_URL = re.compile(rf"^{BASE_URL}/sync")
+ROOM_A = "!a:example.org"
+ROOM_B = "!b:example.org"
+LOGIN = json.loads(Path("tests/data/login_response.json").read_text())
+OWN_ID = LOGIN["user_id"]
 
-login_response: dict = json.loads(Path("tests/data/login_response.json").read_text())
 
-
-def text_event(
-    event_id: str, *, ts: int, room_id: str = TEST_ROOM_ID
-) -> RoomMessageText:
-    """Build a real text event so event_id, source and timestamp are populated."""
+def text_event(event_id: str, ts: int, room_id: str = ROOM_A) -> RoomMessageText:
     event = RoomMessageText.from_dict(
         {
-            "content": {"body": f"body {event_id}", "msgtype": "m.text"},
+            "content": {"body": event_id, "msgtype": "m.text"},
             "event_id": event_id,
-            "sender": "@user:example.org",
+            "sender": "@sender:example.org",
             "origin_server_ts": ts,
             "room_id": room_id,
             "type": "m.room.message",
@@ -71,20 +75,18 @@ def text_event(
 
 def member_event(
     event_id: str,
-    *,
     ts: int,
     membership: str,
-    user_id: str = "@member:example.org",
+    user_id: str = OWN_ID,
 ) -> RoomMemberEvent:
-    """Build a membership state event as it appears in timelines and /messages."""
     event = RoomMemberEvent.from_dict(
         {
-            "content": {"membership": membership, "displayname": "Member"},
+            "content": {"membership": membership},
             "event_id": event_id,
             "sender": user_id,
             "state_key": user_id,
             "origin_server_ts": ts,
-            "room_id": TEST_ROOM_ID,
+            "room_id": ROOM_A,
             "type": "m.room.member",
         }
     )
@@ -92,14 +94,45 @@ def member_event(
     return event
 
 
-def megolm_event(event_id: str, *, ts: int) -> MegolmEvent:
-    """Build an undecryptable megolm event (no session for it exists)."""
+def name_event(event_id: str, ts: int, name: str) -> RoomNameEvent:
+    event = RoomNameEvent.from_dict(
+        {
+            "content": {"name": name},
+            "event_id": event_id,
+            "sender": "@sender:example.org",
+            "origin_server_ts": ts,
+            "room_id": ROOM_A,
+            "state_key": "",
+            "type": "m.room.name",
+        }
+    )
+    assert isinstance(event, RoomNameEvent)
+    return event
+
+
+def encryption_event(room_id: str = ROOM_B) -> RoomEncryptionEvent:
+    event = Event.parse_event(
+        {
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            "event_id": "$encryption",
+            "origin_server_ts": 0,
+            "room_id": room_id,
+            "sender": "@sender:example.org",
+            "state_key": "",
+            "type": "m.room.encryption",
+        }
+    )
+    assert isinstance(event, RoomEncryptionEvent)
+    return event
+
+
+def megolm_event(event_id: str, ts: int) -> MegolmEvent:
     event = Event.parse_event(
         {
             "event_id": event_id,
-            "sender": "@user:example.org",
+            "sender": "@sender:example.org",
             "origin_server_ts": ts,
-            "room_id": TEST_ROOM_ID,
+            "room_id": ROOM_A,
             "type": "m.room.encrypted",
             "content": {
                 "algorithm": "m.megolm.v1.aes-sha2",
@@ -114,57 +147,37 @@ def megolm_event(event_id: str, *, ts: int) -> MegolmEvent:
     return event
 
 
-def name_event(event_id: str, *, ts: int, name: str) -> RoomNameEvent:
-    """Build a room name state event as it appears in timelines and /messages."""
-    event = RoomNameEvent.from_dict(
-        {
-            "content": {"name": name},
-            "event_id": event_id,
-            "sender": "@user:example.org",
-            "state_key": "",
-            "origin_server_ts": ts,
-            "room_id": TEST_ROOM_ID,
-            "type": "m.room.name",
-        }
-    )
-    assert isinstance(event, RoomNameEvent)
-    return event
+def room_info(
+    events: list,
+    *,
+    limited: bool,
+    prev_batch: str | None,
+    state: list | None = None,
+) -> RoomInfo:
+    return RoomInfo(Timeline(events, limited, prev_batch), state or [], [], [])
 
 
 def sync_response(
-    next_batch: str,
-    room_id: str,
-    events: List[RoomMessageText],
+    token: str,
+    joined: dict[str, RoomInfo],
     *,
-    limited: bool,
-    prev_batch: Optional[str],
-    state: Optional[list] = None,
+    invited: dict[str, InviteInfo] | None = None,
+    left: dict | None = None,
+    presence: list | None = None,
 ) -> SyncResponse:
-    """Build a sync response carrying one joined room with the given timeline."""
-    timeline = Timeline(list(events), limited, prev_batch)
-    room_info = RoomInfo(timeline, list(state or []), [], [])
-    rooms = Rooms({}, {room_id: room_info}, {})
     return SyncResponse(
-        next_batch,
-        rooms,
+        token,
+        Rooms(invited or {}, joined, left or {}),
         DeviceOneTimeKeyCount(49, 50),
         DeviceList([], []),
         [],
-        [],
+        presence or [],
     )
 
 
-def sync_json(
-    next_batch: str,
-    room_id: str,
-    events: List[RoomMessageText],
-    *,
-    limited: bool,
-    prev_batch: Optional[str],
-) -> dict:
-    """Build a raw /sync body for tests that drive the real sync() request."""
+def sync_json(token: str, joined: dict[str, RoomInfo]) -> dict:
     return {
-        "next_batch": next_batch,
+        "next_batch": token,
         "device_one_time_keys_count": {"signed_curve25519": 50},
         "device_lists": {"changed": [], "left": []},
         "rooms": {
@@ -173,14 +186,15 @@ def sync_json(
             "join": {
                 room_id: {
                     "timeline": {
-                        "events": [event.source for event in events],
-                        "limited": limited,
-                        "prev_batch": prev_batch,
+                        "events": [event.source for event in info.timeline.events],
+                        "limited": info.timeline.limited,
+                        "prev_batch": info.timeline.prev_batch,
                     },
                     "state": {"events": []},
                     "ephemeral": {"events": []},
                     "account_data": {"events": []},
                 }
+                for room_id, info in joined.items()
             },
         },
         "to_device": {"events": []},
@@ -189,1254 +203,3495 @@ def sync_json(
     }
 
 
-def messages_payload(events: List[RoomMessageText], *, end: Optional[str]) -> dict:
-    """Build a /messages response body, ordered as the server sends it.
+def timeline_response(
+    protocol: str,
+    token: str,
+    events: list[RoomMessageText],
+) -> SyncResponse | SlidingSyncResponse:
+    if protocol == "classic":
+        return sync_response(
+            token,
+            {ROOM_A: room_info(events, limited=False, prev_batch="p0")},
+        )
+    response = SlidingSyncResponse.from_dict(
+        {
+            "pos": token,
+            "rooms": {
+                ROOM_A: {
+                    "membership": "join",
+                    "timeline": [event.source for event in events],
+                }
+            },
+        }
+    )
+    assert isinstance(response, SlidingSyncResponse)
+    return response
 
-    The chunk follows the requested direction: newest first for ``dir=b``
-    walks, oldest first for ``dir=f``. ``end=None`` omits the key entirely,
-    which is how a server signals that the pagination walk has reached its
-    end.
-    """
-    payload: dict = {
-        "start": "start_token",
-        "chunk": [event.source for event in events],
-    }
+
+def messages(events: list, end: str | None) -> dict:
+    payload = {"start": "start", "chunk": [event.source for event in events]}
     if end is not None:
         payload["end"] = end
     return payload
 
 
-class PagedMessages:
-    """A /messages callback that serves pre-canned pages keyed by their `from` token.
-
-    aioresponse invokes ``__call__`` for every matching request; the ``from``
-    query parameter selects which page to return, so the pagination walk can be
-    driven deterministically without depending on request ordering.
-    """
-
-    def __init__(self, pages: dict):
+class Pages:
+    def __init__(self, pages: dict[str, dict]):
         self.pages = pages
-        self.requested_tokens: List[Optional[str]] = []
-        self.requested_dir: List[Optional[str]] = []
-        self.requested_to: List[Optional[str]] = []
+        self.from_tokens: list[str | None] = []
+        self.to_tokens: list[str | None] = []
 
     def __call__(self, url, **kwargs) -> CallbackResult:
         query = parse_qs(urlparse(str(url)).query)
-        token = query.get("from", [None])[0]
-        self.requested_tokens.append(token)
-        self.requested_dir.append(query.get("dir", [None])[0])
-        self.requested_to.append(query.get("to", [None])[0])
-        return CallbackResult(status=200, payload=self.pages[token])
+        start = query.get("from", [None])[0]
+        self.from_tokens.append(start)
+        self.to_tokens.append(query.get("to", [None])[0])
+        return CallbackResult(status=200, payload=self.pages[start])
+
+
+def record_events(client: AsyncClient) -> list[str]:
+    seen: list[str] = []
+
+    async def callback(_room, event):
+        seen.append(event.event_id)
+
+    client.add_event_callback(callback, RoomMessageText)
+    return seen
 
 
 @pytest_asyncio.fixture
-async def backfill_client(tempdir) -> AsyncClient:
-    """An authed client with limited-timeline backfill enabled."""
-    client = AsyncClient(
+async def client(tempdir):
+    value = AsyncClient(
         "https://example.org",
         OWN_ID,
         "DEVICEID",
         tempdir,
-        config=AsyncClientConfig(backfill_limited_timelines=True),
+        config=AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+        ),
     )
-    await client.receive_response(LoginResponse.from_dict(login_response))
-    yield client
-    await client.close()
-
-
-@pytest_asyncio.fixture
-async def disabled_client(tempdir) -> AsyncClient:
-    """An authed client with the default (disabled) backfill behaviour."""
-    client = AsyncClient(
-        "https://example.org",
-        OWN_ID,
-        "DEVICEID",
-        tempdir,
-        config=AsyncClientConfig(),
-    )
-    await client.receive_response(LoginResponse.from_dict(login_response))
-    yield client
-    await client.close()
+    await value.receive_response(LoginResponse.from_dict(LOGIN))
+    yield value
+    await value.close()
 
 
 @pytest.mark.asyncio
-class TestLimitedTimelineBackfill:
-    def _record_callback(self, client: AsyncClient) -> List[str]:
-        """Register an event callback and return the list it appends event ids to."""
-        dispatched: List[str] = []
-
-        async def cb(_room, event):
-            dispatched.append(event.event_id)
-
-        client.add_event_callback(cb, RoomMessageText)
-        return dispatched
-
-    async def test_disabled_makes_no_requests(self, disabled_client, aioresponse):
-        """With the flag off, a limited timeline triggers no /messages requests."""
-        dispatched = self._record_callback(disabled_client)
-
-        await disabled_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$a", ts=100)],
-                limited=False,
-                prev_batch="p0",
-            )
+class TestRoomLocalRecovery:
+    async def test_disabled_preserves_short_circuit(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
         )
-        await disabled_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$b", ts=300)],
-                limited=True,
-                prev_batch="p1",
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        calls: list[str] = []
+
+        async def first(_room, _event):
+            calls.append("first")
+            raise RuntimeError("stop")
+
+        async def second(_room, _event):
+            calls.append("second")
+
+        client.add_event_callback(first, RoomMessageText)
+        client.add_event_callback(second, RoomMessageText)
+        with pytest.raises(RuntimeError, match="stop"):
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$a", 1)], limited=True, prev_batch="p"
+                        )
+                    },
+                )
             )
+        assert calls == ["first"]
+        await client.close()
+
+    async def test_disabled_store_token_stays_eager_on_callback_error(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store_sync_tokens=True),
         )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
 
-        assert dispatched == ["$a", "$b"]
+        async def fail(_room, _event):
+            raise RuntimeError("callback failed")
 
-    async def test_first_sync_is_skipped(self, backfill_client, aioresponse):
-        """A room's first (always limited) sync must not trigger backfill."""
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$a", ts=100)],
-                limited=True,
-                prev_batch="p1",
+        client.add_event_callback(fail, RoomMessageText)
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$a", 1)], limited=True, prev_batch="p"
+                        )
+                    },
+                )
             )
+        assert client.next_batch == "s1"
+        assert client.store.load_sync_token() == "s1"
+        await client.close()
+
+    async def test_disabled_preserves_upstream_cross_room_order(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
         )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = []
 
-        assert dispatched == ["$a"]
+        async def record(room, event):
+            seen.append((room.room_id, type(event).__name__))
 
-    async def test_limited_timeline_recovers_gap_in_order(
-        self, backfill_client, aioresponse
+        client.add_event_callback(record, RoomMessageText)
+        client.add_ephemeral_callback(record, TypingNoticeEvent)
+        rooms = {
+            ROOM_A: room_info([text_event("$a", 1)], limited=False, prev_batch="a"),
+            ROOM_B: room_info(
+                [text_event("$b", 2, ROOM_B)], limited=False, prev_batch="b"
+            ),
+        }
+        for info in rooms.values():
+            info.ephemeral.append(TypingNoticeEvent([OWN_ID]))
+        await client.receive_response(sync_response("s1", rooms))
+        assert seen == [
+            (ROOM_A, "RoomMessageText"),
+            (ROOM_A, "TypingNoticeEvent"),
+            (ROOM_B, "RoomMessageText"),
+            (ROOM_B, "TypingNoticeEvent"),
+        ]
+        await client.close()
+
+    async def test_disabled_preserves_to_device_processing_order(
+        self, tempdir, monkeypatch
     ):
-        """A limited timeline backfills the gap and dispatches chronologically.
-
-        The recovered gap events are delivered before the sync response's own
-        (newer) events, so callbacks observe the room in chronological order.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        # First (non-limited) sync establishes the delivered position at $old.
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        events = [
+            ToDeviceEvent.parse_event(
+                {
+                    "content": {"body": body},
+                    "sender": "@sender:example.org",
+                    "type": "org.example.test",
+                }
             )
-        )
+            for body in ("one", "two")
+        ]
+        assert all(isinstance(event, UnknownToDeviceEvent) for event in events)
+        processed = []
+        seen = []
 
-        # The gap holds $gap1,$gap2; the surviving window is $new. The walk
-        # pages forwards from "s1" (the token sync 2 continued from) and stops
-        # when it reaches the window.
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$gap2", ts=200)],
-                    end="fwd2",
-                ),
-                "fwd2": messages_payload([text_event("$new", ts=300)], end="fwd3"),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        def process(event):
+            processed.append(event.source["content"]["body"])
 
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
+        async def callback(event):
+            seen.append((event.source["content"]["body"], tuple(processed)))
 
-        assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
-        assert pages.requested_tokens == ["s1", "fwd2"]
-        assert pages.requested_dir == ["f", "f"]
-        # The sync's next_batch clamps the walk on servers that honour `to`.
-        assert pages.requested_to == ["s2", "s2"]
+        monkeypatch.setattr(client, "_handle_decrypt_to_device", process)
+        client.add_to_device_callback(callback, UnknownToDeviceEvent)
+        response = sync_response("s1", {})
+        response.to_device_events = events
+        await client.receive_response(response)
+        assert seen == [("one", ("one",)), ("two", ("one", "two"))]
+        await client.close()
 
-    async def test_events_in_sync_response_are_not_redispatched(
-        self, backfill_client, aioresponse
-    ):
-        """Events present in the sync response are boundaries, never re-dispatched."""
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        # /messages overlaps the sync window: $present must stop the walk and is
-        # never dispatched a second time.
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [text_event("$gap1", ts=200), text_event("$present", ts=300)],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$present", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$old", "$gap1", "$present"]
-
-    async def test_pagination_stops_at_page_bound(self, tempdir, aioresponse, caplog):
-        """A never-terminating history walk stops at the configured page bound."""
+    async def test_ordinary_sync_ignores_recovery_deadline(self, tempdir):
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
             "DEVICEID",
             tempdir,
             config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_max_pages=3
+                backfill_limited_timelines=True,
+                backfill_timeout=0,
             ),
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(client)
-
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
         await client.receive_response(
             sync_response(
                 "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=1)],
-                limited=False,
-                prev_batch="p0",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=False, prev_batch="p"
+                    )
+                },
+            )
+        )
+        assert seen == ["$a"]
+        await client.close()
+
+    async def test_first_sync_needs_no_recovery(self, client):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=True, prev_batch="p"
+                    )
+                },
+            )
+        )
+        assert seen == ["$a"]
+        assert not client._recovery.gaps
+
+    async def test_no_id_bad_event_keeps_timeline_position(self, client):
+        seen: list[str] = []
+
+        async def record(_room, event):
+            seen.append(getattr(event, "event_id", None) or "bad")
+
+        client.add_event_callback(record, RoomMessageText)
+        client.add_event_callback(record, UnknownBadEvent)
+        malformed = Event.parse_event({"type": "broken"})
+        assert isinstance(malformed, UnknownBadEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [
+                            text_event("$before", 1),
+                            malformed,
+                            text_event("$after", 2),
+                        ],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [malformed.source],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        await client.receive_response(sliding)
+        assert seen == ["$before", "bad", "$after", "bad", "bad"]
+        assert all(
+            not event_id.startswith("~")
+            for event_id in client._recovery.completed[ROOM_A]
+        )
+
+    async def test_complete_timeline_precedes_other_sync_surfaces(self, client):
+        seen: list[str] = []
+
+        async def room_callback(_room, event):
+            seen.append(type(event).__name__)
+
+        async def presence_callback(event):
+            seen.append(type(event).__name__)
+
+        client.add_event_callback(room_callback, RoomMessageText)
+        client.add_ephemeral_callback(room_callback, TypingNoticeEvent)
+        client.add_room_account_data_callback(room_callback, FullyReadEvent)
+        client.add_presence_callback(presence_callback, PresenceEvent)
+        info = room_info([text_event("$event", 1)], limited=False, prev_batch="p0")
+        payload = sync_json("s1", {ROOM_A: info})
+        payload["rooms"]["join"][ROOM_A]["ephemeral"]["events"] = [
+            {"content": {"user_ids": [OWN_ID]}, "type": "m.typing"}
+        ]
+        payload["rooms"]["join"][ROOM_A]["account_data"]["events"] = [
+            {"content": {"event_id": "$event"}, "type": "m.fully_read"}
+        ]
+        payload["presence"] = {
+            "events": [
+                {
+                    "content": {"presence": "online"},
+                    "sender": OWN_ID,
+                    "type": "m.presence",
+                }
+            ]
+        }
+        response = SyncResponse.from_dict(payload)
+        assert isinstance(response, SyncResponse)
+        await client.receive_response(response)
+        assert seen == [
+            "RoomMessageText",
+            "TypingNoticeEvent",
+            "FullyReadEvent",
+            "PresenceEvent",
+        ]
+
+    async def test_gap_and_live_window_dispatch_in_order(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages(
+                    [text_event("$gap", 2), text_event("$live", 3)],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$live"]
+        assert pages.from_tokens == ["s1"]
+        assert pages.to_tokens == ["p1"]
+        assert client.next_batch == "s2"
+
+        await client.receive_response(
+            sync_response(
+                "s3",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$gap", 2), text_event("$newer", 4)],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$live", "$newer"]
+
+    async def test_recovered_encryption_event_updates_room_and_store(
+        self, client, aioresponse
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [encryption_event(ROOM_A), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
             )
         )
 
-        # Every page yields a fresh event and a fresh end token, so only the page
-        # bound can stop the walk.
-        counter = {"n": 0}
+        assert client.rooms[ROOM_A].encrypted
+        assert ROOM_A in client.encrypted_rooms
+        assert ROOM_A in client.store.load_encrypted_rooms()
 
-        def endless(url, **kwargs) -> CallbackResult:
-            counter["n"] += 1
-            n = counter["n"]
+    async def test_empty_page_and_page_bound_resume(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([], "more"),
+                "more": messages(
+                    [text_event("$gap", 2), text_event("$held", 3)],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        limited = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+
+        await client.receive_response(limited)
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+
+        await client.receive_response(limited)
+        assert pages.from_tokens == ["s1", "more"]
+        assert seen == ["$old", "$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_sliding_room_account_data_waits_for_pending_classic_gap(
+        self, client, aioresponse
+    ):
+        seen: list[str] = []
+
+        async def record(_room, event):
+            seen.append(
+                event.event_id
+                if isinstance(event, RoomMessageText)
+                else type(event).__name__
+            )
+
+        client.add_event_callback(record, RoomMessageText)
+        client.add_room_account_data_callback(record, FullyReadEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap", 2)], "more"),
+                "more": messages(
+                    [text_event("$gap2", 3), text_event("$held", 4)],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old"]
+
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [],
+                    }
+                },
+                "extensions": {
+                    "account_data": {
+                        "rooms": {
+                            ROOM_A: [
+                                {
+                                    "content": {"event_id": "$held"},
+                                    "type": "m.fully_read",
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+
+        assert seen == [
+            "$old",
+            "$gap",
+            "$gap2",
+            "$held",
+            "FullyReadEvent",
+        ]
+        assert not client._recovery.gaps
+
+    async def test_event_bound_abandons_prefix_at_room_wide_cap(
+        self, tempdir, aioresponse
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=1,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2)], "more"),
+                "more": messages([text_event("$gap2", 3)], "p1"),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        limited = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+
+        await client.receive_response(limited)
+        assert pages.from_tokens == ["s1", "more"]
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_room_messages_error_keeps_gap_pending(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+
+    async def test_request_timeout_keeps_gap_pending(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=408)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+
+        with pytest.raises(SendRetryError, match="recovery is still pending"):
+            await client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "secret", "msgtype": "m.text"},
+            )
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_live_callback_can_send_without_recovery_gap(
+        self, client, aioresponse, protocol
+    ):
+        sent = []
+        aioresponse.put(SEND_URL, payload={"event_id": "$sent"})
+
+        async def send(_room, event):
+            sent.append(
+                await client.room_send(
+                    ROOM_A,
+                    "m.room.message",
+                    {"body": event.event_id, "msgtype": "m.text"},
+                    "tx",
+                )
+            )
+
+        client.add_event_callback(send, RoomMessageText)
+        await client.receive_response(
+            timeline_response(protocol, "s1", [text_event("$live", 1)])
+        )
+        assert [response.event_id for response in sent] == ["$sent"]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize(
+        "error_type",
+        [RuntimeError, asyncio.TimeoutError],
+        ids=["runtime-error", "timeout-error"],
+    )
+    async def test_live_callback_error_is_acked_and_does_not_wedge(
+        self, client, protocol, error_type
+    ):
+        calls = []
+        failed = False
+
+        async def first(_room, event):
+            calls.append(f"first:{event.event_id}")
+
+        async def fail_once(_room, event):
+            nonlocal failed
+            calls.append(f"failing:{event.event_id}")
+            if event.event_id == "$bad" and not failed:
+                failed = True
+                raise error_type("callback failed")
+
+        async def last(_room, event):
+            calls.append(f"last:{event.event_id}")
+
+        for callback in (first, fail_once, last):
+            client.add_event_callback(callback, RoomMessageText)
+        response = timeline_response(
+            protocol,
+            "s1",
+            [text_event("$bad", 1), text_event("$after", 2)],
+        )
+        with pytest.raises(error_type, match="callback failed"):
+            await client.receive_response(response)
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$after"
+        ]
+
+        await client.receive_response(response)
+        await client.receive_response(
+            timeline_response(protocol, "s2", [text_event("$next", 3)])
+        )
+        assert calls == [
+            "first:$bad",
+            "failing:$bad",
+            "first:$after",
+            "failing:$after",
+            "last:$after",
+            "first:$next",
+            "failing:$next",
+            "last:$next",
+        ]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_all_room_state_is_ready_before_live_callbacks(
+        self, client, protocol
+    ):
+        failed = False
+        seen = []
+
+        async def callback(room, event):
+            nonlocal failed
+            if event.event_id == "$a" and not failed:
+                failed = True
+                raise RuntimeError("callback failed")
+            if event.event_id == "$b":
+                seen.append(room.encrypted)
+
+        client.add_event_callback(callback, RoomMessageText)
+        if protocol == "classic":
+            response = sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=False, prev_batch="a"
+                    ),
+                    ROOM_B: room_info(
+                        [text_event("$b", 2, ROOM_B)],
+                        limited=False,
+                        prev_batch="b",
+                        state=[encryption_event()],
+                    ),
+                },
+            )
+        else:
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$a", 1).source],
+                        },
+                        ROOM_B: {
+                            "membership": "join",
+                            "required_state": [encryption_event().source],
+                            "timeline": [text_event("$b", 2, ROOM_B).source],
+                        },
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(response)
+        await client.receive_response(response)
+        assert seen == [True]
+        assert client.rooms[ROOM_B].encrypted
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_held_live_bound_abandons_stuck_gap(self, tempdir, protocol):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+                backfill_timeout=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held1", 1)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        await client.receive_response(
+            timeline_response(protocol, "s2", [text_event("$held2", 2)])
+        )
+        assert seen == []
+
+        await client.receive_response(
+            timeline_response(protocol, "s3", [text_event("$held3", 3)])
+        )
+        assert seen == ["$held1", "$held2", "$held3"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_first_limited_window_honors_held_live_bound(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+                backfill_timeout=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event(f"$held{index}", index) for index in range(3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$held0", "$held1", "$held2"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_repeated_end_token_abandons_gap_and_releases_live(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "s1"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("end", [None, "s1"])
+    async def test_live_overlap_closes_gap_without_end_progress(
+        self, client, aioresponse, end
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                end,
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_live_overlap_defers_events_after_held_window(
+        self, tempdir, aioresponse
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$gap", 1),
+                    text_event("$held", 2),
+                    text_event("$overflow", 3),
+                ],
+                "more",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held"]
+        assert not client._recovery.gaps
+        await client.receive_response(
+            sync_response(
+                "s3",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$overflow", 3)],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held", "$overflow"]
+        await client.close()
+
+    @pytest.mark.parametrize("second_protocol", ["classic", "sliding"])
+    async def test_concurrent_response_pumps_dispatch_once(
+        self, client, second_protocol
+    ):
+        pending = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            text_event("$one", 1),
+            True,
+        )
+        assert pending is not None
+        client._recovery.gaps[ROOM_A] = [RecoveryGap(ROOM_A, 1, "", None)]
+        client._recovery.events[(ROOM_A, 1)] = [pending]
+        client.next_batch = "s1"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        seen = []
+
+        async def callback(_room, event):
+            seen.append(event.event_id)
+            entered.set()
+            await release.wait()
+
+        client.add_event_callback(callback, RoomMessageText)
+        first = asyncio.create_task(client.receive_response(sync_response("s1", {})))
+        await entered.wait()
+        if second_protocol == "classic":
+            second_response = sync_response("s1", {})
+        else:
+            second_response = SlidingSyncResponse.from_dict({"pos": "s2", "rooms": {}})
+        second = asyncio.create_task(client.receive_response(second_response))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        assert seen == ["$one"]
+        assert not client._recovery.gaps
+
+    async def test_concurrent_sync_requests_keep_their_own_cursors(
+        self, client, monkeypatch
+    ):
+        class Transport:
+            status = 200
+
+            def __init__(self, request_since):
+                self.request_since = request_since
+
+        responses = {
+            "a": sync_response(
+                "response-a",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=True, prev_batch="target-a"
+                    )
+                },
+            ),
+            "b": sync_response(
+                "response-b",
+                {
+                    ROOM_B: room_info(
+                        [text_event("$b", 2, ROOM_B)],
+                        limited=True,
+                        prev_batch="target-b",
+                    )
+                },
+            ),
+        }
+        b_processed = asyncio.Event()
+
+        async def send(_method, path, *_args, **_kwargs):
+            request_since = parse_qs(urlparse(path).query)["since"][0]
+            if request_since == "a":
+                await b_processed.wait()
+            return Transport(request_since)
+
+        async def create_matrix_response(*, transport_response, **_kwargs):
+            return responses[transport_response.request_since]
+
+        original_receive = client._receive_sync_family
+
+        async def receive(response):
+            await original_receive(response)
+            if ROOM_B in client._recovery.gaps:
+                b_processed.set()
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+        monkeypatch.setattr(client, "_receive_sync_family", receive)
+        first, second = await asyncio.gather(
+            client.sync(since="a"),
+            client.sync(since="b"),
+        )
+        assert {first.next_batch, second.next_batch} == {"response-a", "response-b"}
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "a"
+        assert client._recovery.gaps[ROOM_B][0].cursor_token == "b"
+
+    @pytest.mark.parametrize(
+        "nested_kind",
+        ["sync", "sliding_sync", "receive_sync", "receive_sliding"],
+    )
+    @pytest.mark.parametrize("outer_protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize("child_task", [False, True])
+    async def test_callback_sync_reentry_fails_before_io_or_mutation(
+        self, client, monkeypatch, nested_kind, outer_protocol, child_task
+    ):
+        async def unexpected_send(*_args, **_kwargs):
+            raise AssertionError("callback reentry must fail before HTTP")
+
+        monkeypatch.setattr(client, "_send", unexpected_send)
+        seen: list[str] = []
+        failures: list[str] = []
+
+        async def nested():
+            if nested_kind == "sync":
+                return await client.sync(since="nested")
+            if nested_kind == "sliding_sync":
+                return await client.sliding_sync(pos="nested")
+            if nested_kind == "receive_sync":
+                return await client.receive_response(
+                    timeline_response("classic", "nested", [text_event("$nested", 2)])
+                )
+            return await client.receive_response(
+                timeline_response("sliding", "nested", [text_event("$nested", 2)])
+            )
+
+        async def callback(_room, value):
+            seen.append(value.event_id)
+            if value.event_id != "$outer":
+                return
+            try:
+                operation = nested()
+                if child_task:
+                    await asyncio.create_task(operation)
+                else:
+                    await operation
+            except LocalProtocolError as error:
+                failures.append(str(error))
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response(
+                outer_protocol,
+                "outer",
+                [text_event("$outer", 1), text_event("$suffix", 3)],
+            )
+        )
+        assert failures == ["Sync-family requests cannot run from a timeline callback."]
+        assert seen == ["$outer", "$suffix"]
+        assert client.next_batch == ("outer" if outer_protocol == "classic" else "")
+
+    async def test_stale_inherited_executor_token_may_proceed(self, client):
+        release = asyncio.Event()
+        child: asyncio.Task | None = None
+        seen: list[str] = []
+
+        async def delayed_nested():
+            await release.wait()
+            await client.receive_response(
+                timeline_response("classic", "nested", [text_event("$nested", 2)])
+            )
+
+        async def callback(_room, value):
+            nonlocal child
+            seen.append(value.event_id)
+            if value.event_id == "$outer":
+                child = asyncio.create_task(delayed_nested())
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response("classic", "outer", [text_event("$outer", 1)])
+        )
+        assert child is not None
+        release.set()
+        await child
+        assert seen == ["$outer", "$nested"]
+        assert client.next_batch == "nested"
+
+    @pytest.mark.parametrize("nested_protocol", ["classic", "sliding"])
+    async def test_disabled_callback_sync_reentry_keeps_upstream_behavior(
+        self, tempdir, nested_protocol
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen: list[str] = []
+
+        async def callback(_room, value):
+            seen.append(value.event_id)
+            if value.event_id == "$outer":
+                await client.receive_response(
+                    timeline_response(
+                        nested_protocol,
+                        "nested",
+                        [text_event("$nested", 2)],
+                    )
+                )
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response("classic", "outer", [text_event("$outer", 1)])
+        )
+        assert seen == ["$outer", "$nested"]
+        await client.close()
+
+    async def test_room_send_linearizes_with_concurrent_gap_install(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        sent = object()
+
+        async def send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return sent
+
+        monkeypatch.setattr(client, "_send", send)
+        send_task = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+        )
+        await send_started.wait()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 2)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        await response_task
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert not send_task.done()
+        release_send.set()
+        assert await send_task is sent
+        await client.close()
+
+    async def test_same_room_plan_waits_for_immutable_send_request(
+        self, client, monkeypatch
+    ):
+        client.config = replace(client.config, backfill_max_pages=0)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        prepare_started = asyncio.Event()
+        release_prepare = asyncio.Event()
+        sent = object()
+        original_prepare = client._prepare_room_send
+
+        async def prepare(*args, **kwargs):
+            prepare_started.set()
+            await release_prepare.wait()
+            return await original_prepare(*args, **kwargs)
+
+        async def send(*_args, **_kwargs):
+            assert not client._recovery_room_gate(ROOM_A).locked()
+            return sent
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        send_task = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+        )
+        await prepare_started.wait()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 2)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not client._recovery.gaps
+        assert not response_task.done()
+
+        release_prepare.set()
+        assert await send_task is sent
+        await response_task
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+
+    async def test_blocked_room_preparation_does_not_block_other_room(
+        self, client, monkeypatch
+    ):
+        client.config = replace(client.config, backfill_max_pages=0)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info([], limited=False, prev_batch="a0"),
+                    ROOM_B: room_info([], limited=False, prev_batch="b0"),
+                },
+            )
+        )
+        room_a_started = asyncio.Event()
+        release_room_a = asyncio.Event()
+        room_b_sent = asyncio.Event()
+        original_prepare = client._prepare_room_send
+
+        async def prepare(room_id, *args, **kwargs):
+            if room_id == ROOM_A:
+                room_a_started.set()
+                await release_room_a.wait()
+            return await original_prepare(room_id, *args, **kwargs)
+
+        async def send(_response_class, _method, _path, _data, response_data):
+            if response_data == (ROOM_B,):
+                room_b_sent.set()
+            return object()
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        room_a_send = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "a", "msgtype": "m.text"},
+            )
+        )
+        await room_a_started.wait()
+        room_b_send = asyncio.create_task(
+            client.room_send(
+                ROOM_B,
+                "m.room.message",
+                {"body": "b", "msgtype": "m.text"},
+            )
+        )
+        await asyncio.wait_for(room_b_sent.wait(), 1)
+        await room_b_send
+
+        await asyncio.wait_for(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_B: room_info(
+                            [text_event("$held-b", 2, ROOM_B)],
+                            limited=True,
+                            prev_batch="b1",
+                        )
+                    },
+                )
+            ),
+            1,
+        )
+        assert client._recovery.gaps[ROOM_B][0].cursor_token == "s1"
+        assert not room_a_send.done()
+        release_room_a.set()
+        await room_a_send
+
+    async def test_multi_room_plan_acquires_gates_in_sorted_order(self, client):
+        client.next_batch = "s1"
+        room_a_gate = client._recovery_room_gate(ROOM_A)
+        room_b_gate = client._recovery_room_gate(ROOM_B)
+        await room_a_gate.acquire()
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_B: room_info([], limited=False, prev_batch="b1"),
+                        ROOM_A: room_info([], limited=False, prev_batch="a1"),
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not response_task.done()
+        assert not room_b_gate.locked()
+        room_a_gate.release()
+        await response_task
+
+    async def test_room_send_builds_request_under_gate_and_sends_after(
+        self, client, monkeypatch
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        original_room_send = Api.room_send
+        built = False
+        sent = object()
+
+        def build(*args, **kwargs):
+            nonlocal built
+            assert client._recovery_room_gate(ROOM_A).locked()
+            built = True
+            return original_room_send(*args, **kwargs)
+
+        async def send(*_args, **_kwargs):
+            assert built
+            assert not client._recovery_room_gate(ROOM_A).locked()
+            return sent
+
+        monkeypatch.setattr(Api, "room_send", build)
+        monkeypatch.setattr(client, "_send", send)
+        assert (
+            await client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+            is sent
+        )
+
+    async def test_missing_prev_batch_uses_response_target(self, client, aioresponse):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        pages = Pages({"s1": messages([text_event("$gap", 2)], "s2")})
+        aioresponse.get(MESSAGES_URL, callback=pages)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch=None
+                    )
+                },
+            )
+        )
+        assert pages.to_tokens == ["s2"]
+        assert seen == ["$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_incomplete_room_keeps_transport_monotonic(
+        self, tempdir, aioresponse
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=1,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+            repeat=True,
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+        assert client.next_batch == "s2"
+        assert client.store.load_sync_token() == "s2"
+        assert client._recovery.gaps.get(ROOM_A)
+        assert seen == ["$old"]
+
+        requested: list[str | None] = []
+
+        def next_sync(url, **kwargs):
+            requested.append(parse_qs(urlparse(str(url)).query).get("since", [None])[0])
+            return CallbackResult(status=200, payload=sync_json("s3", {}))
+
+        aioresponse.get(SYNC_URL, callback=next_sync)
+        await client.sync()
+        assert requested == ["s2"]
+        await client.close()
+
+    async def test_unrelated_room_and_presence_do_not_wait(self, client, aioresponse):
+        seen = record_events(client)
+        presence_seen: list[str] = []
+
+        async def on_presence(event):
+            presence_seen.append(event.user_id)
+
+        client.add_presence_callback(on_presence, PresenceEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+            repeat=True,
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    ),
+                    ROOM_B: room_info(
+                        [text_event("$free", 4, ROOM_B)],
+                        limited=False,
+                        prev_batch="q1",
+                    ),
+                },
+                presence=[PresenceEvent("@sender:example.org", "online")],
+            )
+        )
+        assert seen == ["$old", "$free"]
+        assert presence_seen == ["@sender:example.org"]
+
+    async def test_newer_same_room_event_cannot_overtake_gap(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "more": messages(
+                    [text_event("$gap2", 3), text_event("$held", 4)],
+                    "p1",
+                )
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages)
+        await client.receive_response(
+            sync_response(
+                "s3",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$later", 5)], limited=False, prev_batch="p2"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
+
+    async def test_ignored_to_live_boundary_preserves_recovered_prefix(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        recovered = [text_event(f"${index}", index) for index in range(14)]
+        live = [text_event(f"${index}", index) for index in range(14, 64)]
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(recovered + live[:36], "ignored-to-bound"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        live,
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == [f"${index}" for index in range(64)]
+        assert not client._recovery.gaps
+
+    async def test_non_json_messages_4xx_abandons_gap_and_releases_live(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=403, body="forbidden")
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_oversized_page_abandons_durably(self, tempdir, aioresponse):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_events=1,
+            backfill_page_size=1,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$overflow", 3)], "more"
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert not restarted._recovery.gaps
+        assert list(restarted._recovery.completed[ROOM_A]) == ["$old", "$held"]
+        await restarted.close()
+
+    async def test_target_page_recovers_concurrent_dag_branches(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$present2", 4),
+                    text_event("$gap2", 2),
+                    text_event("$present1", 3),
+                    text_event("$gap1", 1),
+                ],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$present1", 3), text_event("$present2", 4)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap2", "$gap1", "$present1", "$present2"]
+        assert not client._recovery.gaps
+
+    async def test_two_rooms_close_independently(self, client, aioresponse):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        page_index = 0
+
+        def page(url, **kwargs):
+            nonlocal page_index
+            page_index += 1
+            if page_index == 1:
+                events = [text_event("$gap-a", 1), text_event("$live-a", 2)]
+            else:
+                events = [
+                    text_event("$gap-b", 1, ROOM_B),
+                    text_event("$live-b", 2, ROOM_B),
+                ]
             return CallbackResult(
                 status=200,
-                payload=messages_payload(
-                    [text_event(f"$gap{n}", ts=1000 + n)], end=f"tok{n}"
-                ),
+                payload=messages(events, "p1" if page_index == 1 else "p2"),
             )
 
-        aioresponse.get(MESSAGES_URL, callback=endless, repeat=True)
+        aioresponse.get(MESSAGES_URL, callback=page, repeat=True)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live-a", 2)], limited=True, prev_batch="p1"
+                    ),
+                    ROOM_B: room_info(
+                        [text_event("$live-b", 2, ROOM_B)],
+                        limited=True,
+                        prev_batch="p2",
+                    ),
+                },
+            )
+        )
+        assert set(seen) == {"$gap-a", "$live-a", "$gap-b", "$live-b"}
+        assert not client._recovery.gaps
 
-        with caplog.at_level(logging.WARNING):
-            await client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=10_000)],
-                    limited=True,
-                    prev_batch="p1",
+    async def test_own_rejoin_discards_prejoin_history(self, client, aioresponse):
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$prejoin", 1),
+                    member_event("$join", 2, "join"),
+                    text_event("$after", 3),
+                    text_event("$live", 4),
+                ],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$join", "$after", "$live"]
+
+    async def test_bounded_prefix_waits_for_later_own_join(self, client, aioresponse):
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
+        client.next_batch = "s1"
+        pages = Pages(
+            {
+                "s1": messages([text_event("$prejoin", 1)], "more"),
+                "more": messages(
+                    [
+                        member_event("$join", 2, "join"),
+                        text_event("$after", 3),
+                        text_event("$held", 4),
+                    ],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        limited = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(limited)
+        assert seen == []
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$prejoin",
+            "$held",
+        ]
+
+        await client.receive_response(limited)
+        assert seen == ["$join", "$after", "$held"]
+        assert "$prejoin" not in seen
+        assert not client._recovery.gaps
+
+    async def test_recent_overlap_and_encrypted_replay(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$seen", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$seen", 1), text_event("$gap", 2), text_event("$live", 3)],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$seen", "$gap", "$live"]
+
+        encrypted = megolm_event("$encrypted", 4)
+        record_completed_timeline_event(
+            client._recovery, ROOM_A, encrypted.event_id, True
+        )
+        clear = text_event("$encrypted", 4)
+        assert should_dispatch_timeline_event(client._recovery, ROOM_A, clear)
+
+    async def test_live_decryption_upgrades_completed_encrypted_event(
+        self, client, monkeypatch
+    ):
+        seen = record_events(client)
+        encrypted = megolm_event("$encrypted", 1)
+        clear = text_event("$encrypted", 1)
+        record_completed_timeline_event(
+            client._recovery, ROOM_A, encrypted.event_id, True
+        )
+
+        def decrypt(event, *_args):
+            return clear if event.event_id == encrypted.event_id else None
+
+        monkeypatch.setattr(client, "_handle_timeline_event", decrypt)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
+        assert seen == ["$encrypted"]
+        assert client._recovery.completed[ROOM_A]["$encrypted"] is False
+
+    async def test_live_decryption_preserves_callback_metadata(
+        self, client, monkeypatch
+    ):
+        encrypted = megolm_event("$encrypted-image", 1)
+        source = json.loads(
+            Path("tests/data/events/room_encrypted_image.json").read_text()
+        )
+        source.update(
+            {
+                "event_id": encrypted.event_id,
+                "origin_server_ts": encrypted.server_timestamp,
+                "room_id": ROOM_A,
+                "sender": encrypted.sender,
+            }
+        )
+        decrypted = Event.parse_decrypted_event(source)
+        assert isinstance(decrypted, RoomEncryptedImage)
+        decrypted.decrypted = True
+        decrypted.verified = True
+        decrypted.sender_key = "sender-key"
+        decrypted.session_id = "session-id"
+        decrypted.room_id = ROOM_A
+        decrypt_calls = 0
+
+        def decrypt(event):
+            nonlocal decrypt_calls
+            assert isinstance(event, MegolmEvent)
+            decrypt_calls += 1
+            return decrypted
+
+        assert client.olm
+        monkeypatch.setattr(client.olm, "_decrypt_megolm_no_error", decrypt)
+        seen = []
+
+        async def record(_room, event):
+            seen.append(
+                (
+                    type(event),
+                    event.decrypted,
+                    event.verified,
+                    event.sender_key,
+                    event.session_id,
                 )
             )
 
-        # Exactly three pages were fetched, then the walk hit the page bound
-        # without reaching the sync window — so its buffer is discarded (it
-        # might predate our membership) and the loss is surfaced.
-        assert dispatched == ["$old", "$new"]
-        assert counter["n"] == 3
-        assert "without fully closing the gap" in caplog.text
-        await client.close()
+        client.add_event_callback(record, RoomEncryptedImage)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
 
-    async def test_event_bound_discards_incomplete_recovery(
-        self, tempdir, aioresponse, caplog
+        assert decrypt_calls == 2
+        assert seen == [(RoomEncryptedImage, True, True, "sender-key", "session-id")]
+
+    async def test_recovery_decryption_preserves_callback_metadata(
+        self, client, aioresponse, monkeypatch
     ):
-        """Hitting the event bound before the window discards the buffer.
+        encrypted = megolm_event("$recovered-image", 1)
+        source = json.loads(
+            Path("tests/data/events/room_encrypted_image.json").read_text()
+        )
+        source.update(
+            {
+                "event_id": encrypted.event_id,
+                "origin_server_ts": encrypted.server_timestamp,
+                "room_id": ROOM_A,
+                "sender": encrypted.sender,
+            }
+        )
+        decrypted = Event.parse_decrypted_event(source)
+        assert isinstance(decrypted, RoomEncryptedImage)
+        decrypted.decrypted = True
+        decrypted.verified = True
+        decrypted.sender_key = "sender-key"
+        decrypted.session_id = "session-id"
+        decrypted.room_id = ROOM_A
+        decrypt_calls = 0
 
-        An incomplete forward walk cannot prove its buffer postdates our
-        membership, so nothing from it may be dispatched, and the loss is
-        surfaced instead of silently accepted.
-        """
-        client = AsyncClient(
+        def decrypt(event):
+            nonlocal decrypt_calls
+            assert isinstance(event, MegolmEvent)
+            decrypt_calls += 1
+            return decrypted
+
+        assert client.olm
+        monkeypatch.setattr(client.olm, "_decrypt_megolm_no_error", decrypt)
+        seen = []
+
+        async def record(_room, event):
+            seen.append(
+                (
+                    type(event),
+                    event.decrypted,
+                    event.verified,
+                    event.sender_key,
+                    event.session_id,
+                )
+            )
+
+        client.add_event_callback(record, RoomEncryptedImage)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([encrypted], "p1"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+
+        assert decrypt_calls == 1
+        assert seen == [(RoomEncryptedImage, True, True, "sender-key", "session-id")]
+
+    async def test_restart_resumes_room_without_replaying_response_surfaces(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
             "https://example.org",
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_max_events=5
-            ),
+            config=config,
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(client)
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first_seen = record_events(first)
+        presence_seen: list[str] = []
+        response_seen: list[str] = []
+        room_surface_seen: list[str] = []
 
-        await client.receive_response(
+        async def on_presence(event):
+            presence_seen.append(event.user_id)
+
+        async def on_room_surface(_room, event):
+            room_surface_seen.append(type(event).__name__)
+
+        async def on_response(response):
+            if isinstance(response, SyncResponse):
+                response_seen.append(response.next_batch)
+
+        first.add_presence_callback(on_presence, PresenceEvent)
+        first.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
+        first.add_room_account_data_callback(
+            on_room_surface, (FullyReadEvent, UnknownBadEvent)
+        )
+        first.add_response_callback(on_response, SyncResponse)
+        await first.receive_response(
             sync_response(
                 "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=1)],
-                limited=False,
-                prev_batch="p0",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
             )
         )
-
-        huge = [text_event(f"$gap{i}", ts=1000 + i) for i in range(20)]
-        pages = PagedMessages({"s1": messages_payload(huge, end="fwd2")})
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        with caplog.at_level(logging.WARNING):
-            await client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=10_000)],
-                    limited=True,
-                    prev_batch="p1",
-                )
-            )
-
-        assert dispatched == ["$old", "$new"]
-        assert "without fully closing the gap" in caplog.text
-        await client.close()
-
-    async def test_room_messages_failure_is_tolerated(
-        self, backfill_client, aioresponse
-    ):
-        """A /messages error is logged and does not break sync handling."""
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
         )
-
-        aioresponse.get(MESSAGES_URL, status=500, repeat=True)
-
-        # The sync response's own events are still delivered even though the
-        # backfill request fails.
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$old", "$new"]
-
-    async def test_missing_prev_batch_does_not_block_recovery(
-        self, backfill_client, aioresponse
-    ):
-        """The forward walk starts from the since token, not prev_batch."""
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        pages = PagedMessages(
+        limited_payload = sync_json(
+            "s2",
             {
-                "s1": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
-                    end="fwd2",
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
                 )
-            }
+            },
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        limited_payload["rooms"]["join"][ROOM_A]["ephemeral"]["events"] = [
+            {"content": {"user_ids": [OWN_ID]}, "type": "m.typing"}
+        ]
+        limited_payload["rooms"]["join"][ROOM_A]["account_data"]["events"] = [
+            {"content": {"event_id": "$held"}, "type": "m.fully_read"},
+            {"type": "m.tag"},
+        ]
+        limited = SyncResponse.from_dict(limited_payload)
+        assert isinstance(limited, SyncResponse)
+        limited.presence_events = [PresenceEvent("@sender:example.org", "online")]
+        await first.receive_response(limited)
+        await first.run_response_callbacks([limited])
+        assert first_seen == ["$old"]
+        assert room_surface_seen == []
+        assert presence_seen == ["@sender:example.org"]
+        assert response_seen == ["s2"]
+        await first.close()
+        first.store.database.close()
 
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch=None,
-            )
-        )
-
-        assert dispatched == ["$old", "$gap1", "$new"]
-
-    async def test_backfilled_state_events_do_not_regress_room_state(
-        self, backfill_client, aioresponse
-    ):
-        """Old state events in the gap are dispatched but never applied.
-
-        Backfilled events are older than the state the sync response already
-        applied, so replaying them into the room would roll back the current
-        name and membership (and feed stale members into E2EE tracking).
-        """
-        name_ids: List[str] = []
-
-        async def name_cb(_room, event):
-            name_ids.append(event.event_id)
-
-        backfill_client.add_event_callback(name_cb, RoomNameEvent)
-
-        # Live sync 1: @member joins and the room is named "Before".
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [
-                    text_event("$old", ts=50),
-                    member_event("$join1", ts=60, membership="join"),
-                    name_event("$name1", ts=70, name="Before"),
-                ],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-        room = backfill_client.rooms[TEST_ROOM_ID]
-        assert "@member:example.org" in room.users
-        assert room.name == "Before"
-
-        # The gap holds an older rename and an older re-join that must lose
-        # against the state the limited sync below applies.
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        member_event("$join2", ts=150, membership="join"),
-                        name_event("$name2", ts=200, name="Gap name"),
-                        member_event("$leave", ts=400, membership="leave"),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        # Live sync 2 (limited): @member leaves and the room is renamed.
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [
-                    member_event("$leave", ts=400, membership="leave"),
-                    name_event("$name3", ts=500, name="After"),
-                ],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        # The gap's state events reached the callbacks...
-        assert "$name2" in name_ids
-        # ...but did not roll back the room's current state.
-        assert room.name == "After"
-        assert "@member:example.org" not in room.users
-
-    async def test_backfill_timeout_is_tolerated(self, tempdir, aioresponse):
-        """A hanging /messages request is abandoned at backfill_timeout."""
-        client = AsyncClient(
+        restarted = AsyncClient(
             "https://example.org",
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_timeout=0.05
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        restarted_seen = record_events(restarted)
+        restarted.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
+        restarted.add_room_account_data_callback(
+            on_room_surface, (FullyReadEvent, UnknownBadEvent)
+        )
+        assert restarted.loaded_sync_token == "s2"
+        assert restarted._recovery.gaps.get(ROOM_A)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap2", 3), text_event("$held", 4)],
+                "p1",
             ),
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(client)
-
-        await client.receive_response(
+        await restarted.receive_response(
             sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
+                "s3",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$later", 5)], limited=False, prev_batch="p2"
+                    )
+                },
             )
         )
+        assert restarted_seen == ["$gap", "$gap2", "$held", "$later"]
+        assert room_surface_seen == [
+            "TypingNoticeEvent",
+            "FullyReadEvent",
+            "UnknownBadEvent",
+        ]
+        assert presence_seen == ["@sender:example.org"]
+        assert response_seen == ["s2"]
+        assert not restarted._recovery.gaps
+        await restarted.close()
 
-        # The mocked homeserver never answers; only backfill_timeout can stop
-        # the backfill (room_messages retries rate limits and timeouts
-        # internally, so no error response ever surfaces).
-        async def hang(url, **kwargs) -> CallbackResult:
-            await asyncio.sleep(30)
-            return CallbackResult(status=200, payload=messages_payload([], end=None))
-
-        aioresponse.get(MESSAGES_URL, callback=hang, repeat=True)
-
-        await client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$old", "$new"]
-        await client.close()
-
-    async def test_restart_resume_backfills_first_limited_sync(
-        self, backfill_client, aioresponse
+    async def test_restart_first_limited_sync_uses_loaded_transport(
+        self, tempdir, aioresponse
     ):
-        """A since-token resume recovers a gap even with no delivered ids.
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first.store.save_sync_token("s1")
+        await first.close()
+        first.store.database.close()
 
-        This is the restart scenario: the client continues from a stored sync
-        token, so a room's first (limited) sync of this run can still hide a
-        gap. The gap is paged forwards from the since token instead of
-        backwards to delivered event ids, so nothing delivered before the
-        restart can be re-dispatched — verified live against Tuwunel, which
-        silently ignores backwards ``to`` bounds.
-        """
-        dispatched = self._record_callback(backfill_client)
-        # Simulate resuming from a stored token: no room has been seen yet,
-        # but the client knows the position the sync continued from.
-        backfill_client.next_batch = "since_restart"
-
-        pages = PagedMessages(
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(restarted)
+        pages = Pages(
             {
-                # Forward pages are chronological, starting at the since token.
-                "since_restart": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$gap2", ts=200)],
-                    end="fwd2",
-                ),
-                # The next page reaches an event from the sync window, the
-                # near edge of the gap.
-                "fwd2": messages_payload([text_event("$new", ts=300)], end="fwd3"),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$gap1", "$gap2", "$new"]
-        # The walk paged forwards from the resume position.
-        assert pages.requested_tokens == ["since_restart", "fwd2"]
-        assert pages.requested_dir == ["f", "f"]
-
-    async def test_newly_joined_room_is_not_backfilled(
-        self, backfill_client, aioresponse
-    ):
-        """A freshly joined room's history is not a gap, even on a since resume.
-
-        The discriminator is our own join transition in the sync timeline: a
-        genuinely resumed room never carries one (our join predates the since
-        token), while a fresh join always does — in the timeline if it survived
-        the window, otherwise in the gap, where the forward walk discards
-        everything collected before it.
-        """
-        dispatched = self._record_callback(backfill_client)
-        backfill_client.next_batch = "since_token"
-
-        calls = {"n": 0}
-
-        def spy(url, **kwargs) -> CallbackResult:
-            calls["n"] += 1
-            return CallbackResult(status=200, payload=messages_payload([], end=None))
-
-        aioresponse.get(MESSAGES_URL, callback=spy, repeat=True)
-
-        own_join = member_event(
-            "$ownjoin", ts=250, membership="join", user_id=backfill_client.user_id
-        )
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [own_join, text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$new"]
-        assert calls["n"] == 0
-
-    async def test_full_state_resume_still_backfills(
-        self, backfill_client, aioresponse
-    ):
-        """Our old join in the state block must not defeat restart recovery.
-
-        A ``full_state=True`` resume (and lazy loading) re-sends our original
-        join event in the room's state block for every room, so only a join in
-        the timeline may mark a room as freshly joined.
-        """
-        dispatched = self._record_callback(backfill_client)
-        backfill_client.next_batch = "since_restart"
-
-        pages = PagedMessages(
-            {
-                "since_restart": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
-                    end="fwd2",
+                "s1": messages(
+                    [text_event("$gap", 2), text_event("$held", 3)],
+                    "p1",
                 )
             }
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        old_join = member_event(
-            "$oldjoin", ts=10, membership="join", user_id=backfill_client.user_id
-        )
-        await backfill_client.receive_response(
+        aioresponse.get(MESSAGES_URL, callback=pages)
+        await restarted.receive_response(
             sync_response(
                 "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-                state=[old_join],
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
             )
         )
+        assert pages.from_tokens == ["s1"]
+        assert seen == ["$gap", "$held"]
+        assert not restarted._recovery.gaps
+        await restarted.close()
 
-        assert dispatched == ["$gap1", "$new"]
-        assert pages.requested_dir == ["f"]
-
-    async def test_walk_stops_at_own_join(self, backfill_client, aioresponse):
-        """A fresh join whose join event fell into the gap recovers only
-        post-join events; pre-join history is never dispatched."""
-        dispatched = self._record_callback(backfill_client)
-        backfill_client.next_batch = "since_token"
-
-        own_join = member_event(
-            "$ownjoin", ts=250, membership="join", user_id=backfill_client.user_id
-        )
-        pages = PagedMessages(
+    async def test_explicit_since_bounds_first_recovery(self, client, aioresponse):
+        seen = record_events(client)
+        pages = Pages(
             {
-                # Forward page from the since position: the walk collects
-                # $prejoin, then discards it when it reaches our own join.
-                "since_token": messages_payload(
-                    [
-                        text_event("$prejoin", ts=240),
-                        own_join,
-                        text_event("$post1", ts=255),
-                        text_event("$post2", ts=260),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$post1", "$post2", "$new"]
-        assert "$prejoin" not in dispatched
-
-    async def test_empty_page_continues_pagination(self, backfill_client, aioresponse):
-        """An empty chunk with an advancing end token continues the walk."""
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        pages = PagedMessages(
-            {
-                # An empty page mid-walk (e.g. filtered or purged history) is
-                # not the end of pagination while the end token advances.
-                "s1": messages_payload([], end="fwd2"),
-                "fwd2": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
-                    end="fwd3",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$old", "$gap1", "$new"]
-        assert pages.requested_tokens == ["s1", "fwd2"]
-
-    async def test_explicit_since_reaches_backfill(self, backfill_client, aioresponse):
-        """A caller-supplied sync(since=...) token bounds restart recovery.
-
-        This drives the real sync() request path, not receive_response(), so
-        it checks that the request's actual since token is the one handed to
-        the backfill as the server-side walk bound.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        pages = PagedMessages(
-            {
-                "tok0": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$new", ts=300)],
-                    end="fwd2",
+                "explicit": messages(
+                    [text_event("$gap", 2), text_event("$held", 3)],
+                    "p1",
                 )
             }
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        aioresponse.get(MESSAGES_URL, callback=pages)
         aioresponse.get(
             SYNC_URL,
             payload=sync_json(
                 "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
             ),
         )
-
-        response = await backfill_client.sync(since="tok0")
-
+        response = await client.sync(since="explicit")
         assert isinstance(response, SyncResponse)
-        assert dispatched == ["$gap1", "$new"]
-        # The forward walk starts exactly at the caller's since token, clamped
-        # by the response's next_batch on servers that honour `to`.
-        assert pages.requested_tokens == ["tok0"]
-        assert pages.requested_dir == ["f"]
-        assert pages.requested_to == ["s2"]
+        assert pages.from_tokens == ["explicit"]
+        assert seen == ["$gap", "$held"]
 
-    async def test_straggler_already_delivered_is_not_redispatched(
-        self, backfill_client, aioresponse
+    async def test_full_state_join_does_not_cancel_timeline_recovery(
+        self, client, aioresponse
     ):
-        """An event delivered by an earlier sync never fires twice.
-
-        Federation ordering can place an already-delivered event inside a
-        later walked gap topologically (/sync uses stream order, /messages
-        topological order); the spec requires clients to de-duplicate the
-        overlap. The straggler is skipped, but it is not a boundary — the walk
-        continues past it.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$straggler", ts=90)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        text_event("$straggler", ts=90),
-                        text_event("$gap1", ts=100),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$straggler", "$gap1", "$new"]
-
-    async def test_walk_upgrades_previously_encrypted_event(
-        self, backfill_client, aioresponse
-    ):
-        """A copy that decrypted is dispatched although the encrypted form was.
-
-        Mirrors the sliding sync loop's rule: an event that could only be
-        handed to the callbacks in encrypted form (its room key had not
-        arrived) goes through once more when a later copy of it — here
-        returned by the recovery walk — decrypts.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [megolm_event("$enc", ts=90)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        # Only the encrypted form was dispatched (invisible to the
-        # RoomMessageText callback), and it was remembered as such.
-        assert dispatched == []
-
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        text_event("$enc", ts=90),
-                        text_event("$gap1", ts=100),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s2",
-                TEST_ROOM_ID,
-                [text_event("$new", ts=300)],
-                limited=True,
-                prev_batch="p1",
-            )
-        )
-
-        assert dispatched == ["$enc", "$gap1", "$new"]
-
-    async def test_dispatch_respects_backfill_budget(
-        self, tempdir, aioresponse, caplog
-    ):
-        """A slow event callback cannot stall dispatch past the budget.
-
-        The budget covers not just the /messages walk but also handing the
-        recovered events to callbacks; a callback that is slow for each of
-        many recovered events would otherwise stall sync handling far beyond
-        backfill_timeout.
-        """
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_timeout=0.3
+        seen = record_events(client)
+        client.next_batch = "s1"
+        own_join = member_event("$old-join", 1, "join")
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                "p1",
             ),
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)],
+                        limited=True,
+                        prev_batch="p1",
+                        state=[own_join],
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held"]
+        assert not client._recovery.gaps
 
-        dispatched: List[str] = []
+    async def test_recovered_state_does_not_regress_live_room_state(
+        self, client, aioresponse
+    ):
+        names: list[str] = []
 
-        async def slow_cb(_room, event):
-            dispatched.append(event.event_id)
-            await asyncio.sleep(0.4)
+        async def record_name(_room, event):
+            names.append(event.name)
 
-        client.add_event_callback(slow_cb, RoomMessageText)
-
+        client.add_event_callback(record_name, RoomNameEvent)
         await client.receive_response(
             sync_response(
                 "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$before", 1, "Before")],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
             )
         )
-
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        text_event("$gap1", ts=100),
-                        text_event("$gap2", ts=110),
-                        text_event("$gap3", ts=120),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        with caplog.at_level(logging.WARNING):
-            await client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=300)],
-                    limited=True,
-                    prev_batch="p1",
-                )
-            )
-
-        # The first gap event's slow callback exhausts the budget; dispatch
-        # stops instead of stalling through the remaining recovered events.
-        # The sync's own event is still delivered by the live path.
-        assert dispatched == ["$old", "$gap1", "$new"]
-        assert "budget is exhausted" in caplog.text
-        await client.close()
-
-    async def test_hanging_callback_cannot_stall_dispatch(
-        self, tempdir, aioresponse, caplog
-    ):
-        """A callback that never returns is cancelled at the budget.
-
-        A deadline check between events cannot regain control once a hanging
-        callback is awaited, so the await itself must be bounded.
-        """
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_timeout=0.2
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    name_event("$gap-name", 2, "Gap"),
+                    name_event("$after", 3, "After"),
+                    text_event("$held", 4),
+                ],
+                "p1",
             ),
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-
-        dispatched: List[str] = []
-
-        async def cb(_room, event):
-            dispatched.append(event.event_id)
-            if event.event_id.startswith("$gap"):
-                # Hang forever, but only for backfilled events, so the live
-                # dispatch of the sync's own events still completes.
-                await asyncio.Event().wait()
-
-        client.add_event_callback(cb, RoomMessageText)
-
         await client.receive_response(
             sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        text_event("$gap1", ts=100),
-                        text_event("$gap2", ts=110),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        with caplog.at_level(logging.WARNING):
-            await asyncio.wait_for(
-                client.receive_response(
-                    sync_response(
-                        "s2",
-                        TEST_ROOM_ID,
-                        [text_event("$new", ts=300)],
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$after", 3, "After"), text_event("$held", 4)],
                         limited=True,
                         prev_batch="p1",
                     )
-                ),
-                timeout=5,
-            )
-
-        assert dispatched == ["$old", "$gap1", "$new"]
-        assert "inside an event callback" in caplog.text
-        await client.close()
-
-    async def test_callback_timeout_error_skips_only_that_event(
-        self, backfill_client, aioresponse, caplog
-    ):
-        """A callback raising TimeoutError is that event's failure alone.
-
-        It must not be mistaken for the dispatch budget expiring, which would
-        abort the remaining recovered events.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        async def flaky(_room, event):
-            if event.event_id == "$gap1":
-                raise asyncio.TimeoutError("the callback's own timeout")
-
-        backfill_client.add_event_callback(flaky, RoomMessageText)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
+                },
             )
         )
+        assert names == ["Before", "Gap", "After"]
+        assert client.rooms[ROOM_A].name == "After"
 
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [
-                        text_event("$gap1", ts=100),
-                        text_event("$gap2", ts=110),
-                        text_event("$new", ts=300),
-                    ],
-                    end="fwd2",
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+    async def test_live_callbacks_see_each_events_room_state(self, client):
+        seen = []
 
-        with caplog.at_level(logging.WARNING):
-            await backfill_client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=300)],
-                    limited=True,
-                    prev_batch="p1",
-                )
-            )
+        async def record_name(room, event):
+            seen.append((event.name, room.name))
 
-        # $gap1's dispatch failed (and is logged), but $gap2 still arrived —
-        # the budget warning must not fire.
-        assert dispatched == ["$old", "$gap1", "$gap2", "$new"]
-        assert "Failed to dispatch backfilled event $gap1" in caplog.text
-        assert "budget is exhausted" not in caplog.text
-
-    async def test_live_edge_does_not_close_the_gap(
-        self, backfill_client, aioresponse, caplog
-    ):
-        """Reaching the live edge without meeting the sync window discards.
-
-        An absent end token proves the walk hit the room's *current* live
-        edge — not the sync position. Events that arrived after the sync
-        response was generated may sit in the buffer; dispatching them here
-        would deliver them again on the next sync.
-        """
-        dispatched = self._record_callback(backfill_client)
-
-        await backfill_client.receive_response(
-            sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
-            )
-        )
-
-        # $future arrived during the backfill: it is newer than the sync
-        # window ($new) yet reachable by the walk; the window's own event
-        # never appears, so the gap is unverified.
-        pages = PagedMessages(
-            {
-                "s1": messages_payload(
-                    [text_event("$gap1", ts=100), text_event("$future", ts=400)],
-                    end=None,
-                ),
-            }
-        )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        with caplog.at_level(logging.WARNING):
-            await backfill_client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=300)],
-                    limited=True,
-                    prev_batch="p1",
-                )
-            )
-
-        assert dispatched == ["$old", "$new"]
-        assert "$future" not in dispatched
-        assert "without fully closing the gap" in caplog.text
-
-    async def test_backfill_budget_is_shared_across_rooms(self, tempdir, aioresponse):
-        """Stalled rooms cannot stack timeouts; one budget covers the sync."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_timeout=0.2
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(client)
-        client.next_batch = "since_x"
-
-        calls = {"n": 0}
-
-        async def hang(url, **kwargs) -> CallbackResult:
-            calls["n"] += 1
-            await asyncio.sleep(30)
-            return CallbackResult(status=200, payload=messages_payload([], end=None))
-
-        aioresponse.get(MESSAGES_URL, callback=hang, repeat=True)
-
-        rooms = Rooms(
-            {},
-            {
-                TEST_ROOM_ID: RoomInfo(
-                    Timeline([text_event("$a", ts=1)], True, "p1"), [], [], []
-                ),
-                OTHER_ROOM_ID: RoomInfo(
-                    Timeline(
-                        [text_event("$b", ts=2, room_id=OTHER_ROOM_ID)], True, "p2"
-                    ),
-                    [],
-                    [],
-                    [],
-                ),
-            },
-            {},
-        )
-        start = time.monotonic()
+        client.add_event_callback(record_name, RoomNameEvent)
         await client.receive_response(
-            SyncResponse(
-                "s2",
-                rooms,
-                DeviceOneTimeKeyCount(49, 50),
-                DeviceList([], []),
-                [],
-                [],
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [
+                            name_event("$first", 1, "First"),
+                            name_event("$second", 2, "Second"),
+                        ],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
             )
         )
-        elapsed = time.monotonic() - start
+        assert seen == [("First", "First"), ("Second", "Second")]
 
-        # Both windows were still delivered; the first room consumed the whole
-        # budget, so the second room skipped its backfill without a request.
-        assert dispatched == ["$a", "$b"]
-        assert calls["n"] == 1
-        assert elapsed < 5
-        await client.close()
+    async def test_same_token_response_pumps_pending_room(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+        limited = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(limited)
+        assert seen == ["$old"]
 
-    async def test_forward_walk_discards_unverified_buffer(
-        self, tempdir, aioresponse, caplog
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap2", 3), text_event("$held", 4)],
+                "p1",
+            ),
+        )
+        await client.receive_response(limited)
+        assert seen == ["$old", "$gap", "$gap2", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_recovery_attempts_all_callbacks_once(self, client, aioresponse):
+        calls: list[str] = []
+
+        async def first(_room, event):
+            if event.event_id == "$gap":
+                calls.append("first")
+
+        async def failing(_room, event):
+            if event.event_id == "$gap":
+                calls.append("failing")
+                raise RuntimeError("callback failed")
+
+        async def last(_room, event):
+            if event.event_id == "$gap":
+                calls.append("last")
+
+        for callback in (first, failing, last):
+            client.add_event_callback(callback, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert calls == ["first", "failing", "last"]
+        assert not client._recovery.gaps
+
+    async def test_callback_fanout_failure_is_terminal_across_restart(
+        self, tempdir, aioresponse
     ):
-        """A forward walk cut off by a bound must not dispatch its buffer.
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first.next_batch = "s1"
+        calls: list[str] = []
 
-        If the walk ends before reaching the sync window, a join of ours may
-        lie in the unwalked remainder — everything buffered would then be
-        pre-join history, visible under shared history visibility. The buffer
-        must be discarded, not dispatched, and the loss surfaced.
-        """
+        async def before(_room, event):
+            calls.append(f"before:{event.event_id}")
+
+        async def fail(_room, event):
+            calls.append(f"fail:{event.event_id}")
+            if event.event_id == "$gap":
+                raise RuntimeError("callback failed")
+
+        async def after(_room, event):
+            calls.append(f"after:{event.event_id}")
+
+        for callback in (before, fail, after):
+            first.add_event_callback(callback, RoomMessageText)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        await first.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert calls == [
+            "before:$gap",
+            "fail:$gap",
+            "after:$gap",
+            "before:$held",
+            "fail:$held",
+            "after:$held",
+        ]
+        assert not first._recovery.gaps
+        await first.close()
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert not restarted._recovery.gaps
+        assert calls == [
+            "before:$gap",
+            "fail:$gap",
+            "after:$gap",
+            "before:$held",
+            "fail:$held",
+            "after:$held",
+        ]
+        await restarted.close()
+
+    async def test_classic_recovery_deduplicates_sliding_replay_after_restart(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first.next_batch = "s1"
+        seen = record_events(first)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        await first.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held"]
+        await first.close()
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def record(_room, event):
+            seen.append(event.event_id)
+
+        restarted.add_event_callback(record, RoomMessageText)
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [
+                            text_event("$gap", 2).source,
+                            text_event("$held", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await restarted.receive_response(sliding)
+        assert seen == ["$gap", "$held"]
+        await restarted.close()
+
+    async def test_sliding_replay_deduplicates_classic_recovery_after_restart(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(sync_response("s1", {}))
+        seen = record_events(first)
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$shared", 2).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await first.receive_response(sliding)
+        assert seen == ["$shared"]
+        await first.close()
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def record(_room, event):
+            seen.append(event.event_id)
+
+        restarted.add_event_callback(record, RoomMessageText)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 1), text_event("$shared", 2)],
+                "p1",
+            ),
+        )
+        await restarted.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$shared", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$shared", "$gap"]
+        await restarted.close()
+
+    async def test_sliding_encrypted_restart_allows_classic_plaintext_upgrade(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(sync_response("s1", {}))
+        seen: list[type[Event]] = []
+
+        async def record_first(_room, event):
+            seen.append(type(event))
+
+        first.add_event_callback(record_first, (MegolmEvent, RoomMessageText))
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [megolm_event("$shared", 2).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await first.receive_response(sliding)
+        assert seen == [MegolmEvent]
+        await first.close()
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def record_restarted(_room, event):
+            seen.append(type(event))
+
+        restarted.add_event_callback(
+            record_restarted,
+            (MegolmEvent, RoomMessageText),
+        )
+        clear = text_event("$shared", 2)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([clear], "p1"),
+        )
+        await restarted.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [clear],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == [MegolmEvent, RoomMessageText]
+        await restarted.close()
+
+    async def test_recovered_encrypted_event_upgrades_after_keys_arrive(
+        self, client, aioresponse, monkeypatch
+    ):
+        encrypted = megolm_event("$shared", 2)
+        clear = text_event("$shared", 2)
+        record_completed_timeline_event(client._recovery, ROOM_A, "$shared", True)
+        assert client.olm
+        monkeypatch.setattr(
+            client.olm,
+            "_decrypt_megolm_no_error",
+            lambda event: clear if event.event_id == "$shared" else None,
+        )
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([encrypted, text_event("$held", 3)], "p1"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$shared", "$held"]
+        assert client._recovery.completed[ROOM_A]["$shared"] is False
+
+    async def test_encrypted_upgrade_needs_no_post_decrypt_commit(
+        self, tempdir, monkeypatch
+    ):
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
             "DEVICEID",
             tempdir,
             config=AsyncClientConfig(
-                backfill_limited_timelines=True, backfill_max_pages=1
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
             ),
         )
-        await client.receive_response(LoginResponse.from_dict(login_response))
-        dispatched = self._record_callback(client)
-        client.next_batch = "since_token"
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        encrypted = megolm_event("$shared", 1)
+        clear = text_event("$shared", 1)
+        seen = []
 
-        # Page 1 buffers $prejoin and offers more pages; the page bound stops
-        # the walk before it can learn whether a join lies further ahead.
-        pages = PagedMessages(
+        async def record(_room, event):
+            seen.append(event.event_id)
+
+        client.add_event_callback(record, (MegolmEvent, RoomMessageText))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
+        assert seen == ["$shared"]
+        assert client.olm
+        monkeypatch.setattr(
+            client.olm, "_decrypt_megolm_no_error", lambda _event: clear
+        )
+        original_save = client.store.save_recovery
+        saves = 0
+
+        def fail_second_save(*args):
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                raise RuntimeError("post-decrypt commit failed")
+            original_save(*args)
+
+        monkeypatch.setattr(client.store, "save_recovery", fail_second_save)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p1")},
+            )
+        )
+        assert saves == 1
+        assert seen == ["$shared", "$shared"]
+        assert client._recovery.completed[ROOM_A]["$shared"] is False
+        await client.close()
+
+    async def test_restart_replays_only_active_unacknowledged_row(
+        self, tempdir, aioresponse, monkeypatch
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first.next_batch = "s1"
+        seen = record_events(first)
+
+        original_finish = first.store.finish_recovery
+        acknowledgements = 0
+
+        def fail_second_ack(room_id, generation, event_id, was_encrypted):
+            nonlocal acknowledgements
+            if event_id:
+                acknowledgements += 1
+            if acknowledgements == 2:
+                raise RuntimeError("ack failed")
+            original_finish(room_id, generation, event_id, was_encrypted)
+
+        monkeypatch.setattr(first.store, "finish_recovery", fail_second_ack)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$gap1", 2),
+                    text_event("$gap2", 3),
+                    text_event("$held", 4),
+                ],
+                "p1",
+            ),
+        )
+        with pytest.raises(RuntimeError, match="ack failed"):
+            await first.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 4)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        assert seen == ["$gap1", "$gap2"]
+        await first.close()
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def record(_room, event):
+            seen.append(event.event_id)
+
+        restarted.add_event_callback(record, RoomMessageText)
+        await restarted.receive_response(sync_response("s2", {}))
+        assert seen == ["$gap1", "$gap2", "$gap2", "$held"]
+        assert not restarted._recovery.gaps
+        await restarted.close()
+
+    async def test_sliding_timeline_joins_classic_recovery_lane(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+        limited = sync_response(
+            "s2",
             {
-                "since_token": messages_payload(
-                    [text_event("$prejoin", ts=240)], end="fwd2"
-                ),
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(limited)
+
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$slide", 5).source],
+                    }
+                },
             }
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        assert seen == ["$old"]
 
-        with caplog.at_level(logging.WARNING):
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap2", 3), text_event("$held", 4)],
+                "p1",
+            ),
+        )
+        await client.receive_response(limited)
+        assert seen == ["$old", "$gap", "$gap2", "$held", "$slide"]
+        assert not client._recovery.gaps
+
+    async def test_sliding_own_join_resets_classic_history_not_current_timeline(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$prejoin", 1)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == []
+        assert client._recovery.gaps
+
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [
+                            text_event("$prejoin2", 1).source,
+                            member_event("$join", 2, "join").source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        assert seen == ["$prejoin2", "$join", "$after"]
+        assert not client._recovery.gaps
+
+    async def test_sliding_initial_historical_join_keeps_classic_gap(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more"),
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more2"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "initial": True,
+                        "membership": "join",
+                        "num_live": 1,
+                        "timeline": [
+                            member_event("$join", 2, "join").source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        assert seen == []
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more2"
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$gap",
+            "$held",
+            "$join",
+            "$after",
+        ]
+
+    @pytest.mark.parametrize("membership", ["leave", "ban", "invite"])
+    async def test_sliding_membership_reset_clears_classic_recovery_durably(
+        self, tempdir, aioresponse, membership
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$seen", 0)],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert client._recovery.gaps
+        assert client.store.load_sync_recovery()[0]
+
+        reset = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {ROOM_A: {"membership": membership, "timeline": []}},
+            }
+        )
+        assert isinstance(reset, SlidingSyncResponse)
+        await client.receive_response(reset)
+        assert not client._recovery.gaps
+        assert seen == ["$seen", "$held"]
+        gaps, events = client.store.load_sync_recovery()
+        assert gaps == []
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
+        assert [(event.event_id, event.generation) for event in events] == [
+            ("$seen", 0),
+            ("$held", 0),
+        ]
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert not restarted._recovery.gaps
+        assert list(restarted._recovery.completed[ROOM_A]) == ["$seen", "$held"]
+        await restarted.close()
+
+    @pytest.mark.parametrize("membership", ["leave", "invite"])
+    async def test_classic_membership_reset_clears_recovery_durably(
+        self, tempdir, aioresponse, membership
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$seen", 0)],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 1)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert client._recovery.gaps
+        assert client.store.load_sync_recovery()[0]
+
+        await client.receive_response(
+            sync_response(
+                "s3",
+                {},
+                invited=({ROOM_A: InviteInfo([])} if membership == "invite" else None),
+                left=(
+                    {ROOM_A: room_info([], limited=False, prev_batch=None)}
+                    if membership == "leave"
+                    else None
+                ),
+            )
+        )
+        assert not client._recovery.gaps
+        assert seen == ["$seen", "$held"]
+        gaps, events = client.store.load_sync_recovery()
+        assert gaps == []
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
+        assert [(event.event_id, event.generation) for event in events] == [
+            ("$seen", 0),
+            ("$held", 0),
+        ]
+        await client.close()
+
+    @pytest.mark.parametrize("sliding", [False, True])
+    async def test_invite_state_waits_for_preserved_live(
+        self, client, aioresponse, sliding
+    ):
+        seen = []
+
+        async def record(_room, event):
+            seen.append(
+                event.event_id if isinstance(event, RoomMessageText) else "invite"
+            )
+
+        client.add_event_callback(record, (RoomMessageText, InviteNameEvent))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        invite = InviteNameEvent.from_dict(
+            {
+                "content": {"name": "Invite"},
+                "sender": "@sender:example.org",
+                "state_key": "",
+                "type": "m.room.name",
+            }
+        )
+        assert isinstance(invite, InviteNameEvent)
+        if sliding:
+            reset = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "slide1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "invite",
+                            "stripped_state": [invite.source],
+                            "timeline": [],
+                        }
+                    },
+                }
+            )
+            assert isinstance(reset, SlidingSyncResponse)
+        else:
+            reset = sync_response("s3", {}, invited={ROOM_A: InviteInfo([invite])})
+        await client.receive_response(reset)
+        assert seen == ["$old", "$held", "invite"]
+
+    async def test_sliding_live_callback_failure_propagates(self, client):
+        calls: list[str] = []
+
+        async def first(_room, event):
+            calls.append(f"first:{event.event_id}")
+
+        async def failing(_room, event):
+            calls.append(f"failing:{event.event_id}")
+            if event.event_id == "$b":
+                raise RuntimeError("callback failed")
+
+        async def last(_room, event):
+            calls.append(f"last:{event.event_id}")
+
+        for callback in (first, failing, last):
+            client.add_event_callback(callback, RoomMessageText)
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [
+                            text_event("$a", 1).source,
+                            text_event("$b", 2).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(sliding)
+        assert calls == [
+            "first:$a",
+            "failing:$a",
+            "last:$a",
+            "first:$b",
+            "failing:$b",
+        ]
+        assert client._recovery.events[(ROOM_A, 1)] == []
+        assert "$b" in client._recovery.completed[ROOM_A]
+
+    async def test_sliding_sync_dedup_stays_bounded(self, client):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$shared", 1)],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        unique = [text_event(f"$slide-{index}", index + 2) for index in range(520)]
+        sliding = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [
+                            text_event("$shared", 1).source,
+                            *(event.source for event in unique),
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(sliding, SlidingSyncResponse)
+        await client.receive_response(sliding)
+        assert seen == ["$shared", *(event.event_id for event in unique)]
+        assert len(client._recovery.completed[ROOM_A]) == 512
+
+    async def test_plaintext_overlap_state_wins_over_later_encrypted_copy(self, client):
+        record_completed_timeline_event(client._recovery, ROOM_A, "$same", False)
+        record_completed_timeline_event(client._recovery, ROOM_A, "$same", True)
+        assert not should_dispatch_timeline_event(
+            client._recovery, ROOM_A, text_event("$same", 1)
+        )
+
+    async def test_failed_plan_commit_restores_transport_cursor(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("commit failed")
+
+        handled = []
+        original_handle = client._handle_to_device
+
+        async def handle(response):
+            handled.append(response)
+            await original_handle(response)
+
+        monkeypatch.setattr(client, "_handle_to_device", handle)
+        monkeypatch.setattr(client.store, "save_recovery", fail)
+        with pytest.raises(RuntimeError, match="commit failed"):
             await client.receive_response(
                 sync_response(
                     "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=300)],
-                    limited=True,
-                    prev_batch="p1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 3)], limited=True, prev_batch="p1"
+                        )
+                    },
                 )
             )
-
-        assert dispatched == ["$new"]
-        assert "$prejoin" not in dispatched
-        assert "without fully closing the gap" in caplog.text
+        assert client.next_batch == "s1"
+        assert client.store.load_sync_token() == "s1"
+        assert not client._recovery.gaps
+        assert handled == []
         await client.close()
 
-    async def test_repeated_end_token_leaves_gap_open(
-        self, backfill_client, aioresponse, caplog
+    async def test_failed_sliding_plan_commit_keeps_to_device_cursor(
+        self, tempdir, monkeypatch
     ):
-        """A page whose end token repeats the from token is a stall, not proof
-        that the history was exhausted; the gap must stay open and warn."""
-        dispatched = self._record_callback(backfill_client)
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client._sliding_sync_to_device_since = "td0"
+        handled = []
 
-        await backfill_client.receive_response(
+        async def handle(response):
+            handled.append(response)
+
+        monkeypatch.setattr(client, "_handle_to_device", handle)
+
+        def fail(*_args):
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(client.store, "save_recovery", fail)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$held", 1).source],
+                    }
+                },
+                "extensions": {
+                    "to_device": {"next_batch": "td1", "events": []},
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await client.receive_response(response)
+        assert client._sliding_sync_to_device_since == "td0"
+        assert handled == []
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_sliding_timeline_retries_decryption_after_to_device(
+        self, client, monkeypatch
+    ):
+        ready = False
+        attempts = []
+
+        async def process(_room_id, _room, timeline, _encrypted_rooms, **_kwargs):
+            attempts.append(ready)
+            if ready:
+                timeline[:] = [text_event("$decrypted", 1)]
+
+        async def handle(_response):
+            nonlocal ready
+            ready = True
+
+        monkeypatch.setattr(client, "_process_timeline", process)
+        monkeypatch.setattr(client, "_handle_to_device", handle)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "slide1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$encrypted", 1).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        await client.receive_response(response)
+        assert attempts == [False, True]
+        assert response.rooms[ROOM_A].timeline[0].event_id == "$decrypted"
+
+    async def test_target_cursor_closes_without_live_echo(self, client, aioresponse):
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "p1"),
+        )
+        await client.receive_response(
             sync_response(
-                "s1",
-                TEST_ROOM_ID,
-                [text_event("$old", ts=50)],
-                limited=False,
-                prev_batch="p0",
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
             )
         )
+        assert seen == ["$gap", "$held"]
+        assert not client._recovery.gaps
 
-        pages = PagedMessages(
-            {"s1": messages_payload([text_event("$gap1", ts=100)], end="s1")}
+    @pytest.mark.parametrize("limited", [False, True])
+    async def test_current_timeline_preserves_events_before_own_join(
+        self, client, limited
+    ):
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
-
-        with caplog.at_level(logging.WARNING):
-            await backfill_client.receive_response(
-                sync_response(
-                    "s2",
-                    TEST_ROOM_ID,
-                    [text_event("$new", ts=300)],
-                    limited=True,
-                    prev_batch="p1",
-                )
+        client.next_batch = "s1"
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [
+                            text_event("$prejoin", 1),
+                            member_event("$join", 2, "join"),
+                            text_event("$after", 3),
+                        ],
+                        limited=limited,
+                        prev_batch="p1",
+                    )
+                },
             )
-
-        # A stalled walk cannot prove its buffer is complete or post-join, so
-        # nothing from it is dispatched, and the stall is surfaced.
-        assert dispatched == ["$old", "$new"]
-        assert "without fully closing the gap" in caplog.text
+        )
+        assert seen == ["$prejoin", "$join", "$after"]
+        assert not client._recovery.gaps

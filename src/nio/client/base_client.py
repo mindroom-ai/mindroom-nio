@@ -897,7 +897,9 @@ class Client:
         for cb in self.ephemeral_callbacks:
             cb.sync_execute(event, room)
 
-    def _on_room_account_data(self, event: AccountDataEvent, room: MatrixRoom):
+    def _on_room_account_data(
+        self, event: AccountDataEvent | BadEventType, room: MatrixRoom
+    ):
         for cb in self.room_account_data_callbacks:
             cb.sync_execute(event, room)
 
