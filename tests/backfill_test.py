@@ -26,6 +26,7 @@ from nio import (
     PresenceEvent,
     RoomEncryptedImage,
     RoomEncryptionEvent,
+    RoomForgetResponse,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
@@ -2904,6 +2905,66 @@ class TestRoomLocalRecovery:
         assert pages.from_tokens == ["w1"]
         assert not second._recovery.gaps
         await second.close()
+
+    async def test_forgetting_a_room_drops_its_window_token(self, tempdir):
+        """A stale baseline must not outlive the membership it was taken under."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+
+        await client.receive_response(RoomForgetResponse.from_dict({}, ROOM_A))
+
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_window_token_is_written_with_its_plan(self, tempdir):
+        """The baseline and the plan it belongs to share one transaction.
+
+        Storing either alone would send a restarted walk from a position
+        that does not match the pending rows it finds.
+        """
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        calls: list[str] = []
+        original = client.store.save_recovery
+        seen_tokens: list[dict] = []
+
+        def record(*args, **kwargs):
+            calls.append("save_recovery")
+            seen_tokens.append(
+                args[5] if len(args) > 5 else kwargs.get("window_tokens")
+            )
+            return original(*args, **kwargs)
+
+        client.store.save_recovery = record
+        client.store.save_sliding_window_tokens = lambda *a, **k: calls.append(
+            "save_sliding_window_tokens"
+        )
+
+        await client.receive_response(
+            self._sliding("s1", [text_event("$one", 1)], prev_batch="w1")
+        )
+
+        assert calls == ["save_recovery"]
+        assert seen_tokens == [{ROOM_A: "w1"}]
+        await client.close()
 
     async def test_left_room_drops_the_persisted_window_token(
         self, tempdir, aioresponse

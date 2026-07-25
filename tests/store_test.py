@@ -644,6 +644,57 @@ class TestClass:
         )
         assert reopened.load_sliding_window_tokens() == {TEST_ROOM: "w3"}
 
+    def test_sliding_window_tokens_chunk_large_batches(self, sqlstore):
+        """More rooms than SQLite can bind in one statement still write."""
+        tokens = {f"!room{index}:example.org": f"w{index}" for index in range(750)}
+        sqlstore.save_sliding_window_tokens(tokens)
+        assert sqlstore.load_sliding_window_tokens() == tokens
+
+        sqlstore.save_sliding_window_tokens({}, list(tokens)[:600])
+        assert len(sqlstore.load_sliding_window_tokens()) == 150
+
+    def test_save_recovery_writes_window_tokens_in_one_transaction(
+        self, sqlstore, monkeypatch
+    ):
+        """The plan and its baselines land together or not at all."""
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+
+        def fail(*args):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(sqlstore, "_upsert_pending_events", fail)
+        with pytest.raises(RuntimeError):
+            sqlstore.save_recovery(
+                "s1",
+                set(),
+                [gap],
+                [
+                    PendingTimelineEvent(
+                        TEST_ROOM,
+                        1,
+                        0,
+                        "$held",
+                        '{"content":{},"event_id":"$held","sender":"@a:b",'
+                        '"type":"m.test"}',
+                        True,
+                        False,
+                    )
+                ],
+                None,
+                {TEST_ROOM: "w1"},
+            )
+
+        # The write failed, so neither the plan nor the token survives.
+        assert sqlstore.load_sliding_window_tokens() == {}
+        gaps, events = sqlstore.load_sync_recovery()
+        assert not gaps
+        assert not events
+
+    def test_forget_sliding_window_token(self, sqlstore):
+        sqlstore.save_sliding_window_tokens({TEST_ROOM: "w1", "!b:example.org": "w2"})
+        sqlstore.forget_sliding_window_token(TEST_ROOM)
+        assert sqlstore.load_sliding_window_tokens() == {"!b:example.org": "w2"}
+
     def test_pending_recovery_payload_is_encrypted_at_rest(self, tempdir):
         store = SqliteStore(
             "@secure:example.org",

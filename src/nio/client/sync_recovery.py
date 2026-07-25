@@ -504,6 +504,8 @@ def persist_response_plan(
     *,
     token: str | None,
     plan: RecoveryPlan,
+    window_tokens: Mapping[str, str] | None = None,
+    forgotten_rooms: Iterable[str] = (),
 ) -> None:
     if store:
         store.save_recovery(
@@ -512,6 +514,8 @@ def persist_response_plan(
             plan.gaps,
             plan.events,
             plan.clear_recovered,
+            window_tokens,
+            forgotten_rooms,
         )
     apply_plan(state, plan)
 

@@ -1089,13 +1089,15 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
+                recorded, forgotten = self._record_sliding_prev_batches(response)
                 persist_response_plan(
                     self._recovery,
                     self._recovery_store,
                     token=None,
                     plan=merge_recovery_plans(plans),
+                    window_tokens=recorded,
+                    forgotten_rooms=forgotten,
                 )
-                self._record_sliding_prev_batches(response)
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
         if self.config.backfill_limited_timelines:
@@ -1134,6 +1136,10 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+
+    def _handle_room_forget_response(self, response: RoomForgetResponse):
+        super()._handle_room_forget_response(response)
+        self._forget_sliding_window_token(response.room_id)
 
     def _sliding_seed_lists(
         self, lists: dict[str, Any] | None
@@ -1198,8 +1204,16 @@ class AsyncClient(Client):
             return None
         return self._sliding_room_prev_batch.get(room_id)
 
-    def _record_sliding_prev_batches(self, response: SlidingSyncResponse) -> None:
-        """Remember each room's window token for the next response's walk."""
+    def _record_sliding_prev_batches(
+        self, response: SlidingSyncResponse
+    ) -> tuple[dict[str, str], list[str]]:
+        """Remember each room's window token for the next response's walk.
+
+        Returns the tokens to store and the rooms whose token is gone, so
+        the caller can commit them alongside the recovery plan they belong
+        to: a baseline persisted without its plan would send a restarted
+        walk from the wrong position.
+        """
         recorded: dict[str, str] = {}
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
@@ -1214,12 +1228,18 @@ class AsyncClient(Client):
             elif room.prev_batch:
                 self._sliding_room_prev_batch[room_id] = room.prev_batch
                 recorded[room_id] = room.prev_batch
+        return recorded, forgotten
 
-        if (recorded or forgotten) and self._recovery_store:
-            # Persisted so a restarted client can still walk the gap its
-            # downtime left behind, the way /v3/sync does from its stored
-            # sync token.
-            self._recovery_store.save_sliding_window_tokens(recorded, forgotten)
+    def _forget_sliding_window_token(self, room_id: str) -> None:
+        """Drop a room's walk baseline once we are no longer in it.
+
+        A stale baseline outlives the membership it was taken under, so a
+        later rejoin would walk history from before we left.
+        """
+        self._sliding_room_prev_batch.pop(room_id, None)
+        store = self._recovery_store
+        if store:
+            store.forget_sliding_window_token(room_id)
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
@@ -3966,7 +3986,10 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
         """
         method, path = Api.room_leave(self.access_token, room_id)
-        return await self._send(RoomLeaveResponse, method, path)
+        response = await self._send(RoomLeaveResponse, method, path)
+        if isinstance(response, RoomLeaveResponse):
+            self._forget_sliding_window_token(room_id)
+        return response
 
     @logged_in_async
     async def room_forget(self, room_id: str) -> RoomForgetResponse | RoomForgetError:

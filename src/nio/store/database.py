@@ -567,9 +567,16 @@ class MatrixStore:
         gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
         events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
         clear_recovered: RecoveryGap | None,
+        window_tokens: Mapping[str, str] | None = None,
+        forgotten_rooms: Iterable[str] = (),
     ) -> None:
         account = self._get_account()
         assert account
+
+        # Window tokens ride the same transaction as the plan they belong
+        # to: a baseline stored without its plan, or the other way round,
+        # would send a restarted walk from the wrong position.
+        self._write_sliding_window_tokens(account, window_tokens, forgotten_rooms)
 
         if token:
             SyncTokens.replace(account=account, token=token).execute()
@@ -796,20 +803,42 @@ class MatrixStore:
         """Persist window tokens, dropping the rooms that no longer have one."""
         account = self._get_account()
         assert account
+        self._write_sliding_window_tokens(account, tokens, forgotten)
 
+    def _write_sliding_window_tokens(
+        self,
+        account,
+        tokens: Mapping[str, str] | None,
+        forgotten: Iterable[str],
+    ) -> None:
+        """Write window tokens in chunks SQLite can bind in one statement."""
         forgotten = list(forgotten)
-        if forgotten:
+        for index in range(0, len(forgotten), _RECOVERY_WRITE_CHUNK_SIZE):
             SlidingWindowTokens.delete().where(
                 SlidingWindowTokens.account == account,
-                SlidingWindowTokens.room_id.in_(forgotten),
+                SlidingWindowTokens.room_id.in_(
+                    forgotten[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+                ),
             ).execute()
-        if not tokens:
+
+        rows = [
+            {"account": account, "room_id": room_id, "token": token}
+            for room_id, token in (tokens or {}).items()
+        ]
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SlidingWindowTokens.replace_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+
+    @use_database_atomic
+    def forget_sliding_window_token(self, room_id: str) -> None:
+        """Drop one room's window token, e.g. after leaving or forgetting it."""
+        account = self._get_account()
+        if not account:
             return
-        SlidingWindowTokens.replace_many(
-            [
-                {"account": account, "room_id": room_id, "token": token}
-                for room_id, token in tokens.items()
-            ]
+        SlidingWindowTokens.delete().where(
+            SlidingWindowTokens.account == account,
+            SlidingWindowTokens.room_id == room_id,
         ).execute()
 
     @use_database_atomic
