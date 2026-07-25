@@ -1070,7 +1070,12 @@ async def recovery_slam(
             await client.close()
 
 
-async def encrypted_recovery_slam(homeserver: str, n_messages: int) -> None:
+async def encrypted_recovery_slam(
+    homeserver: str,
+    n_messages: int,
+    window: int = 1,
+    allow_sliding_gap: bool = False,
+) -> None:
     """Flood an encrypted room with a one-event window and assert decryption."""
     suffix = secrets.token_hex(4)
     alice = await register_configured(
@@ -1089,7 +1094,7 @@ async def encrypted_recovery_slam(homeserver: str, n_messages: int) -> None:
     lists = {
         "recovery": {
             "ranges": [[0, 19]],
-            "timeline_limit": 1,
+            "timeline_limit": window,
             "required_state": [
                 ["m.room.create", ""],
                 ["m.room.encryption", ""],
@@ -1186,11 +1191,21 @@ async def encrypted_recovery_slam(homeserver: str, n_messages: int) -> None:
             600,
         )
         missing = sent_ids - set(recorder.decrypted)
-        check(
-            "encrypted recovery slam: every event was decrypted and dispatched",
-            converged and not missing,
-            f"{len(missing)} never arrived decrypted",
-        )
+        if missing and allow_sliding_gap and window <= 1:
+            # This pass reads through sliding sync only, which plans no
+            # recovery gap, so a one-event window loses events before
+            # decryption ever gets a say. Raise --recovery-encrypted-window
+            # to tell a decryption failure apart from that hole.
+            print(
+                f"encrypted recovery slam: KNOWN GAP: {len(missing)}/"
+                f"{len(sent_ids)} events lost to the sliding backfill gap"
+            )
+        else:
+            check(
+                "encrypted recovery slam: every event was decrypted and dispatched",
+                converged and not missing,
+                f"{len(missing)} never arrived decrypted",
+            )
         check(
             "encrypted recovery slam: no event decrypted twice",
             not [event_id for event_id in sent_ids if recorder.decrypted[event_id] > 1],
@@ -1428,6 +1443,18 @@ async def main() -> None:
     parser.add_argument("--recovery-writers", type=int, default=4)
     parser.add_argument("--recovery-encrypted-messages", type=int, default=250)
     parser.add_argument(
+        "--recovery-encrypted-window",
+        type=int,
+        default=1,
+        help="timeline_limit for the encrypted pass; raise it to keep windows "
+        "unlimited and isolate decryption from the sliding backfill gap",
+    )
+    parser.add_argument(
+        "--only-encrypted-recovery-slam",
+        action="store_true",
+        help="run only the encrypted recovery pass",
+    )
+    parser.add_argument(
         "--skip-recovery-slam",
         action="store_true",
         help="run only the wire-format slam, not the backfill recovery slam",
@@ -1444,6 +1471,16 @@ async def main() -> None:
         help="skip every other check and run the backfill recovery slam alone",
     )
     args = parser.parse_args()
+
+    if args.only_encrypted_recovery_slam:
+        await encrypted_recovery_slam(
+            args.homeserver,
+            args.recovery_encrypted_messages,
+            args.recovery_encrypted_window,
+            args.allow_sliding_backfill_gap,
+        )
+        print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
+        return
 
     if args.only_recovery_slam:
         await recovery_slam(
@@ -1579,7 +1616,10 @@ async def main() -> None:
                     args.allow_sliding_backfill_gap,
                 )
                 await encrypted_recovery_slam(
-                    args.homeserver, args.recovery_encrypted_messages
+                    args.homeserver,
+                    args.recovery_encrypted_messages,
+                    args.recovery_encrypted_window,
+                    args.allow_sliding_backfill_gap,
                 )
 
         if args.bench:
