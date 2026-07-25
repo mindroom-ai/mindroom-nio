@@ -2978,9 +2978,7 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
         await client.close()
 
-    async def test_response_crossing_a_leave_does_not_restore_the_token(
-        self, tempdir
-    ):
+    async def test_response_crossing_a_leave_does_not_restore_the_token(self, tempdir):
         """A join response older than the leave must not revive the baseline."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
