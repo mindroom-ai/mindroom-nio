@@ -12,12 +12,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING
 
+from Crypto.Cipher import AES
 from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
@@ -53,6 +55,23 @@ from . import (
 
 if TYPE_CHECKING:
     from ..client.sync_recovery import PendingTimelineEvent, RecoveryGap
+
+
+_RECOVERY_PAYLOAD_VERSION = 1
+_RECOVERY_NONCE_SIZE = 12
+_RECOVERY_TAG_SIZE = 16
+_RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
+
+
+def _recovery_payload_aad(
+    account_id: int,
+    room_id: str,
+    generation: int,
+    event_id: str,
+) -> bytes:
+    values = (str(account_id), room_id, str(generation), event_id)
+    encoded = (value.encode() for value in values)
+    return b"".join(len(value).to_bytes(4, "big") + value for value in encoded)
 
 
 def use_database(fn):
@@ -542,9 +561,87 @@ class MatrixStore:
             SyncRecoveryGaps.replace_many(rows).execute()
         self._upsert_pending_events(account, events)
 
+    def _recovery_payload_key(self) -> bytes:
+        return hashlib.sha256(_RECOVERY_KEY_DOMAIN + self.pickle_key.encode()).digest()
+
     @staticmethod
-    def _upsert_pending_events(account, events) -> None:
-        rows = [{"account": account, **asdict(event)} for event in events]
+    def _encrypt_recovery_payload(
+        key: bytes,
+        account_id: int,
+        event: PendingTimelineEvent,
+    ) -> bytes:
+        nonce = os.urandom(_RECOVERY_NONCE_SIZE)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=_RECOVERY_TAG_SIZE)
+        header = bytes((_RECOVERY_PAYLOAD_VERSION,))
+        cipher.update(
+            header
+            + _recovery_payload_aad(
+                account_id,
+                event.room_id,
+                event.generation,
+                event.event_id,
+            )
+        )
+        encrypted, tag = cipher.encrypt_and_digest(event.source_json.encode())
+        return header + nonce + tag + encrypted
+
+    @staticmethod
+    def _decrypt_recovery_payload(
+        key: bytes,
+        account_id: int,
+        row: PendingTimelineEvents,
+    ) -> str:
+        payload = bytes(row.event_payload)
+        minimum_size = 1 + _RECOVERY_NONCE_SIZE + _RECOVERY_TAG_SIZE
+        if len(payload) < minimum_size or payload[0] != _RECOVERY_PAYLOAD_VERSION:
+            raise ValueError("Invalid encrypted recovery payload")
+        header = payload[:1]
+        nonce_end = 1 + _RECOVERY_NONCE_SIZE
+        tag_end = nonce_end + _RECOVERY_TAG_SIZE
+        cipher = AES.new(
+            key,
+            AES.MODE_GCM,
+            nonce=payload[1:nonce_end],
+            mac_len=_RECOVERY_TAG_SIZE,
+        )
+        cipher.update(
+            header
+            + _recovery_payload_aad(
+                account_id,
+                row.room_id,
+                row.generation,
+                row.event_id,
+            )
+        )
+        try:
+            decrypted = cipher.decrypt_and_verify(
+                payload[tag_end:],
+                payload[nonce_end:tag_end],
+            )
+            return decrypted.decode()
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("Invalid encrypted recovery payload") from error
+
+    def _upsert_pending_events(self, account, events) -> None:
+        key = self._recovery_payload_key()
+        rows = [
+            {
+                "account": account,
+                "room_id": event.room_id,
+                "generation": event.generation,
+                "sequence": event.sequence,
+                "event_id": event.event_id,
+                "event_payload": (
+                    b""
+                    if event.generation == 0
+                    else self._encrypt_recovery_payload(key, account.id, event)
+                ),
+                "is_live": event.is_live,
+                "was_encrypted": event.was_encrypted,
+                "was_completed": event.was_completed,
+            }
+            for event in events
+        ]
         if not rows:
             return
         PendingTimelineEvents.insert_many(rows).on_conflict(
@@ -556,7 +653,7 @@ class MatrixStore:
             preserve=[
                 PendingTimelineEvents.generation,
                 PendingTimelineEvents.sequence,
-                PendingTimelineEvents.source_json,
+                PendingTimelineEvents.event_payload,
                 PendingTimelineEvents.is_live,
                 PendingTimelineEvents.was_encrypted,
                 PendingTimelineEvents.was_completed,
@@ -571,8 +668,10 @@ class MatrixStore:
     @use_database
     def load_sync_recovery(
         self,
-    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvents]]:
+    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvent]]:
         """Load room obligations and their ordered pending callbacks."""
+        from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
+
         account = self._get_account()
         if not account:
             return [], []
@@ -582,7 +681,7 @@ class MatrixStore:
             .where(SyncRecoveryGaps.account == account)
             .order_by(SyncRecoveryGaps.room_id, SyncRecoveryGaps.generation)
         )
-        events = list(
+        rows = list(
             PendingTimelineEvents.select()
             .where(PendingTimelineEvents.account == account)
             .order_by(
@@ -596,6 +695,24 @@ class MatrixStore:
                 PendingTimelineEvents.sequence,
             )
         )
+        key = self._recovery_payload_key()
+        events = [
+            PendingTimelineEvent(
+                row.room_id,
+                row.generation,
+                row.sequence,
+                row.event_id,
+                (
+                    ""
+                    if row.generation == 0
+                    else self._decrypt_recovery_payload(key, account.id, row)
+                ),
+                row.is_live,
+                row.was_encrypted,
+                row.was_completed,
+            )
+            for row in rows
+        ]
         return gaps, events
 
     @use_database_atomic
@@ -623,7 +740,7 @@ class MatrixStore:
                 return
             pending.id = None
             pending.generation = 0
-            pending.source_json = ""
+            pending.event_payload = b""
             pending.is_live = pending.was_completed = False
             pending.was_encrypted = was_encrypted
             pending.save(force_insert=True)

@@ -233,7 +233,7 @@ class PendingTimelineEvents(Model):
     generation = IntegerField()
     sequence = IntegerField()
     event_id = TextField()
-    source_json = TextField()
+    event_payload = ByteField()
     is_live = BooleanField()
     was_encrypted = BooleanField()
     was_completed = BooleanField()
