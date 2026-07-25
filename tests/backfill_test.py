@@ -21,6 +21,7 @@ from nio import (
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
+    RoomEncryptedImage,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
@@ -1008,6 +1009,62 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$encrypted"]
         assert client._recovery.completed[ROOM_A]["$encrypted"] is False
+
+    async def test_live_decryption_preserves_callback_metadata(
+        self, client, monkeypatch
+    ):
+        encrypted = megolm_event("$encrypted-image", 1)
+        source = json.loads(
+            Path("tests/data/events/room_encrypted_image.json").read_text()
+        )
+        source.update(
+            {
+                "event_id": encrypted.event_id,
+                "origin_server_ts": encrypted.server_timestamp,
+                "room_id": ROOM_A,
+                "sender": encrypted.sender,
+            }
+        )
+        decrypted = Event.parse_decrypted_event(source)
+        assert isinstance(decrypted, RoomEncryptedImage)
+        decrypted.decrypted = True
+        decrypted.verified = True
+        decrypted.sender_key = "sender-key"
+        decrypted.session_id = "session-id"
+        decrypted.room_id = ROOM_A
+        decrypt_calls = 0
+
+        def decrypt(event):
+            nonlocal decrypt_calls
+            assert isinstance(event, MegolmEvent)
+            decrypt_calls += 1
+            return decrypted
+
+        assert client.olm
+        monkeypatch.setattr(client.olm, "_decrypt_megolm_no_error", decrypt)
+        seen = []
+
+        async def record(_room, event):
+            seen.append(
+                (
+                    type(event),
+                    event.decrypted,
+                    event.verified,
+                    event.sender_key,
+                    event.session_id,
+                )
+            )
+
+        client.add_event_callback(record, RoomEncryptedImage)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
+
+        assert decrypt_calls == 2
+        assert seen == [(RoomEncryptedImage, True, True, "sender-key", "session-id")]
 
     async def test_restart_resumes_room_without_replaying_response_surfaces(
         self, tempdir, aioresponse

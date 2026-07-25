@@ -181,15 +181,6 @@ def _plan_live_events(
             continue
         existing = known.get(event_id)
         if existing:
-            if existing.was_encrypted and not pending.was_encrypted:
-                planned.append(
-                    replace(
-                        pending,
-                        generation=existing.generation,
-                        sequence=existing.sequence,
-                        is_live=existing.is_live,
-                    )
-                )
             continue
         if not should_dispatch_timeline_event(state, room_id, event):
             continue
@@ -340,13 +331,6 @@ def _merge_event(
     existing = next((item for item in queued if item.event_id == event.event_id), None)
     if existing is None:
         queued.append(event)
-    elif existing.was_encrypted and not event.was_encrypted:
-        queued[queued.index(existing)] = replace(
-            event,
-            generation=existing.generation,
-            sequence=existing.sequence,
-            is_live=existing.is_live,
-        )
 
 
 def load_recovery_state(

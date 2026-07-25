@@ -562,7 +562,11 @@ class MatrixStore:
                 PendingTimelineEvents.is_live,
                 PendingTimelineEvents.was_encrypted,
             ],
-            where=(PendingTimelineEvents.was_encrypted & ~EXCLUDED.was_encrypted),
+            where=(
+                (PendingTimelineEvents.generation == 0)
+                & PendingTimelineEvents.was_encrypted
+                & ~EXCLUDED.was_encrypted
+            ),
         ).execute()
 
     @use_database

@@ -597,7 +597,7 @@ class TestClass:
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
 
-    def test_recovery_event_upgrade_and_acknowledgement(self, sqlstore):
+    def test_pending_recovery_event_retains_encrypted_source(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
         encrypted = PendingTimelineEvent(
             TEST_ROOM,
@@ -625,16 +625,46 @@ class TestClass:
         gaps, events = sqlstore.load_sync_recovery()
         assert len(gaps) == 1
         assert len(events) == 1
+        assert events[0].was_encrypted
+        assert '"type":"m.room.encrypted"' in events[0].source_json
+
+    def test_completed_encrypted_event_allows_plaintext_upgrade(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$event",
+            '{"content":{},"event_id":"$event","sender":"@a:b",'
+            '"type":"m.room.encrypted"}',
+            False,
+            True,
+        )
+        decrypted = PendingTimelineEvent(
+            TEST_ROOM,
+            2,
+            0,
+            "$event",
+            '{"content":{"body":"clear","msgtype":"m.text"},'
+            '"event_id":"$event","sender":"@a:b","type":"m.room.message"}',
+            False,
+            False,
+        )
+        sqlstore.save_recovery("s2", set(), [gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
+        sqlstore.save_recovery("s3", set(), [next_gap], [decrypted], None)
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert len(gaps) == 2
+        assert len(events) == 1
+        assert events[0].generation == 2
         assert not events[0].was_encrypted
         assert '"body":"clear"' in events[0].source_json
 
-        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", False)
-        gaps, events = sqlstore.load_sync_recovery()
-        assert len(gaps) == 1
-        assert len(events) == 1
-        assert events[0].generation == 0
-
+        sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
         sqlstore.finish_recovery(TEST_ROOM, 1, None, False)
+        sqlstore.finish_recovery(TEST_ROOM, 2, None, False)
         gaps, events = sqlstore.load_sync_recovery()
         assert gaps == []
         assert len(events) == 1
