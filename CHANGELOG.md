@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Make limited-timeline recovery durable per room with monotonic transport tokens, held live rows, restart resumption when encrypted sync-token storage is active, cross-transport event-ID de-duplication, and one later decrypted replay.
+- Migrate the encrypted client store from schema v2 to schema v3 for recovery gaps and pending timeline events, and export `SyncRecoveryGaps` and `PendingTimelineEvents` from `nio.store`.
+
+### Bug Fixes
+
+- Preserve normal live callback exception propagation while recovered-history dispatch attempts every matching callback before acknowledgement.
+- Keep room sends fail closed while that room has an unresolved recovery lane.
+- Treat HTTP 408, HTTP 429, and server errors as retryable recovery failures while terminal client errors release held live rows.
+- Abandon ignored-bound and oversized `/messages` pages when their contents cannot prove a complete gap instead of inferring closure from one held live event.
+- Remove delivered event bodies from durable de-duplication markers while retaining the event ID and encrypted-state bit required for replay suppression.
+
 ## 0.29.0
 
 ### Upstream Sync
@@ -88,31 +103,18 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Add opt-in recovery of events dropped by limited sync timelines
-  (`AsyncClientConfig.backfill_limited_timelines`). When a room's sync
-  timeline arrives with `limited: true`, its `next_batch` remains the
-  monotonic transport cursor while a durable room-local obligation records
-  the private forward `/messages` cursor and held live timeline. Complete
-  rooms and ancillary callback surfaces continue once; only the affected
-  room waits. Recovery runs oldest first in fair, bounded slices, survives
-  process restart when sync-token storage is enabled, and never dispatches
-  pre-join history. A server that ignores the requested upper bound cannot
-  expose unknown future events, while reaching the requested target token
-  closes the slice without requiring a repeated live event. Event IDs
-  de-duplicate `/sync`, `/messages`, and sliding-sync overlap and allow one
-  encrypted event to replay after decryption. Recovery-only dispatch attempts
-  every matching callback before acknowledging the row; a hard kill can
-  replay at most the active row. File-backed correctness writes are serialized
-  and awaited to completion. Disabled behaviour remains identical to upstream
-  nio.
+- Add opt-in recovery of events dropped by limited sync timelines (`AsyncClientConfig.backfill_limited_timelines`).
+  When a room's sync timeline arrives with `limited: true`, the client pages `/messages` forwards from the token the sync continued from and dispatches the recovered gap through the normal event callbacks, oldest first, before the sync response's own events, decrypted like live events but never applied to room state.
+  Gaps spanning a client restart are recovered when resuming from a stored or explicit since token; freshly joined rooms are never backfilled past our own join.
+  Recovery dispatches only when the walk verifiably reaches the sync window; anything less (bounds, errors, stalls, the live edge) is discarded with a warning, so failure is always loud loss, never duplicates.
+  All backfill for one sync response shares a single time budget covering pagination and dispatch, including hanging callbacks.
+  Disabled by default; behaviour with the flag off is identical to upstream nio.
 
 ### Bug Fixes
 
-- Match sliding sync (simplified MSC4186) wire format to deployed servers:
-  `pos`/`timeout`/`set_presence` as query parameters, unstable endpoint by
-  default, `invite_state`/`unstable_expanded_timeline` response keys, and
-  per-room notification counts. Renames `SlidingSyncRoom.timeline_events`
-  to `timeline` (the wire name; nothing consumed the old attribute).
+- Match sliding sync (simplified MSC4186) wire format to deployed servers: `pos`/`timeout`/`set_presence` as query parameters, unstable endpoint by default, `invite_state`/`unstable_expanded_timeline` response keys, and per-room notification counts.
+  Rename `SlidingSyncRoom.timeline_events` to `timeline`, matching the wire field name used by both the MSC text and deployed servers.
+  `Api.sliding_sync`, `AsyncClient.sliding_sync` and `HttpClient.sliding_sync` now default to `unstable=True`.
 
 ## 0.27.3
 

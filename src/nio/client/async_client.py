@@ -90,7 +90,7 @@ from ..events import (
     RoomMemberEvent,
     ToDeviceEvent,
 )
-from ..exceptions import LocalProtocolError, TransferCancelledError
+from ..exceptions import LocalProtocolError, SendRetryError, TransferCancelledError
 from ..monitors import TransferMonitor
 from ..responses import (
     ChangePasswordError,
@@ -362,7 +362,7 @@ class AsyncClientConfig(ClientConfig):
             streams when saving files to disk.
             Defaults to 64 KiB.
 
-        backfill_limited_timelines (bool): Recover limited timelines durably.
+        backfill_limited_timelines (bool): Recover limited timelines with room-local durable ordering; live callback exceptions propagate normally, recovered-history callbacks fan out before acknowledgement, restart persistence requires encryption and sync-token storage, and disabled mode preserves upstream behavior.
         backfill_max_pages (int): Maximum pages per room per pump.
         backfill_max_events (int): Maximum events per room per pump.
         backfill_page_size (int): Events requested per page.
@@ -763,6 +763,8 @@ class AsyncClient(Client):
             try:
                 await callback.async_execute(event, room)
             except Exception:  # noqa: PERF203
+                if is_live:
+                    raise
                 logger.exception("Timeline event callback failed")
         return event
 
@@ -2742,6 +2744,9 @@ class AsyncClient(Client):
         Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
+
+        if self._recovery.gaps.get(room_id):
+            raise SendRetryError("Room timeline recovery is still pending.")
 
         if self.olm:
             try:

@@ -623,9 +623,9 @@ class MatrixStore:
                 return
             pending.id = None
             pending.generation = 0
-            pending.is_live = False
+            pending.source_json = ""
+            pending.is_live = pending.was_completed = False
             pending.was_encrypted = was_encrypted
-            pending.was_completed = False
             pending.save(force_insert=True)
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)

@@ -28,6 +28,7 @@ from nio import (
     RoomMessageText,
     RoomNameEvent,
     Rooms,
+    SendRetryError,
     SlidingSyncResponse,
     SyncResponse,
     Timeline,
@@ -608,6 +609,39 @@ class TestRoomLocalRecovery:
         assert seen == ["$old"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
 
+    async def test_request_timeout_keeps_gap_pending(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=408)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+
+        with pytest.raises(SendRetryError, match="recovery is still pending"):
+            await client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "secret", "msgtype": "m.text"},
+            )
+
     async def test_repeated_end_token_abandons_gap_and_releases_live(
         self, client, aioresponse
     ):
@@ -803,7 +837,7 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
 
-    async def test_live_boundary_closes_when_server_ignores_to(
+    async def test_ignored_to_live_boundary_abandons_unverifiable_page(
         self, client, aioresponse
     ):
         seen = record_events(client)
@@ -821,9 +855,10 @@ class TestRoomLocalRecovery:
             MESSAGES_URL,
             payload=messages(
                 [
-                    text_event("$gap", 2),
+                    text_event("$gap1", 2),
                     text_event("$held", 3),
-                    text_event("$future", 4),
+                    text_event("$gap2", 4),
+                    text_event("$future", 5),
                 ],
                 None,
             ),
@@ -838,7 +873,9 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$held"]
+        assert seen == ["$old", "$held"]
+        assert "$gap1" not in seen
+        assert "$gap2" not in seen
         assert "$future" not in seen
         assert not client._recovery.gaps
 
@@ -1625,7 +1662,8 @@ class TestRoomLocalRecovery:
 
         async def fail(_room, event):
             calls.append(f"fail:{event.event_id}")
-            raise RuntimeError("callback failed")
+            if event.event_id == "$gap":
+                raise RuntimeError("callback failed")
 
         async def after(_room, event):
             calls.append(f"after:{event.event_id}")
@@ -2422,7 +2460,7 @@ class TestRoomLocalRecovery:
         await client.receive_response(reset)
         assert seen == ["$old", "$held", "invite"]
 
-    async def test_sliding_callback_failure_is_terminal(self, client):
+    async def test_sliding_live_callback_failure_propagates(self, client):
         calls: list[str] = []
 
         async def first(_room, event):
@@ -2453,15 +2491,17 @@ class TestRoomLocalRecovery:
             }
         )
         assert isinstance(sliding, SlidingSyncResponse)
-        await client.receive_response(sliding)
-        await client.receive_response(sliding)
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(sliding)
         assert calls == [
             "first:$a",
             "failing:$a",
             "last:$a",
             "first:$b",
             "failing:$b",
-            "last:$b",
+        ]
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$b"
         ]
 
     async def test_sliding_sync_dedup_stays_bounded(self, client):

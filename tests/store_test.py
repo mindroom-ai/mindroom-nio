@@ -669,6 +669,7 @@ class TestClass:
         assert gaps == []
         assert len(events) == 1
         assert events[0].generation == 0
+        assert events[0].source_json == ""
 
     def test_completed_encrypted_event_allows_pending_retry(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
@@ -687,6 +688,7 @@ class TestClass:
         sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
         _, events = sqlstore.load_sync_recovery()
         assert events[0].generation == 0
+        assert events[0].source_json == ""
         assert not events[0].was_completed
         assert not events[0].was_encrypted
 

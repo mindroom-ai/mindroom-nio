@@ -100,7 +100,6 @@ class RecoveryState:
     )
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
     room_offset: int = 0
-    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
@@ -388,8 +387,7 @@ async def _commit(
 ) -> None:
     if store:
         assert operation
-        async with state.write_lock:
-            operation(*args)
+        operation(*args)
     apply()
 
 
@@ -505,7 +503,7 @@ async def _collect_slice(
         if not isinstance(response, RoomMessagesResponse):
             if isinstance(response, RoomMessagesError) and response.transport_response:
                 status = response.transport_response.status
-                if status == 429 or status >= 500:
+                if status in (408, 429) or status >= 500:
                     break
             logger.error("Abandoning failed gap in %s", gap.room_id)
             gap = replace(gap, cursor_token=None)
@@ -559,9 +557,7 @@ async def _collect_slice(
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        if reached_live:
-            next_cursor = None
-        elif truncated or response.end in (None, cursor):
+        if reached_live or truncated or response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
@@ -585,8 +581,6 @@ async def _collect_slice(
         gap = updated
         recovered_count += len(recovered)
         clear_recovered = False
-        if next_cursor is None:
-            break
         cursor = next_cursor
 
     return gap
@@ -625,6 +619,8 @@ async def _drain_gap(
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
             return
         except Exception:
+            if pending.is_live:
+                raise
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
         await _finish(
