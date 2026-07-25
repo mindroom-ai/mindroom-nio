@@ -137,6 +137,11 @@ class RecoveryState:
     max_held_events: int = 200
 
 
+def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+    """Whether this event is our own transition into the room."""
+    return _is_own_join(event, user_id)
+
+
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
     return bool(
         user_id

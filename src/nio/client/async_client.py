@@ -257,6 +257,7 @@ from .sync_recovery import (
     RecoveryOptions,
     RecoveryState,
     _LiveCallbackError,
+    is_own_join,
     load_recovery_state,
     merge_recovery_plans,
     persist_response_plan,
@@ -404,7 +405,10 @@ class AsyncClientConfig(ClientConfig):
             written to the store, which is what lets a restarted client
             finish a walk its downtime interrupted. None (default) follows
             store_sync_tokens, matching the behaviour before this option
-            existed. Set it to True to persist recovery state while keeping
+            existed. Turning it off leaves rows an earlier run wrote in
+            place rather than deleting them, so switching it back on can
+            resume from state that has gone stale in the meantime.
+            Set it to True to persist recovery state while keeping
             ownership of the sync token: nio then never reads or writes
             next_batch itself, which matters for clients that decide for
             themselves when a token may be advanced. Recovery then resumes
@@ -556,6 +560,8 @@ class AsyncClient(Client):
         # server sent a snapshot, not that the snapshot postdates the
         # membership change.
         self._sliding_reset_rooms: dict[str, int] = {}
+        # The oldest request epoch a room still accepts a token from.
+        self._sliding_room_epoch_floor: dict[str, int] = {}
         self._sliding_reset_epoch = 0
         self._sliding_request_epoch: ContextVar[int | None] = ContextVar(
             f"nio_sliding_request_epoch_{id(self)}", default=None
@@ -1224,6 +1230,18 @@ class AsyncClient(Client):
         """
         if not (room.limited or room.initial) or not room.prev_batch:
             return None
+        if any(
+            is_own_join(event, self.user_id)
+            for event in (*room.required_state, *room.timeline)
+            if not isinstance(event, SlidingSyncStateStub)
+        ):
+            # We joined inside this window, so anything the held token
+            # points at belongs to a membership that has since ended —
+            # possibly one that ended while this client was not running.
+            self._reset_sliding_room(room_id)
+            if self.store:
+                self.store.forget_sliding_window_token(room_id)
+            return None
         if self._sliding_sync_room_is_invite(room) or room.membership in (
             "leave",
             "ban",
@@ -1263,11 +1281,17 @@ class AsyncClient(Client):
     def _sliding_token_predates_reset(
         self, room_id: str, room: SlidingSyncRoom
     ) -> bool:
-        """Whether this response's request predates the room's last reset."""
+        """Whether this response's request predates what the room accepted."""
+        request_epoch = self._sliding_request_epoch.get()
+        floor = self._sliding_room_epoch_floor.get(room_id)
+        if request_epoch is not None and floor is not None:
+            # Responses can finish out of order, so the floor rises with
+            # every reset and every token taken; anything older than it
+            # describes a state this room has already moved past.
+            return request_epoch < floor
         reset_epoch = self._sliding_reset_rooms.get(room_id)
         if reset_epoch is None:
             return False
-        request_epoch = self._sliding_request_epoch.get()
         if request_epoch is None:
             # A response handed to receive_response() directly carries no
             # request of ours to date it by, so fall back to the weaker
@@ -1281,6 +1305,7 @@ class AsyncClient(Client):
         self._sliding_room_prev_batch.pop(room_id, None)
         self._sliding_reset_epoch += 1
         self._sliding_reset_rooms[room_id] = self._sliding_reset_epoch
+        self._sliding_room_epoch_floor[room_id] = self._sliding_reset_epoch
 
     def _apply_sliding_prev_batches(
         self, recorded: Mapping[str, str], forgotten: Iterable[str]
@@ -1288,9 +1313,14 @@ class AsyncClient(Client):
         """Adopt baselines whose durable write already succeeded."""
         for room_id in forgotten:
             self._reset_sliding_room(room_id)
+        request_epoch = self._sliding_request_epoch.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
             self._sliding_reset_rooms.pop(room_id, None)
+            if request_epoch is not None:
+                self._sliding_room_epoch_floor[room_id] = max(
+                    self._sliding_room_epoch_floor.get(room_id, 0), request_epoch
+                )
 
     def _forget_sliding_window_token(self, room_id: str) -> None:
         """Drop a room's walk baseline once we are no longer in it.
@@ -1730,6 +1760,11 @@ class AsyncClient(Client):
         max_timeouts = self.config.max_timeouts
 
         while True:
+            if self._sliding_request_epoch.get() is not None:
+                # A retry issued after a membership reset is as current as
+                # any other request; dating it by the first attempt would
+                # throw away a baseline that is in fact valid.
+                self._sliding_request_epoch.set(self._sliding_reset_epoch)
             if data_provider:
                 # mypy expects an "Awaitable[Any]" but data_provider is a
                 # method generated during runtime that may or may not be
