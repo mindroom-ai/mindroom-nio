@@ -28,11 +28,17 @@ logger = logging.getLogger(__name__)
 
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
+PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
 DispatchEvent = Callable[
-    [str, Event | BadEventType | EphemeralEvent | AccountDataEvent, bool, bool],
+    [
+        str,
+        Event | BadEventType | EphemeralEvent | AccountDataEvent,
+        bool,
+        bool,
+        PendingEventKind,
+    ],
     Awaitable[Event | BadEventType | EphemeralEvent | AccountDataEvent | None],
 ]
-PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
 
 
 class _LiveCallbackError(Exception):
@@ -618,7 +624,7 @@ async def _collect_slice(
                 continue
             if event_id in live_ids and response.end != gap.target_token:
                 reached_window = True
-                continue
+                break
             if _is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
@@ -704,7 +710,11 @@ async def _drain_gap(
             continue
         try:
             dispatch = dispatch_event(
-                gap.room_id, event, pending.is_live, pending.was_completed
+                gap.room_id,
+                event,
+                pending.is_live,
+                pending.was_completed,
+                pending.kind,
             )
             delivered = (
                 await dispatch

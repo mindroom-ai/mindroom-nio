@@ -1123,7 +1123,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_live_overlap_classifies_complete_server_page(
+    async def test_live_overlap_defers_events_after_held_window(
         self, tempdir, aioresponse
     ):
         client = AsyncClient(
@@ -1162,8 +1162,21 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$overflow", "$held"]
+        assert seen == ["$gap", "$held"]
         assert not client._recovery.gaps
+        await client.receive_response(
+            sync_response(
+                "s3",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$overflow", 3)],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+        assert seen == ["$gap", "$held", "$overflow"]
         await client.close()
 
     @pytest.mark.parametrize("second_protocol", ["classic", "sliding"])
@@ -2251,7 +2264,9 @@ class TestRoomLocalRecovery:
 
         first.add_presence_callback(on_presence, PresenceEvent)
         first.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
-        first.add_room_account_data_callback(on_room_surface, FullyReadEvent)
+        first.add_room_account_data_callback(
+            on_room_surface, (FullyReadEvent, UnknownBadEvent)
+        )
         first.add_response_callback(on_response, SyncResponse)
         await first.receive_response(
             sync_response(
@@ -2279,7 +2294,8 @@ class TestRoomLocalRecovery:
             {"content": {"user_ids": [OWN_ID]}, "type": "m.typing"}
         ]
         limited_payload["rooms"]["join"][ROOM_A]["account_data"]["events"] = [
-            {"content": {"event_id": "$held"}, "type": "m.fully_read"}
+            {"content": {"event_id": "$held"}, "type": "m.fully_read"},
+            {"type": "m.tag"},
         ]
         limited = SyncResponse.from_dict(limited_payload)
         assert isinstance(limited, SyncResponse)
@@ -2303,7 +2319,9 @@ class TestRoomLocalRecovery:
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         restarted_seen = record_events(restarted)
         restarted.add_ephemeral_callback(on_room_surface, TypingNoticeEvent)
-        restarted.add_room_account_data_callback(on_room_surface, FullyReadEvent)
+        restarted.add_room_account_data_callback(
+            on_room_surface, (FullyReadEvent, UnknownBadEvent)
+        )
         assert restarted.loaded_sync_token == "s2"
         assert restarted._recovery.gaps.get(ROOM_A)
         aioresponse.get(
@@ -2324,7 +2342,11 @@ class TestRoomLocalRecovery:
             )
         )
         assert restarted_seen == ["$gap", "$gap2", "$held", "$later"]
-        assert room_surface_seen == ["TypingNoticeEvent", "FullyReadEvent"]
+        assert room_surface_seen == [
+            "TypingNoticeEvent",
+            "FullyReadEvent",
+            "UnknownBadEvent",
+        ]
         assert presence_seen == ["@sender:example.org"]
         assert response_seen == ["s2"]
         assert not restarted._recovery.gaps

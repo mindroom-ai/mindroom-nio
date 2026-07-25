@@ -103,7 +103,7 @@ async def test_callback_crash_replays_only_active_row():
     calls: list[str] = []
     failed = False
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         nonlocal failed
         calls.append(value.event_id)
         if value.event_id == "$two" and not failed:
@@ -166,7 +166,7 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
         return value
 
@@ -205,7 +205,7 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
             ROOM_B,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
 
     kwargs = {
@@ -244,7 +244,7 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
             ROOM_B,
         )
 
-    async def dispatch(room_id, value, _is_live, _was_completed):
+    async def dispatch(room_id, value, _is_live, _was_completed, _kind):
         if room_id == ROOM:
             await asyncio.Event().wait()
         seen.append(value.event_id)
@@ -310,7 +310,7 @@ async def test_repeated_target_cursor_abandons_unverifiable_page():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
 
     await pump_recovery(
@@ -359,7 +359,7 @@ async def test_hanging_callback_leaves_active_row_pending():
         events={(ROOM, 1): [value]},
     )
 
-    async def dispatch(_room, _event, _is_live, _was_completed):
+    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
         await asyncio.Event().wait()
 
     async def unused_fetch(*args):
@@ -392,7 +392,7 @@ async def test_default_store_commit_stays_on_event_loop_thread():
 
 
 @pytest.mark.asyncio
-async def test_repeated_end_overlap_classifies_complete_interleaved_page():
+async def test_repeated_end_overlap_does_not_recover_suffix():
     present_one = PendingTimelineEvent.from_event(
         ROOM, 1, 0, event("$present-one", 2), True
     )
@@ -421,7 +421,7 @@ async def test_repeated_end_overlap_classifies_complete_interleaved_page():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
         return value
 
@@ -433,12 +433,7 @@ async def test_repeated_end_overlap_classifies_complete_interleaved_page():
         dispatch_event=dispatch,
         store=None,
     )
-    assert seen == [
-        "$gap-two",
-        "$gap-one",
-        "$present-one",
-        "$present-two",
-    ]
+    assert seen == ["$present-one", "$present-two"]
     assert not state.gaps
 
 
@@ -465,7 +460,7 @@ async def test_room_cap_abandons_existing_unverified_prefix():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
         return value
 
@@ -535,7 +530,7 @@ async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
         return value
 
@@ -580,7 +575,7 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed):
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
         seen.append(value.event_id)
         return value
 

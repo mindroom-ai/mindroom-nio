@@ -249,6 +249,7 @@ from .base_client import (
     store_loaded,
 )
 from .sync_recovery import (
+    PendingEventKind,
     RecoveryOptions,
     RecoveryState,
     _LiveCallbackError,
@@ -743,26 +744,33 @@ class AsyncClient(Client):
         event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
         is_live: bool,
         was_completed: bool,
+        kind: PendingEventKind,
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent | None:
         room = self.rooms.get(room_id)
         if room is None:
             room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
             self.rooms[room_id] = room
 
-        if isinstance(event, EphemeralEvent):
+        if kind == "ephemeral":
+            if not isinstance(event, EphemeralEvent):
+                raise ValueError("Invalid pending ephemeral event")
             room.handle_ephemeral_event(event)
             try:
                 await self._on_ephemeral(event, room)
             except Exception as error:
                 raise _LiveCallbackError(error, False) from error
             return event
-        if isinstance(event, AccountDataEvent):
+        if kind == "account_data":
+            if not isinstance(event, AccountDataEvent | BadEventType):
+                raise ValueError("Invalid pending account data event")
             room.handle_account_data(event)
             try:
                 await self._on_room_account_data(event, room)
             except Exception as error:
                 raise _LiveCallbackError(error, False) from error
             return event
+        if not isinstance(event, Event | BadEventType):
+            raise ValueError("Invalid pending timeline event")
         if is_live:
             decrypted = self._handle_timeline_event(
                 event, room_id, room, self.encrypted_rooms
@@ -880,7 +888,9 @@ class AsyncClient(Client):
         for callback in self.ephemeral_callbacks:
             await callback.async_execute(event, room)
 
-    async def _on_room_account_data(self, event: AccountDataEvent, room: MatrixRoom):
+    async def _on_room_account_data(
+        self, event: AccountDataEvent | BadEventType, room: MatrixRoom
+    ):
         for callback in self.room_account_data_callbacks:
             await callback.async_execute(event, room)
 
