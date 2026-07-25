@@ -503,8 +503,10 @@ async def _collect_slice(
             break
         pages += 1
         if not isinstance(response, RoomMessagesResponse):
-            if isinstance(response, RoomMessagesError) and response.status_code is None:
-                break
+            if isinstance(response, RoomMessagesError) and response.transport_response:
+                status = response.transport_response.status
+                if status == 429 or status >= 500:
+                    break
             logger.error("Abandoning failed gap in %s", gap.room_id)
             gap = replace(gap, cursor_token=None)
             await persist_response_plan(
@@ -559,15 +561,13 @@ async def _collect_slice(
 
         if reached_live:
             next_cursor = None
-        elif response.end is None or response.end == cursor:
+        elif truncated or response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
             next_cursor = None
         elif response.end == gap.target_token:
             next_cursor = None
-        elif truncated:
-            break
         else:
             next_cursor = response.end
 

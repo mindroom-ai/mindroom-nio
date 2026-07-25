@@ -670,6 +670,7 @@ class AsyncClient(Client):
 
     async def _handle_invited_rooms(self, response: SyncResponse) -> None:
         for room_id, info in response.rooms.invite.items():
+            await self._pump_sync_recovery(room_id)
             room = self._get_invited_room(room_id)
 
             for event in info.invite_state:
@@ -688,8 +689,6 @@ class AsyncClient(Client):
                 room_id, room, join_info.timeline.events, encrypted_rooms
             )
 
-        for room_id, join_info in response.rooms.join.items():
-            room = self.rooms[room_id]
             await self._pump_sync_recovery(room_id)
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
@@ -1006,6 +1005,7 @@ class AsyncClient(Client):
     async def _handle_sliding_sync_invited_room(
         self, room_id: str, sliding_room: SlidingSyncRoom
     ) -> None:
+        await self._pump_sync_recovery(room_id)
         room = self._get_invited_room(room_id)
 
         for event in sliding_room.stripped_state:

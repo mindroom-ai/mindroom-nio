@@ -18,6 +18,7 @@ from nio import (
     Event,
     FullyReadEvent,
     InviteInfo,
+    InviteNameEvent,
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
@@ -288,6 +289,39 @@ class TestRoomLocalRecovery:
             )
         assert client.next_batch == "s1"
         assert client.store.load_sync_token() == "s1"
+        await client.close()
+
+    async def test_disabled_preserves_upstream_cross_room_order(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = []
+
+        async def record(room, event):
+            seen.append((room.room_id, type(event).__name__))
+
+        client.add_event_callback(record, RoomMessageText)
+        client.add_ephemeral_callback(record, TypingNoticeEvent)
+        rooms = {
+            ROOM_A: room_info([text_event("$a", 1)], limited=False, prev_batch="a"),
+            ROOM_B: room_info(
+                [text_event("$b", 2, ROOM_B)], limited=False, prev_batch="b"
+            ),
+        }
+        for info in rooms.values():
+            info.ephemeral.append(TypingNoticeEvent([OWN_ID]))
+        await client.receive_response(sync_response("s1", rooms))
+        assert seen == [
+            (ROOM_A, "RoomMessageText"),
+            (ROOM_A, "TypingNoticeEvent"),
+            (ROOM_B, "RoomMessageText"),
+            (ROOM_B, "TypingNoticeEvent"),
+        ]
         await client.close()
 
     async def test_ordinary_sync_ignores_recovery_deadline(self, tempdir):
@@ -808,7 +842,7 @@ class TestRoomLocalRecovery:
         assert "$future" not in seen
         assert not client._recovery.gaps
 
-    async def test_messages_error_abandons_gap_and_releases_live(
+    async def test_non_json_messages_4xx_abandons_gap_and_releases_live(
         self, client, aioresponse
     ):
         seen = record_events(client)
@@ -822,11 +856,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        aioresponse.get(
-            MESSAGES_URL,
-            status=400,
-            payload={"errcode": "M_UNKNOWN", "error": "no history"},
-        )
+        aioresponse.get(MESSAGES_URL, status=403, body="forbidden")
         await client.receive_response(
             sync_response(
                 "s2",
@@ -839,6 +869,65 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
+
+    async def test_oversized_page_abandons_durably(self, tempdir, aioresponse):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_events=1,
+            backfill_page_size=1,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$overflow", 3)], "more"
+            ),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert not restarted._recovery.gaps
+        assert list(restarted._recovery.completed[ROOM_A]) == ["$old", "$held"]
+        await restarted.close()
 
     async def test_target_page_recovers_concurrent_dag_branches(
         self, client, aioresponse
@@ -2268,6 +2357,70 @@ class TestRoomLocalRecovery:
             ("$held", 0),
         ]
         await client.close()
+
+    @pytest.mark.parametrize("sliding", [False, True])
+    async def test_invite_state_waits_for_preserved_live(
+        self, client, aioresponse, sliding
+    ):
+        seen = []
+
+        async def record(_room, event):
+            seen.append(
+                event.event_id if isinstance(event, RoomMessageText) else "invite"
+            )
+
+        client.add_event_callback(record, (RoomMessageText, InviteNameEvent))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        invite = InviteNameEvent.from_dict(
+            {
+                "content": {"name": "Invite"},
+                "sender": "@sender:example.org",
+                "state_key": "",
+                "type": "m.room.name",
+            }
+        )
+        assert isinstance(invite, InviteNameEvent)
+        if sliding:
+            reset = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "slide1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "invite",
+                            "stripped_state": [invite.source],
+                            "timeline": [],
+                        }
+                    },
+                }
+            )
+            assert isinstance(reset, SlidingSyncResponse)
+        else:
+            reset = sync_response("s3", {}, invited={ROOM_A: InviteInfo([invite])})
+        await client.receive_response(reset)
+        assert seen == ["$old", "$held", "invite"]
 
     async def test_sliding_callback_failure_is_terminal(self, client):
         calls: list[str] = []
