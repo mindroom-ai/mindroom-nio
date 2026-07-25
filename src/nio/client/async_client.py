@@ -25,6 +25,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Mapping,
     MutableSequence,
     Sequence,
 )
@@ -549,6 +550,10 @@ class AsyncClient(Client):
         # first limited window after it cannot be recovered.
         self._sliding_room_prev_batch: dict[str, str] = {}
 
+        # Rooms whose membership reset since their last window: a token
+        # from a response that crossed the reset must not be adopted.
+        self._sliding_reset_rooms: set[str] = set()
+
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
         self._sliding_sync_recovery_scope = uuid4().hex
@@ -989,10 +994,17 @@ class AsyncClient(Client):
                             else None
                         ),
                         plan=plan,
+                        # A membership this transport saw end invalidates
+                        # the sliding baseline just as much: a rejoin must
+                        # not walk from a token taken under the old one.
+                        forgotten_rooms=reset_rooms,
                     )
                 except BaseException:
                     self.next_batch = previous_batch
                     raise
+                for room_id in reset_rooms:
+                    self._sliding_room_prev_batch.pop(room_id, None)
+                    self._sliding_reset_rooms.add(room_id)
             if self.config.store_sync_tokens and self.store:
                 self.loaded_sync_token = response.next_batch
             for room_id, join_info in response.rooms.join.items():
@@ -1089,7 +1101,7 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
-                recorded, forgotten = self._record_sliding_prev_batches(response)
+                recorded, forgotten = self._plan_sliding_prev_batches(response)
                 persist_response_plan(
                     self._recovery,
                     self._recovery_store,
@@ -1098,6 +1110,10 @@ class AsyncClient(Client):
                     window_tokens=recorded,
                     forgotten_rooms=forgotten,
                 )
+                # Only once the write committed: a rolled back transaction
+                # must not leave memory pointing past a gap the store never
+                # recorded.
+                self._apply_sliding_prev_batches(recorded, forgotten)
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
         if self.config.backfill_limited_timelines:
@@ -1204,10 +1220,10 @@ class AsyncClient(Client):
             return None
         return self._sliding_room_prev_batch.get(room_id)
 
-    def _record_sliding_prev_batches(
+    def _plan_sliding_prev_batches(
         self, response: SlidingSyncResponse
     ) -> tuple[dict[str, str], list[str]]:
-        """Remember each room's window token for the next response's walk.
+        """Work out each room's next walk baseline, without applying it.
 
         Returns the tokens to store and the rooms whose token is gone, so
         the caller can commit them alongside the recovery plan they belong
@@ -1223,12 +1239,26 @@ class AsyncClient(Client):
             ):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
-                self._sliding_room_prev_batch.pop(room_id, None)
                 forgotten.append(room_id)
+            elif room_id in self._sliding_reset_rooms and not room.initial:
+                # A response that left the server before the membership
+                # reset can arrive after it. Only a fresh snapshot proves
+                # the token belongs to the membership we hold now.
+                continue
             elif room.prev_batch:
-                self._sliding_room_prev_batch[room_id] = room.prev_batch
                 recorded[room_id] = room.prev_batch
         return recorded, forgotten
+
+    def _apply_sliding_prev_batches(
+        self, recorded: Mapping[str, str], forgotten: Iterable[str]
+    ) -> None:
+        """Adopt baselines whose durable write already succeeded."""
+        for room_id in forgotten:
+            self._sliding_room_prev_batch.pop(room_id, None)
+            self._sliding_reset_rooms.add(room_id)
+        for room_id, token in recorded.items():
+            self._sliding_room_prev_batch[room_id] = token
+            self._sliding_reset_rooms.discard(room_id)
 
     def _forget_sliding_window_token(self, room_id: str) -> None:
         """Drop a room's walk baseline once we are no longer in it.
@@ -1237,6 +1267,9 @@ class AsyncClient(Client):
         later rejoin would walk history from before we left.
         """
         self._sliding_room_prev_batch.pop(room_id, None)
+        # Armed until a fresh snapshot arrives, so a response that crossed
+        # the membership change cannot write the old baseline back.
+        self._sliding_reset_rooms.add(room_id)
         store = self._recovery_store
         if store:
             store.forget_sliding_window_token(room_id)
