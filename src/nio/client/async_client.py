@@ -34,9 +34,12 @@ from dataclasses import dataclass
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from ..store.database import MatrixStore
 
 import aiofiles
 from aiofiles.threadpool.binary import AsyncBufferedReader
@@ -385,10 +388,9 @@ class AsyncClientConfig(ClientConfig):
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
             Both transports recover: /v3/sync walks from the token the sync
             continued from, Simplified Sliding Sync between consecutive
-            window tokens. The sliding baseline is per-process, so the first
-            limited or initial window after a client restart is not
-            recovered, while /v3/sync recovers across restarts through its
-            stored sync token.
+            window tokens. Both recover across a client restart when
+            recovery state is persisted, which needs a store and therefore
+            encryption enabled; see backfill_persist_recovery.
         backfill_max_pages (int): Maximum pages per room per pump.
         backfill_max_events (int): Maximum durable recovered-history events per
             room across every open generation, and separately the maximum live
@@ -396,6 +398,17 @@ class AsyncClientConfig(ClientConfig):
             Exceeding either bound abandons unverified history.
         backfill_page_size (int): Events requested per page.
         backfill_timeout (float): Seconds available to one recovery pump.
+        backfill_persist_recovery (bool | None): Whether recovery state —
+            gaps, pending timeline events and sliding window tokens — is
+            written to the store, which is what lets a restarted client
+            finish a walk its downtime interrupted. None (default) follows
+            store_sync_tokens, matching the behaviour before this option
+            existed. Set it to True to persist recovery state while keeping
+            ownership of the sync token: nio then never reads or writes
+            next_batch itself, which matters for clients that decide for
+            themselves when a token may be advanced. Recovery then resumes
+            relative to whatever token the caller restores, so a caller that
+            rewinds its token replays the window that follows it.
         backfill_sliding_seed_rooms (int): How many rooms the first request
             of a Simplified Sliding Sync connection widens its list ranges
             to, so that rooms outside the configured window still hand back
@@ -415,6 +428,7 @@ class AsyncClientConfig(ClientConfig):
     backfill_max_events: int = 200
     backfill_page_size: int = 50
     backfill_timeout: float = 30.0
+    backfill_persist_recovery: bool | None = None
     backfill_sliding_seed_rooms: int = 1000
 
 
@@ -541,17 +555,25 @@ class AsyncClient(Client):
 
         super().__init__(user, device_id, store_path, self.config)
 
+    @property
+    def _recovery_store(self) -> MatrixStore | None:
+        """The store to persist recovery state in, if that is enabled."""
+        if not (self.config.backfill_limited_timelines and self.store):
+            return None
+        persist = self.config.backfill_persist_recovery
+        if persist is None:
+            persist = self.config.store_sync_tokens
+        return self.store if persist else None
+
     def load_store(self):
         super().load_store()
-        if (
-            self.config.backfill_limited_timelines
-            and self.config.store_sync_tokens
-            and self.store
-        ):
+        store = self._recovery_store
+        if store:
             load_recovery_state(
                 self._recovery,
-                *self.store.load_sync_recovery(),
+                *store.load_sync_recovery(),
             )
+            self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
 
     def add_response_callback(
         self,
@@ -835,7 +857,7 @@ class AsyncClient(Client):
             ),
             fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
-            store=(self.store if self.config.store_sync_tokens else None),
+            store=self._recovery_store,
             ready_room_id=ready_room_id,
         )
 
@@ -956,8 +978,16 @@ class AsyncClient(Client):
                 try:
                     persist_response_plan(
                         self._recovery,
-                        (self.store if self.config.store_sync_tokens else None),
-                        token=response.next_batch,
+                        self._recovery_store,
+                        # Only the owner of the sync token writes it. A
+                        # client persisting recovery state while keeping
+                        # the token to itself gets the rows without nio
+                        # recording a position it does not control.
+                        token=(
+                            response.next_batch
+                            if self.config.store_sync_tokens
+                            else None
+                        ),
                         plan=plan,
                     )
                 except BaseException:
@@ -1061,7 +1091,7 @@ class AsyncClient(Client):
                 )
                 persist_response_plan(
                     self._recovery,
-                    self.store if self.config.store_sync_tokens else None,
+                    self._recovery_store,
                     token=None,
                     plan=merge_recovery_plans(plans),
                 )
@@ -1153,9 +1183,11 @@ class AsyncClient(Client):
         has no gap; a room seen for the first time this run has no token to
         walk from.
 
-        The token lives in memory, so a connection reset is covered but a
-        process restart is not: the first discontinuity after one has no
-        baseline and its events are not recovered.
+        The token is persisted when recovery persistence is enabled (see
+        backfill_persist_recovery), so both a connection reset and a client
+        restart are covered. Without a store — encryption disabled, or
+        persistence off — it lives only in memory and the first
+        discontinuity after a restart has no baseline to walk from.
         """
         if not (room.limited or room.initial) or not room.prev_batch:
             return None
@@ -1168,6 +1200,8 @@ class AsyncClient(Client):
 
     def _record_sliding_prev_batches(self, response: SlidingSyncResponse) -> None:
         """Remember each room's window token for the next response's walk."""
+        recorded: dict[str, str] = {}
+        forgotten: list[str] = []
         for room_id, room in response.rooms.items():
             if self._sliding_sync_room_is_invite(room) or room.membership in (
                 "leave",
@@ -1176,8 +1210,16 @@ class AsyncClient(Client):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
                 self._sliding_room_prev_batch.pop(room_id, None)
+                forgotten.append(room_id)
             elif room.prev_batch:
                 self._sliding_room_prev_batch[room_id] = room.prev_batch
+                recorded[room_id] = room.prev_batch
+
+        if (recorded or forgotten) and self._recovery_store:
+            # Persisted so a restarted client can still walk the gap its
+            # downtime left behind, the way /v3/sync does from its stored
+            # sync token.
+            self._recovery_store.save_sliding_window_tokens(recorded, forgotten)
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:

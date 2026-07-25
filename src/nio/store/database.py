@@ -49,12 +49,15 @@ from . import (
     OlmSessions,
     OutgoingKeyRequests,
     PendingTimelineEvents,
+    SlidingWindowTokens,
     StoreVersion,
     SyncRecoveryGaps,
     SyncTokens,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
     from ..client.sync_recovery import (
         PendingEventKind,
         PendingTimelineEvent,
@@ -129,8 +132,9 @@ class MatrixStore:
         SyncTokens,
         SyncRecoveryGaps,
         PendingTimelineEvents,
+        SlidingWindowTokens,
     ]
-    store_version = 3
+    store_version = 4
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -167,6 +171,11 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
 
+    def upgrade_to_v4(self):
+        with self.database.bind_ctx(self.models):
+            self.database.create_tables([SlidingWindowTokens])
+        self._update_version(4)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -181,6 +190,9 @@ class MatrixStore:
             store_version = 2
         if store_version == 2:
             self.upgrade_to_v3()
+            store_version = 3
+        if store_version == 3:
+            self.upgrade_to_v4()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -763,6 +775,42 @@ class MatrixStore:
                 )
             )
         return gaps, events
+
+    @use_database
+    def load_sliding_window_tokens(self) -> dict[str, str]:
+        """Load each room's last sliding window token."""
+        account = self._get_account()
+        if not account:
+            return {}
+        return {
+            row.room_id: row.token
+            for row in SlidingWindowTokens.select().where(
+                SlidingWindowTokens.account == account
+            )
+        }
+
+    @use_database_atomic
+    def save_sliding_window_tokens(
+        self, tokens: Mapping[str, str], forgotten: Iterable[str] = ()
+    ) -> None:
+        """Persist window tokens, dropping the rooms that no longer have one."""
+        account = self._get_account()
+        assert account
+
+        forgotten = list(forgotten)
+        if forgotten:
+            SlidingWindowTokens.delete().where(
+                SlidingWindowTokens.account == account,
+                SlidingWindowTokens.room_id.in_(forgotten),
+            ).execute()
+        if not tokens:
+            return
+        SlidingWindowTokens.replace_many(
+            [
+                {"account": account, "room_id": room_id, "token": token}
+                for room_id, token in tokens.items()
+            ]
+        ).execute()
 
     @use_database_atomic
     def finish_recovery(

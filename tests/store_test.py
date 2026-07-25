@@ -27,6 +27,7 @@ from nio.store import (
     SqliteMemoryStore,
     SqliteStore,
     PendingTimelineEvents,
+    SlidingWindowTokens,
     SyncRecoveryGaps,
 )
 
@@ -535,7 +536,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 3
+        assert version == 4
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -594,10 +595,11 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 3
+        assert reopened._get_store_version() == 4
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
+            assert SlidingWindowTokens.table_exists()
             columns = {
                 row[1]: row[2]
                 for row in reopened.database.execute_sql(
@@ -606,6 +608,41 @@ class TestClass:
             }
         assert columns["event_payload"] == "BLOB"
         assert "source_json" not in columns
+
+    def test_v3_store_creates_sliding_window_tokens(self, sqlstore):
+        """A v3 store gains the sliding window token table on open."""
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SlidingWindowTokens])
+            sqlstore._update_version(3)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened._get_store_version() == 4
+        with reopened.database.bind_ctx(reopened.models):
+            assert SlidingWindowTokens.table_exists()
+        assert reopened.load_sliding_window_tokens() == {}
+
+    def test_sliding_window_tokens_roundtrip(self, sqlstore):
+        """Tokens survive a reopen, and forgotten rooms do not."""
+        sqlstore.save_sliding_window_tokens({TEST_ROOM: "w1", "!b:example.org": "w2"})
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: "w1",
+            "!b:example.org": "w2",
+        }
+
+        # A newer window replaces the token; a left room drops it.
+        sqlstore.save_sliding_window_tokens({TEST_ROOM: "w3"}, ["!b:example.org"])
+        assert sqlstore.load_sliding_window_tokens() == {TEST_ROOM: "w3"}
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened.load_sliding_window_tokens() == {TEST_ROOM: "w3"}
 
     def test_pending_recovery_payload_is_encrypted_at_rest(self, tempdir):
         store = SqliteStore(

@@ -31,6 +31,7 @@ if package_installed("vodozemac"):
         OlmSessions,
         OutgoingKeyRequests,
         PendingTimelineEvents,
+        SlidingWindowTokens,
         StoreVersion,
         SyncRecoveryGaps,
         SyncTokens,
