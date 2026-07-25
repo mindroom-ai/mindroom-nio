@@ -536,21 +536,19 @@ async def _collect_slice(
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        if response.end == gap.target_token:
-            next_cursor = None
-        elif truncated:
-            break
-        elif response.end is None or response.end == cursor:
+        if response.end is None or response.end == cursor:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
             next_cursor = None
+        elif response.end == gap.target_token:
+            next_cursor = None
+        elif truncated:
+            break
         else:
             next_cursor = response.end
 
         updated = replace(gap, cursor_token=next_cursor)
-        if deadline - asyncio.get_running_loop().time() <= 0:
-            break
         await persist_response_plan(
             state,
             store,
@@ -639,22 +637,22 @@ async def pump_recovery(
         room_ids = room_ids[offset:] + room_ids[:offset]
         state.room_offset = (offset + 1) % len(room_ids)
     room_ids.sort(key=lambda room_id: state.gaps[room_id][0].cursor_token is not None)
-    recovering = sum(
-        state.gaps[room_id][0].cursor_token is not None for room_id in room_ids
-    )
     deadline = asyncio.get_running_loop().time() + options.timeout
-    for room_id in room_ids:
+    for index, room_id in enumerate(room_ids):
         gaps = state.gaps.get(room_id)
         if not gaps:
             continue
         gap = gaps[0]
-        room_deadline = deadline
-        if gap.cursor_token is not None:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            if gap.cursor_token is not None or gap.target_token:
                 continue
-            room_deadline = asyncio.get_running_loop().time() + remaining / recovering
-            recovering -= 1
+            room_deadline = deadline
+        else:
+            room_deadline = asyncio.get_running_loop().time() + remaining / (
+                len(room_ids) - index
+            )
+        if gap.cursor_token is not None:
             gap = await _collect_slice(
                 state,
                 gap,

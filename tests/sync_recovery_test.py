@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -288,6 +289,110 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
     assert seen == ["$other"]
     assert ROOM in state.gaps
     assert ROOM_B not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_ready_callback_does_not_consume_recovering_room_budget():
+    other_live = PendingTimelineEvent.from_event(
+        ROOM_B, 1, 0, event("$other-live", 2, ROOM_B), True
+    )
+    assert other_live
+    state = RecoveryState(
+        gaps={
+            ROOM: [RecoveryGap(ROOM, 1, "p1", None)],
+            ROOM_B: [RecoveryGap(ROOM_B, 1, "p2", "s2")],
+        },
+        events={(ROOM, 1): [pending("$live", 0)], (ROOM_B, 1): [other_live]},
+    )
+    seen: list[str] = []
+
+    async def fetch(room_id, start, *_args):
+        assert room_id == ROOM_B
+        value = event("$other", 1, ROOM_B)
+        return RoomMessagesResponse.from_dict(
+            {"start": start, "end": "p2", "chunk": [value.source]},
+            ROOM_B,
+        )
+
+    async def dispatch(room_id, value):
+        if room_id == ROOM:
+            await asyncio.Event().wait()
+        seen.append(value.event_id)
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 0.04),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$other", "$other-live"]
+    assert ROOM in state.gaps
+    assert ROOM_B not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_commits_unverifiable_page():
+    value = pending("$live", 0)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
+        events={(ROOM, 1): [value]},
+    )
+
+    async def fetch(*_args):
+        time.sleep(0.02)
+        return RoomMessagesResponse.from_dict(
+            {"start": "s1", "chunk": [event("$untrusted", 1).source]},
+            ROOM,
+        )
+
+    async def dispatch(*_args):
+        raise AssertionError("expired callback budget must not dispatch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 0.01),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert state.gaps[ROOM][0].cursor_token is None
+    assert state.events[(ROOM, 1)] == [value]
+
+
+@pytest.mark.asyncio
+async def test_repeated_target_cursor_abandons_unverifiable_page():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "s1", "s1")]},
+        events={(ROOM, 1): [pending("$live", 0)]},
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "s1",
+                "end": "s1",
+                "chunk": [event("$untrusted", 1).source],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value):
+        seen.append(value.event_id)
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$live"]
+    assert not state.gaps
 
 
 @pytest.mark.asyncio

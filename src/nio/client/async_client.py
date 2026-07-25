@@ -773,10 +773,29 @@ class AsyncClient(Client):
                 page_size=self.config.backfill_page_size,
                 timeout=self.config.backfill_timeout,
             ),
-            fetch_messages=self.room_messages,
+            fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
             store=(self.store if self.config.store_sync_tokens else None),
             ready_room_id=ready_room_id,
+        )
+
+    async def _recovery_room_messages(
+        self,
+        room_id: str,
+        start: str,
+        end: str | None,
+        direction: MessageDirection,
+        limit: int,
+    ) -> RoomMessagesResponse | RoomMessagesError:
+        method, path = Api.room_messages(
+            self.access_token, room_id, start, end, direction, limit
+        )
+        return await self._send(
+            RoomMessagesResponse,
+            method,
+            path,
+            response_data=(room_id,),
+            process_response=False,
         )
 
     async def _persist_recovery_timelines(
@@ -1288,6 +1307,7 @@ class AsyncClient(Client):
         timeout: float | None = None,  # noqa: ASYNC109
         content_length: int | None = None,
         save_to: os.PathLike | None = None,
+        process_response: bool = True,
     ):
         headers = (
             {"Content-Type": content_type}
@@ -1369,7 +1389,8 @@ class AsyncClient(Client):
                 logger.warning("Timed out, sleeping for %ds", wait)
                 await asyncio.sleep(wait)
 
-        await self.receive_response(resp)
+        if process_response:
+            await self.receive_response(resp)
         return resp
 
     @client_session
