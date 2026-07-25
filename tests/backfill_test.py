@@ -618,7 +618,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_event_bound_resumes_from_persisted_cursor(
+    async def test_event_bound_abandons_prefix_at_room_wide_cap(
         self, tempdir, aioresponse
     ):
         client = AsyncClient(
@@ -660,12 +660,8 @@ class TestRoomLocalRecovery:
         )
 
         await client.receive_response(limited)
-        assert seen == ["$old"]
-        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
-
-        await client.receive_response(limited)
         assert pages.from_tokens == ["s1", "more"]
-        assert seen == ["$old", "$gap1", "$gap2", "$held"]
+        assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
         await client.close()
 
@@ -999,7 +995,9 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$held"]
         assert not client._recovery.gaps
 
-    async def test_live_overlap_closes_truncated_page(self, tempdir, aioresponse):
+    async def test_live_overlap_classifies_complete_server_page(
+        self, tempdir, aioresponse
+    ):
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
@@ -1036,7 +1034,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$gap", "$overflow", "$held"]
         assert not client._recovery.gaps
         await client.close()
 

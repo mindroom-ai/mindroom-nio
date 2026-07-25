@@ -370,9 +370,10 @@ class AsyncClientConfig(ClientConfig):
             recovered-history callback errors fan out before acknowledgement.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
         backfill_max_pages (int): Maximum pages per room per pump.
-        backfill_max_events (int): Maximum events per room per pump and maximum
-            live events held behind a stuck gap.
-            Exceeding the held-event bound abandons unverified history.
+        backfill_max_events (int): Maximum durable recovered-history events per
+            room across every open generation, and separately the maximum live
+            events held behind a stuck gap.
+            Exceeding either bound abandons unverified history.
         backfill_page_size (int): Events requested per page.
         backfill_timeout (float): Seconds available to one recovery pump.
     """

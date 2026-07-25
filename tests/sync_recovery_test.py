@@ -389,3 +389,188 @@ async def test_default_store_commit_stays_on_event_loop_thread():
         plan=RecoveryPlan(gaps=(RecoveryGap(ROOM, 1, "p1", "s1"),)),
     )
     assert store.thread_ids == [thread_id]
+
+
+@pytest.mark.asyncio
+async def test_repeated_end_overlap_classifies_complete_interleaved_page():
+    present_one = PendingTimelineEvent.from_event(
+        ROOM, 1, 0, event("$present-one", 2), True
+    )
+    present_two = PendingTimelineEvent.from_event(
+        ROOM, 1, 1, event("$present-two", 4), True
+    )
+    assert present_one and present_two
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [present_one, present_two]},
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "cursor",
+                "chunk": [
+                    event("$present-two", 4).source,
+                    event("$gap-two", 3).source,
+                    event("$present-one", 2).source,
+                    event("$gap-one", 1).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == [
+        "$gap-two",
+        "$gap-one",
+        "$present-one",
+        "$present-two",
+    ]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_room_cap_abandons_existing_unverified_prefix():
+    recovered = PendingTimelineEvent.from_event(
+        ROOM, 1, 0, event("$recovered", 1), False
+    )
+    assert recovered
+    live = pending("$live", 1)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [recovered, live]},
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "more",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$live"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overlap_first", [False, True])
+async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
+    held = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$held", 3), True)
+    assert held
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [held]},
+    )
+    seen: list[str] = []
+    history = [event("$gap-one", 1), event("$gap-two", 2)]
+    page = (
+        [event("$held", 3), *history]
+        if overlap_first
+        else [*history, event("$held", 3)]
+    )
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "cursor",
+                "chunk": [value.source for value in page],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$held"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_room_cap_counts_recovered_rows_in_other_generations():
+    later_recovered = PendingTimelineEvent.from_event(
+        ROOM, 2, 0, event("$later-recovered", 3), False
+    )
+    assert later_recovered
+    live = pending("$live", 0)
+    state = RecoveryState(
+        gaps={
+            ROOM: [
+                RecoveryGap(ROOM, 1, "target-one", "cursor-one"),
+                RecoveryGap(ROOM, 2, "target-two", "cursor-two"),
+            ]
+        },
+        events={(ROOM, 1): [live], (ROOM, 2): [later_recovered]},
+    )
+    seen: list[str] = []
+
+    async def fetch(_room, start, *_args):
+        assert start == "cursor-one"
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": start,
+                "end": "more",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$live"]
+    assert [gap.generation for gap in state.gaps[ROOM]] == [2]
+    assert [
+        queued.event_id
+        for (room_id, _generation), queued_events in state.events.items()
+        if room_id == ROOM
+        for queued in queued_events
+        if not queued.is_live
+    ] == ["$later-recovered"]

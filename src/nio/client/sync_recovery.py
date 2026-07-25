@@ -457,7 +457,7 @@ async def _collect_slice(
     if gap.cursor_token is None:
         return gap
 
-    pages = recovered_count = 0
+    pages = 0
     cursor = gap.cursor_token
     pending = [
         event
@@ -467,13 +467,13 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     live_ids = {event.event_id for event in pending if event.is_live}
+    recovered_count = sum(not event.is_live for event in pending)
 
-    while cursor and pages < options.max_pages and recovered_count < options.max_events:
+    while cursor and pages < options.max_pages:
         clear_recovered = False
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
-        limit = min(options.page_size, options.max_events - recovered_count)
         try:
             response = await asyncio.wait_for(
                 fetch_messages(
@@ -481,7 +481,7 @@ async def _collect_slice(
                     cursor,
                     gap.target_token,
                     MessageDirection.front,
-                    limit,
+                    options.page_size,
                 ),
                 timeout=remaining,
             )
@@ -516,16 +516,14 @@ async def _collect_slice(
             ),
             default=-1,
         )
-        chunk = response.chunk[: options.max_events - recovered_count]
-        truncated = len(chunk) < len(response.chunk)
         reached_window = False
-        for event in chunk:
+        for event in response.chunk:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
             if event_id in live_ids and response.end != gap.target_token:
                 reached_window = True
-                break
+                continue
             if _is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
@@ -549,9 +547,21 @@ async def _collect_slice(
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        if reached_window:
+        current_recovered_count = sum(
+            not event.is_live
+            for event in state.events.get((gap.room_id, gap.generation), ())
+        )
+        retained_recovered_count = recovered_count - (
+            current_recovered_count if clear_recovered else 0
+        )
+        if retained_recovered_count + len(recovered) > options.max_events:
+            logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
+            recovered.clear()
+            clear_recovered = True
             next_cursor = None
-        elif truncated or response.end in (None, cursor):
+        elif reached_window:
+            next_cursor = None
+        elif response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
@@ -573,7 +583,7 @@ async def _collect_slice(
             ),
         )
         gap = updated
-        recovered_count += len(recovered)
+        recovered_count = retained_recovered_count + len(recovered)
         cursor = next_cursor
 
     return gap
