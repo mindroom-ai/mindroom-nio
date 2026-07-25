@@ -1123,6 +1123,113 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$gap", "$held"]
         assert not client._recovery.gaps
 
+    async def test_exhausted_bounded_page_closes_gap(self, tempdir, aioresponse):
+        """A `to`-bounded walk that runs dry has reached the window.
+
+        Deployed servers stop the forward walk before the window's own
+        events and answer the following request with an empty chunk and
+        no `end` token, so the live overlap never closes the gap. The
+        recovered history has to survive that, not be discarded.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=2,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2), text_event("$gap2", 3)], "m1"),
+                "m1": messages([], None),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap1", "$gap2", "$held"]
+        assert pages.from_tokens == ["s1", "m1"]
+        assert pages.to_tokens == ["p1", "p1"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_single_exhausted_page_closes_gap(self, client, aioresponse):
+        """The first page may itself be the last one."""
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, payload=messages([text_event("$gap", 2)], None))
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$gap", "$held"]
+        assert not client._recovery.gaps
+
+    async def test_empty_bounded_gap_closes_without_recovery(self, client, aioresponse):
+        """Nothing between the tokens is a complete walk, not a failure."""
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, payload=messages([], None))
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+
     async def test_live_overlap_defers_events_after_held_window(
         self, tempdir, aioresponse
     ):

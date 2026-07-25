@@ -263,7 +263,14 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
 
 
 @pytest.mark.asyncio
-async def test_expired_budget_commits_unverifiable_page():
+async def test_expired_budget_commits_exhausted_page_without_dispatch():
+    """An exhausted bounded page is kept, but an expired budget defers it.
+
+    The page carries no ``end`` token while the walk was bounded by the
+    window's token, so the server has no further events to give and the
+    slice is complete. Committing it durably is what lets the next pump
+    dispatch it; the expired callback budget only forbids dispatching now.
+    """
     value = pending("$live", 0)
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
@@ -289,7 +296,47 @@ async def test_expired_budget_commits_unverifiable_page():
         store=None,
     )
     assert state.gaps[ROOM][0].cursor_token is None
-    assert state.events[(ROOM, 1)] == [value]
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == [
+        "$untrusted",
+        "$live",
+    ]
+    assert value in state.events[(ROOM, 1)]
+
+
+@pytest.mark.asyncio
+async def test_unbounded_page_without_end_stays_unverifiable():
+    """Without a `to` bound an absent `end` proves nothing.
+
+    A walk with no target token cannot tell "nothing further before the
+    window" from "the live edge", so the page is still discarded.
+    """
+    value = pending("$live", 0)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "", "s1")]},
+        events={(ROOM, 1): [value]},
+    )
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {"start": "s1", "chunk": [event("$untrusted", 1).source]},
+            ROOM,
+        )
+
+    seen: list[str] = []
+
+    async def dispatch(_room, item, _is_live, _was_completed, _kind):
+        seen.append(item.event_id)
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert seen == ["$live"]
+    assert ROOM not in state.gaps
 
 
 @pytest.mark.asyncio

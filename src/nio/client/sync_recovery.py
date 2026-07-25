@@ -662,6 +662,23 @@ async def _collect_slice(
             next_cursor = None
         elif reached_window:
             next_cursor = None
+        elif response.end is None and gap.target_token:
+            # A bounded walk that runs out of events has reached the sync
+            # window: the spec omits `end` exactly when no further events
+            # are available in the requested direction, and the request
+            # was bounded by the token the window starts at. Both Synapse
+            # and Tuwunel answer the last page of a `to`-bounded forward
+            # walk this way — with an empty chunk and no token — and they
+            # stop short of the window's own events, so the live overlap
+            # above never gets the chance to close the gap. Treating the
+            # exhausted page as failure discarded every recovered event
+            # instead.
+            #
+            # The spec also omits `end` when the user may not see any more
+            # events, which this cannot distinguish; a gap truncated by
+            # history visibility is dispatched as if complete rather than
+            # dropped whole.
+            next_cursor = None
         elif response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()

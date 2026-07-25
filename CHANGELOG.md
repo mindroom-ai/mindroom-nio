@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Bug Fixes
+
+- Keep the recovered history of a limited-timeline walk that runs out of
+  events. A forward `/messages` walk bounded by the window's token ends on
+  a page with no `end` token — the spec's way of saying no further events
+  are available — and both Synapse and Tuwunel stop short of the window's
+  own events, so the live-overlap check never got the chance to close the
+  gap. The exhausted page was treated as unprovable and every event the
+  walk had already collected was discarded, losing the majority of events
+  under concurrent writes on both servers (measured with
+  `scripts/probe_classic_recovery.py --concurrent`: 173/200 events lost on
+  Synapse, 148/200 on Tuwunel; zero after the fix). An unbounded walk with
+  no target token still discards such a page, since there it cannot be
+  told apart from the live edge.
+
 ## 0.30.0
 
 ### Features
