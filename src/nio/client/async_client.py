@@ -556,7 +556,7 @@ class AsyncClient(Client):
         super().__init__(user, device_id, store_path, self.config)
 
     @property
-    def _recovery_store(self) -> MatrixStore | None:
+    def _recovery_store(self) -> "MatrixStore | None":
         """The store to persist recovery state in, if that is enabled."""
         if not (self.config.backfill_limited_timelines and self.store):
             return None
