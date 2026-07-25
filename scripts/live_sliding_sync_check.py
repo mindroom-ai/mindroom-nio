@@ -28,6 +28,19 @@ Pass ``--slam`` to additionally run a stress pass: two concurrent
 long-poll sync loops (one per user, separate conn_ids) while a writer
 floods rooms with messages, asserting no event is missed or duplicated
 and that the loop long-polls instead of busy-looping.
+
+``--slam`` then runs the recovery slam, which is where
+``backfill_limited_timelines`` is put under load. Several writers flood
+every room in parallel with messages, edits, threaded replies,
+reactions, redactions and state changes while two readers — one on
+``sliding_sync_forever``, one on ``sync_forever``, both with a
+one-event timeline window so every response is ``limited`` — dispatch
+through /messages recovery walks. The sliding reader is torn down and
+rebuilt from its store mid-flood. Afterwards every accepted write must
+have been dispatched exactly once per reader, in the server's own
+per-room order, with nothing left undecryptable. A final pass repeats
+the flood inside an encrypted room and asserts every megolm event is
+decrypted and dispatched exactly once.
 """
 
 import argparse
@@ -37,10 +50,20 @@ import statistics
 import sys
 import tempfile
 import time
+from collections import Counter, defaultdict
 
-from nio import AsyncClient, InviteMemberEvent, RoomMessageText
+from nio import (
+    AsyncClient,
+    AsyncClientConfig,
+    Event,
+    InviteMemberEvent,
+    MegolmEvent,
+    MessageDirection,
+    RoomMessageText,
+)
 from nio.responses import (
     RegisterResponse,
+    RoomMessagesResponse,
     SlidingSyncError,
     SlidingSyncResponse,
     SyncResponse,
@@ -547,6 +570,647 @@ async def slam(
         )
 
 
+# A one-event timeline window guarantees that any concurrent write burst
+# leaves the sync response `limited`, which is the only way to make the
+# client walk /messages for the events the window dropped.
+RECOVERY_LISTS = {
+    "recovery": {
+        "ranges": [[0, 49]],
+        "timeline_limit": 1,
+        "required_state": [
+            ["m.room.create", ""],
+            ["m.room.member", "$LAZY"],
+        ],
+    }
+}
+
+RECOVERY_SYNC_FILTER = {
+    "room": {"timeline": {"limit": 1}},
+}
+
+
+class Recorder:
+    """Records every event a client dispatches, in dispatch order."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.order: dict[str, list[str]] = defaultdict(list)
+        self.counts: Counter = Counter()
+        self.decrypted: Counter = Counter()
+        self.undecryptable: set[str] = set()
+
+    async def __call__(self, room, event) -> None:
+        event_id = getattr(event, "event_id", None)
+        if not event_id:
+            return
+        self.order[room.room_id].append(event_id)
+        self.counts[event_id] += 1
+        if isinstance(event, MegolmEvent):
+            self.undecryptable.add(event_id)
+        else:
+            self.decrypted[event_id] += 1
+            self.undecryptable.discard(event_id)
+
+    def seen(self) -> set[str]:
+        return set(self.counts)
+
+    def duplicates(self, ids: set[str]) -> dict[str, int]:
+        return {
+            event_id: count
+            for event_id, count in self.counts.items()
+            if count > 1 and event_id in ids
+        }
+
+
+def recovery_config(max_events: int, encryption: bool = False) -> AsyncClientConfig:
+    return AsyncClientConfig(
+        store_sync_tokens=True,
+        encryption_enabled=encryption,
+        backfill_limited_timelines=True,
+        backfill_max_pages=100,
+        backfill_max_events=max_events,
+        backfill_page_size=100,
+        backfill_timeout=60.0,
+    )
+
+
+async def register_configured(
+    homeserver: str, name: str, config: AsyncClientConfig
+) -> AsyncClient:
+    """Register a store-backed client with a non-default config."""
+    store_path = tempfile.mkdtemp(prefix=f"nio-live-{name}-")
+    client = AsyncClient(
+        homeserver, f"@{name}:ignored", store_path=store_path, config=config
+    )
+    resp = await client.register(name, "live-check-password")
+    if not isinstance(resp, RegisterResponse):
+        print(f"FAIL: could not register {name}: {resp}")
+        sys.exit(1)
+    return client
+
+
+async def canonical_order(client: AsyncClient, room_id: str) -> list[str]:
+    """Every event id in the room, oldest first, as the server orders them."""
+    ids: list[str] = []
+    start = ""
+    seen_tokens = set()
+    while True:
+        resp = await client.room_messages(
+            room_id, start=start, direction=MessageDirection.back, limit=500
+        )
+        if not isinstance(resp, RoomMessagesResponse) or not resp.chunk:
+            break
+        ids.extend(
+            event.event_id for event in resp.chunk if getattr(event, "event_id", None)
+        )
+        if not resp.end or resp.end in seen_tokens:
+            break
+        seen_tokens.add(resp.end)
+        start = resp.end
+    ids.reverse()
+    return ids
+
+
+async def flood(
+    writers: list[AsyncClient],
+    room_ids: list[str],
+    n_messages: int,
+    n_edits: int,
+    n_reactions: int,
+    n_redactions: int,
+    n_state: int,
+    label: str = "",
+) -> tuple[dict[str, set[str]], list[object]]:
+    """Hammer every room from every writer at once.
+
+    Returns the event ids accepted by the server per room, plus the
+    failures, so the caller can assert on exactly what was written.
+    """
+    sent: dict[str, set[str]] = defaultdict(set)
+    failures: list[object] = []
+    # Per-writer concurrency: enough parallelism to interleave writes
+    # inside a single room, bounded so the connection pool is not the
+    # thing under test.
+    semaphores = {id(writer): asyncio.Semaphore(16) for writer in writers}
+
+    async def do(writer: AsyncClient, room_id: str, factory) -> str | None:
+        async with semaphores[id(writer)]:
+            resp = await factory(writer, room_id)
+        event_id = getattr(resp, "event_id", None)
+        if not event_id:
+            failures.append(resp)
+            return None
+        sent[room_id].add(event_id)
+        return event_id
+
+    def message(index: int):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_send(
+                room_id,
+                "m.room.message",
+                {"msgtype": "m.text", "body": f"rslam-m-{index}"},
+            )
+
+        return factory
+
+    message_ids = await asyncio.gather(
+        *(
+            do(writers[i % len(writers)], room_ids[i % len(room_ids)], message(i))
+            for i in range(n_messages)
+        )
+    )
+    targets = [
+        (room_ids[i % len(room_ids)], event_id)
+        for i, event_id in enumerate(message_ids)
+        if event_id
+    ]
+    check(
+        f"recovery slam: message flood accepted ({label})",
+        len(targets) == n_messages,
+        f"{n_messages - len(targets)} sends failed, first: {failures[:1]}",
+    )
+
+    def edit(index: int, target: tuple[str, str]):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_send(
+                room_id,
+                "m.room.message",
+                {
+                    "msgtype": "m.text",
+                    "body": f"* rslam-e-{index}",
+                    "m.new_content": {"msgtype": "m.text", "body": f"rslam-e-{index}"},
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": target[1],
+                    },
+                },
+            )
+
+        return factory
+
+    def thread(index: int, target: tuple[str, str]):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_send(
+                room_id,
+                "m.room.message",
+                {
+                    "msgtype": "m.text",
+                    "body": f"rslam-t-{index}",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": target[1],
+                        "is_falling_back": True,
+                    },
+                },
+            )
+
+        return factory
+
+    def reaction(index: int, target: tuple[str, str]):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_send(
+                room_id,
+                "m.reaction",
+                {
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": target[1],
+                        "key": f"\N{THUMBS UP SIGN}{index % 5}",
+                    }
+                },
+            )
+
+        return factory
+
+    def redaction(target: tuple[str, str]):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_redact(room_id, target[1], "rslam")
+
+        return factory
+
+    def topic(index: int):
+        async def factory(writer: AsyncClient, room_id: str):
+            return await writer.room_put_state(
+                room_id, "m.room.topic", {"topic": f"rslam-topic-{index}"}
+            )
+
+        return factory
+
+    # Edits, threaded replies, reactions, redactions and state changes all
+    # race each other across every room and every writer at once.
+    jobs = []
+    for j in range(n_edits):
+        target = targets[j % len(targets)]
+        writer = writers[j % len(writers)]
+        kind = edit(j, target) if j % 2 else thread(j, target)
+        jobs.append(do(writer, target[0], kind))
+    for j in range(n_reactions):
+        target = targets[(j * 7) % len(targets)]
+        # A distinct key per reaction: a repeated (sender, event, key)
+        # annotation is rejected, and a rejected send is not the thing
+        # under test.
+        writer = writers[j % len(writers)]
+        jobs.append(do(writer, target[0], reaction(j, target)))
+    # Redactions of another user's event and topic changes both need
+    # power level 50; only the room creator has it, so those come from
+    # the creator while everything else keeps racing.
+    for j in range(n_redactions):
+        target = targets[-(j + 1)]
+        jobs.append(do(writers[0], target[0], redaction(target)))
+    for j in range(n_state):
+        room_id = room_ids[j % len(room_ids)]
+        jobs.append(do(writers[0], room_id, topic(j)))
+
+    await asyncio.gather(*jobs)
+    return sent, failures
+
+
+async def recovery_slam(
+    homeserver: str,
+    n_rooms: int,
+    n_messages: int,
+    n_edits: int,
+    n_writers: int,
+    allow_sliding_gap: bool = False,
+) -> None:
+    """Flood rooms with a one-event sync window and assert exactly-once.
+
+    This is the check that unit tests cannot make: with
+    ``backfill_limited_timelines`` enabled, every event dropped by the
+    tiny timeline window has to come back through a /messages recovery
+    walk, in the server's order, exactly once, on both transports, and
+    across a mid-flood client restart.
+    """
+    suffix = secrets.token_hex(4)
+    budget = (n_messages + n_edits) * 4 + 1000
+
+    writers = [
+        await register(homeserver, f"rs-w{i}-{suffix}") for i in range(n_writers)
+    ]
+    sliding = await register_configured(
+        homeserver, f"rs-sliding-{suffix}", recovery_config(budget)
+    )
+    classic = await register_configured(
+        homeserver, f"rs-classic-{suffix}", recovery_config(budget)
+    )
+    readers = [sliding, classic]
+
+    sliding_recorder = Recorder("sliding")
+    classic_recorder = Recorder("classic")
+    sliding.add_event_callback(sliding_recorder, Event)
+    classic.add_event_callback(classic_recorder, Event)
+
+    room_ids: list[str] = []
+    try:
+        for i in range(n_rooms):
+            resp = await writers[0].room_create(name=f"recovery slam {i}")
+            room_ids.append(resp.room_id)
+            for member in writers[1:] + readers:
+                await writers[0].room_invite(resp.room_id, member.user_id)
+                await member.join(resp.room_id)
+
+        sliding_task = asyncio.create_task(
+            sliding.sliding_sync_forever(
+                timeout=10_000,
+                conn_id=f"rslam-{suffix}",
+                lists=RECOVERY_LISTS,
+                extensions={"to_device": {"enabled": True}},
+            )
+        )
+        classic_task = asyncio.create_task(
+            classic.sync_forever(timeout=10_000, sync_filter=RECOVERY_SYNC_FILTER)
+        )
+        await asyncio.wait_for(sliding.synced.wait(), 60)
+        await asyncio.wait_for(classic.synced.wait(), 60)
+
+        # First half of the flood.
+        start = time.monotonic()
+        first, failures = await flood(
+            writers,
+            room_ids,
+            n_messages // 2,
+            n_edits // 2,
+            n_edits // 4,
+            n_rooms,
+            n_rooms,
+            label="before restart",
+        )
+
+        # Restart the sliding reader mid-flood, from its store, while the
+        # writers keep going: durable recovery state has to survive the
+        # process boundary without losing or replaying events.
+        restart_credentials = (
+            sliding.user_id,
+            sliding.device_id,
+            sliding.access_token,
+            sliding.store_path,
+        )
+        sliding.stop_sync_forever()
+        await asyncio.wait_for(sliding_task, 120)
+        await sliding.close()
+
+        user_id, device_id, access_token, store_path = restart_credentials
+        sliding = AsyncClient(
+            homeserver, user_id, device_id, store_path, recovery_config(budget)
+        )
+        sliding.restore_login(user_id, device_id, access_token)
+        sliding.add_event_callback(sliding_recorder, Event)
+        readers[0] = sliding
+        sliding_task = asyncio.create_task(
+            sliding.sliding_sync_forever(
+                timeout=10_000,
+                conn_id=f"rslam-restarted-{suffix}",
+                lists=RECOVERY_LISTS,
+                extensions={"to_device": {"enabled": True}},
+            )
+        )
+
+        # Second half, against the restarted reader.
+        second, more_failures = await flood(
+            writers,
+            room_ids,
+            n_messages - n_messages // 2,
+            n_edits - n_edits // 2,
+            n_edits // 4,
+            n_rooms,
+            n_rooms,
+            label="after restart",
+        )
+        write_seconds = time.monotonic() - start
+        failures.extend(more_failures)
+
+        sent: dict[str, set[str]] = defaultdict(set)
+        for part in (first, second):
+            for room_id, ids in part.items():
+                sent[room_id] |= ids
+        sent_ids = {event_id for ids in sent.values() for event_id in ids}
+        check(
+            "recovery slam: every write was accepted",
+            not failures,
+            f"{len(failures)} failures, first: {failures[:1]}",
+        )
+        print(
+            f"recovery slam: wrote {len(sent_ids)} events over {n_rooms} rooms "
+            f"from {n_writers} writers in {write_seconds:.1f}s "
+            f"({len(sent_ids) / write_seconds:.0f}/s)"
+        )
+
+        # Sentinel per room: once it lands, that room's recovery walk has
+        # caught up to the end of the flood.
+        for i, room_id in enumerate(room_ids):
+            resp = await writers[0].room_send(
+                room_id,
+                "m.room.message",
+                {"msgtype": "m.text", "body": f"rslam-sentinel-{i}"},
+            )
+            sent[room_id].add(resp.event_id)
+            sent_ids.add(resp.event_id)
+
+        # Waiting on a reader that is known not to recover only burns the
+        # deadline, so a waived sliding gap drops out of the convergence
+        # condition (its counts are still reported and asserted below).
+        awaited = (
+            (classic_recorder,)
+            if allow_sliding_gap
+            else (sliding_recorder, classic_recorder)
+        )
+        deadline = time.monotonic() + 900
+        last_report = 0.0
+        while time.monotonic() < deadline:
+            missing = {
+                recorder.name: len(sent_ids - recorder.seen())
+                for recorder in (sliding_recorder, classic_recorder)
+            }
+            if not any(missing[recorder.name] for recorder in awaited):
+                break
+            now = time.monotonic()
+            if now - last_report > 15:
+                last_report = now
+                print(f"recovery slam: waiting, missing {missing}")
+            await asyncio.sleep(1)
+
+        # Classic first: it is the transport that plans recovery gaps, so
+        # its verdict is the one that proves the walk works.
+        for recorder in (classic_recorder, sliding_recorder):
+            missing_ids = sent_ids - recorder.seen()
+            if missing_ids and recorder is sliding_recorder and allow_sliding_gap:
+                # `_handle_sliding_sync` never opens a recovery gap, so a
+                # limited sliding window drops events with no walk and no
+                # warning. Known hole, reported rather than asserted.
+                print(
+                    f"recovery slam: KNOWN GAP: sliding lost "
+                    f"{len(missing_ids)}/{len(sent_ids)} events "
+                    f"(sliding sync plans no recovery gap)"
+                )
+            else:
+                check(
+                    f"recovery slam: {recorder.name} lost no events",
+                    not missing_ids,
+                    f"{len(missing_ids)}/{len(sent_ids)} never dispatched, "
+                    f"e.g. {list(missing_ids)[:3]}",
+                )
+            duplicates = recorder.duplicates(sent_ids)
+            check(
+                f"recovery slam: {recorder.name} dispatched each event once",
+                not duplicates,
+                f"{len(duplicates)} duplicated, e.g. {list(duplicates.items())[:3]}",
+            )
+
+        # Order: per room, the dispatch order must be the server's order.
+        # Events a reader never saw cannot break its ordering, so each
+        # reader is compared against the subsequence it did receive.
+        for room_id in room_ids:
+            canonical = [
+                event_id
+                for event_id in await canonical_order(writers[0], room_id)
+                if event_id in sent[room_id]
+            ]
+            for recorder in (classic_recorder, sliding_recorder):
+                expected = [
+                    event_id for event_id in canonical if event_id in recorder.seen()
+                ]
+                got = [
+                    event_id
+                    for event_id in recorder.order[room_id]
+                    if event_id in sent[room_id]
+                ]
+                if got != expected:
+                    first_bad = next(
+                        (i for i, (a, b) in enumerate(zip(got, expected)) if a != b),
+                        min(len(got), len(expected)),
+                    )
+                    check(
+                        f"recovery slam: {recorder.name} preserved room order",
+                        False,
+                        f"{room_id} diverges at index {first_bad}: "
+                        f"got {got[first_bad : first_bad + 3]} "
+                        f"expected {expected[first_bad : first_bad + 3]}",
+                    )
+        check(
+            "recovery slam: both readers preserved per-room order",
+            True,
+        )
+
+        for recorder in (sliding_recorder, classic_recorder):
+            check(
+                f"recovery slam: {recorder.name} left nothing undecryptable",
+                not recorder.undecryptable,
+                f"{len(recorder.undecryptable)} events stuck encrypted",
+            )
+
+        sliding.stop_sync_forever()
+        classic.stop_sync_forever()
+        await asyncio.wait_for(asyncio.gather(sliding_task, classic_task), 120)
+    finally:
+        for task in ("sliding_task", "classic_task"):
+            handle = locals().get(task)
+            if handle is not None and not handle.done():
+                handle.cancel()
+        for client in writers + readers:
+            await client.close()
+
+
+async def encrypted_recovery_slam(homeserver: str, n_messages: int) -> None:
+    """Flood an encrypted room with a one-event window and assert decryption."""
+    suffix = secrets.token_hex(4)
+    alice = await register_configured(
+        homeserver, f"rs-enc-a-{suffix}", recovery_config(n_messages * 4, True)
+    )
+    bob = await register_configured(
+        homeserver, f"rs-enc-b-{suffix}", recovery_config(n_messages * 4, True)
+    )
+
+    if alice.olm is None or bob.olm is None:
+        print("encrypted recovery slam: encryption dependencies missing, skipping")
+        await alice.close()
+        await bob.close()
+        return
+
+    lists = {
+        "recovery": {
+            "ranges": [[0, 19]],
+            "timeline_limit": 1,
+            "required_state": [
+                ["m.room.create", ""],
+                ["m.room.encryption", ""],
+                ["m.room.member", "$LAZY"],
+            ],
+        }
+    }
+    extensions = {
+        "to_device": {"enabled": True},
+        "e2ee": {"enabled": True},
+        "account_data": {"enabled": True},
+    }
+
+    recorder = Recorder("encrypted")
+    bob.add_event_callback(recorder, Event)
+    loop_task = None
+
+    try:
+        loop_task = asyncio.create_task(
+            bob.sliding_sync_forever(
+                timeout=10_000,
+                conn_id=f"rslam-enc-{suffix}",
+                lists=lists,
+                extensions=extensions,
+            )
+        )
+        await asyncio.wait_for(bob.synced.wait(), 60)
+
+        resp = await alice.room_create(
+            name="encrypted recovery slam",
+            initial_state=[
+                {
+                    "type": "m.room.encryption",
+                    "state_key": "",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                }
+            ],
+        )
+        room_id = resp.room_id
+        await alice.room_invite(room_id, bob.user_id)
+        check(
+            "encrypted recovery slam: invite arrives",
+            await _wait_for(lambda: room_id in bob.invited_rooms, 60),
+        )
+        await bob.join(room_id)
+        await alice.sliding_sync(
+            conn_id=f"rslam-enc-a-{suffix}",
+            timeout=0,
+            lists=lists,
+            extensions=extensions,
+        )
+        if alice.should_upload_keys:
+            await alice.keys_upload()
+
+        sent_ids = set()
+        semaphore = asyncio.Semaphore(8)
+
+        async def send(index: int) -> None:
+            async with semaphore:
+                resp = await alice.room_send(
+                    room_id,
+                    "m.room.message",
+                    {"msgtype": "m.text", "body": f"rslam-enc-{index}"},
+                    ignore_unverified_devices=True,
+                )
+            event_id = getattr(resp, "event_id", None)
+            if event_id:
+                sent_ids.add(event_id)
+
+        start = time.monotonic()
+        await asyncio.gather(*(send(i) for i in range(n_messages)))
+        elapsed = time.monotonic() - start
+        check(
+            "encrypted recovery slam: every encrypted send was accepted",
+            len(sent_ids) == n_messages,
+            f"{n_messages - len(sent_ids)} sends failed",
+        )
+        print(
+            f"encrypted recovery slam: sent {n_messages} encrypted events "
+            f"in {elapsed:.1f}s ({n_messages / elapsed:.0f}/s)"
+        )
+
+        converged = await _wait_for(
+            lambda: (
+                not (
+                    sent_ids
+                    - {
+                        event_id
+                        for event_id in recorder.decrypted
+                        if recorder.decrypted[event_id]
+                    }
+                )
+            ),
+            600,
+        )
+        missing = sent_ids - set(recorder.decrypted)
+        check(
+            "encrypted recovery slam: every event was decrypted and dispatched",
+            converged and not missing,
+            f"{len(missing)} never arrived decrypted",
+        )
+        check(
+            "encrypted recovery slam: no event decrypted twice",
+            not [event_id for event_id in sent_ids if recorder.decrypted[event_id] > 1],
+            "an event was dispatched decrypted more than once",
+        )
+        check(
+            "encrypted recovery slam: nothing left stuck encrypted",
+            not recorder.undecryptable,
+            f"{len(recorder.undecryptable)} events never decrypted",
+        )
+
+        bob.stop_sync_forever()
+        await asyncio.wait_for(loop_task, 120)
+    finally:
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
+        await alice.close()
+        await bob.close()
+
+
 async def deep_checks(alice: AsyncClient, bob: AsyncClient) -> None:
     """Exercise response features the basic functional checks don't reach."""
     probe = await alice.sliding_sync(conn_id="deep-probe", timeout=0)
@@ -758,7 +1422,41 @@ async def main() -> None:
     parser.add_argument("--rooms", type=int, default=10)
     parser.add_argument("--messages", type=int, default=2000)
     parser.add_argument("--edits", type=int, default=10000)
+    parser.add_argument("--recovery-rooms", type=int, default=8)
+    parser.add_argument("--recovery-messages", type=int, default=600)
+    parser.add_argument("--recovery-edits", type=int, default=600)
+    parser.add_argument("--recovery-writers", type=int, default=4)
+    parser.add_argument("--recovery-encrypted-messages", type=int, default=250)
+    parser.add_argument(
+        "--skip-recovery-slam",
+        action="store_true",
+        help="run only the wire-format slam, not the backfill recovery slam",
+    )
+    parser.add_argument(
+        "--allow-sliding-backfill-gap",
+        action="store_true",
+        help="report, instead of failing on, events the sliding transport "
+        "drops because it never opens a recovery gap",
+    )
+    parser.add_argument(
+        "--only-recovery-slam",
+        action="store_true",
+        help="skip every other check and run the backfill recovery slam alone",
+    )
     args = parser.parse_args()
+
+    if args.only_recovery_slam:
+        await recovery_slam(
+            args.homeserver,
+            args.recovery_rooms,
+            args.recovery_messages,
+            args.recovery_edits,
+            args.recovery_writers,
+            args.allow_sliding_backfill_gap,
+        )
+        await encrypted_recovery_slam(args.homeserver, args.recovery_encrypted_messages)
+        print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
+        return
 
     suffix = secrets.token_hex(4)
     alice = await register(args.homeserver, f"ss-alice-{suffix}")
@@ -870,6 +1568,19 @@ async def main() -> None:
 
         if args.slam:
             await slam(alice, bob, args.rooms, args.messages, args.edits)
+
+            if not args.skip_recovery_slam:
+                await recovery_slam(
+                    args.homeserver,
+                    args.recovery_rooms,
+                    args.recovery_messages,
+                    args.recovery_edits,
+                    args.recovery_writers,
+                    args.allow_sliding_backfill_gap,
+                )
+                await encrypted_recovery_slam(
+                    args.homeserver, args.recovery_encrypted_messages
+                )
 
         if args.bench:
             await bench(alice, args.rooms)
