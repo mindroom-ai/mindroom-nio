@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
 - Preserve normal live callback exception propagation while recovered-history dispatch attempts every matching callback before acknowledgement.
 - Keep room sends fail closed while that room has an unresolved recovery lane.
 - Treat HTTP 408, HTTP 429, and server errors as retryable recovery failures while terminal client errors release held live rows.
-- Abandon ignored-bound and oversized `/messages` pages when their contents cannot prove a complete gap instead of inferring closure from one held live event.
+- Close ignored-bound `/messages` walks at the first held live-window overlap while preserving the recovered prefix, and abandon only pages whose contents cannot prove a complete gap.
+- Apply every joined room's state before fallible callbacks, enforce held-live limits on the first limited window, and preserve per-event to-device callback ordering.
 - Remove delivered event bodies from durable de-duplication markers while retaining the event ID and encrypted-state bit required for replay suppression.
 
 ## 0.29.0

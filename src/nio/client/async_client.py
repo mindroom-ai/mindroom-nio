@@ -368,8 +368,7 @@ class AsyncClientConfig(ClientConfig):
             Limited lanes block sends until their history obligation clears.
             Live callback errors propagate after acknowledgement, while
             recovered-history callback errors fan out before acknowledgement.
-            Restart persistence requires encryption and sync-token storage.
-            Disabled mode preserves upstream behavior.
+            Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
         backfill_max_pages (int): Maximum pages per room per pump.
         backfill_max_events (int): Maximum events per room per pump and maximum
             live events held behind a stuck gap.
@@ -647,19 +646,16 @@ class AsyncClient(Client):
     async def _handle_to_device(
         self, response: SyncResponse | SlidingSyncResponse
     ) -> None:
-        decrypted_to_device = []
-
         for index, to_device_event in enumerate(response.to_device_events):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                decrypted_to_device.append((index, decrypted_event))
-
-        self._replace_decrypted_to_device(decrypted_to_device, response)
-        for event in response.to_device_events:
-            if isinstance(event, (RoomKeyRequest, RoomKeyRequestCancellation)):
+                response.to_device_events[index] = to_device_event = decrypted_event
+            if isinstance(
+                to_device_event, (RoomKeyRequest, RoomKeyRequestCancellation)
+            ):
                 continue
-            await self._on_to_device(event)
+            await self._on_to_device(to_device_event)
 
     async def _handle_invited_rooms(self, response: SyncResponse) -> None:
         for room_id, info in response.rooms.invite.items():
@@ -675,7 +671,8 @@ class AsyncClient(Client):
         encrypted_rooms: set[str] = set()
 
         for room_id, join_info in response.rooms.join.items():
-            self._handle_joined_state(room_id, join_info, encrypted_rooms)
+            if not self.config.backfill_limited_timelines:
+                self._handle_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
             await self._process_timeline(
@@ -732,11 +729,7 @@ class AsyncClient(Client):
     ) -> Event | BadEventType | None:
         room = self.rooms.get(room_id)
         if room is None:
-            room = MatrixRoom(
-                room_id,
-                self.user_id,
-                room_id in self.encrypted_rooms,
-            )
+            room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
             self.rooms[room_id] = room
 
         if is_live:
@@ -903,6 +896,10 @@ class AsyncClient(Client):
                 raise
             if self.config.store_sync_tokens and self.store:
                 self.loaded_sync_token = response.next_batch
+            for room_id, join_info in response.rooms.join.items():
+                self._handle_joined_state(room_id, join_info, self.encrypted_rooms)
+            if self.store:
+                self.store.save_encrypted_rooms(self.encrypted_rooms)
         elif self.config.store_sync_tokens and self.store:
             self.store.save_sync_token(response.next_batch)
             self.loaded_sync_token = response.next_batch
@@ -955,6 +952,18 @@ class AsyncClient(Client):
             )
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
+        if self.config.backfill_limited_timelines:
+            for room_id, room in response.rooms.items():
+                if self._sliding_sync_room_is_invite(room) or room.membership in (
+                    "leave",
+                    "ban",
+                ):
+                    continue
+                await self._handle_sliding_sync_joined_room(
+                    room_id, room, self.encrypted_rooms
+                )
+            if self.store:
+                self.store.save_encrypted_rooms(self.encrypted_rooms)
         await self._handle_to_device(response)
 
         await self._handle_sliding_sync_rooms(response)
@@ -983,7 +992,7 @@ class AsyncClient(Client):
             # applies them to client state.
             elif sliding_room.membership in ("leave", "ban"):
                 continue
-            else:
+            elif not self.config.backfill_limited_timelines:
                 await self._handle_sliding_sync_joined_room(
                     room_id, sliding_room, encrypted_rooms
                 )
@@ -2733,8 +2742,8 @@ class AsyncClient(Client):
         This method also makes sure that the room members are fully synced and
         that keys are queried before sending messages to an encrypted room.
 
-        If the method can't sync the state fully to send out an encrypted
-        message after a couple of retries it raises `SendRetryError`.
+        If timeline recovery is pending or encrypted state cannot be fully
+        synced after a couple of retries, this raises `SendRetryError`.
 
         Raises `LocalProtocolError` if the client isn't logged in.
         """

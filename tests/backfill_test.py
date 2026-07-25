@@ -23,6 +23,7 @@ from nio import (
     MegolmEvent,
     PresenceEvent,
     RoomEncryptedImage,
+    RoomEncryptionEvent,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
@@ -32,8 +33,10 @@ from nio import (
     SlidingSyncResponse,
     SyncResponse,
     Timeline,
+    ToDeviceEvent,
     TypingNoticeEvent,
     UnknownBadEvent,
+    UnknownToDeviceEvent,
 )
 from nio.api import MATRIX_API_PATH_V3
 from nio.client.sync_recovery import (
@@ -100,6 +103,22 @@ def name_event(event_id: str, ts: int, name: str) -> RoomNameEvent:
         }
     )
     assert isinstance(event, RoomNameEvent)
+    return event
+
+
+def encryption_event(room_id: str = ROOM_B) -> RoomEncryptionEvent:
+    event = Event.parse_event(
+        {
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            "event_id": "$encryption",
+            "origin_server_ts": 0,
+            "room_id": room_id,
+            "sender": "@sender:example.org",
+            "state_key": "",
+            "type": "m.room.encryption",
+        }
+    )
+    assert isinstance(event, RoomEncryptionEvent)
     return event
 
 
@@ -349,6 +368,45 @@ class TestRoomLocalRecovery:
             (ROOM_B, "RoomMessageText"),
             (ROOM_B, "TypingNoticeEvent"),
         ]
+        await client.close()
+
+    async def test_disabled_preserves_to_device_processing_order(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        events = [
+            ToDeviceEvent.parse_event(
+                {
+                    "content": {"body": body},
+                    "sender": "@sender:example.org",
+                    "type": "org.example.test",
+                }
+            )
+            for body in ("one", "two")
+        ]
+        assert all(isinstance(event, UnknownToDeviceEvent) for event in events)
+        processed = []
+        seen = []
+
+        def process(event):
+            processed.append(event.source["content"]["body"])
+
+        async def callback(event):
+            seen.append((event.source["content"]["body"], tuple(processed)))
+
+        monkeypatch.setattr(client, "_handle_decrypt_to_device", process)
+        client.add_to_device_callback(callback, UnknownToDeviceEvent)
+        response = sync_response("s1", {})
+        response.to_device_events = events
+        await client.receive_response(response)
+        assert seen == [("one", ("one",)), ("two", ("one", "two"))]
         await client.close()
 
     async def test_ordinary_sync_ignores_recovery_deadline(self, tempdir):
@@ -747,6 +805,62 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_all_room_state_is_ready_before_live_callbacks(
+        self, client, protocol
+    ):
+        failed = False
+        seen = []
+
+        async def callback(room, event):
+            nonlocal failed
+            if event.event_id == "$a" and not failed:
+                failed = True
+                raise RuntimeError("callback failed")
+            if event.event_id == "$b":
+                seen.append(room.encrypted)
+
+        client.add_event_callback(callback, RoomMessageText)
+        if protocol == "classic":
+            response = sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$a", 1)], limited=False, prev_batch="a"
+                    ),
+                    ROOM_B: room_info(
+                        [text_event("$b", 2, ROOM_B)],
+                        limited=False,
+                        prev_batch="b",
+                        state=[encryption_event()],
+                    ),
+                },
+            )
+        else:
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$a", 1).source],
+                        },
+                        ROOM_B: {
+                            "membership": "join",
+                            "required_state": [encryption_event().source],
+                            "timeline": [text_event("$b", 2, ROOM_B).source],
+                        },
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(response)
+        await client.receive_response(response)
+        assert seen == [True]
+        assert client.rooms[ROOM_B].encrypted
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_held_live_bound_abandons_stuck_gap(self, tempdir, protocol):
         client = AsyncClient(
             "https://example.org",
@@ -783,6 +897,37 @@ class TestRoomLocalRecovery:
             timeline_response(protocol, "s3", [text_event("$held3", 3)])
         )
         assert seen == ["$held1", "$held2", "$held3"]
+        assert not client._recovery.gaps
+        await client.close()
+
+    async def test_first_limited_window_honors_held_live_bound(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+                backfill_timeout=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event(f"$held{index}", index) for index in range(3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$held0", "$held1", "$held2"]
         assert not client._recovery.gaps
         await client.close()
 
@@ -981,46 +1126,30 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
 
-    async def test_ignored_to_live_boundary_abandons_unverifiable_page(
+    async def test_ignored_to_live_boundary_preserves_recovered_prefix(
         self, client, aioresponse
     ):
         seen = record_events(client)
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$old", 1)], limited=False, prev_batch="p0"
-                    )
-                },
-            )
-        )
+        client.next_batch = "s1"
+        recovered = [text_event(f"${index}", index) for index in range(14)]
+        live = [text_event(f"${index}", index) for index in range(14, 64)]
         aioresponse.get(
             MESSAGES_URL,
-            payload=messages(
-                [
-                    text_event("$gap1", 2),
-                    text_event("$held", 3),
-                    text_event("$gap2", 4),
-                    text_event("$future", 5),
-                ],
-                None,
-            ),
+            payload=messages(recovered + live[:36], "ignored-to-bound"),
         )
         await client.receive_response(
             sync_response(
                 "s2",
                 {
                     ROOM_A: room_info(
-                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                        live,
+                        limited=True,
+                        prev_batch="p1",
                     )
                 },
             )
         )
-        assert seen == ["$old", "$held"]
-        assert "$gap1" not in seen
-        assert "$gap2" not in seen
-        assert "$future" not in seen
+        assert seen == [f"${index}" for index in range(64)]
         assert not client._recovery.gaps
 
     async def test_non_json_messages_4xx_abandons_gap_and_releases_live(
