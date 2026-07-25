@@ -247,7 +247,6 @@ from .base_client import (
     store_loaded,
 )
 from .sync_recovery import (
-    CommittedCancellation,
     RecoveryOptions,
     RecoveryState,
     load_recovery_state,
@@ -261,7 +260,6 @@ from .sync_recovery import (
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
-_RecoveryTimeline = tuple[str, Sequence[Event | BadEventType], str, int | None]
 
 _ProfileGetDisplayNameT = ProfileGetDisplayNameResponse | ProfileGetDisplayNameError
 _ProfileSetDisplayNameT = ProfileSetDisplayNameResponse | ProfileSetDisplayNameError
@@ -690,10 +688,6 @@ class AsyncClient(Client):
                 room_id, room, join_info.timeline.events, encrypted_rooms
             )
 
-        await self._persist_recovery_timelines(
-            (room_id, info.timeline.events, "join", None)
-            for room_id, info in response.rooms.join.items()
-        )
         for room_id, join_info in response.rooms.join.items():
             room = self.rooms[room_id]
             await self._pump_sync_recovery(room_id)
@@ -722,14 +716,18 @@ class AsyncClient(Client):
         deduplicate: bool = False,
     ) -> None:
         for index, event in enumerate(timeline):
+            if self.config.backfill_limited_timelines:
+                if isinstance(event, MegolmEvent) and self.olm:
+                    event.room_id = room_id
+                    timeline[index] = self.olm._decrypt_megolm_no_error(event) or event
+                continue
             decrypted = self._handle_timeline_event(
                 event, room_id, room, encrypted_rooms
             )
             if decrypted:
                 event = timeline[index] = decrypted
-            if not self.config.backfill_limited_timelines and (
-                not deduplicate
-                or should_dispatch_timeline_event(self._recovery, room_id, event)
+            if not deduplicate or should_dispatch_timeline_event(
+                self._recovery, room_id, event
             ):
                 await self._on_event(event, room)
 
@@ -737,7 +735,9 @@ class AsyncClient(Client):
         self,
         room_id: str,
         event: Event | BadEventType,
-    ) -> Event | BadEventType:
+        is_live: bool,
+        was_completed: bool,
+    ) -> Event | BadEventType | None:
         room = self.rooms.get(room_id)
         if room is None:
             room = MatrixRoom(
@@ -747,13 +747,19 @@ class AsyncClient(Client):
             )
             self.rooms[room_id] = room
 
-        if isinstance(event, MegolmEvent) and self.olm:
+        if is_live:
+            decrypted = self._handle_timeline_event(
+                event, room_id, room, self.encrypted_rooms
+            )
+            if decrypted:
+                event = decrypted
+            if self.store and isinstance(event, RoomEncryptionEvent):
+                self.store.save_encrypted_rooms({room_id})
+        elif isinstance(event, MegolmEvent) and self.olm:
             event.room_id = room_id
             event = self.olm._decrypt_megolm_no_error(event) or event
-        if isinstance(event, RoomEncryptionEvent):
-            self.encrypted_rooms.add(room_id)
-            if self.store:
-                self.store.save_encrypted_rooms({room_id})
+        if was_completed and isinstance(event, MegolmEvent):
+            return None
         for callback in self.event_callbacks:
             try:
                 await callback.async_execute(event, room)
@@ -796,32 +802,6 @@ class AsyncClient(Client):
             path,
             response_data=(room_id,),
             process_response=False,
-        )
-
-    async def _persist_recovery_timelines(
-        self,
-        timelines: Iterable[_RecoveryTimeline],
-        *,
-        batch_id: str | None = None,
-    ) -> None:
-        if not self.config.backfill_limited_timelines:
-            return
-        await persist_response_plan(
-            self._recovery,
-            self.store if self.config.store_sync_tokens else None,
-            token=None,
-            plan=merge_recovery_plans(
-                plan_room_timeline(
-                    self._recovery,
-                    room_id=room_id,
-                    timeline_events=timeline,
-                    user_id=self.user_id,
-                    membership=membership,
-                    live_event_count=live_event_count,
-                    batch_id=batch_id,
-                )
-                for room_id, timeline, membership, live_event_count in timelines
-            ),
         )
 
     async def _handle_presence_events(
@@ -922,8 +902,6 @@ class AsyncClient(Client):
                     token=response.next_batch,
                     plan=plan,
                 )
-            except CommittedCancellation:
-                raise
             except BaseException:
                 self.next_batch = previous_batch
                 raise
@@ -953,22 +931,32 @@ class AsyncClient(Client):
 
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
-        await self._persist_recovery_timelines(
-            (
-                (
-                    room_id,
-                    room.timeline,
-                    (
-                        "invite"
-                        if self._sliding_sync_room_is_invite(room)
-                        else room.membership or "join"
-                    ),
-                    (room.num_live or 0) if room.initial else None,
-                )
-                for room_id, room in response.rooms.items()
-            ),
-            batch_id=f"sliding:{self._sliding_sync_recovery_scope}:{response.pos}",
-        )
+        if self.config.backfill_limited_timelines:
+            await persist_response_plan(
+                self._recovery,
+                self.store if self.config.store_sync_tokens else None,
+                token=None,
+                plan=merge_recovery_plans(
+                    plan_room_timeline(
+                        self._recovery,
+                        room_id=room_id,
+                        timeline_events=room.timeline,
+                        user_id=self.user_id,
+                        membership=(
+                            "invite"
+                            if self._sliding_sync_room_is_invite(room)
+                            else room.membership or "join"
+                        ),
+                        live_event_count=(
+                            (room.num_live or 0) if room.initial else None
+                        ),
+                        batch_id=(
+                            f"sliding:{self._sliding_sync_recovery_scope}:{response.pos}"
+                        ),
+                    )
+                    for room_id, room in response.rooms.items()
+                ),
+            )
         if response.to_device_next_batch:
             self._sliding_sync_to_device_since = response.to_device_next_batch
         await self._handle_to_device(response)
@@ -1008,17 +996,6 @@ class AsyncClient(Client):
 
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
-        await self._persist_recovery_timelines(
-            (
-                room_id,
-                room.timeline,
-                room.membership or "join",
-                (room.num_live or 0) if room.initial else None,
-            )
-            for room_id, room in response.rooms.items()
-            if not self._sliding_sync_room_is_invite(room)
-            and room.membership not in ("leave", "ban")
-        )
         for room_id, room in response.rooms.items():
             if not self._sliding_sync_room_is_invite(room) and room.membership not in (
                 "leave",

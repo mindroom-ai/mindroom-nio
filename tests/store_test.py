@@ -670,6 +670,26 @@ class TestClass:
         assert len(events) == 1
         assert events[0].generation == 0
 
+    def test_completed_encrypted_event_allows_pending_retry(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        encrypted = PendingTimelineEvent(TEST_ROOM, 1, 0, "$event", "{}", False, True)
+        sqlstore.save_recovery("s1", set(), [gap], [encrypted], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$event", True)
+        retry = PendingTimelineEvent(TEST_ROOM, 2, 0, "$event", "{}", False, True, True)
+        next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
+        sqlstore.save_recovery("s2", set(), [next_gap], [retry], None)
+
+        _, events = sqlstore.load_sync_recovery()
+        assert len(events) == 1
+        assert events[0].generation == 2
+        assert events[0].was_completed
+
+        sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
+        _, events = sqlstore.load_sync_recovery()
+        assert events[0].generation == 0
+        assert not events[0].was_completed
+        assert not events[0].was_encrypted
+
     def test_synthetic_recovery_key_is_deleted_after_callback(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "", None)
         event = PendingTimelineEvent(

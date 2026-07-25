@@ -106,8 +106,6 @@ class MatrixStore:
         PendingTimelineEvents,
     ]
     store_version = 3
-    supports_threaded_writes = False
-
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -561,11 +559,12 @@ class MatrixStore:
                 PendingTimelineEvents.source_json,
                 PendingTimelineEvents.is_live,
                 PendingTimelineEvents.was_encrypted,
+                PendingTimelineEvents.was_completed,
             ],
             where=(
                 (PendingTimelineEvents.generation == 0)
                 & PendingTimelineEvents.was_encrypted
-                & ~EXCLUDED.was_encrypted
+                & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
             ),
         ).execute()
 
@@ -626,6 +625,7 @@ class MatrixStore:
             pending.generation = 0
             pending.is_live = False
             pending.was_encrypted = was_encrypted
+            pending.was_completed = False
             pending.save(force_insert=True)
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)

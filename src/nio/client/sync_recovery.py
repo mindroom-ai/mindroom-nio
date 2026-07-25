@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..api import MessageDirection
 from ..events import BadEventType, Event, MegolmEvent, RoomMemberEvent
-from ..responses import RoomMessagesResponse
+from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
     from ..store.database import MatrixStore
@@ -20,14 +20,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class CommittedCancellation(asyncio.CancelledError):
-    pass
-
-
-FetchMessages = Callable[
-    [str, str, str | None, MessageDirection, int], Awaitable[object]
+FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
+DispatchEvent = Callable[
+    [str, Event | BadEventType, bool, bool],
+    Awaitable[Event | BadEventType | None],
 ]
-DispatchEvent = Callable[[str, Event | BadEventType], Awaitable[Event | None]]
 
 
 @dataclass(frozen=True)
@@ -55,6 +52,7 @@ class PendingTimelineEvent:
     source_json: str
     is_live: bool
     was_encrypted: bool
+    was_completed: bool = False
 
     @classmethod
     def from_event(
@@ -65,6 +63,7 @@ class PendingTimelineEvent:
         event: Event | BadEventType,
         is_live: bool,
         fallback_event_id: str | None = None,
+        was_completed: bool = False,
     ) -> PendingTimelineEvent | None:
         event_id = getattr(event, "event_id", None) or fallback_event_id
         if not event_id:
@@ -78,6 +77,7 @@ class PendingTimelineEvent:
             source,
             is_live,
             isinstance(event, MegolmEvent),
+            was_completed,
         )
 
     def parse(self) -> Event | BadEventType:
@@ -182,12 +182,35 @@ def _plan_live_events(
         existing = known.get(event_id)
         if existing:
             continue
-        if not should_dispatch_timeline_event(state, room_id, event):
+        was_completed = bool(state.completed.get(room_id, {}).get(event_id))
+        if not should_dispatch_timeline_event(state, room_id, event) and not (
+            was_completed and isinstance(event, MegolmEvent)
+        ):
             continue
+        pending = replace(pending, was_completed=was_completed)
         planned.append(pending)
         known[event_id] = pending
         sequence += 1
     return planned
+
+
+def _plan_room_reset(state: RecoveryState, room_id: str) -> RecoveryPlan:
+    gaps = state.gaps.get(room_id, ())
+    live = [
+        event
+        for gap in gaps
+        for event in state.events.get((room_id, gap.generation), ())
+        if event.is_live
+    ]
+    clear = frozenset({room_id})
+    if not live:
+        return RecoveryPlan(clear_rooms=clear)
+    generation = max(gap.generation for gap in gaps) + 1
+    events = tuple(
+        replace(event, generation=generation, sequence=index)
+        for index, event in enumerate(live)
+    )
+    return RecoveryPlan(clear, (RecoveryGap(room_id, generation, "", None),), events)
 
 
 def plan_room_timeline(
@@ -203,7 +226,7 @@ def plan_room_timeline(
     batch_id: str | None = None,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
-        return RecoveryPlan(clear_rooms=frozenset({room_id}))
+        return _plan_room_reset(state, room_id)
 
     last_join = max(
         (
@@ -254,15 +277,11 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     clear_rooms: set[str] = set()
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
-    clear_recovered = None
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
-        clear_recovered = plan.clear_recovered or clear_recovered
-    return RecoveryPlan(
-        frozenset(clear_rooms), tuple(gaps), tuple(events), clear_recovered
-    )
+    return RecoveryPlan(frozenset(clear_rooms), tuple(gaps), tuple(events))
 
 
 def plan_sync_response(
@@ -274,7 +293,7 @@ def plan_sync_response(
     joined_rooms: Mapping[str, Any],
     reset_room_ids: Iterable[str] = (),
 ) -> RecoveryPlan:
-    plan = merge_recovery_plans(
+    plans = [
         plan_room_timeline(
             state,
             room_id=room_id,
@@ -288,12 +307,9 @@ def plan_sync_response(
             batch_id=f"sync:{response_token}",
         )
         for room_id, room_info in joined_rooms.items()
-    )
-    return RecoveryPlan(
-        plan.clear_rooms | frozenset(reset_room_ids),
-        plan.gaps,
-        plan.events,
-    )
+    ]
+    plans.extend(_plan_room_reset(state, room_id) for room_id in reset_room_ids)
+    return merge_recovery_plans(plans)
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
@@ -320,17 +336,10 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.completed.get(event.room_id, {}).pop(event.event_id, None)
         key = (event.room_id, event.generation)
         queued = state.events.setdefault(key, [])
-        _merge_event(queued, event)
+        if not any(item.event_id == event.event_id for item in queued):
+            queued.append(event)
     for key in {(event.room_id, event.generation) for event in plan.events}:
         state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
-
-
-def _merge_event(
-    queued: list[PendingTimelineEvent], event: PendingTimelineEvent
-) -> None:
-    existing = next((item for item in queued if item.event_id == event.event_id), None)
-    if existing is None:
-        queued.append(event)
 
 
 def load_recovery_state(
@@ -363,6 +372,7 @@ def load_recovery_state(
             row.source_json,
             row.is_live,
             row.was_encrypted,
+            row.was_completed,
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
@@ -376,22 +386,11 @@ async def _commit(
     apply: Callable[[], None],
     *args: Any,
 ) -> None:
-    cancelled = False
     if store:
         assert operation
         async with state.write_lock:
-            if not store.supports_threaded_writes:
-                operation(*args)
-            else:
-                task = asyncio.create_task(asyncio.to_thread(operation, *args))
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    await asyncio.shield(task)
-                    cancelled = True
+            operation(*args)
     apply()
-    if cancelled:
-        raise CommittedCancellation
 
 
 async def persist_response_plan(
@@ -471,12 +470,14 @@ async def _collect_slice(
     recovered_count = 0
     clear_recovered = False
     cursor = gap.cursor_token
-    pending_ids = {
-        event.event_id
+    pending = [
+        event
         for (event_room, generation), queued in state.events.items()
         if event_room == gap.room_id and generation > 0
         for event in queued
-    }
+    ]
+    pending_ids = {event.event_id for event in pending}
+    live_ids = {event.event_id for event in pending if event.is_live}
 
     while cursor and pages < options.max_pages and recovered_count < options.max_events:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -502,8 +503,17 @@ async def _collect_slice(
             break
         pages += 1
         if not isinstance(response, RoomMessagesResponse):
-            logger.warning("Limited-timeline recovery stopped in %s", gap.room_id)
-            break
+            if isinstance(response, RoomMessagesError) and response.status_code is None:
+                break
+            logger.error("Abandoning failed gap in %s", gap.room_id)
+            gap = replace(gap, cursor_token=None)
+            await persist_response_plan(
+                state,
+                store,
+                token=None,
+                plan=RecoveryPlan(gaps=(gap,), clear_recovered=gap),
+            )
+            return gap
 
         recovered: list[PendingTimelineEvent] = []
         next_sequence = 1 + max(
@@ -516,27 +526,40 @@ async def _collect_slice(
         )
         chunk = response.chunk[: options.max_events - recovered_count]
         truncated = len(chunk) < len(response.chunk)
+        reached_live = False
         for event in chunk:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
+            if event_id in live_ids and response.end != gap.target_token:
+                reached_live = True
+                break
             if _is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
                 next_sequence = 0
-            if event_id in pending_ids or not should_dispatch_timeline_event(
-                state, gap.room_id, event
+            was_completed = bool(state.completed.get(gap.room_id, {}).get(event_id))
+            if event_id in pending_ids or (
+                not should_dispatch_timeline_event(state, gap.room_id, event)
+                and not (was_completed and isinstance(event, MegolmEvent))
             ):
                 continue
             pending = PendingTimelineEvent.from_event(
-                gap.room_id, gap.generation, next_sequence, event, False
+                gap.room_id,
+                gap.generation,
+                next_sequence,
+                event,
+                False,
+                was_completed=was_completed,
             )
             if pending:
                 recovered.append(pending)
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        if response.end is None or response.end == cursor:
+        if reached_live:
+            next_cursor = None
+        elif response.end is None or response.end == cursor:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
@@ -588,7 +611,9 @@ async def _drain_gap(
             await _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:
-            dispatch = dispatch_event(gap.room_id, event)
+            dispatch = dispatch_event(
+                gap.room_id, event, pending.is_live, pending.was_completed
+            )
             delivered = (
                 await dispatch
                 if deadline is None

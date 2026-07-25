@@ -769,7 +769,7 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
 
-    async def test_ignored_to_abandons_untrusted_page_and_releases_live(
+    async def test_live_boundary_closes_when_server_ignores_to(
         self, client, aioresponse
     ):
         seen = record_events(client)
@@ -804,8 +804,40 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$held"]
+        assert seen == ["$old", "$gap", "$held"]
         assert "$future" not in seen
+        assert not client._recovery.gaps
+
+    async def test_messages_error_abandons_gap_and_releases_live(
+        self, client, aioresponse
+    ):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            status=400,
+            payload={"errcode": "M_UNKNOWN", "error": "no history"},
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
 
     async def test_target_page_recovers_concurrent_dag_branches(
@@ -1380,6 +1412,30 @@ class TestRoomLocalRecovery:
         assert names == ["Before", "Gap", "After"]
         assert client.rooms[ROOM_A].name == "After"
 
+    async def test_live_callbacks_see_each_events_room_state(self, client):
+        seen = []
+
+        async def record_name(room, event):
+            seen.append((event.name, room.name))
+
+        client.add_event_callback(record_name, RoomNameEvent)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [
+                            name_event("$first", 1, "First"),
+                            name_event("$second", 2, "Second"),
+                        ],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        assert seen == [("First", "First"), ("Second", "Second")]
+
     async def test_same_token_response_pumps_pending_room(self, client, aioresponse):
         seen = record_events(client)
         await client.receive_response(
@@ -1749,6 +1805,94 @@ class TestRoomLocalRecovery:
         assert seen == [MegolmEvent, RoomMessageText]
         await restarted.close()
 
+    async def test_recovered_encrypted_event_upgrades_after_keys_arrive(
+        self, client, aioresponse, monkeypatch
+    ):
+        encrypted = megolm_event("$shared", 2)
+        clear = text_event("$shared", 2)
+        record_completed_timeline_event(client._recovery, ROOM_A, "$shared", True)
+        assert client.olm
+        monkeypatch.setattr(
+            client.olm,
+            "_decrypt_megolm_no_error",
+            lambda event: clear if event.event_id == "$shared" else None,
+        )
+        seen = record_events(client)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([encrypted, text_event("$held", 3)], "p1"),
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        assert seen == ["$shared", "$held"]
+        assert client._recovery.completed[ROOM_A]["$shared"] is False
+
+    async def test_encrypted_upgrade_needs_no_post_decrypt_commit(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        encrypted = megolm_event("$shared", 1)
+        clear = text_event("$shared", 1)
+        seen = []
+
+        async def record(_room, event):
+            seen.append(event.event_id)
+
+        client.add_event_callback(record, (MegolmEvent, RoomMessageText))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p0")},
+            )
+        )
+        assert seen == ["$shared"]
+        assert client.olm
+        monkeypatch.setattr(
+            client.olm, "_decrypt_megolm_no_error", lambda _event: clear
+        )
+        original_save = client.store.save_recovery
+        saves = 0
+
+        def fail_second_save(*args):
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                raise RuntimeError("post-decrypt commit failed")
+            original_save(*args)
+
+        monkeypatch.setattr(client.store, "save_recovery", fail_second_save)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {ROOM_A: room_info([encrypted], limited=False, prev_batch="p1")},
+            )
+        )
+        assert saves == 1
+        assert seen == ["$shared", "$shared"]
+        assert client._recovery.completed[ROOM_A]["$shared"] is False
+        await client.close()
+
     async def test_restart_replays_only_active_unacknowledged_row(
         self, tempdir, aioresponse, monkeypatch
     ):
@@ -1991,6 +2135,7 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
         await client.receive_response(
             sync_response(
                 "s1",
@@ -2029,11 +2174,13 @@ class TestRoomLocalRecovery:
         assert isinstance(reset, SlidingSyncResponse)
         await client.receive_response(reset)
         assert not client._recovery.gaps
+        assert seen == ["$seen", "$held"]
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
-        assert list(client._recovery.completed[ROOM_A]) == ["$seen"]
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
         assert [(event.event_id, event.generation) for event in events] == [
-            ("$seen", 0)
+            ("$seen", 0),
+            ("$held", 0),
         ]
         await client.close()
         client.store.database.close()
@@ -2047,7 +2194,7 @@ class TestRoomLocalRecovery:
         )
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         assert not restarted._recovery.gaps
-        assert list(restarted._recovery.completed[ROOM_A]) == ["$seen"]
+        assert list(restarted._recovery.completed[ROOM_A]) == ["$seen", "$held"]
         await restarted.close()
 
     @pytest.mark.parametrize("membership", ["leave", "invite"])
@@ -2067,6 +2214,7 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
         await client.receive_response(
             sync_response(
                 "s1",
@@ -2111,11 +2259,13 @@ class TestRoomLocalRecovery:
             )
         )
         assert not client._recovery.gaps
+        assert seen == ["$seen", "$held"]
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
-        assert list(client._recovery.completed[ROOM_A]) == ["$seen"]
+        assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
         assert [(event.event_id, event.generation) for event in events] == [
-            ("$seen", 0)
+            ("$seen", 0),
+            ("$held", 0),
         ]
         await client.close()
 

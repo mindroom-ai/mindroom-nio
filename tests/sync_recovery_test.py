@@ -19,7 +19,6 @@ from nio.client.sync_recovery import (
     pump_recovery,
 )
 from nio.responses import RoomMessagesResponse
-from nio.store import MatrixStore
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
@@ -71,41 +70,6 @@ def test_no_id_keys_are_scoped_to_the_sliding_connection():
     assert first.events[0].event_id != second.events[0].event_id
 
 
-class BlockingStore:
-    supports_threaded_writes = True
-
-    def __init__(self):
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.writes: list[str] = []
-
-    def save_recovery(self, token, clear_rooms, gaps, events, clear_recovered):
-        if token == "s2":
-            self.started.set()
-            self.release.wait()
-        self.writes.append(token)
-
-
-class BlockingMutationStore:
-    supports_threaded_writes = True
-
-    def __init__(self, operation):
-        self.operation = operation
-        self.started = threading.Event()
-        self.release = threading.Event()
-
-    def _run(self, operation):
-        if self.operation == operation:
-            self.started.set()
-            self.release.wait()
-
-    def save_recovery(self, *args):
-        self._run("progress")
-
-    def finish_recovery(self, room_id, generation, event_id, was_encrypted):
-        self._run("acknowledge" if event_id else "delete")
-
-
 class InlineStore:
     supports_threaded_writes = False
 
@@ -117,40 +81,6 @@ class InlineStore:
 
     def finish_recovery(self, room_id, generation, event_id, was_encrypted):
         self.thread_ids.append(threading.get_ident())
-
-
-@pytest.mark.asyncio
-async def test_cancelled_old_commit_stays_ahead_of_newer_commit():
-    state = RecoveryState()
-    store = BlockingStore()
-    gap = RecoveryGap(ROOM, 1, "p1", "s1")
-    first = asyncio.create_task(
-        persist_response_plan(
-            state,
-            store,
-            token="s2",
-            plan=RecoveryPlan(gaps=(gap,)),
-        )
-    )
-    await asyncio.to_thread(store.started.wait)
-    first.cancel()
-    second = asyncio.create_task(
-        persist_response_plan(
-            state,
-            store,
-            token="s3",
-            plan=RecoveryPlan(),
-        )
-    )
-    await asyncio.sleep(0)
-    assert store.writes == []
-
-    store.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    assert state.gaps == {ROOM: [gap]}
-    await second
-    assert store.writes == ["s2", "s3"]
 
 
 @pytest.mark.asyncio
@@ -173,7 +103,7 @@ async def test_callback_crash_replays_only_active_row():
     calls: list[str] = []
     failed = False
 
-    async def dispatch(_room, value):
+    async def dispatch(_room, value, _is_live, _was_completed):
         nonlocal failed
         calls.append(value.event_id)
         if value.event_id == "$two" and not failed:
@@ -236,7 +166,7 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
             ROOM,
         )
 
-    async def dispatch(_room, value):
+    async def dispatch(_room, value, _is_live, _was_completed):
         seen.append(value.event_id)
         return value
 
@@ -275,7 +205,7 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
             ROOM_B,
         )
 
-    async def dispatch(_room, value):
+    async def dispatch(_room, value, _is_live, _was_completed):
         seen.append(value.event_id)
 
     kwargs = {
@@ -314,7 +244,7 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
             ROOM_B,
         )
 
-    async def dispatch(room_id, value):
+    async def dispatch(room_id, value, _is_live, _was_completed):
         if room_id == ROOM:
             await asyncio.Event().wait()
         seen.append(value.event_id)
@@ -380,7 +310,7 @@ async def test_repeated_target_cursor_abandons_unverifiable_page():
             ROOM,
         )
 
-    async def dispatch(_room, value):
+    async def dispatch(_room, value, _is_live, _was_completed):
         seen.append(value.event_id)
 
     await pump_recovery(
@@ -429,7 +359,7 @@ async def test_hanging_callback_leaves_active_row_pending():
         events={(ROOM, 1): [value]},
     )
 
-    async def dispatch(_room, _event):
+    async def dispatch(_room, _event, _is_live, _was_completed):
         await asyncio.Event().wait()
 
     async def unused_fetch(*args):
@@ -451,7 +381,6 @@ async def test_hanging_callback_leaves_active_row_pending():
 async def test_default_store_commit_stays_on_event_loop_thread():
     state = RecoveryState()
     store = InlineStore()
-    store.supports_threaded_writes = MatrixStore.supports_threaded_writes
     thread_id = threading.get_ident()
     await persist_response_plan(
         state,
@@ -460,56 +389,3 @@ async def test_default_store_commit_stays_on_event_loop_thread():
         plan=RecoveryPlan(gaps=(RecoveryGap(ROOM, 1, "p1", "s1"),)),
     )
     assert store.thread_ids == [thread_id]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["progress", "acknowledge", "delete"])
-async def test_committed_mutation_updates_memory_before_cancellation(operation):
-    cursor = "s1" if operation == "progress" else None
-    queued = [] if operation == "delete" else [pending("$live", 0)]
-    state = RecoveryState(
-        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", cursor)]},
-        events={(ROOM, 1): queued},
-    )
-    store = BlockingMutationStore(operation)
-
-    async def fetch(*args):
-        return RoomMessagesResponse.from_dict(
-            {
-                "start": "s1",
-                "end": "p1",
-                "chunk": [event("$gap", 1).source],
-            },
-            ROOM,
-        )
-
-    async def dispatch(_room, value):
-        return value
-
-    task = asyncio.create_task(
-        pump_recovery(
-            state,
-            user_id="@me:example.org",
-            options=RecoveryOptions(1, 10, 10, 10),
-            fetch_messages=fetch,
-            dispatch_event=dispatch,
-            store=store,
-        )
-    )
-    await asyncio.to_thread(store.started.wait)
-    task.cancel()
-    store.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    if operation == "progress":
-        assert state.gaps[ROOM][0].cursor_token is None
-        assert [item.event_id for item in state.events[(ROOM, 1)]] == [
-            "$gap",
-            "$live",
-        ]
-    elif operation == "acknowledge":
-        assert state.events[(ROOM, 1)] == []
-        assert state.gaps
-    else:
-        assert not state.gaps
