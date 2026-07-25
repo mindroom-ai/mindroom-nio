@@ -27,6 +27,13 @@ DispatchEvent = Callable[
 ]
 
 
+class _LiveCallbackError(Exception):
+    def __init__(self, error: Exception, was_encrypted: bool):
+        super().__init__(error)
+        self.error = error
+        self.was_encrypted = was_encrypted
+
+
 @dataclass(frozen=True)
 class RecoveryOptions:
     max_pages: int
@@ -100,6 +107,7 @@ class RecoveryState:
     )
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
     room_offset: int = 0
+    max_held_events: int = 200
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
@@ -193,18 +201,22 @@ def _plan_live_events(
     return planned
 
 
-def _plan_room_reset(state: RecoveryState, room_id: str) -> RecoveryPlan:
+def _plan_room_reset(
+    state: RecoveryState,
+    room_id: str,
+    additional_events: Iterable[PendingTimelineEvent] = (),
+) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
         event
         for gap in gaps
         for event in state.events.get((room_id, gap.generation), ())
         if event.is_live
-    ]
+    ] + list(additional_events)
     clear = frozenset({room_id})
     if not live:
         return RecoveryPlan(clear_rooms=clear)
-    generation = max(gap.generation for gap in gaps) + 1
+    generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
         replace(event, generation=generation, sequence=index)
         for index, event in enumerate(live)
@@ -255,6 +267,14 @@ def plan_room_timeline(
         include_pending=not clear,
         batch_id=batch_id,
     )
+    held_count = sum(
+        event.is_live
+        for gap in existing
+        for event in state.events.get((room_id, gap.generation), ())
+    )
+    if existing and held_count + len(events) > state.max_held_events:
+        logger.error("Abandoning recovery with too many held events in %s", room_id)
+        return _plan_room_reset(state, room_id, events)
     gap = (
         RecoveryGap(
             room_id,
@@ -378,45 +398,38 @@ def load_recovery_state(
         queued.sort(key=lambda event: (event.is_live, event.sequence))
 
 
-async def _commit(
-    state: RecoveryState,
-    store: MatrixStore | None,
-    operation: Callable[..., None] | None,
-    apply: Callable[[], None],
-    *args: Any,
-) -> None:
-    if store:
-        assert operation
-        operation(*args)
-    apply()
-
-
-async def persist_response_plan(
+def persist_response_plan(
     state: RecoveryState,
     store: MatrixStore | None,
     *,
     token: str | None,
     plan: RecoveryPlan,
 ) -> None:
-    await _commit(
-        state,
-        store,
-        store.save_recovery if store else None,
-        lambda: apply_plan(state, plan),
-        token,
-        set(plan.clear_rooms),
-        plan.gaps,
-        plan.events,
-        plan.clear_recovered,
-    )
+    if store:
+        store.save_recovery(
+            token,
+            set(plan.clear_rooms),
+            plan.gaps,
+            plan.events,
+            plan.clear_recovered,
+        )
+    apply_plan(state, plan)
 
 
-def _finish_memory(
+def _finish(
     state: RecoveryState,
+    store: MatrixStore | None,
     gap: RecoveryGap,
-    event: PendingTimelineEvent | None,
-    was_encrypted: bool,
+    event: PendingTimelineEvent | None = None,
+    was_encrypted: bool = False,
 ) -> None:
+    if store:
+        store.finish_recovery(
+            gap.room_id,
+            gap.generation,
+            event.event_id if event else None,
+            was_encrypted,
+        )
     key = (gap.room_id, gap.generation)
     if event:
         state.events[key].remove(event)
@@ -430,25 +443,6 @@ def _finish_memory(
     gaps.remove(gap)
     if not gaps:
         state.gaps.pop(gap.room_id)
-
-
-async def _finish(
-    state: RecoveryState,
-    store: MatrixStore | None,
-    gap: RecoveryGap,
-    event: PendingTimelineEvent | None = None,
-    was_encrypted: bool = False,
-) -> None:
-    await _commit(
-        state,
-        store,
-        store.finish_recovery if store else None,
-        lambda: _finish_memory(state, gap, event, was_encrypted),
-        gap.room_id,
-        gap.generation,
-        event.event_id if event else None,
-        was_encrypted,
-    )
 
 
 async def _collect_slice(
@@ -507,7 +501,7 @@ async def _collect_slice(
                     break
             logger.error("Abandoning failed gap in %s", gap.room_id)
             gap = replace(gap, cursor_token=None)
-            await persist_response_plan(
+            persist_response_plan(
                 state,
                 store,
                 token=None,
@@ -568,7 +562,7 @@ async def _collect_slice(
             next_cursor = response.end
 
         updated = replace(gap, cursor_token=next_cursor)
-        await persist_response_plan(
+        persist_response_plan(
             state,
             store,
             token=None,
@@ -602,7 +596,7 @@ async def _drain_gap(
             event = pending.parse()
         except Exception:
             logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
-            await _finish(state, store, gap, pending, pending.was_encrypted)
+            _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:
             dispatch = dispatch_event(
@@ -615,15 +609,16 @@ async def _drain_gap(
                     dispatch, timeout=deadline - asyncio.get_running_loop().time()
                 )
             )
+        except _LiveCallbackError as error:
+            _finish(state, store, gap, pending, error.was_encrypted)
+            raise error.error
         except asyncio.TimeoutError:
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
             return
         except Exception:
-            if pending.is_live:
-                raise
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
-        await _finish(
+        _finish(
             state,
             store,
             gap,
@@ -631,7 +626,7 @@ async def _drain_gap(
             isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted,
         )
 
-    await _finish(state, store, gap)
+    _finish(state, store, gap)
 
 
 async def pump_recovery(

@@ -382,7 +382,7 @@ async def test_default_store_commit_stays_on_event_loop_thread():
     state = RecoveryState()
     store = InlineStore()
     thread_id = threading.get_ident()
-    await persist_response_plan(
+    persist_response_plan(
         state,
         store,
         token="s2",

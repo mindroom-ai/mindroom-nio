@@ -249,6 +249,7 @@ from .base_client import (
 from .sync_recovery import (
     RecoveryOptions,
     RecoveryState,
+    _LiveCallbackError,
     load_recovery_state,
     merge_recovery_plans,
     persist_response_plan,
@@ -362,9 +363,17 @@ class AsyncClientConfig(ClientConfig):
             streams when saving files to disk.
             Defaults to 64 KiB.
 
-        backfill_limited_timelines (bool): Recover limited timelines with room-local durable ordering; live callback exceptions propagate normally, recovered-history callbacks fan out before acknowledgement, restart persistence requires encryption and sync-token storage, and disabled mode preserves upstream behavior.
+        backfill_limited_timelines (bool): Recover limited timelines through a
+            durable room-local queue.
+            Limited lanes block sends until their history obligation clears.
+            Live callback errors propagate after acknowledgement, while
+            recovered-history callback errors fan out before acknowledgement.
+            Restart persistence requires encryption and sync-token storage.
+            Disabled mode preserves upstream behavior.
         backfill_max_pages (int): Maximum pages per room per pump.
-        backfill_max_events (int): Maximum events per room per pump.
+        backfill_max_events (int): Maximum events per room per pump and maximum
+            live events held behind a stuck gap.
+            Exceeding the held-event bound abandons unverified history.
         backfill_page_size (int): Events requested per page.
         backfill_timeout (float): Seconds available to one recovery pump.
     """
@@ -484,7 +493,7 @@ class AsyncClient(Client):
         # The token the in-flight sync request resumed from.
         self._sync_since: str | None = None
 
-        self._recovery = RecoveryState()
+        self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
 
         # Sliding account data retained until its room is known.
         self._pending_sliding_room_account_data: dict[
@@ -635,37 +644,21 @@ class AsyncClient(Client):
         resp.transport_response = transport_response
         return resp
 
-    def _prepare_to_device(
+    async def _handle_to_device(
         self, response: SyncResponse | SlidingSyncResponse
-    ) -> list[ToDeviceEvent]:
-        """Process crypto state before persistence, deferring user callbacks."""
+    ) -> None:
         decrypted_to_device = []
-        callback_events = []
 
         for index, to_device_event in enumerate(response.to_device_events):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
                 decrypted_to_device.append((index, decrypted_event))
-                to_device_event = decrypted_event
-
-            # Do not pass room key request events to our user here. We don't
-            # want to notify them about requests that get automatically handled
-            # or canceled right away.
-            if isinstance(
-                to_device_event, (RoomKeyRequest, RoomKeyRequestCancellation)
-            ):
-                continue
-
-            callback_events.append(to_device_event)
 
         self._replace_decrypted_to_device(decrypted_to_device, response)
-        return callback_events
-
-    async def _handle_to_device(
-        self, response: SyncResponse | SlidingSyncResponse
-    ) -> None:
-        for event in self._prepare_to_device(response):
+        for event in response.to_device_events:
+            if isinstance(event, (RoomKeyRequest, RoomKeyRequestCancellation)):
+                continue
             await self._on_to_device(event)
 
     async def _handle_invited_rooms(self, response: SyncResponse) -> None:
@@ -762,9 +755,11 @@ class AsyncClient(Client):
         for callback in self.event_callbacks:
             try:
                 await callback.async_execute(event, room)
-            except Exception:  # noqa: PERF203
+            except Exception as error:  # noqa: PERF203
                 if is_live:
-                    raise
+                    raise _LiveCallbackError(
+                        error, isinstance(event, MegolmEvent)
+                    ) from error
                 logger.exception("Timeline event callback failed")
         return event
 
@@ -897,7 +892,7 @@ class AsyncClient(Client):
                 reset_room_ids=(set(response.rooms.leave) | set(response.rooms.invite)),
             )
             try:
-                await persist_response_plan(
+                persist_response_plan(
                     self._recovery,
                     (self.store if self.config.store_sync_tokens else None),
                     token=response.next_batch,
@@ -933,7 +928,7 @@ class AsyncClient(Client):
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
         if self.config.backfill_limited_timelines:
-            await persist_response_plan(
+            persist_response_plan(
                 self._recovery,
                 self.store if self.config.store_sync_tokens else None,
                 token=None,
@@ -2745,7 +2740,10 @@ class AsyncClient(Client):
         """
         uuid: str | UUID = tx_id or uuid4()
 
-        if self._recovery.gaps.get(room_id):
+        if any(
+            gap.cursor_token is not None or gap.target_token
+            for gap in self._recovery.gaps.get(room_id, ())
+        ):
             raise SendRetryError("Room timeline recovery is still pending.")
 
         if self.olm:

@@ -43,6 +43,7 @@ from nio.client.sync_recovery import (
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
 MESSAGES_URL = re.compile(rf"^{BASE_URL}/rooms/.+/messages")
+SEND_URL = re.compile(rf"^{BASE_URL}/rooms/.+/send/m.room.message/.+")
 SYNC_URL = re.compile(rf"^{BASE_URL}/sync")
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
@@ -177,6 +178,31 @@ def sync_json(token: str, joined: dict[str, RoomInfo]) -> dict:
         "presence": {"events": []},
         "account_data": {"events": []},
     }
+
+
+def timeline_response(
+    protocol: str,
+    token: str,
+    events: list[RoomMessageText],
+) -> SyncResponse | SlidingSyncResponse:
+    if protocol == "classic":
+        return sync_response(
+            token,
+            {ROOM_A: room_info(events, limited=False, prev_batch="p0")},
+        )
+    response = SlidingSyncResponse.from_dict(
+        {
+            "pos": token,
+            "rooms": {
+                ROOM_A: {
+                    "membership": "join",
+                    "timeline": [event.source for event in events],
+                }
+            },
+        }
+    )
+    assert isinstance(response, SlidingSyncResponse)
+    return response
 
 
 def messages(events: list, end: str | None) -> dict:
@@ -641,6 +667,124 @@ class TestRoomLocalRecovery:
                 "m.room.message",
                 {"body": "secret", "msgtype": "m.text"},
             )
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_live_callback_can_send_without_recovery_gap(
+        self, client, aioresponse, protocol
+    ):
+        sent = []
+        aioresponse.put(SEND_URL, payload={"event_id": "$sent"})
+
+        async def send(_room, event):
+            sent.append(
+                await client.room_send(
+                    ROOM_A,
+                    "m.room.message",
+                    {"body": event.event_id, "msgtype": "m.text"},
+                    "tx",
+                )
+            )
+
+        client.add_event_callback(send, RoomMessageText)
+        await client.receive_response(
+            timeline_response(protocol, "s1", [text_event("$live", 1)])
+        )
+        assert [response.event_id for response in sent] == ["$sent"]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize(
+        "error_type",
+        [RuntimeError, asyncio.TimeoutError],
+        ids=["runtime-error", "timeout-error"],
+    )
+    async def test_live_callback_error_is_acked_and_does_not_wedge(
+        self, client, protocol, error_type
+    ):
+        calls = []
+        failed = False
+
+        async def first(_room, event):
+            calls.append(f"first:{event.event_id}")
+
+        async def fail_once(_room, event):
+            nonlocal failed
+            calls.append(f"failing:{event.event_id}")
+            if event.event_id == "$bad" and not failed:
+                failed = True
+                raise error_type("callback failed")
+
+        async def last(_room, event):
+            calls.append(f"last:{event.event_id}")
+
+        for callback in (first, fail_once, last):
+            client.add_event_callback(callback, RoomMessageText)
+        response = timeline_response(
+            protocol,
+            "s1",
+            [text_event("$bad", 1), text_event("$after", 2)],
+        )
+        with pytest.raises(error_type, match="callback failed"):
+            await client.receive_response(response)
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$after"
+        ]
+
+        await client.receive_response(response)
+        await client.receive_response(
+            timeline_response(protocol, "s2", [text_event("$next", 3)])
+        )
+        assert calls == [
+            "first:$bad",
+            "failing:$bad",
+            "first:$after",
+            "failing:$after",
+            "last:$after",
+            "first:$next",
+            "failing:$next",
+            "last:$next",
+        ]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_held_live_bound_abandons_stuck_gap(self, tempdir, protocol):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+                backfill_timeout=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held1", 1)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        await client.receive_response(
+            timeline_response(protocol, "s2", [text_event("$held2", 2)])
+        )
+        assert seen == []
+
+        await client.receive_response(
+            timeline_response(protocol, "s3", [text_event("$held3", 3)])
+        )
+        assert seen == ["$held1", "$held2", "$held3"]
+        assert not client._recovery.gaps
+        await client.close()
 
     async def test_repeated_end_token_abandons_gap_and_releases_live(
         self, client, aioresponse
@@ -2500,9 +2644,8 @@ class TestRoomLocalRecovery:
             "first:$b",
             "failing:$b",
         ]
-        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
-            "$b"
-        ]
+        assert client._recovery.events[(ROOM_A, 1)] == []
+        assert "$b" in client._recovery.completed[ROOM_A]
 
     async def test_sliding_sync_dedup_stays_bounded(self, client):
         seen = record_events(client)
@@ -2573,14 +2716,14 @@ class TestRoomLocalRecovery:
         def fail(*args, **kwargs):
             raise RuntimeError("commit failed")
 
-        prepared = []
-        original_prepare = client._prepare_to_device
+        handled = []
+        original_handle = client._handle_to_device
 
-        def prepare(response):
-            prepared.append(response)
-            return original_prepare(response)
+        async def handle(response):
+            handled.append(response)
+            await original_handle(response)
 
-        monkeypatch.setattr(client, "_prepare_to_device", prepare)
+        monkeypatch.setattr(client, "_handle_to_device", handle)
         monkeypatch.setattr(client.store, "save_recovery", fail)
         with pytest.raises(RuntimeError, match="commit failed"):
             await client.receive_response(
@@ -2596,7 +2739,7 @@ class TestRoomLocalRecovery:
         assert client.next_batch == "s1"
         assert client.store.load_sync_token() == "s1"
         assert not client._recovery.gaps
-        assert prepared == []
+        assert handled == []
         await client.close()
 
     async def test_failed_sliding_plan_commit_keeps_to_device_cursor(
@@ -2614,12 +2757,12 @@ class TestRoomLocalRecovery:
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         client._sliding_sync_to_device_since = "td0"
-        prepared = []
-        monkeypatch.setattr(
-            client,
-            "_prepare_to_device",
-            lambda response: prepared.append(response) or [],
-        )
+        handled = []
+
+        async def handle(response):
+            handled.append(response)
+
+        monkeypatch.setattr(client, "_handle_to_device", handle)
 
         def fail(*_args):
             raise RuntimeError("commit failed")
@@ -2643,7 +2786,7 @@ class TestRoomLocalRecovery:
         with pytest.raises(RuntimeError, match="commit failed"):
             await client.receive_response(response)
         assert client._sliding_sync_to_device_since == "td0"
-        assert prepared == []
+        assert handled == []
         assert not client._recovery.gaps
         await client.close()
 
