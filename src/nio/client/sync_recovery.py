@@ -124,6 +124,9 @@ class RecoveryPlan:
     gaps: tuple[RecoveryGap, ...] = ()
     events: tuple[PendingTimelineEvent, ...] = ()
     clear_recovered: RecoveryGap | None = None
+    #: Rooms whose gap this plan closes by giving up on it rather than by
+    #: walking it. The events it covered are gone for good.
+    abandoned_rooms: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -135,6 +138,12 @@ class RecoveryState:
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
+    #: Room id to whether the gap that closed for it delivered everything it
+    #: covered. Written as gaps close and drained by the sync handler that
+    #: reports them, so a room appears here only for the response that
+    #: settled it. Kept in memory only: a gap the process dies on is still
+    #: recorded as a gap, and is settled again after the restart.
+    outcomes: dict[str, bool] = field(default_factory=dict)
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
@@ -255,6 +264,8 @@ def _plan_room_reset(
     state: RecoveryState,
     room_id: str,
     additional_events: Iterable[PendingTimelineEvent] = (),
+    *,
+    abandoned: bool = False,
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -264,14 +275,20 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
+    abandoned_rooms = frozenset({room_id}) if abandoned else frozenset()
     if not live:
-        return RecoveryPlan(clear_rooms=clear)
+        return RecoveryPlan(clear_rooms=clear, abandoned_rooms=abandoned_rooms)
     generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
         replace(event, generation=generation, sequence=index)
         for index, event in enumerate(live)
     )
-    return RecoveryPlan(clear, (RecoveryGap(room_id, generation, "", None),), events)
+    return RecoveryPlan(
+        clear,
+        (RecoveryGap(room_id, generation, "", None),),
+        events,
+        abandoned_rooms=abandoned_rooms,
+    )
 
 
 def plan_room_timeline(
@@ -358,7 +375,7 @@ def plan_room_timeline(
     )
     if (new_gap or existing) and held_count + len(events) > state.max_held_events:
         logger.error("Abandoning recovery with too many held events in %s", room_id)
-        return _plan_room_reset(state, room_id, events)
+        return _plan_room_reset(state, room_id, events, abandoned=True)
     gap = (
         RecoveryGap(
             room_id,
@@ -380,11 +397,18 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     clear_rooms: set[str] = set()
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
+    abandoned_rooms: set[str] = set()
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
-    return RecoveryPlan(frozenset(clear_rooms), tuple(gaps), tuple(events))
+        abandoned_rooms.update(plan.abandoned_rooms)
+    return RecoveryPlan(
+        frozenset(clear_rooms),
+        tuple(gaps),
+        tuple(events),
+        abandoned_rooms=frozenset(abandoned_rooms),
+    )
 
 
 def plan_sync_response(
@@ -418,6 +442,9 @@ def plan_sync_response(
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
+    for room_id in plan.abandoned_rooms:
+        state.outcomes[room_id] = False
+
     for room_id in plan.clear_rooms:
         for gap in state.gaps.pop(room_id, ()):
             for event in state.events.pop((room_id, gap.generation), ()):
@@ -460,6 +487,26 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
 
 
+def take_recovery_outcomes(
+    state: RecoveryState,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Drain the rooms settled since the last call into recovered and not.
+
+    A room is only reported recovered once nio has walked its gap to the
+    sync window and handed every event it found to the callbacks. A gap
+    that is still open, or that was given up on, reports the room
+    unrecovered instead — the two are indistinguishable from
+    :attr:`RecoveryState.gaps` alone, because abandoning a gap removes it
+    just as closing it does. Rooms nio never had a gap for appear in
+    neither set.
+    """
+    outcomes = state.outcomes
+    state.outcomes = {}
+    pending = frozenset(state.gaps)
+    recovered = frozenset(room_id for room_id, ok in outcomes.items() if ok) - pending
+    return recovered, (frozenset(outcomes) - recovered) | pending
+
+
 def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
@@ -468,6 +515,7 @@ def load_recovery_state(
     state.gaps.clear()
     state.events.clear()
     state.completed.clear()
+    state.outcomes.clear()
     for row in gaps:
         gap = RecoveryGap(
             row.room_id, row.generation, row.target_token, row.cursor_token
@@ -543,6 +591,12 @@ def _finish(
     gaps.remove(gap)
     if not gaps:
         state.gaps.pop(gap.room_id)
+    # Only a gap that came from a limited timeline carries a target token;
+    # the generations that merely hold live events in order are not a
+    # recovery outcome to report. An abandonment already recorded its
+    # verdict, and keeps it.
+    if gap.target_token:
+        state.outcomes.setdefault(gap.room_id, True)
 
 
 async def _collect_slice(
@@ -572,6 +626,7 @@ async def _collect_slice(
 
     while cursor and pages < options.max_pages:
         clear_recovered = False
+        abandoned = False
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
@@ -604,7 +659,11 @@ async def _collect_slice(
                 state,
                 store,
                 token=None,
-                plan=RecoveryPlan(gaps=(gap,), clear_recovered=gap),
+                plan=RecoveryPlan(
+                    gaps=(gap,),
+                    clear_recovered=gap,
+                    abandoned_rooms=frozenset({gap.room_id}),
+                ),
             )
             return gap
 
@@ -659,6 +718,7 @@ async def _collect_slice(
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
+            abandoned = True
             next_cursor = None
         elif reached_window:
             next_cursor = None
@@ -683,6 +743,7 @@ async def _collect_slice(
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
+            abandoned = True
             next_cursor = None
         elif response.end == gap.target_token:
             next_cursor = None
@@ -698,6 +759,9 @@ async def _collect_slice(
                 gaps=(updated,),
                 events=tuple(recovered),
                 clear_recovered=updated if clear_recovered else None,
+                abandoned_rooms=(
+                    frozenset({gap.room_id}) if abandoned else frozenset()
+                ),
             ),
         )
         gap = updated
@@ -723,6 +787,9 @@ async def _drain_gap(
             event = pending.parse()
         except Exception:
             logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
+            # The event is gone, so the gap it belonged to cannot be
+            # reported as fully delivered.
+            state.outcomes[gap.room_id] = False
             _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:

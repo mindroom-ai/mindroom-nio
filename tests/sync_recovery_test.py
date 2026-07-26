@@ -17,6 +17,7 @@ from nio.client.sync_recovery import (
     persist_response_plan,
     plan_room_timeline,
     pump_recovery,
+    take_recovery_outcomes,
 )
 from nio.responses import RoomMessagesResponse
 
@@ -643,3 +644,16 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
         for queued in queued_events
         if not queued.is_live
     ] == ["$later-recovered"]
+
+
+def test_open_gap_outranks_a_settled_outcome():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 2, "p2", "s2")]},
+        outcomes={ROOM: True, ROOM_B: False},
+    )
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM, ROOM_B}),
+    )
+    # Settled rooms are reported once; an open gap keeps reporting.
+    assert take_recovery_outcomes(state) == (frozenset(), frozenset({ROOM}))

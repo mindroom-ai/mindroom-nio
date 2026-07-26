@@ -2055,6 +2055,24 @@ class RoomContextResponse(Response):
 
 @dataclass
 class SyncResponse(Response):
+    """A response for a /sync request.
+
+    Attributes:
+        recovered_room_ids (FrozenSet[str]): Rooms whose limited-timeline
+            gap nio closed while handling this response, having walked the
+            gap and dispatched every event it found. Only populated when
+            ``AsyncClientConfig.backfill_limited_timelines`` is enabled.
+            The gap may have been opened by an earlier response: recovery
+            spans as many responses as it needs.
+        unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-timeline
+            gap that is still open, or that nio gave up on. Events in those
+            rooms may never be delivered.
+
+    ``timeline.limited`` keeps reporting what the server sent, whether or
+    not the gap behind it was recovered. A room absent from both sets had
+    no gap for nio to act on.
+    """
+
     next_batch: str = field()
     rooms: Rooms = field()
     device_key_count: DeviceOneTimeKeyCount = field()
@@ -2062,6 +2080,8 @@ class SyncResponse(Response):
     to_device_events: list[ToDeviceEvent] = field()
     presence_events: list[PresenceEvent] = field()
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
+    recovered_room_ids: frozenset[str] = frozenset()
+    unrecovered_room_ids: frozenset[str] = frozenset()
 
     def __str__(self) -> str:
         result = []
@@ -2305,6 +2325,12 @@ class SlidingSyncResponse(Response):
         room_account_data (Dict[str, List[AccountDataEvent]]): Per-room
             account data events from the ``account_data`` extension, keyed
             by room id.
+        recovered_room_ids (FrozenSet[str]): Rooms whose limited-window gap
+            nio closed while handling this response, mirroring
+            ``SyncResponse.recovered_room_ids``.
+        unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window
+            gap that is still open, or that nio gave up on, mirroring
+            ``SyncResponse.unrecovered_room_ids``.
     """
 
     pos: str = field()
@@ -2319,6 +2345,8 @@ class SlidingSyncResponse(Response):
     device_list: DeviceList = field(default_factory=lambda: DeviceList([], []))
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
     room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
+    recovered_room_ids: frozenset[str] = frozenset()
+    unrecovered_room_ids: frozenset[str] = frozenset()
 
     @staticmethod
     def _parse_list(

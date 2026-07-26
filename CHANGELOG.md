@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Report the outcome of limited-timeline recovery on the sync response.
+  `backfill_limited_timelines` walked a gap and dispatched what it found,
+  but told the caller nothing: `timeline.limited` still said the room was
+  limited, and a caller could not tell a recovered room from one whose gap
+  was still open, so the only safe reading was to distrust every limited
+  room and pay for the recovery twice. `SyncResponse` and
+  `SlidingSyncResponse` now carry `recovered_room_ids` and
+  `unrecovered_room_ids`, populated while the response is handled and
+  therefore visible to response callbacks. A room is only reported
+  recovered once its gap was walked to the sync window and every event it
+  found reached the callbacks; a gap that is still open, or that recovery
+  gave up on, reports the room unrecovered instead. The two cannot be told
+  apart from the client's gap state, because abandoning a gap removes it
+  just as closing it does. A gap opened by one response can close several
+  responses later, and is reported on the response that closed it.
+  `timeline.limited` is left reporting what the server sent.
+
 ## 0.31.0
 
 ### Features

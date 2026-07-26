@@ -3917,3 +3917,311 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$prejoin", "$join", "$after"]
         assert not client._recovery.gaps
+
+
+@pytest.mark.asyncio
+class TestRecoveryOutcome:
+    """The caller must be able to tell a closed gap from a lost one."""
+
+    async def test_untouched_response_reports_no_recovery(self, client):
+        response = sync_response(
+            "s1",
+            {ROOM_A: room_info([text_event("$a", 1)], limited=False, prev_batch="p0")},
+        )
+        await client.receive_response(response)
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()
+
+    async def test_closed_gap_reports_the_room_recovered(self, client, aioresponse):
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            callback=Pages(
+                {"s1": messages([text_event("$gap", 2), text_event("$live", 3)], "p1")}
+            ),
+            repeat=True,
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+        assert seen == ["$old", "$gap", "$live"]
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        # The wire flag is what the server said, and stays that way.
+        assert response.rooms.join[ROOM_A].timeline.limited is True
+
+    async def test_pending_gap_reports_the_room_unrecovered(self, client, aioresponse):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_abandoned_gap_reports_the_room_unrecovered(
+        self, client, aioresponse
+    ):
+        """A gap nio gave up on leaves no gap behind, and is not a recovery."""
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=403, body="forbidden")
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+        assert seen == ["$old", "$held"]
+        assert not client._recovery.gaps
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_unverifiable_page_reports_the_room_unrecovered(
+        self, client, aioresponse
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, payload=messages([text_event("$gap", 2)], "s1"))
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+        assert not client._recovery.gaps
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_late_recovery_is_reported_on_the_response_that_closed_it(
+        self, client, aioresponse
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        pending = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(pending)
+        assert pending.unrecovered_room_ids == frozenset({ROOM_A})
+
+        aioresponse.get(
+            MESSAGES_URL,
+            callback=Pages(
+                {"s1": messages([text_event("$gap", 2), text_event("$held", 3)], "p1")}
+            ),
+            repeat=True,
+        )
+        closing = sync_response("s3", {})
+        await client.receive_response(closing)
+        assert not client._recovery.gaps
+        assert closing.recovered_room_ids == frozenset({ROOM_A})
+        assert closing.unrecovered_room_ids == frozenset()
+
+    async def test_one_room_recovers_while_another_stays_open(
+        self, client, aioresponse
+    ):
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$olda", 1)], limited=False, prev_batch="p0"
+                    ),
+                    ROOM_B: room_info(
+                        [text_event("$oldb", 1, ROOM_B)],
+                        limited=False,
+                        prev_batch="p0",
+                    ),
+                },
+            )
+        )
+
+        def page(url, **kwargs) -> CallbackResult:
+            if ROOM_B in str(url):
+                return CallbackResult(status=500)
+            return CallbackResult(
+                status=200,
+                payload=messages(
+                    [text_event("$gapa", 2), text_event("$livea", 3)], "p1"
+                ),
+            )
+
+        aioresponse.get(MESSAGES_URL, callback=page, repeat=True)
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$livea", 3)], limited=True, prev_batch="p1"
+                ),
+                ROOM_B: room_info(
+                    [text_event("$liveb", 3, ROOM_B)], limited=True, prev_batch="p1"
+                ),
+            },
+        )
+        await client.receive_response(response)
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset({ROOM_B})
+
+    async def test_sliding_response_reports_recovery(self, client, aioresponse):
+        first = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "timeline": [text_event("$old", 1).source],
+                        "prev_batch": "w1",
+                    }
+                },
+            }
+        )
+        assert isinstance(first, SlidingSyncResponse)
+        await client.receive_response(first)
+        assert first.recovered_room_ids == frozenset()
+
+        aioresponse.get(
+            MESSAGES_URL,
+            callback=Pages(
+                {"w1": messages([text_event("$gap", 2), text_event("$live", 3)], "w2")}
+            ),
+            repeat=True,
+        )
+        second = SlidingSyncResponse.from_dict(
+            {
+                "pos": "p2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "limited": True,
+                        "timeline": [text_event("$live", 3).source],
+                        "prev_batch": "w2",
+                    }
+                },
+            }
+        )
+        assert isinstance(second, SlidingSyncResponse)
+        await client.receive_response(second)
+        assert second.recovered_room_ids == frozenset({ROOM_A})
+        assert second.unrecovered_room_ids == frozenset()
+
+    async def test_held_event_overflow_reports_the_room_unrecovered(
+        self, tempdir, aioresponse
+    ):
+        """Giving up because too many live events piled up is not a recovery."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_events=2,
+                backfill_timeout=0,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held1", 1)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held2", 2)], limited=False, prev_batch="p2"
+                    )
+                },
+            )
+        )
+        overflowing = sync_response(
+            "s3",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held3", 3)], limited=False, prev_batch="p3"
+                )
+            },
+        )
+        await client.receive_response(overflowing)
+        assert seen == ["$held1", "$held2", "$held3"]
+        assert not client._recovery.gaps
+        assert overflowing.recovered_room_ids == frozenset()
+        assert overflowing.unrecovered_room_ids == frozenset({ROOM_A})
+        await client.close()
