@@ -197,7 +197,16 @@ def verify(schema, error_class, pass_arguments=True):
                 logger.debug("Validating response schema %r: %s", schema, parsed_dict)
                 validate_json(parsed_dict, schema)
             except (SchemaError, ValidationError) as e:
-                logger.warning("Error validating response: " + str(e.message))
+                # An error body fails the success schema, so report the errcode the
+                # server sent alongside the missing success field. Only these two
+                # fields are logged; the rest of the body may hold user content.
+                body = parsed_dict if isinstance(parsed_dict, dict) else {}
+                logger.warning(
+                    "Error validating response: %s (errcode=%s, error=%s)",
+                    e.message,
+                    body.get("errcode"),
+                    body.get("error"),
+                )
 
                 if pass_arguments:
                     return error_class.from_dict(parsed_dict, *args, **kwargs)
