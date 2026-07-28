@@ -139,6 +139,11 @@ class RecoveryState:
     max_held_events: int = 200
 
 
+def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+    """Whether this event is our own transition into the room."""
+    return _is_own_join(event, user_id)
+
+
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
     return bool(
         user_id
@@ -506,6 +511,8 @@ def persist_response_plan(
     *,
     token: str | None,
     plan: RecoveryPlan,
+    window_tokens: Mapping[str, str] | None = None,
+    forgotten_rooms: Iterable[str] = (),
 ) -> None:
     if store:
         store.save_recovery(
@@ -514,6 +521,8 @@ def persist_response_plan(
             plan.gaps,
             plan.events,
             plan.clear_recovered,
+            window_tokens,
+            forgotten_rooms,
         )
     apply_plan(state, plan)
 

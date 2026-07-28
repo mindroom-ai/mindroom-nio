@@ -26,6 +26,11 @@ async def main() -> None:
         "--transport", choices=("classic", "sliding"), default="classic"
     )
     parser.add_argument("--concurrent", action="store_true")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="tear the reader down mid-flood and rebuild it from its store",
+    )
     args = parser.parse_args()
 
     suffix = secrets.token_hex(4)
@@ -35,7 +40,9 @@ async def main() -> None:
 
     config = AsyncClientConfig(
         store_sync_tokens=True,
-        encryption_enabled=False,
+        # A store only exists when encryption is enabled, and without one
+        # nothing about recovery is durable.
+        encryption_enabled=True,
         backfill_limited_timelines=True,
         backfill_max_pages=100,
         backfill_max_events=10_000,
@@ -54,20 +61,21 @@ async def main() -> None:
     # Trace the recovery walk itself: what the client asked /messages for,
     # and what came back, is the only way to see which boundary proof the
     # walk found (or failed to find).
-    original_fetch = reader._recovery_room_messages
+    def traced_fetch_for(original):
+        async def traced_fetch(room_id, start, end, direction, limit):
+            resp = await original(room_id, start, end, direction, limit)
+            bodies = [getattr(e, "body", None) for e in getattr(resp, "chunk", [])]
+            print(
+                f"  walk: from={start!r} to={end!r} dir={direction} -> "
+                f"n={len(bodies)} end={getattr(resp, 'end', None)!r} "
+                f"first={bodies[0] if bodies else None!r} "
+                f"last={bodies[-1] if bodies else None!r}"
+            )
+            return resp
 
-    async def traced_fetch(room_id, start, end, direction, limit):
-        resp = await original_fetch(room_id, start, end, direction, limit)
-        bodies = [getattr(e, "body", None) for e in getattr(resp, "chunk", [])]
-        print(
-            f"  walk: from={start!r} to={end!r} dir={direction} -> "
-            f"n={len(bodies)} end={getattr(resp, 'end', None)!r} "
-            f"first={bodies[0] if bodies else None!r} "
-            f"last={bodies[-1] if bodies else None!r}"
-        )
-        return resp
+        return traced_fetch
 
-    reader._recovery_room_messages = traced_fetch
+    reader._recovery_room_messages = traced_fetch_for(reader._recovery_room_messages)
 
     seen = []
 
@@ -120,6 +128,55 @@ async def main() -> None:
         for body in sent:
             await writer.room_send(
                 room_id, "m.room.message", {"msgtype": "m.text", "body": body}
+            )
+
+    if args.restart:
+        # Rebuild the reader from its store while the writer keeps going:
+        # whatever the walk needs across the boundary has to come off disk.
+        credentials = (reader.user_id, reader.device_id, reader.access_token)
+        store_path = reader.store_path
+        reader.stop_sync_forever()
+        await asyncio.wait_for(task, 120)
+        await reader.close()
+        print(f"  restart: reader down, {len(seen)} events dispatched so far")
+
+        for i in range(args.messages, args.messages + 20):
+            body = f"probe-{i}"
+            sent.append(body)
+            await writer.room_send(
+                room_id, "m.room.message", {"msgtype": "m.text", "body": body}
+            )
+        print("  restart: wrote 20 events while the reader was down")
+
+        user_id, device_id, access_token = credentials
+        reader = AsyncClient(
+            args.homeserver, user_id, device_id, store_path, config=config
+        )
+        reader.restore_login(user_id, device_id, access_token)
+        print(f"  restart: reloaded tokens {reader._sliding_room_prev_batch}")
+        reader.add_event_callback(cb, RoomMessageText)
+        original_fetch = reader._recovery_room_messages
+        reader._recovery_room_messages = traced_fetch_for(original_fetch)
+        if args.transport == "classic":
+            task = asyncio.create_task(
+                reader.sync_forever(
+                    timeout=5_000, sync_filter={"room": {"timeline": {"limit": 1}}}
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                reader.sliding_sync_forever(
+                    timeout=5_000,
+                    conn_id=f"probe-{suffix}-restarted",
+                    lists={
+                        "probe": {
+                            "ranges": [[0, 19]],
+                            "timeline_limit": 1,
+                            "required_state": [["m.room.create", ""]],
+                        }
+                    },
+                    extensions={"to_device": {"enabled": True}},
+                )
             )
 
     for _ in range(60):

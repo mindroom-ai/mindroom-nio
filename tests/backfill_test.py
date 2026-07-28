@@ -26,6 +26,7 @@ from nio import (
     PresenceEvent,
     RoomEncryptedImage,
     RoomEncryptionEvent,
+    RoomForgetResponse,
     RoomInfo,
     RoomMemberEvent,
     RoomMessageText,
@@ -2877,6 +2878,417 @@ class TestRoomLocalRecovery:
         await restarted.receive_response(sliding)
         assert seen == ["$held", "$gap"]
         await restarted.close()
+
+    async def test_sliding_window_token_survives_a_restart(self, tempdir, aioresponse):
+        """A restarted client walks the gap its downtime left behind.
+
+        The walk baseline is the token the room's last window carried, so
+        persisting it is what lets the first limited window after a restart
+        be recovered instead of dropped.
+        """
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert first.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        await first.close()
+
+        # A fresh process against the same store: nothing in memory, the
+        # baseline comes back from disk.
+        second = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await second.receive_response(LoginResponse.from_dict(LOGIN))
+        assert second._sliding_room_prev_batch == {ROOM_A: "w1"}
+
+        seen = record_events(second)
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await second.receive_response(
+            self._sliding("s2", [text_event("$held", 3)], limited=True, prev_batch="w2")
+        )
+
+        assert seen == ["$held", "$gap"]
+        assert pages.from_tokens == ["w1"]
+        assert not second._recovery.gaps
+        await second.close()
+
+    async def test_forgetting_a_room_drops_its_window_token(self, tempdir):
+        """A stale baseline must not outlive the membership it was taken under."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+
+        await client.receive_response(RoomForgetResponse.from_dict({}, ROOM_A))
+
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_classic_leave_clears_the_sliding_window_token(self, tempdir):
+        """A departure seen on /v3/sync invalidates the sliding baseline too."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+
+        left = sync_response("s2", {})
+        left.rooms.leave[ROOM_A] = RoomInfo(Timeline([], False, None), [], [], [])
+        await client.receive_response(left)
+
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_token_is_not_adopted_when_the_write_fails(self, tempdir):
+        """A rolled back write must not leave memory past the stored gap."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$one", 1)], prev_batch="w1")
+        )
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("store is full")
+
+        client.store.save_recovery = fail
+        with pytest.raises(RuntimeError):
+            await client.receive_response(
+                self._sliding("s2", [text_event("$two", 2)], prev_batch="w2")
+            )
+
+        # The advanced token was never committed, so the next walk still
+        # starts from the last baseline that was.
+        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        await client.close()
+
+    async def test_response_crossing_a_leave_does_not_restore_the_token(self, tempdir):
+        """A join response older than the leave must not revive the baseline."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        client._forget_sliding_window_token(ROOM_A)
+
+        # In flight before the leave, handled after it.
+        await client.receive_response(
+            self._sliding("s2", [text_event("$stale", 2)], prev_batch="w2")
+        )
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sliding_window_tokens() == {}
+
+        # A fresh snapshot belongs to the membership held now, so it counts.
+        await client.receive_response(
+            self._sliding(
+                "s3", [text_event("$rejoined", 3)], prev_batch="w3", initial=True
+            )
+        )
+        assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
+        await client.close()
+
+    async def test_sync_token_is_stored_without_recovery_persistence(self, tempdir):
+        """Turning recovery rows off must not stop the sync token being saved."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+            backfill_persist_recovery=False,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+
+        assert client.store.load_sync_token() == "s1"
+        await client.close()
+
+    async def test_leave_deletes_a_token_stored_by_an_earlier_run(self, tempdir):
+        """A token on disk outlives the run that wrote it, so deletion must too."""
+        persisting = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=persisting
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert first.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        await first.close()
+
+        # This run refuses to write recovery rows, but the stale baseline
+        # from the previous one still has to go.
+        not_persisting = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+            backfill_persist_recovery=False,
+        )
+        second = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=not_persisting
+        )
+        await second.receive_response(LoginResponse.from_dict(LOGIN))
+        second._forget_sliding_window_token(ROOM_A)
+
+        assert second.store.load_sliding_window_tokens() == {}
+        await second.close()
+
+    async def test_initial_response_older_than_the_reset_is_rejected(self, tempdir):
+        """`initial` says snapshot, not that the snapshot postdates the leave."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        # A request issued now, whose response arrives after a leave.
+        stale_epoch = client._sliding_reset_epoch
+        client._forget_sliding_window_token(ROOM_A)
+
+        token = client._sliding_request_epoch.set(stale_epoch)
+        try:
+            await client.receive_response(
+                self._sliding(
+                    "s2", [text_event("$stale", 2)], prev_batch="w2", initial=True
+                )
+            )
+        finally:
+            client._sliding_request_epoch.reset(token)
+        assert client._sliding_room_prev_batch == {}
+
+        # A request issued after the reset carries a usable token.
+        token = client._sliding_request_epoch.set(client._sliding_reset_epoch)
+        try:
+            await client.receive_response(
+                self._sliding(
+                    "s3", [text_event("$fresh", 3)], prev_batch="w3", initial=True
+                )
+            )
+        finally:
+            client._sliding_request_epoch.reset(token)
+        assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
+        await client.close()
+
+    async def test_rejoin_in_the_timeline_discards_the_restored_token(self, tempdir):
+        """A join inside the timeline ends the membership the token described."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+
+        seen = record_events(client)
+        rejoin = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "limited": True,
+                        "prev_batch": "w2",
+                        "timeline": [
+                            member_event("$join", 2, "join", OWN_ID).source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(rejoin, SlidingSyncResponse)
+        await client.receive_response(rejoin)
+
+        # No walk from the pre-departure token; the snapshot's own token
+        # becomes the baseline for the membership that exists now.
+        assert seen == ["$after"]
+        assert not client._recovery.gaps
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w2"}
+        await client.close()
+
+    async def test_restart_snapshot_still_walks_from_the_stored_token(
+        self, tempdir, aioresponse
+    ):
+        """required_state carries our membership on every snapshot.
+
+        A restart re-enters every room `initial` with our own member event
+        in required_state. Reading that as a fresh membership would drop
+        the baseline and skip the walk the restart exists to perform.
+        """
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+
+        second = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await second.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(second)
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        snapshot = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "limited": True,
+                        "prev_batch": "w2",
+                        "required_state": [
+                            member_event("$join", 0, "join", OWN_ID).source
+                        ],
+                        "timeline": [text_event("$held", 3).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(snapshot, SlidingSyncResponse)
+        await second.receive_response(snapshot)
+
+        assert seen == ["$held", "$gap"]
+        assert pages.from_tokens == ["w1"]
+        await second.close()
+
+    async def test_window_token_is_written_with_its_plan(self, tempdir):
+        """The baseline and the plan it belongs to share one transaction.
+
+        Storing either alone would send a restarted walk from a position
+        that does not match the pending rows it finds.
+        """
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        calls: list[str] = []
+        original = client.store.save_recovery
+        seen_tokens: list[dict] = []
+
+        def record(*args, **kwargs):
+            calls.append("save_recovery")
+            seen_tokens.append(
+                args[5] if len(args) > 5 else kwargs.get("window_tokens")
+            )
+            return original(*args, **kwargs)
+
+        client.store.save_recovery = record
+        client.store.save_sliding_window_tokens = lambda *a, **k: calls.append(
+            "save_sliding_window_tokens"
+        )
+
+        await client.receive_response(
+            self._sliding("s1", [text_event("$one", 1)], prev_batch="w1")
+        )
+
+        assert calls == ["save_recovery"]
+        assert seen_tokens == [{ROOM_A: "w1"}]
+        await client.close()
+
+    async def test_left_room_drops_the_persisted_window_token(
+        self, tempdir, aioresponse
+    ):
+        """Leaving clears the stored baseline, not just the in-memory one."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await client.receive_response(
+            self._sliding("s2", [], membership="leave", prev_batch="w2")
+        )
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_persist_recovery_without_owning_the_sync_token(
+        self, tempdir, aioresponse
+    ):
+        """Recovery state can be durable while the caller owns next_batch."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=False,
+            backfill_persist_recovery=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+
+        # The window token is durable...
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        # ...while nio has recorded no sync token of its own.
+        assert client.store.load_sync_token() is None
+        await client.close()
 
     async def test_sliding_replay_deduplicates_classic_recovery_after_restart(
         self, tempdir, aioresponse
