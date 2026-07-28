@@ -884,7 +884,7 @@ async def recovery_slam(
     transports and across a mid-flood client restart.
     """
     suffix = secrets.token_hex(4)
-    budget = max_events or (n_messages + n_edits) * 4 + 1000
+    budget = max_events if max_events is not None else (n_messages + n_edits) * 4 + 1000
 
     writers = [
         await register(homeserver, f"rs-w{i}-{suffix}") for i in range(n_writers)
