@@ -796,6 +796,48 @@ class TestClass:
         assert completed.generation == 0
         assert completed.event_payload == b""
 
+    def test_completed_live_event_keeps_durable_gap_boundary(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$live",
+            '{"content":{},"event_id":"$live","sender":"@a:b","type":"m.test"}',
+            True,
+            False,
+        )
+        boundary = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "~boundary:1",
+            "$live",
+            True,
+            False,
+            kind="boundary",
+        )
+        sqlstore.save_recovery("s2", set(), [gap], [event], None)
+
+        sqlstore.finish_recovery(
+            TEST_ROOM,
+            1,
+            event.event_id,
+            False,
+            boundary=boundary,
+        )
+
+        gaps, events = sqlstore.load_sync_recovery()
+        assert [
+            (item.room_id, item.generation, item.target_token, item.cursor_token)
+            for item in gaps
+        ] == [(TEST_ROOM, 1, "p1", "s1")]
+        assert [(item.event_id, item.generation, item.kind) for item in events] == [
+            ("$live", 0, "timeline"),
+            ("~boundary:1", 1, "boundary"),
+        ]
+        assert events[1].source_json == "$live"
+
     def test_pending_recovery_event_retains_encrypted_source(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
         encrypted = PendingTimelineEvent(

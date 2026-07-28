@@ -2159,9 +2159,11 @@ class TestRoomLocalRecovery:
         )
         await client.receive_response(limited)
         assert seen == ["$held"]
-        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
-            "$prejoin",
-        ]
+        assert [
+            event.event_id
+            for event in client._recovery.events[(ROOM_A, 1)]
+            if event.kind != "boundary"
+        ] == ["$prejoin"]
 
         await client.receive_response(limited)
         assert seen == ["$held", "$join", "$after"]
@@ -3129,13 +3131,19 @@ class TestRoomLocalRecovery:
         original_finish = first.store.finish_recovery
         acknowledgements = 0
 
-        def fail_third_ack(room_id, generation, event_id, was_encrypted):
+        def fail_third_ack(room_id, generation, event_id, was_encrypted, boundary=None):
             nonlocal acknowledgements
             if event_id:
                 acknowledgements += 1
             if acknowledgements == 3:
                 raise RuntimeError("ack failed")
-            original_finish(room_id, generation, event_id, was_encrypted)
+            original_finish(
+                room_id,
+                generation,
+                event_id,
+                was_encrypted,
+                boundary=boundary,
+            )
 
         monkeypatch.setattr(first.store, "finish_recovery", fail_third_ack)
         aioresponse.get(
@@ -3448,9 +3456,11 @@ class TestRoomLocalRecovery:
         await client.receive_response(sliding)
         assert seen == ["$held", "$after"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "more2"
-        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
-            "$gap",
-        ]
+        assert [
+            event.event_id
+            for event in client._recovery.events[(ROOM_A, 1)]
+            if event.kind != "boundary"
+        ] == ["$gap"]
 
     @pytest.mark.parametrize("membership", ["leave", "ban", "invite"])
     async def test_sliding_membership_reset_clears_classic_recovery_durably(
@@ -3707,7 +3717,9 @@ class TestRoomLocalRecovery:
             "first:$b",
             "failing:$b",
         ]
-        assert client._recovery.events[(ROOM_A, 1)] == []
+        assert all(
+            event.kind == "boundary" for event in client._recovery.events[(ROOM_A, 1)]
+        )
         assert "$b" in client._recovery.completed[ROOM_A]
 
     async def test_sliding_sync_dedup_stays_bounded(self, client):
