@@ -1090,7 +1090,7 @@ async def recovery_slam(
                         (
                             i
                             for i, (actual, wanted) in enumerate(
-                                zip(lane_got, lane_expected)
+                                zip(lane_got, lane_expected, strict=False)
                             )
                             if actual != wanted
                         ),
