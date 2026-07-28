@@ -1239,9 +1239,7 @@ class AsyncClient(Client):
             # token was taken under. Only the timeline dates the join:
             # required_state carries our membership on every snapshot,
             # including the ones a plain restart produces.
-            self._reset_sliding_room(room_id)
-            if self.store:
-                self.store.forget_sliding_window_token(room_id)
+            self._forget_sliding_window_token(room_id)
             return None
         if self._sliding_sync_room_is_invite(room) or room.membership in (
             "leave",
