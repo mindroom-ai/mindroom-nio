@@ -399,19 +399,32 @@ async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
 
 
 @pytest.mark.asyncio
-async def test_hanging_callback_leaves_active_row_pending():
+async def test_callback_overrunning_deadline_is_not_restarted():
     value = pending("$live", 0)
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
         events={(ROOM, 1): [value]},
     )
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
-        await asyncio.Event().wait()
+    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+        calls.append("early")
+        started.set()
+        await release.wait()
+        calls.append("late")
+        return event
 
     async def unused_fetch(*args):
         raise AssertionError("closed gap must not fetch")
 
+    async def release_after_deadline():
+        await started.wait()
+        await asyncio.sleep(0.03)
+        release.set()
+
+    releaser = asyncio.create_task(release_after_deadline())
     await pump_recovery(
         state,
         user_id="@me:example.org",
@@ -420,8 +433,21 @@ async def test_hanging_callback_leaves_active_row_pending():
         dispatch_event=dispatch,
         store=None,
     )
+    assert calls == ["early"]
     assert state.events[(ROOM, 1)] == [value]
-    assert ROOM in state.gaps
+    assert len(state._active_dispatches) == 1
+    await releaser
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 1),
+        fetch_messages=unused_fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    assert calls == ["early", "late"]
+    assert not state.gaps
+    assert not state._active_dispatches
 
 
 @pytest.mark.asyncio
