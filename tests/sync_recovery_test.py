@@ -622,17 +622,15 @@ async def test_capped_gap_dispatches_live_before_history_resume():
 
     assert seen == ["$live"]
     assert state.gaps[ROOM][0].cursor_token == "cursor"
-    assert [
-        (item.kind, item.source_json) for item in state.events[(ROOM, 1)]
-    ] == [("boundary", "$live")]
+    assert [(item.kind, item.source_json) for item in state.events[(ROOM, 1)]] == [
+        ("boundary", "$live")
+    ]
 
     await pump_recovery(state, **kwargs)
 
     assert seen == ["$live"]
     assert state.gaps[ROOM][0].cursor_token == "more"
-    assert [
-        (item.event_id, item.kind) for item in state.events[(ROOM, 1)]
-    ] == [
+    assert [(item.event_id, item.kind) for item in state.events[(ROOM, 1)]] == [
         ("$history", "timeline"),
         ("~boundary:1", "boundary"),
     ]
