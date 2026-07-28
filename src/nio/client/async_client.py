@@ -380,6 +380,8 @@ class AsyncClientConfig(ClientConfig):
         backfill_limited_timelines (bool): Recover limited timelines through a
             durable room-local queue.
             Limited lanes block sends until their history obligation clears.
+            Live timeline callbacks run before the history walk; recovered
+            history callbacks may therefore arrive later.
             Live callback errors propagate after acknowledgement, while
             recovered-history callback errors fan out before acknowledgement.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.

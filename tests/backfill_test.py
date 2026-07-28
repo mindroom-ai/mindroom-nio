@@ -540,7 +540,9 @@ class TestRoomLocalRecovery:
             "PresenceEvent",
         ]
 
-    async def test_gap_and_live_window_dispatch_in_order(self, client, aioresponse):
+    async def test_live_window_dispatches_before_backfill_fetch(
+        self, client, aioresponse
+    ):
         seen = record_events(client)
         await client.receive_response(
             sync_response(
@@ -560,7 +562,13 @@ class TestRoomLocalRecovery:
                 ),
             }
         )
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        seen_at_fetch: list[list[str]] = []
+
+        def fetch_page(url, **kwargs):
+            seen_at_fetch.append(seen.copy())
+            return pages(url, **kwargs)
+
+        aioresponse.get(MESSAGES_URL, callback=fetch_page, repeat=True)
         await client.receive_response(
             sync_response(
                 "s2",
@@ -571,7 +579,8 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$live"]
+        assert seen_at_fetch == [["$old", "$live"]]
+        assert seen == ["$old", "$live", "$gap"]
         assert pages.from_tokens == ["s1"]
         assert pages.to_tokens == ["p1"]
         assert client.next_batch == "s2"
@@ -588,7 +597,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$live", "$newer"]
+        assert seen == ["$old", "$live", "$gap", "$newer"]
 
     async def test_recovered_encryption_event_updates_room_and_store(
         self, client, aioresponse
@@ -657,12 +666,12 @@ class TestRoomLocalRecovery:
         )
 
         await client.receive_response(limited)
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
 
         await client.receive_response(limited)
         assert pages.from_tokens == ["s1", "more"]
-        assert seen == ["$old", "$gap", "$held"]
+        assert seen == ["$old", "$held", "$gap"]
         assert not client._recovery.gaps
 
     async def test_sliding_room_account_data_waits_for_pending_classic_gap(
@@ -709,7 +718,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
 
         sliding = SlidingSyncResponse.from_dict(
             {
@@ -739,9 +748,9 @@ class TestRoomLocalRecovery:
 
         assert seen == [
             "$old",
+            "$held",
             "$gap",
             "$gap2",
-            "$held",
             "FullyReadEvent",
         ]
         assert not client._recovery.gaps
@@ -816,7 +825,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
 
     async def test_request_timeout_keeps_gap_pending(self, client, aioresponse):
@@ -842,7 +851,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
 
         with pytest.raises(SendRetryError, match="recovery is still pending"):
@@ -987,7 +996,7 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_B].encrypted
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
-    async def test_held_live_bound_abandons_stuck_gap(self, tempdir, protocol):
+    async def test_live_events_do_not_wait_for_stuck_gap(self, tempdir, protocol):
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
@@ -1017,13 +1026,13 @@ class TestRoomLocalRecovery:
         await client.receive_response(
             timeline_response(protocol, "s2", [text_event("$held2", 2)])
         )
-        assert seen == []
+        assert seen == ["$held1", "$held2"]
 
         await client.receive_response(
             timeline_response(protocol, "s3", [text_event("$held3", 3)])
         )
         assert seen == ["$held1", "$held2", "$held3"]
-        assert not client._recovery.gaps
+        assert client._recovery.gaps
         await client.close()
 
     async def test_first_limited_window_honors_held_live_bound(self, tempdir):
@@ -1120,7 +1129,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$held"]
+        assert seen == ["$old", "$held", "$gap"]
         assert not client._recovery.gaps
 
     async def test_exhausted_bounded_page_closes_gap(self, tempdir, aioresponse):
@@ -1170,7 +1179,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap1", "$gap2", "$held"]
+        assert seen == ["$old", "$held", "$gap1", "$gap2"]
         assert pages.from_tokens == ["s1", "m1"]
         assert pages.to_tokens == ["p1", "p1"]
         assert not client._recovery.gaps
@@ -1200,7 +1209,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$held"]
+        assert seen == ["$old", "$held", "$gap"]
         assert not client._recovery.gaps
 
     async def test_empty_bounded_gap_closes_without_recovery(self, client, aioresponse):
@@ -1269,7 +1278,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         assert not client._recovery.gaps
         await client.receive_response(
             sync_response(
@@ -1283,7 +1292,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held", "$overflow"]
+        assert seen == ["$held", "$gap", "$overflow"]
         await client.close()
 
     @pytest.mark.parametrize("second_protocol", ["classic", "sliding"])
@@ -1754,7 +1763,7 @@ class TestRoomLocalRecovery:
             )
         )
         assert pages.to_tokens == ["s2"]
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         assert not client._recovery.gaps
 
     async def test_incomplete_room_keeps_transport_monotonic(
@@ -1800,7 +1809,7 @@ class TestRoomLocalRecovery:
         assert client.next_batch == "s2"
         assert client.store.load_sync_token() == "s2"
         assert client._recovery.gaps.get(ROOM_A)
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
 
         requested: list[str | None] = []
 
@@ -1852,10 +1861,12 @@ class TestRoomLocalRecovery:
                 presence=[PresenceEvent("@sender:example.org", "online")],
             )
         )
-        assert seen == ["$old", "$free"]
+        assert seen == ["$old", "$held", "$free"]
         assert presence_seen == ["@sender:example.org"]
 
-    async def test_newer_same_room_event_cannot_overtake_gap(self, client, aioresponse):
+    async def test_newer_same_room_event_dispatches_before_pending_gap(
+        self, client, aioresponse
+    ):
         seen = record_events(client)
         await client.receive_response(
             sync_response(
@@ -1900,7 +1911,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$gap", "$gap2", "$held", "$later"]
+        assert seen == ["$old", "$held", "$later", "$gap", "$gap2"]
 
     async def test_ignored_to_live_boundary_preserves_recovered_prefix(
         self, client, aioresponse
@@ -1925,7 +1936,9 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == [f"${index}" for index in range(64)]
+        assert seen == [f"${index}" for index in range(14, 64)] + [
+            f"${index}" for index in range(14)
+        ]
         assert not client._recovery.gaps
 
     async def test_non_json_messages_4xx_abandons_gap_and_releases_live(
@@ -2044,7 +2057,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap2", "$gap1", "$present1", "$present2"]
+        assert seen == ["$present1", "$present2", "$gap2", "$gap1"]
         assert not client._recovery.gaps
 
     async def test_two_rooms_close_independently(self, client, aioresponse):
@@ -2114,7 +2127,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$join", "$after", "$live"]
+        assert seen == ["$live", "$join", "$after"]
 
     async def test_bounded_prefix_waits_for_later_own_join(self, client, aioresponse):
         seen = record_events(client)
@@ -2145,14 +2158,13 @@ class TestRoomLocalRecovery:
             },
         )
         await client.receive_response(limited)
-        assert seen == []
+        assert seen == ["$held"]
         assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
             "$prejoin",
-            "$held",
         ]
 
         await client.receive_response(limited)
-        assert seen == ["$join", "$after", "$held"]
+        assert seen == ["$held", "$join", "$after"]
         assert "$prejoin" not in seen
         assert not client._recovery.gaps
 
@@ -2185,7 +2197,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$seen", "$gap", "$live"]
+        assert seen == ["$seen", "$live", "$gap"]
 
         encrypted = megolm_event("$encrypted", 4)
         record_completed_timeline_event(
@@ -2409,7 +2421,7 @@ class TestRoomLocalRecovery:
         limited.presence_events = [PresenceEvent("@sender:example.org", "online")]
         await first.receive_response(limited)
         await first.run_response_callbacks([limited])
-        assert first_seen == ["$old"]
+        assert first_seen == ["$old", "$held"]
         assert room_surface_seen == []
         assert presence_seen == ["@sender:example.org"]
         assert response_seen == ["s2"]
@@ -2448,7 +2460,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert restarted_seen == ["$gap", "$gap2", "$held", "$later"]
+        assert restarted_seen == ["$later", "$gap", "$gap2"]
         assert room_surface_seen == [
             "TypingNoticeEvent",
             "FullyReadEvent",
@@ -2507,7 +2519,7 @@ class TestRoomLocalRecovery:
             )
         )
         assert pages.from_tokens == ["s1"]
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         assert not restarted._recovery.gaps
         await restarted.close()
 
@@ -2536,7 +2548,7 @@ class TestRoomLocalRecovery:
         response = await client.sync(since="explicit")
         assert isinstance(response, SyncResponse)
         assert pages.from_tokens == ["explicit"]
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
 
     async def test_full_state_join_does_not_cancel_timeline_recovery(
         self, client, aioresponse
@@ -2564,7 +2576,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         assert not client._recovery.gaps
 
     async def test_recovered_state_does_not_regress_live_room_state(
@@ -2611,7 +2623,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert names == ["Before", "Gap", "After"]
+        assert names == ["Before", "After", "Gap"]
         assert client.rooms[ROOM_A].name == "After"
 
     async def test_live_callbacks_see_each_events_room_state(self, client):
@@ -2663,7 +2675,7 @@ class TestRoomLocalRecovery:
             },
         )
         await client.receive_response(limited)
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held"]
 
         aioresponse.get(
             MESSAGES_URL,
@@ -2673,7 +2685,7 @@ class TestRoomLocalRecovery:
             ),
         )
         await client.receive_response(limited)
-        assert seen == ["$old", "$gap", "$gap2", "$held"]
+        assert seen == ["$old", "$held", "$gap", "$gap2"]
         assert not client._recovery.gaps
 
     async def test_recovery_attempts_all_callbacks_once(self, client, aioresponse):
@@ -2764,12 +2776,12 @@ class TestRoomLocalRecovery:
             )
         )
         assert calls == [
-            "before:$gap",
-            "fail:$gap",
-            "after:$gap",
             "before:$held",
             "fail:$held",
             "after:$held",
+            "before:$gap",
+            "fail:$gap",
+            "after:$gap",
         ]
         assert not first._recovery.gaps
         await first.close()
@@ -2785,12 +2797,12 @@ class TestRoomLocalRecovery:
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         assert not restarted._recovery.gaps
         assert calls == [
-            "before:$gap",
-            "fail:$gap",
-            "after:$gap",
             "before:$held",
             "fail:$held",
             "after:$held",
+            "before:$gap",
+            "fail:$gap",
+            "after:$gap",
         ]
         await restarted.close()
 
@@ -2828,7 +2840,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         await first.close()
         first.store.database.close()
 
@@ -2861,7 +2873,7 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await restarted.receive_response(sliding)
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         await restarted.close()
 
     async def test_sliding_replay_deduplicates_classic_recovery_after_restart(
@@ -3038,7 +3050,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$shared", "$held"]
+        assert seen == ["$held", "$shared"]
         assert client._recovery.completed[ROOM_A]["$shared"] is False
 
     async def test_encrypted_upgrade_needs_no_post_decrypt_commit(
@@ -3117,15 +3129,15 @@ class TestRoomLocalRecovery:
         original_finish = first.store.finish_recovery
         acknowledgements = 0
 
-        def fail_second_ack(room_id, generation, event_id, was_encrypted):
+        def fail_third_ack(room_id, generation, event_id, was_encrypted):
             nonlocal acknowledgements
             if event_id:
                 acknowledgements += 1
-            if acknowledgements == 2:
+            if acknowledgements == 3:
                 raise RuntimeError("ack failed")
             original_finish(room_id, generation, event_id, was_encrypted)
 
-        monkeypatch.setattr(first.store, "finish_recovery", fail_second_ack)
+        monkeypatch.setattr(first.store, "finish_recovery", fail_third_ack)
         aioresponse.get(
             MESSAGES_URL,
             payload=messages(
@@ -3150,7 +3162,7 @@ class TestRoomLocalRecovery:
                     },
                 )
             )
-        assert seen == ["$gap1", "$gap2"]
+        assert seen == ["$held", "$gap1", "$gap2"]
         await first.close()
         first.store.database.close()
 
@@ -3168,7 +3180,7 @@ class TestRoomLocalRecovery:
 
         restarted.add_event_callback(record, RoomMessageText)
         await restarted.receive_response(sync_response("s2", {}))
-        assert seen == ["$gap1", "$gap2", "$gap2", "$held"]
+        assert seen == ["$held", "$gap1", "$gap2", "$gap2"]
         assert not restarted._recovery.gaps
         await restarted.close()
 
@@ -3213,7 +3225,7 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
-        assert seen == ["$old"]
+        assert seen == ["$old", "$held", "$slide"]
 
         aioresponse.get(
             MESSAGES_URL,
@@ -3223,7 +3235,7 @@ class TestRoomLocalRecovery:
             ),
         )
         await client.receive_response(limited)
-        assert seen == ["$old", "$gap", "$gap2", "$held", "$slide"]
+        assert seen == ["$old", "$held", "$slide", "$gap", "$gap2"]
         assert not client._recovery.gaps
 
     @staticmethod
@@ -3264,12 +3276,19 @@ class TestRoomLocalRecovery:
         assert seen == ["$first"]
 
         pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
-        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        seen_at_fetch: list[list[str]] = []
+
+        def fetch_page(url, **kwargs):
+            seen_at_fetch.append(seen.copy())
+            return pages(url, **kwargs)
+
+        aioresponse.get(MESSAGES_URL, callback=fetch_page, repeat=True)
         await client.receive_response(
             self._sliding("s2", [text_event("$held", 3)], limited=True, prev_batch="w2")
         )
 
-        assert seen == ["$first", "$gap", "$held"]
+        assert seen_at_fetch == [["$first", "$held"]]
+        assert seen == ["$first", "$held", "$gap"]
         assert pages.from_tokens == ["w1"]
         assert pages.to_tokens == ["w2"]
         assert not client._recovery.gaps
@@ -3306,7 +3325,7 @@ class TestRoomLocalRecovery:
                 initial=True,
             )
         )
-        assert seen == ["$first", "$gap", "$held"]
+        assert seen == ["$first", "$held", "$gap"]
         assert pages.from_tokens == ["w1"]
         assert not client._recovery.gaps
 
@@ -3363,7 +3382,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == []
+        assert seen == ["$held"]
         assert client._recovery.gaps
 
         sliding = SlidingSyncResponse.from_dict(
@@ -3383,7 +3402,7 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
-        assert seen == ["$prejoin2", "$join", "$after"]
+        assert seen == ["$held", "$prejoin2", "$join", "$after"]
         assert not client._recovery.gaps
 
     async def test_sliding_initial_historical_join_keeps_classic_gap(
@@ -3427,13 +3446,10 @@ class TestRoomLocalRecovery:
         )
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
-        assert seen == []
+        assert seen == ["$held", "$after"]
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "more2"
         assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
             "$gap",
-            "$held",
-            "$join",
-            "$after",
         ]
 
     @pytest.mark.parametrize("membership", ["leave", "ban", "invite"])
@@ -3887,7 +3903,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$held"]
+        assert seen == ["$held", "$gap"]
         assert not client._recovery.gaps
 
     @pytest.mark.parametrize("limited", [False, True])

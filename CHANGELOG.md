@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Bug Fixes
+
+- Dispatch live timeline events before walking a limited-timeline gap, so a
+  slow or retrying history backfill cannot delay new-message callbacks.
+  Recovered history still follows in its durable per-room lane.
+
 ## 0.31.0
 
 ### Features

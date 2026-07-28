@@ -567,7 +567,11 @@ async def _collect_slice(
         for event in queued
     ]
     pending_ids = {event.event_id for event in pending}
-    live_ids = {event.event_id for event in pending if event.is_live}
+    # A live row moves to the completed set when its early dispatch succeeds.
+    # Both forms still mark where the backfill reached the current window.
+    boundary_ids = {
+        event.event_id for event in pending if event.is_live
+    } | state.completed.get(gap.room_id, {}).keys()
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:
@@ -622,7 +626,7 @@ async def _collect_slice(
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if event_id in live_ids and response.end != gap.target_token:
+            if event_id in boundary_ids and response.end != gap.target_token:
                 reached_window = True
                 break
             if _is_own_join(event, user_id):
@@ -714,11 +718,14 @@ async def _drain_gap(
     dispatch_event: DispatchEvent,
     store: MatrixStore | None,
     deadline: float | None,
+    live_timeline_only: bool = False,
 ) -> None:
-    if gap.cursor_token is not None:
+    if gap.cursor_token is not None and not live_timeline_only:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
+        if live_timeline_only and (not pending.is_live or pending.kind != "timeline"):
+            continue
         try:
             event = pending.parse()
         except Exception:
@@ -757,7 +764,8 @@ async def _drain_gap(
             isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted,
         )
 
-    _finish(state, store, gap)
+    if not live_timeline_only:
+        _finish(state, store, gap)
 
 
 async def pump_recovery(
@@ -772,9 +780,21 @@ async def pump_recovery(
 ) -> None:
     if ready_room_id is not None:
         gaps = state.gaps.get(ready_room_id)
-        if not gaps or gaps[0].cursor_token is not None:
+        if not gaps:
             return
         room_ids = [ready_room_id]
+        for gap in gaps:
+            await _drain_gap(
+                state,
+                gap,
+                dispatch_event=dispatch_event,
+                store=store,
+                deadline=None,
+                live_timeline_only=True,
+            )
+        gaps = state.gaps.get(ready_room_id)
+        if not gaps or gaps[0].cursor_token is not None:
+            return
     else:
         room_ids = list(state.gaps)
     if not room_ids:
