@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -260,6 +261,47 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
     assert seen == ["$other", "$other-live"]
     assert ROOM in state.gaps
     assert ROOM_B not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_early_live_boundary_ignores_unrelated_completed_event():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live", 2)]},
+        completed={ROOM: OrderedDict([("$old", False)])},
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "next",
+                "chunk": [
+                    event("$old", 0).source,
+                    event("$unseen", 1).source,
+                    event("$live", 2).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    kwargs = {
+        "user_id": "@me:example.org",
+        "options": RecoveryOptions(1, 10, 10, 10),
+        "fetch_messages": fetch,
+        "dispatch_event": dispatch,
+        "store": None,
+    }
+    await pump_recovery(state, ready_room_id=ROOM, **kwargs)
+    await pump_recovery(state, **kwargs)
+
+    assert seen == ["$live", "$unseen"]
+    assert not state.gaps
 
 
 @pytest.mark.asyncio
@@ -543,6 +585,57 @@ async def test_room_cap_defers_existing_unverified_prefix():
     assert starts == ["cursor", "more"]
     assert seen == ["$recovered", "$overflow", "$live"]
     assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_capped_gap_dispatches_live_before_history_resume():
+    gap = RecoveryGap(ROOM, 1, "target", "cursor")
+    state = RecoveryState(
+        gaps={ROOM: [gap]},
+        events={(ROOM, 1): [pending("$live", 2)]},
+    )
+    seen: list[str] = []
+
+    async def fetch(_room, start, *_args):
+        assert start == "cursor"
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": start,
+                "end": "more",
+                "chunk": [event("$history", 1).source],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    kwargs = {
+        "user_id": "@me:example.org",
+        "options": RecoveryOptions(10, 1, 10, 10),
+        "fetch_messages": fetch,
+        "dispatch_event": dispatch,
+        "store": None,
+    }
+    await pump_recovery(state, ready_room_id=ROOM, **kwargs)
+
+    assert seen == ["$live"]
+    assert state.gaps[ROOM][0].cursor_token == "cursor"
+    assert [
+        (item.kind, item.source_json) for item in state.events[(ROOM, 1)]
+    ] == [("boundary", "$live")]
+
+    await pump_recovery(state, **kwargs)
+
+    assert seen == ["$live"]
+    assert state.gaps[ROOM][0].cursor_token == "more"
+    assert [
+        (item.event_id, item.kind) for item in state.events[(ROOM, 1)]
+    ] == [
+        ("$history", "timeline"),
+        ("~boundary:1", "boundary"),
+    ]
 
 
 @pytest.mark.asyncio

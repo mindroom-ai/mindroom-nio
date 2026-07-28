@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file.
   reached. The bound now pauses collection between complete pages and retains
   the cursor for the next recovery pump instead of discarding the recovered
   prefix and permanently closing the gap.
+- Dispatch live timeline events before walking a limited-timeline gap, so a
+  slow or retrying history backfill cannot delay new-message callbacks.
+  Recovered history still follows in its durable per-room lane.
 
 ## 0.31.0
 
