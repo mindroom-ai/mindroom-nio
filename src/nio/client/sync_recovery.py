@@ -527,6 +527,8 @@ def _finish(
     *,
     retain_boundary: bool = False,
 ) -> None:
+    # Keep the oldest live ID as the durable gap anchor; later live rows use
+    # completed-event deduplication instead of adding more boundary markers.
     boundary = (
         PendingTimelineEvent(
             gap.room_id,
