@@ -485,7 +485,7 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
 
 
 @pytest.mark.asyncio
-async def test_room_cap_abandons_existing_unverified_prefix():
+async def test_room_cap_defers_existing_unverified_prefix():
     recovered = PendingTimelineEvent.from_event(
         ROOM, 1, 0, event("$recovered", 1), False
     )
@@ -496,13 +496,15 @@ async def test_room_cap_abandons_existing_unverified_prefix():
         events={(ROOM, 1): [recovered, live]},
     )
     seen: list[str] = []
+    starts: list[str] = []
 
-    async def fetch(*_args):
+    async def fetch(_room, start, *_args):
+        starts.append(start)
         return RoomMessagesResponse.from_dict(
             {
-                "start": "cursor",
-                "end": "more",
-                "chunk": [event("$overflow", 2).source],
+                "start": start,
+                "end": "more" if start == "cursor" else "target",
+                "chunk": ([event("$overflow", 2).source] if start == "cursor" else []),
             },
             ROOM,
         )
@@ -519,7 +521,27 @@ async def test_room_cap_abandons_existing_unverified_prefix():
         dispatch_event=dispatch,
         store=None,
     )
-    assert seen == ["$live"]
+
+    assert starts == ["cursor"]
+    assert seen == []
+    assert state.gaps[ROOM][0].cursor_token == "more"
+    assert [queued.event_id for queued in state.events[(ROOM, 1)]] == [
+        "$recovered",
+        "$overflow",
+        "$live",
+    ]
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert starts == ["cursor", "more"]
+    assert seen == ["$recovered", "$overflow", "$live"]
     assert not state.gaps
 
 
@@ -552,7 +574,7 @@ def test_abandonment_restores_promoted_completed_marker(clear_mode):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overlap_first", [False, True])
-async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
+async def test_room_cap_accepts_complete_over_cap_page_at_overlap(overlap_first):
     held = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$held", 3), True)
     assert held
     state = RecoveryState(
@@ -589,12 +611,12 @@ async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
         dispatch_event=dispatch,
         store=None,
     )
-    assert seen == ["$held"]
+    assert seen == (["$held"] if overlap_first else ["$gap-one", "$gap-two", "$held"])
     assert not state.gaps
 
 
 @pytest.mark.asyncio
-async def test_room_cap_counts_recovered_rows_in_other_generations():
+async def test_pump_cap_ignores_recovered_rows_in_other_generations():
     later_recovered = PendingTimelineEvent.from_event(
         ROOM, 2, 0, event("$later-recovered", 3), False
     )
@@ -634,12 +656,15 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
         dispatch_event=dispatch,
         store=None,
     )
-    assert seen == ["$live"]
-    assert [gap.generation for gap in state.gaps[ROOM]] == [2]
-    assert [
-        queued.event_id
-        for (room_id, _generation), queued_events in state.events.items()
-        if room_id == ROOM
-        for queued in queued_events
-        if not queued.is_live
-    ] == ["$later-recovered"]
+    assert seen == []
+    assert [(gap.generation, gap.cursor_token) for gap in state.gaps[ROOM]] == [
+        (1, "more"),
+        (2, "cursor-two"),
+    ]
+    assert [queued.event_id for queued in state.events[(ROOM, 1)]] == [
+        "$overflow",
+        "$live",
+    ]
+    assert [queued.event_id for queued in state.events[(ROOM, 2)]] == [
+        "$later-recovered"
+    ]

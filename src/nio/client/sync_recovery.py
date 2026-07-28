@@ -568,9 +568,14 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     live_ids = {event.event_id for event in pending if event.is_live}
-    recovered_count = sum(not event.is_live for event in pending)
+    recovered_this_pump = 0
 
     while cursor and pages < options.max_pages:
+        # Keep pages atomic: advancing to a page's end after retaining only
+        # part of it would lose the omitted events. Existing queued rows do
+        # not count against this pump, or a full queue could never resume.
+        if pages and recovered_this_pump >= options.max_events:
+            break
         clear_recovered = False
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -648,19 +653,7 @@ async def _collect_slice(
                 pending_ids.add(event_id)
                 next_sequence += 1
 
-        current_recovered_count = sum(
-            not event.is_live
-            for event in state.events.get((gap.room_id, gap.generation), ())
-        )
-        retained_recovered_count = recovered_count - (
-            current_recovered_count if clear_recovered else 0
-        )
-        if retained_recovered_count + len(recovered) > options.max_events:
-            logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
-            recovered.clear()
-            clear_recovered = True
-            next_cursor = None
-        elif reached_window:
+        if reached_window:
             next_cursor = None
         elif response.end is None and gap.target_token:
             # A bounded walk that runs out of events has reached the sync
@@ -701,7 +694,7 @@ async def _collect_slice(
             ),
         )
         gap = updated
-        recovered_count = retained_recovered_count + len(recovered)
+        recovered_this_pump += len(recovered)
         cursor = next_cursor
 
     return gap

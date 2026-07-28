@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Bug Fixes
+
+- Preserve recovered limited-timeline history when `backfill_max_events` is
+  reached. The bound now pauses collection between complete pages and retains
+  the cursor for the next recovery pump instead of discarding the recovered
+  prefix and permanently closing the gap.
+
 ## 0.31.0
 
 ### Features

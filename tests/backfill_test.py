@@ -746,7 +746,7 @@ class TestRoomLocalRecovery:
         ]
         assert not client._recovery.gaps
 
-    async def test_event_bound_abandons_prefix_at_room_wide_cap(
+    async def test_event_bound_defers_prefix_and_resumes_from_cursor(
         self, tempdir, aioresponse
     ):
         client = AsyncClient(
@@ -788,8 +788,13 @@ class TestRoomLocalRecovery:
         )
 
         await client.receive_response(limited)
+        assert pages.from_tokens == ["s1"]
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+
+        await client.receive_response(limited)
         assert pages.from_tokens == ["s1", "more"]
-        assert seen == ["$old", "$held"]
+        assert seen == ["$old", "$gap1", "$gap2", "$held"]
         assert not client._recovery.gaps
         await client.close()
 
@@ -1956,7 +1961,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
 
-    async def test_oversized_page_abandons_durably(self, tempdir, aioresponse):
+    async def test_oversized_page_defers_durably(self, tempdir, aioresponse):
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
             backfill_max_events=1,
@@ -1998,8 +2003,13 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$old", "$held"]
-        assert not client._recovery.gaps
+        assert seen == ["$old"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
+            "$gap",
+            "$overflow",
+            "$held",
+        ]
         await client.close()
         client.store.database.close()
 
@@ -2011,8 +2021,13 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        restarted_seen = record_events(restarted)
+        assert restarted._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        aioresponse.get(MESSAGES_URL, payload=messages([], "p1"))
+        await restarted.receive_response(sync_response("s2", {}))
+
         assert not restarted._recovery.gaps
-        assert list(restarted._recovery.completed[ROOM_A]) == ["$old", "$held"]
+        assert restarted_seen == ["$gap", "$overflow", "$held"]
         await restarted.close()
 
     async def test_target_page_recovers_concurrent_dag_branches(
@@ -2117,6 +2132,11 @@ class TestRoomLocalRecovery:
         assert seen == ["$join", "$after", "$live"]
 
     async def test_bounded_prefix_waits_for_later_own_join(self, client, aioresponse):
+        client.config = replace(
+            client.config,
+            backfill_max_pages=10,
+            backfill_max_events=1,
+        )
         seen = record_events(client)
         client.add_event_callback(
             lambda _room, event: seen.append(event.event_id), RoomMemberEvent
@@ -2145,6 +2165,7 @@ class TestRoomLocalRecovery:
             },
         )
         await client.receive_response(limited)
+        assert pages.from_tokens == ["s1"]
         assert seen == []
         assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
             "$prejoin",

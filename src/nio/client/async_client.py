@@ -390,10 +390,11 @@ class AsyncClientConfig(ClientConfig):
             recovered, while /v3/sync recovers across restarts through its
             stored sync token.
         backfill_max_pages (int): Maximum pages per room per pump.
-        backfill_max_events (int): Maximum durable recovered-history events per
-            room across every open generation, and separately the maximum live
-            events held behind a stuck gap.
-            Exceeding either bound abandons unverified history.
+        backfill_max_events (int): Approximate maximum new recovered-history
+            events accepted per room per pump, checked between complete pages;
+            one page can exceed it. Reaching the bound retains the cursor for
+            the next pump. Separately, this is the maximum live events held
+            behind a stuck gap; exceeding that bound abandons unverified history.
         backfill_page_size (int): Events requested per page.
         backfill_timeout (float): Seconds available to one recovery pump.
         backfill_sliding_seed_rooms (int): How many rooms the first request
