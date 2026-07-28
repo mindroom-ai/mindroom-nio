@@ -3232,9 +3232,7 @@ class TestRoomLocalRecovery:
         assert seen_tokens == [{ROOM_A: "w1"}]
         await client.close()
 
-    async def test_left_room_drops_the_persisted_window_token(
-        self, tempdir, aioresponse
-    ):
+    async def test_left_room_drops_the_persisted_window_token(self, tempdir):
         """Leaving clears the stored baseline, not just the in-memory one."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3253,9 +3251,7 @@ class TestRoomLocalRecovery:
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 
-    async def test_persist_recovery_without_owning_the_sync_token(
-        self, tempdir, aioresponse
-    ):
+    async def test_persist_recovery_without_owning_the_sync_token(self, tempdir):
         """Recovery state can be durable while the caller owns next_batch."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
