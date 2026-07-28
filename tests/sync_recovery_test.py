@@ -545,6 +545,66 @@ async def test_room_cap_defers_existing_unverified_prefix():
     assert not state.gaps
 
 
+@pytest.mark.asyncio
+async def test_room_cap_rebases_after_own_join_clears_prefix():
+    live = pending("$live", 4)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [live]},
+    )
+    seen: list[str] = []
+    starts: list[str] = []
+    pages = {
+        "cursor": {
+            "end": "middle",
+            "chunk": [event("$pre-one", 1).source, event("$pre-two", 2).source],
+        },
+        "middle": {
+            "end": "more",
+            "chunk": [
+                {
+                    "content": {"membership": "join"},
+                    "event_id": "$join",
+                    "origin_server_ts": 3,
+                    "room_id": ROOM,
+                    "sender": "@me:example.org",
+                    "state_key": "@me:example.org",
+                    "type": "m.room.member",
+                },
+                event("$after", 3).source,
+            ],
+        },
+        "more": {
+            "end": "target",
+            "chunk": [event("$live", 4).source],
+        },
+    }
+
+    async def fetch(_room, start, *_args):
+        starts.append(start)
+        return RoomMessagesResponse.from_dict(
+            {"start": start, **pages[start]},
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(10, 3, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert starts == ["cursor", "middle", "more"]
+    assert seen == ["$join", "$after", "$live"]
+    assert not state.gaps
+
+
 @pytest.mark.parametrize("clear_mode", ["recovered", "room"])
 def test_abandonment_restores_promoted_completed_marker(clear_mode):
     retry = PendingTimelineEvent.from_event(

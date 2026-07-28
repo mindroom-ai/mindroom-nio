@@ -575,6 +575,12 @@ async def _collect_slice(
         # part of it would lose the omitted events. Existing queued rows do
         # not count against this pump, or a full queue could never resume.
         if pages and recovered_this_pump >= options.max_events:
+            logger.debug(
+                "Pausing recovery at the room event throttle in %s (%d >= %d)",
+                gap.room_id,
+                recovered_this_pump,
+                options.max_events,
+            )
             break
         clear_recovered = False
         remaining = deadline - asyncio.get_running_loop().time()
@@ -694,6 +700,8 @@ async def _collect_slice(
             ),
         )
         gap = updated
+        if clear_recovered:
+            recovered_this_pump = 0
         recovered_this_pump += len(recovered)
         cursor = next_cursor
 
