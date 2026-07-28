@@ -38,3 +38,10 @@ def test_recovery_order_rejects_reordering_inside_a_lane():
         "recovered": (["$history1", "$history2"], ["$history2", "$history1"]),
         "live": (["$live1", "$live2"], ["$live2", "$live1"]),
     }
+
+
+def test_recovery_config_accepts_a_tiny_page():
+    config = live_check.recovery_config(7, page_size=3)
+
+    assert config.backfill_max_events == 7
+    assert config.backfill_page_size == 3

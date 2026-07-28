@@ -655,7 +655,11 @@ def recovery_lane_orders(
     }
 
 
-def recovery_config(max_events: int, encryption: bool = True) -> AsyncClientConfig:
+def recovery_config(
+    max_events: int,
+    encryption: bool = True,
+    page_size: int = 100,
+) -> AsyncClientConfig:
     # Encryption on by default: nio only builds a store inside that branch,
     # and without a store there is nothing to persist recovery state or
     # window tokens in, so the durable paths would go untested.
@@ -665,7 +669,7 @@ def recovery_config(max_events: int, encryption: bool = True) -> AsyncClientConf
         backfill_limited_timelines=True,
         backfill_max_pages=100,
         backfill_max_events=max_events,
-        backfill_page_size=100,
+        backfill_page_size=page_size,
         backfill_timeout=60.0,
     )
 
@@ -868,6 +872,8 @@ async def recovery_slam(
     n_edits: int,
     n_writers: int,
     restart: bool = True,
+    max_events: int | None = None,
+    page_size: int = 100,
 ) -> None:
     """Flood rooms with a one-event sync window and assert exactly-once.
 
@@ -878,16 +884,20 @@ async def recovery_slam(
     transports and across a mid-flood client restart.
     """
     suffix = secrets.token_hex(4)
-    budget = (n_messages + n_edits) * 4 + 1000
+    budget = max_events or (n_messages + n_edits) * 4 + 1000
 
     writers = [
         await register(homeserver, f"rs-w{i}-{suffix}") for i in range(n_writers)
     ]
     sliding = await register_configured(
-        homeserver, f"rs-sliding-{suffix}", recovery_config(budget)
+        homeserver,
+        f"rs-sliding-{suffix}",
+        recovery_config(budget, page_size=page_size),
     )
     classic = await register_configured(
-        homeserver, f"rs-classic-{suffix}", recovery_config(budget)
+        homeserver,
+        f"rs-classic-{suffix}",
+        recovery_config(budget, page_size=page_size),
     )
     readers = [sliding, classic]
 
@@ -950,7 +960,11 @@ async def recovery_slam(
 
             user_id, device_id, access_token, store_path = restart_credentials
             sliding = AsyncClient(
-                homeserver, user_id, device_id, store_path, recovery_config(budget)
+                homeserver,
+                user_id,
+                device_id,
+                store_path,
+                recovery_config(budget, page_size=page_size),
             )
             sliding.restore_login(user_id, device_id, access_token)
             sliding_recorder.observe_recovery(sliding)
@@ -1006,13 +1020,6 @@ async def recovery_slam(
             sent[room_id].add(resp.event_id)
             sent_ids.add(resp.event_id)
 
-        # The sliding reader holds its walk baseline in memory, so a
-        # restart costs it the first discontinuity per room afterwards.
-        # Waiting on a reader that cannot converge only burns the deadline;
-        # its counts are still reported and bounded below.
-        awaited = (
-            (classic_recorder,) if restart else (sliding_recorder, classic_recorder)
-        )
         deadline = time.monotonic() + 900
         last_report = 0.0
         while time.monotonic() < deadline:
@@ -1020,7 +1027,7 @@ async def recovery_slam(
                 recorder.name: len(sent_ids - recorder.seen())
                 for recorder in (sliding_recorder, classic_recorder)
             }
-            if not any(missing[recorder.name] for recorder in awaited):
+            if not any(missing.values()):
                 break
             now = time.monotonic()
             if now - last_report > 15:
@@ -1032,30 +1039,12 @@ async def recovery_slam(
         # its verdict is the one that proves the walk works.
         for recorder in (classic_recorder, sliding_recorder):
             missing_ids = sent_ids - recorder.seen()
-            if missing_ids and recorder is sliding_recorder and restart:
-                # The sliding walk baseline is per-process, so the first
-                # discontinuity after the restart has nothing to walk from.
-                # That is bounded by one window per room; anything larger is
-                # a regression in the steady-state path, not this hole.
-                budget_lost = 4 * n_rooms + len(sent_ids) // 20
-                print(
-                    f"recovery slam: sliding lost {len(missing_ids)}/"
-                    f"{len(sent_ids)} events across its restart "
-                    f"(in-memory walk baseline, bound {budget_lost})"
-                )
-                check(
-                    "recovery slam: sliding restart loss stays bounded",
-                    len(missing_ids) <= budget_lost,
-                    f"{len(missing_ids)} lost exceeds the {budget_lost} a "
-                    f"restart can explain: steady-state recovery regressed",
-                )
-            else:
-                check(
-                    f"recovery slam: {recorder.name} lost no events",
-                    not missing_ids,
-                    f"{len(missing_ids)}/{len(sent_ids)} never dispatched, "
-                    f"e.g. {list(missing_ids)[:3]}",
-                )
+            check(
+                f"recovery slam: {recorder.name} lost no events",
+                not missing_ids,
+                f"{len(missing_ids)}/{len(sent_ids)} never dispatched, "
+                f"e.g. {list(missing_ids)[:3]}",
+            )
             duplicates = recorder.duplicates(sent_ids)
             check(
                 f"recovery slam: {recorder.name} dispatched each event once",
@@ -2051,6 +2040,17 @@ async def main() -> None:
     parser.add_argument("--recovery-writers", type=int, default=4)
     parser.add_argument("--recovery-encrypted-messages", type=int, default=250)
     parser.add_argument(
+        "--recovery-max-events",
+        type=int,
+        help="override the per-pump recovery event throttle",
+    )
+    parser.add_argument(
+        "--recovery-page-size",
+        type=int,
+        default=100,
+        help="events requested per /messages recovery page",
+    )
+    parser.add_argument(
         "--recovery-encrypted-window",
         type=int,
         default=1,
@@ -2145,6 +2145,8 @@ async def main() -> None:
             args.recovery_edits,
             args.recovery_writers,
             not args.no_recovery_restart,
+            args.recovery_max_events,
+            args.recovery_page_size,
         )
         await encrypted_recovery_slam(args.homeserver, args.recovery_encrypted_messages)
         print(f"\nall {len(PASSED)} live checks passed against {args.homeserver}")
@@ -2269,6 +2271,8 @@ async def main() -> None:
                     args.recovery_edits,
                     args.recovery_writers,
                     not args.no_recovery_restart,
+                    args.recovery_max_events,
+                    args.recovery_page_size,
                 )
                 await encrypted_recovery_slam(
                     args.homeserver,
