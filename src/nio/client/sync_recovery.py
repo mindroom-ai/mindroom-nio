@@ -154,16 +154,38 @@ def _dispatch_finished(
     key: _DispatchKey,
     task: asyncio.Task[_DispatchResult],
 ) -> None:
-    if not task.cancelled():
-        task.exception()
-    if not _has_pending_dispatch(state, key):
-        state._active_dispatches.pop(key, None)
+    if _has_pending_dispatch(state, key):
+        if not task.cancelled():
+            task.exception()
+        return
+    if state._active_dispatches.pop(key, None) is task:
+        _report_orphaned_dispatch(key, task)
+
+
+def _report_orphaned_dispatch(
+    key: _DispatchKey, task: asyncio.Task[_DispatchResult]
+) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error:
+        logger.error(
+            "Recovered event callback failed after its row was cleared: %s",
+            key[3],
+            exc_info=error,
+        )
 
 
 def _discard_orphaned_dispatches(state: RecoveryState) -> None:
     for key, task in tuple(state._active_dispatches.items()):
-        if task.done() and not _has_pending_dispatch(state, key):
-            state._active_dispatches.pop(key, None)
+        if _has_pending_dispatch(state, key):
+            continue
+        if state._active_dispatches.pop(key, None) is not task:
+            continue
+        if task.done():
+            _report_orphaned_dispatch(key, task)
+        else:
+            task.cancel()
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
