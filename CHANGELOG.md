@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Features
+
+- Persist each room's sliding window token, so a restarted client can walk
+  the gap its downtime left behind instead of dropping it. 0.31.0 held the
+  walk baseline in memory, which left the first limited or initial window
+  after a restart unrecoverable — the one case the `/v3/sync` transport had
+  always covered through its stored sync token. Live, a sliding reader torn
+  down mid-flood and rebuilt from its store now loses nothing where it
+  previously lost every event written while it was down. Requires a store,
+  so encryption must be enabled; migrates the store from schema v3 to v4 and
+  exports `SlidingWindowTokens` from `nio.store`.
+- Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
+  which follows `store_sync_tokens` as before, and can be set to True to
+  persist recovery state while nio never reads or writes `next_batch`
+  itself. Clients that decide for themselves when a sync token may be
+  advanced — because they only trust a token once their own writes are
+  durable — previously had to choose between that ownership and durable
+  recovery. Recovery then resumes relative to whatever token the caller
+  restores.
+
 ### Bug Fixes
 
 - Preserve recovered limited-timeline history when `backfill_max_events` is

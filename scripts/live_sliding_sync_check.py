@@ -623,7 +623,10 @@ class Recorder:
         }
 
 
-def recovery_config(max_events: int, encryption: bool = False) -> AsyncClientConfig:
+def recovery_config(max_events: int, encryption: bool = True) -> AsyncClientConfig:
+    # Encryption on by default: nio only builds a store inside that branch,
+    # and without a store there is nothing to persist recovery state or
+    # window tokens in, so the durable paths would go untested.
     return AsyncClientConfig(
         store_sync_tokens=True,
         encryption_enabled=encryption,
