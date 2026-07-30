@@ -57,11 +57,6 @@ class _DispatchFinishError(Exception):
 
 
 @dataclass(frozen=True)
-class _DispatchOutcome:
-    error: _LiveCallbackError | None = None
-
-
-@dataclass(frozen=True)
 class RecoveryOptions:
     max_pages: int
     max_events: int
@@ -150,8 +145,8 @@ class RecoveryState:
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
-    _active_dispatches: dict[_DispatchKey, asyncio.Task[_DispatchOutcome]] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+    _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
+        field(default_factory=dict, init=False, repr=False, compare=False)
     )
     _dispatch_waiters: dict[_DispatchKey, int] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -168,7 +163,7 @@ def _has_pending_dispatch(state: RecoveryState, key: _DispatchKey) -> bool:
 def _dispatch_finished(
     state: RecoveryState,
     key: _DispatchKey,
-    task: asyncio.Task[_DispatchOutcome],
+    task: asyncio.Task[_LiveCallbackError | None],
 ) -> None:
     if _has_pending_dispatch(state, key):
         if not task.cancelled():
@@ -180,7 +175,7 @@ def _dispatch_finished(
 
 
 def _report_orphaned_dispatch(
-    key: _DispatchKey, task: asyncio.Task[_DispatchOutcome]
+    key: _DispatchKey, task: asyncio.Task[_LiveCallbackError | None]
 ) -> None:
     _report_dispatch_error(
         key,
@@ -191,7 +186,7 @@ def _report_orphaned_dispatch(
 
 def _report_dispatch_error(
     key: _DispatchKey,
-    task: asyncio.Task[_DispatchOutcome],
+    task: asyncio.Task[_LiveCallbackError | None],
     message: str,
 ) -> None:
     if task.cancelled():
@@ -219,42 +214,6 @@ def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
     return _is_own_join(event, user_id)
 
 
-def _finish_dispatch(
-    state: RecoveryState,
-    store: MatrixStore | None,
-    gap: RecoveryGap,
-    pending: PendingTimelineEvent,
-    delivered: _DispatchResult,
-    *,
-    was_encrypted: bool | None = None,
-    retain_boundary: bool = False,
-) -> None:
-    key = (
-        pending.room_id,
-        pending.generation,
-        pending.sequence,
-        pending.event_id,
-    )
-    if not _has_pending_dispatch(state, key):
-        return
-    encrypted = (
-        was_encrypted
-        if was_encrypted is not None
-        else isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted
-    )
-    try:
-        _finish(
-            state,
-            store,
-            gap,
-            pending,
-            encrypted,
-            retain_boundary=retain_boundary,
-        )
-    except Exception as error:
-        raise _DispatchFinishError(error) from error
-
-
 async def _run_dispatch(
     state: RecoveryState,
     store: MatrixStore | None,
@@ -265,7 +224,8 @@ async def _run_dispatch(
     event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
     *,
     retain_boundary: bool,
-) -> _DispatchOutcome:
+) -> _LiveCallbackError | None:
+    error: _LiveCallbackError | None = None
     try:
         delivered = await dispatch_event(
             gap.room_id,
@@ -274,32 +234,41 @@ async def _run_dispatch(
             pending.was_completed,
             pending.kind,
         )
-    except _LiveCallbackError as error:
-        _finish_dispatch(
-            state,
-            store,
-            gap,
-            pending,
-            None,
-            was_encrypted=error.was_encrypted,
-            retain_boundary=retain_boundary,
+    except _LiveCallbackError as dispatch_error:
+        error = dispatch_error
+        delivered = None
+
+    if _has_pending_dispatch(state, key):
+        was_encrypted = (
+            error.was_encrypted
+            if error
+            else (
+                isinstance(delivered, MegolmEvent)
+                if delivered
+                else pending.was_encrypted
+            )
         )
+        try:
+            _finish(
+                state,
+                store,
+                gap,
+                pending,
+                was_encrypted,
+                retain_boundary=retain_boundary,
+            )
+        except Exception as finish_error:
+            raise _DispatchFinishError(finish_error) from finish_error
+
+    if error:
         if not state._dispatch_waiters.get(key):
             logger.error(
                 "Recovered event callback failed after its recovery pump returned: %s",
                 pending.event_id,
                 exc_info=error.error,
             )
-        return _DispatchOutcome(error=error)
-    _finish_dispatch(
-        state,
-        store,
-        gap,
-        pending,
-        delivered,
-        retain_boundary=retain_boundary,
-    )
-    return _DispatchOutcome()
+        return error
+    return None
 
 
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
@@ -1004,9 +973,9 @@ async def _drain_gap(
                 )
                 return
             state._active_dispatches.pop(key, None)
-            outcome = task.result()
-            if outcome.error:
-                raise outcome.error
+            error = task.result()
+            if error:
+                raise error
         except _LiveCallbackError as error:
             raise error.error
         except _DispatchFinishError as error:
