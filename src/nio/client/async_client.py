@@ -867,7 +867,9 @@ class AsyncClient(Client):
         return event
 
     async def _pump_sync_recovery(self, ready_room_id: str | None = None) -> None:
-        if not (self.config.backfill_limited_timelines and self._recovery.gaps):
+        if not self.config.backfill_limited_timelines or not (
+            self._recovery.gaps or self._recovery._deferred_dispatch_errors
+        ):
             return
         await pump_recovery(
             self._recovery,
@@ -3808,12 +3810,15 @@ class AsyncClient(Client):
 
     async def close(self):
         """Close the underlying http session."""
+        caller = asyncio.current_task()
 
         async def finish_close() -> None:
-            await drain_recovery_dispatches(self._recovery)
-            if self.client_session:
-                await self.client_session.close()
-                self.client_session = None
+            try:
+                await drain_recovery_dispatches(self._recovery, exclude=caller)
+            finally:
+                if self.client_session:
+                    await self.client_session.close()
+                    self.client_session = None
 
         close_task = asyncio.create_task(finish_close())
         cancelled = False

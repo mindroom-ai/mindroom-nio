@@ -40,7 +40,7 @@ DispatchEvent = Callable[
     ],
     Awaitable[_DispatchResult],
 ]
-_DispatchKey = tuple[str, int, int, str]
+_DispatchKey = tuple[str, str, PendingEventKind]
 
 
 class _LiveCallbackError(Exception):
@@ -148,16 +148,49 @@ class RecoveryState:
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
         field(default_factory=dict, init=False, repr=False, compare=False)
     )
-    _dispatch_waiters: dict[_DispatchKey, int] = field(
+    _dispatch_waiters: dict[asyncio.Task[_LiveCallbackError | None], int] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _deferred_dispatch_errors: list[Exception] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
+
+
+def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:
+    return pending.room_id, pending.event_id, pending.kind
+
+
+def _pending_dispatch(
+    state: RecoveryState, key: _DispatchKey
+) -> tuple[RecoveryGap, PendingTimelineEvent] | None:
+    for (room_id, generation), queued in state.events.items():
+        if room_id != key[0]:
+            continue
+        pending = next(
+            (
+                event
+                for event in queued
+                if event.event_id == key[1] and event.kind == key[2]
+            ),
+            None,
+        )
+        if pending is None:
+            continue
+        gap = next(
+            (
+                gap
+                for gap in state.gaps.get(room_id, ())
+                if gap.generation == generation
+            ),
+            None,
+        )
+        if gap:
+            return gap, pending
+    return None
 
 
 def _has_pending_dispatch(state: RecoveryState, key: _DispatchKey) -> bool:
-    return any(
-        event.sequence == key[2] and event.event_id == key[3]
-        for event in state.events.get(key[:2], ())
-    )
+    return _pending_dispatch(state, key) is not None
 
 
 def _dispatch_finished(
@@ -165,13 +198,27 @@ def _dispatch_finished(
     key: _DispatchKey,
     task: asyncio.Task[_LiveCallbackError | None],
 ) -> None:
+    if state._active_dispatches.get(key) is not task:
+        if not task.cancelled():
+            task.exception()
+        return
+    if state._dispatch_waiters.get(task):
+        return
     if _has_pending_dispatch(state, key):
         if not task.cancelled():
             task.exception()
         return
-    if state._active_dispatches.pop(key, None) is task:
-        state._dispatch_waiters.pop(key, None)
+    state._active_dispatches.pop(key, None)
+    state._dispatch_waiters.pop(task, None)
+    if task.cancelled():
+        return
+    try:
+        dispatch_error = task.result()
+    except Exception:
         _report_orphaned_dispatch(key, task)
+    else:
+        if dispatch_error:
+            state._deferred_dispatch_errors.append(dispatch_error.error)
 
 
 def _report_orphaned_dispatch(
@@ -193,7 +240,7 @@ def _report_dispatch_error(
         return
     error = task.exception()
     if error:
-        logger.error(message, key[3], exc_info=error)
+        logger.error(message, key[1], exc_info=error)
 
 
 def _discard_orphaned_dispatches(state: RecoveryState) -> None:
@@ -202,7 +249,7 @@ def _discard_orphaned_dispatches(state: RecoveryState) -> None:
             continue
         if state._active_dispatches.pop(key, None) is not task:
             continue
-        state._dispatch_waiters.pop(key, None)
+        state._dispatch_waiters.pop(task, None)
         if task.done():
             _report_orphaned_dispatch(key, task)
         else:
@@ -238,30 +285,33 @@ async def _run_dispatch(
         error = dispatch_error
         delivered = None
 
-    if _has_pending_dispatch(state, key):
+    task = asyncio.current_task()
+    target = _pending_dispatch(state, key)
+    if target and state._active_dispatches.get(key) is task:
+        current_gap, current_pending = target
         was_encrypted = (
             error.was_encrypted
             if error
             else (
                 isinstance(delivered, MegolmEvent)
                 if delivered
-                else pending.was_encrypted
+                else current_pending.was_encrypted
             )
         )
         try:
             _finish(
                 state,
                 store,
-                gap,
-                pending,
+                current_gap,
+                current_pending,
                 was_encrypted,
-                retain_boundary=retain_boundary,
+                retain_boundary=retain_boundary and error is None,
             )
         except Exception as finish_error:
             raise _DispatchFinishError(finish_error) from finish_error
 
     if error:
-        if not state._dispatch_waiters.get(key):
+        if task is None or not state._dispatch_waiters.get(task):
             logger.error(
                 "Recovered event callback failed after its recovery pump returned: %s",
                 pending.event_id,
@@ -271,16 +321,22 @@ async def _run_dispatch(
     return None
 
 
-async def drain_recovery_dispatches(state: RecoveryState) -> None:
+async def drain_recovery_dispatches(
+    state: RecoveryState, *, exclude: asyncio.Task[Any] | None = None
+) -> None:
     """Wait for retained callback work and release its in-memory task entries."""
-    tasks = tuple(state._active_dispatches.values())
+    tasks = tuple(
+        task for task in state._active_dispatches.values() if task is not exclude
+    )
     if tasks:
         await asyncio.wait(tasks)
     finish_error: Exception | None = None
     for key, task in tuple(state._active_dispatches.items()):
+        if task is exclude:
+            continue
         if not task.done() or state._active_dispatches.pop(key, None) is not task:
             continue
-        state._dispatch_waiters.pop(key, None)
+        state._dispatch_waiters.pop(task, None)
         error = None if task.cancelled() else task.exception()
         if isinstance(error, _DispatchFinishError):
             finish_error = finish_error or error.error
@@ -922,12 +978,7 @@ async def _drain_gap(
             _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:
-            key = (
-                pending.room_id,
-                pending.generation,
-                pending.sequence,
-                pending.event_id,
-            )
+            key = _dispatch_key(pending)
             task = state._active_dispatches.get(key)
             loop = asyncio.get_running_loop()
             if task is None:
@@ -958,28 +1009,33 @@ async def _drain_gap(
                     )
                 )
             timeout = None if deadline is None else max(0, deadline - loop.time())
-            state._dispatch_waiters[key] = state._dispatch_waiters.get(key, 0) + 1
+            state._dispatch_waiters[task] = state._dispatch_waiters.get(task, 0) + 1
+            done: set[asyncio.Task[_LiveCallbackError | None]] = set()
             try:
                 done, _ = await asyncio.wait((task,), timeout=timeout)
             finally:
-                waiters = state._dispatch_waiters.get(key, 0)
+                waiters = state._dispatch_waiters.get(task, 0)
                 if waiters <= 1:
-                    state._dispatch_waiters.pop(key, None)
+                    state._dispatch_waiters.pop(task, None)
                 else:
-                    state._dispatch_waiters[key] = waiters - 1
+                    state._dispatch_waiters[task] = waiters - 1
+                if task.done() and task not in done:
+                    _dispatch_finished(state, key, task)
             if not done:
                 logger.warning(
                     "Recovered event callback timed out: %s", pending.event_id
                 )
+                return
+            if state._active_dispatches.get(key) is not task:
                 return
             state._active_dispatches.pop(key, None)
             error = task.result()
             if error:
                 raise error
         except _LiveCallbackError as error:
-            raise error.error
+            raise error.error from error
         except _DispatchFinishError as error:
-            raise error.error
+            raise error.error from error
         except asyncio.TimeoutError:
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
             return
@@ -1001,6 +1057,8 @@ async def pump_recovery(
     store: MatrixStore | None,
     ready_room_id: str | None = None,
 ) -> None:
+    if state._deferred_dispatch_errors:
+        raise state._deferred_dispatch_errors.pop(0)
     if ready_room_id is not None:
         gaps = state.gaps.get(ready_room_id)
         if not gaps:

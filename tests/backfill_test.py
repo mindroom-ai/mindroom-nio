@@ -279,6 +279,14 @@ async def client(tempdir):
 
 @pytest.mark.asyncio
 class TestRoomLocalRecovery:
+    async def test_deferred_callback_error_surfaces_without_recovery_gap(self, client):
+        client._recovery._deferred_dispatch_errors.append(
+            RuntimeError("late callback failure")
+        )
+
+        with pytest.raises(RuntimeError, match="late callback failure"):
+            await client._pump_sync_recovery()
+
     async def test_disabled_preserves_short_circuit(self, tempdir):
         client = AsyncClient(
             "https://example.org",
