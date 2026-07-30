@@ -22,6 +22,7 @@ from ..events import (
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
+    from ..sliding_sync_tokens import SlidingWindowToken
     from ..store.database import MatrixStore
 
 logger = logging.getLogger(__name__)
@@ -812,7 +813,7 @@ def persist_response_plan(
     *,
     token: str | None,
     plan: RecoveryPlan,
-    window_tokens: Mapping[str, str] | None = None,
+    window_tokens: Mapping[str, SlidingWindowToken] | None = None,
     forgotten_rooms: Iterable[str] = (),
 ) -> None:
     try:

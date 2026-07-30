@@ -258,6 +258,7 @@ class SlidingWindowTokens(Model):
 
     room_id = TextField()
     token = TextField()
+    membership_event_id = TextField()
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

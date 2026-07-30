@@ -245,6 +245,7 @@ from ..responses import (
     WhoamiResponse,
 )
 from ..rooms import MatrixRoom
+from ..sliding_sync_tokens import SlidingWindowToken
 from .base_client import (
     Client,
     ClientCallback,
@@ -557,7 +558,8 @@ class AsyncClient(Client):
         # used as the start of the next limited window's recovery walk.
         # Restored from the store when recovery persistence is enabled;
         # otherwise it lives only in memory and cannot survive a restart.
-        self._sliding_room_prev_batch: dict[str, str] = {}
+        self._sliding_room_prev_batch: dict[str, SlidingWindowToken] = {}
+        self._sliding_verified_membership_event_ids: dict[str, str] = {}
 
         # Rooms whose membership reset since their last window, each with
         # the epoch of the reset. A response only carries a usable token if
@@ -1319,11 +1321,31 @@ class AsyncClient(Client):
             "ban",
         ):
             return None
-        return self._sliding_room_prev_batch.get(room_id)
+        window_token = self._sliding_room_prev_batch.get(room_id)
+        if not window_token:
+            return None
+        membership_event_id = self._sliding_membership_event_id(room_id, room)
+        if membership_event_id != window_token.membership_event_id:
+            return None
+        return window_token.token
+
+    def _sliding_membership_event_id(
+        self, room_id: str, room: SlidingSyncRoom
+    ) -> str | None:
+        """Return the verified membership event owning this room snapshot."""
+        own_membership_events = [
+            event
+            for event in (*room.required_state, *room.timeline)
+            if isinstance(event, RoomMemberEvent) and event.state_key == self.user_id
+        ]
+        if own_membership_events:
+            event = own_membership_events[-1]
+            return event.event_id if event.membership == "join" else None
+        return self._sliding_verified_membership_event_ids.get(room_id)
 
     def _plan_sliding_prev_batches(
         self, response: SlidingSyncResponse
-    ) -> tuple[dict[str, str], list[str]]:
+    ) -> tuple[dict[str, SlidingWindowToken], list[str]]:
         """Work out each room's next walk baseline, without applying it.
 
         Returns the tokens to store and the rooms whose token is gone, so
@@ -1331,10 +1353,14 @@ class AsyncClient(Client):
         to: a baseline persisted without its plan would send a restarted
         walk from the wrong position.
         """
-        recorded: dict[str, str] = {}
+        recorded: dict[str, SlidingWindowToken] = {}
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
             own_join = any(is_own_join(event, self.user_id) for event in room.timeline)
+            if self._sliding_token_predates_reset(room_id, room):
+                continue
+            membership_event_id = self._sliding_membership_event_id(room_id, room)
+            window_token = self._sliding_room_prev_batch.get(room_id)
             if self._sliding_sync_room_is_invite(room) or room.membership in (
                 "leave",
                 "ban",
@@ -1342,23 +1368,18 @@ class AsyncClient(Client):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
                 forgotten.append(room_id)
-            elif own_join:
-                # Invalidate the old membership's token while adopting this
-                # window's baseline in the same transaction. The response
-                # itself must still predate no reset that happened before it.
+            elif membership_event_id is None:
                 forgotten.append(room_id)
-                if (
-                    not self._sliding_token_predates_reset(room_id, room)
-                    and room.prev_batch
+            else:
+                if own_join or (
+                    window_token
+                    and window_token.membership_event_id != membership_event_id
                 ):
-                    recorded[room_id] = room.prev_batch
-            elif self._sliding_token_predates_reset(room_id, room):
-                # A response that left the server before the membership
-                # reset can arrive after it, `initial` included, so its
-                # token describes a membership we no longer hold.
-                continue
-            elif room.prev_batch:
-                recorded[room_id] = room.prev_batch
+                    forgotten.append(room_id)
+                if room.prev_batch:
+                    recorded[room_id] = SlidingWindowToken(
+                        room.prev_batch, membership_event_id
+                    )
         return recorded, forgotten
 
     def _sliding_token_predates_reset(
@@ -1386,12 +1407,15 @@ class AsyncClient(Client):
     def _reset_sliding_room(self, room_id: str) -> None:
         """Mark a room's baseline invalid from this moment on."""
         self._sliding_room_prev_batch.pop(room_id, None)
+        self._sliding_verified_membership_event_ids.pop(room_id, None)
         self._sliding_reset_epoch += 1
         self._sliding_reset_rooms[room_id] = self._sliding_reset_epoch
         self._sliding_room_epoch_floor[room_id] = self._sliding_reset_epoch
 
     def _apply_sliding_prev_batches(
-        self, recorded: Mapping[str, str], forgotten: Iterable[str]
+        self,
+        recorded: Mapping[str, SlidingWindowToken],
+        forgotten: Iterable[str],
     ) -> None:
         """Adopt baselines whose durable write already succeeded."""
         for room_id in forgotten:
@@ -1402,6 +1426,9 @@ class AsyncClient(Client):
         request_epoch = self._sliding_request_epoch.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
+            self._sliding_verified_membership_event_ids[room_id] = (
+                token.membership_event_id
+            )
             self._sliding_reset_rooms.pop(room_id, None)
             if request_epoch is not None:
                 self._sliding_room_epoch_floor[room_id] = max(
@@ -2396,8 +2423,10 @@ class AsyncClient(Client):
                 int(self.config.request_timeout) * 1000 if timeout is None else timeout
             ),
             set_presence=presence,
-            lists=lists,
-            room_subscriptions=room_subscriptions,
+            lists=self._sliding_sync_request_membership(lists),
+            room_subscriptions=self._sliding_sync_request_membership(
+                room_subscriptions
+            ),
             extensions=extensions,
             unstable=unstable,
         )
@@ -2609,6 +2638,21 @@ class AsyncClient(Client):
             "since": self._sliding_sync_to_device_since,
         }
         return threaded
+
+    def _sliding_sync_request_membership(
+        self, rooms: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Request our membership state without mutating caller dictionaries."""
+        if not self.config.backfill_limited_timelines or rooms is None:
+            return rooms
+        own_membership = ["m.room.member", "$ME"]
+        requested: dict[str, Any] = {}
+        for name, spec in rooms.items():
+            required_state = list(spec.get("required_state") or ())
+            if own_membership not in required_state:
+                required_state.append(own_membership)
+            requested[name] = {**spec, "required_state": required_state}
+        return requested
 
     @logged_in_async
     async def sliding_sync_forever(

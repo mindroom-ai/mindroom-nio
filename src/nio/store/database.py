@@ -35,6 +35,7 @@ from ..crypto import (
     SessionStore,
     TrustState,
 )
+from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
     DeviceKeys,
@@ -134,7 +135,7 @@ class MatrixStore:
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 4
+    store_version = 5
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -176,6 +177,12 @@ class MatrixStore:
             self.database.create_tables([SlidingWindowTokens])
         self._update_version(4)
 
+    def upgrade_to_v5(self):
+        with self.database.bind_ctx(self.models):
+            self.database.drop_tables([SlidingWindowTokens], safe=True)
+            self.database.create_tables([SlidingWindowTokens])
+        self._update_version(5)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -193,6 +200,9 @@ class MatrixStore:
             store_version = 3
         if store_version == 3:
             self.upgrade_to_v4()
+            store_version = 4
+        if store_version == 4:
+            self.upgrade_to_v5()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -567,7 +577,7 @@ class MatrixStore:
         gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
         events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
         clear_recovered: RecoveryGap | None,
-        window_tokens: Mapping[str, str] | None = None,
+        window_tokens: Mapping[str, SlidingWindowToken] | None = None,
         forgotten_rooms: Iterable[str] = (),
     ) -> None:
         account = self._get_account()
@@ -787,13 +797,13 @@ class MatrixStore:
         return gaps, events
 
     @use_database
-    def load_sliding_window_tokens(self) -> dict[str, str]:
+    def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
         """Load each room's last sliding window token."""
         account = self._get_account()
         if not account:
             return {}
         return {
-            row.room_id: row.token
+            row.room_id: SlidingWindowToken(row.token, row.membership_event_id)
             for row in SlidingWindowTokens.select().where(
                 SlidingWindowTokens.account == account
             )
@@ -801,7 +811,9 @@ class MatrixStore:
 
     @use_database_atomic
     def save_sliding_window_tokens(
-        self, tokens: Mapping[str, str], forgotten: Iterable[str] = ()
+        self,
+        tokens: Mapping[str, SlidingWindowToken],
+        forgotten: Iterable[str] = (),
     ) -> None:
         """Persist window tokens, dropping the rooms that no longer have one."""
         account = self._get_account()
@@ -811,7 +823,7 @@ class MatrixStore:
     def _write_sliding_window_tokens(
         self,
         account,
-        tokens: Mapping[str, str] | None,
+        tokens: Mapping[str, SlidingWindowToken] | None,
         forgotten: Iterable[str],
     ) -> None:
         """Write window tokens in chunks SQLite can bind in one statement."""
@@ -825,7 +837,12 @@ class MatrixStore:
             ).execute()
 
         rows = [
-            {"account": account, "room_id": room_id, "token": token}
+            {
+                "account": account,
+                "room_id": room_id,
+                "token": token.token,
+                "membership_event_id": token.membership_event_id,
+            }
             for room_id, token in (tokens or {}).items()
         ]
         for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):

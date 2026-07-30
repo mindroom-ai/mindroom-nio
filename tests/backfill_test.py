@@ -50,6 +50,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
+from nio.sliding_sync_tokens import SlidingWindowToken
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
 MESSAGES_URL = re.compile(rf"^{BASE_URL}/rooms/.+/messages")
@@ -59,6 +60,12 @@ ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
 LOGIN = json.loads(Path("tests/data/login_response.json").read_text())
 OWN_ID = LOGIN["user_id"]
+
+
+def window_token(
+    token: str, membership_event_id: str = "$membership"
+) -> SlidingWindowToken:
+    return SlidingWindowToken(token, membership_event_id)
 
 
 def text_event(event_id: str, ts: int, room_id: str = ROOM_A) -> RoomMessageText:
@@ -2931,7 +2938,7 @@ class TestRoomLocalRecovery:
         await first.receive_response(
             self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
         )
-        assert first.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert first.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await first.close()
 
         # A fresh process against the same store: nothing in memory, the
@@ -2940,7 +2947,7 @@ class TestRoomLocalRecovery:
             "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
         )
         await second.receive_response(LoginResponse.from_dict(LOGIN))
-        assert second._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert second._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
 
         seen = record_events(second)
         pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
@@ -2953,6 +2960,100 @@ class TestRoomLocalRecovery:
         assert pages.from_tokens == ["w1"]
         assert not second._recovery.gaps
         await second.close()
+
+    @pytest.mark.parametrize(
+        ("membership_event_id", "expected_token"),
+        [(None, None), ("$new-membership", "w2")],
+    )
+    async def test_restart_token_requires_current_membership_identity(
+        self,
+        tempdir,
+        aioresponse,
+        membership_event_id,
+        expected_token,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+
+        second = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await second.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(second)
+        pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await second.receive_response(
+            self._sliding(
+                "s2",
+                [text_event("$held", 3)],
+                limited=True,
+                prev_batch="w2",
+                membership_event_id=membership_event_id,
+            )
+        )
+
+        assert seen == ["$held"]
+        assert pages.from_tokens == []
+        stored = second.store.load_sliding_window_tokens().get(ROOM_A)
+        assert (stored.token if stored else None) == expected_token
+        assert (stored.membership_event_id if stored else None) == membership_event_id
+        await second.close()
+
+    async def test_sliding_sync_requests_own_membership_without_mutating_inputs(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(backfill_limited_timelines=True)
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        lists = {
+            "main": {
+                "ranges": [[0, 9]],
+                "required_state": [["m.room.create", ""]],
+            }
+        }
+        subscriptions = {
+            ROOM_A: {
+                "required_state": [["m.room.name", ""]],
+            }
+        }
+        sent: list[dict] = []
+
+        async def send(*_args, **kwargs):
+            sent.append(json.loads(_args[3]))
+            return SlidingSyncResponse.from_dict({"pos": "s1", "rooms": {}})
+
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sliding_sync(
+            lists=lists,
+            room_subscriptions=subscriptions,
+        )
+
+        own_membership = ["m.room.member", "$ME"]
+        assert sent[0]["lists"]["main"]["required_state"] == [
+            ["m.room.create", ""],
+            own_membership,
+        ]
+        assert sent[0]["room_subscriptions"][ROOM_A]["required_state"] == [
+            ["m.room.name", ""],
+            own_membership,
+        ]
+        assert lists["main"]["required_state"] == [["m.room.create", ""]]
+        assert subscriptions[ROOM_A]["required_state"] == [["m.room.name", ""]]
+        await client.close()
 
     async def test_forgetting_a_room_drops_its_window_token(self, tempdir):
         """A stale baseline must not outlive the membership it was taken under."""
@@ -2967,7 +3068,7 @@ class TestRoomLocalRecovery:
         await client.receive_response(
             self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
         )
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
 
         await client.receive_response(RoomForgetResponse.from_dict({}, ROOM_A))
 
@@ -2988,7 +3089,7 @@ class TestRoomLocalRecovery:
         await client.receive_response(
             self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
         )
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
 
         left = sync_response("s2", {})
         left.rooms.leave[ROOM_A] = RoomInfo(Timeline([], False, None), [], [], [])
@@ -3023,7 +3124,7 @@ class TestRoomLocalRecovery:
 
         # The advanced token was never committed, so the next walk still
         # starts from the last baseline that was.
-        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
         await client.close()
 
     async def test_response_crossing_a_leave_does_not_restore_the_token(self, tempdir):
@@ -3054,7 +3155,7 @@ class TestRoomLocalRecovery:
                 "s3", [text_event("$rejoined", 3)], prev_batch="w3", initial=True
             )
         )
-        assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
         await client.close()
 
     async def test_sync_token_is_stored_without_recovery_persistence(self, tempdir):
@@ -3089,7 +3190,7 @@ class TestRoomLocalRecovery:
         await first.receive_response(
             self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
         )
-        assert first.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert first.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await first.close()
 
         # This run refuses to write recovery rows, but the stale baseline
@@ -3151,7 +3252,7 @@ class TestRoomLocalRecovery:
             )
         finally:
             client._sliding_request_epoch.reset(token)
-        assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
         await client.close()
 
     async def test_rejoin_in_the_timeline_discards_the_restored_token(
@@ -3169,7 +3270,7 @@ class TestRoomLocalRecovery:
         await client.receive_response(
             self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
         )
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
 
         seen = record_events(client)
         rejoin = SlidingSyncResponse.from_dict(
@@ -3202,7 +3303,9 @@ class TestRoomLocalRecovery:
         # becomes the baseline for the membership that exists now.
         assert seen == ["$after"]
         assert not client._recovery.gaps
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w2"}
+        assert client.store.load_sliding_window_tokens() == {
+            ROOM_A: window_token("w2", "$join")
+        }
         await client.close()
 
     async def test_cancelled_rejoin_planning_keeps_the_committed_baseline(
@@ -3252,8 +3355,8 @@ class TestRoomLocalRecovery:
         with pytest.raises(asyncio.CancelledError):
             await client.sliding_sync()
 
-        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
@@ -3292,8 +3395,8 @@ class TestRoomLocalRecovery:
             await getattr(client, operation)(ROOM_A)
 
         assert sent == []
-        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await client.close()
 
     async def test_restart_snapshot_still_walks_from_the_stored_token(
@@ -3336,7 +3439,7 @@ class TestRoomLocalRecovery:
                         "limited": True,
                         "prev_batch": "w2",
                         "required_state": [
-                            member_event("$join", 0, "join", OWN_ID).source
+                            member_event("$membership", 0, "join", OWN_ID).source
                         ],
                         "timeline": [text_event("$held", 3).source],
                     }
@@ -3386,7 +3489,7 @@ class TestRoomLocalRecovery:
         )
 
         assert calls == ["save_recovery"]
-        assert seen_tokens == [{ROOM_A: "w1"}]
+        assert seen_tokens == [{ROOM_A: window_token("w1")}]
         await client.close()
 
     async def test_left_room_drops_the_persisted_window_token(self, tempdir):
@@ -3424,7 +3527,7 @@ class TestRoomLocalRecovery:
         )
 
         # The window token is durable...
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         # ...while nio has recorded no sync token of its own.
         assert client.store.load_sync_token() is None
         await client.close()
@@ -3807,12 +3910,17 @@ class TestRoomLocalRecovery:
         prev_batch: str | None = None,
         initial: bool = False,
         membership: str = "join",
+        membership_event_id: str | None = "$membership",
     ) -> SlidingSyncResponse:
         room: dict = {
             "membership": membership,
             "timeline": [event.source for event in events],
             "limited": limited,
         }
+        if membership_event_id is not None:
+            room["required_state"] = [
+                member_event(membership_event_id, 0, membership).source
+            ]
         if prev_batch is not None:
             room["prev_batch"] = prev_batch
         if initial:
