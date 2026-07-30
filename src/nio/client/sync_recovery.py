@@ -332,8 +332,9 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
     while state._active_dispatches:
         await asyncio.wait(tuple(set(state._active_dispatches.values())))
         for key, task in tuple(state._active_dispatches.items()):
-            if not task.done() or state._active_dispatches.pop(key, None) is not task:
+            if not task.done() or state._active_dispatches.get(key) is not task:
                 continue
+            state._active_dispatches.pop(key)
             state._dispatch_waiters.pop(task, None)
             error = None if task.cancelled() else task.exception()
             if isinstance(error, _DispatchFinishError):

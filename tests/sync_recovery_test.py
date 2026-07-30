@@ -856,7 +856,7 @@ async def test_dispatch_drain_reaches_tasks_registered_while_waiting():
         nested_finished.set()
 
     async def first_dispatch():
-        state._active_dispatches[(ROOM_B, "$nested", "timeline")] = asyncio.create_task(
+        state._active_dispatches[(ROOM, "$live", "timeline")] = asyncio.create_task(
             nested_dispatch()
         )
 
