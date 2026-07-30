@@ -844,33 +844,51 @@ async def test_stale_waiter_does_not_remove_or_close_replacement():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_drain_skips_excluded_caller():
+async def test_dispatch_drain_reaches_tasks_registered_while_waiting():
     state = RecoveryState()
-    caller = asyncio.current_task()
-    assert caller
-    key = (ROOM, "$live", "timeline")
-    state._active_dispatches[key] = caller
+    nested_started = asyncio.Event()
+    nested_release = asyncio.Event()
+    nested_finished = asyncio.Event()
 
-    await sync_recovery.drain_recovery_dispatches(state, exclude=caller)
+    async def nested_dispatch():
+        nested_started.set()
+        await nested_release.wait()
+        nested_finished.set()
 
-    assert state._active_dispatches[key] is caller
-    state._active_dispatches.clear()
+    async def first_dispatch():
+        state._active_dispatches[(ROOM_B, "$nested", "timeline")] = asyncio.create_task(
+            nested_dispatch()
+        )
+
+    state._active_dispatches[(ROOM, "$live", "timeline")] = asyncio.create_task(
+        first_dispatch()
+    )
+    drain = asyncio.create_task(sync_recovery.drain_recovery_dispatches(state))
+    await nested_started.wait()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(drain), 0.01)
+    nested_release.set()
+    await drain
+
+    assert nested_finished.is_set()
+    assert not state._active_dispatches
 
 
 @pytest.mark.asyncio
-async def test_close_excludes_its_caller_from_dispatch_drain(monkeypatch):
-    caller = asyncio.current_task()
-    excluded = []
+async def test_close_drains_without_caller_exclusion(monkeypatch):
+    calls = 0
 
-    async def drain(_state, *, exclude=None):
-        excluded.append(exclude)
+    async def drain(_state):
+        nonlocal calls
+        calls += 1
 
     monkeypatch.setattr(async_client_module, "drain_recovery_dispatches", drain)
     client = AsyncClient("https://example.org")
 
     await client.close()
 
-    assert excluded == [caller]
+    assert calls == 1
 
 
 @pytest.mark.asyncio

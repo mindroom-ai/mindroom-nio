@@ -326,31 +326,24 @@ async def _run_dispatch(
     return None
 
 
-async def drain_recovery_dispatches(
-    state: RecoveryState, *, exclude: asyncio.Task[Any] | None = None
-) -> None:
+async def drain_recovery_dispatches(state: RecoveryState) -> None:
     """Wait for retained callback work and release its in-memory task entries."""
-    tasks = tuple(
-        task for task in state._active_dispatches.values() if task is not exclude
-    )
-    if tasks:
-        await asyncio.wait(tasks)
     finish_error: Exception | None = None
-    for key, task in tuple(state._active_dispatches.items()):
-        if task is exclude:
-            continue
-        if not task.done() or state._active_dispatches.pop(key, None) is not task:
-            continue
-        state._dispatch_waiters.pop(task, None)
-        error = None if task.cancelled() else task.exception()
-        if isinstance(error, _DispatchFinishError):
-            finish_error = finish_error or error.error
-            continue
-        _report_dispatch_error(
-            key,
-            task,
-            "Recovered event callback failed while the client was closing: %s",
-        )
+    while state._active_dispatches:
+        await asyncio.wait(tuple(set(state._active_dispatches.values())))
+        for key, task in tuple(state._active_dispatches.items()):
+            if not task.done() or state._active_dispatches.pop(key, None) is not task:
+                continue
+            state._dispatch_waiters.pop(task, None)
+            error = None if task.cancelled() else task.exception()
+            if isinstance(error, _DispatchFinishError):
+                finish_error = finish_error or error.error
+                continue
+            _report_dispatch_error(
+                key,
+                task,
+                "Recovered event callback failed while the client was closing: %s",
+            )
     if finish_error:
         raise finish_error
 

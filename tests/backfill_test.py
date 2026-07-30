@@ -1488,6 +1488,34 @@ class TestRoomLocalRecovery:
         assert seen == ["$outer", "$suffix"]
         assert client.next_batch == ("outer" if outer_protocol == "classic" else "")
 
+    async def test_callback_close_reentry_fails_before_session_close(self, client):
+        failures: list[str] = []
+
+        class Session:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        session = Session()
+        client.client_session = session
+
+        async def callback(_room, value):
+            if value.event_id != "$outer":
+                return
+            try:
+                await client.close()
+            except LocalProtocolError as error:
+                failures.append(str(error))
+
+        client.add_event_callback(callback, RoomMessageText)
+        await client.receive_response(
+            timeline_response("classic", "outer", [text_event("$outer", 1)])
+        )
+
+        assert failures == ["AsyncClient.close() cannot run from a timeline callback."]
+        assert not session.closed
+
     async def test_stale_inherited_executor_token_may_proceed(self, client):
         release = asyncio.Event()
         child: asyncio.Task | None = None

@@ -3985,11 +3985,18 @@ class AsyncClient(Client):
 
     async def close(self):
         """Close the underlying http session."""
-        caller = asyncio.current_task()
+        if (
+            self.config.backfill_limited_timelines
+            and self._sync_executor_context.get() is self._active_sync_executor_token
+            and self._active_sync_executor_token is not None
+        ):
+            raise LocalProtocolError(
+                "AsyncClient.close() cannot run from a timeline callback."
+            )
 
         async def finish_close() -> None:
             try:
-                await drain_recovery_dispatches(self._recovery, exclude=caller)
+                await drain_recovery_dispatches(self._recovery)
             finally:
                 if self.client_session:
                     await self.client_session.close()
