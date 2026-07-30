@@ -547,7 +547,7 @@ class AsyncClient(Client):
         )
         self._active_sync_executor_token: object | None = None
         self._recovery_room_gates: dict[str, asyncio.Lock] = {}
-        self._room_leave_locks: dict[str, asyncio.Lock] = {}
+        self._room_membership_locks: dict[str, asyncio.Lock] = {}
         self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
 
         # Sliding account data retained until its room is known.
@@ -1536,7 +1536,9 @@ class AsyncClient(Client):
         return True
 
     @staticmethod
-    def _room_leave_was_definitively_rejected(response: RoomLeaveError) -> bool:
+    def _room_membership_change_was_definitively_rejected(
+        response: RoomLeaveError | RoomForgetError,
+    ) -> bool:
         transport = response.transport_response
         return bool(
             transport
@@ -4395,7 +4397,7 @@ class AsyncClient(Client):
         Args:
             room_id: The room id of the room to leave.
         """
-        async with self._room_leave_locks.setdefault(room_id, asyncio.Lock()):
+        async with self._room_membership_locks.setdefault(room_id, asyncio.Lock()):
             method, path = Api.room_leave(self.access_token, room_id)
             window_token = self._sliding_room_prev_batch.get(room_id)
             self._forget_sliding_window_token(room_id)
@@ -4404,7 +4406,7 @@ class AsyncClient(Client):
             if (
                 window_token is not None
                 and isinstance(response, RoomLeaveError)
-                and self._room_leave_was_definitively_rejected(response)
+                and self._room_membership_change_was_definitively_rejected(response)
             ):
                 self._restore_sliding_window_token(
                     room_id,
@@ -4429,11 +4431,25 @@ class AsyncClient(Client):
         Args:
             room_id (str): The room id of the room to forget.
         """
-        method, path = Api.room_forget(self.access_token, room_id)
-        self._forget_sliding_window_token(room_id)
-        return await self._send(
-            RoomForgetResponse, method, path, response_data=(room_id,)
-        )
+        async with self._room_membership_locks.setdefault(room_id, asyncio.Lock()):
+            method, path = Api.room_forget(self.access_token, room_id)
+            window_token = self._sliding_room_prev_batch.get(room_id)
+            self._forget_sliding_window_token(room_id)
+            reset_issuance = self._sliding_reset_rooms[room_id]
+            response = await self._send(
+                RoomForgetResponse, method, path, response_data=(room_id,)
+            )
+            if (
+                window_token is not None
+                and isinstance(response, RoomForgetError)
+                and self._room_membership_change_was_definitively_rejected(response)
+            ):
+                self._restore_sliding_window_token(
+                    room_id,
+                    window_token,
+                    reset_issuance,
+                )
+            return response
 
     @logged_in_async
     async def room_kick(

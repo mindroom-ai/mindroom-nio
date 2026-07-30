@@ -27,6 +27,7 @@ from nio import (
     PresenceEvent,
     RoomEncryptedImage,
     RoomEncryptionEvent,
+    RoomForgetError,
     RoomForgetResponse,
     RoomInfo,
     RoomLeaveError,
@@ -3885,8 +3886,15 @@ class TestRoomLocalRecovery:
         ("status", "restored"),
         [(403, True), (500, False)],
     )
-    async def test_room_leave_restores_token_only_after_definitive_rejection(
-        self, tempdir, monkeypatch, status, restored
+    @pytest.mark.parametrize(
+        ("operation", "error_type"),
+        [
+            ("room_leave", RoomLeaveError),
+            ("room_forget", RoomForgetError),
+        ],
+    )
+    async def test_membership_change_restores_token_only_after_definitive_rejection(
+        self, tempdir, monkeypatch, status, restored, operation, error_type
     ):
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3904,8 +3912,11 @@ class TestRoomLocalRecovery:
             def __init__(self, response_status):
                 self.status = response_status
 
-        response = RoomLeaveError.from_dict(
-            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        error = {"errcode": "M_FORBIDDEN", "error": "membership change rejected"}
+        response = (
+            error_type.from_dict(error, ROOM_A)
+            if error_type is RoomForgetError
+            else error_type.from_dict(error)
         )
         response.transport_response = Transport(status)
 
@@ -3914,7 +3925,7 @@ class TestRoomLocalRecovery:
 
         monkeypatch.setattr(client, "_send", send)
 
-        result = await client.room_leave(ROOM_A)
+        result = await getattr(client, operation)(ROOM_A)
 
         assert result is response
         expected = {ROOM_A: window_token("w1")} if restored else {}
