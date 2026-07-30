@@ -304,6 +304,14 @@ async def client(tempdir):
 
 @pytest.mark.asyncio
 class TestRoomLocalRecovery:
+    async def test_deferred_callback_error_surfaces_without_recovery_gap(self, client):
+        client._recovery._deferred_dispatch_errors.append(
+            RuntimeError("late callback failure")
+        )
+
+        with pytest.raises(RuntimeError, match="late callback failure"):
+            await client._pump_sync_recovery()
+
     async def test_disabled_preserves_short_circuit(self, tempdir):
         client = AsyncClient(
             "https://example.org",
@@ -4587,11 +4595,12 @@ class TestRecoveryOutcome:
         self, client, aioresponse
     ):
         started = asyncio.Event()
+        release = asyncio.Event()
 
         async def block_recovered(_room, event):
             if event.event_id == "$gap":
                 started.set()
-                await asyncio.Event().wait()
+                await release.wait()
 
         client.add_event_callback(block_recovered, RoomMessageText)
         client.next_batch = "s1"
@@ -4615,12 +4624,15 @@ class TestRecoveryOutcome:
         task = asyncio.create_task(client.receive_response(response))
         await asyncio.wait_for(started.wait(), 1)
 
-        task.cancel()
+        try:
+            task.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert response.recovered_room_ids == frozenset()
-        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert response.recovered_room_ids == frozenset()
+            assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        finally:
+            release.set()
 
     async def test_cancelled_before_plan_keeps_response_retryable(
         self, client, aioresponse, monkeypatch
