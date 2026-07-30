@@ -8,7 +8,6 @@ from collections import OrderedDict
 import nio.client.sync_recovery as sync_recovery
 import pytest
 
-import nio.client.sync_recovery as sync_recovery
 from nio import AsyncClient, Event, RoomMessageText
 from nio.client import async_client as async_client_module
 from nio.client.sync_recovery import (
