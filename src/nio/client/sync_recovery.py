@@ -50,6 +50,17 @@ class _LiveCallbackError(Exception):
         self.was_encrypted = was_encrypted
 
 
+class _DispatchFinishError(Exception):
+    def __init__(self, error: Exception):
+        super().__init__(error)
+        self.error = error
+
+
+@dataclass(frozen=True)
+class _DispatchOutcome:
+    error: _LiveCallbackError | None = None
+
+
 @dataclass(frozen=True)
 class RecoveryOptions:
     max_pages: int
@@ -139,7 +150,10 @@ class RecoveryState:
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
-    _active_dispatches: dict[_DispatchKey, asyncio.Task[_DispatchResult]] = field(
+    _active_dispatches: dict[_DispatchKey, asyncio.Task[_DispatchOutcome]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _dispatch_waiters: dict[_DispatchKey, int] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
 
@@ -154,28 +168,37 @@ def _has_pending_dispatch(state: RecoveryState, key: _DispatchKey) -> bool:
 def _dispatch_finished(
     state: RecoveryState,
     key: _DispatchKey,
-    task: asyncio.Task[_DispatchResult],
+    task: asyncio.Task[_DispatchOutcome],
 ) -> None:
     if _has_pending_dispatch(state, key):
         if not task.cancelled():
             task.exception()
         return
     if state._active_dispatches.pop(key, None) is task:
+        state._dispatch_waiters.pop(key, None)
         _report_orphaned_dispatch(key, task)
 
 
 def _report_orphaned_dispatch(
-    key: _DispatchKey, task: asyncio.Task[_DispatchResult]
+    key: _DispatchKey, task: asyncio.Task[_DispatchOutcome]
+) -> None:
+    _report_dispatch_error(
+        key,
+        task,
+        "Recovered event callback failed after its row was cleared: %s",
+    )
+
+
+def _report_dispatch_error(
+    key: _DispatchKey,
+    task: asyncio.Task[_DispatchOutcome],
+    message: str,
 ) -> None:
     if task.cancelled():
         return
     error = task.exception()
     if error:
-        logger.error(
-            "Recovered event callback failed after its row was cleared: %s",
-            key[3],
-            exc_info=error,
-        )
+        logger.error(message, key[3], exc_info=error)
 
 
 def _discard_orphaned_dispatches(state: RecoveryState) -> None:
@@ -184,6 +207,7 @@ def _discard_orphaned_dispatches(state: RecoveryState) -> None:
             continue
         if state._active_dispatches.pop(key, None) is not task:
             continue
+        state._dispatch_waiters.pop(key, None)
         if task.done():
             _report_orphaned_dispatch(key, task)
         else:
@@ -193,6 +217,112 @@ def _discard_orphaned_dispatches(state: RecoveryState) -> None:
 def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
     """Whether this event is our own transition into the room."""
     return _is_own_join(event, user_id)
+
+
+def _finish_dispatch(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending: PendingTimelineEvent,
+    delivered: _DispatchResult,
+    *,
+    was_encrypted: bool | None = None,
+    retain_boundary: bool = False,
+) -> None:
+    key = (
+        pending.room_id,
+        pending.generation,
+        pending.sequence,
+        pending.event_id,
+    )
+    if not _has_pending_dispatch(state, key):
+        return
+    encrypted = (
+        was_encrypted
+        if was_encrypted is not None
+        else isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted
+    )
+    try:
+        _finish(
+            state,
+            store,
+            gap,
+            pending,
+            encrypted,
+            retain_boundary=retain_boundary,
+        )
+    except Exception as error:
+        raise _DispatchFinishError(error) from error
+
+
+async def _run_dispatch(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending: PendingTimelineEvent,
+    key: _DispatchKey,
+    dispatch_event: DispatchEvent,
+    event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
+    *,
+    retain_boundary: bool,
+) -> _DispatchOutcome:
+    try:
+        delivered = await dispatch_event(
+            gap.room_id,
+            event,
+            pending.is_live,
+            pending.was_completed,
+            pending.kind,
+        )
+    except _LiveCallbackError as error:
+        _finish_dispatch(
+            state,
+            store,
+            gap,
+            pending,
+            None,
+            was_encrypted=error.was_encrypted,
+            retain_boundary=retain_boundary,
+        )
+        if not state._dispatch_waiters.get(key):
+            logger.error(
+                "Recovered event callback failed after its recovery pump returned: %s",
+                pending.event_id,
+                exc_info=error.error,
+            )
+        return _DispatchOutcome(error=error)
+    _finish_dispatch(
+        state,
+        store,
+        gap,
+        pending,
+        delivered,
+        retain_boundary=retain_boundary,
+    )
+    return _DispatchOutcome()
+
+
+async def drain_recovery_dispatches(state: RecoveryState) -> None:
+    """Wait for retained callback work and release its in-memory task entries."""
+    tasks = tuple(state._active_dispatches.values())
+    if tasks:
+        await asyncio.wait(tasks)
+    finish_error: Exception | None = None
+    for key, task in tuple(state._active_dispatches.items()):
+        if not task.done() or state._active_dispatches.pop(key, None) is not task:
+            continue
+        state._dispatch_waiters.pop(key, None)
+        error = None if task.cancelled() else task.exception()
+        if isinstance(error, _DispatchFinishError):
+            finish_error = finish_error or error.error
+            continue
+        _report_dispatch_error(
+            key,
+            task,
+            "Recovered event callback failed while the client was closing: %s",
+        )
+    if finish_error:
+        raise finish_error
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
@@ -838,12 +968,16 @@ async def _drain_gap(
                     )
                     return
                 task = loop.create_task(
-                    dispatch_event(
-                        gap.room_id,
+                    _run_dispatch(
+                        state,
+                        store,
+                        gap,
+                        pending,
+                        key,
+                        dispatch_event,
                         event,
-                        pending.is_live,
-                        pending.was_completed,
-                        pending.kind,
+                        retain_boundary=live_timeline_only
+                        and not any(item.kind == "boundary" for item in queued),
                     )
                 )
                 # A timeout must stop waiting without cancelling callbacks that
@@ -855,17 +989,27 @@ async def _drain_gap(
                     )
                 )
             timeout = None if deadline is None else max(0, deadline - loop.time())
-            done, _ = await asyncio.wait((task,), timeout=timeout)
+            state._dispatch_waiters[key] = state._dispatch_waiters.get(key, 0) + 1
+            try:
+                done, _ = await asyncio.wait((task,), timeout=timeout)
+            finally:
+                waiters = state._dispatch_waiters.get(key, 0)
+                if waiters <= 1:
+                    state._dispatch_waiters.pop(key, None)
+                else:
+                    state._dispatch_waiters[key] = waiters - 1
             if not done:
                 logger.warning(
                     "Recovered event callback timed out: %s", pending.event_id
                 )
                 return
-            if state._active_dispatches.pop(key, None) is not task:
-                return
-            delivered = task.result()
+            state._active_dispatches.pop(key, None)
+            outcome = task.result()
+            if outcome.error:
+                raise outcome.error
         except _LiveCallbackError as error:
-            _finish(state, store, gap, pending, error.was_encrypted)
+            raise error.error
+        except _DispatchFinishError as error:
             raise error.error
         except asyncio.TimeoutError:
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
@@ -873,18 +1017,6 @@ async def _drain_gap(
         except Exception:
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
-        was_encrypted = (
-            isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted
-        )
-        _finish(
-            state,
-            store,
-            gap,
-            pending,
-            was_encrypted,
-            retain_boundary=live_timeline_only
-            and not any(item.kind == "boundary" for item in queued),
-        )
 
     if not live_timeline_only:
         _finish(state, store, gap)

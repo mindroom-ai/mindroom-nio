@@ -257,6 +257,7 @@ from .sync_recovery import (
     RecoveryOptions,
     RecoveryState,
     _LiveCallbackError,
+    drain_recovery_dispatches,
     is_own_join,
     load_recovery_state,
     merge_recovery_plans,
@@ -3807,9 +3808,25 @@ class AsyncClient(Client):
 
     async def close(self):
         """Close the underlying http session."""
-        if self.client_session:
-            await self.client_session.close()
-            self.client_session = None
+
+        async def finish_close() -> None:
+            await drain_recovery_dispatches(self._recovery)
+            if self.client_session:
+                await self.client_session.close()
+                self.client_session = None
+
+        close_task = asyncio.create_task(finish_close())
+        cancelled = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:  # noqa: PERF203
+                cancelled = True
+        error = close_task.exception()
+        if error:
+            raise error
+        if cancelled:
+            raise asyncio.CancelledError
 
     @store_loaded
     async def export_keys(self, outfile: str, passphrase: str, count: int = 10000):
