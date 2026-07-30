@@ -268,7 +268,7 @@ def _plan_room_reset(
         event
         for gap in gaps
         for event in state.events.get((room_id, gap.generation), ())
-        if event.is_live
+        if event.is_live and event.kind != "boundary"
     ] + list(additional_events)
     clear = frozenset({room_id})
     if not live:
@@ -359,7 +359,7 @@ def plan_room_timeline(
             )
         )
     held_count = sum(
-        event.is_live
+        event.is_live and event.kind != "boundary"
         for gap in existing
         for event in state.events.get((room_id, gap.generation), ())
     )
