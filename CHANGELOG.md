@@ -6,17 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Persist each room's sliding window token, so a restarted client can walk
-  the gap its downtime left behind instead of dropping it. 0.31.0 held the
-  walk baseline in memory, which left the first limited or initial window
-  after a restart unrecoverable — the one case the `/v3/sync` transport had
-  always covered through its stored sync token. Live, a sliding reader torn
-  down mid-flood and rebuilt from its store now loses nothing where it
-  previously lost every event written while it was down. Persistence requires
-  `backfill_limited_timelines=True`, a store, and
-  `backfill_persist_recovery` resolving to `True`; when unset, the latter
-  follows `store_sync_tokens`. This migrates the store from schema v3 to v4
-  and exports `SlidingWindowTokens` from `nio.store`.
+- Persist each room's sliding window token, so a restarted client can walk the gap its downtime left behind instead of dropping it.
+  0.31.0 held the walk baseline in memory, which left the first limited or initial window after a restart unrecoverable — the one case the `/v3/sync` transport had always covered through its stored sync token.
+  Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
+  Each token is scoped to the exact own-membership event that earned it, and old-token walks require the server's current `$ME` membership state to match.
+  Missing or mismatched membership state fails closed, and request inputs are copied before `$ME` is added.
+  Sliding request attempts, retries, and membership resets share a monotonic issuance clock, so an older response cannot replace a newer token.
+  Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
+  This migrates the store from schema v3 to v5, safely discards unscoped v4 token rows, and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
   which follows `store_sync_tokens` as before, and can be set to True to
   persist recovery state while nio never reads or writes `next_batch`
@@ -31,6 +28,7 @@ All notable changes to this project will be documented in this file.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.
+- Retain one keyed task for a recovered callback that outlives its pump deadline, then durably finish it before client shutdown so started callback side effects are neither cancelled nor replayed after restart.
 
 ## 0.32.0
 
