@@ -50,6 +50,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
+from nio.responses import SlidingSyncError
 from nio.sliding_sync_tokens import SlidingWindowToken
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -3228,10 +3229,10 @@ class TestRoomLocalRecovery:
         await client.receive_response(LoginResponse.from_dict(LOGIN))
 
         # A request issued now, whose response arrives after a leave.
-        stale_epoch = client._sliding_reset_epoch
+        stale_issuance = client._sliding_issuance_clock
         client._forget_sliding_window_token(ROOM_A)
 
-        token = client._sliding_request_epoch.set(stale_epoch)
+        token = client._sliding_request_issuance.set(stale_issuance)
         try:
             await client.receive_response(
                 self._sliding(
@@ -3239,11 +3240,11 @@ class TestRoomLocalRecovery:
                 )
             )
         finally:
-            client._sliding_request_epoch.reset(token)
+            client._sliding_request_issuance.reset(token)
         assert client._sliding_room_prev_batch == {}
 
         # A request issued after the reset carries a usable token.
-        token = client._sliding_request_epoch.set(client._sliding_reset_epoch)
+        token = client._sliding_request_issuance.set(client._next_sliding_issuance())
         try:
             await client.receive_response(
                 self._sliding(
@@ -3251,8 +3252,90 @@ class TestRoomLocalRecovery:
                 )
             )
         finally:
-            client._sliding_request_epoch.reset(token)
+            client._sliding_request_issuance.reset(token)
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
+        await client.close()
+
+    async def test_out_of_order_sliding_responses_keep_newest_token(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(backfill_limited_timelines=True)
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        older_started = asyncio.Event()
+        release_older = asyncio.Event()
+
+        async def send(*args, **_kwargs):
+            request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
+            if request_pos == "older":
+                older_started.set()
+                await release_older.wait()
+                response = self._sliding(
+                    "older-response",
+                    [text_event("$older", 1)],
+                    prev_batch="w1",
+                )
+            else:
+                response = self._sliding(
+                    "newer-response",
+                    [text_event("$newer", 2)],
+                    prev_batch="w2",
+                )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        older = asyncio.create_task(client.sliding_sync(pos="older"))
+        await older_started.wait()
+        await client.sliding_sync(pos="newer")
+        release_older.set()
+        await older
+
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        await client.close()
+
+    async def test_sliding_retry_gets_new_issuance(self, tempdir, monkeypatch):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            max_limit_exceeded=1,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        issuances: list[int | None] = []
+        responses = [
+            SlidingSyncError.from_dict(
+                {
+                    "errcode": "M_LIMIT_EXCEEDED",
+                    "error": "retry",
+                    "retry_after_ms": 1,
+                }
+            ),
+            SlidingSyncResponse.from_dict({"pos": "s1", "rooms": {}}),
+        ]
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(*_args, **_kwargs):
+            issuances.append(client._sliding_request_issuance.get())
+            return Transport(429 if len(issuances) == 1 else 200)
+
+        async def create_matrix_response(**_kwargs):
+            return responses.pop(0)
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+
+        await client.sliding_sync()
+
+        assert None not in issuances
+        assert issuances[0] < issuances[1]
         await client.close()
 
     async def test_rejoin_in_the_timeline_discards_the_restored_token(

@@ -562,16 +562,16 @@ class AsyncClient(Client):
         self._sliding_verified_membership_event_ids: dict[str, str] = {}
 
         # Rooms whose membership reset since their last window, each with
-        # the epoch of the reset. A response only carries a usable token if
-        # its request was issued after that epoch: `initial` says the
+        # the issuance of the reset. A response only carries a usable token if
+        # its request was issued after that reset: `initial` says the
         # server sent a snapshot, not that the snapshot postdates the
         # membership change.
         self._sliding_reset_rooms: dict[str, int] = {}
-        # The oldest request epoch a room still accepts a token from.
-        self._sliding_room_epoch_floor: dict[str, int] = {}
-        self._sliding_reset_epoch = 0
-        self._sliding_request_epoch: ContextVar[int | None] = ContextVar(
-            f"nio_sliding_request_epoch_{id(self)}", default=None
+        # The oldest request issuance a room still accepts a token from.
+        self._sliding_room_issuance_floor: dict[str, int] = {}
+        self._sliding_issuance_clock = 0
+        self._sliding_request_issuance: ContextVar[int | None] = ContextVar(
+            f"nio_sliding_request_issuance_{id(self)}", default=None
         )
 
         # Device-scoped token surviving sliding connection expiry.
@@ -1386,31 +1386,35 @@ class AsyncClient(Client):
         self, room_id: str, room: SlidingSyncRoom
     ) -> bool:
         """Whether this response's request predates what the room accepted."""
-        request_epoch = self._sliding_request_epoch.get()
-        floor = self._sliding_room_epoch_floor.get(room_id)
-        if request_epoch is not None and floor is not None:
+        request_issuance = self._sliding_request_issuance.get()
+        floor = self._sliding_room_issuance_floor.get(room_id)
+        if request_issuance is not None and floor is not None:
             # Responses can finish out of order, so the floor rises with
             # every reset and every token taken; anything older than it
             # describes a state this room has already moved past.
-            return request_epoch < floor
-        reset_epoch = self._sliding_reset_rooms.get(room_id)
-        if reset_epoch is None:
+            return request_issuance < floor
+        reset_issuance = self._sliding_reset_rooms.get(room_id)
+        if reset_issuance is None:
             return False
-        if request_epoch is None:
+        if request_issuance is None:
             # A response handed to receive_response() directly carries no
             # request of ours to date it by, so fall back to the weaker
             # test: a snapshot is the only thing that looks like a fresh
             # membership.
             return not room.initial
-        return request_epoch < reset_epoch
+        return request_issuance < reset_issuance
+
+    def _next_sliding_issuance(self) -> int:
+        self._sliding_issuance_clock += 1
+        return self._sliding_issuance_clock
 
     def _reset_sliding_room(self, room_id: str) -> None:
         """Mark a room's baseline invalid from this moment on."""
         self._sliding_room_prev_batch.pop(room_id, None)
         self._sliding_verified_membership_event_ids.pop(room_id, None)
-        self._sliding_reset_epoch += 1
-        self._sliding_reset_rooms[room_id] = self._sliding_reset_epoch
-        self._sliding_room_epoch_floor[room_id] = self._sliding_reset_epoch
+        reset_issuance = self._next_sliding_issuance()
+        self._sliding_reset_rooms[room_id] = reset_issuance
+        self._sliding_room_issuance_floor[room_id] = reset_issuance
 
     def _apply_sliding_prev_batches(
         self,
@@ -1423,16 +1427,17 @@ class AsyncClient(Client):
                 self._forget_sliding_window_token(room_id)
             else:
                 self._reset_sliding_room(room_id)
-        request_epoch = self._sliding_request_epoch.get()
+        request_issuance = self._sliding_request_issuance.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
             self._sliding_verified_membership_event_ids[room_id] = (
                 token.membership_event_id
             )
             self._sliding_reset_rooms.pop(room_id, None)
-            if request_epoch is not None:
-                self._sliding_room_epoch_floor[room_id] = max(
-                    self._sliding_room_epoch_floor.get(room_id, 0), request_epoch
+            if request_issuance is not None:
+                self._sliding_room_issuance_floor[room_id] = max(
+                    self._sliding_room_issuance_floor.get(room_id, 0),
+                    request_issuance,
                 )
 
     def _forget_sliding_window_token(self, room_id: str) -> None:
@@ -1885,6 +1890,7 @@ class AsyncClient(Client):
         save_to: os.PathLike | None = None,
         process_response: bool = True,
         sync_request_context: _SyncRequestContext | None = None,
+        sliding_request: bool = False,
     ):
         headers = (
             {"Content-Type": content_type}
@@ -1911,12 +1917,11 @@ class AsyncClient(Client):
         got_timeouts = 0
         max_timeouts = self.config.max_timeouts
 
+        attempt = 0
         while True:
-            if self._sliding_request_epoch.get() is not None:
-                # A retry issued after a membership reset is as current as
-                # any other request; dating it by the first attempt would
-                # throw away a baseline that is in fact valid.
-                self._sliding_request_epoch.set(self._sliding_reset_epoch)
+            if attempt and sliding_request:
+                self._sliding_request_issuance.set(self._next_sliding_issuance())
+            attempt += 1
             if data_provider:
                 # mypy expects an "Awaitable[Any]" but data_provider is a
                 # method generated during runtime that may or may not be
@@ -2434,7 +2439,9 @@ class AsyncClient(Client):
         # Stamped before the request leaves, and read again while its
         # response is handled, so a membership reset that lands in between
         # can tell this response's tokens are stale.
-        epoch_token = self._sliding_request_epoch.set(self._sliding_reset_epoch)
+        issuance_token = self._sliding_request_issuance.set(
+            self._next_sliding_issuance()
+        )
         try:
             response = await self._send(
                 SlidingSyncResponse,
@@ -2442,9 +2449,10 @@ class AsyncClient(Client):
                 path,
                 data,
                 timeout=timeout / 1000 + 15 if timeout else timeout,
+                sliding_request=True,
             )
         finally:
-            self._sliding_request_epoch.reset(epoch_token)
+            self._sliding_request_issuance.reset(issuance_token)
 
         return response
 
