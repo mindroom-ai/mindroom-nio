@@ -4868,6 +4868,9 @@ class TestRecoveryOutcome:
                 "rooms": {
                     ROOM_A: {
                         "membership": "join",
+                        "required_state": [
+                            member_event("$membership", 0, "join").source
+                        ],
                         "timeline": [text_event("$old", 1).source],
                         "prev_batch": "w1",
                     }
@@ -4884,6 +4887,9 @@ class TestRecoveryOutcome:
                 "rooms": {
                     ROOM_A: {
                         "membership": "join",
+                        "required_state": [
+                            member_event("$membership", 0, "join").source
+                        ],
                         "timeline": [text_event("$live", 2).source],
                         "limited": True,
                         "prev_batch": "w2",
@@ -4932,6 +4938,9 @@ class TestRecoveryOutcome:
                     "rooms": {
                         ROOM_A: {
                             "membership": "join",
+                            "required_state": [
+                                member_event("$membership", 0, "join").source
+                            ],
                             "timeline": [text_event("$old", 1).source],
                             "prev_batch": "w1",
                         }
@@ -4946,6 +4955,9 @@ class TestRecoveryOutcome:
                     "rooms": {
                         ROOM_A: {
                             "membership": "join",
+                            "required_state": [
+                                member_event("$membership", 0, "join").source
+                            ],
                             "timeline": [text_event("$live", 2).source],
                             "limited": True,
                             "prev_batch": "w2",
@@ -4972,7 +4984,7 @@ class TestRecoveryOutcome:
         if protocol == "classic":
             assert client.next_batch == "s1"
         else:
-            assert client._sliding_room_prev_batch[ROOM_A] == "w1"
+            assert client._sliding_room_prev_batch[ROOM_A] == window_token("w1")
 
     @pytest.mark.parametrize("stage", ["executor", "room"])
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
