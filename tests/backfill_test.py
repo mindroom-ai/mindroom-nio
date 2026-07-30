@@ -3137,19 +3137,20 @@ class TestRoomLocalRecovery:
                 "p1",
             ),
         )
-        with pytest.raises(RuntimeError, match="ack failed"):
-            await first.receive_response(
-                sync_response(
-                    "s2",
-                    {
-                        ROOM_A: room_info(
-                            [text_event("$held", 4)],
-                            limited=True,
-                            prev_batch="p1",
-                        )
-                    },
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)],
+                    limited=True,
+                    prev_batch="p1",
                 )
-            )
+            },
+        )
+        with pytest.raises(RuntimeError, match="ack failed"):
+            await first.receive_response(response)
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         assert seen == ["$gap1", "$gap2"]
         await first.close()
         first.store.database.close()
@@ -3772,17 +3773,18 @@ class TestRoomLocalRecovery:
 
         monkeypatch.setattr(client, "_handle_to_device", handle)
         monkeypatch.setattr(client.store, "save_recovery", fail)
-        with pytest.raises(RuntimeError, match="commit failed"):
-            await client.receive_response(
-                sync_response(
-                    "s2",
-                    {
-                        ROOM_A: room_info(
-                            [text_event("$held", 3)], limited=True, prev_batch="p1"
-                        )
-                    },
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
                 )
-            )
+            },
+        )
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await client.receive_response(response)
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         assert client.next_batch == "s1"
         assert client.store.load_sync_token() == "s1"
         assert not client._recovery.gaps
@@ -4002,5 +4004,44 @@ class TestRecoveryOutcome:
 
         await client.receive_response(response)
 
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_cancelled_recovery_preserves_unrecovered_outcome(
+        self, client, aioresponse
+    ):
+        started = asyncio.Event()
+
+        async def block_recovered(_room, event):
+            if event.event_id == "$gap":
+                started.set()
+                await asyncio.Event().wait()
+
+        client.add_event_callback(block_recovered, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 1), text_event("$live", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset({ROOM_A})

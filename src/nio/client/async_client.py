@@ -945,7 +945,6 @@ class AsyncClient(Client):
 
         if self.next_batch == response.next_batch:
             await self._pump_sync_recovery()
-            self._publish_recovery_outcome(response)
             return
 
         previous_batch = self.next_batch
@@ -996,7 +995,6 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
-        self._publish_recovery_outcome(response)
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -1116,7 +1114,6 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
-        self._publish_recovery_outcome(response)
 
     def _sliding_seed_lists(
         self, lists: dict[str, Any] | None
@@ -1535,6 +1532,11 @@ class AsyncClient(Client):
 
         self._raise_on_sync_reentry()
         async with self._sync_response_lock:
+            sync_response = (
+                response.response
+                if isinstance(response, _SyncResponseEnvelope)
+                else response
+            )
             executor = object()
             self._active_sync_executor_token = executor
             context_token = self._sync_executor_context.set(executor)
@@ -1544,6 +1546,7 @@ class AsyncClient(Client):
                 else:
                     await self._handle_sliding_sync(response)
             finally:
+                self._publish_recovery_outcome(sync_response)
                 self._active_sync_executor_token = None
                 self._sync_executor_context.reset(context_token)
 

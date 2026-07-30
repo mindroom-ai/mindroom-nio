@@ -539,15 +539,23 @@ def persist_response_plan(
     token: str | None,
     plan: RecoveryPlan,
 ) -> None:
-    if store:
-        store.save_recovery(
-            token,
-            set(plan.clear_rooms),
-            plan.gaps,
-            plan.events,
-            plan.clear_recovered,
-        )
-    apply_plan(state, plan)
+    try:
+        if store:
+            store.save_recovery(
+                token,
+                set(plan.clear_rooms),
+                plan.gaps,
+                plan.events,
+                plan.clear_recovered,
+            )
+        apply_plan(state, plan)
+    except BaseException:
+        for room_id in plan.unrecovered_room_ids:
+            state.outcomes[room_id] = False
+        for gap in plan.gaps:
+            if gap.target_token:
+                state.outcomes[gap.room_id] = False
+        raise
 
 
 def _finish(
