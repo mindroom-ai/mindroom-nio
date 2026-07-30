@@ -261,6 +261,8 @@ from .sync_recovery import (
     pump_recovery,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
+    take_recovery_outcomes,
+    would_plan_real_gap,
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
@@ -839,6 +841,74 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def _publish_recovery_outcome(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> None:
+        if not self.config.backfill_limited_timelines:
+            return
+        recovered, unrecovered = take_recovery_outcomes(self._recovery)
+        response.recovered_room_ids = recovered
+        response.unrecovered_room_ids = unrecovered
+
+    def _classic_response_real_gap_room_ids(
+        self,
+        response: SyncResponse,
+        request_since: str | None,
+    ) -> frozenset[str]:
+        if self.next_batch == response.next_batch:
+            return frozenset()
+
+        return frozenset(
+            room_id
+            for room_id, room_info in response.rooms.join.items()
+            if would_plan_real_gap(
+                timeline_events=room_info.timeline.events,
+                user_id=self.user_id,
+                membership="join",
+                cursor_token=(
+                    request_since
+                    if room_info.timeline.limited and request_since
+                    else None
+                ),
+            )
+        )
+
+    def _sliding_response_real_gap_room_ids(
+        self,
+        response: SlidingSyncResponse,
+    ) -> frozenset[str]:
+        return frozenset(
+            room_id
+            for room_id, room in response.rooms.items()
+            if would_plan_real_gap(
+                timeline_events=room.timeline,
+                user_id=self.user_id,
+                membership=self._sliding_sync_recovery_membership(room),
+                live_event_count=((room.num_live or 0) if room.initial else None),
+                cursor_token=self._sliding_recovery_cursor(room_id, room),
+            )
+        )
+
+    def _publish_waiting_sync_cancellation(
+        self,
+        response: SyncResponse | SlidingSyncResponse,
+        request_since: str | None,
+    ) -> None:
+        """Publish a fail-closed snapshot without draining the active executor."""
+        unrecovered = {
+            room_id
+            for room_id, gaps in self._recovery.gaps.items()
+            if any(gap.target_token for gap in gaps)
+        }
+        if isinstance(response, SyncResponse):
+            unrecovered.update(
+                self._classic_response_real_gap_room_ids(response, request_since)
+            )
+        else:
+            unrecovered.update(self._sliding_response_real_gap_room_ids(response))
+        response.recovered_room_ids = frozenset()
+        response.unrecovered_room_ids = frozenset(unrecovered)
+
     async def _recovery_room_messages(
         self,
         room_id: str,
@@ -937,13 +1007,15 @@ class AsyncClient(Client):
             await self._pump_sync_recovery()
             return
 
-        previous_batch = self.next_batch
-        self.next_batch = response.next_batch
-
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
-            async with self._recovery_room_state(
-                set(response.rooms.join) | reset_rooms
+            new_gap_room_ids = self._classic_response_real_gap_room_ids(
+                response,
+                request_since,
+            )
+            async with self._recovery_response_room_state(
+                set(response.rooms.join) | reset_rooms,
+                new_gap_room_ids,
             ):
                 plan = plan_sync_response(
                     self._recovery,
@@ -953,25 +1025,24 @@ class AsyncClient(Client):
                     joined_rooms=response.rooms.join,
                     reset_room_ids=reset_rooms,
                 )
-                try:
-                    persist_response_plan(
-                        self._recovery,
-                        (self.store if self.config.store_sync_tokens else None),
-                        token=response.next_batch,
-                        plan=plan,
-                    )
-                except BaseException:
-                    self.next_batch = previous_batch
-                    raise
+                persist_response_plan(
+                    self._recovery,
+                    (self.store if self.config.store_sync_tokens else None),
+                    token=response.next_batch,
+                    plan=plan,
+                )
+            self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
                 self.loaded_sync_token = response.next_batch
             for room_id, join_info in response.rooms.join.items():
                 self._handle_joined_state(room_id, join_info, self.encrypted_rooms)
             if self.store:
                 self.store.save_encrypted_rooms(self.encrypted_rooms)
-        elif self.config.store_sync_tokens and self.store:
-            self.store.save_sync_token(response.next_batch)
-            self.loaded_sync_token = response.next_batch
+        else:
+            self.next_batch = response.next_batch
+            if self.config.store_sync_tokens and self.store:
+                self.store.save_sync_token(response.next_batch)
+                self.loaded_sync_token = response.next_batch
 
         await self._handle_to_device(response)
 
@@ -1005,18 +1076,18 @@ class AsyncClient(Client):
                 for room_id in self._pending_sliding_room_account_data
                 if room_id in self.rooms
             )
-            async with self._recovery_room_state(planned_room_ids):
+            new_gap_room_ids = self._sliding_response_real_gap_room_ids(response)
+            async with self._recovery_response_room_state(
+                planned_room_ids,
+                new_gap_room_ids,
+            ):
                 plans = [
                     plan_room_timeline(
                         self._recovery,
                         room_id=room_id,
                         timeline_events=room.timeline,
                         user_id=self.user_id,
-                        membership=(
-                            "invite"
-                            if self._sliding_sync_room_is_invite(room)
-                            else room.membership or "join"
-                        ),
+                        membership=self._sliding_sync_recovery_membership(room),
                         live_event_count=(
                             (room.num_live or 0) if room.initial else None
                         ),
@@ -1183,6 +1254,13 @@ class AsyncClient(Client):
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
         return room.membership == "invite" or (
             room.membership is None and bool(room.stripped_state)
+        )
+
+    def _sliding_sync_recovery_membership(self, room: SlidingSyncRoom) -> str:
+        return (
+            "invite"
+            if self._sliding_sync_room_is_invite(room)
+            else room.membership or "join"
         )
 
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
@@ -1521,21 +1599,53 @@ class AsyncClient(Client):
             return
 
         self._raise_on_sync_reentry()
-        async with self._sync_response_lock:
-            executor = object()
-            self._active_sync_executor_token = executor
-            context_token = self._sync_executor_context.set(executor)
-            try:
-                if isinstance(response, _SyncResponseEnvelope):
-                    await self._handle_sync(response)
-                else:
-                    await self._handle_sliding_sync(response)
-            finally:
-                self._active_sync_executor_token = None
-                self._sync_executor_context.reset(context_token)
+        sync_response = (
+            response.response
+            if isinstance(response, _SyncResponseEnvelope)
+            else response
+        )
+        request_since = (
+            response.request_since
+            if isinstance(response, _SyncResponseEnvelope)
+            else None
+        )
+        entered_executor = False
+        try:
+            async with self._sync_response_lock:
+                entered_executor = True
+                executor = object()
+                self._active_sync_executor_token = executor
+                context_token = self._sync_executor_context.set(executor)
+                try:
+                    if isinstance(response, _SyncResponseEnvelope):
+                        await self._handle_sync(response)
+                    else:
+                        await self._handle_sliding_sync(response)
+                finally:
+                    self._publish_recovery_outcome(sync_response)
+                    self._active_sync_executor_token = None
+                    self._sync_executor_context.reset(context_token)
+        except asyncio.CancelledError:
+            if not entered_executor:
+                self._publish_waiting_sync_cancellation(sync_response, request_since)
+            raise
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _recovery_response_room_state(
+        self,
+        room_ids: Iterable[str],
+        unrecovered_room_ids: Iterable[str],
+    ) -> AsyncIterator[None]:
+        try:
+            async with self._recovery_room_state(room_ids):
+                yield
+        except BaseException:
+            for room_id in unrecovered_room_ids:
+                self._recovery.outcomes[room_id] = False
+            raise
 
     @asynccontextmanager
     async def _recovery_room_state(

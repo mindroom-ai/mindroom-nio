@@ -124,6 +124,8 @@ class RecoveryPlan:
     gaps: tuple[RecoveryGap, ...] = ()
     events: tuple[PendingTimelineEvent, ...] = ()
     clear_recovered: RecoveryGap | None = None
+    # Explicit real-gap failures; synthetic empty-token drains never enter this set.
+    unrecovered_room_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -133,6 +135,8 @@ class RecoveryState:
         default_factory=dict
     )
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
+    # Outcomes since the last take; False stays sticky when _finish records True.
+    outcomes: dict[str, bool] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
 
@@ -144,6 +148,47 @@ def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
         and event.state_key == user_id
         and event.membership == "join"
         and event.prev_membership != "join"
+    )
+
+
+def _timeline_clears_recovery(
+    timeline_events: Sequence[Event | BadEventType],
+    user_id: str | None,
+    live_event_count: int | None,
+) -> bool:
+    last_join = max(
+        (
+            index
+            for index, event in enumerate(timeline_events)
+            if _is_own_join(event, user_id)
+        ),
+        default=-1,
+    )
+    live_start = (
+        0
+        if live_event_count is None
+        else max(0, len(timeline_events) - live_event_count)
+    )
+    return last_join >= live_start
+
+
+def would_plan_real_gap(
+    *,
+    timeline_events: Sequence[Event | BadEventType],
+    user_id: str | None,
+    membership: str,
+    live_event_count: int | None = None,
+    cursor_token: str | None = None,
+) -> bool:
+    """Return whether these inputs create a targeted recovery gap."""
+    return (
+        membership not in {"leave", "ban", "invite"}
+        and cursor_token is not None
+        and not _timeline_clears_recovery(
+            timeline_events,
+            user_id,
+            live_event_count,
+        )
     )
 
 
@@ -255,6 +300,8 @@ def _plan_room_reset(
     state: RecoveryState,
     room_id: str,
     additional_events: Iterable[PendingTimelineEvent] = (),
+    *,
+    unrecovered: bool = False,
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -264,14 +311,23 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
+    unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
     if not live:
-        return RecoveryPlan(clear_rooms=clear)
+        return RecoveryPlan(
+            clear_rooms=clear,
+            unrecovered_room_ids=unrecovered_room_ids,
+        )
     generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
         replace(event, generation=generation, sequence=index)
         for index, event in enumerate(live)
     )
-    return RecoveryPlan(clear, (RecoveryGap(room_id, generation, "", None),), events)
+    return RecoveryPlan(
+        clear,
+        (RecoveryGap(room_id, generation, "", None),),
+        events,
+        unrecovered_room_ids=unrecovered_room_ids,
+    )
 
 
 def plan_room_timeline(
@@ -291,22 +347,19 @@ def plan_room_timeline(
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
 
-    last_join = max(
-        (
-            index
-            for index, event in enumerate(timeline_events)
-            if _is_own_join(event, user_id)
-        ),
-        default=-1,
+    clear = _timeline_clears_recovery(
+        timeline_events,
+        user_id,
+        live_event_count,
     )
-    live_start = (
-        0
-        if live_event_count is None
-        else max(0, len(timeline_events) - live_event_count)
-    )
-    clear = last_join >= live_start
     existing = () if clear else state.gaps.get(room_id, ())
-    new_gap = cursor_token is not None and not clear
+    new_gap = would_plan_real_gap(
+        timeline_events=timeline_events,
+        user_id=user_id,
+        membership=membership,
+        live_event_count=live_event_count,
+        cursor_token=cursor_token,
+    )
     generation = existing[-1].generation if existing else 0
     if new_gap or not existing:
         generation += 1
@@ -358,7 +411,12 @@ def plan_room_timeline(
     )
     if (new_gap or existing) and held_count + len(events) > state.max_held_events:
         logger.error("Abandoning recovery with too many held events in %s", room_id)
-        return _plan_room_reset(state, room_id, events)
+        return _plan_room_reset(
+            state,
+            room_id,
+            events,
+            unrecovered=new_gap or any(gap.target_token for gap in existing),
+        )
     gap = (
         RecoveryGap(
             room_id,
@@ -380,11 +438,18 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     clear_rooms: set[str] = set()
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
+    unrecovered_room_ids: set[str] = set()
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
-    return RecoveryPlan(frozenset(clear_rooms), tuple(gaps), tuple(events))
+        unrecovered_room_ids.update(plan.unrecovered_room_ids)
+    return RecoveryPlan(
+        frozenset(clear_rooms),
+        tuple(gaps),
+        tuple(events),
+        unrecovered_room_ids=frozenset(unrecovered_room_ids),
+    )
 
 
 def plan_sync_response(
@@ -418,8 +483,14 @@ def plan_sync_response(
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
+    for room_id in plan.unrecovered_room_ids:
+        state.outcomes[room_id] = False
+
     for room_id in plan.clear_rooms:
-        for gap in state.gaps.pop(room_id, ()):
+        gaps = state.gaps.pop(room_id, ())
+        if any(gap.target_token for gap in gaps):
+            state.outcomes[room_id] = False
+        for gap in gaps:
             for event in state.events.pop((room_id, gap.generation), ()):
                 if event.was_completed and not event.event_id.startswith("~"):
                     record_completed_timeline_event(
@@ -460,6 +531,27 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
 
 
+def take_recovery_outcomes(
+    state: RecoveryState,
+) -> tuple[frozenset[str], frozenset[str]]:
+    outcomes = state.outcomes
+    state.outcomes = {}
+    pending = frozenset(
+        room_id
+        for room_id, gaps in state.gaps.items()
+        if any(gap.target_token for gap in gaps)
+    )
+    recovered = (
+        frozenset(room_id for room_id, complete in outcomes.items() if complete)
+        - pending
+    )
+    unrecovered = (
+        frozenset(room_id for room_id, complete in outcomes.items() if not complete)
+        | pending
+    )
+    return recovered, unrecovered
+
+
 def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
@@ -468,6 +560,7 @@ def load_recovery_state(
     state.gaps.clear()
     state.events.clear()
     state.completed.clear()
+    state.outcomes.clear()
     for row in gaps:
         gap = RecoveryGap(
             row.room_id, row.generation, row.target_token, row.cursor_token
@@ -505,15 +598,23 @@ def persist_response_plan(
     token: str | None,
     plan: RecoveryPlan,
 ) -> None:
-    if store:
-        store.save_recovery(
-            token,
-            set(plan.clear_rooms),
-            plan.gaps,
-            plan.events,
-            plan.clear_recovered,
-        )
-    apply_plan(state, plan)
+    try:
+        if store:
+            store.save_recovery(
+                token,
+                set(plan.clear_rooms),
+                plan.gaps,
+                plan.events,
+                plan.clear_recovered,
+            )
+        apply_plan(state, plan)
+    except BaseException:
+        for room_id in plan.unrecovered_room_ids:
+            state.outcomes[room_id] = False
+        for gap in plan.gaps:
+            if gap.target_token:
+                state.outcomes[gap.room_id] = False
+        raise
 
 
 def _finish(
@@ -543,6 +644,8 @@ def _finish(
     gaps.remove(gap)
     if not gaps:
         state.gaps.pop(gap.room_id)
+    if gap.target_token:
+        state.outcomes.setdefault(gap.room_id, True)
 
 
 async def _collect_slice(
@@ -572,6 +675,7 @@ async def _collect_slice(
 
     while cursor and pages < options.max_pages:
         clear_recovered = False
+        abandoned = False
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
@@ -604,7 +708,11 @@ async def _collect_slice(
                 state,
                 store,
                 token=None,
-                plan=RecoveryPlan(gaps=(gap,), clear_recovered=gap),
+                plan=RecoveryPlan(
+                    gaps=(gap,),
+                    clear_recovered=gap,
+                    unrecovered_room_ids=frozenset({gap.room_id}),
+                ),
             )
             return gap
 
@@ -659,6 +767,7 @@ async def _collect_slice(
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
+            abandoned = True
             next_cursor = None
         elif reached_window:
             next_cursor = None
@@ -683,6 +792,7 @@ async def _collect_slice(
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
+            abandoned = True
             next_cursor = None
         elif response.end == gap.target_token:
             next_cursor = None
@@ -698,6 +808,9 @@ async def _collect_slice(
                 gaps=(updated,),
                 events=tuple(recovered),
                 clear_recovered=updated if clear_recovered else None,
+                unrecovered_room_ids=(
+                    frozenset({gap.room_id}) if abandoned else frozenset()
+                ),
             ),
         )
         gap = updated
@@ -723,6 +836,8 @@ async def _drain_gap(
             event = pending.parse()
         except Exception:
             logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
+            if gap.target_token:
+                state.outcomes[gap.room_id] = False
             _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:

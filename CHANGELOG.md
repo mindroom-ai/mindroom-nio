@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Add typed recovered and unrecovered room outcomes to classic and Sliding
+  Sync responses when limited-timeline recovery is enabled, while preserving
+  the server's original limited-timeline flag.
+
 ## 0.31.0
 
 ### Features
