@@ -256,6 +256,7 @@ from .base_client import (
 from .sync_recovery import (
     PendingEventKind,
     RecoveryOptions,
+    RecoveryPlan,
     RecoveryState,
     _LiveCallbackError,
     drain_recovery_dispatches,
@@ -953,7 +954,7 @@ class AsyncClient(Client):
         self,
         response: SlidingSyncResponse,
     ) -> frozenset[str]:
-        return frozenset(
+        recoverable = frozenset(
             room_id
             for room_id, room in response.rooms.items()
             if not self._sliding_response_is_stale(room_id)
@@ -964,6 +965,9 @@ class AsyncClient(Client):
                 live_event_count=((room.num_live or 0) if room.initial else None),
                 cursor_token=self._sliding_recovery_cursor(room_id, room),
             )
+        )
+        return recoverable | self._sliding_unrecoverable_discontinuity_room_ids(
+            response
         )
 
     def _publish_waiting_sync_cancellation(
@@ -1184,6 +1188,9 @@ class AsyncClient(Client):
                 planned_room_ids,
                 new_gap_room_ids,
             ):
+                unrecoverable_room_ids = (
+                    self._sliding_unrecoverable_discontinuity_room_ids(response)
+                )
                 plans = [
                     plan_room_timeline(
                         self._recovery,
@@ -1228,6 +1235,7 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
+                plans.append(RecoveryPlan(unrecovered_room_ids=unrecoverable_room_ids))
                 recorded, forgotten = self._plan_sliding_prev_batches(response)
                 persist_response_plan(
                     self._recovery,
@@ -1358,6 +1366,21 @@ class AsyncClient(Client):
         if membership_event_id != window_token.membership_event_id:
             return None
         return window_token.token
+
+    def _sliding_unrecoverable_discontinuity_room_ids(
+        self,
+        response: SlidingSyncResponse,
+    ) -> frozenset[str]:
+        """Return discontinuities whose held baseline cannot be trusted."""
+        return frozenset(
+            room_id
+            for room_id, room in response.rooms.items()
+            if not self._sliding_response_is_stale(room_id)
+            and (room.limited or room.initial)
+            and room_id in self._sliding_room_prev_batch
+            and not any(is_own_join(event, self.user_id) for event in room.timeline)
+            and self._sliding_recovery_cursor(room_id, room) is None
+        )
 
     def _sliding_membership_event_id(
         self, room_id: str, room: SlidingSyncRoom

@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Report a restarted limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched current membership proof, while treating an own-join timeline event as a proven continuity boundary.
 - Keep recovered timeline obligations pending and mark their rooms unrecovered when an event callback fails, so callers cannot certify a checkpoint whose durable side effect did not commit.
 - Reject late Sliding Sync continuations from superseded named or default connections, release their ordering state when the last active request finishes, serialize membership resets with room recovery, preserve boundary-anchor deduplication after cache eviction, wait for active recovery execution before closing the HTTP session, and resume sync processing when a closed client is reused.
 - Dispatch live timeline events before walking a limited-timeline gap, so a

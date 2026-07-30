@@ -3095,18 +3095,19 @@ class TestRoomLocalRecovery:
         pages = Pages({"w1": messages([text_event("$gap", 2)], "w2")})
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
-        await second.receive_response(
-            self._sliding(
-                "s2",
-                [text_event("$held", 3)],
-                limited=True,
-                prev_batch="w2",
-                membership_event_id=membership_event_id,
-            )
+        response = self._sliding(
+            "s2",
+            [text_event("$held", 3)],
+            limited=True,
+            prev_batch="w2",
+            membership_event_id=membership_event_id,
         )
+        await second.receive_response(response)
 
         assert seen == ["$held"]
         assert pages.from_tokens == []
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         stored = second.store.load_sliding_window_tokens().get(ROOM_A)
         assert (stored.token if stored else None) == expected_token
         assert (stored.membership_event_id if stored else None) == membership_event_id
@@ -3953,6 +3954,8 @@ class TestRoomLocalRecovery:
         # becomes the baseline for the membership that exists now.
         assert seen == ["$after"]
         assert not client._recovery.gaps
+        assert rejoin.recovered_room_ids == frozenset()
+        assert rejoin.unrecovered_room_ids == frozenset()
         assert client.store.load_sliding_window_tokens() == {
             ROOM_A: window_token("w2", "$join")
         }
