@@ -8,7 +8,7 @@ from collections import OrderedDict
 import nio.client.sync_recovery as sync_recovery
 import pytest
 
-from nio import AsyncClient, Event, RoomMessageText
+from nio import AsyncClient, Event, LocalProtocolError, RoomMessageText
 from nio.client import async_client as async_client_module
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
@@ -889,6 +889,29 @@ async def test_close_drains_without_caller_exclusion(monkeypatch):
     await client.close()
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_retained_dispatch_caller(monkeypatch):
+    callback_task = asyncio.create_task(asyncio.sleep(0))
+    await callback_task
+    monkeypatch.setattr(
+        async_client_module.asyncio,
+        "current_task",
+        lambda: callback_task,
+    )
+    client = AsyncClient("https://example.org")
+    key = (ROOM, "$live", "timeline")
+    client._recovery._active_dispatches[key] = callback_task
+
+    try:
+        with pytest.raises(
+            LocalProtocolError,
+            match=r"AsyncClient\.close\(\) cannot run from a timeline callback\.",
+        ):
+            await client.close()
+    finally:
+        client._recovery._active_dispatches.clear()
 
 
 @pytest.mark.asyncio
