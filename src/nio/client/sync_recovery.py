@@ -124,6 +124,7 @@ class RecoveryPlan:
     gaps: tuple[RecoveryGap, ...] = ()
     events: tuple[PendingTimelineEvent, ...] = ()
     clear_recovered: RecoveryGap | None = None
+    # Explicit real-gap failures; synthetic empty-token drains never enter this set.
     unrecovered_room_ids: frozenset[str] = frozenset()
 
 
@@ -134,6 +135,7 @@ class RecoveryState:
         default_factory=dict
     )
     completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
+    # Outcomes since the last take; False stays sticky when _finish records True.
     outcomes: dict[str, bool] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200

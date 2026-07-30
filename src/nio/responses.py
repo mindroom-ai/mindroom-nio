@@ -2061,7 +2061,9 @@ class SyncResponse(Response):
     closed while handling this response after dispatching every recovered
     event. ``unrecovered_room_ids`` contains rooms with a gap still open or
     abandoned. Both fields are populated only when limited-timeline backfill
-    is enabled; ``timeline.limited`` remains the unmodified server value.
+    is enabled. They can include rooms absent from ``rooms`` when earlier
+    recovery completes while handling this response. ``timeline.limited``
+    remains the unmodified server value.
     """
 
     next_batch: str = field()
@@ -2318,7 +2320,8 @@ class SlidingSyncResponse(Response):
             by room id.
         recovered_room_ids (FrozenSet[str]): Rooms whose limited-window gaps
             nio closed while handling this response after dispatching every
-            recovered event.
+            recovered event. The room can be absent from ``rooms`` when
+            earlier recovery completes while handling this response.
         unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window gap
             still open or abandoned.
 
