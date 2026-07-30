@@ -4299,3 +4299,30 @@ class TestRecoveryOutcome:
             await task
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset()
+
+    async def test_cancelled_queued_duplicate_classic_response_is_not_a_gap(
+        self, client
+    ):
+        client.next_batch = "s2"
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$duplicate", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel()
+        client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()

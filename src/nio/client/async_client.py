@@ -855,6 +855,9 @@ class AsyncClient(Client):
         response: SyncResponse,
         request_since: str | None,
     ) -> frozenset[str]:
+        if self.next_batch == response.next_batch:
+            return frozenset()
+
         return frozenset(
             room_id
             for room_id, room_info in response.rooms.join.items()
