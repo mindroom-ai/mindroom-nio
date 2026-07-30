@@ -4158,3 +4158,68 @@ class TestRecoveryOutcome:
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "w1"
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_cancelled_while_waiting_for_sync_executor_reports_unrecovered(
+        self, client, protocol
+    ):
+        if protocol == "classic":
+            client.next_batch = "s1"
+            response = sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        else:
+            baseline = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$old", 1).source],
+                            "prev_batch": "w1",
+                        }
+                    },
+                }
+            )
+            assert isinstance(baseline, SlidingSyncResponse)
+            await client.receive_response(baseline)
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s2",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$live", 2).source],
+                            "limited": True,
+                            "prev_batch": "w2",
+                        }
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        client._recovery.outcomes[ROOM_B] = True
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel()
+        client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        assert client._recovery.outcomes == {ROOM_B: True}
+        if protocol == "classic":
+            assert client.next_batch == "s1"
+        else:
+            assert client._sliding_room_prev_batch[ROOM_A] == "w1"

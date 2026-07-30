@@ -849,6 +849,30 @@ class AsyncClient(Client):
         response.recovered_room_ids = recovered
         response.unrecovered_room_ids = unrecovered
 
+    def _publish_waiting_sync_cancellation(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> None:
+        """Publish a fail-closed snapshot without draining the active executor."""
+        unrecovered = {
+            room_id
+            for room_id, gaps in self._recovery.gaps.items()
+            if any(gap.target_token for gap in gaps)
+        }
+        if isinstance(response, SyncResponse):
+            unrecovered.update(
+                room_id
+                for room_id, room_info in response.rooms.join.items()
+                if room_info.timeline.limited
+            )
+        else:
+            unrecovered.update(
+                room_id
+                for room_id, room in response.rooms.items()
+                if self._sliding_recovery_cursor(room_id, room) is not None
+            )
+        response.recovered_room_ids = frozenset()
+        response.unrecovered_room_ids = frozenset(unrecovered)
+
     async def _recovery_room_messages(
         self,
         room_id: str,
@@ -1541,24 +1565,31 @@ class AsyncClient(Client):
             return
 
         self._raise_on_sync_reentry()
-        async with self._sync_response_lock:
-            sync_response = (
-                response.response
-                if isinstance(response, _SyncResponseEnvelope)
-                else response
-            )
-            executor = object()
-            self._active_sync_executor_token = executor
-            context_token = self._sync_executor_context.set(executor)
-            try:
-                if isinstance(response, _SyncResponseEnvelope):
-                    await self._handle_sync(response)
-                else:
-                    await self._handle_sliding_sync(response)
-            finally:
-                self._publish_recovery_outcome(sync_response)
-                self._active_sync_executor_token = None
-                self._sync_executor_context.reset(context_token)
+        sync_response = (
+            response.response
+            if isinstance(response, _SyncResponseEnvelope)
+            else response
+        )
+        entered_executor = False
+        try:
+            async with self._sync_response_lock:
+                entered_executor = True
+                executor = object()
+                self._active_sync_executor_token = executor
+                context_token = self._sync_executor_context.set(executor)
+                try:
+                    if isinstance(response, _SyncResponseEnvelope):
+                        await self._handle_sync(response)
+                    else:
+                        await self._handle_sliding_sync(response)
+                finally:
+                    self._publish_recovery_outcome(sync_response)
+                    self._active_sync_executor_token = None
+                    self._sync_executor_context.reset(context_token)
+        except asyncio.CancelledError:
+            if not entered_executor:
+                self._publish_waiting_sync_cancellation(sync_response)
+            raise
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
