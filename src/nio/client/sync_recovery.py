@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
-PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
+PendingEventKind = Literal["timeline", "ephemeral", "account_data", "boundary"]
 DispatchEvent = Callable[
     [
         str,
@@ -107,6 +107,8 @@ class PendingTimelineEvent:
     def parse(
         self,
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent:
+        if self.kind == "boundary":
+            raise ValueError("Boundary markers cannot be parsed as events")
         source = json.loads(self.source_json)
         if self.kind == "ephemeral":
             event = EphemeralEvent.parse_event(source)
@@ -531,13 +533,33 @@ def _finish(
     gap: RecoveryGap,
     event: PendingTimelineEvent | None = None,
     was_encrypted: bool = False,
+    *,
+    retain_boundary: bool = False,
 ) -> None:
+    # Keep the oldest live ID as the durable gap anchor; later live rows use
+    # completed-event deduplication instead of adding more boundary markers.
+    boundary = (
+        PendingTimelineEvent(
+            gap.room_id,
+            gap.generation,
+            event.sequence,
+            f"~boundary:{gap.generation}",
+            event.event_id,
+            True,
+            False,
+            kind="boundary",
+        )
+        if event and retain_boundary
+        else None
+    )
     if store:
+        kwargs = {"boundary": boundary} if boundary else {}
         store.finish_recovery(
             gap.room_id,
             gap.generation,
             event.event_id if event else None,
             was_encrypted,
+            **kwargs,
         )
     key = (gap.room_id, gap.generation)
     if event:
@@ -546,6 +568,9 @@ def _finish(
             record_completed_timeline_event(
                 state, gap.room_id, event.event_id, was_encrypted
             )
+        if boundary:
+            state.events[key].append(boundary)
+            state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
         return
     state.events.pop(key, None)
     gaps = state.gaps[gap.room_id]
@@ -576,7 +601,11 @@ async def _collect_slice(
         for event in queued
     ]
     pending_ids = {event.event_id for event in pending}
-    live_ids = {event.event_id for event in pending if event.is_live}
+    boundary_ids = {
+        event.source_json if event.kind == "boundary" else event.event_id
+        for event in state.events.get((gap.room_id, gap.generation), ())
+        if event.is_live and event.kind in {"timeline", "boundary"}
+    }
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:
@@ -631,7 +660,7 @@ async def _collect_slice(
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if event_id in live_ids and response.end != gap.target_token:
+            if event_id in boundary_ids and response.end != gap.target_token:
                 reached_window = True
                 break
             if _is_own_join(event, user_id):
@@ -723,11 +752,17 @@ async def _drain_gap(
     dispatch_event: DispatchEvent,
     store: MatrixStore | None,
     deadline: float | None,
+    live_timeline_only: bool = False,
 ) -> None:
-    if gap.cursor_token is not None:
+    if gap.cursor_token is not None and not live_timeline_only:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
+        if live_timeline_only and (not pending.is_live or pending.kind != "timeline"):
+            continue
+        if pending.kind == "boundary":
+            _finish(state, store, gap, pending)
+            continue
         try:
             event = pending.parse()
         except Exception:
@@ -758,15 +793,21 @@ async def _drain_gap(
         except Exception:
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
+        was_encrypted = (
+            isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted
+        )
         _finish(
             state,
             store,
             gap,
             pending,
-            isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted,
+            was_encrypted,
+            retain_boundary=live_timeline_only
+            and not any(item.kind == "boundary" for item in queued),
         )
 
-    _finish(state, store, gap)
+    if not live_timeline_only:
+        _finish(state, store, gap)
 
 
 async def pump_recovery(
@@ -781,9 +822,21 @@ async def pump_recovery(
 ) -> None:
     if ready_room_id is not None:
         gaps = state.gaps.get(ready_room_id)
-        if not gaps or gaps[0].cursor_token is not None:
+        if not gaps:
             return
         room_ids = [ready_room_id]
+        for gap in gaps:
+            await _drain_gap(
+                state,
+                gap,
+                dispatch_event=dispatch_event,
+                store=store,
+                deadline=None,
+                live_timeline_only=True,
+            )
+        gaps = state.gaps.get(ready_room_id)
+        if not gaps or gaps[0].cursor_token is not None:
+            return
     else:
         room_ids = list(state.gaps)
     if not room_ids:

@@ -678,9 +678,12 @@ class MatrixStore:
             decoded = json.loads(decrypted)
             kind = decoded["kind"]
             source = decoded["source"]
-            if kind not in {"timeline", "ephemeral", "account_data"} or not isinstance(
-                source, str
-            ):
+            if kind not in {
+                "timeline",
+                "ephemeral",
+                "account_data",
+                "boundary",
+            } or not isinstance(source, str):
                 raise ValueError
             return source, kind
         except (KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
@@ -848,6 +851,7 @@ class MatrixStore:
         generation: int,
         event_id: str | None,
         was_encrypted: bool,
+        boundary: PendingTimelineEvent | None = None,
     ) -> None:
         account = self._get_account()
         assert account
@@ -870,6 +874,8 @@ class MatrixStore:
             pending.is_live = pending.was_completed = False
             pending.was_encrypted = was_encrypted
             pending.save(force_insert=True)
+            if boundary:
+                self._upsert_pending_events(account, (boundary,))
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)
                 .where(

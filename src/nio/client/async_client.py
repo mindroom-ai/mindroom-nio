@@ -385,6 +385,8 @@ class AsyncClientConfig(ClientConfig):
         backfill_limited_timelines (bool): Recover limited timelines through a
             durable room-local queue.
             Limited lanes block sends until their history obligation clears.
+            Live timeline callbacks run before the history walk; recovered
+            history callbacks may therefore arrive later.
             Live callback errors propagate after acknowledgement, while
             recovered-history callback errors fan out before acknowledgement.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
@@ -810,6 +812,8 @@ class AsyncClient(Client):
             room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
             self.rooms[room_id] = room
 
+        if kind == "boundary":
+            raise ValueError("Boundary markers cannot be dispatched")
         if kind == "ephemeral":
             if not isinstance(event, EphemeralEvent):
                 raise ValueError("Invalid pending ephemeral event")
