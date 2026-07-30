@@ -554,8 +554,8 @@ class AsyncClient(Client):
 
         # Per-room /messages token from each room's last sliding window,
         # used as the start of the next limited window's recovery walk.
-        # In-memory only: a restart has no baseline to walk from, so the
-        # first limited window after it cannot be recovered.
+        # Restored from the store when recovery persistence is enabled;
+        # otherwise it lives only in memory and cannot survive a restart.
         self._sliding_room_prev_batch: dict[str, str] = {}
 
         # Rooms whose membership reset since their last window, each with
@@ -1085,7 +1085,10 @@ class AsyncClient(Client):
                     forgotten_rooms=reset_rooms,
                 )
                 for room_id in reset_rooms:
-                    self._reset_sliding_room(room_id)
+                    if self._recovery_store is None:
+                        self._forget_sliding_window_token(room_id)
+                    else:
+                        self._reset_sliding_room(room_id)
             self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
                 if self._recovery_store is None:
@@ -1389,7 +1392,10 @@ class AsyncClient(Client):
     ) -> None:
         """Adopt baselines whose durable write already succeeded."""
         for room_id in forgotten:
-            self._reset_sliding_room(room_id)
+            if self._recovery_store is None:
+                self._forget_sliding_window_token(room_id)
+            else:
+                self._reset_sliding_room(room_id)
         request_epoch = self._sliding_request_epoch.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token

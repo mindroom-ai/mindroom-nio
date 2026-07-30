@@ -3065,7 +3065,10 @@ class TestRoomLocalRecovery:
         assert client.store.load_sync_token() == "s1"
         await client.close()
 
-    async def test_leave_deletes_a_token_stored_by_an_earlier_run(self, tempdir):
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_membership_reset_deletes_a_token_stored_by_an_earlier_run(
+        self, tempdir, protocol
+    ):
         """A token on disk outlives the run that wrote it, so deletion must too."""
         persisting = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3092,7 +3095,14 @@ class TestRoomLocalRecovery:
             "https://example.org", OWN_ID, "DEVICEID", tempdir, config=not_persisting
         )
         await second.receive_response(LoginResponse.from_dict(LOGIN))
-        second._forget_sliding_window_token(ROOM_A)
+        if protocol == "classic":
+            response = sync_response("s2", {})
+            response.rooms.leave[ROOM_A] = RoomInfo(
+                Timeline([], False, None), [], [], []
+            )
+        else:
+            response = self._sliding("s2", [], membership="leave")
+        await second.receive_response(response)
 
         assert second.store.load_sliding_window_tokens() == {}
         await second.close()
