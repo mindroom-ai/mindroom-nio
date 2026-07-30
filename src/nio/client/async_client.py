@@ -583,7 +583,8 @@ class AsyncClient(Client):
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
-        self._sliding_sync_recovery_scope = uuid4().hex
+        self._sliding_connection_recovery_scopes: dict[str | None, str] = {}
+        self._sliding_receive_recovery_scope = uuid4().hex
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -1420,8 +1421,31 @@ class AsyncClient(Client):
         """Return the logical Sliding Sync connection handling this response."""
         return (
             self._sliding_request_recovery_scope.get()
-            or self._sliding_sync_recovery_scope
+            or self._sliding_receive_recovery_scope
         )
+
+    def _sliding_connection_recovery_scope(
+        self, conn_id: str | None, pos: str | None
+    ) -> str:
+        """Return one recovery scope for a logical Sliding Sync connection."""
+        if pos is not None:
+            scope = self._sliding_connection_recovery_scopes.get(conn_id)
+            if scope is not None:
+                return scope
+
+        old_scope = self._sliding_connection_recovery_scopes.get(conn_id)
+        scope = uuid4().hex
+        self._sliding_connection_recovery_scopes[conn_id] = scope
+        if old_scope is not None:
+            self._retire_sliding_recovery_scope(old_scope)
+        return scope
+
+    def _retire_sliding_recovery_scope(self, scope: str) -> None:
+        """Discard ordering floors once no connection owns their scope."""
+        self._sliding_response_issuance_floor.pop(scope, None)
+        for key in tuple(self._sliding_room_issuance_floor):
+            if key[0] == scope:
+                self._sliding_room_issuance_floor.pop(key)
 
     def _sliding_token_predates_reset(
         self, room_id: str, room: SlidingSyncRoom
@@ -2484,9 +2508,7 @@ class AsyncClient(Client):
                 long-poll timeout and the client-side request timeout.
         """
         self._raise_on_sync_reentry()
-        if pos is None:
-            self._sliding_sync_recovery_scope = uuid4().hex
-        recovery_scope = self._sliding_sync_recovery_scope
+        recovery_scope = self._sliding_connection_recovery_scope(conn_id, pos)
         presence = set_presence or self._presence
         method, path, data = Api.sliding_sync(
             self.access_token,
@@ -2523,6 +2545,8 @@ class AsyncClient(Client):
         finally:
             self._sliding_request_recovery_scope.reset(recovery_scope_token)
             self._sliding_request_issuance.reset(issuance_token)
+            if recovery_scope not in self._sliding_connection_recovery_scopes.values():
+                self._retire_sliding_recovery_scope(recovery_scope)
 
         return response
 

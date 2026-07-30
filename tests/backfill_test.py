@@ -3567,6 +3567,84 @@ class TestRoomLocalRecovery:
         assert global_values == ["second", "first"]
         assert to_device_values == ["second", "first"]
         assert client._sliding_sync_to_device_since == "first-to-device"
+        assert len(client._sliding_response_issuance_floor) == 1
+        assert not client._sliding_room_issuance_floor
+        await client.close()
+
+    async def test_sliding_connection_continuation_keeps_its_recovery_scope(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        a_continuation_started = asyncio.Event()
+        release_a_continuation = asyncio.Event()
+        seen = record_events(client)
+
+        async def send(*args, **_kwargs):
+            body = json.loads(args[3])
+            conn_id = body["conn_id"]
+            request_pos = parse_qs(urlparse(args[2]).query).get("pos", [None])[0]
+            if conn_id == "a" and request_pos is not None:
+                a_continuation_started.set()
+                await release_a_continuation.wait()
+            label = f"{conn_id}{'2' if request_pos else '1'}"
+            response = self._sliding(
+                f"{label}-pos",
+                [text_event(f"${label}", client._sliding_issuance_clock)],
+            )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sliding_sync(conn_id="a")
+        await client.sliding_sync(conn_id="b")
+        a_continuation = asyncio.create_task(
+            client.sliding_sync(conn_id="a", pos="a1-pos")
+        )
+        await a_continuation_started.wait()
+        await client.sliding_sync(conn_id="b", pos="b1-pos")
+        release_a_continuation.set()
+        await a_continuation
+
+        assert seen == ["$a1", "$b1", "$b2", "$a2"]
+        await client.close()
+
+    async def test_sliding_connection_restart_retires_old_scope_floors(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def send(*_args, **_kwargs):
+            response = self._sliding(
+                f"p{client._sliding_issuance_clock}",
+                [],
+                prev_batch=f"w{client._sliding_issuance_clock}",
+            )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sliding_sync(conn_id="main")
+        await client.sliding_sync(conn_id="main")
+        await client.sliding_sync(conn_id="main")
+
+        assert len(client._sliding_response_issuance_floor) == 1
+        assert len(client._sliding_room_issuance_floor) == 1
         await client.close()
 
     async def test_late_sliding_membership_reset_keeps_newer_gap(

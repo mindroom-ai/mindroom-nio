@@ -265,11 +265,6 @@ def _discard_orphaned_dispatches(state: RecoveryState) -> None:
             task.cancel()
 
 
-def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
-    """Whether this event is our own transition into the room."""
-    return _is_own_join(event, user_id)
-
-
 async def _run_dispatch(
     state: RecoveryState,
     store: MatrixStore | None,
@@ -362,7 +357,8 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
         raise state._deferred_dispatch_errors.pop(0)
 
 
-def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+    """Whether this event is our own transition into the room."""
     return bool(
         user_id
         and isinstance(event, RoomMemberEvent)
@@ -381,7 +377,7 @@ def _timeline_clears_recovery(
         (
             index
             for index, event in enumerate(timeline_events)
-            if _is_own_join(event, user_id)
+            if is_own_join(event, user_id)
         ),
         default=-1,
     )
@@ -978,7 +974,7 @@ async def _collect_slice(
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if _is_own_join(event, user_id):
+            if is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
                 next_sequence = 0

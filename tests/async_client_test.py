@@ -951,13 +951,14 @@ class TestClass:
             return SlidingSyncResponse.from_dict({"pos": "p1"})
 
         monkeypatch.setattr(async_client, "_send", send)
-        previous = async_client._sliding_sync_recovery_scope
-        await async_client.sliding_sync(pos=None)
-        current = async_client._sliding_sync_recovery_scope
-        assert current != previous
+        await async_client.sliding_sync(conn_id="main", pos=None)
+        current = async_client._sliding_connection_recovery_scopes["main"]
 
-        await async_client.sliding_sync(pos="p1")
-        assert async_client._sliding_sync_recovery_scope == current
+        await async_client.sliding_sync(conn_id="main", pos="p1")
+        assert async_client._sliding_connection_recovery_scopes["main"] == current
+
+        await async_client.sliding_sync(conn_id="main", pos=None)
+        assert async_client._sliding_connection_recovery_scopes["main"] != current
 
     sliding_sync_url = re.compile(
         rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"

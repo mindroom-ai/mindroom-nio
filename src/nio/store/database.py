@@ -172,11 +172,6 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
 
-    def upgrade_to_v4(self):
-        with self.database.bind_ctx(self.models):
-            self.database.create_tables([SlidingWindowTokens])
-        self._update_version(4)
-
     def upgrade_to_v5(self):
         with self.database.bind_ctx(self.models):
             self.database.drop_tables([SlidingWindowTokens], safe=True)
@@ -198,10 +193,7 @@ class MatrixStore:
         if store_version == 2:
             self.upgrade_to_v3()
             store_version = 3
-        if store_version == 3:
-            self.upgrade_to_v4()
-            store_version = 4
-        if store_version == 4:
+        if store_version in (3, 4):
             self.upgrade_to_v5()
 
         with self.database.bind_ctx(self.models):
