@@ -277,8 +277,15 @@ async def test_early_live_boundary_ignores_unrelated_completed_event():
         completed={ROOM: OrderedDict([("$old", False)])},
     )
     seen: list[str] = []
+    starts: list[str] = []
 
-    async def fetch(*_args):
+    async def fetch(_room_id, start, *_args):
+        starts.append(start)
+        if start == "next":
+            return RoomMessagesResponse.from_dict(
+                {"start": "next", "end": "target", "chunk": []},
+                ROOM,
+            )
         return RoomMessagesResponse.from_dict(
             {
                 "start": "cursor",
@@ -298,7 +305,7 @@ async def test_early_live_boundary_ignores_unrelated_completed_event():
 
     kwargs = {
         "user_id": "@me:example.org",
-        "options": RecoveryOptions(1, 10, 10, 10),
+        "options": RecoveryOptions(2, 10, 10, 10),
         "fetch_messages": fetch,
         "dispatch_event": dispatch,
         "store": None,
@@ -307,6 +314,7 @@ async def test_early_live_boundary_ignores_unrelated_completed_event():
     await pump_recovery(state, **kwargs)
 
     assert seen == ["$live", "$unseen"]
+    assert starts == ["cursor", "next"]
     assert not state.gaps
 
 
@@ -915,6 +923,85 @@ async def test_close_rejects_retained_dispatch_caller(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_close_rejects_orphaned_dispatch_caller(monkeypatch):
+    callback_task = asyncio.create_task(asyncio.sleep(0))
+    await callback_task
+    monkeypatch.setattr(
+        async_client_module.asyncio,
+        "current_task",
+        lambda: callback_task,
+    )
+    client = AsyncClient("https://example.org")
+    client._recovery._orphaned_dispatches[callback_task] = (
+        ROOM,
+        "$live",
+        "timeline",
+    )
+
+    try:
+        with pytest.raises(
+            LocalProtocolError,
+            match=r"AsyncClient\.close\(\) cannot run from a timeline callback\.",
+        ):
+            await client.close()
+    finally:
+        client._recovery._orphaned_dispatches.clear()
+
+
+@pytest.mark.asyncio
+async def test_close_drains_cleared_dispatch_that_suppresses_cancellation():
+    value = pending("$live", 0)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
+        events={(ROOM, 1): [value]},
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finished.set()
+        return event
+
+    async def unused_fetch(*_args):
+        raise AssertionError("closed gap must not fetch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 0.01),
+        fetch_messages=unused_fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    await started.wait()
+    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+    await cancelled.wait()
+
+    assert not state._active_dispatches
+    assert len(state._orphaned_dispatches) == 1
+
+    client = AsyncClient("https://example.org")
+    client._recovery = state
+    close = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    release.set()
+    await close
+
+    assert finished.is_set()
+    assert not state._orphaned_dispatches
+
+
+@pytest.mark.asyncio
 async def test_close_drains_dispatch_after_repeated_cancellation():
     value = pending("$live", 0)
     state = RecoveryState(
@@ -1108,6 +1195,55 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
         store=None,
     )
     assert seen == ["$present-one", "$present-two"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_live_boundary_dedupes_without_hiding_page_suffix():
+    live = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$live-boundary", 2), True)
+    assert live
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [live]},
+    )
+    seen: list[str] = []
+    starts: list[str] = []
+
+    async def fetch(_room_id, start, *_args):
+        starts.append(start)
+        if start == "next":
+            return RoomMessagesResponse.from_dict(
+                {"start": "next", "end": "target", "chunk": []},
+                ROOM,
+            )
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "next",
+                "chunk": [
+                    event("$gap-before", 1).source,
+                    event("$live-boundary", 2).source,
+                    event("$gap-suffix", 3).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(2, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert seen == ["$gap-before", "$gap-suffix", "$live-boundary"]
+    assert starts == ["cursor", "next"]
     assert not state.gaps
 
 

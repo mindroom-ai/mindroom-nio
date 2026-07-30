@@ -29,6 +29,7 @@ from nio import (
     RoomEncryptionEvent,
     RoomForgetResponse,
     RoomInfo,
+    RoomLeaveError,
     RoomLeaveResponse,
     RoomMemberEvent,
     RoomMessageText,
@@ -40,6 +41,7 @@ from nio import (
     Timeline,
     ToDeviceEvent,
     TypingNoticeEvent,
+    UnknownAccountDataEvent,
     UnknownBadEvent,
     UnknownToDeviceEvent,
 )
@@ -1140,8 +1142,8 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
 
-    @pytest.mark.parametrize("end", [None, "s1"])
-    async def test_live_overlap_closes_gap_without_end_progress(
+    @pytest.mark.parametrize("end", [None, "p1"])
+    async def test_token_or_exhaustion_closes_gap_without_end_progress(
         self, client, aioresponse, end
     ):
         seen = record_events(client)
@@ -1282,7 +1284,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
 
-    async def test_live_overlap_defers_events_after_held_window(
+    async def test_live_overlap_recovers_events_after_held_window(
         self, tempdir, aioresponse
     ):
         client = AsyncClient(
@@ -1309,6 +1311,7 @@ class TestRoomLocalRecovery:
                 "more",
             ),
         )
+        aioresponse.get(MESSAGES_URL, payload=messages([], "p1"))
         await client.receive_response(
             sync_response(
                 "s2",
@@ -1321,7 +1324,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$held", "$gap"]
+        assert seen == ["$held", "$gap", "$overflow"]
         assert not client._recovery.gaps
         await client.receive_response(
             sync_response(
@@ -1984,16 +1987,14 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$held", "$later", "$gap", "$gap2"]
 
-    async def test_ignored_to_live_boundary_preserves_recovered_prefix(
-        self, client, aioresponse
-    ):
+    async def test_target_token_preserves_recovered_prefix(self, client, aioresponse):
         seen = record_events(client)
         client.next_batch = "s1"
         recovered = [text_event(f"${index}", index) for index in range(14)]
         live = [text_event(f"${index}", index) for index in range(14, 64)]
         aioresponse.get(
             MESSAGES_URL,
-            payload=messages(recovered + live[:36], "ignored-to-bound"),
+            payload=messages(recovered + live[:36], "p1"),
         )
         await client.receive_response(
             sync_response(
@@ -3295,6 +3296,109 @@ class TestRoomLocalRecovery:
         older_started = asyncio.Event()
         release_older = asyncio.Event()
         reverse_walks: list[tuple[str | None, str | None]] = []
+        invite_names: list[str] = []
+        global_values: list[str] = []
+        room_markers: list[str] = []
+        to_device_values: list[str] = []
+        e2ee_positions: list[str] = []
+
+        async def invite_callback(_room, event):
+            invite_names.append(event.name)
+
+        async def global_callback(event):
+            global_values.append(event.source["content"]["value"])
+
+        async def room_callback(_room, event):
+            room_markers.append(event.event_id)
+
+        async def to_device_callback(event):
+            to_device_values.append(event.source["content"]["body"])
+
+        def handle_olm(response):
+            e2ee_positions.append(response.pos)
+
+        client.add_event_callback(invite_callback, InviteNameEvent)
+        client.add_global_account_data_callback(
+            global_callback, UnknownAccountDataEvent
+        )
+        client.add_room_account_data_callback(room_callback, FullyReadEvent)
+        client.add_to_device_callback(to_device_callback, UnknownToDeviceEvent)
+        monkeypatch.setattr(client, "_handle_olm_events", handle_olm)
+
+        def sliding_response(label: str, token: str, *, limited: bool):
+            invite = {
+                "content": {"name": f"{label} invite"},
+                "sender": "@sender:example.org",
+                "state_key": "",
+                "type": "m.room.name",
+            }
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": f"{label}-response",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "initial": True,
+                            "limited": limited,
+                            "prev_batch": token,
+                            "required_state": [
+                                member_event("$membership", 0, "join", OWN_ID).source,
+                                member_event(
+                                    f"${label}-member",
+                                    1,
+                                    "join" if label == "newer" else "leave",
+                                    "@surface:example.org",
+                                ).source,
+                                name_event(f"${label}-name", 2, f"{label} room").source,
+                                encryption_event(ROOM_A).source,
+                            ],
+                            "timeline": [
+                                text_event(f"${label}", 3).source,
+                            ],
+                        },
+                        ROOM_B: {
+                            "membership": "invite",
+                            "stripped_state": [invite],
+                        },
+                    },
+                    "extensions": {
+                        "to_device": {
+                            "next_batch": f"{label}-to-device",
+                            "events": [
+                                {
+                                    "content": {"body": label},
+                                    "sender": "@sender:example.org",
+                                    "type": "org.example.test",
+                                }
+                            ],
+                        },
+                        "e2ee": {
+                            "device_lists": {
+                                "changed": [f"@{label}:example.org"],
+                                "left": [],
+                            }
+                        },
+                        "account_data": {
+                            "global": [
+                                {
+                                    "content": {"value": label},
+                                    "type": "org.example.settings",
+                                }
+                            ],
+                            "rooms": {
+                                ROOM_A: [
+                                    {
+                                        "content": {"event_id": f"${label}-read"},
+                                        "type": "m.fully_read",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+            return response
 
         async def send(*args, **_kwargs):
             if args[0] is RoomMessagesResponse:
@@ -3313,18 +3417,9 @@ class TestRoomLocalRecovery:
             if request_pos == "older":
                 older_started.set()
                 await release_older.wait()
-                response = self._sliding(
-                    "older-response",
-                    [text_event("$older", 1)],
-                    limited=True,
-                    prev_batch="w1",
-                )
+                response = sliding_response("older", "w1", limited=True)
             else:
-                response = self._sliding(
-                    "newer-response",
-                    [text_event("$newer", 2)],
-                    prev_batch="w2",
-                )
+                response = sliding_response("newer", "w2", limited=False)
             await client.receive_response(response)
             return response
 
@@ -3339,6 +3434,16 @@ class TestRoomLocalRecovery:
         assert reverse_walks == []
         assert not client._recovery.gaps
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        assert client.rooms[ROOM_A].name == "newer room"
+        assert "@surface:example.org" in client.rooms[ROOM_A].users
+        assert client.rooms[ROOM_A].encrypted
+        assert client.invited_rooms[ROOM_B].name == "newer invite"
+        assert invite_names == ["newer invite"]
+        assert global_values == ["newer"]
+        assert room_markers == ["$newer-read"]
+        assert to_device_values == ["newer"]
+        assert e2ee_positions == ["newer-response"]
+        assert client._sliding_sync_to_device_since == "newer-to-device"
         await client.close()
 
     async def test_late_sliding_membership_reset_keeps_newer_gap(
@@ -3573,6 +3678,47 @@ class TestRoomLocalRecovery:
         assert sent == []
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
         assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
+        await client.close()
+
+    @pytest.mark.parametrize(
+        ("status", "restored"),
+        [(403, True), (500, False)],
+    )
+    async def test_room_leave_restores_token_only_after_definitive_rejection(
+        self, tempdir, monkeypatch, status, restored
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+
+        class Transport:
+            def __init__(self, response_status):
+                self.status = response_status
+
+        response = RoomLeaveError.from_dict(
+            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        )
+        response.transport_response = Transport(status)
+
+        async def send(*_args, **_kwargs):
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        result = await client.room_leave(ROOM_A)
+
+        assert result is response
+        expected = {ROOM_A: window_token("w1")} if restored else {}
+        assert client._sliding_room_prev_batch == expected
+        assert client.store.load_sliding_window_tokens() == expected
         await client.close()
 
     async def test_restart_snapshot_still_walks_from_the_stored_token(

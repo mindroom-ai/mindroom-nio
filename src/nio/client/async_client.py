@@ -570,6 +570,7 @@ class AsyncClient(Client):
         # The oldest request issuance a room still accepts a token from.
         self._sliding_room_issuance_floor: dict[str, int] = {}
         self._sliding_issuance_clock = 0
+        self._sliding_response_issuance_floor = 0
         self._sliding_request_issuance: ContextVar[int | None] = ContextVar(
             f"nio_sliding_request_issuance_{id(self)}", default=None
         )
@@ -1133,6 +1134,8 @@ class AsyncClient(Client):
 
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
+        if not self._accept_sliding_response():
+            return
         if self.config.backfill_limited_timelines:
             planned_room_ids = set(response.rooms)
             planned_room_ids.update(
@@ -1397,6 +1400,16 @@ class AsyncClient(Client):
             and request_issuance < floor
         )
 
+    def _accept_sliding_response(self) -> bool:
+        """Reject a response older than one already accepted in full."""
+        request_issuance = self._sliding_request_issuance.get()
+        if request_issuance is None:
+            return True
+        if request_issuance < self._sliding_response_issuance_floor:
+            return False
+        self._sliding_response_issuance_floor = request_issuance
+        return True
+
     def _sliding_token_predates_reset(
         self, room_id: str, room: SlidingSyncRoom
     ) -> bool:
@@ -1463,6 +1476,25 @@ class AsyncClient(Client):
         if self.store:
             self.store.forget_sliding_window_token(room_id)
         self._reset_sliding_room(room_id)
+
+    def _restore_sliding_window_token(
+        self, room_id: str, token: SlidingWindowToken
+    ) -> None:
+        """Restore a baseline after the server definitively rejected a leave."""
+        if self.store:
+            self.store.save_sliding_window_tokens({room_id: token})
+        self._sliding_room_prev_batch[room_id] = token
+        self._sliding_verified_membership_event_ids[room_id] = token.membership_event_id
+        self._sliding_reset_rooms.pop(room_id, None)
+
+    @staticmethod
+    def _room_leave_was_definitively_rejected(response: RoomLeaveError) -> bool:
+        transport = response.transport_response
+        return bool(
+            transport
+            and 400 <= transport.status < 500
+            and transport.status not in (408, 429)
+        )
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
@@ -3998,7 +4030,11 @@ class AsyncClient(Client):
         """Close the underlying http session."""
         caller = asyncio.current_task()
         if (
-            caller is not None and caller in self._recovery._active_dispatches.values()
+            caller is not None
+            and (
+                caller in self._recovery._active_dispatches.values()
+                or caller in self._recovery._orphaned_dispatches
+            )
         ) or (
             self.config.backfill_limited_timelines
             and self._active_sync_executor_token is not None
@@ -4309,8 +4345,16 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
         """
         method, path = Api.room_leave(self.access_token, room_id)
+        window_token = self._sliding_room_prev_batch.get(room_id)
         self._forget_sliding_window_token(room_id)
-        return await self._send(RoomLeaveResponse, method, path)
+        response = await self._send(RoomLeaveResponse, method, path)
+        if (
+            window_token is not None
+            and isinstance(response, RoomLeaveError)
+            and self._room_leave_was_definitively_rejected(response)
+        ):
+            self._restore_sliding_window_token(room_id, window_token)
+        return response
 
     @logged_in_async
     async def room_forget(self, room_id: str) -> RoomForgetResponse | RoomForgetError:

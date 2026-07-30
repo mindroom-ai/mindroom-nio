@@ -156,6 +156,9 @@ class RecoveryState:
     _dispatch_waiters: dict[asyncio.Task[_LiveCallbackError | None], int] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _orphaned_dispatches: dict[
+        asyncio.Task[_LiveCallbackError | None], _DispatchKey
+    ] = field(default_factory=dict, init=False, repr=False, compare=False)
     _deferred_dispatch_errors: list[Exception] = field(
         default_factory=list, init=False, repr=False, compare=False
     )
@@ -258,6 +261,7 @@ def _discard_orphaned_dispatches(state: RecoveryState) -> None:
         if task.done():
             _report_orphaned_dispatch(key, task)
         else:
+            state._orphaned_dispatches[task] = key
             task.cancel()
 
 
@@ -329,8 +333,10 @@ async def _run_dispatch(
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
     """Wait for retained callback work and release its in-memory task entries."""
     finish_error: Exception | None = None
-    while state._active_dispatches:
-        await asyncio.wait(tuple(set(state._active_dispatches.values())))
+    while state._active_dispatches or state._orphaned_dispatches:
+        tasks = set(state._active_dispatches.values())
+        tasks.update(state._orphaned_dispatches)
+        await asyncio.wait(tuple(tasks))
         for key, task in tuple(state._active_dispatches.items()):
             if not task.done() or state._active_dispatches.get(key) is not task:
                 continue
@@ -345,6 +351,11 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
                 task,
                 "Recovered event callback failed while the client was closing: %s",
             )
+        for task, key in tuple(state._orphaned_dispatches.items()):
+            if not task.done():
+                continue
+            state._orphaned_dispatches.pop(task)
+            _report_orphaned_dispatch(key, task)
     if finish_error:
         raise finish_error
 
@@ -907,11 +918,6 @@ async def _collect_slice(
         for event in queued
     ]
     pending_ids = {event.event_id for event in pending}
-    boundary_ids = {
-        event.source_json if event.kind == "boundary" else event.event_id
-        for event in state.events.get((gap.room_id, gap.generation), ())
-        if event.is_live and event.kind in {"timeline", "boundary"}
-    }
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:
@@ -966,14 +972,10 @@ async def _collect_slice(
             ),
             default=-1,
         )
-        reached_window = False
         for event in response.chunk:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if event_id in boundary_ids and response.end != gap.target_token:
-                reached_window = True
-                break
             if _is_own_join(event, user_id):
                 recovered.clear()
                 clear_recovered = True
@@ -1009,8 +1011,6 @@ async def _collect_slice(
             recovered.clear()
             clear_recovered = True
             abandoned = True
-            next_cursor = None
-        elif reached_window:
             next_cursor = None
         elif response.end is None and gap.target_token:
             # A bounded walk that runs out of events has reached the sync
