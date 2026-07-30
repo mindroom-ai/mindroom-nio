@@ -1,5 +1,6 @@
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Type
 
@@ -40,6 +41,7 @@ from nio.responses import (
     RoomKeyRequestResponse,
     RoomKnockResponse,
     RoomLeaveResponse,
+    RoomMessagesError,
     RoomMessagesResponse,
     RoomTypingResponse,
     SlidingSyncError,
@@ -581,3 +583,67 @@ class TestClass:
         parsed_dict = _load_response("tests/data/register_interactive_response.json")
         response = RegisterInteractiveResponse.from_dict(parsed_dict)
         assert isinstance(response, RegisterInteractiveResponse)
+
+
+class TestSchemaValidationWarning:
+    """Response bodies are checked against the success schema before anything looks at
+    whether the body is actually an error. A server error body therefore fails success
+    validation, and the warning that gets logged describes the missing success field
+    rather than the error the server reported. These tests pin the warning to the real
+    errcode so a failed request is diagnosable from logs alone."""
+
+    def _warnings(self, caplog):
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "nio.responses" and record.levelno == logging.WARNING
+        ]
+
+    def test_warning_reports_errcode_from_error_body(self, caplog):
+        parsed_dict = {
+            "errcode": "M_FORBIDDEN",
+            "error": "You don't have permission to view this room.",
+        }
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            response = RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        assert isinstance(response, RoomMessagesError)
+        assert response.status_code == "M_FORBIDDEN"
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert "M_FORBIDDEN" in warnings[0]
+        assert "You don't have permission to view this room." in warnings[0]
+
+    def test_warning_still_names_the_failed_schema_field(self, caplog):
+        parsed_dict = {"errcode": "M_FORBIDDEN", "error": "denied"}
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        assert "chunk" in self._warnings(caplog)[0]
+
+    def test_warning_omits_unrelated_body_fields(self, caplog):
+        # An error body is not guaranteed to be free of user content, so only the two
+        # documented error fields may be logged.
+        parsed_dict = {
+            "errcode": "M_FORBIDDEN",
+            "error": "denied",
+            "extra_detail": "must-not-be-logged",
+        }
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        assert "must-not-be-logged" not in self._warnings(caplog)[0]
+
+    @pytest.mark.parametrize(
+        "parsed_dict",
+        [{}, [], "not-a-mapping", None, {"errcode": None}, {"errcode": ["nested"]}],
+        ids=["empty", "list", "string", "none", "null-errcode", "nested-errcode"],
+    )
+    def test_malformed_bodies_do_not_raise_from_the_log_call(self, parsed_dict, caplog):
+        # The warning happens on the failure path; it must never become the thing that
+        # raises, whatever shape the body turned out to be.
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            response = RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        assert isinstance(response, RoomMessagesError)
+        assert len(self._warnings(caplog)) == 1

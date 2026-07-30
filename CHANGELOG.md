@@ -30,6 +30,23 @@ All notable changes to this project will be documented in this file.
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.
 
+## 0.32.0
+
+### Features
+
+- Add typed recovered and unrecovered room outcomes to classic and Sliding
+  Sync responses when limited-timeline recovery is enabled, while preserving
+  the server's original limited-timeline flag.
+
+### Bug Fixes
+
+- Report the server's `errcode` and `error` when a response fails its success
+  schema. Responses are validated against the success schema before anything
+  checks whether the body is an error, so an error body failed that validation
+  and the warning named the first missing success field instead of the errcode
+  the server sent, leaving the request outcome invisible in logs. Only those
+  two fields are logged, since the rest of a body may hold user content.
+
 ## 0.31.0
 
 ### Features

@@ -5,6 +5,7 @@ import threading
 import time
 from collections import OrderedDict
 
+import nio.client.sync_recovery as sync_recovery
 import pytest
 
 from nio import Event, RoomMessageText
@@ -753,3 +754,36 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
         for queued in queued_events
         if not queued.is_live
     ] == ["$later-recovered"]
+
+
+def test_recovery_outcome_keeps_open_real_gap_unrecovered():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 2, "p2", "s2")]},
+    )
+    state.outcomes = {ROOM: True, ROOM_B: False}
+
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM, ROOM_B}),
+    )
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+    )
+
+
+def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
+    state = RecoveryState(
+        gaps={
+            ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")],
+            ROOM_B: [RecoveryGap(ROOM_B, 1, "", None)],
+        },
+        events={(ROOM, 1): [], (ROOM_B, 1): []},
+    )
+
+    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM, ROOM_B})))
+
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+    )
