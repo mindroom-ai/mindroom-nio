@@ -307,6 +307,19 @@ class _SyncResponseEnvelope:
     request_since: str | None
 
 
+@dataclass(frozen=True)
+class _SlidingRequestConnection:
+    conn_id: str | None
+    recovery_scope: str
+    is_continuation: bool
+
+
+@dataclass
+class _SlidingConnectionRecoveryOwner:
+    recovery_scope: str
+    active_requests: int = 1
+
+
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -578,13 +591,15 @@ class AsyncClient(Client):
         self._sliding_request_issuance: ContextVar[int | None] = ContextVar(
             f"nio_sliding_request_issuance_{id(self)}", default=None
         )
-        self._sliding_request_connection: ContextVar[tuple[str | None, str] | None] = (
-            ContextVar(f"nio_sliding_request_connection_{id(self)}", default=None)
-        )
+        self._sliding_request_connection: ContextVar[
+            _SlidingRequestConnection | None
+        ] = ContextVar(f"nio_sliding_request_connection_{id(self)}", default=None)
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
-        self._sliding_connection_recovery_scopes: dict[str | None, str] = {}
+        self._sliding_connection_recovery_scopes: dict[
+            str | None, _SlidingConnectionRecoveryOwner
+        ] = {}
         self._sliding_receive_recovery_scope = uuid4().hex
 
         super().__init__(user, device_id, store_path, self.config)
@@ -1410,11 +1425,20 @@ class AsyncClient(Client):
         if request_issuance is None:
             return True
         connection = self._sliding_request_connection.get()
+        # Fresh unnamed requests have no shared connection identity, but an
+        # unnamed continuation still belongs to the active default owner.
         if (
             connection is not None
-            and connection[0] is not None
-            and self._sliding_connection_recovery_scopes.get(connection[0])
-            != connection[1]
+            and (connection.conn_id is not None or connection.is_continuation)
+            and (
+                (
+                    owner := self._sliding_connection_recovery_scopes.get(
+                        connection.conn_id
+                    )
+                )
+                is None
+                or owner.recovery_scope != connection.recovery_scope
+            )
         ):
             return False
         scope = self._current_sliding_recovery_scope()
@@ -1427,23 +1451,42 @@ class AsyncClient(Client):
     def _current_sliding_recovery_scope(self) -> str:
         """Return the logical Sliding Sync connection handling this response."""
         connection = self._sliding_request_connection.get()
-        return connection[1] if connection else self._sliding_receive_recovery_scope
+        return (
+            connection.recovery_scope
+            if connection
+            else self._sliding_receive_recovery_scope
+        )
 
     def _sliding_connection_recovery_scope(
         self, conn_id: str | None, pos: str | None
     ) -> str:
         """Return one recovery scope for a logical Sliding Sync connection."""
+        owner = self._sliding_connection_recovery_scopes.get(conn_id)
         if pos is not None:
-            scope = self._sliding_connection_recovery_scopes.get(conn_id)
-            if scope is not None:
-                return scope
+            if owner is not None:
+                owner.active_requests += 1
+                return owner.recovery_scope
 
-        old_scope = self._sliding_connection_recovery_scopes.get(conn_id)
+        old_scope = owner.recovery_scope if owner is not None else None
         scope = uuid4().hex
-        self._sliding_connection_recovery_scopes[conn_id] = scope
+        self._sliding_connection_recovery_scopes[conn_id] = (
+            _SlidingConnectionRecoveryOwner(scope)
+        )
         if old_scope is not None:
             self._retire_sliding_recovery_scope(old_scope)
         return scope
+
+    def _release_sliding_connection_recovery_scope(
+        self, conn_id: str | None, scope: str
+    ) -> None:
+        """Release ownership once the scope has no active requests."""
+        owner = self._sliding_connection_recovery_scopes.get(conn_id)
+        if owner is not None and owner.recovery_scope == scope:
+            owner.active_requests -= 1
+            if owner.active_requests:
+                return
+            self._sliding_connection_recovery_scopes.pop(conn_id)
+        self._retire_sliding_recovery_scope(scope)
 
     def _retire_sliding_recovery_scope(self, scope: str) -> None:
         """Discard ordering floors once no connection owns their scope."""
@@ -2534,7 +2577,6 @@ class AsyncClient(Client):
                 long-poll timeout and the client-side request timeout.
         """
         self._raise_on_sync_reentry()
-        recovery_scope = self._sliding_connection_recovery_scope(conn_id, pos)
         presence = set_presence or self._presence
         method, path, data = Api.sliding_sync(
             self.access_token,
@@ -2551,6 +2593,7 @@ class AsyncClient(Client):
             extensions=extensions,
             unstable=unstable,
         )
+        recovery_scope = self._sliding_connection_recovery_scope(conn_id, pos)
 
         # Stamped before the request leaves, and read again while its
         # response is handled, so a membership reset that lands in between
@@ -2559,7 +2602,11 @@ class AsyncClient(Client):
             self._next_sliding_issuance()
         )
         connection_token = self._sliding_request_connection.set(
-            (conn_id, recovery_scope)
+            _SlidingRequestConnection(
+                conn_id,
+                recovery_scope,
+                is_continuation=pos is not None,
+            )
         )
         try:
             response = await self._send(
@@ -2573,8 +2620,7 @@ class AsyncClient(Client):
         finally:
             self._sliding_request_connection.reset(connection_token)
             self._sliding_request_issuance.reset(issuance_token)
-            if recovery_scope not in self._sliding_connection_recovery_scopes.values():
-                self._retire_sliding_recovery_scope(recovery_scope)
+            self._release_sliding_connection_recovery_scope(conn_id, recovery_scope)
 
         return response
 

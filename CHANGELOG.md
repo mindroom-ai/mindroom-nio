@@ -26,7 +26,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Keep recovered timeline obligations pending and mark their rooms unrecovered when an event callback fails, so callers cannot certify a checkpoint whose durable side effect did not commit.
-- Reject late Sliding Sync continuations from superseded named connections, serialize membership resets with room recovery, preserve boundary-anchor deduplication after cache eviction, and wait for active recovery execution before closing the HTTP session.
+- Reject late Sliding Sync continuations from superseded named or default connections, release their ordering state when the last active request finishes, serialize membership resets with room recovery, preserve boundary-anchor deduplication after cache eviction, and wait for active recovery execution before closing the HTTP session.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.

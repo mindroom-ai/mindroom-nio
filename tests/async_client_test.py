@@ -944,21 +944,50 @@ class TestClass:
         assert resp.pos == "s1"
         assert resp.lists["main"].count == 1
 
-    async def test_new_sliding_connection_rotates_recovery_scope(
+    async def test_sliding_connection_scope_lives_only_while_requests_are_active(
         self, async_client, monkeypatch
     ):
+        started = [asyncio.Event() for _ in range(3)]
+        releases = [asyncio.Event() for _ in range(3)]
+        request_count = 0
+
         async def send(*args, **kwargs):
+            nonlocal request_count
+            index = request_count
+            request_count += 1
+            started[index].set()
+            await releases[index].wait()
             return SlidingSyncResponse.from_dict({"pos": "p1"})
 
         monkeypatch.setattr(async_client, "_send", send)
-        await async_client.sliding_sync(conn_id="main", pos=None)
-        current = async_client._sliding_connection_recovery_scopes["main"]
+        fresh = asyncio.create_task(async_client.sliding_sync(conn_id="main", pos=None))
+        await started[0].wait()
+        current = async_client._sliding_connection_recovery_scopes[
+            "main"
+        ].recovery_scope
 
-        await async_client.sliding_sync(conn_id="main", pos="p1")
-        assert async_client._sliding_connection_recovery_scopes["main"] == current
+        continuation = asyncio.create_task(
+            async_client.sliding_sync(conn_id="main", pos="p1")
+        )
+        await started[1].wait()
+        assert (
+            async_client._sliding_connection_recovery_scopes["main"].recovery_scope
+            == current
+        )
 
-        await async_client.sliding_sync(conn_id="main", pos=None)
-        assert async_client._sliding_connection_recovery_scopes["main"] != current
+        replacement = asyncio.create_task(
+            async_client.sliding_sync(conn_id="main", pos=None)
+        )
+        await started[2].wait()
+        assert (
+            async_client._sliding_connection_recovery_scopes["main"].recovery_scope
+            != current
+        )
+
+        for release in releases:
+            release.set()
+        await asyncio.gather(fresh, continuation, replacement)
+        assert not async_client._sliding_connection_recovery_scopes
 
     sliding_sync_url = re.compile(
         rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"
