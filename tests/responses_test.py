@@ -634,6 +634,30 @@ class TestSchemaValidationWarning:
 
         assert "must-not-be-logged" not in self._warnings(caplog)[0]
 
+    def test_warning_escapes_server_control_characters(self, caplog):
+        parsed_dict = {
+            "errcode": "M_FORBIDDEN\nFORGED",
+            "error": "denied\rFORGED",
+        }
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        warning = self._warnings(caplog)[0]
+        assert "\n" not in warning
+        assert "\r" not in warning
+        assert r"\n" in warning
+        assert r"\r" in warning
+
+    def test_warning_bounds_server_error_fields(self, caplog):
+        parsed_dict = {
+            "errcode": "E" * 1_000,
+            "error": "x" * 1_000_000,
+        }
+        with caplog.at_level(logging.WARNING, logger="nio.responses"):
+            RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+
+        assert len(self._warnings(caplog)[0]) < 1_000
+
     @pytest.mark.parametrize(
         "parsed_dict",
         [{}, [], "not-a-mapping", None, {"errcode": None}, {"errcode": ["nested"]}],
