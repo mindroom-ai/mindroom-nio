@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -260,6 +261,94 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
     assert seen == ["$other", "$other-live"]
     assert ROOM in state.gaps
     assert ROOM_B not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_early_live_boundary_ignores_unrelated_completed_event():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live", 2)]},
+        completed={ROOM: OrderedDict([("$old", False)])},
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "next",
+                "chunk": [
+                    event("$old", 0).source,
+                    event("$unseen", 1).source,
+                    event("$live", 2).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    kwargs = {
+        "user_id": "@me:example.org",
+        "options": RecoveryOptions(1, 10, 10, 10),
+        "fetch_messages": fetch,
+        "dispatch_event": dispatch,
+        "store": None,
+    }
+    await pump_recovery(state, ready_room_id=ROOM, **kwargs)
+    await pump_recovery(state, **kwargs)
+
+    assert seen == ["$live", "$unseen"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_cancelled_early_live_callback_is_reused():
+    value = pending("$live", 0)
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [value]},
+    )
+    calls: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+        calls.append("early")
+        started.set()
+        await release.wait()
+        calls.append("late")
+        return event
+
+    async def unused_fetch(*_args):
+        raise AssertionError("ready-room live dispatch must not fetch")
+
+    kwargs = {
+        "state": state,
+        "ready_room_id": ROOM,
+        "user_id": "@me:example.org",
+        "options": RecoveryOptions(1, 10, 10, 10),
+        "fetch_messages": unused_fetch,
+        "dispatch_event": dispatch,
+        "store": None,
+    }
+    first_pump = asyncio.create_task(pump_recovery(**kwargs))
+    await started.wait()
+    first_pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_pump
+    assert calls == ["early"]
+    assert len(state._active_dispatches) == 1
+
+    second_pump = asyncio.create_task(pump_recovery(**kwargs))
+    release.set()
+    await second_pump
+
+    assert calls == ["early", "late"]
+    assert all(item.kind == "boundary" for item in state.events[(ROOM, 1)])
+    assert not state._active_dispatches
 
 
 @pytest.mark.asyncio
