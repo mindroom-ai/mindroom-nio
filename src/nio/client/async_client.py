@@ -929,7 +929,7 @@ class AsyncClient(Client):
         return frozenset(
             room_id
             for room_id, room in response.rooms.items()
-            if not self._sliding_response_is_stale(room_id, room)
+            if not self._sliding_response_is_stale(room_id)
             and would_plan_real_gap(
                 timeline_events=room.timeline,
                 user_id=self.user_id,
@@ -1176,7 +1176,7 @@ class AsyncClient(Client):
                         ),
                     )
                     for room_id, room in response.rooms.items()
-                    if not self._sliding_response_is_stale(room_id, room)
+                    if not self._sliding_response_is_stale(room_id)
                 ]
                 plans.extend(
                     plan_room_timeline(
@@ -1359,7 +1359,7 @@ class AsyncClient(Client):
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
             own_join = any(is_own_join(event, self.user_id) for event in room.timeline)
-            if self._sliding_response_is_stale(room_id, room):
+            if self._sliding_token_predates_reset(room_id, room):
                 continue
             membership_event_id = self._sliding_membership_event_id(room_id, room)
             window_token = self._sliding_room_prev_batch.get(room_id)
@@ -1384,15 +1384,26 @@ class AsyncClient(Client):
                     )
         return recorded, forgotten
 
-    def _sliding_response_is_stale(self, room_id: str, room: SlidingSyncRoom) -> bool:
+    def _sliding_response_is_stale(self, room_id: str) -> bool:
         """Whether this response's request predates what the room accepted."""
         request_issuance = self._sliding_request_issuance.get()
         floor = self._sliding_room_issuance_floor.get(room_id)
-        if request_issuance is not None and floor is not None:
-            # Responses can finish out of order, so the floor rises with
-            # every reset and every token taken; anything older than it
-            # describes a state this room has already moved past.
-            return request_issuance < floor
+        # Responses can finish out of order, so the floor rises with every
+        # reset and every token taken; anything older than it describes a
+        # state this room has already moved past.
+        return (
+            request_issuance is not None
+            and floor is not None
+            and request_issuance < floor
+        )
+
+    def _sliding_token_predates_reset(
+        self, room_id: str, room: SlidingSyncRoom
+    ) -> bool:
+        """Whether this room's token predates a membership reset."""
+        if self._sliding_response_is_stale(room_id):
+            return True
+        request_issuance = self._sliding_request_issuance.get()
         reset_issuance = self._sliding_reset_rooms.get(room_id)
         if reset_issuance is None:
             return False
