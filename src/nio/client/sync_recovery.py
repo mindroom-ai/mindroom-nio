@@ -151,6 +151,47 @@ def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
     )
 
 
+def _timeline_clears_recovery(
+    timeline_events: Sequence[Event | BadEventType],
+    user_id: str | None,
+    live_event_count: int | None,
+) -> bool:
+    last_join = max(
+        (
+            index
+            for index, event in enumerate(timeline_events)
+            if _is_own_join(event, user_id)
+        ),
+        default=-1,
+    )
+    live_start = (
+        0
+        if live_event_count is None
+        else max(0, len(timeline_events) - live_event_count)
+    )
+    return last_join >= live_start
+
+
+def would_plan_real_gap(
+    *,
+    timeline_events: Sequence[Event | BadEventType],
+    user_id: str | None,
+    membership: str,
+    live_event_count: int | None = None,
+    cursor_token: str | None = None,
+) -> bool:
+    """Return whether these inputs create a targeted recovery gap."""
+    return (
+        membership not in {"leave", "ban", "invite"}
+        and cursor_token is not None
+        and not _timeline_clears_recovery(
+            timeline_events,
+            user_id,
+            live_event_count,
+        )
+    )
+
+
 def should_dispatch_timeline_event(
     state: RecoveryState,
     room_id: str,
@@ -306,22 +347,19 @@ def plan_room_timeline(
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
 
-    last_join = max(
-        (
-            index
-            for index, event in enumerate(timeline_events)
-            if _is_own_join(event, user_id)
-        ),
-        default=-1,
+    clear = _timeline_clears_recovery(
+        timeline_events,
+        user_id,
+        live_event_count,
     )
-    live_start = (
-        0
-        if live_event_count is None
-        else max(0, len(timeline_events) - live_event_count)
-    )
-    clear = last_join >= live_start
     existing = () if clear else state.gaps.get(room_id, ())
-    new_gap = cursor_token is not None and not clear
+    new_gap = would_plan_real_gap(
+        timeline_events=timeline_events,
+        user_id=user_id,
+        membership=membership,
+        live_event_count=live_event_count,
+        cursor_token=cursor_token,
+    )
     generation = existing[-1].generation if existing else 0
     if new_gap or not existing:
         generation += 1

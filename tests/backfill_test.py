@@ -4223,3 +4223,79 @@ class TestRecoveryOutcome:
             assert client.next_batch == "s1"
         else:
             assert client._sliding_room_prev_batch[ROOM_A] == "w1"
+
+    @pytest.mark.parametrize("stage", ["executor", "room"])
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize("scenario", ["no_token", "own_join"])
+    async def test_cancelled_before_plan_ignores_non_gap_transport_hints(
+        self, client, monkeypatch, stage, protocol, scenario
+    ):
+        events = (
+            [member_event("$join", 2, "join")]
+            if scenario == "own_join"
+            else [text_event("$live", 2)]
+        )
+        if protocol == "classic":
+            if scenario == "own_join":
+                client.next_batch = "s1"
+            response = sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        events,
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        else:
+            if scenario == "own_join":
+                baseline = SlidingSyncResponse.from_dict(
+                    {
+                        "pos": "s1",
+                        "rooms": {
+                            ROOM_A: {
+                                "membership": "join",
+                                "timeline": [text_event("$old", 1).source],
+                                "prev_batch": "w1",
+                            }
+                        },
+                    }
+                )
+                assert isinstance(baseline, SlidingSyncResponse)
+                await client.receive_response(baseline)
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s2",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [event.source for event in events],
+                            "limited": True,
+                            "prev_batch": "w2",
+                        }
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        if stage == "executor":
+            await client._sync_response_lock.acquire()
+            started = None
+        else:
+            started = block_next_recovery_plan(client, monkeypatch)
+        task = asyncio.create_task(client.receive_response(response))
+        if started:
+            await asyncio.wait_for(started.wait(), 1)
+        else:
+            await asyncio.sleep(0)
+            assert not task.done()
+
+        task.cancel()
+        if stage == "executor":
+            client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()
