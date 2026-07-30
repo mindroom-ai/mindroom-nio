@@ -5992,6 +5992,26 @@ class TestRecoveryOutcome:
         assert not closed_before_release
         assert callback_saw_closed == [False]
 
+    async def test_sync_response_processing_resumes_after_close(self, client):
+        seen = record_events(client)
+        await client.close()
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$reopened", 1).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        await client.receive_response(response)
+
+        assert seen == ["$reopened"]
+
     async def test_cancelled_queued_duplicate_classic_response_is_not_a_gap(
         self, client
     ):
