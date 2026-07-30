@@ -50,7 +50,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
-from nio.responses import SlidingSyncError
+from nio.responses import RoomMessagesResponse, SlidingSyncError
 from nio.sliding_sync_tokens import SlidingWindowToken
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -3294,8 +3294,21 @@ class TestRoomLocalRecovery:
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         older_started = asyncio.Event()
         release_older = asyncio.Event()
+        reverse_walks: list[tuple[str | None, str | None]] = []
 
         async def send(*args, **_kwargs):
+            if args[0] is RoomMessagesResponse:
+                query = parse_qs(urlparse(args[2]).query)
+                reverse_walks.append(
+                    (
+                        query.get("from", [None])[0],
+                        query.get("to", [None])[0],
+                    )
+                )
+                return RoomMessagesResponse.from_dict(
+                    {"start": "w2", "end": "w1", "chunk": []},
+                    ROOM_A,
+                )
             request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
             if request_pos == "older":
                 older_started.set()
@@ -3303,6 +3316,7 @@ class TestRoomLocalRecovery:
                 response = self._sliding(
                     "older-response",
                     [text_event("$older", 1)],
+                    limited=True,
                     prev_batch="w1",
                 )
             else:
@@ -3322,6 +3336,57 @@ class TestRoomLocalRecovery:
         release_older.set()
         await older
 
+        assert reverse_walks == []
+        assert not client._recovery.gaps
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        await client.close()
+
+    async def test_late_sliding_membership_reset_keeps_newer_gap(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(backfill_limited_timelines=True)
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("seed", [text_event("$seed", 0)], prev_batch="w0")
+        )
+        older_started = asyncio.Event()
+        release_older = asyncio.Event()
+
+        async def send(*args, **_kwargs):
+            if args[0] is RoomMessagesResponse:
+                raise RuntimeError("keep the newer recovery gap open")
+            request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
+            if request_pos == "older":
+                older_started.set()
+                await release_older.wait()
+                response = self._sliding(
+                    "older-response",
+                    [],
+                    membership="leave",
+                )
+            else:
+                response = self._sliding(
+                    "newer-response",
+                    [text_event("$newer", 2)],
+                    limited=True,
+                    prev_batch="w2",
+                )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        older = asyncio.create_task(client.sliding_sync(pos="older"))
+        await older_started.wait()
+        await client.sliding_sync(pos="newer")
+        gap = client._recovery.gaps[ROOM_A][0]
+        release_older.set()
+        await older
+
+        assert client._recovery.gaps[ROOM_A][0] == gap
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
         await client.close()
 
