@@ -385,6 +385,38 @@ class TestRoomLocalRecovery:
         assert client.store.load_sync_token() == "s1"
         await client.close()
 
+    async def test_disabled_does_not_drop_out_of_order_sliding_response(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        older_issuance = client._next_sliding_issuance()
+        newer_issuance = client._next_sliding_issuance()
+
+        issuance = client._sliding_request_issuance.set(newer_issuance)
+        try:
+            await client.receive_response(
+                self._sliding("newer", [text_event("$newer", 2)])
+            )
+        finally:
+            client._sliding_request_issuance.reset(issuance)
+
+        issuance = client._sliding_request_issuance.set(older_issuance)
+        try:
+            await client.receive_response(
+                self._sliding("older", [text_event("$older", 1)])
+            )
+        finally:
+            client._sliding_request_issuance.reset(issuance)
+
+        assert seen == ["$newer", "$older"]
+        await client.close()
+
     async def test_disabled_preserves_upstream_cross_room_order(self, tempdir):
         client = AsyncClient(
             "https://example.org",

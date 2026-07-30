@@ -1137,7 +1137,10 @@ class AsyncClient(Client):
 
     async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
         """Process a sliding sync response into client state."""
-        if not self._accept_sliding_response():
+        if (
+            self.config.backfill_limited_timelines
+            and not self._accept_sliding_response()
+        ):
             return
         if self.config.backfill_limited_timelines:
             recovery_scope = (
