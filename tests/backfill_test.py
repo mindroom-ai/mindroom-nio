@@ -1041,20 +1041,21 @@ class TestRoomLocalRecovery:
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         client.next_batch = "s0"
         seen = record_events(client)
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {
-                    ROOM_A: room_info(
-                        [text_event(f"$held{index}", index) for index in range(3)],
-                        limited=True,
-                        prev_batch="p1",
-                    )
-                },
-            )
+        response = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [text_event(f"$held{index}", index) for index in range(3)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
         )
+        await client.receive_response(response)
         assert seen == ["$held0", "$held1", "$held2"]
         assert not client._recovery.gaps
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         await client.close()
 
     async def test_repeated_end_token_abandons_gap_and_releases_live(
@@ -3386,6 +3387,8 @@ class TestRoomLocalRecovery:
         await client.receive_response(sliding)
         assert seen == ["$prejoin2", "$join", "$after"]
         assert not client._recovery.gaps
+        assert sliding.recovered_room_ids == frozenset()
+        assert sliding.unrecovered_room_ids == frozenset({ROOM_A})
 
     async def test_sliding_initial_historical_join_keeps_classic_gap(
         self, client, aioresponse
@@ -3494,6 +3497,8 @@ class TestRoomLocalRecovery:
         await client.receive_response(reset)
         assert not client._recovery.gaps
         assert seen == ["$seen", "$held"]
+        assert reset.recovered_room_ids == frozenset()
+        assert reset.unrecovered_room_ids == frozenset({ROOM_A})
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
@@ -3565,20 +3570,21 @@ class TestRoomLocalRecovery:
         assert client._recovery.gaps
         assert client.store.load_sync_recovery()[0]
 
-        await client.receive_response(
-            sync_response(
-                "s3",
-                {},
-                invited=({ROOM_A: InviteInfo([])} if membership == "invite" else None),
-                left=(
-                    {ROOM_A: room_info([], limited=False, prev_batch=None)}
-                    if membership == "leave"
-                    else None
-                ),
-            )
+        reset = sync_response(
+            "s3",
+            {},
+            invited=({ROOM_A: InviteInfo([])} if membership == "invite" else None),
+            left=(
+                {ROOM_A: room_info([], limited=False, prev_batch=None)}
+                if membership == "leave"
+                else None
+            ),
         )
+        await client.receive_response(reset)
         assert not client._recovery.gaps
         assert seen == ["$seen", "$held"]
+        assert reset.recovered_room_ids == frozenset()
+        assert reset.unrecovered_room_ids == frozenset({ROOM_A})
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]

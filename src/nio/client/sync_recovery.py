@@ -257,6 +257,8 @@ def _plan_room_reset(
     state: RecoveryState,
     room_id: str,
     additional_events: Iterable[PendingTimelineEvent] = (),
+    *,
+    unrecovered: bool = False,
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -266,14 +268,23 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
+    unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
     if not live:
-        return RecoveryPlan(clear_rooms=clear)
+        return RecoveryPlan(
+            clear_rooms=clear,
+            unrecovered_room_ids=unrecovered_room_ids,
+        )
     generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
         replace(event, generation=generation, sequence=index)
         for index, event in enumerate(live)
     )
-    return RecoveryPlan(clear, (RecoveryGap(room_id, generation, "", None),), events)
+    return RecoveryPlan(
+        clear,
+        (RecoveryGap(room_id, generation, "", None),),
+        events,
+        unrecovered_room_ids=unrecovered_room_ids,
+    )
 
 
 def plan_room_timeline(
@@ -360,7 +371,12 @@ def plan_room_timeline(
     )
     if (new_gap or existing) and held_count + len(events) > state.max_held_events:
         logger.error("Abandoning recovery with too many held events in %s", room_id)
-        return _plan_room_reset(state, room_id, events)
+        return _plan_room_reset(
+            state,
+            room_id,
+            events,
+            unrecovered=new_gap or any(gap.target_token for gap in existing),
+        )
     gap = (
         RecoveryGap(
             room_id,
@@ -431,7 +447,10 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.outcomes[room_id] = False
 
     for room_id in plan.clear_rooms:
-        for gap in state.gaps.pop(room_id, ()):
+        gaps = state.gaps.pop(room_id, ())
+        if any(gap.target_token for gap in gaps):
+            state.outcomes[room_id] = False
+        for gap in gaps:
             for event in state.events.pop((room_id, gap.generation), ()):
                 if event.was_completed and not event.event_id.startswith("~"):
                     record_completed_timeline_event(
