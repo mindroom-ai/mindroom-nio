@@ -1002,6 +1002,29 @@ async def test_close_drains_cleared_dispatch_that_suppresses_cancellation():
 
 
 @pytest.mark.asyncio
+async def test_close_surfaces_deferred_error_after_dispatch_drain():
+    state = RecoveryState()
+    state._deferred_dispatch_errors.append(RuntimeError("late callback failure"))
+    finished = asyncio.Event()
+
+    async def dispatch():
+        await asyncio.sleep(0)
+        finished.set()
+
+    key = (ROOM, "$live", "timeline")
+    state._active_dispatches[key] = asyncio.create_task(dispatch())
+    client = AsyncClient("https://example.org")
+    client._recovery = state
+
+    with pytest.raises(RuntimeError, match="late callback failure"):
+        await client.close()
+
+    assert finished.is_set()
+    assert not state._active_dispatches
+    assert not state._deferred_dispatch_errors
+
+
+@pytest.mark.asyncio
 async def test_close_drains_dispatch_after_repeated_cancellation():
     value = pending("$live", 0)
     state = RecoveryState(

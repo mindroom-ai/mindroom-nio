@@ -358,6 +358,8 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
             _report_orphaned_dispatch(key, task)
     if finish_error:
         raise finish_error
+    if state._deferred_dispatch_errors:
+        raise state._deferred_dispatch_errors.pop(0)
 
 
 def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:

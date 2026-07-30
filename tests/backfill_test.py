@@ -3446,6 +3446,59 @@ class TestRoomLocalRecovery:
         assert client._sliding_sync_to_device_since == "newer-to-device"
         await client.close()
 
+    async def test_concurrent_fresh_sliding_requests_keep_distinct_recovery_scopes(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+        release_second = asyncio.Event()
+        request_count = 0
+        recovery_scopes: list[str] = []
+        original_plan = async_client_module.plan_room_timeline
+
+        def record_plan(*args, **kwargs):
+            recovery_scopes.append(kwargs["batch_id"].split(":")[1])
+            return original_plan(*args, **kwargs)
+
+        async def send(*_args, **_kwargs):
+            nonlocal request_count
+            request_count += 1
+            if request_count == 1:
+                first_started.set()
+                await release_first.wait()
+                response = self._sliding("first", [text_event("$first", 1)])
+            else:
+                second_started.set()
+                await release_second.wait()
+                response = self._sliding("second", [text_event("$second", 2)])
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(async_client_module, "plan_room_timeline", record_plan)
+        monkeypatch.setattr(client, "_send", send)
+
+        first = asyncio.create_task(client.sliding_sync())
+        await first_started.wait()
+        second = asyncio.create_task(client.sliding_sync())
+        await second_started.wait()
+        release_first.set()
+        await first
+        release_second.set()
+        await second
+
+        assert len(recovery_scopes) == 2
+        assert len(set(recovery_scopes)) == 2
+        await client.close()
+
     async def test_late_sliding_membership_reset_keeps_newer_gap(
         self, tempdir, monkeypatch
     ):
@@ -3719,6 +3772,94 @@ class TestRoomLocalRecovery:
         expected = {ROOM_A: window_token("w1")} if restored else {}
         assert client._sliding_room_prev_batch == expected
         assert client.store.load_sliding_window_tokens() == expected
+        await client.close()
+
+    async def test_rejected_leave_does_not_persist_when_recovery_store_is_disabled(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+            backfill_persist_recovery=False,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+
+        class Transport:
+            status = 403
+
+        response = RoomLeaveError.from_dict(
+            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        )
+        response.transport_response = Transport()
+
+        async def send(*_args, **_kwargs):
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+        await client.room_leave(ROOM_A)
+
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_rejected_leave_does_not_replace_newer_accepted_token(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        leave_started = asyncio.Event()
+        release_leave = asyncio.Event()
+
+        class Transport:
+            status = 403
+
+        response = RoomLeaveError.from_dict(
+            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        )
+        response.transport_response = Transport()
+
+        async def send(*_args, **_kwargs):
+            leave_started.set()
+            await release_leave.wait()
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+        leave = asyncio.create_task(client.room_leave(ROOM_A))
+        await leave_started.wait()
+
+        issuance = client._sliding_request_issuance.set(client._next_sliding_issuance())
+        try:
+            await client.receive_response(
+                self._sliding(
+                    "s2",
+                    [text_event("$newer", 2)],
+                    prev_batch="w2",
+                    initial=True,
+                )
+            )
+        finally:
+            client._sliding_request_issuance.reset(issuance)
+
+        release_leave.set()
+        await leave
+
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w2")}
         await client.close()
 
     async def test_restart_snapshot_still_walks_from_the_stored_token(

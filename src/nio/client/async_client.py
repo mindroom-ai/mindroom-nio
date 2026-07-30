@@ -574,6 +574,9 @@ class AsyncClient(Client):
         self._sliding_request_issuance: ContextVar[int | None] = ContextVar(
             f"nio_sliding_request_issuance_{id(self)}", default=None
         )
+        self._sliding_request_recovery_scope: ContextVar[str | None] = ContextVar(
+            f"nio_sliding_request_recovery_scope_{id(self)}", default=None
+        )
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
@@ -1137,6 +1140,11 @@ class AsyncClient(Client):
         if not self._accept_sliding_response():
             return
         if self.config.backfill_limited_timelines:
+            recovery_scope = (
+                self._sliding_request_recovery_scope.get()
+                or self._sliding_sync_recovery_scope
+            )
+            batch_id = f"sliding:{recovery_scope}:{response.pos}"
             planned_room_ids = set(response.rooms)
             planned_room_ids.update(
                 room_id
@@ -1165,10 +1173,7 @@ class AsyncClient(Client):
                         ),
                         cursor_token=self._sliding_recovery_cursor(room_id, room),
                         target_token=room.prev_batch or "",
-                        batch_id=(
-                            f"sliding:{self._sliding_sync_recovery_scope}:"
-                            f"{response.pos}"
-                        ),
+                        batch_id=batch_id,
                         account_data_events=(
                             tuple(
                                 self._pending_sliding_room_account_data.get(
@@ -1188,10 +1193,7 @@ class AsyncClient(Client):
                         timeline_events=(),
                         user_id=self.user_id,
                         membership="join",
-                        batch_id=(
-                            f"sliding:{self._sliding_sync_recovery_scope}:"
-                            f"{response.pos}"
-                        ),
+                        batch_id=batch_id,
                         account_data_events=(
                             tuple(
                                 self._pending_sliding_room_account_data.get(
@@ -1478,14 +1480,24 @@ class AsyncClient(Client):
         self._reset_sliding_room(room_id)
 
     def _restore_sliding_window_token(
-        self, room_id: str, token: SlidingWindowToken
-    ) -> None:
+        self,
+        room_id: str,
+        token: SlidingWindowToken,
+        reset_issuance: int,
+    ) -> bool:
         """Restore a baseline after the server definitively rejected a leave."""
-        if self.store:
-            self.store.save_sliding_window_tokens({room_id: token})
+        if (
+            self._sliding_reset_rooms.get(room_id) != reset_issuance
+            or room_id in self._sliding_room_prev_batch
+        ):
+            return False
+        store = self._recovery_store
+        if store:
+            store.save_sliding_window_tokens({room_id: token})
         self._sliding_room_prev_batch[room_id] = token
         self._sliding_verified_membership_event_ids[room_id] = token.membership_event_id
         self._sliding_reset_rooms.pop(room_id, None)
+        return True
 
     @staticmethod
     def _room_leave_was_definitively_rejected(response: RoomLeaveError) -> bool:
@@ -2462,6 +2474,7 @@ class AsyncClient(Client):
         self._raise_on_sync_reentry()
         if pos is None:
             self._sliding_sync_recovery_scope = uuid4().hex
+        recovery_scope = self._sliding_sync_recovery_scope
         presence = set_presence or self._presence
         method, path, data = Api.sliding_sync(
             self.access_token,
@@ -2485,6 +2498,7 @@ class AsyncClient(Client):
         issuance_token = self._sliding_request_issuance.set(
             self._next_sliding_issuance()
         )
+        recovery_scope_token = self._sliding_request_recovery_scope.set(recovery_scope)
         try:
             response = await self._send(
                 SlidingSyncResponse,
@@ -2495,6 +2509,7 @@ class AsyncClient(Client):
                 sliding_request=True,
             )
         finally:
+            self._sliding_request_recovery_scope.reset(recovery_scope_token)
             self._sliding_request_issuance.reset(issuance_token)
 
         return response
@@ -4347,13 +4362,18 @@ class AsyncClient(Client):
         method, path = Api.room_leave(self.access_token, room_id)
         window_token = self._sliding_room_prev_batch.get(room_id)
         self._forget_sliding_window_token(room_id)
+        reset_issuance = self._sliding_reset_rooms[room_id]
         response = await self._send(RoomLeaveResponse, method, path)
         if (
             window_token is not None
             and isinstance(response, RoomLeaveError)
             and self._room_leave_was_definitively_rejected(response)
         ):
-            self._restore_sliding_window_token(room_id, window_token)
+            self._restore_sliding_window_token(
+                room_id,
+                window_token,
+                reset_issuance,
+            )
         return response
 
     @logged_in_async
