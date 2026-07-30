@@ -293,26 +293,29 @@ async def _run_dispatch(
     target = _pending_dispatch(state, key)
     if target and state._active_dispatches.get(key) is task:
         current_gap, current_pending = target
-        was_encrypted = (
-            error.was_encrypted
-            if error
-            else (
-                isinstance(delivered, MegolmEvent)
-                if delivered
-                else current_pending.was_encrypted
+        if error and not current_pending.is_live:
+            state.outcomes[current_gap.room_id] = False
+        else:
+            was_encrypted = (
+                error.was_encrypted
+                if error
+                else (
+                    isinstance(delivered, MegolmEvent)
+                    if delivered
+                    else current_pending.was_encrypted
+                )
             )
-        )
-        try:
-            _finish(
-                state,
-                store,
-                current_gap,
-                current_pending,
-                was_encrypted,
-                retain_boundary=retain_boundary and error is None,
-            )
-        except Exception as finish_error:
-            raise _DispatchFinishError(finish_error) from finish_error
+            try:
+                _finish(
+                    state,
+                    store,
+                    current_gap,
+                    current_pending,
+                    was_encrypted,
+                    retain_boundary=retain_boundary and error is None,
+                )
+            except Exception as finish_error:
+                raise _DispatchFinishError(finish_error) from finish_error
 
     if error:
         if task is None or not state._dispatch_waiters.get(task):
@@ -915,7 +918,14 @@ async def _collect_slice(
         if event_room == gap.room_id and generation > 0
         for event in queued
     ]
-    pending_ids = {event.event_id for event in pending}
+    # A boundary row's synthetic event ID identifies the durable marker, while
+    # source_json is the already-dispatched live event anchoring the gap. Use
+    # that anchor for overlap deduplication even after the completed-ID cache
+    # evicts it; skipping the anchor must not stop the rest of the page.
+    pending_ids = {
+        event.source_json if event.kind == "boundary" else event.event_id
+        for event in pending
+    }
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:

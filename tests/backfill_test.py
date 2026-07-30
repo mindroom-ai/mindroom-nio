@@ -2796,7 +2796,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$held", "$gap", "$gap2"]
         assert not client._recovery.gaps
 
-    async def test_recovery_attempts_all_callbacks_once(self, client, aioresponse):
+    async def test_recovery_stops_callback_fanout_on_failure(self, client, aioresponse):
         calls: list[str] = []
 
         async def first(_room, event):
@@ -2822,20 +2822,55 @@ class TestRoomLocalRecovery:
                 "p1",
             ),
         )
-        await client.receive_response(
-            sync_response(
-                "s2",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$held", 3)], limited=True, prev_batch="p1"
-                    )
-                },
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.receive_response(
+                sync_response(
+                    "s2",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 3)], limited=True, prev_batch="p1"
+                        )
+                    },
+                )
             )
-        )
-        assert calls == ["first", "failing", "last"]
-        assert not client._recovery.gaps
+        assert calls == ["first", "failing"]
+        assert ROOM_A in client._recovery.gaps
 
-    async def test_callback_fanout_failure_is_terminal_across_restart(
+    async def test_recovered_callback_failure_keeps_gap_unrecovered(
+        self, client, aioresponse
+    ):
+        async def fail(_room, event):
+            if event.event_id == "$gap":
+                raise RuntimeError("durable callback failed")
+
+        client.add_event_callback(fail, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 2), text_event("$held", 3)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="durable callback failed"):
+            await client.receive_response(response)
+
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        assert "$gap" in {
+            event.event_id for event in client._recovery.events[(ROOM_A, 1)]
+        }
+
+    async def test_callback_fanout_failure_retries_across_restart(
         self, tempdir, aioresponse
     ):
         config = AsyncClientConfig(
@@ -2873,25 +2908,26 @@ class TestRoomLocalRecovery:
                 "p1",
             ),
         )
-        await first.receive_response(
-            sync_response(
-                "s2",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$held", 3)], limited=True, prev_batch="p1"
-                    )
-                },
-            )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
         )
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await first.receive_response(response)
         assert calls == [
             "before:$held",
             "fail:$held",
             "after:$held",
             "before:$gap",
             "fail:$gap",
-            "after:$gap",
         ]
-        assert not first._recovery.gaps
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        assert ROOM_A in first._recovery.gaps
         await first.close()
         first.store.database.close()
 
@@ -2903,15 +2939,17 @@ class TestRoomLocalRecovery:
             config=config,
         )
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert ROOM_A in restarted._recovery.gaps
+        replayed: list[str] = []
+
+        async def replay(_room, event):
+            replayed.append(event.event_id)
+
+        restarted.add_event_callback(replay, RoomMessageText)
+        await restarted.receive_response(sync_response("s2", {}))
+
+        assert replayed == ["$gap"]
         assert not restarted._recovery.gaps
-        assert calls == [
-            "before:$held",
-            "fail:$held",
-            "after:$held",
-            "before:$gap",
-            "fail:$gap",
-            "after:$gap",
-        ]
         await restarted.close()
 
     async def test_classic_recovery_deduplicates_sliding_replay_after_restart(
@@ -3648,6 +3686,54 @@ class TestRoomLocalRecovery:
         assert len(client._sliding_room_issuance_floor) == 1
         await client.close()
 
+    async def test_superseded_connection_rejects_its_in_flight_continuation(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        fresh_count = 0
+        seen = record_events(client)
+
+        async def send(*args, **_kwargs):
+            nonlocal fresh_count
+            request_pos = parse_qs(urlparse(args[2]).query).get("pos", [None])[0]
+            if request_pos is not None:
+                old_started.set()
+                await release_old.wait()
+                label, token = "old", "w-old"
+            else:
+                fresh_count += 1
+                label = "seed" if fresh_count == 1 else "new"
+                token = "w1" if fresh_count == 1 else "w2"
+            response = self._sliding(
+                f"{label}-pos",
+                [text_event(f"${label}", client._sliding_issuance_clock)],
+                prev_batch=token,
+            )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sliding_sync(conn_id="main")
+        old = asyncio.create_task(client.sliding_sync(conn_id="main", pos="seed-pos"))
+        await old_started.wait()
+        await client.sliding_sync(conn_id="main")
+        release_old.set()
+        await old
+
+        assert seen == ["$seed", "$new"]
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        await client.close()
+
     async def test_late_sliding_membership_reset_keeps_newer_gap(
         self, tempdir, monkeypatch
     ):
@@ -3933,6 +4019,108 @@ class TestRoomLocalRecovery:
         assert client.store.load_sliding_window_tokens() == expected
         await client.close()
 
+    async def test_successful_leave_wins_over_crossing_sliding_response(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        leave_started = asyncio.Event()
+        release_leave = asyncio.Event()
+        sliding_sent = asyncio.Event()
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomLeaveResponse:
+                leave_started.set()
+                await release_leave.wait()
+                return RoomLeaveResponse.from_dict({})
+            response = self._sliding(
+                "s2",
+                [text_event("$crossing", 2)],
+                prev_batch="w2",
+            )
+            sliding_sent.set()
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        leave = asyncio.create_task(client.room_leave(ROOM_A))
+        await leave_started.wait()
+        sliding = asyncio.create_task(client.sliding_sync(pos="crossing"))
+        await sliding_sent.wait()
+        await asyncio.sleep(0)
+        release_leave.set()
+        await asyncio.gather(leave, sliding)
+
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+
+    async def test_rejected_leave_rolls_back_reset_floor_for_in_flight_response(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        sliding_started = asyncio.Event()
+        release_sliding = asyncio.Event()
+
+        class Transport:
+            status = 403
+
+        rejected = RoomLeaveError.from_dict(
+            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        )
+        rejected.transport_response = Transport()
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomLeaveResponse:
+                return rejected
+            sliding_started.set()
+            await release_sliding.wait()
+            response = self._sliding(
+                "s2",
+                [text_event("$valid", 2)],
+                prev_batch="w2",
+            )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        sliding = asyncio.create_task(client.sliding_sync(pos="in-flight"))
+        await sliding_started.wait()
+        await client.room_leave(ROOM_A)
+        release_sliding.set()
+        await sliding
+
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w2")}
+        await client.close()
+
     async def test_concurrent_rejected_leaves_preserve_baseline(
         self, tempdir, monkeypatch
     ):
@@ -4055,19 +4243,23 @@ class TestRoomLocalRecovery:
 
         issuance = client._sliding_request_issuance.set(client._next_sliding_issuance())
         try:
-            await client.receive_response(
-                self._sliding(
-                    "s2",
-                    [text_event("$newer", 2)],
-                    prev_batch="w2",
-                    initial=True,
+            sliding = asyncio.create_task(
+                client.receive_response(
+                    self._sliding(
+                        "s2",
+                        [text_event("$newer", 2)],
+                        prev_batch="w2",
+                        initial=True,
+                    )
                 )
             )
         finally:
             client._sliding_request_issuance.reset(issuance)
 
+        await asyncio.sleep(0)
+        assert not sliding.done()
         release_leave.set()
-        await leave
+        await asyncio.gather(leave, sliding)
 
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
         assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w2")}
@@ -5652,6 +5844,72 @@ class TestRecoveryOutcome:
             await task
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset()
+
+    async def test_close_waits_for_active_sync_before_closing_session(
+        self, client, monkeypatch
+    ):
+        planning_started = asyncio.Event()
+        release_planning = asyncio.Event()
+        callback_saw_closed: list[bool] = []
+        original_room_state = client._recovery_room_state
+
+        class Session:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class BlockBeforePlan:
+            def __init__(self, room_ids):
+                self.room_ids = room_ids
+                self.inner = None
+
+            async def __aenter__(self):
+                planning_started.set()
+                await release_planning.wait()
+                self.inner = original_room_state(self.room_ids)
+                return await self.inner.__aenter__()
+
+            async def __aexit__(self, *args):
+                assert self.inner is not None
+                return await self.inner.__aexit__(*args)
+
+        session = Session()
+        client.client_session = session
+        monkeypatch.setattr(
+            client,
+            "_recovery_room_state",
+            lambda room_ids: BlockBeforePlan(room_ids),
+        )
+
+        async def callback(_room, _event):
+            callback_saw_closed.append(session.closed)
+
+        client.add_event_callback(callback, RoomMessageText)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$live", 1).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        sync = asyncio.create_task(client.receive_response(response))
+        await planning_started.wait()
+
+        close = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+        closed_before_release = session.closed
+        release_planning.set()
+        await sync
+        await close
+
+        assert not closed_before_release
+        assert callback_saw_closed == [False]
 
     async def test_cancelled_queued_duplicate_classic_response_is_not_a_gap(
         self, client

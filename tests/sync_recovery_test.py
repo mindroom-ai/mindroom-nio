@@ -1271,6 +1271,58 @@ async def test_live_boundary_dedupes_without_hiding_page_suffix():
 
 
 @pytest.mark.asyncio
+async def test_boundary_anchor_dedupes_after_completed_cache_eviction():
+    boundary = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "~boundary:1",
+        "$live-boundary",
+        True,
+        False,
+        kind="boundary",
+    )
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [boundary]},
+        completed={
+            ROOM: OrderedDict((f"$newer-{index}", False) for index in range(512))
+        },
+    )
+    seen: list[str] = []
+
+    async def fetch(_room_id, _start, *_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "target",
+                "chunk": [
+                    event("$gap-before", 1).source,
+                    event("$live-boundary", 2).source,
+                    event("$gap-suffix", 3).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert seen == ["$gap-before", "$gap-suffix"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
 async def test_room_cap_abandons_existing_unverified_prefix():
     recovered = PendingTimelineEvent.from_event(
         ROOM, 1, 0, event("$recovered", 1), False
