@@ -947,13 +947,16 @@ class AsyncClient(Client):
             await self._pump_sync_recovery()
             return
 
-        previous_batch = self.next_batch
-        self.next_batch = response.next_batch
-
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
-            async with self._recovery_room_state(
-                set(response.rooms.join) | reset_rooms
+            limited_room_ids = frozenset(
+                room_id
+                for room_id, room_info in response.rooms.join.items()
+                if room_info.timeline.limited
+            )
+            async with self._recovery_response_room_state(
+                set(response.rooms.join) | reset_rooms,
+                limited_room_ids,
             ):
                 plan = plan_sync_response(
                     self._recovery,
@@ -963,25 +966,24 @@ class AsyncClient(Client):
                     joined_rooms=response.rooms.join,
                     reset_room_ids=reset_rooms,
                 )
-                try:
-                    persist_response_plan(
-                        self._recovery,
-                        (self.store if self.config.store_sync_tokens else None),
-                        token=response.next_batch,
-                        plan=plan,
-                    )
-                except BaseException:
-                    self.next_batch = previous_batch
-                    raise
+                persist_response_plan(
+                    self._recovery,
+                    (self.store if self.config.store_sync_tokens else None),
+                    token=response.next_batch,
+                    plan=plan,
+                )
+            self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
                 self.loaded_sync_token = response.next_batch
             for room_id, join_info in response.rooms.join.items():
                 self._handle_joined_state(room_id, join_info, self.encrypted_rooms)
             if self.store:
                 self.store.save_encrypted_rooms(self.encrypted_rooms)
-        elif self.config.store_sync_tokens and self.store:
-            self.store.save_sync_token(response.next_batch)
-            self.loaded_sync_token = response.next_batch
+        else:
+            self.next_batch = response.next_batch
+            if self.config.store_sync_tokens and self.store:
+                self.store.save_sync_token(response.next_batch)
+                self.loaded_sync_token = response.next_batch
 
         await self._handle_to_device(response)
 
@@ -1015,7 +1017,15 @@ class AsyncClient(Client):
                 for room_id in self._pending_sliding_room_account_data
                 if room_id in self.rooms
             )
-            async with self._recovery_room_state(planned_room_ids):
+            new_gap_room_ids = frozenset(
+                room_id
+                for room_id, room in response.rooms.items()
+                if self._sliding_recovery_cursor(room_id, room) is not None
+            )
+            async with self._recovery_response_room_state(
+                planned_room_ids,
+                new_gap_room_ids,
+            ):
                 plans = [
                     plan_room_timeline(
                         self._recovery,
@@ -1552,6 +1562,20 @@ class AsyncClient(Client):
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _recovery_response_room_state(
+        self,
+        room_ids: Iterable[str],
+        unrecovered_room_ids: Iterable[str],
+    ) -> AsyncIterator[None]:
+        try:
+            async with self._recovery_room_state(room_ids):
+                yield
+        except BaseException:
+            for room_id in unrecovered_room_ids:
+                self._recovery.outcomes[room_id] = False
+            raise
 
     @asynccontextmanager
     async def _recovery_room_state(

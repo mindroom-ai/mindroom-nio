@@ -259,6 +259,29 @@ def record_events(client: AsyncClient) -> list[str]:
     return seen
 
 
+def block_next_recovery_plan(client: AsyncClient, monkeypatch) -> asyncio.Event:
+    started = asyncio.Event()
+    block_once = True
+
+    class BlockBeforePlan:
+        async def __aenter__(self):
+            nonlocal block_once
+            if block_once:
+                block_once = False
+                started.set()
+                await asyncio.Event().wait()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        client,
+        "_recovery_room_state",
+        lambda _room_ids: BlockBeforePlan(),
+    )
+    return started
+
+
 @pytest_asyncio.fixture
 async def client(tempdir):
     value = AsyncClient(
@@ -4049,5 +4072,89 @@ class TestRecoveryOutcome:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_cancelled_before_plan_keeps_response_retryable(
+        self, client, aioresponse, monkeypatch
+    ):
+        started = block_next_recovery_plan(client, monkeypatch)
+        client.next_batch = "s1"
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.next_batch == "s1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+        aioresponse.get(MESSAGES_URL, status=500)
+        await client.receive_response(response)
+
+        assert client.next_batch == "s2"
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_cancelled_sliding_before_plan_reports_unrecovered(
+        self, client, aioresponse, monkeypatch
+    ):
+        baseline = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$old", 1).source],
+                        "prev_batch": "w1",
+                    }
+                },
+            }
+        )
+        assert isinstance(baseline, SlidingSyncResponse)
+        await client.receive_response(baseline)
+
+        started = block_next_recovery_plan(client, monkeypatch)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$live", 2).source],
+                        "limited": True,
+                        "prev_batch": "w2",
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+        aioresponse.get(MESSAGES_URL, status=500)
+        await client.receive_response(response)
+
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "w1"
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset({ROOM_A})
