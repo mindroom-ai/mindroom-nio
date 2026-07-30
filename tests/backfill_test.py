@@ -3229,9 +3229,7 @@ class TestRoomLocalRecovery:
             raise asyncio.CancelledError
 
         monkeypatch.setattr(client, "_send", send)
-        monkeypatch.setattr(
-            async_client_module, "plan_room_timeline", cancel_planning
-        )
+        monkeypatch.setattr(async_client_module, "plan_room_timeline", cancel_planning)
 
         with pytest.raises(asyncio.CancelledError):
             await client.sliding_sync()
