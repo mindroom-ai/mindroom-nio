@@ -2055,6 +2055,15 @@ class RoomContextResponse(Response):
 
 @dataclass
 class SyncResponse(Response):
+    """A response for a /sync request.
+
+    ``recovered_room_ids`` contains rooms whose limited-timeline gaps nio
+    closed while handling this response after dispatching every recovered
+    event. ``unrecovered_room_ids`` contains rooms with a gap still open or
+    abandoned. Both fields are populated only when limited-timeline backfill
+    is enabled; ``timeline.limited`` remains the unmodified server value.
+    """
+
     next_batch: str = field()
     rooms: Rooms = field()
     device_key_count: DeviceOneTimeKeyCount = field()
@@ -2062,6 +2071,8 @@ class SyncResponse(Response):
     to_device_events: list[ToDeviceEvent] = field()
     presence_events: list[PresenceEvent] = field()
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
+    recovered_room_ids: frozenset[str] = frozenset()
+    unrecovered_room_ids: frozenset[str] = frozenset()
 
     def __str__(self) -> str:
         result = []
@@ -2305,6 +2316,14 @@ class SlidingSyncResponse(Response):
         room_account_data (Dict[str, List[AccountDataEvent]]): Per-room
             account data events from the ``account_data`` extension, keyed
             by room id.
+        recovered_room_ids (FrozenSet[str]): Rooms whose limited-window gaps
+            nio closed while handling this response after dispatching every
+            recovered event.
+        unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window gap
+            still open or abandoned.
+
+    Recovery outcomes are populated only when limited-timeline backfill is
+    enabled. The room's ``limited`` field remains the unmodified server value.
     """
 
     pos: str = field()
@@ -2319,6 +2338,8 @@ class SlidingSyncResponse(Response):
     device_list: DeviceList = field(default_factory=lambda: DeviceList([], []))
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
     room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
+    recovered_room_ids: frozenset[str] = frozenset()
+    unrecovered_room_ids: frozenset[str] = frozenset()
 
     @staticmethod
     def _parse_list(

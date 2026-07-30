@@ -3917,3 +3917,90 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$prejoin", "$join", "$after"]
         assert not client._recovery.gaps
+
+
+@pytest.mark.asyncio
+class TestRecoveryOutcome:
+    async def test_sync_response_types_default_to_no_recovery(self, client):
+        response = sync_response("s1", {})
+        sliding = SlidingSyncResponse.from_dict({"pos": "p1"})
+        assert isinstance(sliding, SlidingSyncResponse)
+
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()
+        assert sliding.recovered_room_ids == frozenset()
+        assert sliding.unrecovered_room_ids == frozenset()
+
+    async def test_restored_token_first_sync_reports_recovered_room(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        seed = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await seed.receive_response(LoginResponse.from_dict(LOGIN))
+        await seed.receive_response(sync_response("s1", {}))
+        await seed.close()
+        seed.store.database.close()
+
+        restored = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restored.receive_response(LoginResponse.from_dict(LOGIN))
+        assert restored.loaded_sync_token == "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 1), text_event("$live", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        await restored.receive_response(response)
+
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert response.rooms.join[ROOM_A].timeline.limited is True
+        await restored.close()
+
+    async def test_restored_token_incomplete_recovery_reports_unrecovered(
+        self, client, aioresponse
+    ):
+        client.loaded_sync_token = "s1"
+        aioresponse.get(MESSAGES_URL, status=500)
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        await client.receive_response(response)
+
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})

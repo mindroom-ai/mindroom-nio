@@ -261,6 +261,7 @@ from .sync_recovery import (
     pump_recovery,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
+    take_recovery_outcomes,
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
@@ -839,6 +840,15 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def _publish_recovery_outcome(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> None:
+        if not self.config.backfill_limited_timelines:
+            return
+        recovered, unrecovered = take_recovery_outcomes(self._recovery)
+        response.recovered_room_ids = recovered
+        response.unrecovered_room_ids = unrecovered
+
     async def _recovery_room_messages(
         self,
         room_id: str,
@@ -935,6 +945,7 @@ class AsyncClient(Client):
 
         if self.next_batch == response.next_batch:
             await self._pump_sync_recovery()
+            self._publish_recovery_outcome(response)
             return
 
         previous_batch = self.next_batch
@@ -985,6 +996,7 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+        self._publish_recovery_outcome(response)
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -1104,6 +1116,7 @@ class AsyncClient(Client):
             self._handle_olm_events(response)
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+        self._publish_recovery_outcome(response)
 
     def _sliding_seed_lists(
         self, lists: dict[str, Any] | None
