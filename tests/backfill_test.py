@@ -275,6 +275,7 @@ def record_events(client: AsyncClient) -> list[str]:
 def block_next_recovery_plan(client: AsyncClient, monkeypatch) -> asyncio.Event:
     started = asyncio.Event()
     block_once = True
+    original = client._recovery_room_state
 
     class BlockBeforePlan:
         async def __aenter__(self):
@@ -290,7 +291,7 @@ def block_next_recovery_plan(client: AsyncClient, monkeypatch) -> asyncio.Event:
     monkeypatch.setattr(
         client,
         "_recovery_room_state",
-        lambda _room_ids: BlockBeforePlan(),
+        lambda room_ids: BlockBeforePlan() if block_once else original(room_ids),
     )
     return started
 
@@ -3495,23 +3496,56 @@ class TestRoomLocalRecovery:
         release_second = asyncio.Event()
         request_count = 0
         recovery_scopes: list[str] = []
+        seen = record_events(client)
+        global_values: list[str] = []
+        to_device_values: list[str] = []
         original_plan = async_client_module.plan_room_timeline
 
         def record_plan(*args, **kwargs):
             recovery_scopes.append(kwargs["batch_id"].split(":")[1])
             return original_plan(*args, **kwargs)
 
+        async def global_callback(event):
+            global_values.append(event.content["value"])
+
+        async def to_device_callback(event):
+            to_device_values.append(event.source["content"]["body"])
+
+        client.add_global_account_data_callback(
+            global_callback, UnknownAccountDataEvent
+        )
+        client.add_to_device_callback(to_device_callback, UnknownToDeviceEvent)
+
         async def send(*_args, **_kwargs):
             nonlocal request_count
             request_count += 1
             if request_count == 1:
+                label = "first"
                 first_started.set()
                 await release_first.wait()
-                response = self._sliding("first", [text_event("$first", 1)])
             else:
+                label = "second"
                 second_started.set()
                 await release_second.wait()
-                response = self._sliding("second", [text_event("$second", 2)])
+            response = self._sliding(label, [text_event(f"${label}", request_count)])
+            response.to_device_next_batch = f"{label}-to-device"
+            response.to_device_events = [
+                UnknownToDeviceEvent.from_dict(
+                    {
+                        "content": {"body": label},
+                        "sender": "@sender:example.org",
+                        "type": "org.example.test",
+                    }
+                )
+            ]
+            response.account_data_events = [
+                UnknownAccountDataEvent.from_dict(
+                    {
+                        "content": {"value": label},
+                        "type": "org.example.settings",
+                    }
+                )
+            ]
             await client.receive_response(response)
             return response
 
@@ -3522,13 +3556,17 @@ class TestRoomLocalRecovery:
         await first_started.wait()
         second = asyncio.create_task(client.sliding_sync())
         await second_started.wait()
-        release_first.set()
-        await first
         release_second.set()
         await second
+        release_first.set()
+        await first
 
         assert len(recovery_scopes) == 2
         assert len(set(recovery_scopes)) == 2
+        assert seen == ["$second", "$first"]
+        assert global_values == ["second", "first"]
+        assert to_device_values == ["second", "first"]
+        assert client._sliding_sync_to_device_since == "first-to-device"
         await client.close()
 
     async def test_late_sliding_membership_reset_keeps_newer_gap(
@@ -3804,6 +3842,58 @@ class TestRoomLocalRecovery:
         expected = {ROOM_A: window_token("w1")} if restored else {}
         assert client._sliding_room_prev_batch == expected
         assert client.store.load_sliding_window_tokens() == expected
+        await client.close()
+
+    async def test_concurrent_rejected_leaves_preserve_baseline(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        class Transport:
+            status = 403
+
+        response = RoomLeaveError.from_dict(
+            {"errcode": "M_FORBIDDEN", "error": "leave rejected"}
+        )
+        response.transport_response = Transport()
+
+        async def send(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+        first = asyncio.create_task(client.room_leave(ROOM_A))
+        await first_started.wait()
+        second = asyncio.create_task(client.room_leave(ROOM_A))
+        await asyncio.sleep(0)
+        second_started_before_first_finished = second_started.is_set()
+        release_first.set()
+        await asyncio.gather(first, second)
+
+        assert not second_started_before_first_finished
+        assert calls == 2
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await client.close()
 
     async def test_rejected_leave_does_not_persist_when_recovery_store_is_disabled(
