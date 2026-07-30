@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from aioresponses import CallbackResult
 
+import nio.client.async_client as async_client_module
 from nio import (
     AsyncClient,
     AsyncClientConfig,
@@ -28,6 +29,7 @@ from nio import (
     RoomEncryptionEvent,
     RoomForgetResponse,
     RoomInfo,
+    RoomLeaveResponse,
     RoomMemberEvent,
     RoomMessageText,
     RoomNameEvent,
@@ -3110,7 +3112,9 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
         await client.close()
 
-    async def test_rejoin_in_the_timeline_discards_the_restored_token(self, tempdir):
+    async def test_rejoin_in_the_timeline_discards_the_restored_token(
+        self, tempdir, monkeypatch
+    ):
         """A join inside the timeline ends the membership the token described."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3144,13 +3148,112 @@ class TestRoomLocalRecovery:
             }
         )
         assert isinstance(rejoin, SlidingSyncResponse)
-        await client.receive_response(rejoin)
+
+        async def send(*_args, **_kwargs):
+            await client.receive_response(rejoin)
+            return rejoin
+
+        monkeypatch.setattr(client, "_send", send)
+        await client.sliding_sync()
 
         # No walk from the pre-departure token; the snapshot's own token
         # becomes the baseline for the membership that exists now.
         assert seen == ["$after"]
         assert not client._recovery.gaps
         assert client.store.load_sliding_window_tokens() == {ROOM_A: "w2"}
+        await client.close()
+
+    async def test_cancelled_rejoin_planning_keeps_the_committed_baseline(
+        self, tempdir, monkeypatch
+    ):
+        """A cancelled response must not mutate state before its plan commits."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        rejoin = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "limited": True,
+                        "prev_batch": "w2",
+                        "timeline": [
+                            member_event("$join", 2, "join", OWN_ID).source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(rejoin, SlidingSyncResponse)
+
+        async def send(*_args, **_kwargs):
+            await client.receive_response(rejoin)
+            return rejoin
+
+        def cancel_planning(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(client, "_send", send)
+        monkeypatch.setattr(
+            async_client_module, "plan_room_timeline", cancel_planning
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await client.sliding_sync()
+
+        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_membership_change_waits_for_durable_token_invalidation(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A remote departure must not happen while its old baseline survives."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        sent = []
+
+        async def send(response_class, *_args, **_kwargs):
+            sent.append(response_class)
+            if response_class is RoomForgetResponse:
+                response = RoomForgetResponse.from_dict({}, ROOM_A)
+                await client.receive_response(response)
+                return response
+            return RoomLeaveResponse.from_dict({})
+
+        def fail(_room_id):
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(client, "_send", send)
+        monkeypatch.setattr(client.store, "forget_sliding_window_token", fail)
+
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert sent == []
+        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
         await client.close()
 
     async def test_restart_snapshot_still_walks_from_the_stored_token(

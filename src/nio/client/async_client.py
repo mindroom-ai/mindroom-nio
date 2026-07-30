@@ -1239,7 +1239,6 @@ class AsyncClient(Client):
             # token was taken under. Only the timeline dates the join:
             # required_state carries our membership on every snapshot,
             # including the ones a plain restart produces.
-            self._forget_sliding_window_token(room_id)
             return None
         if self._sliding_sync_room_is_invite(room) or room.membership in (
             "leave",
@@ -1261,6 +1260,7 @@ class AsyncClient(Client):
         recorded: dict[str, str] = {}
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
+            own_join = any(is_own_join(event, self.user_id) for event in room.timeline)
             if self._sliding_sync_room_is_invite(room) or room.membership in (
                 "leave",
                 "ban",
@@ -1268,6 +1268,16 @@ class AsyncClient(Client):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
                 forgotten.append(room_id)
+            elif own_join:
+                # Invalidate the old membership's token while adopting this
+                # window's baseline in the same transaction. The response
+                # itself must still predate no reset that happened before it.
+                forgotten.append(room_id)
+                if (
+                    not self._sliding_token_predates_reset(room_id, room)
+                    and room.prev_batch
+                ):
+                    recorded[room_id] = room.prev_batch
             elif self._sliding_token_predates_reset(room_id, room):
                 # A response that left the server before the membership
                 # reset can arrive after it, `initial` included, so its
@@ -1327,12 +1337,12 @@ class AsyncClient(Client):
         A stale baseline outlives the membership it was taken under, so a
         later rejoin would walk history from before we left.
         """
-        self._reset_sliding_room(room_id)
         # Deleting goes through the store itself, not the recovery gate: a
         # token this run refuses to write may still be on disk from a run
         # that did, and it must not outlive the membership either.
         if self.store:
             self.store.forget_sliding_window_token(room_id)
+        self._reset_sliding_room(room_id)
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
@@ -4091,10 +4101,8 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
         """
         method, path = Api.room_leave(self.access_token, room_id)
-        response = await self._send(RoomLeaveResponse, method, path)
-        if isinstance(response, RoomLeaveResponse):
-            self._forget_sliding_window_token(room_id)
-        return response
+        self._forget_sliding_window_token(room_id)
+        return await self._send(RoomLeaveResponse, method, path)
 
     @logged_in_async
     async def room_forget(self, room_id: str) -> RoomForgetResponse | RoomForgetError:
@@ -4113,6 +4121,7 @@ class AsyncClient(Client):
             room_id (str): The room id of the room to forget.
         """
         method, path = Api.room_forget(self.access_token, room_id)
+        self._forget_sliding_window_token(room_id)
         return await self._send(
             RoomForgetResponse, method, path, response_data=(room_id,)
         )
