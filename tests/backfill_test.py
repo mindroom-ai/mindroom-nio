@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from aioresponses import CallbackResult
 
+import nio.client.async_client as async_client_module
 from nio import (
     AsyncClient,
     AsyncClientConfig,
@@ -28,6 +29,7 @@ from nio import (
     RoomEncryptionEvent,
     RoomForgetResponse,
     RoomInfo,
+    RoomLeaveResponse,
     RoomMemberEvent,
     RoomMessageText,
     RoomNameEvent,
@@ -258,6 +260,29 @@ def record_events(client: AsyncClient) -> list[str]:
 
     client.add_event_callback(callback, RoomMessageText)
     return seen
+
+
+def block_next_recovery_plan(client: AsyncClient, monkeypatch) -> asyncio.Event:
+    started = asyncio.Event()
+    block_once = True
+
+    class BlockBeforePlan:
+        async def __aenter__(self):
+            nonlocal block_once
+            if block_once:
+                block_once = False
+                started.set()
+                await asyncio.Event().wait()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        client,
+        "_recovery_room_state",
+        lambda _room_ids: BlockBeforePlan(),
+    )
+    return started
 
 
 @pytest_asyncio.fixture
@@ -1059,20 +1084,21 @@ class TestRoomLocalRecovery:
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         client.next_batch = "s0"
         seen = record_events(client)
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {
-                    ROOM_A: room_info(
-                        [text_event(f"$held{index}", index) for index in range(3)],
-                        limited=True,
-                        prev_batch="p1",
-                    )
-                },
-            )
+        response = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [text_event(f"$held{index}", index) for index in range(3)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
         )
+        await client.receive_response(response)
         assert seen == ["$held0", "$held1", "$held2"]
         assert not client._recovery.gaps
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         await client.close()
 
     async def test_repeated_end_token_abandons_gap_and_releases_live(
@@ -3047,7 +3073,10 @@ class TestRoomLocalRecovery:
         assert client.store.load_sync_token() == "s1"
         await client.close()
 
-    async def test_leave_deletes_a_token_stored_by_an_earlier_run(self, tempdir):
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_membership_reset_deletes_a_token_stored_by_an_earlier_run(
+        self, tempdir, protocol
+    ):
         """A token on disk outlives the run that wrote it, so deletion must too."""
         persisting = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3074,7 +3103,14 @@ class TestRoomLocalRecovery:
             "https://example.org", OWN_ID, "DEVICEID", tempdir, config=not_persisting
         )
         await second.receive_response(LoginResponse.from_dict(LOGIN))
-        second._forget_sliding_window_token(ROOM_A)
+        if protocol == "classic":
+            response = sync_response("s2", {})
+            response.rooms.leave[ROOM_A] = RoomInfo(
+                Timeline([], False, None), [], [], []
+            )
+        else:
+            response = self._sliding("s2", [], membership="leave")
+        await second.receive_response(response)
 
         assert second.store.load_sliding_window_tokens() == {}
         await second.close()
@@ -3118,7 +3154,9 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: "w3"}
         await client.close()
 
-    async def test_rejoin_in_the_timeline_discards_the_restored_token(self, tempdir):
+    async def test_rejoin_in_the_timeline_discards_the_restored_token(
+        self, tempdir, monkeypatch
+    ):
         """A join inside the timeline ends the membership the token described."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -3152,13 +3190,110 @@ class TestRoomLocalRecovery:
             }
         )
         assert isinstance(rejoin, SlidingSyncResponse)
-        await client.receive_response(rejoin)
+
+        async def send(*_args, **_kwargs):
+            await client.receive_response(rejoin)
+            return rejoin
+
+        monkeypatch.setattr(client, "_send", send)
+        await client.sliding_sync()
 
         # No walk from the pre-departure token; the snapshot's own token
         # becomes the baseline for the membership that exists now.
         assert seen == ["$after"]
         assert not client._recovery.gaps
         assert client.store.load_sliding_window_tokens() == {ROOM_A: "w2"}
+        await client.close()
+
+    async def test_cancelled_rejoin_planning_keeps_the_committed_baseline(
+        self, tempdir, monkeypatch
+    ):
+        """A cancelled response must not mutate state before its plan commits."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        rejoin = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "initial": True,
+                        "limited": True,
+                        "prev_batch": "w2",
+                        "timeline": [
+                            member_event("$join", 2, "join", OWN_ID).source,
+                            text_event("$after", 3).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(rejoin, SlidingSyncResponse)
+
+        async def send(*_args, **_kwargs):
+            await client.receive_response(rejoin)
+            return rejoin
+
+        def cancel_planning(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(client, "_send", send)
+        monkeypatch.setattr(async_client_module, "plan_room_timeline", cancel_planning)
+
+        with pytest.raises(asyncio.CancelledError):
+            await client.sliding_sync()
+
+        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_membership_change_waits_for_durable_token_invalidation(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A remote departure must not happen while its old baseline survives."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        sent = []
+
+        async def send(response_class, *_args, **_kwargs):
+            sent.append(response_class)
+            if response_class is RoomForgetResponse:
+                response = RoomForgetResponse.from_dict({}, ROOM_A)
+                await client.receive_response(response)
+                return response
+            return RoomLeaveResponse.from_dict({})
+
+        def fail(_room_id):
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(client, "_send", send)
+        monkeypatch.setattr(client.store, "forget_sliding_window_token", fail)
+
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert sent == []
+        assert client._sliding_room_prev_batch == {ROOM_A: "w1"}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: "w1"}
         await client.close()
 
     async def test_restart_snapshot_still_walks_from_the_stored_token(
@@ -3573,19 +3708,20 @@ class TestRoomLocalRecovery:
                 "p1",
             ),
         )
-        with pytest.raises(RuntimeError, match="ack failed"):
-            await first.receive_response(
-                sync_response(
-                    "s2",
-                    {
-                        ROOM_A: room_info(
-                            [text_event("$held", 4)],
-                            limited=True,
-                            prev_batch="p1",
-                        )
-                    },
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)],
+                    limited=True,
+                    prev_batch="p1",
                 )
-            )
+            },
+        )
+        with pytest.raises(RuntimeError, match="ack failed"):
+            await first.receive_response(response)
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         assert seen == ["$held", "$gap1", "$gap2"]
         await first.close()
         first.store.database.close()
@@ -3828,6 +3964,8 @@ class TestRoomLocalRecovery:
         await client.receive_response(sliding)
         assert seen == ["$held", "$prejoin2", "$join", "$after"]
         assert not client._recovery.gaps
+        assert sliding.recovered_room_ids == frozenset()
+        assert sliding.unrecovered_room_ids == frozenset({ROOM_A})
 
     async def test_sliding_initial_historical_join_keeps_classic_gap(
         self, client, aioresponse
@@ -3935,6 +4073,8 @@ class TestRoomLocalRecovery:
         await client.receive_response(reset)
         assert not client._recovery.gaps
         assert seen == ["$seen", "$held"]
+        assert reset.recovered_room_ids == frozenset()
+        assert reset.unrecovered_room_ids == frozenset({ROOM_A})
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
@@ -4006,20 +4146,21 @@ class TestRoomLocalRecovery:
         assert client._recovery.gaps
         assert client.store.load_sync_recovery()[0]
 
-        await client.receive_response(
-            sync_response(
-                "s3",
-                {},
-                invited=({ROOM_A: InviteInfo([])} if membership == "invite" else None),
-                left=(
-                    {ROOM_A: room_info([], limited=False, prev_batch=None)}
-                    if membership == "leave"
-                    else None
-                ),
-            )
+        reset = sync_response(
+            "s3",
+            {},
+            invited=({ROOM_A: InviteInfo([])} if membership == "invite" else None),
+            left=(
+                {ROOM_A: room_info([], limited=False, prev_batch=None)}
+                if membership == "leave"
+                else None
+            ),
         )
+        await client.receive_response(reset)
         assert not client._recovery.gaps
         assert seen == ["$seen", "$held"]
+        assert reset.recovered_room_ids == frozenset()
+        assert reset.unrecovered_room_ids == frozenset({ROOM_A})
         gaps, events = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
@@ -4216,17 +4357,18 @@ class TestRoomLocalRecovery:
 
         monkeypatch.setattr(client, "_handle_to_device", handle)
         monkeypatch.setattr(client.store, "save_recovery", fail)
-        with pytest.raises(RuntimeError, match="commit failed"):
-            await client.receive_response(
-                sync_response(
-                    "s2",
-                    {
-                        ROOM_A: room_info(
-                            [text_event("$held", 3)], limited=True, prev_batch="p1"
-                        )
-                    },
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
                 )
-            )
+            },
+        )
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await client.receive_response(response)
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
         assert client.next_batch == "s1"
         assert client.store.load_sync_token() == "s1"
         assert not client._recovery.gaps
@@ -4361,3 +4503,385 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$prejoin", "$join", "$after"]
         assert not client._recovery.gaps
+
+
+@pytest.mark.asyncio
+class TestRecoveryOutcome:
+    async def test_sync_response_types_default_to_no_recovery(self, client):
+        response = sync_response("s1", {})
+        sliding = SlidingSyncResponse.from_dict({"pos": "p1"})
+        assert isinstance(sliding, SlidingSyncResponse)
+
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()
+        assert sliding.recovered_room_ids == frozenset()
+        assert sliding.unrecovered_room_ids == frozenset()
+
+    async def test_restored_token_first_sync_reports_recovered_room(
+        self, tempdir, aioresponse
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        seed = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await seed.receive_response(LoginResponse.from_dict(LOGIN))
+        await seed.receive_response(sync_response("s1", {}))
+        await seed.close()
+        seed.store.database.close()
+
+        restored = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restored.receive_response(LoginResponse.from_dict(LOGIN))
+        assert restored.loaded_sync_token == "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 1), text_event("$live", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        await restored.receive_response(response)
+
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert response.rooms.join[ROOM_A].timeline.limited is True
+        await restored.close()
+
+    async def test_restored_token_incomplete_recovery_reports_unrecovered(
+        self, client, aioresponse
+    ):
+        client.loaded_sync_token = "s1"
+        aioresponse.get(MESSAGES_URL, status=500)
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        await client.receive_response(response)
+
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_cancelled_recovery_preserves_unrecovered_outcome(
+        self, client, aioresponse
+    ):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_recovered(_room, event):
+            if event.event_id == "$gap":
+                started.set()
+                await release.wait()
+
+        client.add_event_callback(block_recovered, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap", 1), text_event("$live", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        try:
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert response.recovered_room_ids == frozenset()
+            assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        finally:
+            release.set()
+
+    async def test_cancelled_before_plan_keeps_response_retryable(
+        self, client, aioresponse, monkeypatch
+    ):
+        started = block_next_recovery_plan(client, monkeypatch)
+        client.next_batch = "s1"
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$live", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.next_batch == "s1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+        aioresponse.get(MESSAGES_URL, status=500)
+        await client.receive_response(response)
+
+        assert client.next_batch == "s2"
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    async def test_cancelled_sliding_before_plan_reports_unrecovered(
+        self, client, aioresponse, monkeypatch
+    ):
+        baseline = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$old", 1).source],
+                        "prev_batch": "w1",
+                    }
+                },
+            }
+        )
+        assert isinstance(baseline, SlidingSyncResponse)
+        await client.receive_response(baseline)
+
+        started = block_next_recovery_plan(client, monkeypatch)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s2",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "timeline": [text_event("$live", 2).source],
+                        "limited": True,
+                        "prev_batch": "w2",
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.wait_for(started.wait(), 1)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+        aioresponse.get(MESSAGES_URL, status=500)
+        await client.receive_response(response)
+
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "w1"
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_cancelled_while_waiting_for_sync_executor_reports_unrecovered(
+        self, client, protocol
+    ):
+        if protocol == "classic":
+            client.next_batch = "s1"
+            response = sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        else:
+            baseline = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s1",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$old", 1).source],
+                            "prev_batch": "w1",
+                        }
+                    },
+                }
+            )
+            assert isinstance(baseline, SlidingSyncResponse)
+            await client.receive_response(baseline)
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s2",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [text_event("$live", 2).source],
+                            "limited": True,
+                            "prev_batch": "w2",
+                        }
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        client._recovery.outcomes[ROOM_B] = True
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel()
+        client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        assert client._recovery.outcomes == {ROOM_B: True}
+        if protocol == "classic":
+            assert client.next_batch == "s1"
+        else:
+            assert client._sliding_room_prev_batch[ROOM_A] == "w1"
+
+    @pytest.mark.parametrize("stage", ["executor", "room"])
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    @pytest.mark.parametrize("scenario", ["no_token", "own_join"])
+    async def test_cancelled_before_plan_ignores_non_gap_transport_hints(
+        self, client, monkeypatch, stage, protocol, scenario
+    ):
+        events = (
+            [member_event("$join", 2, "join")]
+            if scenario == "own_join"
+            else [text_event("$live", 2)]
+        )
+        if protocol == "classic":
+            if scenario == "own_join":
+                client.next_batch = "s1"
+            response = sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        events,
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        else:
+            if scenario == "own_join":
+                baseline = SlidingSyncResponse.from_dict(
+                    {
+                        "pos": "s1",
+                        "rooms": {
+                            ROOM_A: {
+                                "membership": "join",
+                                "timeline": [text_event("$old", 1).source],
+                                "prev_batch": "w1",
+                            }
+                        },
+                    }
+                )
+                assert isinstance(baseline, SlidingSyncResponse)
+                await client.receive_response(baseline)
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "s2",
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "timeline": [event.source for event in events],
+                            "limited": True,
+                            "prev_batch": "w2",
+                        }
+                    },
+                }
+            )
+            assert isinstance(response, SlidingSyncResponse)
+
+        if stage == "executor":
+            await client._sync_response_lock.acquire()
+            started = None
+        else:
+            started = block_next_recovery_plan(client, monkeypatch)
+        task = asyncio.create_task(client.receive_response(response))
+        if started:
+            await asyncio.wait_for(started.wait(), 1)
+        else:
+            await asyncio.sleep(0)
+            assert not task.done()
+
+        task.cancel()
+        if stage == "executor":
+            client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()
+
+    async def test_cancelled_queued_duplicate_classic_response_is_not_a_gap(
+        self, client
+    ):
+        client.next_batch = "s2"
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$duplicate", 2)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(client.receive_response(response))
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel()
+        client._sync_response_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.recovered_room_ids == frozenset()
+        assert response.unrecovered_room_ids == frozenset()

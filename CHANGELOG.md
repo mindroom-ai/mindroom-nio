@@ -12,9 +12,11 @@ All notable changes to this project will be documented in this file.
   after a restart unrecoverable — the one case the `/v3/sync` transport had
   always covered through its stored sync token. Live, a sliding reader torn
   down mid-flood and rebuilt from its store now loses nothing where it
-  previously lost every event written while it was down. Requires a store,
-  so encryption must be enabled; migrates the store from schema v3 to v4 and
-  exports `SlidingWindowTokens` from `nio.store`.
+  previously lost every event written while it was down. Persistence requires
+  `backfill_limited_timelines=True`, a store, and
+  `backfill_persist_recovery` resolving to `True`; when unset, the latter
+  follows `store_sync_tokens`. This migrates the store from schema v3 to v4
+  and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
   which follows `store_sync_tokens` as before, and can be set to True to
   persist recovery state while nio never reads or writes `next_batch`
@@ -29,6 +31,23 @@ All notable changes to this project will be documented in this file.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.
+
+## 0.32.0
+
+### Features
+
+- Add typed recovered and unrecovered room outcomes to classic and Sliding
+  Sync responses when limited-timeline recovery is enabled, while preserving
+  the server's original limited-timeline flag.
+
+### Bug Fixes
+
+- Report the server's `errcode` and `error` when a response fails its success
+  schema. Responses are validated against the success schema before anything
+  checks whether the body is an error, so an error body failed that validation
+  and the warning named the first missing success field instead of the errcode
+  the server sent, leaving the request outcome invisible in logs. Only those
+  two fields are logged, since the rest of a body may hold user content.
 
 ## 0.31.0
 

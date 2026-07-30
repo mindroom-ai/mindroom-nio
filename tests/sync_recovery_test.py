@@ -5,6 +5,7 @@ import threading
 import time
 from collections import OrderedDict
 
+import nio.client.sync_recovery as sync_recovery
 import pytest
 
 import nio.client.sync_recovery as sync_recovery
@@ -359,6 +360,74 @@ async def test_cancelled_early_live_callback_finishes_without_replay():
 
     await pump_recovery(**kwargs)
     assert calls == ["early", "late"]
+
+
+@pytest.mark.asyncio
+async def test_boundary_marker_does_not_consume_held_event_limit():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live-first", 1)]},
+        max_held_events=1,
+    )
+
+    async def unused_fetch(*_args):
+        raise AssertionError("ready live dispatch must not fetch")
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 1, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=dispatch,
+        store=None,
+        ready_room_id=ROOM,
+    )
+    assert [(item.event_id, item.kind) for item in state.events[(ROOM, 1)]] == [
+        ("~boundary:1", "boundary")
+    ]
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$second", 2)],
+        user_id="@me:example.org",
+        membership="join",
+    )
+
+    assert not plan.clear_rooms
+    assert [item.event_id for item in plan.events] == ["$second"]
+
+
+def test_room_reset_does_not_retain_boundary_marker_as_live_payload():
+    boundary = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "~boundary:1",
+        "$old-live",
+        True,
+        False,
+        kind="boundary",
+    )
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", None)]},
+        events={(ROOM, 1): [boundary]},
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="leave",
+    )
+
+    assert plan.clear_rooms == frozenset({ROOM})
+    assert not plan.gaps
+    assert not plan.events
 
 
 @pytest.mark.asyncio
@@ -1161,3 +1230,36 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
         for queued in queued_events
         if not queued.is_live
     ] == ["$later-recovered"]
+
+
+def test_recovery_outcome_keeps_open_real_gap_unrecovered():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 2, "p2", "s2")]},
+    )
+    state.outcomes = {ROOM: True, ROOM_B: False}
+
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM, ROOM_B}),
+    )
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+    )
+
+
+def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
+    state = RecoveryState(
+        gaps={
+            ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")],
+            ROOM_B: [RecoveryGap(ROOM_B, 1, "", None)],
+        },
+        events={(ROOM, 1): [], (ROOM_B, 1): []},
+    )
+
+    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM, ROOM_B})))
+
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+    )

@@ -267,6 +267,8 @@ from .sync_recovery import (
     pump_recovery,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
+    take_recovery_outcomes,
+    would_plan_real_gap,
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
@@ -553,8 +555,8 @@ class AsyncClient(Client):
 
         # Per-room /messages token from each room's last sliding window,
         # used as the start of the next limited window's recovery walk.
-        # In-memory only: a restart has no baseline to walk from, so the
-        # first limited window after it cannot be recovered.
+        # Restored from the store when recovery persistence is enabled;
+        # otherwise it lives only in memory and cannot survive a restart.
         self._sliding_room_prev_batch: dict[str, str] = {}
 
         # Rooms whose membership reset since their last window, each with
@@ -886,6 +888,74 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def _publish_recovery_outcome(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> None:
+        if not self.config.backfill_limited_timelines:
+            return
+        recovered, unrecovered = take_recovery_outcomes(self._recovery)
+        response.recovered_room_ids = recovered
+        response.unrecovered_room_ids = unrecovered
+
+    def _classic_response_real_gap_room_ids(
+        self,
+        response: SyncResponse,
+        request_since: str | None,
+    ) -> frozenset[str]:
+        if self.next_batch == response.next_batch:
+            return frozenset()
+
+        return frozenset(
+            room_id
+            for room_id, room_info in response.rooms.join.items()
+            if would_plan_real_gap(
+                timeline_events=room_info.timeline.events,
+                user_id=self.user_id,
+                membership="join",
+                cursor_token=(
+                    request_since
+                    if room_info.timeline.limited and request_since
+                    else None
+                ),
+            )
+        )
+
+    def _sliding_response_real_gap_room_ids(
+        self,
+        response: SlidingSyncResponse,
+    ) -> frozenset[str]:
+        return frozenset(
+            room_id
+            for room_id, room in response.rooms.items()
+            if would_plan_real_gap(
+                timeline_events=room.timeline,
+                user_id=self.user_id,
+                membership=self._sliding_sync_recovery_membership(room),
+                live_event_count=((room.num_live or 0) if room.initial else None),
+                cursor_token=self._sliding_recovery_cursor(room_id, room),
+            )
+        )
+
+    def _publish_waiting_sync_cancellation(
+        self,
+        response: SyncResponse | SlidingSyncResponse,
+        request_since: str | None,
+    ) -> None:
+        """Publish a fail-closed snapshot without draining the active executor."""
+        unrecovered = {
+            room_id
+            for room_id, gaps in self._recovery.gaps.items()
+            if any(gap.target_token for gap in gaps)
+        }
+        if isinstance(response, SyncResponse):
+            unrecovered.update(
+                self._classic_response_real_gap_room_ids(response, request_since)
+            )
+        else:
+            unrecovered.update(self._sliding_response_real_gap_room_ids(response))
+        response.recovered_room_ids = frozenset()
+        response.unrecovered_room_ids = frozenset(unrecovered)
+
     async def _recovery_room_messages(
         self,
         room_id: str,
@@ -984,13 +1054,15 @@ class AsyncClient(Client):
             await self._pump_sync_recovery()
             return
 
-        previous_batch = self.next_batch
-        self.next_batch = response.next_batch
-
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
-            async with self._recovery_room_state(
-                set(response.rooms.join) | reset_rooms
+            new_gap_room_ids = self._classic_response_real_gap_room_ids(
+                response,
+                request_since,
+            )
+            async with self._recovery_response_room_state(
+                set(response.rooms.join) | reset_rooms,
+                new_gap_room_ids,
             ):
                 plan = plan_sync_response(
                     self._recovery,
@@ -1000,30 +1072,27 @@ class AsyncClient(Client):
                     joined_rooms=response.rooms.join,
                     reset_room_ids=reset_rooms,
                 )
-                try:
-                    persist_response_plan(
-                        self._recovery,
-                        self._recovery_store,
-                        # Only the owner of the sync token writes it. A
-                        # client persisting recovery state while keeping
-                        # the token to itself gets the rows without nio
-                        # recording a position it does not control.
-                        token=(
-                            response.next_batch
-                            if self.config.store_sync_tokens
-                            else None
-                        ),
-                        plan=plan,
-                        # A membership this transport saw end invalidates
-                        # the sliding baseline just as much: a rejoin must
-                        # not walk from a token taken under the old one.
-                        forgotten_rooms=reset_rooms,
-                    )
-                except BaseException:
-                    self.next_batch = previous_batch
-                    raise
+                persist_response_plan(
+                    self._recovery,
+                    self._recovery_store,
+                    # Only the owner of the sync token writes it. A client
+                    # persisting recovery state while keeping the token to
+                    # itself gets rows without nio recording its position.
+                    token=(
+                        response.next_batch if self.config.store_sync_tokens else None
+                    ),
+                    plan=plan,
+                    # A membership this transport saw end invalidates the
+                    # sliding baseline too: a rejoin must not walk from a
+                    # token taken under the old membership.
+                    forgotten_rooms=reset_rooms,
+                )
                 for room_id in reset_rooms:
-                    self._reset_sliding_room(room_id)
+                    if self._recovery_store is None:
+                        self._forget_sliding_window_token(room_id)
+                    else:
+                        self._reset_sliding_room(room_id)
+            self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
                 if self._recovery_store is None:
                     # Recovery rows are off, so nothing above wrote the
@@ -1035,9 +1104,11 @@ class AsyncClient(Client):
                 self._handle_joined_state(room_id, join_info, self.encrypted_rooms)
             if self.store:
                 self.store.save_encrypted_rooms(self.encrypted_rooms)
-        elif self.config.store_sync_tokens and self.store:
-            self.store.save_sync_token(response.next_batch)
-            self.loaded_sync_token = response.next_batch
+        else:
+            self.next_batch = response.next_batch
+            if self.config.store_sync_tokens and self.store:
+                self.store.save_sync_token(response.next_batch)
+                self.loaded_sync_token = response.next_batch
 
         await self._handle_to_device(response)
 
@@ -1071,18 +1142,18 @@ class AsyncClient(Client):
                 for room_id in self._pending_sliding_room_account_data
                 if room_id in self.rooms
             )
-            async with self._recovery_room_state(planned_room_ids):
+            new_gap_room_ids = self._sliding_response_real_gap_room_ids(response)
+            async with self._recovery_response_room_state(
+                planned_room_ids,
+                new_gap_room_ids,
+            ):
                 plans = [
                     plan_room_timeline(
                         self._recovery,
                         room_id=room_id,
                         timeline_events=room.timeline,
                         user_id=self.user_id,
-                        membership=(
-                            "invite"
-                            if self._sliding_sync_room_is_invite(room)
-                            else room.membership or "join"
-                        ),
+                        membership=self._sliding_sync_recovery_membership(room),
                         live_event_count=(
                             (room.num_live or 0) if room.initial else None
                         ),
@@ -1242,7 +1313,6 @@ class AsyncClient(Client):
             # token was taken under. Only the timeline dates the join:
             # required_state carries our membership on every snapshot,
             # including the ones a plain restart produces.
-            self._forget_sliding_window_token(room_id)
             return None
         if self._sliding_sync_room_is_invite(room) or room.membership in (
             "leave",
@@ -1264,6 +1334,7 @@ class AsyncClient(Client):
         recorded: dict[str, str] = {}
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
+            own_join = any(is_own_join(event, self.user_id) for event in room.timeline)
             if self._sliding_sync_room_is_invite(room) or room.membership in (
                 "leave",
                 "ban",
@@ -1271,6 +1342,16 @@ class AsyncClient(Client):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
                 forgotten.append(room_id)
+            elif own_join:
+                # Invalidate the old membership's token while adopting this
+                # window's baseline in the same transaction. The response
+                # itself must still predate no reset that happened before it.
+                forgotten.append(room_id)
+                if (
+                    not self._sliding_token_predates_reset(room_id, room)
+                    and room.prev_batch
+                ):
+                    recorded[room_id] = room.prev_batch
             elif self._sliding_token_predates_reset(room_id, room):
                 # A response that left the server before the membership
                 # reset can arrive after it, `initial` included, so its
@@ -1314,7 +1395,10 @@ class AsyncClient(Client):
     ) -> None:
         """Adopt baselines whose durable write already succeeded."""
         for room_id in forgotten:
-            self._reset_sliding_room(room_id)
+            if self._recovery_store is None:
+                self._forget_sliding_window_token(room_id)
+            else:
+                self._reset_sliding_room(room_id)
         request_epoch = self._sliding_request_epoch.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
@@ -1330,17 +1414,24 @@ class AsyncClient(Client):
         A stale baseline outlives the membership it was taken under, so a
         later rejoin would walk history from before we left.
         """
-        self._reset_sliding_room(room_id)
         # Deleting goes through the store itself, not the recovery gate: a
         # token this run refuses to write may still be on disk from a run
         # that did, and it must not outlive the membership either.
         if self.store:
             self.store.forget_sliding_window_token(room_id)
+        self._reset_sliding_room(room_id)
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
         return room.membership == "invite" or (
             room.membership is None and bool(room.stripped_state)
+        )
+
+    def _sliding_sync_recovery_membership(self, room: SlidingSyncRoom) -> str:
+        return (
+            "invite"
+            if self._sliding_sync_room_is_invite(room)
+            else room.membership or "join"
         )
 
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
@@ -1679,21 +1770,53 @@ class AsyncClient(Client):
             return
 
         self._raise_on_sync_reentry()
-        async with self._sync_response_lock:
-            executor = object()
-            self._active_sync_executor_token = executor
-            context_token = self._sync_executor_context.set(executor)
-            try:
-                if isinstance(response, _SyncResponseEnvelope):
-                    await self._handle_sync(response)
-                else:
-                    await self._handle_sliding_sync(response)
-            finally:
-                self._active_sync_executor_token = None
-                self._sync_executor_context.reset(context_token)
+        sync_response = (
+            response.response
+            if isinstance(response, _SyncResponseEnvelope)
+            else response
+        )
+        request_since = (
+            response.request_since
+            if isinstance(response, _SyncResponseEnvelope)
+            else None
+        )
+        entered_executor = False
+        try:
+            async with self._sync_response_lock:
+                entered_executor = True
+                executor = object()
+                self._active_sync_executor_token = executor
+                context_token = self._sync_executor_context.set(executor)
+                try:
+                    if isinstance(response, _SyncResponseEnvelope):
+                        await self._handle_sync(response)
+                    else:
+                        await self._handle_sliding_sync(response)
+                finally:
+                    self._publish_recovery_outcome(sync_response)
+                    self._active_sync_executor_token = None
+                    self._sync_executor_context.reset(context_token)
+        except asyncio.CancelledError:
+            if not entered_executor:
+                self._publish_waiting_sync_cancellation(sync_response, request_since)
+            raise
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _recovery_response_room_state(
+        self,
+        room_ids: Iterable[str],
+        unrecovered_room_ids: Iterable[str],
+    ) -> AsyncIterator[None]:
+        try:
+            async with self._recovery_room_state(room_ids):
+                yield
+        except BaseException:
+            for room_id in unrecovered_room_ids:
+                self._recovery.outcomes[room_id] = False
+            raise
 
     @asynccontextmanager
     async def _recovery_room_state(
@@ -4113,10 +4236,8 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
         """
         method, path = Api.room_leave(self.access_token, room_id)
-        response = await self._send(RoomLeaveResponse, method, path)
-        if isinstance(response, RoomLeaveResponse):
-            self._forget_sliding_window_token(room_id)
-        return response
+        self._forget_sliding_window_token(room_id)
+        return await self._send(RoomLeaveResponse, method, path)
 
     @logged_in_async
     async def room_forget(self, room_id: str) -> RoomForgetResponse | RoomForgetError:
@@ -4135,6 +4256,7 @@ class AsyncClient(Client):
             room_id (str): The room id of the room to forget.
         """
         method, path = Api.room_forget(self.access_token, room_id)
+        self._forget_sliding_window_token(room_id)
         return await self._send(
             RoomForgetResponse, method, path, response_data=(room_id,)
         )

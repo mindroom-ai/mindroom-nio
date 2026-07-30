@@ -38,9 +38,9 @@ one-event timeline window so every response is ``limited`` — dispatch
 through /messages recovery walks. The sliding reader is torn down and
 rebuilt from its store mid-flood. Afterwards every accepted write must
 have been dispatched exactly once per reader, in the server's own
-per-room order, with nothing left undecryptable. A final pass repeats
-the flood inside an encrypted room and asserts every megolm event is
-decrypted and dispatched exactly once.
+per-room order within the live and recovered lanes, with nothing left
+undecryptable. A final pass repeats the flood inside an encrypted room
+and asserts every megolm event is decrypted and dispatched exactly once.
 """
 
 import argparse
@@ -599,6 +599,7 @@ class Recorder:
         self.counts: Counter = Counter()
         self.decrypted: Counter = Counter()
         self.undecryptable: set[str] = set()
+        self.recovery_live: dict[str, bool] = {}
 
     async def __call__(self, room, event) -> None:
         event_id = getattr(event, "event_id", None)
@@ -621,6 +622,37 @@ class Recorder:
             for event_id, count in self.counts.items()
             if count > 1 and event_id in ids
         }
+
+    def observe_recovery(self, client: AsyncClient) -> None:
+        dispatch = client._dispatch_timeline_event
+
+        async def record_lane(room_id, event, is_live, was_completed, kind):
+            event_id = getattr(event, "event_id", None)
+            if event_id and kind == "timeline":
+                self.recovery_live[event_id] = is_live
+            return await dispatch(room_id, event, is_live, was_completed, kind)
+
+        client._dispatch_timeline_event = record_lane
+
+
+def recovery_lane_orders(
+    canonical: list[str],
+    observed: list[str],
+    is_live: dict[str, bool],
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Return expected and observed server order for each recovery lane."""
+    observed_ids = set(observed)
+    return {
+        name: (
+            [
+                event_id
+                for event_id in canonical
+                if event_id in observed_ids and is_live.get(event_id) is lane
+            ],
+            [event_id for event_id in observed if is_live.get(event_id) is lane],
+        )
+        for name, lane in (("recovered", False), ("live", True))
+    }
 
 
 def recovery_config(max_events: int, encryption: bool = True) -> AsyncClientConfig:
@@ -842,8 +874,8 @@ async def recovery_slam(
     This is the check that unit tests cannot make: with
     ``backfill_limited_timelines`` enabled, every event dropped by the
     tiny timeline window has to come back through a /messages recovery
-    walk, in the server's order, exactly once, on both transports, and
-    across a mid-flood client restart.
+    walk exactly once, in server order within each dispatch lane, on both
+    transports and across a mid-flood client restart.
     """
     suffix = secrets.token_hex(4)
     budget = (n_messages + n_edits) * 4 + 1000
@@ -861,6 +893,8 @@ async def recovery_slam(
 
     sliding_recorder = Recorder("sliding")
     classic_recorder = Recorder("classic")
+    sliding_recorder.observe_recovery(sliding)
+    classic_recorder.observe_recovery(classic)
     sliding.add_event_callback(sliding_recorder, Event)
     classic.add_event_callback(classic_recorder, Event)
 
@@ -919,6 +953,7 @@ async def recovery_slam(
                 homeserver, user_id, device_id, store_path, recovery_config(budget)
             )
             sliding.restore_login(user_id, device_id, access_token)
+            sliding_recorder.observe_recovery(sliding)
             sliding.add_event_callback(sliding_recorder, Event)
             readers[0] = sliding
             sliding_task = asyncio.create_task(
@@ -1028,9 +1063,8 @@ async def recovery_slam(
                 f"{len(duplicates)} duplicated, e.g. {list(duplicates.items())[:3]}",
             )
 
-        # Order: per room, the dispatch order must be the server's order.
-        # Events a reader never saw cannot break its ordering, so each
-        # reader is compared against the subsequence it did receive.
+        # Live callbacks may overtake recovery walks. Within each lane,
+        # dispatch must still preserve the server's per-room order.
         for room_id in room_ids:
             canonical = [
                 event_id
@@ -1046,20 +1080,42 @@ async def recovery_slam(
                     for event_id in recorder.order[room_id]
                     if event_id in sent[room_id]
                 ]
-                if got != expected:
+                unknown = [
+                    event_id
+                    for event_id in got
+                    if event_id not in recorder.recovery_live
+                ]
+                check(
+                    f"recovery slam: {recorder.name} recorded dispatch lanes",
+                    not unknown,
+                    f"{len(unknown)} events lack lane identity, e.g. {unknown[:3]}",
+                )
+                for lane, (lane_expected, lane_got) in recovery_lane_orders(
+                    expected,
+                    got,
+                    recorder.recovery_live,
+                ).items():
+                    if lane_got == lane_expected:
+                        continue
                     first_bad = next(
-                        (i for i, (a, b) in enumerate(zip(got, expected)) if a != b),
-                        min(len(got), len(expected)),
+                        (
+                            i
+                            for i, (actual, wanted) in enumerate(
+                                zip(lane_got, lane_expected)
+                            )
+                            if actual != wanted
+                        ),
+                        min(len(lane_got), len(lane_expected)),
                     )
                     check(
-                        f"recovery slam: {recorder.name} preserved room order",
+                        f"recovery slam: {recorder.name} preserved {lane} order",
                         False,
                         f"{room_id} diverges at index {first_bad}: "
-                        f"got {got[first_bad : first_bad + 3]} "
-                        f"expected {expected[first_bad : first_bad + 3]}",
+                        f"got {lane_got[first_bad : first_bad + 3]} "
+                        f"expected {lane_expected[first_bad : first_bad + 3]}",
                     )
         check(
-            "recovery slam: both readers preserved per-room order",
+            "recovery slam: both readers preserved per-lane room order",
             True,
         )
 
