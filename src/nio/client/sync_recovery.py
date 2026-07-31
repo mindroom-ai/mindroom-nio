@@ -542,9 +542,13 @@ def _plan_timeline_events(
     )
     # Reserve lower sequences for `/messages` history discovered after this
     # sync timeline, so recovery can prepend it without reordering later inputs.
-    sequence = 1 + max(
-        (event.sequence for event in state.events.get((room_id, generation), ())),
-        default=state.max_held_events - 1,
+    sequence = max(
+        state.max_held_events,
+        1
+        + max(
+            (event.sequence for event in state.events.get((room_id, generation), ())),
+            default=-1,
+        ),
     )
     live_start = (
         0 if live_event_count is None else len(timeline_events) - live_event_count
@@ -697,14 +701,18 @@ def plan_room_timeline(
     if ephemeral_events or account_data_events:
         if batch_id is None:
             raise ValueError("Ancillary recovery events require a batch ID")
-        next_sequence = 1 + max(
-            (event.sequence for event in events),
-            default=max(
-                (
-                    event.sequence
-                    for event in state.events.get((room_id, generation), ())
+        next_sequence = max(
+            state.max_held_events,
+            1
+            + max(
+                (event.sequence for event in events),
+                default=max(
+                    (
+                        event.sequence
+                        for event in state.events.get((room_id, generation), ())
+                    ),
+                    default=-1,
                 ),
-                default=-1,
             ),
         )
         deferred = _plan_ancillary_events(

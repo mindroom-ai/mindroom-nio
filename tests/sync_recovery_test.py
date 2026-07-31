@@ -118,6 +118,25 @@ def test_no_id_keys_are_scoped_to_the_sliding_connection():
     assert first.events[0].event_id != second.events[0].event_id
 
 
+def test_received_timeline_stays_after_a_recovered_only_prefix():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
+        events={(ROOM, 1): [pending("$gap", 0)]},
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$live", 2)],
+        user_id="@me:example.org",
+        membership="join",
+    )
+
+    assert len(plan.events) == 1
+    assert plan.events[0].sequence == state.max_held_events
+    assert plan.events[0].is_live
+
+
 class InlineStore:
     supports_threaded_writes = False
 
