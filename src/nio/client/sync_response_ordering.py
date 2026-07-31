@@ -38,6 +38,8 @@ def account_data_kind(
 ) -> tuple[str, str | None]:
     """Return the parsed class and wire type of type-keyed account data."""
     wire_type = event.source.get("type")
+    if not isinstance(wire_type, str):
+        wire_type = getattr(event, "type", None)
     return (
         type(event).__name__,
         wire_type if isinstance(wire_type, str) else None,
