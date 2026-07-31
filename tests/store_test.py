@@ -688,6 +688,13 @@ class TestClass:
             TEST_ROOM: SlidingWindowToken("w3", "$join-a")
         }
 
+    @pytest.mark.parametrize("membership_event_id", [None, ""])
+    def test_sliding_window_token_requires_membership_identity(
+        self, membership_event_id
+    ):
+        with pytest.raises(ValueError, match="membership_event_id"):
+            SlidingWindowToken("w1", membership_event_id)
+
     def test_sliding_window_tokens_chunk_large_batches(self, sqlstore):
         """More rooms than SQLite can bind in one statement still write."""
         tokens = {

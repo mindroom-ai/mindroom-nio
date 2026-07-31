@@ -413,7 +413,7 @@ class AsyncClientConfig(ClientConfig):
             Limited lanes block sends until their history obligation clears.
             Live timeline callbacks run before the history walk; recovered
             history callbacks may therefore arrive later.
-            Event admission callbacks finish before ordinary callback fanout.
+            The event admission owner finishes before ordinary callback fanout.
             CallbackNotAcceptedError is valid only from that pre-side-effect
             admission boundary and keeps the event pending for redispatch.
             Ordinary live callback errors acknowledge the event once, while
@@ -553,7 +553,7 @@ class AsyncClient(Client):
 
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
-        self.event_admission_callbacks: list[ClientCallback] = []
+        self.event_admission_callback: ClientCallback | None = None
         self._event_callback_task: ContextVar[asyncio.Task[Any] | None] = ContextVar(
             f"nio_event_callback_task_{id(self)}", default=None
         )
@@ -597,7 +597,6 @@ class AsyncClient(Client):
         # Restored from the store when recovery persistence is enabled;
         # otherwise it lives only in memory and cannot survive a restart.
         self._sliding_room_prev_batch: dict[str, SlidingWindowToken] = {}
-        self._sliding_verified_membership_event_ids: dict[str, str] = {}
         self._sliding_request_scope: ContextVar[str | None] = ContextVar(
             f"nio_sliding_request_scope_{id(self)}", default=None
         )
@@ -660,14 +659,18 @@ class AsyncClient(Client):
         callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
         filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
-        """Add a callback that durably accepts a timeline event before fanout.
+        """Set the callback that durably accepts timeline events before fanout.
 
-        All matching admission callbacks finish before any matching event
-        callback runs.
+        Only one admission owner can be registered because multiple callbacks
+        cannot make their durable side effects atomic.
         Raise CallbackNotAcceptedError before producing side effects to keep
         the event pending for redispatch when limited-timeline recovery is on.
         """
-        self.event_admission_callbacks.append(ClientCallback(callback, filter))
+        if self.event_admission_callback is not None:
+            raise LocalProtocolError(
+                "An event admission callback is already registered."
+            )
+        self.event_admission_callback = ClientCallback(callback, filter)
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -1084,8 +1087,10 @@ class AsyncClient(Client):
     async def _on_event_admission(
         self, event: Event | BadEventType, room: MatrixRoom
     ) -> None:
+        if self.event_admission_callback is None:
+            return
         await self._run_event_callbacks(
-            self.event_admission_callbacks,
+            (self.event_admission_callback,),
             event,
             room,
         )
@@ -1136,6 +1141,10 @@ class AsyncClient(Client):
                 set(response.rooms.join) | reset_rooms,
                 new_gap_room_ids,
             ):
+                await drain_recovery_room_dispatches(
+                    self._recovery,
+                    set(response.rooms.join) | reset_rooms,
+                )
                 plan = plan_sync_response(
                     self._recovery,
                     user_id=self.user_id,
@@ -1143,10 +1152,6 @@ class AsyncClient(Client):
                     response_token=response.next_batch,
                     joined_rooms=response.rooms.join,
                     reset_room_ids=reset_rooms,
-                )
-                await drain_recovery_room_dispatches(
-                    self._recovery,
-                    plan.clear_rooms,
                 )
                 persist_response_plan(
                     self._recovery,
@@ -1228,6 +1233,10 @@ class AsyncClient(Client):
                 planned_room_ids,
                 new_gap_room_ids,
             ):
+                await drain_recovery_room_dispatches(
+                    self._recovery,
+                    planned_room_ids,
+                )
                 unrecoverable_room_ids = (
                     self._sliding_unrecoverable_discontinuity_room_ids(response)
                 )
@@ -1277,20 +1286,12 @@ class AsyncClient(Client):
                 plans.append(RecoveryPlan(unrecovered_room_ids=unrecoverable_room_ids))
                 recorded, forgotten = self._plan_sliding_prev_batches(response)
                 plan = merge_recovery_plans(plans)
-                await drain_recovery_room_dispatches(
-                    self._recovery,
-                    plan.clear_rooms,
-                )
                 persist_response_plan(
                     self._recovery,
                     self._recovery_store,
                     token=None,
                     plan=plan,
-                    window_tokens={
-                        room_id: token
-                        for room_id, token in recorded.items()
-                        if token.membership_event_id is not None
-                    },
+                    window_tokens=recorded,
                     forgotten_rooms=forgotten,
                 )
                 # Only once the write committed: a rolled back transaction
@@ -1342,7 +1343,8 @@ class AsyncClient(Client):
         limit: int,
     ) -> list[list[int]]:
         merged: list[list[int]] = []
-        for start, end in sorted([[0, limit - 1], *ranges]):
+        normalized = [[start, end] for start, end in ranges]
+        for start, end in sorted([[0, limit - 1], *normalized]):
             if merged and start <= merged[-1][1] + 1:
                 merged[-1][1] = max(merged[-1][1], end)
             else:
@@ -1412,12 +1414,6 @@ class AsyncClient(Client):
         """
         if not (room.limited or room.initial) or not room.prev_batch:
             return None
-        if any(is_own_join(event, self.user_id) for event in room.timeline):
-            # Joining inside this window ends whatever membership the held
-            # token was taken under. Only the timeline dates the join:
-            # required_state carries our membership on every snapshot,
-            # including the ones a plain restart produces.
-            return None
         if self._sliding_sync_room_is_invite(room) or room.membership in (
             "leave",
             "ban",
@@ -1427,23 +1423,12 @@ class AsyncClient(Client):
         if not window_token:
             return None
         membership_event = self._sliding_membership_event(room)
-        membership_event_id = (
-            membership_event.event_id
-            if isinstance(membership_event, RoomMemberEvent)
-            else (
-                None
-                if isinstance(membership_event, SlidingSyncStateStub)
-                else self._sliding_verified_membership_event_ids.get(room_id)
-            )
-        )
-        if window_token.membership_event_id is None:
-            return window_token.token
-        if membership_event_id is None:
-            return None
-        if membership_event_id != window_token.membership_event_id and not (
+        if not (
             isinstance(membership_event, RoomMemberEvent)
-            and membership_event.prev_membership == "join"
+            and membership_event.membership == "join"
         ):
+            return None
+        if membership_event.event_id != window_token.membership_event_id:
             return None
         return window_token.token
 
@@ -1456,20 +1441,37 @@ class AsyncClient(Client):
             room_id
             for room_id, room in response.rooms.items()
             if (room.limited or room.initial)
-            and not any(is_own_join(event, self.user_id) for event in room.timeline)
+            and (room_id in self._sliding_room_prev_batch or room_id in self.rooms)
+            and not self._sliding_live_own_join(room)
             and not self._sliding_sync_room_is_invite(room)
             and room.membership not in ("leave", "ban")
             and self._sliding_recovery_cursor(room_id, room) is None
         )
 
+    @staticmethod
+    def _sliding_live_timeline(
+        room: SlidingSyncRoom,
+    ) -> Sequence[Event | BadEventType]:
+        if not room.initial:
+            return room.timeline
+        live_event_count = room.num_live or 0
+        return room.timeline[-live_event_count:] if live_event_count else ()
+
+    def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
+        return any(
+            is_own_join(event, self.user_id)
+            for event in self._sliding_live_timeline(room)
+        )
+
     def _sliding_membership_event(
         self, room: SlidingSyncRoom
     ) -> RoomMemberEvent | SlidingSyncStateStub | None:
-        """Return the last own membership event carried by this room."""
+        """Return exact current own membership, excluding historical timeline."""
+        events = (*room.required_state, *self._sliding_live_timeline(room))
         return next(
             (
                 event
-                for event in reversed((*room.required_state, *room.timeline))
+                for event in reversed(events)
                 if (
                     isinstance(event, RoomMemberEvent)
                     and event.state_key == self.user_id
@@ -1482,17 +1484,6 @@ class AsyncClient(Client):
             ),
             None,
         )
-
-    def _sliding_membership_event_id(
-        self, room_id: str, room: SlidingSyncRoom
-    ) -> str | None:
-        """Return the verified membership event owning this room snapshot."""
-        event = self._sliding_membership_event(room)
-        if event:
-            if isinstance(event, SlidingSyncStateStub):
-                return None
-            return event.event_id if event.membership == "join" else None
-        return self._sliding_verified_membership_event_ids.get(room_id)
 
     def _plan_sliding_prev_batches(
         self, response: SlidingSyncResponse
@@ -1507,9 +1498,7 @@ class AsyncClient(Client):
         recorded: dict[str, SlidingWindowToken] = {}
         forgotten: list[str] = []
         for room_id, room in response.rooms.items():
-            own_join = any(is_own_join(event, self.user_id) for event in room.timeline)
             membership_event = self._sliding_membership_event(room)
-            membership_event_id = self._sliding_membership_event_id(room_id, room)
             window_token = self._sliding_room_prev_batch.get(room_id)
             if self._sliding_sync_room_is_invite(room) or room.membership in (
                 "leave",
@@ -1518,29 +1507,26 @@ class AsyncClient(Client):
                 # The room is no longer tracked; a stale token would make
                 # the next join walk history from before it.
                 forgotten.append(room_id)
-            elif isinstance(membership_event, SlidingSyncStateStub):
+            elif not (
+                isinstance(membership_event, RoomMemberEvent)
+                and membership_event.membership == "join"
+            ):
                 forgotten.append(room_id)
-            elif membership_event_id is None:
-                if window_token and window_token.membership_event_id is not None:
-                    forgotten.append(room_id)
-                if room.prev_batch:
-                    recorded[room_id] = SlidingWindowToken(room.prev_batch, None)
             else:
-                if own_join or (
+                if self._sliding_live_own_join(room) or (
                     window_token
-                    and window_token.membership_event_id != membership_event_id
+                    and window_token.membership_event_id != membership_event.event_id
                 ):
                     forgotten.append(room_id)
                 if room.prev_batch:
                     recorded[room_id] = SlidingWindowToken(
-                        room.prev_batch, membership_event_id
+                        room.prev_batch, membership_event.event_id
                     )
         return recorded, forgotten
 
     def _reset_sliding_room(self, room_id: str) -> None:
         """Mark a room's baseline invalid from this moment on."""
         self._sliding_room_prev_batch.pop(room_id, None)
-        self._sliding_verified_membership_event_ids.pop(room_id, None)
 
     def _apply_sliding_prev_batches(
         self,
@@ -1555,12 +1541,6 @@ class AsyncClient(Client):
                 self._reset_sliding_room(room_id)
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
-            if token.membership_event_id is None:
-                self._sliding_verified_membership_event_ids.pop(room_id, None)
-            else:
-                self._sliding_verified_membership_event_ids[room_id] = (
-                    token.membership_event_id
-                )
 
     def _forget_sliding_window_token(self, room_id: str) -> None:
         """Drop a room's walk baseline once we are no longer in it.
@@ -1581,28 +1561,29 @@ class AsyncClient(Client):
         send_request: Callable[[], Coroutine[Any, Any, _RoomMembershipResponseT]],
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
-        task = asyncio.current_task()
-        if task is not None and task is self._event_callback_task.get():
+        if (
+            self.config.backfill_limited_timelines
+            and self._event_callback_task.get() is not None
+        ):
             raise LocalProtocolError(
-                "Room membership changes cannot run from an event callback; "
-                "schedule the operation in a separate task."
+                "Room membership changes cannot run from an event callback."
             )
         response = await send_request()
         if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
             return response
 
-        while True:
-            generation = self._sync_generation
-            async with generation.request_lock:
-                if generation is not self._sync_generation:
-                    continue
-                async with self._recovery_room_state((room_id,)):
-                    await drain_recovery_room_dispatches(
-                        self._recovery,
-                        (room_id,),
-                    )
-                    self._forget_sliding_window_token(room_id)
-                return response
+        if not self.config.backfill_limited_timelines:
+            self._forget_sliding_window_token(room_id)
+            return response
+
+        async with self._sync_response_lock:
+            async with self._recovery_room_state((room_id,)):
+                await drain_recovery_room_dispatches(
+                    self._recovery,
+                    (room_id,),
+                )
+                self._forget_sliding_window_token(room_id)
+        return response
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
@@ -2531,42 +2512,43 @@ class AsyncClient(Client):
         """
 
         self._raise_on_sync_reentry()
-        sync_token = since or self.next_batch or self.loaded_sync_token or None
         presence = set_presence or self._presence
-        method, path = Api.sync(
-            self.access_token,
-            since=sync_token,
-            timeout=(
-                int(self.config.request_timeout) * 1000
-                if timeout is None
-                else timeout or None
-            ),
-            filter=sync_filter,
-            full_state=full_state,
-            set_presence=presence,
-        )
 
-        generation = self._sync_generation
-        async with generation.request_lock:
-            generation_token = self._sync_request_generation.set(generation)
-            try:
-                response = await self._send(
-                    SyncResponse,
-                    method,
-                    path,
-                    # 0 if full_state: server doesn't respect timeout if full_state
-                    # + 15: give server a chance to naturally return before we timeout
+        while True:
+            generation = self._sync_generation
+            async with generation.request_lock:
+                if generation is not self._sync_generation:
+                    continue
+                sync_token = since or self.next_batch or self.loaded_sync_token or None
+                method, path = Api.sync(
+                    self.access_token,
+                    since=sync_token,
                     timeout=(
-                        0 if full_state else timeout / 1000 + 15 if timeout else timeout
+                        int(self.config.request_timeout) * 1000
+                        if timeout is None
+                        else timeout or None
                     ),
-                    sync_request_context=_SyncRequestContext(
-                        sync_token,
-                    ),
+                    filter=sync_filter,
+                    full_state=full_state,
+                    set_presence=presence,
                 )
-            finally:
-                self._sync_request_generation.reset(generation_token)
-
-        return response
+                generation_token = self._sync_request_generation.set(generation)
+                try:
+                    return await self._send(
+                        SyncResponse,
+                        method,
+                        path,
+                        # 0 if full_state: server doesn't respect timeout if full_state
+                        # + 15: give server a chance to naturally return before we timeout
+                        timeout=(
+                            0
+                            if full_state
+                            else timeout / 1000 + 15 if timeout else timeout
+                        ),
+                        sync_request_context=_SyncRequestContext(sync_token),
+                    )
+                finally:
+                    self._sync_request_generation.reset(generation_token)
 
     @logged_in_async
     async def sliding_sync(
@@ -4514,8 +4496,8 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
 
         Raises:
-            LocalProtocolError: If directly awaited by an event callback.
-                Schedule it in a separate task from the callback instead.
+            LocalProtocolError: If called from an event callback context while
+                limited-timeline recovery is enabled.
         """
         method, path = Api.room_leave(self.access_token, room_id)
 
@@ -4541,8 +4523,8 @@ class AsyncClient(Client):
             room_id (str): The room id of the room to forget.
 
         Raises:
-            LocalProtocolError: If directly awaited by an event callback.
-                Schedule it in a separate task from the callback instead.
+            LocalProtocolError: If called from an event callback context while
+                limited-timeline recovery is enabled.
         """
         method, path = Api.room_forget(self.access_token, room_id)
 

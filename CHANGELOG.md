@@ -26,15 +26,21 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
-- Report a restarted limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched current membership proof, while treating an own-join timeline event as a proven continuity boundary.
+- Report a known limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched exact current own-membership proof.
+  Fresh rooms without a prior baseline are not reported as lost, and historical joins outside `num_live` do not suppress a real gap.
 - Add `AsyncClient.add_event_admission_callback()` as a pre-fanout durable admission boundary.
+  Exactly one admission owner may be registered so durable side effects cannot be partially accepted by multiple callbacks.
   `CallbackNotAcceptedError` is valid only there and keeps the event pending when raised before acceptance or side effects.
   The same exception from an ordinary callback is too late to reject and has ordinary error behavior.
   Ordinary live callback errors acknowledge the event once, while ordinary recovered-history errors leave it pending for a later pump or restart.
-- Drain started room callback work before a membership reset clears recovery state, abort the reset when that callback fails, and apply successful leave or forget invalidation exactly once after its network request.
-  Directly awaiting `room_leave()` or `room_forget()` from an event callback now raises before sending the request; schedule the membership operation in a separate task instead.
+- Drain started room callback work before computing the response plan that replaces room recovery state.
+  This prevents a stale pre-drain plan from restoring an event whose callback already finished.
+- Apply successful leave or forget invalidation under response serialization without waiting for an in-flight sync long poll.
+  Recovery-enabled membership changes called from a direct or inherited event-callback context raise before network I/O, while default recovery-disabled behavior remains uncoordinated.
+- Serialize implicit Classic Sync cursor selection with its request so concurrent calls cannot send the same stale `since` token.
 - Prevent a sync request from retrying or creating a new HTTP session after `close()` replaces its client generation.
-- Preserve caller Sliding Sync list ranges when the initial recovery seed range is added.
+- Preserve tuple or list caller Sliding Sync ranges when the initial recovery seed range is added.
+- Require every `SlidingWindowToken` to carry a non-empty own-membership event ID matching its non-null database column.
 - Document that recovery-aware `close()` cannot run from a timeline callback; stop the sync loop there and await `close()` from its owner after the loop exits.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
