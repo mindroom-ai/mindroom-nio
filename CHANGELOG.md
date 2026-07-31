@@ -10,9 +10,9 @@ All notable changes to this project will be documented in this file.
   0.31.0 held the walk baseline in memory, which left the first limited or initial window after a restart unrecoverable — the one case the `/v3/sync` transport had always covered through its stored sync token.
   Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
   Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
-  Servers without `$ME` support retain an unverified baseline only for the current run, while a post-restart discontinuity is reported as unrecovered.
-  Sync-family requests are serialized through response application within one replaceable client generation, so every unique response is delivered without stale shared-state regression and a late pre-close response cannot mutate reused client state.
-  The serialization includes the long poll, so multiple sync connections on one client do not overlap and latency-sensitive independent connections need separate clients.
+  Servers without `$ME` support provide no trusted initial membership proof, so nio retains no baseline and reports later known discontinuities as unrecovered.
+  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap and a monotonic per-room issuance floor rejects stale room effects.
+  Sync-family response application remains serialized within one replaceable client generation, so every accepted response slice is delivered once and a late pre-close response cannot mutate reused client state.
   Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
   This migrates the store from schema v3 to v5, safely discards unscoped v4 token rows, and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
@@ -41,10 +41,7 @@ All notable changes to this project will be documented in this file.
 - Prevent a sync request from retrying or creating a new HTTP session after `close()` replaces its client generation.
 - Preserve tuple or list caller Sliding Sync ranges when the initial recovery seed range is added.
 - Require every `SlidingWindowToken` to carry a non-empty own-membership event ID matching its non-null database column.
-- Document that recovery-aware `close()` cannot run from a timeline callback; stop the sync loop there and await `close()` from its owner after the loop exits.
-- Dispatch live timeline events before walking a limited-timeline gap, so a
-  slow or retrying history backfill cannot delay new-message callbacks.
-  Recovered history still follows in its durable per-room lane.
+- Document that `close()` cannot run from a sync-loop timeline callback; stop the sync loop there and await `close()` from its owner after the loop exits.
 - Retain one keyed task for a recovered callback that outlives its pump deadline, then durably finish it before client shutdown so started callback side effects are neither cancelled nor replayed after restart.
 
 ## 0.32.0

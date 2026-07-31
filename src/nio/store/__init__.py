@@ -14,6 +14,7 @@ isort:skip_file
 """
 
 from .._compat import package_installed
+from ..sliding_sync_tokens import SlidingWindowToken
 
 if package_installed("vodozemac"):
     from .log import logger

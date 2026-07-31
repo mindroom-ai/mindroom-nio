@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
-PendingEventKind = Literal["timeline", "ephemeral", "account_data", "boundary"]
+PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
 _DispatchResult = Event | BadEventType | EphemeralEvent | AccountDataEvent | None
 DispatchEvent = Callable[
     [
@@ -123,8 +123,6 @@ class PendingTimelineEvent:
     def parse(
         self,
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent:
-        if self.kind == "boundary":
-            raise ValueError("Boundary markers cannot be parsed as events")
         source = json.loads(self.source_json)
         if self.kind == "ephemeral":
             event = EphemeralEvent.parse_event(source)
@@ -263,8 +261,6 @@ async def _run_dispatch(
     key: _DispatchKey,
     dispatch_event: DispatchEvent,
     event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
-    *,
-    retain_boundary: bool,
 ) -> _LiveCallbackError | None:
     error: _LiveCallbackError | None = None
     try:
@@ -304,7 +300,6 @@ async def _run_dispatch(
                     current_gap,
                     current_pending,
                     was_encrypted,
-                    retain_boundary=retain_boundary,
                 )
             except Exception as finish_error:
                 raise _DispatchFinishError(finish_error) from finish_error
@@ -553,7 +548,7 @@ def _plan_room_reset(
         event
         for gap in gaps
         for event in state.events.get((room_id, gap.generation), ())
-        if event.is_live and event.kind != "boundary"
+        if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
     unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
@@ -650,7 +645,7 @@ def plan_room_timeline(
             )
         )
     held_count = sum(
-        event.is_live and event.kind != "boundary"
+        event.is_live
         for gap in existing
         for event in state.events.get((room_id, gap.generation), ())
     )
@@ -872,33 +867,13 @@ def _finish(
     gap: RecoveryGap,
     event: PendingTimelineEvent | None = None,
     was_encrypted: bool = False,
-    *,
-    retain_boundary: bool = False,
 ) -> None:
-    # Keep the oldest live ID as the durable gap anchor; later live rows use
-    # completed-event deduplication instead of adding more boundary markers.
-    boundary = (
-        PendingTimelineEvent(
-            gap.room_id,
-            gap.generation,
-            event.sequence,
-            f"~boundary:{gap.generation}",
-            event.event_id,
-            True,
-            False,
-            kind="boundary",
-        )
-        if event and retain_boundary
-        else None
-    )
     if store:
-        kwargs = {"boundary": boundary} if boundary else {}
         store.finish_recovery(
             gap.room_id,
             gap.generation,
             event.event_id if event else None,
             was_encrypted,
-            **kwargs,
         )
     key = (gap.room_id, gap.generation)
     if event:
@@ -907,9 +882,6 @@ def _finish(
             record_completed_timeline_event(
                 state, gap.room_id, event.event_id, was_encrypted
             )
-        if boundary:
-            state.events[key].append(boundary)
-            state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
         return
     state.events.pop(key, None)
     gaps = state.gaps[gap.room_id]
@@ -941,14 +913,7 @@ async def _collect_slice(
         if event_room == gap.room_id and generation > 0
         for event in queued
     ]
-    # A boundary row's synthetic event ID identifies the durable marker, while
-    # source_json is the already-dispatched live event anchoring the gap. Use
-    # that anchor for overlap deduplication even after the completed-ID cache
-    # evicts it; skipping the anchor must not stop the rest of the page.
-    pending_ids = {
-        event.source_json if event.kind == "boundary" else event.event_id
-        for event in pending
-    }
+    pending_ids = {event.event_id for event in pending}
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:
@@ -1099,18 +1064,12 @@ async def _drain_gap(
     dispatch_event: DispatchEvent,
     store: MatrixStore | None,
     deadline: float | None,
-    live_timeline_only: bool = False,
 ) -> None:
-    if gap.cursor_token is not None and not live_timeline_only:
+    if gap.cursor_token is not None:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
         callback_error: Exception | None = None
-        if live_timeline_only and (not pending.is_live or pending.kind != "timeline"):
-            continue
-        if pending.kind == "boundary":
-            _finish(state, store, gap, pending)
-            continue
         try:
             event = pending.parse()
         except Exception:
@@ -1138,8 +1097,6 @@ async def _drain_gap(
                         key,
                         dispatch_event,
                         event,
-                        retain_boundary=live_timeline_only
-                        and not any(item.kind == "boundary" for item in queued),
                     )
                 )
                 # A timeout must stop waiting without cancelling callbacks that
@@ -1187,8 +1144,7 @@ async def _drain_gap(
         if callback_error is not None:
             raise callback_error
 
-    if not live_timeline_only:
-        _finish(state, store, gap)
+    _finish(state, store, gap)
 
 
 async def pump_recovery(
@@ -1205,21 +1161,9 @@ async def pump_recovery(
         raise state._deferred_dispatch_errors.pop(0)
     if ready_room_id is not None:
         gaps = state.gaps.get(ready_room_id)
-        if not gaps:
-            return
-        room_ids = [ready_room_id]
-        for gap in gaps:
-            await _drain_gap(
-                state,
-                gap,
-                dispatch_event=dispatch_event,
-                store=store,
-                deadline=None,
-                live_timeline_only=True,
-            )
-        gaps = state.gaps.get(ready_room_id)
         if not gaps or gaps[0].cursor_token is not None:
             return
+        room_ids = [ready_room_id]
     else:
         room_ids = list(state.gaps)
     if not room_ids:
