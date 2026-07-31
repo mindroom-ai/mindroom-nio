@@ -115,6 +115,7 @@ from ..responses import (
     DeleteDevicesResponse,
     DeletePushRuleError,
     DeletePushRuleResponse,
+    DeviceOneTimeKeyCount,
     DevicesError,
     DevicesResponse,
     DirectRoomsErrorResponse,
@@ -284,9 +285,11 @@ from .sync_recovery import (
     would_plan_real_gap,
 )
 from .sync_reset_fence import (
+    SyncRequestId,
     SyncResetFence,
     accept_current_account_data,
     accept_current_components,
+    accept_current_one_time_key_count,
     accept_reset_safe_rooms,
     finish_sync_request,
     issue_sync_request,
@@ -326,14 +329,14 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _SyncRequestContext:
     request_since: str | None
-    request_id: int | None
+    request_id: SyncRequestId | None
 
 
 @dataclass(frozen=True)
 class _SyncResponseEnvelope:
     response: SyncResponse | SlidingSyncResponse
     request_since: str | None
-    request_id: int | None
+    request_id: SyncRequestId | None
 
 
 @dataclass(frozen=True)
@@ -496,8 +499,9 @@ class AsyncClientConfig(ClientConfig):
             Requests carrying to-device messages serialize their shared device
             cursor. Classic and Sliding Sync cannot both consume that stream in
             one client generation because their cursor formats are incompatible.
-            Late room snapshots and same-type account-data deltas cannot
-            rewind newer state; their unseen timeline events still fan out.
+            Within one ordered sync stream, late room snapshots and same-type
+            account-data deltas cannot rewind newer state.
+            Independent streams apply their deltas in response-arrival order.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
             Both transports recover: /v3/sync walks from the token the sync
             continued from, Simplified Sliding Sync between consecutive
@@ -656,7 +660,7 @@ class AsyncClient(Client):
         self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
             f"nio_sync_request_generation_{id(self)}", default=None
         )
-        self._sync_request_id: ContextVar[int | None] = ContextVar(
+        self._sync_request_id: ContextVar[SyncRequestId | None] = ContextVar(
             f"nio_sync_request_id_{id(self)}", default=None
         )
         self._sync_reset_fence = SyncResetFence()
@@ -1000,7 +1004,6 @@ class AsyncClient(Client):
         if not admission_accepted and self.event_admission_callback is not None:
             try:
                 await self._on_event_admission(event, room)
-                mark_admission_accepted()
             except CallbackNotAcceptedError as error:
                 raise _LiveCallbackError(
                     error,
@@ -1011,6 +1014,14 @@ class AsyncClient(Client):
                 raise _LiveCallbackError(
                     error,
                     isinstance(event, MegolmEvent),
+                ) from error
+            try:
+                mark_admission_accepted()
+            except Exception as error:
+                raise _LiveCallbackError(
+                    error,
+                    isinstance(event, MegolmEvent),
+                    accepted=False,
                 ) from error
         try:
             await self._on_event(event, room)
@@ -2103,6 +2114,10 @@ class AsyncClient(Client):
     def _raise_on_sync_reentry(self) -> None:
         if not self.config.backfill_limited_timelines:
             return
+        if is_recovery_dispatch_task(self._recovery, asyncio.current_task()):
+            raise LocalProtocolError(
+                "Sync-family requests cannot run from a timeline callback."
+            )
         inherited = self._sync_executor_context.get()
         if inherited is not None and inherited is self._active_sync_executor_token:
             raise LocalProtocolError(
@@ -2132,8 +2147,18 @@ class AsyncClient(Client):
     def _ordered_response_view(
         self,
         response: SyncResponse | SlidingSyncResponse,
-        request_id: int | None,
+        request_id: SyncRequestId | None,
     ) -> _OrderedResponseView:
+        accept_one_time_key_count = accept_current_one_time_key_count(
+            self._sync_reset_fence,
+            present=response.device_key_count.signed_curve25519 is not None,
+            request_id=request_id,
+        )
+        if not accept_one_time_key_count:
+            response = replace(
+                response,
+                device_key_count=DeviceOneTimeKeyCount(None, None),
+            )
         accepted = accept_reset_safe_rooms(
             self._sync_reset_fence,
             self._response_room_ids(response),
@@ -2893,7 +2918,7 @@ class AsyncClient(Client):
 
         async def send_sync(
             sync_token: str | None,
-            request_id: int | None,
+            request_id: SyncRequestId | None,
         ) -> SyncResponse | SyncError:
             method, path = Api.sync(
                 self.access_token,
@@ -2932,7 +2957,10 @@ class AsyncClient(Client):
                 if generation is not self._sync_generation:
                     continue
                 sync_token = since or self.next_batch or self.loaded_sync_token or None
-                request_id = issue_sync_request(self._sync_reset_fence)
+                request_id = issue_sync_request(
+                    self._sync_reset_fence,
+                    "classic",
+                )
                 generation_token = self._sync_request_generation.set(generation)
                 request_id_token = self._sync_request_id.set(request_id)
                 try:
@@ -2990,7 +3018,7 @@ class AsyncClient(Client):
         presence = set_presence or self._presence
 
         async def send_sliding(
-            request_id: int | None,
+            request_id: SyncRequestId | None,
             recovery_enabled: bool,
         ) -> SlidingSyncResponse | SlidingSyncError:
             method, path, data = Api.sliding_sync(
@@ -3052,7 +3080,10 @@ class AsyncClient(Client):
             ):
                 if generation is not self._sync_generation:
                     continue
-                request_id = issue_sync_request(self._sync_reset_fence)
+                request_id = issue_sync_request(
+                    self._sync_reset_fence,
+                    ("sliding", conn_id),
+                )
                 generation_token = self._sync_request_generation.set(generation)
                 request_id_token = self._sync_request_id.set(request_id)
                 scope_token = self._sliding_request_scope.set(uuid4().hex)

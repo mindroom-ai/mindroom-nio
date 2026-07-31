@@ -1044,6 +1044,68 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_admission_marker_failure_keeps_event_redispatchable(
+        self, tempdir, monkeypatch, protocol
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        original_accept = client.store.accept_recovery_event
+        fail_marker = True
+        calls: list[str] = []
+
+        def accept_recovery_event(room_id, generation, event_id):
+            nonlocal fail_marker
+            if fail_marker:
+                fail_marker = False
+                raise OSError("admission marker unavailable")
+            original_accept(room_id, generation, event_id)
+
+        async def admit(_room, event):
+            calls.append(f"admit:{event.event_id}")
+
+        async def ordinary(_room, event):
+            calls.append(f"ordinary:{event.event_id}")
+
+        monkeypatch.setattr(
+            client.store,
+            "accept_recovery_event",
+            accept_recovery_event,
+        )
+        client.add_event_admission_callback(admit, RoomMessageText)
+        client.add_event_callback(ordinary, RoomMessageText)
+        response = timeline_response(protocol, "s1", [text_event("$retry", 1)])
+
+        with pytest.raises(OSError, match="admission marker unavailable"):
+            await client.receive_response(response)
+
+        assert calls == ["admit:$retry"]
+        assert any(
+            pending.event_id == "$retry"
+            for pending_events in client._recovery.events.values()
+            for pending in pending_events
+        )
+
+        await client.receive_response(response)
+
+        assert calls == [
+            "admit:$retry",
+            "admit:$retry",
+            "ordinary:$retry",
+        ]
+        assert not client._recovery.gaps
+        await client.close()
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_untyped_admission_failure_does_not_replay_live_event(
         self, client, protocol
     ):
@@ -1707,6 +1769,73 @@ class TestRoomLocalRecovery:
         assert failures == ["Sync-family requests cannot run from a timeline callback."]
         assert seen == ["$outer", "$suffix"]
         assert client.next_batch == ("outer" if outer_protocol == "classic" else "")
+
+    async def test_retained_callback_sync_reentry_fails_after_executor_clears(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_timeout=0.02,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+        failures: list[str] = []
+
+        async def unexpected_send(*_args, **_kwargs):
+            raise AssertionError("retained callback reentry must fail before HTTP")
+
+        async def fetch_messages(*_args, **_kwargs):
+            return RoomMessagesResponse.from_dict(
+                {"start": "previous", "end": "target", "chunk": []},
+                ROOM_A,
+            )
+
+        async def callback(_room, event):
+            callback_started.set()
+            await release_callback.wait()
+            try:
+                await client.sync(since="nested")
+            except LocalProtocolError as error:
+                failures.append(str(error))
+
+        monkeypatch.setattr(client, "_send", unexpected_send)
+        monkeypatch.setattr(client, "_recovery_room_messages", fetch_messages)
+        client.add_event_callback(callback, RoomMessageText)
+        client.next_batch = "previous"
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "outer",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$outer", 1)],
+                            limited=True,
+                            prev_batch="target",
+                        )
+                    },
+                )
+            )
+        )
+
+        try:
+            await callback_started.wait()
+            await asyncio.wait_for(response_task, 1)
+            assert client._active_sync_executor_token is None
+            assert client._recovery._active_dispatches
+        finally:
+            release_callback.set()
+        await client._pump_sync_recovery()
+
+        assert failures == ["Sync-family requests cannot run from a timeline callback."]
+        assert not client._recovery.gaps
+        await client.close()
 
     async def test_callback_close_reentry_fails_before_session_close(self, client):
         failures: list[str] = []
@@ -3702,7 +3831,7 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
         await client.close()
 
-    async def test_out_of_order_sliding_connections_preserve_events_without_rewind(
+    async def test_independent_sliding_connections_apply_deltas_in_arrival_order(
         self, tempdir, monkeypatch
     ):
         config = AsyncClientConfig(
@@ -3897,16 +4026,17 @@ class TestRoomLocalRecovery:
 
         assert reverse_walks == []
         assert not client._recovery.gaps
-        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
-        assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w2")}
-        assert client.rooms[ROOM_A].name == "newer room"
-        assert "@surface:example.org" in client.rooms[ROOM_A].users
+        expected_window = window_token("w1", "$stale-own-membership")
+        assert client._sliding_room_prev_batch == {ROOM_A: expected_window}
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: expected_window}
+        assert client.rooms[ROOM_A].name == "older room"
+        assert "@surface:example.org" not in client.rooms[ROOM_A].users
         assert client.rooms[ROOM_A].encrypted
-        assert client.invited_rooms[ROOM_B].name == "newer invite"
-        assert invite_names == ["newer invite"]
+        assert client.invited_rooms[ROOM_B].name == "older invite"
+        assert invite_names == ["newer invite", "older invite"]
         assert seen == ["$newer", "$older"]
-        assert global_values == ["newer", "older-extra"]
-        assert room_markers == ["$newer-read"]
+        assert global_values == ["newer", "older", "older-extra"]
+        assert room_markers == ["$newer-read", "$older-read"]
         assert room_extras == ["older-room-extra"]
         assert to_device_values == ["newer", "older"]
         assert client._sliding_sync_to_device_since == "newer-to-device"
@@ -3917,7 +4047,123 @@ class TestRoomLocalRecovery:
         assert client._sync_reset_fence.to_device_floor == 0
         await client.close()
 
-    async def test_late_sliding_response_cannot_rewind_newer_classic_state(
+    async def test_independent_sliding_connections_keep_same_type_deltas(
+        self, client, monkeypatch
+    ):
+        lower_started = asyncio.Event()
+        release_lower = asyncio.Event()
+        values: list[str] = []
+
+        async def account_data_callback(event):
+            values.append(event.source["content"]["value"])
+
+        def response(label):
+            value = SlidingSyncResponse.from_dict(
+                {
+                    "pos": label,
+                    "rooms": {},
+                    "extensions": {
+                        "account_data": {
+                            "global": [
+                                {
+                                    "content": {"value": label},
+                                    "type": "org.example.settings",
+                                }
+                            ]
+                        }
+                    },
+                }
+            )
+            assert isinstance(value, SlidingSyncResponse)
+            return value
+
+        async def send(*args, **_kwargs):
+            request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
+            if request_pos == "lower":
+                lower_started.set()
+                await release_lower.wait()
+            value = response(request_pos)
+            await client.receive_response(value)
+            return value
+
+        client.add_global_account_data_callback(
+            account_data_callback,
+            UnknownAccountDataEvent,
+        )
+        monkeypatch.setattr(client, "_send", send)
+
+        lower = asyncio.create_task(client.sliding_sync(conn_id="lower", pos="lower"))
+        await lower_started.wait()
+        await client.sliding_sync(conn_id="higher", pos="higher")
+        release_lower.set()
+        await lower
+
+        assert values == ["higher", "lower"]
+
+    async def test_older_sliding_response_cannot_rewind_one_time_key_count(
+        self, client, monkeypatch
+    ):
+        lower_started = asyncio.Event()
+        release_lower = asyncio.Event()
+        uploaded_key_count = 50
+
+        async def no_expired_verifications():
+            pass
+
+        async def no_key_requests():
+            pass
+
+        def handle_olm(response):
+            nonlocal uploaded_key_count
+            count = response.device_key_count.signed_curve25519
+            if count is not None:
+                uploaded_key_count = count
+
+        def response(label, count):
+            value = SlidingSyncResponse.from_dict(
+                {
+                    "pos": label,
+                    "rooms": {},
+                    "extensions": {
+                        "e2ee": {
+                            "device_one_time_keys_count": {"signed_curve25519": count}
+                        }
+                    },
+                }
+            )
+            assert isinstance(value, SlidingSyncResponse)
+            return value
+
+        async def send(*args, **_kwargs):
+            request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
+            if request_pos == "lower":
+                lower_started.set()
+                await release_lower.wait()
+                value = response("lower", 50)
+            else:
+                value = response("higher", 0)
+            await client.receive_response(value)
+            return value
+
+        client.olm = object()
+        monkeypatch.setattr(
+            client,
+            "_handle_expired_verifications",
+            no_expired_verifications,
+        )
+        monkeypatch.setattr(client, "_collect_key_requests", no_key_requests)
+        monkeypatch.setattr(client, "_handle_olm_events", handle_olm)
+        monkeypatch.setattr(client, "_send", send)
+
+        lower = asyncio.create_task(client.sliding_sync(conn_id="lower", pos="lower"))
+        await lower_started.wait()
+        await client.sliding_sync(conn_id="higher", pos="higher")
+        release_lower.set()
+        await lower
+
+        assert uploaded_key_count == 0
+
+    async def test_independent_transport_deltas_apply_in_arrival_order(
         self, tempdir, monkeypatch
     ):
         client = AsyncClient(
@@ -3980,11 +4226,11 @@ class TestRoomLocalRecovery:
 
         assert seen == ["$newer", "$older"]
         assert names == ["older timeline"]
-        assert client.rooms[ROOM_A].name == "newer room"
-        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w0")}
+        assert client.rooms[ROOM_A].name == "older timeline"
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
         await client.close()
 
-    async def test_stale_initial_historical_join_cannot_clear_newer_gap(
+    async def test_independent_initial_snapshot_does_not_clear_existing_gap(
         self, tempdir, monkeypatch
     ):
         client = AsyncClient(
@@ -4036,10 +4282,10 @@ class TestRoomLocalRecovery:
         await older
 
         assert client._recovery.gaps[ROOM_A][0].target_token == "w2"
-        assert client._sliding_room_prev_batch[ROOM_A] == window_token("w2")
+        assert client._sliding_room_prev_batch[ROOM_A] == window_token("w1")
         await client.close()
 
-    async def test_late_classic_leave_cannot_clear_newer_sliding_baseline(
+    async def test_independent_classic_leave_clears_sliding_baseline_on_arrival(
         self, tempdir, monkeypatch
     ):
         client = AsyncClient(
@@ -4083,7 +4329,7 @@ class TestRoomLocalRecovery:
         release_older.set()
         await older
 
-        assert client._sliding_room_prev_batch[ROOM_A] == window_token("w2")
+        assert ROOM_A not in client._sliding_room_prev_batch
         assert ROOM_A in client.rooms
         await client.close()
 
@@ -4448,7 +4694,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$a1", "$b1", "$b2", "$a2"]
         await client.close()
 
-    async def test_overlapping_connections_cannot_reverse_shared_room_baseline(
+    async def test_independent_connections_update_shared_baseline_on_arrival(
         self, tempdir, monkeypatch
     ):
         client = AsyncClient(
@@ -4505,7 +4751,7 @@ class TestRoomLocalRecovery:
         await first
         await client.sliding_sync(conn_id="probe")
 
-        assert walk_starts == ["w2"]
+        assert walk_starts == ["w1"]
         assert client._sliding_room_prev_batch == {
             ROOM_A: window_token("w3"),
         }
@@ -4683,7 +4929,7 @@ class TestRoomLocalRecovery:
         assert client._sync_generation.sliding_request_locks == {}
         await client.close()
 
-    async def test_out_of_order_sliding_membership_does_not_clear_newer_gap(
+    async def test_independent_sliding_membership_delta_clears_existing_gap(
         self, tempdir, monkeypatch
     ):
         config = AsyncClientConfig(backfill_limited_timelines=True)
@@ -4729,8 +4975,8 @@ class TestRoomLocalRecovery:
         release_older.set()
         await older
 
-        assert client._recovery.gaps[ROOM_A][0].target_token == "w2"
-        assert client._sliding_room_prev_batch[ROOM_A] == window_token("w2")
+        assert ROOM_A not in client._recovery.gaps
+        assert ROOM_A not in client._sliding_room_prev_batch
         await client.close()
 
     async def test_sliding_retry_stays_in_one_request_generation(
