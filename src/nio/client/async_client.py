@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import sys
 import warnings
 from asyncio import Event as AsyncioEvent
 from collections.abc import (
@@ -358,7 +359,7 @@ async def _run_to_completion(
         result = task.result()
     except BaseException:
         caller = asyncio.current_task()
-        if caller is not None:
+        if caller is not None and sys.version_info >= (3, 11):
             for _ in range(cancellations):
                 caller.uncancel()
         raise

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import sys
 from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -5069,6 +5070,8 @@ class TestRoomLocalRecovery:
         async def run():
             with pytest.raises(RuntimeError, match="owned failure"):
                 await async_client_module._run_to_completion(operation())
+            if sys.version_info < (3, 11):
+                return None
             task = asyncio.current_task()
             assert task is not None
             return task.cancelling()
@@ -5081,7 +5084,8 @@ class TestRoomLocalRecovery:
         await asyncio.sleep(0)
         release.set()
 
-        assert await task == 0
+        expected_cancellations = 0 if sys.version_info >= (3, 11) else None
+        assert await task == expected_cancellations
 
     async def test_rejected_leave_does_not_affect_in_flight_response(
         self, tempdir, monkeypatch
