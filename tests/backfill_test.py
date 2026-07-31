@@ -5281,6 +5281,105 @@ class TestRoomLocalRecovery:
         assert generations[0] is generations[1]
         await client.close()
 
+    async def test_sliding_retry_after_membership_reset_accepts_fresh_room(
+        self, tempdir, monkeypatch
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+            max_limit_exceeded=1,
+        )
+        client = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        def response(
+            pos: str,
+            membership_event_id: str,
+            room_name: str,
+            event_id: str,
+            prev_batch: str,
+        ) -> SlidingSyncResponse:
+            value = SlidingSyncResponse.from_dict(
+                {
+                    "pos": pos,
+                    "rooms": {
+                        ROOM_A: {
+                            "membership": "join",
+                            "initial": True,
+                            "limited": False,
+                            "prev_batch": prev_batch,
+                            "num_live": 1,
+                            "required_state": [
+                                member_event(
+                                    membership_event_id,
+                                    0,
+                                    "join",
+                                ).source,
+                                name_event(
+                                    f"${room_name.lower()}-name",
+                                    1,
+                                    room_name,
+                                ).source,
+                            ],
+                            "timeline": [text_event(event_id, 2).source],
+                        }
+                    },
+                }
+            )
+            assert isinstance(value, SlidingSyncResponse)
+            return value
+
+        await client.receive_response(response("seed", "$join1", "Old", "$seed", "w1"))
+        seen = record_events(client)
+        sliding_attempts = 0
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(_method, path, *_args, **_kwargs):
+            nonlocal sliding_attempts
+            if path.endswith("/leave"):
+                return Transport(200)
+            sliding_attempts += 1
+            return Transport(429 if sliding_attempts == 1 else 200)
+
+        async def create_matrix_response(*, response_class, **_kwargs):
+            if response_class is RoomLeaveResponse:
+                return RoomLeaveResponse.from_dict({})
+            if sliding_attempts == 1:
+                return SlidingSyncError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry",
+                        "retry_after_ms": 1,
+                    }
+                )
+            return response("s2", "$join2", "New", "$new", "w2")
+
+        async def leave_on_retry(_responses):
+            result = await client.room_leave(ROOM_A)
+            assert isinstance(result, RoomLeaveResponse)
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+        monkeypatch.setattr(client, "run_response_callbacks", leave_on_retry)
+
+        result = await client.sliding_sync(conn_id="main", pos="s1")
+
+        expected_token = window_token("w2", "$join2")
+        assert result.pos == "s2"
+        assert seen == ["$new"]
+        assert client.rooms[ROOM_A].name == "New"
+        assert client._sliding_room_prev_batch == {ROOM_A: expected_token}
+        assert client.store.load_sliding_window_tokens() == {
+            ROOM_A: expected_token
+        }
+        assert client._sync_reset_fence.active_request_ids == set()
+        await client.close()
+
     async def test_rejoin_in_the_timeline_discards_the_restored_token(
         self, tempdir, monkeypatch
     ):

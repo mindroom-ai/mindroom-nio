@@ -327,7 +327,7 @@ AsyncFileType = AsyncBufferedReader | AsyncTextIOWrapper
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _SyncRequestContext:
     request_since: str | None
     request_id: SyncRequestId | None
@@ -2158,6 +2158,21 @@ class AsyncClient(Client):
         generation = self._sync_request_generation.get()
         return generation is not None and generation is not self._sync_generation
 
+    def _refresh_sync_request_context(
+        self,
+        context: _SyncRequestContext | None,
+    ) -> None:
+        """Give a retried transport attempt a fresh ordering identity."""
+        if context is None or context.request_id is None:
+            return
+        previous = context.request_id
+        finish_sync_request(self._sync_reset_fence, previous)
+        context.request_id = issue_sync_request(
+            self._sync_reset_fence,
+            previous.stream,
+        )
+        self._sync_request_id.set(context.request_id)
+
     def _room_component_is_current(self, room_id: str) -> bool:
         current = self._current_response_room_ids.get()
         return current is None or room_id in current
@@ -2540,7 +2555,12 @@ class AsyncClient(Client):
         got_timeouts = 0
         max_timeouts = self.config.max_timeouts
 
+        first_attempt = True
         while True:
+            if first_attempt:
+                first_attempt = False
+            else:
+                self._refresh_sync_request_context(sync_request_context)
             if data_provider:
                 # mypy expects an "Awaitable[Any]" but data_provider is a
                 # method generated during runtime that may or may not be
@@ -2985,7 +3005,7 @@ class AsyncClient(Client):
 
         async def send_sync(
             sync_token: str | None,
-            request_id: SyncRequestId | None,
+            request_context: _SyncRequestContext | None,
         ) -> SyncResponse | SyncError:
             method, path = Api.sync(
                 self.access_token,
@@ -3008,7 +3028,7 @@ class AsyncClient(Client):
                 timeout=(
                     0 if full_state else timeout / 1000 + 15 if timeout else timeout
                 ),
-                sync_request_context=_SyncRequestContext(sync_token, request_id),
+                sync_request_context=request_context,
             )
 
         if not self.config.backfill_limited_timelines:
@@ -3024,18 +3044,27 @@ class AsyncClient(Client):
                 if generation is not self._sync_generation:
                     continue
                 sync_token = since or self.next_batch or self.loaded_sync_token or None
-                request_id = issue_sync_request(
-                    self._sync_reset_fence,
-                    "classic",
+                request_context = _SyncRequestContext(
+                    sync_token,
+                    issue_sync_request(
+                        self._sync_reset_fence,
+                        "classic",
+                    ),
                 )
                 generation_token = self._sync_request_generation.set(generation)
-                request_id_token = self._sync_request_id.set(request_id)
+                request_id_token = self._sync_request_id.set(
+                    request_context.request_id
+                )
                 try:
-                    return await send_sync(sync_token, request_id)
+                    return await send_sync(sync_token, request_context)
                 finally:
                     self._sync_request_id.reset(request_id_token)
                     self._sync_request_generation.reset(generation_token)
-                    finish_sync_request(self._sync_reset_fence, request_id)
+                    assert request_context.request_id is not None
+                    finish_sync_request(
+                        self._sync_reset_fence,
+                        request_context.request_id,
+                    )
 
     @logged_in_async
     async def sliding_sync(
@@ -3085,7 +3114,7 @@ class AsyncClient(Client):
         presence = set_presence or self._presence
 
         async def send_sliding(
-            request_id: SyncRequestId | None,
+            request_context: _SyncRequestContext | None,
             recovery_enabled: bool,
         ) -> SlidingSyncResponse | SlidingSyncError:
             method, path, data = Api.sliding_sync(
@@ -3121,11 +3150,7 @@ class AsyncClient(Client):
                 path,
                 data,
                 timeout=timeout / 1000 + 15 if timeout else timeout,
-                sync_request_context=(
-                    _SyncRequestContext(None, request_id)
-                    if request_id is not None
-                    else None
-                ),
+                sync_request_context=request_context,
             )
 
         if not self.config.backfill_limited_timelines:
@@ -3147,20 +3172,29 @@ class AsyncClient(Client):
             ):
                 if generation is not self._sync_generation:
                     continue
-                request_id = issue_sync_request(
-                    self._sync_reset_fence,
-                    ("sliding", conn_id),
+                request_context = _SyncRequestContext(
+                    None,
+                    issue_sync_request(
+                        self._sync_reset_fence,
+                        ("sliding", conn_id),
+                    ),
                 )
                 generation_token = self._sync_request_generation.set(generation)
-                request_id_token = self._sync_request_id.set(request_id)
+                request_id_token = self._sync_request_id.set(
+                    request_context.request_id
+                )
                 scope_token = self._sliding_request_scope.set(uuid4().hex)
                 try:
-                    return await send_sliding(request_id, True)
+                    return await send_sliding(request_context, True)
                 finally:
                     self._sliding_request_scope.reset(scope_token)
                     self._sync_request_id.reset(request_id_token)
                     self._sync_request_generation.reset(generation_token)
-                    finish_sync_request(self._sync_reset_fence, request_id)
+                    assert request_context.request_id is not None
+                    finish_sync_request(
+                        self._sync_reset_fence,
+                        request_context.request_id,
+                    )
 
     @logged_in_async
     async def send_to_device_messages(
