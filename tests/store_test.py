@@ -781,17 +781,24 @@ class TestClass:
 
     def test_sliding_window_tokens_chunk_large_batches(self, sqlstore):
         """More rooms than SQLite can bind in one statement still write."""
+        connection = sqlstore.database.connection()
+        if not hasattr(connection, "setlimit"):
+            pytest.skip("sqlite3.Connection.setlimit is unavailable")
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
         tokens = {
             f"!room{index}:example.org": SlidingWindowToken(
                 f"w{index}", f"$join{index}"
             )
             for index in range(750)
         }
-        sqlstore.save_sliding_window_tokens(tokens)
-        assert sqlstore.load_sliding_window_tokens() == tokens
+        try:
+            sqlstore.save_sliding_window_tokens(tokens)
+            assert sqlstore.load_sliding_window_tokens() == tokens
 
-        sqlstore.save_sliding_window_tokens({}, list(tokens)[:600])
-        assert len(sqlstore.load_sliding_window_tokens()) == 150
+            sqlstore.save_sliding_window_tokens({}, list(tokens)[:600])
+            assert len(sqlstore.load_sliding_window_tokens()) == 150
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
 
     def test_save_recovery_writes_window_tokens_in_one_transaction(
         self, sqlstore, monkeypatch

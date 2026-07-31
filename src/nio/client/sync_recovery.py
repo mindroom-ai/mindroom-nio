@@ -8,6 +8,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..api import MessageDirection
@@ -978,10 +979,9 @@ def _merge_recovery_page_order(
         for page_index, event in enumerate(page_events)
         if event.event_id in queued_indexes
     ]
-    if any(
-        previous[1] >= current[1]
-        for previous, current in zip(anchors, anchors[1:], strict=False)
-    ):
+    # Conflicting overlap order cannot be spliced safely. Insert only the
+    # page's new events at the normal recovered/live boundary instead.
+    if any(previous[1] >= current[1] for previous, current in pairwise(anchors)):
         page_events = [
             event for event in page_events if event.event_id not in queued_indexes
         ]
