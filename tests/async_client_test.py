@@ -2253,6 +2253,7 @@ class TestClass:
 
         old_loop = asyncio.create_task(client.sliding_sync_forever())
         await old_request_started.wait()
+        client.stop_sync_forever()
         await client.close()
         release_old_request.set()
         await asyncio.wait_for(old_loop, 1)

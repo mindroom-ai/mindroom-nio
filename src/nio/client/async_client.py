@@ -4150,6 +4150,7 @@ class AsyncClient(Client):
 
         self._closing = True
         self._sync_forever_generation += 1
+        self._stop_sync_forever = False
 
         async def finish_close() -> None:
             try:
