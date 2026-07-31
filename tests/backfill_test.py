@@ -40,6 +40,8 @@ from nio import (
     Rooms,
     SendRetryError,
     SlidingSyncResponse,
+    SlidingSyncRoom,
+    SlidingSyncStateStub,
     SyncResponse,
     Timeline,
     ToDeviceEvent,
@@ -8485,3 +8487,185 @@ class TestRecoveryOutcome:
             await task
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset()
+
+
+def own_member_event(
+    event_id: str,
+    membership: str = "join",
+    *,
+    prev_membership: str | None = None,
+    replaces_state: str | None = None,
+) -> RoomMemberEvent:
+    """Our own membership event, optionally linked to the one it replaces."""
+    unsigned: dict = {}
+    if prev_membership is not None:
+        unsigned["prev_content"] = {"membership": prev_membership}
+    if replaces_state is not None:
+        unsigned["replaces_state"] = replaces_state
+    source = {
+        "content": {"membership": membership},
+        "event_id": event_id,
+        "sender": OWN_ID,
+        "state_key": OWN_ID,
+        "origin_server_ts": 0,
+        "room_id": ROOM_A,
+        "type": "m.room.member",
+    }
+    if unsigned:
+        source["unsigned"] = unsigned
+    event = RoomMemberEvent.from_dict(source)
+    assert isinstance(event, RoomMemberEvent)
+    return event
+
+
+def proof_room(
+    *,
+    required_state: list | None = None,
+    timeline: list | None = None,
+    initial: bool = False,
+    num_live: int | None = None,
+) -> SlidingSyncRoom:
+    return SlidingSyncRoom(
+        membership="join",
+        initial=initial,
+        required_state=list(required_state or []),
+        timeline=list(timeline or []),
+        num_live=num_live,
+    )
+
+
+@pytest.mark.asyncio
+class TestSlidingMembershipProof:
+    """Direct coverage for the predicate guarding persisted walk baselines.
+
+    A wrong answer here lets a restarted client walk a room's history from a
+    token taken under a membership that has since ended.
+    """
+
+    @pytest.mark.parametrize(
+        ("held", "room", "expected"),
+        [
+            pytest.param(
+                None,
+                proof_room(required_state=[own_member_event("$leave", "leave")]),
+                None,
+                id="explicit_membership_loss_fails_closed",
+            ),
+            pytest.param(
+                None,
+                proof_room(required_state=[own_member_event("$m1")]),
+                "$m1",
+                id="no_held_baseline_accepts_current_membership",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(required_state=[own_member_event("$m1")]),
+                "$m1",
+                id="exact_match_with_held_baseline",
+            ),
+            pytest.param(
+                "$old",
+                proof_room(timeline=[own_member_event("$new")]),
+                "$new",
+                id="live_own_join_supersedes_mismatched_baseline",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(
+                    required_state=[
+                        own_member_event(
+                            "$m2", prev_membership="join", replaces_state="$m1"
+                        )
+                    ]
+                ),
+                "$m2",
+                id="linked_join_to_join_rotation",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(
+                    required_state=[
+                        own_member_event(
+                            "$m2", prev_membership="join", replaces_state="$other"
+                        )
+                    ]
+                ),
+                None,
+                id="rotation_replacing_a_different_event_fails_closed",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(
+                    required_state=[
+                        own_member_event(
+                            "$m2", prev_membership="invite", replaces_state="$m1"
+                        )
+                    ]
+                ),
+                None,
+                id="rotation_from_non_join_fails_closed",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(required_state=[own_member_event("$m2")]),
+                None,
+                id="required_state_join_alone_does_not_date_a_rejoin",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(
+                    required_state=[SlidingSyncStateStub("m.room.member", OWN_ID)]
+                ),
+                None,
+                id="unparsed_membership_stub_fails_closed",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(),
+                "$m1",
+                id="no_membership_delta_keeps_held_baseline",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(initial=True),
+                None,
+                id="initial_window_without_membership_proof_fails_closed",
+            ),
+            pytest.param(
+                None,
+                proof_room(),
+                None,
+                id="no_membership_delta_and_no_held_baseline",
+            ),
+            pytest.param(
+                "$m1",
+                proof_room(
+                    required_state=[own_member_event("$m2")],
+                    timeline=[own_member_event("$historical"), text_event("$t", 0)],
+                    initial=True,
+                    num_live=1,
+                ),
+                None,
+                id="historical_join_outside_num_live_is_not_a_live_join",
+            ),
+        ],
+    )
+    async def test_membership_proof(self, client, held, room, expected):
+        if held is not None:
+            client._sliding_room_prev_batch[ROOM_A] = window_token("w1", held)
+
+        assert client._sliding_membership_proof(ROOM_A, room) == expected
+
+    async def test_live_own_join_proves_membership_but_breaks_continuity(self, client):
+        """A rejoin dates the new membership yet invalidates the old baseline."""
+        client._sliding_room_prev_batch[ROOM_A] = window_token("w1", "$old")
+        room = proof_room(timeline=[own_member_event("$new")])
+
+        assert client._sliding_membership_proof(ROOM_A, room) == "$new"
+        assert client._sliding_membership_continues(ROOM_A, room) is False
+
+    async def test_unchanged_membership_continues(self, client):
+        client._sliding_room_prev_batch[ROOM_A] = window_token("w1", "$m1")
+        room = proof_room(required_state=[own_member_event("$m1")])
+
+        assert client._sliding_membership_continues(ROOM_A, room) is True
