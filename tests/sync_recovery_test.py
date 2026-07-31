@@ -36,7 +36,6 @@ from nio.responses import RoomMessagesResponse
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
-HELD_SEQUENCE_BASE = RecoveryState().max_held_events
 
 
 def event(event_id: str, ts: int, room_id: str = ROOM) -> RoomMessageText:
@@ -96,7 +95,7 @@ def pending(event_id: str, sequence: int) -> PendingTimelineEvent:
     value = PendingTimelineEvent.from_event(
         ROOM,
         1,
-        sequence + HELD_SEQUENCE_BASE if is_live else sequence,
+        sequence,
         event(event_id, sequence),
         is_live,
     )
@@ -343,7 +342,7 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
                 PendingTimelineEvent.from_event(
                     ROOM,
                     2,
-                    HELD_SEQUENCE_BASE,
+                    0,
                     event("$live2", 4),
                     True,
                 )
@@ -447,7 +446,7 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
     other_live = PendingTimelineEvent.from_event(
         ROOM_B,
         1,
-        HELD_SEQUENCE_BASE,
+        0,
         event("$other-live", 2, ROOM_B),
         True,
     )
@@ -1432,7 +1431,7 @@ async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
     held = PendingTimelineEvent.from_event(
         ROOM,
         1,
-        HELD_SEQUENCE_BASE,
+        0,
         event("$held", 3),
         True,
     )
