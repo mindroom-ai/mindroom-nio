@@ -11,10 +11,10 @@ All notable changes to this project will be documented in this file.
   Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
   Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
   Servers without `$ME` support provide no trusted initial membership proof, so nio retains no baseline and reports later known discontinuities as unrecovered.
-  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap and a monotonic per-room issuance floor rejects stale room effects.
+  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap and bounded per-room issuance floors reject stale snapshots and baselines without dropping unseen timeline events.
   Sync-family response application remains serialized within one replaceable client generation, so every accepted response slice is delivered once and a late pre-close response cannot mutate reused client state.
   Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
-  This migrates the store from schema v3 to v5, safely discards unscoped v4 token rows, and exports `SlidingWindowTokens` from `nio.store`.
+  This migrates the store from schema v3 to v6, safely discards unscoped v4 token rows, records durable event-admission acceptance, and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
   which follows `store_sync_tokens` as before, and can be set to True to
   persist recovery state while nio never reads or writes `next_batch`
@@ -35,6 +35,7 @@ All notable changes to this project will be documented in this file.
   Ordinary live callback errors acknowledge the event once, while ordinary recovered-history errors leave it pending for a later pump or restart.
 - Drain started room callback work before computing the response plan that replaces room recovery state.
   This prevents a stale pre-drain plan from restoring an event whose callback already finished.
+- Continue bounded forward recovery walks until the server exhausts the range instead of stopping when an event overlaps the live window.
 - Apply successful leave or forget invalidation under response serialization without waiting for an in-flight sync long poll.
   Recovery-enabled membership changes called from a direct or inherited event-callback context raise before network I/O, while default recovery-disabled behavior remains uncoordinated.
 - Serialize implicit Classic Sync cursor selection with its request so concurrent calls cannot send the same stale `since` token.

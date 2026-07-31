@@ -1109,6 +1109,25 @@ class TestRoomLocalRecovery:
         ):
             client.add_event_admission_callback(lambda _room, _event: None)
 
+    async def test_no_admission_owner_skips_durable_acceptance_marker(self, client):
+        marked = False
+
+        def mark():
+            nonlocal marked
+            marked = True
+
+        await client._dispatch_timeline_event(
+            ROOM_A,
+            text_event("$plain", 1),
+            True,
+            False,
+            "timeline",
+            False,
+            mark,
+        )
+
+        assert not marked
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_non_acceptance_from_event_fanout_does_not_replay(
         self, client, protocol
@@ -1852,6 +1871,63 @@ class TestRoomLocalRecovery:
         release_send.set()
         assert await send_task is sent
         await client.close()
+
+    async def test_response_drain_does_not_hold_room_gate_needed_by_callback_send(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(self._sliding("s1", []))
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+        callback_finished = asyncio.Event()
+        sent = object()
+
+        async def callback():
+            callback_started.set()
+            await release_callback.wait()
+            assert (
+                await client.room_send(
+                    ROOM_A,
+                    "m.room.message",
+                    {"body": "reply", "msgtype": "m.text"},
+                )
+                is sent
+            )
+            callback_finished.set()
+            return None
+
+        async def send(*_args, **_kwargs):
+            return sent
+
+        monkeypatch.setattr(client, "_send", send)
+        retained = asyncio.create_task(callback())
+        client._recovery._active_dispatches[(ROOM_A, "$retained", "timeline")] = (
+            retained
+        )
+        await callback_started.wait()
+
+        second = asyncio.create_task(client.receive_response(self._sliding("s2", [])))
+        await asyncio.sleep(0)
+        release_callback.set()
+        done, _ = await asyncio.wait((second,), timeout=0.1)
+        if second in done:
+            await second
+            assert callback_finished.is_set()
+            await client.close()
+            return
+
+        second.cancel()
+        retained.cancel()
+        await asyncio.gather(second, retained, return_exceptions=True)
+        client._recovery._active_dispatches.clear()
+        pytest.fail("response drain deadlocked with the callback's room_send()")
 
     async def test_same_room_plan_waits_for_immutable_send_request(
         self, client, monkeypatch
@@ -3439,6 +3515,7 @@ class TestRoomLocalRecovery:
 
         assert client._sliding_room_prev_batch == {}
         assert client.store.load_sliding_window_tokens() == {}
+        assert client._sync_reset_fence.room_cutoffs == {}
         await client.close()
 
     async def test_classic_leave_clears_the_sliding_window_token(self, tempdir):
@@ -3600,7 +3677,7 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
         await client.close()
 
-    async def test_out_of_order_sliding_connections_apply_each_response(
+    async def test_out_of_order_sliding_connections_preserve_events_without_rewind(
         self, tempdir, monkeypatch
     ):
         config = AsyncClientConfig(backfill_limited_timelines=True)
@@ -3752,17 +3829,21 @@ class TestRoomLocalRecovery:
 
         assert reverse_walks == []
         assert not client._recovery.gaps
-        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
-        assert client.rooms[ROOM_A].name == "older room"
-        assert "@surface:example.org" not in client.rooms[ROOM_A].users
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w2")}
+        assert client.rooms[ROOM_A].name == "newer room"
+        assert "@surface:example.org" in client.rooms[ROOM_A].users
         assert client.rooms[ROOM_A].encrypted
-        assert client.invited_rooms[ROOM_B].name == "older invite"
-        assert invite_names == ["newer invite", "older invite"]
+        assert client.invited_rooms[ROOM_B].name == "newer invite"
+        assert invite_names == ["newer invite"]
         assert seen == ["$newer", "$older"]
         assert global_values == ["newer", "older"]
         assert room_markers == ["$newer-read", "$older-read"]
         assert to_device_values == ["newer", "older"]
+        assert client._sliding_sync_to_device_since == "newer-to-device"
         assert e2ee_positions == ["newer-response", "older-response"]
+        assert client._sync_reset_fence.active_request_ids == set()
+        assert client._sync_reset_fence.room_component_floors == {}
+        assert client._sync_reset_fence.to_device_floor == 0
         await client.close()
 
     async def test_concurrent_sliding_requests_deliver_each_response_in_order(
@@ -4041,7 +4122,7 @@ class TestRoomLocalRecovery:
         await first
         await client.sliding_sync(conn_id="probe")
 
-        assert walk_starts == ["w1"]
+        assert walk_starts == ["w2"]
         assert client._sliding_room_prev_batch == {
             ROOM_A: window_token("w3"),
         }
@@ -4219,7 +4300,7 @@ class TestRoomLocalRecovery:
         assert client._sync_generation.sliding_request_locks == {}
         await client.close()
 
-    async def test_out_of_order_sliding_membership_reset_fails_closed(
+    async def test_out_of_order_sliding_membership_does_not_clear_newer_gap(
         self, tempdir, monkeypatch
     ):
         config = AsyncClientConfig(backfill_limited_timelines=True)
@@ -4265,8 +4346,8 @@ class TestRoomLocalRecovery:
         release_older.set()
         await older
 
-        assert ROOM_A not in client._recovery.gaps
-        assert client._sliding_room_prev_batch == {}
+        assert client._recovery.gaps[ROOM_A][0].target_token == "w2"
+        assert client._sliding_room_prev_batch[ROOM_A] == window_token("w2")
         await client.close()
 
     async def test_sliding_retry_stays_in_one_request_generation(
@@ -4495,6 +4576,60 @@ class TestRoomLocalRecovery:
             if response_class is RoomForgetResponse:
                 return RoomForgetResponse.from_dict({}, ROOM_A)
             return RoomLeaveResponse.from_dict({})
+
+        client.add_event_callback(callback, RoomMessageText)
+        monkeypatch.setattr(client, "_send", send)
+
+        with pytest.raises(
+            LocalProtocolError,
+            match="cannot run from an event callback",
+        ):
+            await asyncio.wait_for(client.sync(), 0.5)
+
+        assert membership_requests == 0
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_awaited_callback_child_membership_change_rejects_before_network(
+        self, tempdir, monkeypatch, operation
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        membership_requests = 0
+
+        async def callback(_room, _event):
+            await asyncio.create_task(getattr(client, operation)(ROOM_A))
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            if response_class is SyncResponse:
+                response = sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$leave", 1)],
+                            limited=False,
+                            prev_batch=None,
+                        )
+                    },
+                )
+                await client.receive_response(response)
+                return response
+            membership_requests += 1
+            if response_class is RoomForgetResponse:
+                return RoomForgetError.from_dict(
+                    {"errcode": "M_FORBIDDEN", "error": "rejected"},
+                    ROOM_A,
+                )
+            return RoomLeaveError.from_dict(
+                {"errcode": "M_FORBIDDEN", "error": "rejected"}
+            )
 
         client.add_event_callback(callback, RoomMessageText)
         monkeypatch.setattr(client, "_send", send)

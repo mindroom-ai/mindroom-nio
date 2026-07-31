@@ -858,6 +858,42 @@ async def test_close_surfaces_deferred_error_after_dispatch_drain():
 
 
 @pytest.mark.asyncio
+async def test_close_surfaces_error_returned_by_retained_dispatch():
+    state = RecoveryState()
+
+    async def dispatch():
+        await asyncio.sleep(0)
+        return sync_recovery._LiveCallbackError(
+            RuntimeError("retained callback failure"),
+            False,
+        )
+
+    key = (ROOM, "$live", "timeline")
+    state._active_dispatches[key] = asyncio.create_task(dispatch())
+    client = AsyncClient("https://example.org")
+    client._recovery = state
+
+    with pytest.raises(RuntimeError, match="retained callback failure"):
+        await client.close()
+
+    assert not state._active_dispatches
+
+
+@pytest.mark.asyncio
+async def test_room_drain_ignores_cancelled_retained_dispatch():
+    state = RecoveryState()
+    task = asyncio.create_task(asyncio.sleep(10))
+    key = (ROOM, "$cancelled", "timeline")
+    state._active_dispatches[key] = task
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    await sync_recovery.drain_recovery_room_dispatches(state, (ROOM,))
+
+    assert not state._active_dispatches
+
+
+@pytest.mark.asyncio
 async def test_close_drains_dispatch_after_repeated_cancellation():
     value = pending("$live", 0)
     state = RecoveryState(

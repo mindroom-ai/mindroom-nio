@@ -169,6 +169,19 @@ class RecoveryState:
     )
 
 
+def has_pending_recovery_work(state: RecoveryState) -> bool:
+    """Whether a recovery pump has gaps or deferred callback failures."""
+    return bool(state.gaps or state._deferred_dispatch_errors)
+
+
+def is_recovery_dispatch_task(
+    state: RecoveryState,
+    task: asyncio.Task[Any] | None,
+) -> bool:
+    """Whether task owns a retained recovery callback."""
+    return task is not None and task in state._active_dispatches.values()
+
+
 def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:
     return pending.room_id, pending.event_id, pending.kind
 
@@ -337,7 +350,7 @@ def _mark_admission_accepted(
 
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
     """Wait for retained callback work and release its in-memory task entries."""
-    finish_error: Exception | None = None
+    drain_error: Exception | None = None
     while state._active_dispatches:
         tasks = set(state._active_dispatches.values())
         await asyncio.wait(tuple(tasks))
@@ -346,17 +359,19 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
                 continue
             state._active_dispatches.pop(key)
             state._dispatch_waiters.pop(task, None)
-            error = None if task.cancelled() else task.exception()
-            if isinstance(error, _DispatchFinishError):
-                finish_error = finish_error or error.error
+            if task.cancelled():
                 continue
-            _report_dispatch_error(
-                key,
-                task,
-                "Recovered event callback failed while the client was closing: %s",
-            )
-    if finish_error:
-        raise finish_error
+            try:
+                callback_error = task.result()
+            except _DispatchFinishError as error:
+                drain_error = drain_error or error.error
+            except Exception as error:
+                drain_error = drain_error or error
+            else:
+                if callback_error:
+                    drain_error = drain_error or callback_error.error
+    if drain_error:
+        raise drain_error
     if state._deferred_dispatch_errors:
         raise state._deferred_dispatch_errors.pop(0)
 
@@ -390,6 +405,8 @@ async def drain_recovery_room_dispatches(
             if state._active_dispatches.get(key) is not task:
                 continue
             state._active_dispatches.pop(key)
+            if task.cancelled():
+                continue
             error = task.exception()
             if isinstance(error, _DispatchFinishError):
                 raise error.error
@@ -1036,10 +1053,8 @@ async def _collect_slice(
             # was bounded by the token the window starts at. Both Synapse
             # and Tuwunel answer the last page of a `to`-bounded forward
             # walk this way — with an empty chunk and no token — and they
-            # stop short of the window's own events, so the live overlap
-            # above never gets the chance to close the gap. Treating the
-            # exhausted page as failure discarded every recovered event
-            # instead.
+            # stop short of the window's own events. Treating the exhausted
+            # page as failure discarded every recovered event instead.
             #
             # The spec also omits `end` when the user may not see any more
             # events, which this cannot distinguish; a gap truncated by
