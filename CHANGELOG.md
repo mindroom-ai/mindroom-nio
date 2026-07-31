@@ -26,8 +26,9 @@ These only apply when `backfill_limited_timelines=True`; default behaviour is un
 ### Features
 
 - Add typed `TimelineEventProvenance` metadata to the single durable timeline admission callback.
-  Classic Sync distinguishes initial history from `since` continuations, `/messages` recovery stays historical, and Sliding Sync uses the exact validated `num_live` tail on initial rooms.
-  Store schema v6 atomically clears legacy recovery rows, completed markers, Sliding Sync baselines, and the sync token because their admission provenance cannot be inferred safely.
+  Classic Sync distinguishes initial history from `since` continuations, `/messages` recovery stays historical, and Sliding Sync uses the exact validated `num_live` tail on every response.
+  Historical sync rows retain their independent sync-origin durability and room-state behavior instead of overloading provenance.
+  Store schema v7 atomically clears only legacy recovery rows and completed markers whose provenance cannot be inferred safely, while preserving Classic and Sliding Sync transport tokens.
 - Persist each room's sliding window token, so a restarted client can walk the gap its downtime left behind instead of dropping it.
   0.31.0 held the walk baseline in memory, which left the first limited or initial window after a restart unrecoverable — the one case the `/v3/sync` transport had always covered through its stored sync token.
   Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.

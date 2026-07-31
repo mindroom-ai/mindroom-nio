@@ -14,6 +14,8 @@ from nio import (
     AsyncClient,
     Event,
     LocalProtocolError,
+    MegolmEvent,
+    RoomMemberEvent,
     RoomMessageText,
     TimelineEventProvenance,
 )
@@ -28,6 +30,7 @@ from nio.client.sync_recovery import (
     persist_response_plan,
     plan_room_timeline,
     pump_recovery,
+    record_completed_timeline_event,
 )
 from nio.responses import RoomMessagesResponse
 
@@ -48,6 +51,43 @@ def event(event_id: str, ts: int, room_id: str = ROOM) -> RoomMessageText:
         }
     )
     assert isinstance(value, RoomMessageText)
+    return value
+
+
+def own_join(event_id: str) -> RoomMemberEvent:
+    value = RoomMemberEvent.from_dict(
+        {
+            "content": {"membership": "join"},
+            "event_id": event_id,
+            "sender": "@me:example.org",
+            "state_key": "@me:example.org",
+            "origin_server_ts": 1,
+            "room_id": ROOM,
+            "type": "m.room.member",
+        }
+    )
+    assert isinstance(value, RoomMemberEvent)
+    return value
+
+
+def encrypted_event(event_id: str) -> MegolmEvent:
+    value = Event.parse_event(
+        {
+            "event_id": event_id,
+            "sender": "@sender:example.org",
+            "origin_server_ts": 1,
+            "room_id": ROOM,
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "AwgAEnACgAkLmt6q",
+                "device_id": "DEVICEID",
+                "sender_key": "sender-key",
+                "session_id": "session-id",
+            },
+        }
+    )
+    assert isinstance(value, MegolmEvent)
     return value
 
 
@@ -133,8 +173,74 @@ def test_received_timeline_stays_after_a_recovered_only_prefix():
     )
 
     assert len(plan.events) == 1
-    assert plan.events[0].sequence == state.max_held_events
+    assert plan.events[0].sequence == 0
     assert plan.events[0].is_live
+
+
+def test_classic_initial_own_join_clears_stale_recovery():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live-old", 0)]},
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[own_join("$join")],
+        user_id="@me:example.org",
+        membership="join",
+        live_event_count=None,
+        provenance_live_event_count=0,
+    )
+
+    assert plan.clear_rooms == frozenset({ROOM})
+
+
+def test_sync_history_counts_toward_held_cap():
+    state = RecoveryState(max_held_events=1)
+    first = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$history-1", 1)],
+        user_id="@me:example.org",
+        membership="join",
+        provenance_live_event_count=0,
+    )
+    apply_plan(state, first)
+
+    second = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$history-2", 2)],
+        user_id="@me:example.org",
+        membership="join",
+        provenance_live_event_count=0,
+    )
+
+    assert second.clear_rooms == frozenset({ROOM})
+
+
+def test_room_reset_preserves_unaccepted_sync_history():
+    state = RecoveryState()
+    first = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$history", 1)],
+        user_id="@me:example.org",
+        membership="join",
+        provenance_live_event_count=0,
+    )
+    apply_plan(state, first)
+
+    reset = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="leave",
+    )
+
+    assert [item.event_id for item in reset.events] == ["$history"]
 
 
 class InlineStore:
@@ -185,9 +291,10 @@ async def test_callback_crash_replays_only_active_row():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -263,9 +370,10 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -311,9 +419,10 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -363,9 +472,10 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
     async def dispatch(
         room_id,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -452,9 +562,10 @@ async def test_unbounded_page_without_end_stays_unverifiable():
     async def dispatch(
         _room,
         item,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -494,9 +605,10 @@ async def test_repeated_target_cursor_abandons_unverifiable_page():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -517,7 +629,17 @@ async def test_repeated_target_cursor_abandons_unverifiable_page():
 
 @pytest.mark.asyncio
 async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
-    corrupt = PendingTimelineEvent(ROOM, 1, 0, "$bad", "{", False, True)
+    corrupt = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "$bad",
+        "{",
+        False,
+        True,
+        provenance=TimelineEventProvenance.HISTORY,
+        apply_room_state=False,
+    )
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "", None)]},
         events={(ROOM, 1): [corrupt]},
@@ -557,9 +679,10 @@ async def test_callback_overrunning_deadline_is_not_restarted():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -617,9 +740,10 @@ async def test_completed_timeout_dispatch_is_acknowledged_without_next_pump():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -664,9 +788,10 @@ async def test_live_callback_failure_after_deadline_is_deferred(caplog):
     async def dispatch(
         _room,
         _event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -728,9 +853,10 @@ async def test_reset_preserves_in_flight_dispatch_without_replay():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -870,9 +996,10 @@ async def test_close_drains_cleared_dispatch_without_cancelling_it():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -984,9 +1111,10 @@ async def test_close_drains_dispatch_after_repeated_cancellation():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1055,9 +1183,10 @@ async def test_clearing_room_drains_active_dispatch_before_reset():
     async def dispatch(
         _room,
         event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1117,9 +1246,10 @@ async def test_clearing_failed_dispatch_aborts_before_plan():
     async def dispatch(
         _room,
         _event,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1197,9 +1327,10 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1245,9 +1376,10 @@ async def test_room_cap_abandons_existing_unverified_prefix():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1330,9 +1462,10 @@ async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1384,9 +1517,10 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
     async def dispatch(
         _room,
         value,
-        _is_live,
         _was_completed,
         _kind,
+        _provenance,
+        _apply_room_state,
         admission_accepted,
         mark_admission_accepted,
     ):
@@ -1411,6 +1545,59 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
         for queued in queued_events
         if not queued.is_live
     ] == ["$later-recovered"]
+
+
+@pytest.mark.asyncio
+async def test_completed_plaintext_does_not_consume_encrypted_retry_budget():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+    )
+    record_completed_timeline_event(
+        state,
+        ROOM,
+        "$completed",
+        False,
+        TimelineEventProvenance.HISTORY,
+    )
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "target",
+                "chunk": [
+                    encrypted_event("$completed").source,
+                    event("$unseen", 2).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(
+        _room,
+        value,
+        _was_completed,
+        _kind,
+        _provenance,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 1, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert seen == ["$unseen"]
 
 
 def test_recovery_outcome_keeps_open_real_gap_unrecovered():

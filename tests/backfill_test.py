@@ -241,6 +241,7 @@ def timeline_response(
             "rooms": {
                 ROOM_A: {
                     "membership": "join",
+                    "num_live": len(events),
                     "timeline": [event.source for event in events],
                 }
             },
@@ -975,8 +976,6 @@ class TestRoomLocalRecovery:
     async def test_live_callback_error_is_acked_and_does_not_wedge(
         self, client, protocol, error_type
     ):
-        if protocol == "classic":
-            client.next_batch = "s0"
         calls = []
         failed = False
 
@@ -1310,10 +1309,46 @@ class TestRoomLocalRecovery:
             ("$live-2", TimelineEventProvenance.LIVE),
         ]
 
-    @pytest.mark.parametrize("num_live", [None, -1, 3])
-    async def test_sliding_initial_invalid_live_count_fails_closed(
+    async def test_sliding_expanded_timeline_uses_num_live_without_regressing_state(
         self,
         client,
+    ):
+        admissions = record_admissions(client, (RoomMessageText, RoomNameEvent))
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "expanded_timeline": True,
+                        "membership": "join",
+                        "num_live": 1,
+                        "required_state": [
+                            name_event("$current", 3, "Current").source,
+                        ],
+                        "timeline": [
+                            name_event("$history", 1, "Historic").source,
+                            text_event("$live", 2).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        await client.receive_response(response)
+
+        assert admissions == [
+            ("$history", TimelineEventProvenance.HISTORY),
+            ("$live", TimelineEventProvenance.LIVE),
+        ]
+        assert client.rooms[ROOM_A].name == "Current"
+
+    @pytest.mark.parametrize("initial", [False, True])
+    @pytest.mark.parametrize("num_live", [None, -1, 3])
+    async def test_sliding_invalid_live_count_fails_closed(
+        self,
+        client,
+        initial,
         num_live,
     ):
         admissions = record_admissions(client)
@@ -1322,7 +1357,7 @@ class TestRoomLocalRecovery:
                 "pos": "s1",
                 "rooms": {
                     ROOM_A: {
-                        "initial": True,
+                        "initial": initial,
                         "membership": "join",
                         "num_live": num_live,
                         "timeline": [
@@ -1452,8 +1487,6 @@ class TestRoomLocalRecovery:
     async def test_non_acceptance_from_event_fanout_does_not_replay(
         self, client, protocol
     ):
-        if protocol == "classic":
-            client.next_batch = "s0"
         calls: list[str] = []
 
         async def admit(_room, event, _provenance):
@@ -3414,7 +3447,6 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "After"
 
     async def test_live_callbacks_see_each_events_room_state(self, client):
-        client.next_batch = "s0"
         seen = []
 
         async def record_name(room, event):

@@ -35,6 +35,7 @@ from ..crypto import (
     SessionStore,
     TrustState,
 )
+from ..event_provenance import TimelineEventProvenance
 from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
 _RECOVERY_PAYLOAD_VERSION = 1
 _RECOVERY_NONCE_SIZE = 12
 _RECOVERY_TAG_SIZE = 16
-_RECOVERY_WRITE_CHUNK_SIZE = 90
+_RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
 
@@ -135,7 +136,7 @@ class MatrixStore:
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 6
+    store_version = 7
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -194,6 +195,33 @@ class MatrixStore:
                 )
         self._update_version(6)
 
+    @use_database_atomic
+    def upgrade_to_v7(self):
+        table = PendingTimelineEvents._meta.table_name
+        columns = {
+            row[1]
+            for row in self.database.execute_sql(
+                f'PRAGMA table_info("{table}")'
+            ).fetchall()
+        }
+        if "provenance" not in columns:
+            self.database.execute_sql(
+                f'ALTER TABLE "{table}" '
+                "ADD COLUMN provenance TEXT NOT NULL DEFAULT 'live'"
+            )
+        if "apply_room_state" not in columns:
+            self.database.execute_sql(
+                f'ALTER TABLE "{table}" '
+                "ADD COLUMN apply_room_state INTEGER NOT NULL DEFAULT 1"
+            )
+
+        # Old recovery rows cannot recover the two independent meanings that
+        # v6 encoded together in is_live. Keep transport cursors, but discard
+        # only the ambiguous callback obligations.
+        PendingTimelineEvents.delete().execute()
+        SyncRecoveryGaps.delete().execute()
+        self._update_version(7)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -214,6 +242,9 @@ class MatrixStore:
             store_version = 5
         if store_version == 5:
             self.upgrade_to_v6()
+            store_version = 6
+        if store_version == 6:
+            self.upgrade_to_v7()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -573,6 +604,7 @@ class MatrixStore:
             was_encrypted=True,
             was_completed=False,
             admission_accepted=False,
+            apply_room_state=False,
         ).where(
             PendingTimelineEvents.account == account,
             PendingTimelineEvents.generation > 0,
@@ -729,6 +761,8 @@ class MatrixStore:
                 "was_encrypted": event.was_encrypted,
                 "was_completed": event.was_completed,
                 "admission_accepted": event.admission_accepted,
+                "provenance": event.provenance.value,
+                "apply_room_state": event.apply_room_state,
             }
             for event in events
         ]
@@ -781,6 +815,16 @@ class MatrixStore:
                             ),
                         ),
                         PendingTimelineEvents.admission_accepted,
+                    ),
+                    PendingTimelineEvents.provenance: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.provenance),),
+                        PendingTimelineEvents.provenance,
+                    ),
+                    PendingTimelineEvents.apply_room_state: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.apply_room_state),),
+                        PendingTimelineEvents.apply_room_state,
                     ),
                 },
                 where=promote_completed_placeholder | resequence_same_generation,
@@ -835,6 +879,8 @@ class MatrixStore:
                     row.was_completed,
                     kind,
                     row.admission_accepted,
+                    TimelineEventProvenance(row.provenance),
+                    row.apply_room_state,
                 )
             )
         return gaps, events
@@ -955,6 +1001,7 @@ class MatrixStore:
             pending.event_payload = b""
             pending.is_live = pending.was_completed = False
             pending.admission_accepted = False
+            pending.apply_room_state = False
             pending.was_encrypted = was_encrypted
             pending.save(force_insert=True)
             stale = (

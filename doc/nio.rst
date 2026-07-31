@@ -61,6 +61,9 @@ AsyncClient
     :undoc-members:
     :show-inheritance:
 
+.. autoclass:: nio.TimelineEventProvenance
+    :members:
+
 .. autoclass:: nio.TransferMonitor
     :members:
     :undoc-members:

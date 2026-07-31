@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 from helpers import ephemeral, ephemeral_dir, faker
 
+from nio import TimelineEventProvenance
+from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
 from nio.crypto import (
     InboundGroupSession,
     OlmAccount,
@@ -17,7 +19,6 @@ from nio.crypto import (
     TrustState,
 )
 from nio.exceptions import OlmTrustError
-from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
 from nio.sliding_sync_tokens import SlidingWindowToken
 from nio.store import (
     DefaultStore,
@@ -574,7 +575,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 6
+        assert version == 7
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -587,6 +588,8 @@ class TestClass:
             '{"content":{},"event_id":"$held","sender":"@a:b","type":"m.test"}',
             True,
             False,
+            provenance=TimelineEventProvenance.HISTORY,
+            apply_room_state=False,
         )
 
         original = sqlstore._upsert_pending_events
@@ -619,8 +622,20 @@ class TestClass:
             events[0].generation,
             events[0].sequence,
             events[0].event_id,
+            events[0].is_live,
             events[0].admission_accepted,
-        ) == (TEST_ROOM, 1, 0, "$held", False)
+            events[0].provenance,
+            events[0].apply_room_state,
+        ) == (
+            TEST_ROOM,
+            1,
+            0,
+            "$held",
+            True,
+            False,
+            TimelineEventProvenance.HISTORY,
+            False,
+        )
 
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
@@ -688,7 +703,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 6
+        assert reopened._get_store_version() == 7
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
@@ -701,6 +716,8 @@ class TestClass:
             }
         assert columns["event_payload"] == "BLOB"
         assert columns["admission_accepted"] == "INTEGER"
+        assert columns["provenance"] == "TEXT"
+        assert columns["apply_room_state"] == "INTEGER"
         assert "source_json" not in columns
 
     def test_v3_store_creates_sliding_window_tokens(self, sqlstore):
@@ -714,7 +731,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 6
+        assert reopened._get_store_version() == 7
         with reopened.database.bind_ctx(reopened.models):
             assert SlidingWindowTokens.table_exists()
         assert reopened.load_sliding_window_tokens() == {}
@@ -747,7 +764,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 6
+        assert reopened._get_store_version() == 7
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_v5_store_adds_durable_admission_phase(self, sqlstore):
@@ -769,14 +786,90 @@ class TestClass:
             )
             sqlstore._update_version(5)
 
+        sqlstore.upgrade_to_v6()
+
+        assert sqlstore._get_store_version() == 6
+        assert not sqlstore.load_sync_recovery()[1][0].admission_accepted
+
+    def test_v6_store_adds_provenance_without_dropping_transport_tokens(
+        self,
+        sqlstore,
+    ):
+        seed_v5_recovery_state(sqlstore)
+        sqlstore.upgrade_to_v6()
+        table = PendingTimelineEvents._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN apply_room_state'
+            )
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN provenance'
+            )
+
         reopened = SqliteStore(
             sqlstore.user_id,
             sqlstore.device_id,
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 6
-        assert not reopened.load_sync_recovery()[1][0].admission_accepted
+        assert reopened._get_store_version() == 7
+        assert reopened.load_sync_token() == "s1"
+        assert reopened.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w1", "$join")
+        }
+        assert reopened.load_sync_recovery() == ([], [])
+        with reopened.database.bind_ctx(reopened.models):
+            columns = {
+                row[1]
+                for row in reopened.database.execute_sql(
+                    f'PRAGMA table_info("{PendingTimelineEvents._meta.table_name}")'
+                ).fetchall()
+            }
+        assert {"provenance", "apply_room_state"} <= columns
+
+    def test_v7_recovery_reset_is_atomic(self, sqlstore, monkeypatch):
+        seed_v5_recovery_state(sqlstore)
+        sqlstore.upgrade_to_v6()
+        table = PendingTimelineEvents._meta.table_name
+        gaps_table = SyncRecoveryGaps._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN apply_room_state'
+            )
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN provenance'
+            )
+
+        def fail_version_update(_version):
+            raise RuntimeError("version write failed")
+
+        monkeypatch.setattr(sqlstore, "_update_version", fail_version_update)
+
+        with pytest.raises(RuntimeError, match="version write failed"):
+            sqlstore.upgrade_to_v7()
+
+        assert sqlstore._get_store_version() == 6
+        assert sqlstore.load_sync_token() == "s1"
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            columns = {
+                row[1]
+                for row in sqlstore.database.execute_sql(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+            event_count = sqlstore.database.execute_sql(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0]
+            gap_count = sqlstore.database.execute_sql(
+                f'SELECT COUNT(*) FROM "{gaps_table}"'
+            ).fetchone()[0]
+        assert "provenance" not in columns
+        assert "apply_room_state" not in columns
+        assert event_count == 2
+        assert gap_count == 1
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w1", "$join")
+        }
 
     def test_sliding_window_tokens_roundtrip(self, sqlstore):
         """Tokens survive a reopen, and forgotten rooms do not."""
