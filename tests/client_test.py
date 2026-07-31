@@ -4,7 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from helpers import FrameFactory, ephemeral, ephemeral_dir, faker
+from helpers import FrameFactory, faker
 
 from nio import (
     Client,
@@ -657,9 +657,8 @@ class TestClass:
 
         assert client.users_for_key_query == {BOB_ID}
 
-    @ephemeral
-    def test_query_rule(self):
-        client = Client("ephemeral", "DEVICEID", ephemeral_dir)
+    def test_query_rule(self, tempdir):
+        client = Client("ephemeral", "DEVICEID", tempdir)
         client.receive_response(self.login_response)
         assert client.store is not None
         client.receive_response(KeysUploadResponse(50, 50))
@@ -674,7 +673,7 @@ class TestClass:
 
         del client
 
-        client = Client("ephemeral", "DEVICEID", ephemeral_dir)
+        client = Client("ephemeral", "DEVICEID", tempdir)
         client.receive_response(self.login_response)
         assert not client.should_upload_keys
         assert not client.should_query_keys
@@ -699,14 +698,13 @@ class TestClass:
         assert client.users_for_key_query == {BOB_ID}
         assert client.should_query_keys
 
-    @ephemeral
-    def test_early_store_loading(self):
+    def test_early_store_loading(self, tempdir):
         client = Client("ephemeral")
 
         with pytest.raises(LocalProtocolError):
             client.load_store()
 
-        client = Client("ephemeral", store_path=ephemeral_dir)
+        client = Client("ephemeral", store_path=tempdir)
         client.user_id = "@ephemeral:example.org"
 
         with pytest.raises(LocalProtocolError):
@@ -721,7 +719,7 @@ class TestClass:
         client.receive_response(self.login_response)
 
         del client
-        client = Client("ephemeral", "DEVICEID", ephemeral_dir)
+        client = Client("ephemeral", "DEVICEID", tempdir)
         client.user_id = "@ephemeral:example.org"
 
         assert not client.store

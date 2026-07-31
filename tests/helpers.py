@@ -5,8 +5,6 @@ helpers
 This module contains helpers for the nio tests.
 """
 
-import os
-import tempfile
 from random import choice
 from string import ascii_letters, ascii_uppercase
 
@@ -71,21 +69,6 @@ class Provider(BaseProvider):
 
 
 faker.add_provider(Provider)
-
-
-_ephemeral_tmpdir = tempfile.TemporaryDirectory(prefix="nio-test-store-")
-ephemeral_dir = _ephemeral_tmpdir.name
-
-
-def ephemeral(func):
-    def wrapper(*args, **kwargs):
-        try:
-            ret = func(*args, **kwargs)
-        finally:
-            os.remove(os.path.join(ephemeral_dir, "@ephemeral:example.org_DEVICEID.db"))
-        return ret
-
-    return wrapper
 
 
 class FrameFactory:

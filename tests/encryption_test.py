@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,18 +54,7 @@ Malory_device = "MALORYDEVICE"
 PICKLE_KEY = "DEFAULT_KEY"
 TEST_ROOM = "!test_room"
 
-ephemeral_dir = os.path.join(os.curdir, "tests/data/encryption")
-
-
-def ephemeral(func):
-    def wrapper(*args, **kwargs):
-        try:
-            ret = func(*args, **kwargs)
-        finally:
-            os.remove(os.path.join(ephemeral_dir, "@ephemeral:localhost_DEVICEID.db"))
-        return ret
-
-    return wrapper
+ENCRYPTION_FIXTURES = Path(__file__).parent / "data" / "encryption"
 
 
 @pytest.fixture
@@ -113,12 +101,23 @@ def alice_account_pair(tempdir):
 
 
 class TestClass:
+    @pytest.fixture(autouse=True)
+    def _store_path(self, tempdir):
+        self.store_path = tempdir
+
     @staticmethod
     def _load_response(filename):
         return json.loads(Path(filename).read_text())
 
     def _get_store(self, user_id, device_id, pickle_key=""):
-        return DefaultStore(user_id, device_id, ephemeral_dir, pickle_key)
+        database_name = f"{user_id}_{device_id}.db"
+        source = ENCRYPTION_FIXTURES / database_name
+        target = Path(self.store_path) / database_name
+
+        if source.exists() and not target.exists():
+            copyfile(source, target)
+
+        return DefaultStore(user_id, device_id, self.store_path, pickle_key)
 
     @staticmethod
     def olm_message_to_event(message_dict, recipient, sender):
@@ -136,7 +135,6 @@ class TestClass:
         device_id = "DEVICEID"
         return Olm(user_id, device_id, self._get_store(user_id, device_id))
 
-    @ephemeral
     def test_new_account_creation(self):
         olm = self.ephemeral_olm
         assert isinstance(olm.account, OlmAccount)
@@ -164,8 +162,8 @@ class TestClass:
         device_id = "DEVICEID"
         version_name = f"libolm_account_pickle_{version}"
 
-        source = os.path.join(ephemeral_dir, f"{user_id}_{device_id}.{version_name}.db")
-        target = os.path.join(tempdir, f"{user_id}_{device_id}.db")
+        source = ENCRYPTION_FIXTURES / f"{user_id}_{device_id}.{version_name}.db"
+        target = Path(tempdir) / f"{user_id}_{device_id}.db"
         copyfile(source, target)
 
         # libolm pickle format
@@ -232,7 +230,7 @@ class TestClass:
             return
 
         monkeypatch.setattr(KeyStore, "_save", mocksave)
-        store = KeyStore(os.path.join(ephemeral_dir, "ephemeral_devices"))
+        store = KeyStore(str(Path(self.store_path) / "ephemeral_devices"))
         account = OlmAccount()
         device = OlmDevice("example", "DEVICEID", account.identity_keys)
         key = Key.from_olmdevice(device)
@@ -244,7 +242,7 @@ class TestClass:
         assert store.check(key) is False
 
     def test_fingerprint_store_loading(self):
-        store = KeyStore(os.path.join(ephemeral_dir, "known_devices"))
+        store = KeyStore(str(ENCRYPTION_FIXTURES / "known_devices"))
         key = Ed25519Key(
             "example", "DEVICEID", "2MX1WOCAmE9eyywGdiMsQ4RxL2SIKVeyJXiSjVFycpA"
         )
@@ -316,7 +314,6 @@ class TestClass:
         assert store.add(alice) is False
         assert alice in store
 
-    @ephemeral
     def test_olm_outbound_session_create(self):
         bob = OlmAccount()
         bob.generate_one_time_keys(1)
@@ -345,8 +342,8 @@ class TestClass:
         device_id = "DEVICEID"
         version_name = "libolm_session_pickle_v1"
 
-        source = os.path.join(ephemeral_dir, f"{user_id}_{device_id}.{version_name}.db")
-        target = os.path.join(tempdir, f"{user_id}_{device_id}.db")
+        source = ENCRYPTION_FIXTURES / f"{user_id}_{device_id}.{version_name}.db"
+        target = Path(tempdir) / f"{user_id}_{device_id}.db"
         copyfile(source, target)
 
         # libolm pickle format
@@ -406,8 +403,8 @@ class TestClass:
         sender_key = "N6XtYK/YQ0VD3equiUvrCCvCT5gBENB0+igXcb3KkRk"
         session_id = "u1HJVAIqIhdVQ7RzJLRxfNBAsNlE2sIT34Xe3beabHk"
 
-        source = os.path.join(ephemeral_dir, f"{user_id}_{device_id}.{version_name}.db")
-        target = os.path.join(tempdir, f"{user_id}_{device_id}.db")
+        source = ENCRYPTION_FIXTURES / f"{user_id}_{device_id}.{version_name}.db"
+        target = Path(tempdir) / f"{user_id}_{device_id}.db"
         copyfile(source, target)
 
         # libolm pickle format
@@ -455,7 +452,6 @@ class TestClass:
             pickles = {s.session for s in store._get_account().inbound_group_sessions}
         assert pickles == pickles_vodozemac
 
-    @ephemeral
     def test_olm_group_session_store(self):
         olm = self.ephemeral_olm
         bob_account = OlmAccount()
@@ -479,7 +475,6 @@ class TestClass:
         assert bob_session
         assert bob_session.id == outbound_session.id
 
-    @ephemeral
     def test_keys_query(self):
         olm = self.ephemeral_olm
         parsed_dict = TestClass._load_response("tests/data/keys_query.json")
@@ -497,7 +492,6 @@ class TestClass:
         device = olm.device_store["@alice:example.org"]["JLAFKJWSCS"]
         assert device.ed25519 == "nE6W2fCblxDcOFmeEtCHNl8/l8bXcu7GKyAswA4r3mM"
 
-    @ephemeral
     def test_same_query_response_twice(self):
         olm = self.ephemeral_olm
         parsed_dict = TestClass._load_response("tests/data/keys_query.json")
@@ -649,56 +643,49 @@ class TestClass:
         assert isinstance(olm_event, OlmEvent)
 
         # bob decrypts the message and creates a new inbound session with alice
-        try:
-            # pdb.set_trace()
-            bob.decrypt_event(olm_event)
+        # pdb.set_trace()
+        bob.decrypt_event(olm_event)
 
-            # we check that the session is there
-            assert bob.session_store.get(alice_device.curve25519)
-            # we check that the group session is there
-            assert bob.inbound_group_store.get(
-                "!test:example.org",
-                alice_device.curve25519,
-                group_session.id,
-            )
+        # we check that the session is there
+        assert bob.session_store.get(alice_device.curve25519)
+        # we check that the group session is there
+        assert bob.inbound_group_store.get(
+            "!test:example.org",
+            alice_device.curve25519,
+            group_session.id,
+        )
 
-            # Test another round of sharing, this time with an existing session
-            alice.create_outbound_group_session(TEST_ROOM)
-            group_session = alice.outbound_group_sessions[TEST_ROOM]
+        # Test another round of sharing, this time with an existing session
+        alice.create_outbound_group_session(TEST_ROOM)
+        group_session = alice.outbound_group_sessions[TEST_ROOM]
 
-            _sharing_with, to_device = alice.share_group_session(
-                TEST_ROOM, [BobId, MaloryId]
-            )
+        _sharing_with, to_device = alice.share_group_session(
+            TEST_ROOM, [BobId, MaloryId]
+        )
 
-            ciphertext = to_device["messages"][BobId][bob_device.id]["ciphertext"]
+        ciphertext = to_device["messages"][BobId][bob_device.id]["ciphertext"]
 
-            olm_event_dict = {
-                "sender": AliceId,
-                "type": "m.room.encrypted",
-                "content": {
-                    "algorithm": Olm._olm_algorithm,
-                    "sender_key": alice_device.curve25519,
-                    "ciphertext": ciphertext,
-                },
-            }
+        olm_event_dict = {
+            "sender": AliceId,
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": Olm._olm_algorithm,
+                "sender_key": alice_device.curve25519,
+                "ciphertext": ciphertext,
+            },
+        }
 
-            olm_event = OlmEvent.from_dict(olm_event_dict)
-            assert isinstance(olm_event, OlmEvent)
+        olm_event = OlmEvent.from_dict(olm_event_dict)
+        assert isinstance(olm_event, OlmEvent)
 
-            event = bob.decrypt_event(olm_event)
-            assert event
+        event = bob.decrypt_event(olm_event)
+        assert event
 
-            assert bob.inbound_group_store.get(
-                TEST_ROOM,
-                alice_device.curve25519,
-                group_session.id,
-            )
-
-        finally:
-            # remove the databases, the known devices store is handled by
-            # monkeypatching
-            os.remove(os.path.join(ephemeral_dir, f"{AliceId}_{Alice_device}.db"))
-            os.remove(os.path.join(ephemeral_dir, f"{BobId}_{Bob_device}.db"))
+        assert bob.inbound_group_store.get(
+            TEST_ROOM,
+            alice_device.curve25519,
+            group_session.id,
+        )
 
     def test_group_session_sharing(self, monkeypatch):
         def mocksave(self):
@@ -754,10 +741,6 @@ class TestClass:
 
         assert len(sharing_with) == 1
 
-        os.remove(os.path.join(ephemeral_dir, f"{AliceId}_{Alice_device}.db"))
-        os.remove(os.path.join(ephemeral_dir, f"{BobId}_{Bob_device}.db"))
-
-    @ephemeral
     def test_room_key_event(self):
         olm = self.ephemeral_olm
 
@@ -894,10 +877,6 @@ class TestClass:
         alice.verify_device(bob2_device)
         assert alice.user_fully_verified(BobId)
 
-        os.remove(os.path.join(ephemeral_dir, f"{AliceId}_{Alice_device}.db"))
-        os.remove(os.path.join(ephemeral_dir, f"{BobId}_{Bob_device}.db"))
-
-    @ephemeral
     def test_group_decryption(self):
         olm = self.ephemeral_olm
         olm.create_outbound_group_session(TEST_ROOM)
@@ -947,7 +926,6 @@ class TestClass:
         assert isinstance(event, RoomMessageText)
         assert event.decrypted
 
-    @ephemeral
     def test_key_sharing(self):
         olm = self.ephemeral_olm
 
@@ -1029,9 +1007,6 @@ class TestClass:
 
         assert not alice.get_missing_sessions([BobId])
         assert alice.session_store.get(bob_device.curve25519)
-
-        os.remove(os.path.join(ephemeral_dir, f"{AliceId}_{Alice_device}.db"))
-        os.remove(os.path.join(ephemeral_dir, f"{BobId}_{Bob_device}.db"))
 
     def test_group_session_sharing_new(self, olm_account, bob_account):
         alice = olm_account
