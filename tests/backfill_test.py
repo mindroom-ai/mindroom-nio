@@ -1490,6 +1490,7 @@ class TestRoomLocalRecovery:
             "timeline",
             TimelineEventProvenance.LIVE,
             True,
+            True,
             False,
             mark,
         )
@@ -4890,6 +4891,79 @@ class TestRoomLocalRecovery:
             ("$older", TimelineEventProvenance.LIVE),
         ]
         await client.close()
+
+    async def test_state_fenced_sliding_event_does_not_create_room(self, client):
+        admissions = record_admissions(client)
+        seen: list[tuple[str, str]] = []
+
+        async def callback(room, event):
+            seen.append((room.room_id, event.event_id))
+
+        client.add_event_callback(callback, RoomMessageText)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "stale",
+                "rooms": {
+                    ROOM_B: {
+                        "membership": "join",
+                        "num_live": 1,
+                        "timeline": [text_event("$stale", 1, ROOM_B).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        current_rooms_token = client._current_response_room_ids.set(frozenset())
+        try:
+            await client._handle_sliding_sync(response)
+        finally:
+            client._current_response_room_ids.reset(current_rooms_token)
+
+        assert admissions == [("$stale", TimelineEventProvenance.LIVE)]
+        assert seen == [(ROOM_B, "$stale")]
+        assert ROOM_B not in client.rooms
+        assert not client._recovery.events
+
+    async def test_state_fenced_sliding_encryption_does_not_mutate_room(self, client):
+        await client.receive_response(
+            self._sliding("seed", [text_event("$seed", 0)], prev_batch="w0")
+        )
+        room = client.rooms[ROOM_A]
+        admissions = record_admissions(client, RoomEncryptionEvent)
+        seen: list[str] = []
+
+        async def callback(_room, event):
+            seen.append(event.event_id)
+
+        client.add_event_callback(callback, RoomEncryptionEvent)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "stale",
+                "rooms": {
+                    ROOM_A: {
+                        "membership": "join",
+                        "num_live": 1,
+                        "timeline": [encryption_event(ROOM_A).source],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        current_rooms_token = client._current_response_room_ids.set(frozenset())
+        try:
+            await client._handle_sliding_sync(response)
+        finally:
+            client._current_response_room_ids.reset(current_rooms_token)
+
+        assert admissions == [("$encryption", TimelineEventProvenance.LIVE)]
+        assert seen == ["$encryption"]
+        assert client.rooms[ROOM_A] is room
+        assert not room.encrypted
+        assert ROOM_A not in client.encrypted_rooms
+        assert ROOM_A not in client.store.load_encrypted_rooms()
+        assert not client._recovery.events
 
     async def test_independent_initial_snapshot_does_not_clear_existing_gap(
         self, tempdir, monkeypatch

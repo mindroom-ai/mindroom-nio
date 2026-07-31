@@ -980,14 +980,17 @@ class AsyncClient(Client):
         was_completed: bool,
         kind: PendingEventKind,
         provenance: TimelineEventProvenance,
+        sync_origin: bool,
         apply_room_state: bool,
         admission_accepted: bool,
         mark_admission_accepted: Callable[[], None],
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent | None:
+        state_suppressed = kind == "timeline" and sync_origin and not apply_room_state
         room = self.rooms.get(room_id)
         if room is None:
             room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
-            self.rooms[room_id] = room
+            if not state_suppressed:
+                self.rooms[room_id] = room
 
         if kind == "ephemeral":
             if not isinstance(event, EphemeralEvent):
@@ -1017,7 +1020,7 @@ class AsyncClient(Client):
                 event = decrypted
             if self.store and isinstance(event, RoomEncryptionEvent):
                 self.store.save_encrypted_rooms({room_id})
-        elif isinstance(event, RoomEncryptionEvent):
+        elif isinstance(event, RoomEncryptionEvent) and not state_suppressed:
             self.encrypted_rooms.add(room_id)
             room.handle_event(event)
             if self.store:
