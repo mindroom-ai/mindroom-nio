@@ -98,7 +98,6 @@ from ..events import (
     ToDeviceEvent,
 )
 from ..exceptions import (
-    CallbackNotAcceptedError,
     LocalProtocolError,
     SendRetryError,
     TransferCancelledError,
@@ -280,9 +279,9 @@ from .sync_recovery import (
     take_recovery_outcomes,
     would_plan_real_gap,
 )
-from .sync_response_order import (
-    SyncResponseOrder,
-    accept_response_rooms,
+from .sync_reset_fence import (
+    SyncResetFence,
+    accept_reset_safe_rooms,
     issue_sync_request,
     mark_room_reset,
 )
@@ -320,19 +319,26 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _SyncRequestContext:
     request_since: str | None
-    issuance: int
+    request_id: int | None
 
 
 @dataclass(frozen=True)
 class _SyncResponseEnvelope:
     response: SyncResponse | SlidingSyncResponse
     request_since: str | None
-    issuance: int | None
+    request_id: int | None
+
+
+@dataclass(eq=False)
+class _RequestLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 @dataclass(eq=False)
 class _SyncGeneration:
     classic_request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    sliding_request_locks: dict[str | None, _RequestLock] = field(default_factory=dict)
 
 
 async def _run_to_completion(
@@ -340,14 +346,23 @@ async def _run_to_completion(
 ) -> _RunToCompletionT:
     """Drain owned work through repeated cancellation before propagating it."""
     task = asyncio.create_task(operation)
-    cancelled = False
+    cancellations = 0
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:  # noqa: PERF203
-            cancelled = True
-    result = task.result()
-    if cancelled:
+            cancellations += 1
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException:
+        caller = asyncio.current_task()
+        if caller is not None:
+            for _ in range(cancellations):
+                caller.uncancel()
+        raise
+    if cancellations:
         raise asyncio.CancelledError
     return result
 
@@ -608,10 +623,10 @@ class AsyncClient(Client):
         self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
             f"nio_sync_request_generation_{id(self)}", default=None
         )
-        self._sync_request_issuance: ContextVar[int | None] = ContextVar(
-            f"nio_sync_request_issuance_{id(self)}", default=None
+        self._sync_request_id: ContextVar[int | None] = ContextVar(
+            f"nio_sync_request_id_{id(self)}", default=None
         )
-        self._sync_response_order = SyncResponseOrder()
+        self._sync_reset_fence = SyncResetFence()
         self._sync_executor_context: ContextVar[object | None] = ContextVar(
             f"nio_sync_executor_{id(self)}", default=None
         )
@@ -697,6 +712,8 @@ class AsyncClient(Client):
         cannot make their durable side effects atomic.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
+        The callback must be idempotent by event ID because its external write
+        and nio's acceptance marker cannot share one transaction.
 
         The exception propagates from sync(), receive_response(), or
         sync_forever(); the caller must continue the sync loop to retry it.
@@ -886,7 +903,6 @@ class AsyncClient(Client):
             if not deduplicate or should_dispatch_timeline_event(
                 self._recovery, room_id, event
             ):
-                await self._on_event_admission(event, room)
                 await self._on_event(event, room)
 
     async def _dispatch_timeline_event(
@@ -896,6 +912,8 @@ class AsyncClient(Client):
         is_live: bool,
         was_completed: bool,
         kind: PendingEventKind,
+        admission_accepted: bool,
+        mark_admission_accepted: Callable[[], None],
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent | None:
         room = self.rooms.get(room_id)
         if room is None:
@@ -905,6 +923,11 @@ class AsyncClient(Client):
         if kind == "ephemeral":
             if not isinstance(event, EphemeralEvent):
                 raise ValueError("Invalid pending ephemeral event")
+            if not admission_accepted:
+                try:
+                    mark_admission_accepted()
+                except Exception as error:
+                    raise _LiveCallbackError(error, False, accepted=False) from error
             room.handle_ephemeral_event(event)
             try:
                 await self._on_ephemeral(event, room)
@@ -914,6 +937,11 @@ class AsyncClient(Client):
         if kind == "account_data":
             if not isinstance(event, AccountDataEvent | BadEventType):
                 raise ValueError("Invalid pending account data event")
+            if not admission_accepted:
+                try:
+                    mark_admission_accepted()
+                except Exception as error:
+                    raise _LiveCallbackError(error, False, accepted=False) from error
             room.handle_account_data(event)
             try:
                 await self._on_room_account_data(event, room)
@@ -942,16 +970,16 @@ class AsyncClient(Client):
             event = self.olm._decrypt_megolm_no_error(event) or event
         if was_completed and isinstance(event, MegolmEvent):
             return None
-        try:
-            await self._on_event_admission(event, room)
-        except CallbackNotAcceptedError as error:
-            raise _LiveCallbackError(
-                error,
-                isinstance(event, MegolmEvent),
-                accepted=False,
-            ) from error
-        except Exception as error:
-            raise _LiveCallbackError(error, isinstance(event, MegolmEvent)) from error
+        if not admission_accepted:
+            try:
+                await self._on_event_admission(event, room)
+                mark_admission_accepted()
+            except Exception as error:
+                raise _LiveCallbackError(
+                    error,
+                    isinstance(event, MegolmEvent),
+                    accepted=False,
+                ) from error
         try:
             await self._on_event(event, room)
         except Exception as error:
@@ -1209,7 +1237,7 @@ class AsyncClient(Client):
                     if self._recovery_store is None:
                         self._forget_sliding_window_token(room_id)
                     else:
-                        self._reset_sliding_room(room_id)
+                        self._sliding_room_prev_batch.pop(room_id, None)
             self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
                 if self._recovery_store is None:
@@ -1459,8 +1487,7 @@ class AsyncClient(Client):
         window_token = self._sliding_room_prev_batch.get(room_id)
         if not window_token:
             return None
-        membership_event_id = self._sliding_membership_proof(room_id, room)
-        if membership_event_id != window_token.membership_event_id:
+        if not self._sliding_membership_continues(room_id, room):
             return None
         return window_token.token
 
@@ -1525,15 +1552,48 @@ class AsyncClient(Client):
         """Return exact current own-membership identity for this room delta."""
         membership_event = self._sliding_membership_event(room)
         if isinstance(membership_event, RoomMemberEvent):
-            return (
-                membership_event.event_id
-                if membership_event.membership == "join"
-                else None
-            )
+            if membership_event.membership != "join":
+                return None
+            held = self._sliding_room_prev_batch.get(room_id)
+            if (
+                held is None
+                or membership_event.event_id == held.membership_event_id
+                or self._sliding_live_own_join(room)
+            ):
+                return membership_event.event_id
+            unsigned = membership_event.source.get("unsigned", {})
+            if (
+                membership_event.prev_membership == "join"
+                and isinstance(unsigned, dict)
+                and unsigned.get("replaces_state") == held.membership_event_id
+            ):
+                return membership_event.event_id
+            return None
         if membership_event is not None or room.initial:
             return None
         held = self._sliding_room_prev_batch.get(room_id)
         return held.membership_event_id if held else None
+
+    def _sliding_membership_continues(
+        self,
+        room_id: str,
+        room: SlidingSyncRoom,
+    ) -> bool:
+        held = self._sliding_room_prev_batch.get(room_id)
+        if held is None:
+            return False
+        if self._sliding_membership_proof(room_id, room) == held.membership_event_id:
+            return True
+        membership_event = self._sliding_membership_event(room)
+        if not isinstance(membership_event, RoomMemberEvent):
+            return False
+        unsigned = membership_event.source.get("unsigned", {})
+        return (
+            membership_event.membership == "join"
+            and membership_event.prev_membership == "join"
+            and isinstance(unsigned, dict)
+            and unsigned.get("replaces_state") == held.membership_event_id
+        )
 
     def _plan_sliding_prev_batches(
         self, response: SlidingSyncResponse
@@ -1560,20 +1620,21 @@ class AsyncClient(Client):
             elif membership_event_id is None:
                 forgotten.append(room_id)
             else:
-                if self._sliding_live_own_join(room) or (
-                    window_token
-                    and window_token.membership_event_id != membership_event_id
-                ):
+                if self._sliding_live_own_join(room):
                     forgotten.append(room_id)
                 if room.prev_batch:
                     recorded[room_id] = SlidingWindowToken(
                         room.prev_batch, membership_event_id
                     )
+                elif (
+                    window_token
+                    and window_token.membership_event_id != membership_event_id
+                ):
+                    recorded[room_id] = SlidingWindowToken(
+                        window_token.token,
+                        membership_event_id,
+                    )
         return recorded, forgotten
-
-    def _reset_sliding_room(self, room_id: str) -> None:
-        """Mark a room's baseline invalid from this moment on."""
-        self._sliding_room_prev_batch.pop(room_id, None)
 
     def _apply_sliding_prev_batches(
         self,
@@ -1585,7 +1646,7 @@ class AsyncClient(Client):
             if self._recovery_store is None:
                 self._forget_sliding_window_token(room_id)
             else:
-                self._reset_sliding_room(room_id)
+                self._sliding_room_prev_batch.pop(room_id, None)
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
 
@@ -1600,7 +1661,7 @@ class AsyncClient(Client):
         # that did, and it must not outlive the membership either.
         if self.store:
             self.store.forget_sliding_window_token(room_id)
-        self._reset_sliding_room(room_id)
+        self._sliding_room_prev_batch.pop(room_id, None)
 
     async def _run_room_membership_reset(
         self,
@@ -1608,9 +1669,8 @@ class AsyncClient(Client):
         send_request: Callable[[], Coroutine[Any, Any, _RoomMembershipResponseT]],
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
-        if (
-            self.config.backfill_limited_timelines
-            and self._event_callback_task.get() is not None
+        if self.config.backfill_limited_timelines and (
+            self._event_callback_task.get() is asyncio.current_task()
         ):
             raise LocalProtocolError(
                 "Room membership changes cannot run from an event callback."
@@ -1619,16 +1679,24 @@ class AsyncClient(Client):
         if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
             return response
 
-        mark_room_reset(self._sync_response_order, room_id)
-        if not self.config.backfill_limited_timelines:
-            self._forget_sliding_window_token(room_id)
-            return response
-
+        if self.config.backfill_limited_timelines:
+            mark_room_reset(self._sync_reset_fence, room_id)
         await _run_to_completion(self._apply_room_membership_reset(room_id))
         return response
 
     async def _apply_room_membership_reset(self, room_id: str) -> None:
         """Clear every room-local recovery artifact after server success."""
+        if not self.config.backfill_limited_timelines:
+            persist_response_plan(
+                self._recovery,
+                self.store,
+                token=None,
+                plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
+                forgotten_rooms=(room_id,),
+            )
+            self._sliding_room_prev_batch.pop(room_id, None)
+            return
+
         async with self._sync_response_lock:
             async with self._recovery_room_state((room_id,)):
                 await drain_recovery_room_dispatches(
@@ -1642,7 +1710,7 @@ class AsyncClient(Client):
                     plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
                     forgotten_rooms=(room_id,),
                 )
-                self._reset_sliding_room(room_id)
+                self._sliding_room_prev_batch.pop(room_id, None)
 
     @staticmethod
     def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
@@ -1965,7 +2033,7 @@ class AsyncClient(Client):
                 _SyncResponseEnvelope(
                     response,
                     self.next_batch or self.loaded_sync_token or None,
-                    self._sync_request_issuance.get(),
+                    self._sync_request_id.get(),
                 )
             )
         elif isinstance(response, SlidingSyncResponse):
@@ -1973,13 +2041,15 @@ class AsyncClient(Client):
                 _SyncResponseEnvelope(
                     response,
                     None,
-                    self._sync_request_issuance.get(),
+                    self._sync_request_id.get(),
                 )
             )
         else:
             super().receive_response(response)
 
     def _raise_on_sync_reentry(self) -> None:
+        if not self.config.backfill_limited_timelines:
+            return
         inherited = self._sync_executor_context.get()
         if inherited is not None and inherited is self._active_sync_executor_token:
             raise LocalProtocolError(
@@ -2005,12 +2075,12 @@ class AsyncClient(Client):
     def _ordered_response_view(
         self,
         response: SyncResponse | SlidingSyncResponse,
-        request_issuance: int | None,
+        request_id: int | None,
     ) -> SyncResponse | SlidingSyncResponse:
-        accepted = accept_response_rooms(
-            self._sync_response_order,
+        accepted = accept_reset_safe_rooms(
+            self._sync_reset_fence,
             self._response_room_ids(response),
-            request_issuance,
+            request_id,
         )
         if isinstance(response, SyncResponse):
             return replace(
@@ -2050,6 +2120,13 @@ class AsyncClient(Client):
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
         sync_response = envelope.response
         request_since = envelope.request_since
+        if not self.config.backfill_limited_timelines:
+            if isinstance(sync_response, SyncResponse):
+                await self._handle_sync(envelope)
+            else:
+                await self._handle_sliding_sync(sync_response)
+            return
+
         generation = self._sync_request_generation.get()
         if generation is not None and generation is not self._sync_generation:
             if self.config.backfill_limited_timelines:
@@ -2065,13 +2142,6 @@ class AsyncClient(Client):
                     request_since,
                 )
             return
-        if not self.config.backfill_limited_timelines and envelope.issuance is None:
-            if isinstance(sync_response, SyncResponse):
-                await self._handle_sync(envelope)
-            else:
-                await self._handle_sliding_sync(sync_response)
-            return
-
         self._raise_on_sync_reentry()
         entered_executor = False
         try:
@@ -2092,7 +2162,7 @@ class AsyncClient(Client):
                 try:
                     ordered_response = self._ordered_response_view(
                         sync_response,
-                        envelope.issuance,
+                        envelope.request_id,
                     )
                     if isinstance(ordered_response, SyncResponse):
                         await self._handle_sync(
@@ -2112,6 +2182,25 @@ class AsyncClient(Client):
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _sliding_request_lock(
+        self,
+        generation: _SyncGeneration,
+        conn_id: str | None,
+    ) -> AsyncIterator[None]:
+        entry = generation.sliding_request_locks.setdefault(conn_id, _RequestLock())
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if (
+                entry.users == 0
+                and generation.sliding_request_locks.get(conn_id) is entry
+            ):
+                del generation.sliding_request_locks[conn_id]
 
     @asynccontextmanager
     async def _recovery_response_room_state(
@@ -2261,7 +2350,7 @@ class AsyncClient(Client):
                     _SyncResponseEnvelope(
                         resp,
                         sync_request_context.request_since,
-                        sync_request_context.issuance,
+                        sync_request_context.request_id,
                     )
                 )
             else:
@@ -2636,13 +2725,37 @@ class AsyncClient(Client):
         self._raise_on_sync_reentry()
         presence = set_presence or self._presence
 
+        if not self.config.backfill_limited_timelines:
+            sync_token = since or self.next_batch or self.loaded_sync_token or None
+            method, path = Api.sync(
+                self.access_token,
+                since=sync_token,
+                timeout=(
+                    int(self.config.request_timeout) * 1000
+                    if timeout is None
+                    else timeout or None
+                ),
+                filter=sync_filter,
+                full_state=full_state,
+                set_presence=presence,
+            )
+            return await self._send(
+                SyncResponse,
+                method,
+                path,
+                timeout=(
+                    0 if full_state else timeout / 1000 + 15 if timeout else timeout
+                ),
+                sync_request_context=_SyncRequestContext(sync_token, None),
+            )
+
         while True:
             generation = self._sync_generation
             async with generation.classic_request_lock:
                 if generation is not self._sync_generation:
                     continue
                 sync_token = since or self.next_batch or self.loaded_sync_token or None
-                issuance = issue_sync_request(self._sync_response_order)
+                request_id = issue_sync_request(self._sync_reset_fence)
                 method, path = Api.sync(
                     self.access_token,
                     since=sync_token,
@@ -2656,7 +2769,7 @@ class AsyncClient(Client):
                     set_presence=presence,
                 )
                 generation_token = self._sync_request_generation.set(generation)
-                issuance_token = self._sync_request_issuance.set(issuance)
+                request_id_token = self._sync_request_id.set(request_id)
                 try:
                     return await self._send(
                         SyncResponse,
@@ -2671,11 +2784,11 @@ class AsyncClient(Client):
                         ),
                         sync_request_context=_SyncRequestContext(
                             sync_token,
-                            issuance,
+                            request_id,
                         ),
                     )
                 finally:
-                    self._sync_request_issuance.reset(issuance_token)
+                    self._sync_request_id.reset(request_id_token)
                     self._sync_request_generation.reset(generation_token)
 
     @logged_in_async
@@ -2728,33 +2841,51 @@ class AsyncClient(Client):
                 int(self.config.request_timeout) * 1000 if timeout is None else timeout
             ),
             set_presence=presence,
-            lists=self._sliding_sync_request_membership(lists),
-            room_subscriptions=self._sliding_sync_request_membership(
-                room_subscriptions
+            lists=(
+                self._sliding_sync_request_membership(lists)
+                if self.config.backfill_limited_timelines
+                else lists
+            ),
+            room_subscriptions=(
+                self._sliding_sync_request_membership(room_subscriptions)
+                if self.config.backfill_limited_timelines
+                else room_subscriptions
             ),
             extensions=extensions,
             unstable=unstable,
         )
-        generation = self._sync_generation
-        issuance = issue_sync_request(self._sync_response_order)
-        generation_token = self._sync_request_generation.set(generation)
-        issuance_token = self._sync_request_issuance.set(issuance)
-        scope_token = self._sliding_request_scope.set(uuid4().hex)
-        try:
-            response = await self._send(
+
+        if not self.config.backfill_limited_timelines:
+            return await self._send(
                 SlidingSyncResponse,
                 method,
                 path,
                 data,
                 timeout=timeout / 1000 + 15 if timeout else timeout,
-                sync_request_context=_SyncRequestContext(None, issuance),
             )
-        finally:
-            self._sliding_request_scope.reset(scope_token)
-            self._sync_request_issuance.reset(issuance_token)
-            self._sync_request_generation.reset(generation_token)
 
-        return response
+        while True:
+            generation = self._sync_generation
+            async with self._sliding_request_lock(generation, conn_id):
+                if generation is not self._sync_generation:
+                    continue
+                request_id = issue_sync_request(self._sync_reset_fence)
+                generation_token = self._sync_request_generation.set(generation)
+                request_id_token = self._sync_request_id.set(request_id)
+                scope_token = self._sliding_request_scope.set(uuid4().hex)
+                try:
+                    return await self._send(
+                        SlidingSyncResponse,
+                        method,
+                        path,
+                        data,
+                        timeout=timeout / 1000 + 15 if timeout else timeout,
+                        sync_request_context=_SyncRequestContext(None, request_id),
+                    )
+                finally:
+                    self._sliding_request_scope.reset(scope_token)
+                    self._sync_request_id.reset(request_id_token)
+                    self._sync_request_generation.reset(generation_token)
 
     @logged_in_async
     async def send_to_device_messages(
@@ -4299,6 +4430,8 @@ class AsyncClient(Client):
         Raises:
             LocalProtocolError: If called from a serialized sync-loop
                 timeline callback.
+            Exception: The first retained callback or durable finalization
+                failure encountered while draining recovery work.
         """
         caller = asyncio.current_task()
         if (
@@ -4317,7 +4450,10 @@ class AsyncClient(Client):
 
         async def finish_close() -> None:
             try:
-                async with self._sync_response_lock:
+                if self.config.backfill_limited_timelines:
+                    async with self._sync_response_lock:
+                        await drain_recovery_dispatches(self._recovery)
+                else:
                     await drain_recovery_dispatches(self._recovery)
             finally:
                 try:

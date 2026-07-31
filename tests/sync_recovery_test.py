@@ -79,6 +79,7 @@ class InlineStore:
     def __init__(self):
         self.thread_ids: list[int] = []
         self.finished: list[tuple[str, int, str | None, bool]] = []
+        self.accepted: list[tuple[str, int, str]] = []
 
     def save_recovery(self, *args):
         self.thread_ids.append(threading.get_ident())
@@ -86,6 +87,15 @@ class InlineStore:
     def finish_recovery(self, room_id, generation, event_id, was_encrypted):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
+
+    def accept_recovery_event(self, room_id, generation, event_id):
+        self.thread_ids.append(threading.get_ident())
+        self.accepted.append((room_id, generation, event_id))
+
+
+def accept_admission(admission_accepted, mark_admission_accepted):
+    if not admission_accepted:
+        mark_admission_accepted()
 
 
 @pytest.mark.asyncio
@@ -108,8 +118,17 @@ async def test_callback_crash_replays_only_active_row():
     calls: list[str] = []
     failed = False
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
         nonlocal failed
+        accept_admission(admission_accepted, mark_admission_accepted)
         calls.append(value.event_id)
         if value.event_id == "$two" and not failed:
             failed = True
@@ -171,7 +190,16 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
         return value
 
@@ -210,7 +238,16 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
             ROOM_B,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
 
     kwargs = {
@@ -249,7 +286,16 @@ async def test_ready_callback_does_not_consume_recovering_room_budget():
             ROOM_B,
         )
 
-    async def dispatch(room_id, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        room_id,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         if room_id == ROOM:
             await asyncio.Event().wait()
         seen.append(value.event_id)
@@ -329,7 +375,16 @@ async def test_unbounded_page_without_end_stays_unverifiable():
 
     seen: list[str] = []
 
-    async def dispatch(_room, item, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        item,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(item.event_id)
 
     await pump_recovery(
@@ -362,7 +417,16 @@ async def test_repeated_target_cursor_abandons_unverifiable_page():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
 
     await pump_recovery(
@@ -414,7 +478,16 @@ async def test_callback_overrunning_deadline_is_not_restarted():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         calls.append("early")
         started.set()
         await release.wait()
@@ -437,7 +510,8 @@ async def test_callback_overrunning_deadline_is_not_restarted():
     await started.wait()
     await asyncio.wait_for(first_pump, 1)
     assert calls == ["early"]
-    assert state.events[(ROOM, 1)] == [value]
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == ["$live"]
+    assert state.events[(ROOM, 1)][0].admission_accepted
     assert len(state._active_dispatches) == 1
     release.set()
     await pump_recovery(
@@ -464,7 +538,16 @@ async def test_completed_timeout_dispatch_is_acknowledged_without_next_pump():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         started.set()
         await release.wait()
         return event
@@ -502,7 +585,16 @@ async def test_live_callback_failure_after_deadline_is_deferred(caplog):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        _event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         started.set()
         await release.wait()
         raise sync_recovery._LiveCallbackError(RuntimeError("late failure"), False)
@@ -557,7 +649,16 @@ async def test_reset_preserves_in_flight_dispatch_without_replay():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         calls.append("early")
         started.set()
         try:
@@ -690,7 +791,16 @@ async def test_close_drains_cleared_dispatch_without_cancelling_it():
     release = asyncio.Event()
     finished = asyncio.Event()
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         started.set()
         await release.wait()
         finished.set()
@@ -759,7 +869,16 @@ async def test_close_drains_dispatch_after_repeated_cancellation():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         calls.append("early")
         started.set()
         await release.wait()
@@ -821,7 +940,16 @@ async def test_clearing_room_drains_active_dispatch_before_reset():
     release = asyncio.Event()
     calls: list[str] = []
 
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         calls.append(f"start:{event.event_id}")
         started.set()
         await release.wait()
@@ -874,7 +1002,16 @@ async def test_clearing_failed_dispatch_aborts_before_plan():
     )
     release = asyncio.Event()
 
-    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        _event,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         await release.wait()
         raise RuntimeError("failed after timeout")
 
@@ -945,7 +1082,16 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
         return value
 
@@ -984,7 +1130,16 @@ async def test_room_cap_abandons_existing_unverified_prefix():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
         return value
 
@@ -1054,7 +1209,16 @@ async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
         return value
 
@@ -1099,7 +1263,16 @@ async def test_room_cap_counts_recovered_rows_in_other_generations():
             ROOM,
         )
 
-    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+    async def dispatch(
+        _room,
+        value,
+        _is_live,
+        _was_completed,
+        _kind,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
         seen.append(value.event_id)
         return value
 

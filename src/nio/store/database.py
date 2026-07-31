@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 _RECOVERY_PAYLOAD_VERSION = 1
 _RECOVERY_NONCE_SIZE = 12
 _RECOVERY_TAG_SIZE = 16
-_RECOVERY_WRITE_CHUNK_SIZE = 100
+_RECOVERY_WRITE_CHUNK_SIZE = 90
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
 
@@ -135,7 +135,7 @@ class MatrixStore:
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 5
+    store_version = 6
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -178,6 +178,22 @@ class MatrixStore:
             self.database.create_tables([SlidingWindowTokens])
         self._update_version(5)
 
+    def upgrade_to_v6(self):
+        with self.database.bind_ctx(self.models):
+            table = PendingTimelineEvents._meta.table_name
+            columns = {
+                row[1]
+                for row in self.database.execute_sql(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+            if "admission_accepted" not in columns:
+                self.database.execute_sql(
+                    f'ALTER TABLE "{table}" '
+                    "ADD COLUMN admission_accepted INTEGER NOT NULL DEFAULT 0"
+                )
+        self._update_version(6)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -195,6 +211,9 @@ class MatrixStore:
             store_version = 3
         if store_version in (3, 4):
             self.upgrade_to_v5()
+            store_version = 5
+        if store_version == 5:
+            self.upgrade_to_v6()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -554,6 +573,7 @@ class MatrixStore:
             is_live=False,
             was_encrypted=True,
             was_completed=False,
+            admission_accepted=False,
         ).where(
             PendingTimelineEvents.account == account,
             PendingTimelineEvents.generation > 0,
@@ -707,6 +727,7 @@ class MatrixStore:
                 "is_live": event.is_live,
                 "was_encrypted": event.was_encrypted,
                 "was_completed": event.was_completed,
+                "admission_accepted": event.admission_accepted,
             }
             for event in events
         ]
@@ -726,6 +747,7 @@ class MatrixStore:
                     PendingTimelineEvents.is_live,
                     PendingTimelineEvents.was_encrypted,
                     PendingTimelineEvents.was_completed,
+                    PendingTimelineEvents.admission_accepted,
                 ],
                 where=(
                     (PendingTimelineEvents.generation == 0)
@@ -783,9 +805,33 @@ class MatrixStore:
                     row.was_encrypted,
                     row.was_completed,
                     kind,
+                    row.admission_accepted,
                 )
             )
         return gaps, events
+
+    @use_database_atomic
+    def accept_recovery_event(
+        self,
+        room_id: str,
+        generation: int,
+        event_id: str,
+    ) -> None:
+        """Durably record admission before ordinary callback fanout."""
+        account = self._get_account()
+        assert account
+        updated = (
+            PendingTimelineEvents.update(admission_accepted=True)
+            .where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id == room_id,
+                PendingTimelineEvents.generation == generation,
+                PendingTimelineEvents.event_id == event_id,
+            )
+            .execute()
+        )
+        if updated != 1:
+            raise ValueError(f"Pending recovery event not found: {event_id}")
 
     @use_database
     def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
@@ -879,6 +925,7 @@ class MatrixStore:
             pending.generation = 0
             pending.event_payload = b""
             pending.is_live = pending.was_completed = False
+            pending.admission_accepted = False
             pending.was_encrypted = was_encrypted
             pending.save(force_insert=True)
             stale = (

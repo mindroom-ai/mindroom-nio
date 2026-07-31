@@ -38,6 +38,8 @@ DispatchEvent = Callable[
         bool,
         bool,
         PendingEventKind,
+        bool,
+        Callable[[], None],
     ],
     Awaitable[_DispatchResult],
 ]
@@ -91,6 +93,7 @@ class PendingTimelineEvent:
     was_encrypted: bool
     was_completed: bool = False
     kind: PendingEventKind = "timeline"
+    admission_accepted: bool = False
 
     @classmethod
     def from_event(
@@ -199,10 +202,6 @@ def _pending_dispatch(
     return None
 
 
-def _has_pending_dispatch(state: RecoveryState, key: _DispatchKey) -> bool:
-    return _pending_dispatch(state, key) is not None
-
-
 def _dispatch_finished(
     state: RecoveryState,
     key: _DispatchKey,
@@ -214,7 +213,7 @@ def _dispatch_finished(
         return
     if state._dispatch_waiters.get(task):
         return
-    if _has_pending_dispatch(state, key):
+    if _pending_dispatch(state, key) is not None:
         if not task.cancelled():
             task.exception()
         return
@@ -225,20 +224,14 @@ def _dispatch_finished(
     try:
         dispatch_error = task.result()
     except Exception:
-        _report_orphaned_dispatch(key, task)
+        _report_dispatch_error(
+            key,
+            task,
+            "Recovered event callback failed after its row was cleared: %s",
+        )
     else:
         if dispatch_error:
             state._deferred_dispatch_errors.append(dispatch_error.error)
-
-
-def _report_orphaned_dispatch(
-    key: _DispatchKey, task: asyncio.Task[_LiveCallbackError | None]
-) -> None:
-    _report_dispatch_error(
-        key,
-        task,
-        "Recovered event callback failed after its row was cleared: %s",
-    )
 
 
 def _report_dispatch_error(
@@ -263,6 +256,10 @@ async def _run_dispatch(
     event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
 ) -> _LiveCallbackError | None:
     error: _LiveCallbackError | None = None
+
+    def mark_admission_accepted() -> None:
+        _mark_admission_accepted(state, store, gap, pending)
+
     try:
         delivered = await dispatch_event(
             gap.room_id,
@@ -270,6 +267,8 @@ async def _run_dispatch(
             pending.is_live,
             pending.was_completed,
             pending.kind,
+            pending.admission_accepted,
+            mark_admission_accepted,
         )
     except _LiveCallbackError as dispatch_error:
         error = dispatch_error
@@ -313,6 +312,27 @@ async def _run_dispatch(
             )
         return error
     return None
+
+
+def _mark_admission_accepted(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending: PendingTimelineEvent,
+) -> None:
+    if store:
+        store.accept_recovery_event(
+            gap.room_id,
+            gap.generation,
+            pending.event_id,
+        )
+    key = (gap.room_id, gap.generation)
+    queued = state.events[key]
+    for index, current in enumerate(queued):
+        if current.event_id == pending.event_id and current.kind == pending.kind:
+            queued[index] = replace(current, admission_accepted=True)
+            return
+    raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
 
 
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
@@ -825,6 +845,7 @@ def load_recovery_state(
             row.was_encrypted,
             row.was_completed,
             row.kind,
+            row.admission_accepted,
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():

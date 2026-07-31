@@ -537,7 +537,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 5
+        assert version == 6
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -582,7 +582,11 @@ class TestClass:
             events[0].generation,
             events[0].sequence,
             events[0].event_id,
-        ) == (TEST_ROOM, 1, 0, "$held")
+            events[0].admission_accepted,
+        ) == (TEST_ROOM, 1, 0, "$held", False)
+
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
+        assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
     def test_v2_store_creates_recovery_tables(self, sqlstore):
         with sqlstore.database.bind_ctx(sqlstore.models):
@@ -596,7 +600,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 5
+        assert reopened._get_store_version() == 6
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
@@ -608,6 +612,7 @@ class TestClass:
                 ).fetchall()
             }
         assert columns["event_payload"] == "BLOB"
+        assert columns["admission_accepted"] == "INTEGER"
         assert "source_json" not in columns
 
     def test_v3_store_creates_sliding_window_tokens(self, sqlstore):
@@ -621,7 +626,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 5
+        assert reopened._get_store_version() == 6
         with reopened.database.bind_ctx(reopened.models):
             assert SlidingWindowTokens.table_exists()
         assert reopened.load_sliding_window_tokens() == {}
@@ -654,8 +659,36 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 5
+        assert reopened._get_store_version() == 6
         assert reopened.load_sliding_window_tokens() == {}
+
+    def test_v5_store_adds_durable_admission_phase(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        table = PendingTimelineEvents._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN admission_accepted'
+            )
+            sqlstore._update_version(5)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 6
+        assert not reopened.load_sync_recovery()[1][0].admission_accepted
 
     def test_sliding_window_tokens_roundtrip(self, sqlstore):
         """Tokens survive a reopen, and forgotten rooms do not."""

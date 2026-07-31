@@ -237,6 +237,7 @@ class PendingTimelineEvents(Model):
     is_live = BooleanField()
     was_encrypted = BooleanField()
     was_completed = BooleanField()
+    admission_accepted = BooleanField(default=False)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",
