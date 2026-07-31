@@ -14,6 +14,7 @@
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
@@ -82,6 +83,7 @@ from ..crypto.cross_signing import (
     cross_signing_sidecar_path,
 )
 from ..event_builders import ToDeviceMessage
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEventType,
@@ -311,6 +313,42 @@ _RoomMembershipResponseT = TypeVar(
 )
 
 DataProvider = Callable[[int, int], AsyncDataT]
+EventAdmissionCallback = Callable[
+    [MatrixRoom, Event, TimelineEventProvenance],
+    Awaitable[None] | None,
+]
+LegacyEventAdmissionCallback = Callable[
+    [MatrixRoom, Event],
+    Awaitable[None] | None,
+]
+
+
+def _adapt_event_admission_callback(
+    callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
+) -> EventAdmissionCallback:
+    """Keep the released two-argument admission callback contract working."""
+    legacy_callback = cast(LegacyEventAdmissionCallback, callback)
+
+    def with_provenance(
+        room: MatrixRoom,
+        event: Event,
+        _provenance: TimelineEventProvenance,
+    ) -> Awaitable[None] | None:
+        return legacy_callback(room, event)
+
+    try:
+        callback_signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return cast(EventAdmissionCallback, callback)
+
+    try:
+        callback_signature.bind(None, None)
+    except TypeError:
+        return cast(EventAdmissionCallback, callback)
+
+    return with_provenance
+
+
 SynchronousFile = (
     io.TextIOBase,
     io.BufferedReader,
@@ -751,13 +789,23 @@ class AsyncClient(Client):
 
     def add_event_admission_callback(
         self,
-        callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
+        callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
 
         Only one admission owner can be registered because multiple callbacks
         cannot make their durable side effects atomic.
+        The callback receives the room, event, and its live-or-history
+        ``TimelineEventProvenance``.
+        Two-argument callbacks registered against nio 0.33 remain supported;
+        new callbacks should require the provenance argument.
+        Classic Sync initial timelines are history, while timelines that
+        continue from ``since`` are live.
+        Sliding Sync uses the validated ``num_live`` tail when present.
+        Ordinary continuations without it are live, while initial or expanded
+        responses without it are history.
+        Events recovered through ``/messages`` are history.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
@@ -776,7 +824,10 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "An event admission callback is already registered."
             )
-        self.event_admission_callback = ClientCallback(callback, cb_filter)
+        self.event_admission_callback = ClientCallback(
+            _adapt_event_admission_callback(callback),
+            cb_filter,
+        )
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -964,16 +1015,20 @@ class AsyncClient(Client):
         self,
         room_id: str,
         event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
-        is_live: bool,
         was_completed: bool,
         kind: PendingEventKind,
+        provenance: TimelineEventProvenance,
+        sync_origin: bool,
+        apply_room_state: bool,
         admission_accepted: bool,
         mark_admission_accepted: Callable[[], None],
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent | None:
+        state_suppressed = kind == "timeline" and sync_origin and not apply_room_state
         room = self.rooms.get(room_id)
         if room is None:
             room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
-            self.rooms[room_id] = room
+            if not state_suppressed:
+                self.rooms[room_id] = room
 
         if kind == "ephemeral":
             if not isinstance(event, EphemeralEvent):
@@ -995,7 +1050,7 @@ class AsyncClient(Client):
             return event
         if not isinstance(event, Event | BadEventType):
             raise ValueError("Invalid pending timeline event")
-        if is_live:
+        if apply_room_state:
             decrypted = self._handle_timeline_event(
                 event, room_id, room, self.encrypted_rooms
             )
@@ -1003,7 +1058,7 @@ class AsyncClient(Client):
                 event = decrypted
             if self.store and isinstance(event, RoomEncryptionEvent):
                 self.store.save_encrypted_rooms({room_id})
-        elif isinstance(event, RoomEncryptionEvent):
+        elif isinstance(event, RoomEncryptionEvent) and not state_suppressed:
             self.encrypted_rooms.add(room_id)
             room.handle_event(event)
             if self.store:
@@ -1017,7 +1072,7 @@ class AsyncClient(Client):
             return None
         if not admission_accepted and self.event_admission_callback is not None:
             try:
-                await self._on_event_admission(event, room)
+                await self._on_event_admission(event, room, provenance)
             except CallbackNotAcceptedError as error:
                 raise _LiveCallbackError(
                     error,
@@ -1108,7 +1163,7 @@ class AsyncClient(Client):
                 timeline_events=room.timeline,
                 user_id=self.user_id,
                 membership=self._sliding_sync_recovery_membership(room),
-                live_event_count=((room.num_live or 0) if room.initial else None),
+                live_event_count=self._sliding_live_event_count(room),
                 cursor_token=self._sliding_recovery_cursor(room_id, room),
             )
         )
@@ -1199,25 +1254,31 @@ class AsyncClient(Client):
         callbacks: Iterable[ClientCallback],
         event: object,
         room: MatrixRoom | None = None,
+        *callback_args: object,
     ) -> None:
         scope = _EventCallbackScope()
         token = self._event_callback_scope.set(scope)
         try:
             for callback in callbacks:
-                await callback.async_execute(event, room)
+                await callback.async_execute(event, room, *callback_args)
         finally:
             scope.active = False
             self._event_callback_scope.reset(token)
 
     async def _on_event_admission(
-        self, event: Event | BadEventType, room: MatrixRoom
+        self,
+        event: Event | BadEventType,
+        room: MatrixRoom,
+        provenance: TimelineEventProvenance,
     ) -> None:
-        if self.event_admission_callback is None:
+        callback = self.event_admission_callback
+        if callback is None:
             return
         await self._run_event_callbacks(
-            (self.event_admission_callback,),
+            (callback,),
             event,
             room,
+            provenance,
         )
 
     async def _on_event(self, event: Event | BadEventType, room: MatrixRoom):
@@ -1379,47 +1440,56 @@ class AsyncClient(Client):
                 unrecoverable_room_ids = (
                     self._sliding_unrecoverable_discontinuity_room_ids(response)
                 )
-                plans = [
-                    plan_room_timeline(
-                        self._recovery,
-                        room_id=room_id,
-                        timeline_events=room.timeline,
-                        user_id=(
-                            self.user_id
-                            if self._room_component_is_current(room_id)
-                            else None
-                        ),
-                        membership=(
-                            self._sliding_sync_recovery_membership(room)
-                            if self._room_component_is_current(room_id)
-                            else "join"
-                        ),
-                        live_event_count=(
-                            (room.num_live or 0) if room.initial else None
-                        ),
-                        cursor_token=(
-                            self._sliding_recovery_cursor(room_id, room)
-                            if self._room_component_is_current(room_id)
-                            else None
-                        ),
-                        target_token=(
-                            room.prev_batch or ""
-                            if self._room_component_is_current(room_id)
-                            else ""
-                        ),
-                        batch_id=batch_id,
-                        account_data_events=(
-                            tuple(
-                                self._pending_sliding_room_account_data.get(
-                                    room_id, {}
-                                ).values()
-                            )
-                            + tuple(response.room_account_data.get(room_id, ()))
-                        ),
-                        timeline_events_live=self._room_component_is_current(room_id),
+                plans = []
+                for room_id, room in response.rooms.items():
+                    component_is_current = self._room_component_is_current(room_id)
+                    live_event_count = self._sliding_live_event_count(room)
+                    membership_live_event_count = (
+                        live_event_count
+                        if room.initial or room.expanded_timeline
+                        else None
                     )
-                    for room_id, room in response.rooms.items()
-                ]
+                    apply_state_live_event_count = (
+                        live_event_count
+                        if room.expanded_timeline and not room.initial
+                        else None
+                    )
+                    if not component_is_current:
+                        membership_live_event_count = 0
+                        apply_state_live_event_count = 0
+                    plans.append(
+                        plan_room_timeline(
+                            self._recovery,
+                            room_id=room_id,
+                            timeline_events=room.timeline,
+                            user_id=self.user_id if component_is_current else None,
+                            membership=(
+                                self._sliding_sync_recovery_membership(room)
+                                if component_is_current
+                                else "join"
+                            ),
+                            live_event_count=membership_live_event_count,
+                            provenance_live_event_count=live_event_count,
+                            apply_state_live_event_count=apply_state_live_event_count,
+                            cursor_token=(
+                                self._sliding_recovery_cursor(room_id, room)
+                                if component_is_current
+                                else None
+                            ),
+                            target_token=(
+                                room.prev_batch or "" if component_is_current else ""
+                            ),
+                            batch_id=batch_id,
+                            account_data_events=(
+                                tuple(
+                                    self._pending_sliding_room_account_data.get(
+                                        room_id, {}
+                                    ).values()
+                                )
+                                + tuple(response.room_account_data.get(room_id, ()))
+                            ),
+                        )
+                    )
                 plans.extend(
                     plan_room_timeline(
                         self._recovery,
@@ -1607,12 +1677,21 @@ class AsyncClient(Client):
         )
 
     @staticmethod
+    def _sliding_live_event_count(room: SlidingSyncRoom) -> int:
+        """Normalize the live tail represented by deployed server responses.
+
+        Tuwunel omits ``num_live`` on ordinary continuations and reports the
+        total live count when a truncated window can contain only its tail.
+        """
+        if room.num_live is None:
+            return 0 if room.initial or room.expanded_timeline else len(room.timeline)
+        return min(max(room.num_live, 0), len(room.timeline))
+
+    @staticmethod
     def _sliding_live_timeline(
         room: SlidingSyncRoom,
     ) -> Sequence[Event | BadEventType]:
-        if not room.initial:
-            return room.timeline
-        live_event_count = room.num_live or 0
+        live_event_count = AsyncClient._sliding_live_event_count(room)
         return room.timeline[-live_event_count:] if live_event_count else ()
 
     def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
@@ -1914,7 +1993,9 @@ class AsyncClient(Client):
         )
 
         if not self.config.backfill_limited_timelines:
-            for event in sliding_room.timeline:
+            live_event_count = self._sliding_live_event_count(sliding_room)
+            live_start = len(sliding_room.timeline) - live_event_count
+            for index, event in enumerate(sliding_room.timeline):
                 event_id = getattr(event, "event_id", None)
                 if event_id:
                     record_completed_timeline_event(
@@ -1922,6 +2003,11 @@ class AsyncClient(Client):
                         room_id,
                         event_id,
                         isinstance(event, MegolmEvent),
+                        (
+                            TimelineEventProvenance.LIVE
+                            if index >= live_start
+                            else TimelineEventProvenance.HISTORY
+                        ),
                     )
 
         if room.encrypted and self.olm is not None:

@@ -238,6 +238,8 @@ class PendingTimelineEvents(Model):
     was_encrypted = BooleanField()
     was_completed = BooleanField()
     admission_accepted = BooleanField(default=False)
+    provenance = TextField(default="live")
+    apply_room_state = BooleanField(default=True)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

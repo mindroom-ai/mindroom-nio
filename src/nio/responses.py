@@ -373,6 +373,10 @@ class SlidingSyncRoom:
 
     @classmethod
     def from_dict(cls, parsed_dict: dict[Any, Any]) -> SlidingSyncRoom:
+        num_live = parsed_dict.get("num_live")
+        if num_live is not None and type(num_live) is not int:
+            raise TypeError("num_live must be an integer")
+
         return cls(
             bump_stamp=parsed_dict.get("bump_stamp"),
             membership=parsed_dict.get("membership"),
@@ -397,7 +401,7 @@ class SlidingSyncRoom:
             timeline=SyncResponse._get_room_events(parsed_dict.get("timeline", [])),
             prev_batch=parsed_dict.get("prev_batch"),
             limited=parsed_dict.get("limited", False),
-            num_live=parsed_dict.get("num_live"),
+            num_live=num_live,
             joined_count=parsed_dict.get("joined_count"),
             invited_count=parsed_dict.get("invited_count"),
             # The current MSC4186 text drops these counts, but deployed

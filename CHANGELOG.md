@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Add typed `TimelineEventProvenance` metadata to the single durable timeline admission callback.
+  Classic Sync distinguishes initial history from `since` continuations, and `/messages` recovery stays historical.
+  Sliding Sync uses the validated `num_live` tail when present, clamps server counts to the returned timeline, treats ordinary continuations without the optional count as live, and treats initial or expanded responses without it as history.
+  Historical sync rows retain their independent sync-origin durability and room-state behavior instead of overloading provenance.
+  Store schema v7 preserves legacy recovery obligations and transport tokens, classifies their previously unrecorded provenance conservatively as history, and derives room-state application from their existing sync origin.
+  Existing two-argument admission callbacks remain supported; new callbacks can accept provenance as a third argument.
+
+### Bug Fixes
+
+- Keep newly received timelines after every queued recovery row, including a recovered-only prefix, and use insertion order to break legacy sequence ties after restart.
+
 ## 0.33.0
 
 ### Breaking Changes

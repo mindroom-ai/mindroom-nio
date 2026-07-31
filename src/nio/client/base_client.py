@@ -127,7 +127,12 @@ class ClientCallback:
     func: Callable[..., None] | Callable[..., Awaitable[None]] = field()
     filter: tuple[type, ...] | type | None = None
 
-    def _execute(self, event, room: MatrixRoom | None = None) -> Awaitable | None:
+    def _execute(
+        self,
+        event,
+        room: MatrixRoom | None = None,
+        *callback_args,
+    ) -> Awaitable | None:
         """
         Checks the filter and executes the function once.
         sync_execute and async_execute will each determine
@@ -135,19 +140,29 @@ class ClientCallback:
         """
         if self.filter is None or isinstance(event, self.filter):
             if room:
-                return self.func(room, event)
+                return self.func(room, event, *callback_args)
             else:
-                return self.func(event)
+                return self.func(event, *callback_args)
 
-    def sync_execute(self, event, room: MatrixRoom | None = None) -> None:
+    def sync_execute(
+        self,
+        event,
+        room: MatrixRoom | None = None,
+        *callback_args,
+    ) -> None:
         """Execute callback from synchronous context."""
-        result = self._execute(event, room)
+        result = self._execute(event, room, *callback_args)
         if inspect.iscoroutine(result):
             asyncio.run(result)
 
-    async def async_execute(self, event, room: MatrixRoom | None = None) -> None:
+    async def async_execute(
+        self,
+        event,
+        room: MatrixRoom | None = None,
+        *callback_args,
+    ) -> None:
         """Execute callback from asynchronous context."""
-        result = self._execute(event, room)
+        result = self._execute(event, room, *callback_args)
         if inspect.isawaitable(result):
             await result
 

@@ -12,6 +12,7 @@ from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..api import MessageDirection
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEventType,
@@ -37,8 +38,10 @@ DispatchEvent = Callable[
         str,
         Event | BadEventType | EphemeralEvent | AccountDataEvent,
         bool,
-        bool,
         PendingEventKind,
+        TimelineEventProvenance,
+        bool,
+        bool,
         bool,
         Callable[[], None],
     ],
@@ -85,6 +88,16 @@ class RecoveryGap:
 
 @dataclass(frozen=True)
 class PendingTimelineEvent:
+    """One durable callback obligation.
+
+    ``is_live`` distinguishes sync-origin rows from ``/messages`` recovery
+    rows. Sync-origin rows survive room resets, count toward the held-event
+    cap, and acknowledge ordinary callback failures. ``provenance`` is the
+    independent live-or-history classification exposed at admission.
+    ``apply_room_state`` keeps historical Sliding Sync expansions from
+    replacing current room state; Classic Sync timelines always apply state.
+    """
+
     room_id: str
     generation: int
     sequence: int
@@ -95,6 +108,8 @@ class PendingTimelineEvent:
     was_completed: bool = False
     kind: PendingEventKind = "timeline"
     admission_accepted: bool = False
+    provenance: TimelineEventProvenance = TimelineEventProvenance.LIVE
+    apply_room_state: bool = True
 
     @classmethod
     def from_event(
@@ -107,6 +122,8 @@ class PendingTimelineEvent:
         fallback_event_id: str | None = None,
         was_completed: bool = False,
         kind: PendingEventKind = "timeline",
+        provenance: TimelineEventProvenance | None = None,
+        apply_room_state: bool | None = None,
     ) -> PendingTimelineEvent | None:
         event_id = getattr(event, "event_id", None) or fallback_event_id
         if not event_id:
@@ -122,6 +139,17 @@ class PendingTimelineEvent:
             isinstance(event, MegolmEvent),
             was_completed,
             kind,
+            False,
+            (
+                provenance
+                if provenance is not None
+                else (
+                    TimelineEventProvenance.LIVE
+                    if is_live
+                    else TimelineEventProvenance.HISTORY
+                )
+            ),
+            is_live if apply_room_state is None else apply_room_state,
         )
 
     def parse(
@@ -148,13 +176,21 @@ class RecoveryPlan:
     unrecovered_room_ids: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True)
+class CompletedTimelineEvent:
+    was_encrypted: bool
+    provenance: TimelineEventProvenance
+
+
 @dataclass
 class RecoveryState:
     gaps: dict[str, list[RecoveryGap]] = field(default_factory=dict)
     events: dict[tuple[str, int], list[PendingTimelineEvent]] = field(
         default_factory=dict
     )
-    completed: dict[str, OrderedDict[str, bool]] = field(default_factory=dict)
+    completed: dict[str, OrderedDict[str, CompletedTimelineEvent]] = field(
+        default_factory=dict
+    )
     # Outcomes since the last take; False stays sticky when _finish records True.
     outcomes: dict[str, bool] = field(default_factory=dict)
     room_offset: int = 0
@@ -278,9 +314,11 @@ async def _run_dispatch(
         delivered = await dispatch_event(
             gap.room_id,
             event,
-            pending.is_live,
             pending.was_completed,
             pending.kind,
+            pending.provenance,
+            pending.is_live,
+            pending.apply_room_state,
             pending.admission_accepted,
             mark_admission_accepted,
         )
@@ -484,9 +522,9 @@ def should_dispatch_timeline_event(
     event_id = getattr(event, "event_id", None)
     if not event_id:
         return True
-    was_encrypted = state.completed.get(room_id, {}).get(event_id)
-    return was_encrypted is None or (
-        was_encrypted and not isinstance(event, MegolmEvent)
+    completed = state.completed.get(room_id, {}).get(event_id)
+    return completed is None or (
+        completed.was_encrypted and not isinstance(event, MegolmEvent)
     )
 
 
@@ -495,25 +533,32 @@ def record_completed_timeline_event(
     room_id: str,
     event_id: str,
     was_encrypted: bool,
+    provenance: TimelineEventProvenance,
 ) -> None:
     completed = state.completed.setdefault(room_id, OrderedDict())
     previous = completed.pop(event_id, None)
-    completed[event_id] = (
-        was_encrypted if previous is None else previous and was_encrypted
+    completed[event_id] = CompletedTimelineEvent(
+        was_encrypted=(
+            was_encrypted
+            if previous is None
+            else previous.was_encrypted and was_encrypted
+        ),
+        provenance=provenance if previous is None else previous.provenance,
     )
     if len(completed) > 512:
         completed.popitem(last=False)
 
 
-def _plan_live_events(
+def _plan_timeline_events(
     state: RecoveryState,
     room_id: str,
     generation: int,
-    timeline_events: Iterable[Event | BadEventType],
+    timeline_events: Sequence[Event | BadEventType],
     *,
     include_pending: bool,
     batch_id: str | None,
-    is_live: bool = True,
+    provenance_live_event_count: int | None,
+    apply_state_live_event_count: int | None,
 ) -> list[PendingTimelineEvent]:
     known = (
         {
@@ -529,20 +574,47 @@ def _plan_live_events(
         (event.sequence for event in state.events.get((room_id, generation), ())),
         default=-1,
     )
+    provenance_live_start = (
+        0
+        if provenance_live_event_count is None
+        else len(timeline_events) - provenance_live_event_count
+    )
+    apply_state_start = (
+        0
+        if apply_state_live_event_count is None
+        else len(timeline_events) - apply_state_live_event_count
+    )
     planned = []
     for index, event in enumerate(timeline_events):
         event_id = getattr(event, "event_id", None) or (
             f"~{batch_id}:{index}" if batch_id is not None else None
         )
+        completed = state.completed.get(room_id, {}).get(event_id) if event_id else None
+        provenance = (
+            completed.provenance
+            if completed
+            else (
+                TimelineEventProvenance.LIVE
+                if index >= provenance_live_start
+                else TimelineEventProvenance.HISTORY
+            )
+        )
         pending = PendingTimelineEvent.from_event(
-            room_id, generation, sequence, event, is_live, event_id
+            room_id,
+            generation,
+            sequence,
+            event,
+            True,
+            event_id,
+            provenance=provenance,
+            apply_room_state=index >= apply_state_start,
         )
         if not event_id or not pending:
             continue
         existing = known.get(event_id)
         if existing:
             continue
-        was_completed = bool(state.completed.get(room_id, {}).get(event_id))
+        was_completed = bool(completed and completed.was_encrypted)
         if not should_dispatch_timeline_event(state, room_id, event) and not (
             was_completed and isinstance(event, MegolmEvent)
         ):
@@ -619,15 +691,29 @@ def plan_room_timeline(
     user_id: str | None,
     membership: str,
     live_event_count: int | None = None,
+    provenance_live_event_count: int | None = None,
+    apply_state_live_event_count: int | None = None,
     cursor_token: str | None = None,
     target_token: str = "",
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
-    timeline_events_live: bool = True,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
+
+    if live_event_count is not None and not (
+        0 <= live_event_count <= len(timeline_events)
+    ):
+        live_event_count = 0
+    if provenance_live_event_count is not None and not (
+        0 <= provenance_live_event_count <= len(timeline_events)
+    ):
+        provenance_live_event_count = 0
+    if apply_state_live_event_count is not None and not (
+        0 <= apply_state_live_event_count <= len(timeline_events)
+    ):
+        apply_state_live_event_count = 0
 
     clear = _timeline_clears_recovery(
         timeline_events,
@@ -645,14 +731,15 @@ def plan_room_timeline(
     generation = existing[-1].generation if existing else 0
     if new_gap or not existing:
         generation += 1
-    events = _plan_live_events(
+    events = _plan_timeline_events(
         state,
         room_id,
         generation,
         timeline_events,
         include_pending=not clear,
         batch_id=batch_id,
-        is_live=timeline_events_live,
+        provenance_live_event_count=provenance_live_event_count,
+        apply_state_live_event_count=apply_state_live_event_count,
     )
     if ephemeral_events or account_data_events:
         if batch_id is None:
@@ -769,12 +856,15 @@ def plan_sync_response(
                 if current_room_ids is None or room_id in current_room_ids
                 else ""
             ),
+            provenance_live_event_count=None if request_since is not None else 0,
+            # Classic timeline events advance room state even when the initial
+            # response classifies their callback provenance as history.
+            apply_state_live_event_count=(
+                None if current_room_ids is None or room_id in current_room_ids else 0
+            ),
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,
             account_data_events=room_info.account_data,
-            timeline_events_live=(
-                current_room_ids is None or room_id in current_room_ids
-            ),
         )
         for room_id, room_info in joined_rooms.items()
     ]
@@ -794,7 +884,11 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
             for event in state.events.pop((room_id, gap.generation), ()):
                 if event.was_completed and not event.event_id.startswith("~"):
                     record_completed_timeline_event(
-                        state, room_id, event.event_id, True
+                        state,
+                        room_id,
+                        event.event_id,
+                        True,
+                        event.provenance,
                     )
 
     for gap in plan.gaps:
@@ -817,7 +911,11 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
                 and not event.event_id.startswith("~")
             ):
                 record_completed_timeline_event(
-                    state, plan.clear_recovered.room_id, event.event_id, True
+                    state,
+                    plan.clear_recovered.room_id,
+                    event.event_id,
+                    True,
+                    event.provenance,
                 )
         state.events[key][:] = [event for event in state.events[key] if event.is_live]
 
@@ -877,9 +975,12 @@ def load_recovery_state(
 
     for row in events:
         if row.generation == 0:
-            state.completed.setdefault(row.room_id, OrderedDict())[
-                row.event_id
-            ] = row.was_encrypted
+            state.completed.setdefault(row.room_id, OrderedDict())[row.event_id] = (
+                CompletedTimelineEvent(
+                    row.was_encrypted,
+                    row.provenance,
+                )
+            )
             continue
         event = PendingTimelineEvent(
             row.room_id,
@@ -892,6 +993,8 @@ def load_recovery_state(
             row.was_completed,
             row.kind,
             row.admission_accepted,
+            row.provenance,
+            row.apply_room_state,
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
@@ -947,7 +1050,11 @@ def _finish(
         state.events[key].remove(event)
         if not event.event_id.startswith("~"):
             record_completed_timeline_event(
-                state, gap.room_id, event.event_id, was_encrypted
+                state,
+                gap.room_id,
+                event.event_id,
+                was_encrypted,
+                event.provenance,
             )
         return
     state.events.pop(key, None)
@@ -1100,7 +1207,8 @@ async def _collect_slice(
                 page_events.clear()
                 page_ids.clear()
                 clear_recovered = True
-            was_completed = bool(state.completed.get(gap.room_id, {}).get(event_id))
+            completed = state.completed.get(gap.room_id, {}).get(event_id)
+            was_completed = bool(completed and completed.was_encrypted)
             if event_id in pending_ids:
                 existing = queued_by_id.get(event_id)
                 if (
@@ -1122,6 +1230,12 @@ async def _collect_slice(
                 event,
                 False,
                 was_completed=was_completed,
+                provenance=(
+                    completed.provenance
+                    if completed is not None
+                    else TimelineEventProvenance.HISTORY
+                ),
+                apply_room_state=False,
             )
             if pending_event:
                 recovered.append(pending_event)
