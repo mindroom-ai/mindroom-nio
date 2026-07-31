@@ -1404,7 +1404,9 @@ class AsyncClient(Client):
                     component_is_current = self._room_component_is_current(room_id)
                     live_event_count = self._sliding_live_event_count(room)
                     membership_live_event_count = (
-                        (room.num_live or 0) if room.initial else None
+                        live_event_count
+                        if room.initial or room.expanded_timeline
+                        else None
                     )
                     apply_state_live_event_count = (
                         live_event_count
@@ -1445,7 +1447,7 @@ class AsyncClient(Client):
                                 )
                                 + tuple(response.room_account_data.get(room_id, ()))
                             ),
-                            timeline_events_live=component_is_current,
+                            timeline_events_live=True,
                         )
                     )
                 plans.extend(

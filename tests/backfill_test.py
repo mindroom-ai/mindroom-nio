@@ -4817,6 +4817,80 @@ class TestRoomLocalRecovery:
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w0")}
         await client.close()
 
+    async def test_stale_sync_event_retries_after_membership_reset(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("seed", [text_event("$seed", 0)], prev_batch="w0")
+        )
+        older_started = asyncio.Event()
+        release_older = asyncio.Event()
+        calls: list[tuple[str, TimelineEventProvenance]] = []
+
+        async def admit(_room, event, provenance):
+            calls.append((event.event_id, provenance))
+            if event.event_id == "$older":
+                raise CallbackNotAcceptedError("durable admission failed")
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is SlidingSyncResponse:
+                older_started.set()
+                await release_older.wait()
+                response = self._sliding(
+                    "older",
+                    [text_event("$older", 2)],
+                    prev_batch="w1",
+                )
+            else:
+                response = sync_response(
+                    "newer",
+                    {
+                        ROOM_A: RoomInfo(
+                            Timeline([text_event("$newer", 1)], False, None),
+                            [],
+                            [],
+                            [],
+                        )
+                    },
+                )
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+        older = asyncio.create_task(client.sliding_sync(conn_id="older", pos="older"))
+        await older_started.wait()
+        await client.sync(since="classic")
+        release_older.set()
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable admission failed",
+        ):
+            await older
+
+        leave = self._sliding("leave", [], membership="leave")
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable admission failed",
+        ):
+            await client.receive_response(leave)
+
+        assert calls == [
+            ("$newer", TimelineEventProvenance.HISTORY),
+            ("$older", TimelineEventProvenance.LIVE),
+            ("$older", TimelineEventProvenance.LIVE),
+        ]
+        await client.close()
+
     async def test_independent_initial_snapshot_does_not_clear_existing_gap(
         self, tempdir, monkeypatch
     ):
@@ -7688,8 +7762,13 @@ class TestRoomLocalRecovery:
         assert sliding.recovered_room_ids == frozenset()
         assert sliding.unrecovered_room_ids == frozenset({ROOM_A})
 
-    async def test_sliding_initial_historical_join_keeps_classic_gap(
-        self, client, aioresponse
+    @pytest.mark.parametrize(
+        "timeline_shape",
+        [{"initial": True}, {"expanded_timeline": True}],
+        ids=["initial", "expanded"],
+    )
+    async def test_sliding_historical_join_keeps_classic_gap(
+        self, client, aioresponse, timeline_shape
     ):
         seen = record_events(client)
         client.next_batch = "s1"
@@ -7716,7 +7795,7 @@ class TestRoomLocalRecovery:
                 "pos": "slide1",
                 "rooms": {
                     ROOM_A: {
-                        "initial": True,
+                        **timeline_shape,
                         "membership": "join",
                         "num_live": 1,
                         "timeline": [

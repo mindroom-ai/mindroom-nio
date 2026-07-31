@@ -869,9 +869,7 @@ def plan_sync_response(
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,
             account_data_events=room_info.account_data,
-            timeline_events_live=(
-                current_room_ids is None or room_id in current_room_ids
-            ),
+            timeline_events_live=True,
         )
         for room_id, room_info in joined_rooms.items()
     ]

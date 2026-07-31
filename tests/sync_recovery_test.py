@@ -17,6 +17,8 @@ from nio import (
     MegolmEvent,
     RoomMemberEvent,
     RoomMessageText,
+    RoomInfo,
+    Timeline,
     TimelineEventProvenance,
 )
 from nio.client import async_client as async_client_module
@@ -29,6 +31,7 @@ from nio.client.sync_recovery import (
     apply_plan,
     persist_response_plan,
     plan_room_timeline,
+    plan_sync_response,
     pump_recovery,
     record_completed_timeline_event,
 )
@@ -240,6 +243,29 @@ def test_room_reset_preserves_unaccepted_sync_history():
     )
 
     assert [item.event_id for item in reset.events] == ["$history"]
+
+
+def test_stale_classic_sync_history_remains_sync_origin():
+    plan = plan_sync_response(
+        RecoveryState(),
+        user_id="@me:example.org",
+        request_since="s0",
+        response_token="s1",
+        joined_rooms={
+            ROOM: RoomInfo(
+                Timeline([event("$history", 1)], False, None),
+                [],
+                [],
+                [],
+            )
+        },
+        current_room_ids=frozenset(),
+    )
+
+    assert len(plan.events) == 1
+    assert plan.events[0].is_live
+    assert plan.events[0].provenance is TimelineEventProvenance.LIVE
+    assert not plan.events[0].apply_room_state
 
 
 class InlineStore:
