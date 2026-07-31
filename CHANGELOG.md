@@ -2,7 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.33.0
+
+### Breaking Changes
+
+These only apply when `backfill_limited_timelines=True`; default behaviour is unchanged.
+
+- `room_leave()` and `room_forget()` raise `LocalProtocolError` when called from
+  any event callback — to-device, presence and account-data callbacks included,
+  not only timeline ones. Those callbacks run while the sync response lock is
+  held and the membership reset needs that lock, so the call would deadlock.
+  Leave the room from the task that owns the sync loop instead.
+- `close()` can now raise, and can block. It waits for the sync response lock
+  and every started recovery callback, re-raising the first callback or
+  finalization failure. A callback that never returns prevents `close()` from
+  returning. It also raises `LocalProtocolError` if called from a serialized
+  sync-loop timeline callback.
+- Classic Sync and a to-device-enabled Sliding Sync connection cannot both
+  consume to-device messages in one client generation, because their cursor
+  formats are incompatible. A single `sync()` call claims that stream for the
+  generation, so a later to-device Sliding Sync raises `LocalProtocolError`.
 
 ### Features
 
