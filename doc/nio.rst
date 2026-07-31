@@ -194,6 +194,10 @@ Storage
 .. autoclass:: nio.store.SqliteMemoryStore
     :show-inheritance:
 
+.. automodule:: nio.sliding_sync_tokens
+    :members:
+    :undoc-members:
+
 Encryption
 ----------
 .. automodule:: nio.crypto

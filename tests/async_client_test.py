@@ -944,21 +944,6 @@ class TestClass:
         assert resp.pos == "s1"
         assert resp.lists["main"].count == 1
 
-    async def test_new_sliding_connection_rotates_recovery_scope(
-        self, async_client, monkeypatch
-    ):
-        async def send(*args, **kwargs):
-            return SlidingSyncResponse.from_dict({"pos": "p1"})
-
-        monkeypatch.setattr(async_client, "_send", send)
-        previous = async_client._sliding_sync_recovery_scope
-        await async_client.sliding_sync(pos=None)
-        current = async_client._sliding_sync_recovery_scope
-        assert current != previous
-
-        await async_client.sliding_sync(pos="p1")
-        assert async_client._sliding_sync_recovery_scope == current
-
     sliding_sync_url = re.compile(
         rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"
         r"/org\.matrix\.simplified_msc3575/sync.*$"
@@ -1190,7 +1175,10 @@ class TestClass:
 
         aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
 
-        lists = {"main": {"ranges": [[0, 9]], "timeline_limit": 5}}
+        lists = {
+            "main": {"ranges": [[0, 9]], "timeline_limit": 5},
+            "archive": {"ranges": [[1000, 1010]], "timeline_limit": 1},
+        }
         await asyncio.wait_for(
             async_client.sliding_sync_forever(
                 timeout=30_000, conn_id="seed", lists=lists
@@ -1199,9 +1187,15 @@ class TestClass:
         )
 
         assert requests[0]["lists"]["main"]["ranges"] == [[0, 499]]
+        assert requests[0]["lists"]["archive"]["ranges"] == [
+            [0, 499],
+            [1000, 1010],
+        ]
         assert requests[1]["lists"]["main"]["ranges"] == [[0, 9]]
+        assert requests[1]["lists"]["archive"]["ranges"] == [[1000, 1010]]
         # Widening is a copy; the caller's lists are untouched.
         assert lists["main"]["ranges"] == [[0, 9]]
+        assert lists["archive"]["ranges"] == [[1000, 1010]]
         assert requests[0]["lists"]["main"]["timeline_limit"] == 5
 
     async def test_sliding_sync_forever_without_backfill_keeps_ranges(
@@ -2232,6 +2226,102 @@ class TestClass:
             await asyncio.wait_for(async_client.sliding_sync_forever(), 30)
 
         await asyncio.wait_for(long_poll_cancelled.wait(), 30)
+
+    async def test_sliding_sync_forever_restarts_after_close(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(encryption_enabled=False),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        requests = 0
+        old_request_started = asyncio.Event()
+        release_old_request = asyncio.Event()
+
+        async def sliding_sync(**_kwargs):
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                old_request_started.set()
+                await release_old_request.wait()
+            else:
+                client.stop_sync_forever()
+            return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
+
+        client.sliding_sync = sliding_sync
+
+        old_loop = asyncio.create_task(client.sliding_sync_forever())
+        await old_request_started.wait()
+        client.stop_sync_forever()
+        await client.close()
+        release_old_request.set()
+        await asyncio.wait_for(old_loop, 1)
+
+        assert requests == 1
+        await asyncio.wait_for(client.sliding_sync_forever(), 1)
+
+        assert requests == 2
+        await client.close()
+
+    async def test_close_replaces_sync_generation_without_waiting_old_request(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                encryption_enabled=False,
+                backfill_limited_timelines=True,
+            ),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        request_count = 0
+
+        async def send(*_args, **_kwargs):
+            nonlocal request_count
+            request_count += 1
+            token = "old" if request_count == 1 else "new"
+            if token == "old":
+                old_started.set()
+                await release_old.wait()
+            response = SyncResponse.from_dict({"next_batch": token, "rooms": {}})
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        old = asyncio.create_task(client.sync())
+        await old_started.wait()
+        await client.close()
+        await asyncio.wait_for(client.sync(), 1)
+        assert client.next_batch == "new"
+
+        release_old.set()
+        await asyncio.wait_for(old, 1)
+        assert client.next_batch == "new"
+        await client.close()
 
     async def test_sync_notification_counts(self, async_client, aioresponse):
         aioresponse.get(

@@ -237,6 +237,7 @@ class PendingTimelineEvents(Model):
     is_live = BooleanField()
     was_encrypted = BooleanField()
     was_completed = BooleanField()
+    admission_accepted = BooleanField(default=False)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",
@@ -245,6 +246,28 @@ class PendingTimelineEvents(Model):
 
     class Meta:
         constraints = [SQL("UNIQUE(account_id,room_id,event_id)")]
+
+
+class SlidingWindowTokens(Model):
+    """The /messages token a room's last sliding window handed out.
+
+    Simplified Sliding Sync positions are connection-scoped, so a limited
+    window can only be recovered from the token the room's previous window
+    carried. Keeping it here is what lets a restarted client walk the gap
+    its downtime left behind.
+    """
+
+    room_id = TextField()
+    token = TextField()
+    membership_event_id = TextField()
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="sliding_window_tokens",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id)")]
 
 
 class TrackedUsers(Model):

@@ -626,11 +626,27 @@ class Recorder:
     def observe_recovery(self, client: AsyncClient) -> None:
         dispatch = client._dispatch_timeline_event
 
-        async def record_lane(room_id, event, is_live, was_completed, kind):
+        async def record_lane(
+            room_id,
+            event,
+            is_live,
+            was_completed,
+            kind,
+            admission_accepted,
+            mark_admission_accepted,
+        ):
             event_id = getattr(event, "event_id", None)
             if event_id and kind == "timeline":
                 self.recovery_live[event_id] = is_live
-            return await dispatch(room_id, event, is_live, was_completed, kind)
+            return await dispatch(
+                room_id,
+                event,
+                is_live,
+                was_completed,
+                kind,
+                admission_accepted,
+                mark_admission_accepted,
+            )
 
         client._dispatch_timeline_event = record_lane
 
@@ -655,7 +671,10 @@ def recovery_lane_orders(
     }
 
 
-def recovery_config(max_events: int, encryption: bool = False) -> AsyncClientConfig:
+def recovery_config(max_events: int, encryption: bool = True) -> AsyncClientConfig:
+    # Encryption on by default: nio only builds a store inside that branch,
+    # and without a store there is nothing to persist recovery state or
+    # window tokens in, so the durable paths would go untested.
     return AsyncClientConfig(
         store_sync_tokens=True,
         encryption_enabled=encryption,

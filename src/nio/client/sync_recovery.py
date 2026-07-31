@@ -8,6 +8,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..api import MessageDirection
@@ -22,6 +23,7 @@ from ..events import (
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
+    from ..sliding_sync_tokens import SlidingWindowToken
     from ..store.database import MatrixStore
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
 PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
+_DispatchResult = Event | BadEventType | EphemeralEvent | AccountDataEvent | None
 DispatchEvent = Callable[
     [
         str,
@@ -36,16 +39,32 @@ DispatchEvent = Callable[
         bool,
         bool,
         PendingEventKind,
+        bool,
+        Callable[[], None],
     ],
-    Awaitable[Event | BadEventType | EphemeralEvent | AccountDataEvent | None],
+    Awaitable[_DispatchResult],
 ]
+_DispatchKey = tuple[str, str, PendingEventKind]
 
 
 class _LiveCallbackError(Exception):
-    def __init__(self, error: Exception, was_encrypted: bool):
+    def __init__(
+        self,
+        error: Exception,
+        was_encrypted: bool,
+        *,
+        accepted: bool = True,
+    ):
         super().__init__(error)
         self.error = error
         self.was_encrypted = was_encrypted
+        self.accepted = accepted
+
+
+class _DispatchFinishError(Exception):
+    def __init__(self, error: Exception):
+        super().__init__(error)
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -75,6 +94,7 @@ class PendingTimelineEvent:
     was_encrypted: bool
     was_completed: bool = False
     kind: PendingEventKind = "timeline"
+    admission_accepted: bool = False
 
     @classmethod
     def from_event(
@@ -139,9 +159,273 @@ class RecoveryState:
     outcomes: dict[str, bool] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
+    _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
+        field(default_factory=dict, init=False, repr=False, compare=False)
+    )
+    _dispatch_waiters: dict[asyncio.Task[_LiveCallbackError | None], int] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _deferred_dispatch_errors: list[Exception] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
 
 
-def _is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+def has_pending_recovery_work(state: RecoveryState) -> bool:
+    """Whether a recovery pump has gaps or deferred callback failures."""
+    return bool(state.gaps or state._deferred_dispatch_errors)
+
+
+def is_recovery_dispatch_task(
+    state: RecoveryState,
+    task: asyncio.Task[Any] | None,
+) -> bool:
+    """Whether task owns a retained recovery callback."""
+    return task is not None and task in state._active_dispatches.values()
+
+
+def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:
+    return pending.room_id, pending.event_id, pending.kind
+
+
+def _pending_dispatch(
+    state: RecoveryState, key: _DispatchKey
+) -> tuple[RecoveryGap, PendingTimelineEvent] | None:
+    for (room_id, generation), queued in state.events.items():
+        if room_id != key[0]:
+            continue
+        pending = next(
+            (
+                event
+                for event in queued
+                if event.event_id == key[1] and event.kind == key[2]
+            ),
+            None,
+        )
+        if pending is None:
+            continue
+        gap = next(
+            (
+                gap
+                for gap in state.gaps.get(room_id, ())
+                if gap.generation == generation
+            ),
+            None,
+        )
+        if gap:
+            return gap, pending
+    return None
+
+
+def _dispatch_finished(
+    state: RecoveryState,
+    key: _DispatchKey,
+    task: asyncio.Task[_LiveCallbackError | None],
+) -> None:
+    if state._active_dispatches.get(key) is not task:
+        if not task.cancelled():
+            task.exception()
+        return
+    if state._dispatch_waiters.get(task):
+        return
+    if _pending_dispatch(state, key) is not None:
+        if not task.cancelled():
+            task.exception()
+        return
+    state._active_dispatches.pop(key, None)
+    state._dispatch_waiters.pop(task, None)
+    if task.cancelled():
+        return
+    try:
+        dispatch_error = task.result()
+    except Exception:
+        _report_dispatch_error(
+            key,
+            task,
+            "Recovered event callback failed after its row was cleared: %s",
+        )
+    else:
+        if dispatch_error:
+            state._deferred_dispatch_errors.append(dispatch_error.error)
+
+
+def _report_dispatch_error(
+    key: _DispatchKey,
+    task: asyncio.Task[_LiveCallbackError | None],
+    message: str,
+) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error:
+        logger.error(message, key[1], exc_info=error)
+
+
+async def _run_dispatch(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending: PendingTimelineEvent,
+    key: _DispatchKey,
+    dispatch_event: DispatchEvent,
+    event: Event | BadEventType | EphemeralEvent | AccountDataEvent,
+) -> _LiveCallbackError | None:
+    error: _LiveCallbackError | None = None
+
+    def mark_admission_accepted() -> None:
+        _mark_admission_accepted(state, store, gap, pending)
+
+    try:
+        delivered = await dispatch_event(
+            gap.room_id,
+            event,
+            pending.is_live,
+            pending.was_completed,
+            pending.kind,
+            pending.admission_accepted,
+            mark_admission_accepted,
+        )
+    except _LiveCallbackError as dispatch_error:
+        error = dispatch_error
+        delivered = None
+
+    task = asyncio.current_task()
+    target = _pending_dispatch(state, key)
+    if target and state._active_dispatches.get(key) is task:
+        current_gap, current_pending = target
+        if error and not error.accepted:
+            pass
+        elif error and not current_pending.is_live:
+            state.outcomes[current_gap.room_id] = False
+        else:
+            was_encrypted = (
+                error.was_encrypted
+                if error
+                else (
+                    isinstance(delivered, MegolmEvent)
+                    if delivered
+                    else current_pending.was_encrypted
+                )
+            )
+            try:
+                _finish(
+                    state,
+                    store,
+                    current_gap,
+                    current_pending,
+                    was_encrypted,
+                )
+            except Exception as finish_error:
+                raise _DispatchFinishError(finish_error) from finish_error
+
+    if error:
+        if task is None or not state._dispatch_waiters.get(task):
+            logger.error(
+                "Recovered event callback failed after its recovery pump returned: %s",
+                pending.event_id,
+                exc_info=error.error,
+            )
+        return error
+    return None
+
+
+def _mark_admission_accepted(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending: PendingTimelineEvent,
+) -> None:
+    key = (gap.room_id, gap.generation)
+    queued = state.events[key]
+    index = next(
+        (
+            index
+            for index, current in enumerate(queued)
+            if current.event_id == pending.event_id and current.kind == pending.kind
+        ),
+        None,
+    )
+    if index is None:
+        raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
+    if store:
+        store.accept_recovery_event(
+            gap.room_id,
+            gap.generation,
+            pending.event_id,
+        )
+    queued[index] = replace(queued[index], admission_accepted=True)
+
+
+async def drain_recovery_dispatches(state: RecoveryState) -> None:
+    """Wait for retained callback work and release its in-memory task entries."""
+    drain_error: Exception | None = None
+    while state._active_dispatches:
+        tasks = set(state._active_dispatches.values())
+        await asyncio.wait(tuple(tasks))
+        for key, task in tuple(state._active_dispatches.items()):
+            if not task.done() or state._active_dispatches.get(key) is not task:
+                continue
+            state._active_dispatches.pop(key)
+            state._dispatch_waiters.pop(task, None)
+            if task.cancelled():
+                continue
+            try:
+                callback_error = task.result()
+            except _DispatchFinishError as error:
+                drain_error = drain_error or error.error
+            except Exception as error:
+                drain_error = drain_error or error
+            else:
+                if callback_error:
+                    drain_error = drain_error or callback_error.error
+    if drain_error:
+        raise drain_error
+    if state._deferred_dispatch_errors:
+        raise state._deferred_dispatch_errors.pop(0)
+
+
+async def drain_recovery_room_dispatches(
+    state: RecoveryState, room_ids: Iterable[str]
+) -> None:
+    """Finish retained callback work before replacing room recovery state."""
+    selected_rooms = set(room_ids)
+    while True:
+        selected = {
+            key: task
+            for key, task in state._active_dispatches.items()
+            if key[0] in selected_rooms
+        }
+        if not selected:
+            return
+        tasks = set(selected.values())
+        for task in tasks:
+            state._dispatch_waiters[task] = state._dispatch_waiters.get(task, 0) + 1
+        try:
+            await asyncio.wait(tuple(tasks))
+        finally:
+            for task in tasks:
+                waiters = state._dispatch_waiters.get(task, 0)
+                if waiters <= 1:
+                    state._dispatch_waiters.pop(task, None)
+                else:
+                    state._dispatch_waiters[task] = waiters - 1
+        for key, task in selected.items():
+            if state._active_dispatches.get(key) is not task:
+                continue
+            state._active_dispatches.pop(key)
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if isinstance(error, _DispatchFinishError):
+                raise error.error
+            if error:
+                raise error
+            dispatch_error = task.result()
+            if dispatch_error:
+                raise dispatch_error.error
+
+
+def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
+    """Whether this event is our own transition into the room."""
     return bool(
         user_id
         and isinstance(event, RoomMemberEvent)
@@ -160,7 +444,7 @@ def _timeline_clears_recovery(
         (
             index
             for index, event in enumerate(timeline_events)
-            if _is_own_join(event, user_id)
+            if is_own_join(event, user_id)
         ),
         default=-1,
     )
@@ -229,6 +513,7 @@ def _plan_live_events(
     *,
     include_pending: bool,
     batch_id: str | None,
+    is_live: bool = True,
 ) -> list[PendingTimelineEvent]:
     known = (
         {
@@ -241,11 +526,7 @@ def _plan_live_events(
         else {}
     )
     sequence = 1 + max(
-        (
-            event.sequence
-            for event in state.events.get((room_id, generation), ())
-            if event.is_live
-        ),
+        (event.sequence for event in state.events.get((room_id, generation), ())),
         default=-1,
     )
     planned = []
@@ -254,7 +535,7 @@ def _plan_live_events(
             f"~{batch_id}:{index}" if batch_id is not None else None
         )
         pending = PendingTimelineEvent.from_event(
-            room_id, generation, sequence, event, True, event_id
+            room_id, generation, sequence, event, is_live, event_id
         )
         if not event_id or not pending:
             continue
@@ -343,6 +624,7 @@ def plan_room_timeline(
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
+    timeline_events_live: bool = True,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
@@ -370,6 +652,7 @@ def plan_room_timeline(
         timeline_events,
         include_pending=not clear,
         batch_id=batch_id,
+        is_live=timeline_events_live,
     )
     if ephemeral_events or account_data_events:
         if batch_id is None:
@@ -380,7 +663,6 @@ def plan_room_timeline(
                 (
                     event.sequence
                     for event in state.events.get((room_id, generation), ())
-                    if event.is_live
                 ),
                 default=-1,
             ),
@@ -460,21 +742,39 @@ def plan_sync_response(
     response_token: str,
     joined_rooms: Mapping[str, Any],
     reset_room_ids: Iterable[str] = (),
+    current_room_ids: frozenset[str] | None = None,
 ) -> RecoveryPlan:
     plans = [
         plan_room_timeline(
             state,
             room_id=room_id,
             timeline_events=tuple(room_info.timeline.events),
-            user_id=user_id,
+            user_id=(
+                user_id
+                if current_room_ids is None or room_id in current_room_ids
+                else None
+            ),
             membership="join",
             cursor_token=(
-                request_since if room_info.timeline.limited and request_since else None
+                (
+                    request_since
+                    if room_info.timeline.limited and request_since
+                    else None
+                )
+                if current_room_ids is None or room_id in current_room_ids
+                else None
             ),
-            target_token=room_info.timeline.prev_batch or response_token,
+            target_token=(
+                room_info.timeline.prev_batch or response_token
+                if current_room_ids is None or room_id in current_room_ids
+                else ""
+            ),
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,
             account_data_events=room_info.account_data,
+            timeline_events_live=(
+                current_room_ids is None or room_id in current_room_ids
+            ),
         )
         for room_id, room_info in joined_rooms.items()
     ]
@@ -525,10 +825,16 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.completed.get(event.room_id, {}).pop(event.event_id, None)
         key = (event.room_id, event.generation)
         queued = state.events.setdefault(key, [])
-        if not any(item.event_id == event.event_id for item in queued):
+        existing = next(
+            (item for item in queued if item.event_id == event.event_id),
+            None,
+        )
+        if existing is None:
             queued.append(event)
+        else:
+            queued[queued.index(existing)] = event
     for key in {(event.room_id, event.generation) for event in plan.events}:
-        state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
+        state.events[key].sort(key=lambda item: item.sequence)
 
 
 def take_recovery_outcomes(
@@ -585,10 +891,11 @@ def load_recovery_state(
             row.was_encrypted,
             row.was_completed,
             row.kind,
+            row.admission_accepted,
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
-        queued.sort(key=lambda event: (event.is_live, event.sequence))
+        queued.sort(key=lambda event: event.sequence)
 
 
 def persist_response_plan(
@@ -597,6 +904,8 @@ def persist_response_plan(
     *,
     token: str | None,
     plan: RecoveryPlan,
+    window_tokens: Mapping[str, SlidingWindowToken] | None = None,
+    forgotten_rooms: Iterable[str] = (),
 ) -> None:
     try:
         if store:
@@ -606,6 +915,8 @@ def persist_response_plan(
                 plan.gaps,
                 plan.events,
                 plan.clear_recovered,
+                window_tokens,
+                forgotten_rooms,
             )
         apply_plan(state, plan)
     except BaseException:
@@ -648,6 +959,66 @@ def _finish(
         state.outcomes.setdefault(gap.room_id, True)
 
 
+def _merge_recovery_page_order(
+    queued: Iterable[PendingTimelineEvent],
+    page: Iterable[PendingTimelineEvent],
+) -> tuple[PendingTimelineEvent, ...]:
+    """Place page overlap anchors between recovered history and later live work."""
+    page_events = list(page)
+    queued_events = list(queued)
+    if not page_events:
+        return tuple(
+            replace(event, sequence=index) for index, event in enumerate(queued_events)
+        )
+
+    queued_indexes = {
+        event.event_id: index for index, event in enumerate(queued_events)
+    }
+    anchors = [
+        (page_index, queued_indexes[event.event_id])
+        for page_index, event in enumerate(page_events)
+        if event.event_id in queued_indexes
+    ]
+    # Conflicting overlap order cannot be spliced safely. Insert only the
+    # page's new events at the normal recovered/live boundary instead.
+    if any(previous[1] >= current[1] for previous, current in pairwise(anchors)):
+        page_events = [
+            event for event in page_events if event.event_id not in queued_indexes
+        ]
+        anchors = []
+    page_ids = {event.event_id for event in page_events}
+    if not anchors:
+        insert_at = 1 + max(
+            (index for index, event in enumerate(queued_events) if not event.is_live),
+            default=-1,
+        )
+        ordered = [
+            *queued_events[:insert_at],
+            *page_events,
+            *queued_events[insert_at:],
+        ]
+    else:
+        ordered = []
+        queued_start = 0
+        page_start = 0
+        for page_end, queued_end in anchors:
+            ordered.extend(
+                event
+                for event in queued_events[queued_start:queued_end]
+                if event.event_id not in page_ids
+            )
+            ordered.extend(page_events[page_start : page_end + 1])
+            queued_start = queued_end + 1
+            page_start = page_end + 1
+        ordered.extend(page_events[page_start:])
+        ordered.extend(
+            event
+            for event in queued_events[queued_start:]
+            if event.event_id not in page_ids
+        )
+    return tuple(replace(event, sequence=index) for index, event in enumerate(ordered))
+
+
 async def _collect_slice(
     state: RecoveryState,
     gap: RecoveryGap,
@@ -670,7 +1041,6 @@ async def _collect_slice(
         for event in queued
     ]
     pending_ids = {event.event_id for event in pending}
-    live_ids = {event.event_id for event in pending if event.is_live}
     recovered_count = sum(not event.is_live for event in pending)
 
     while cursor and pages < options.max_pages:
@@ -717,44 +1087,47 @@ async def _collect_slice(
             return gap
 
         recovered: list[PendingTimelineEvent] = []
-        next_sequence = 1 + max(
-            (
-                event.sequence
-                for event in state.events.get((gap.room_id, gap.generation), ())
-                if not event.is_live
-            ),
-            default=-1,
-        )
-        reached_window = False
+        page_events: list[PendingTimelineEvent] = []
+        page_ids: set[str] = set()
+        queued = state.events.get((gap.room_id, gap.generation), ())
+        queued_by_id = {event.event_id: event for event in queued}
         for event in response.chunk:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
-            if event_id in live_ids and response.end != gap.target_token:
-                reached_window = True
-                break
-            if _is_own_join(event, user_id):
+            if is_own_join(event, user_id):
                 recovered.clear()
+                page_events.clear()
+                page_ids.clear()
                 clear_recovered = True
-                next_sequence = 0
             was_completed = bool(state.completed.get(gap.room_id, {}).get(event_id))
-            if event_id in pending_ids or (
-                not should_dispatch_timeline_event(state, gap.room_id, event)
-                and not (was_completed and isinstance(event, MegolmEvent))
+            if event_id in pending_ids:
+                existing = queued_by_id.get(event_id)
+                if (
+                    existing
+                    and (existing.is_live or not clear_recovered)
+                    and event_id not in page_ids
+                ):
+                    page_events.append(existing)
+                    page_ids.add(event_id)
+                continue
+            if not should_dispatch_timeline_event(state, gap.room_id, event) and not (
+                was_completed and isinstance(event, MegolmEvent)
             ):
                 continue
-            pending = PendingTimelineEvent.from_event(
+            pending_event = PendingTimelineEvent.from_event(
                 gap.room_id,
                 gap.generation,
-                next_sequence,
+                0,
                 event,
                 False,
                 was_completed=was_completed,
             )
-            if pending:
-                recovered.append(pending)
+            if pending_event:
+                recovered.append(pending_event)
+                page_events.append(pending_event)
+                page_ids.add(event_id)
                 pending_ids.add(event_id)
-                next_sequence += 1
 
         current_recovered_count = sum(
             not event.is_live
@@ -766,10 +1139,9 @@ async def _collect_slice(
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
+            page_events.clear()
             clear_recovered = True
             abandoned = True
-            next_cursor = None
-        elif reached_window:
             next_cursor = None
         elif response.end is None and gap.target_token:
             # A bounded walk that runs out of events has reached the sync
@@ -778,10 +1150,8 @@ async def _collect_slice(
             # was bounded by the token the window starts at. Both Synapse
             # and Tuwunel answer the last page of a `to`-bounded forward
             # walk this way — with an empty chunk and no token — and they
-            # stop short of the window's own events, so the live overlap
-            # above never gets the chance to close the gap. Treating the
-            # exhausted page as failure discarded every recovered event
-            # instead.
+            # stop short of the window's own events. Treating the exhausted
+            # page as failure discarded every recovered event instead.
             #
             # The spec also omits `end` when the user may not see any more
             # events, which this cannot distinguish; a gap truncated by
@@ -799,6 +1169,12 @@ async def _collect_slice(
         else:
             next_cursor = response.end
 
+        retained = (
+            [event for event in queued if event.is_live] if clear_recovered else queued
+        )
+        ordered_events = (
+            () if abandoned else _merge_recovery_page_order(retained, page_events)
+        )
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
             state,
@@ -806,7 +1182,7 @@ async def _collect_slice(
             token=None,
             plan=RecoveryPlan(
                 gaps=(updated,),
-                events=tuple(recovered),
+                events=ordered_events,
                 clear_recovered=updated if clear_recovered else None,
                 unrecovered_room_ids=(
                     frozenset({gap.room_id}) if abandoned else frozenset()
@@ -832,6 +1208,7 @@ async def _drain_gap(
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
+        callback_error: Exception | None = None
         try:
             event = pending.parse()
         except Exception:
@@ -841,36 +1218,70 @@ async def _drain_gap(
             _finish(state, store, gap, pending, pending.was_encrypted)
             continue
         try:
-            dispatch = dispatch_event(
-                gap.room_id,
-                event,
-                pending.is_live,
-                pending.was_completed,
-                pending.kind,
-            )
-            delivered = (
-                await dispatch
-                if deadline is None
-                else await asyncio.wait_for(
-                    dispatch, timeout=deadline - asyncio.get_running_loop().time()
+            key = _dispatch_key(pending)
+            task = state._active_dispatches.get(key)
+            loop = asyncio.get_running_loop()
+            if task is None:
+                if deadline is not None and deadline <= loop.time():
+                    logger.warning(
+                        "Recovered event callback timed out: %s", pending.event_id
+                    )
+                    return
+                task = loop.create_task(
+                    _run_dispatch(
+                        state,
+                        store,
+                        gap,
+                        pending,
+                        key,
+                        dispatch_event,
+                        event,
+                    )
                 )
-            )
+                # A timeout must stop waiting without cancelling callbacks that
+                # may already have side effects. The next pump reuses this task.
+                state._active_dispatches[key] = task
+                task.add_done_callback(
+                    lambda done, state=state, key=key: _dispatch_finished(
+                        state, key, done
+                    )
+                )
+            timeout = None if deadline is None else max(0, deadline - loop.time())
+            state._dispatch_waiters[task] = state._dispatch_waiters.get(task, 0) + 1
+            done: set[asyncio.Task[_LiveCallbackError | None]] = set()
+            try:
+                done, _ = await asyncio.wait((task,), timeout=timeout)
+            finally:
+                waiters = state._dispatch_waiters.get(task, 0)
+                if waiters <= 1:
+                    state._dispatch_waiters.pop(task, None)
+                else:
+                    state._dispatch_waiters[task] = waiters - 1
+                if task.done() and task not in done:
+                    _dispatch_finished(state, key, task)
+            if not done:
+                logger.warning(
+                    "Recovered event callback timed out: %s", pending.event_id
+                )
+                return
+            if state._active_dispatches.get(key) is not task:
+                return
+            state._active_dispatches.pop(key, None)
+            error = task.result()
+            if error:
+                raise error
         except _LiveCallbackError as error:
-            _finish(state, store, gap, pending, error.was_encrypted)
-            raise error.error
+            callback_error = error.error
+        except _DispatchFinishError as error:
+            raise error.error from error
         except asyncio.TimeoutError:
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
             return
         except Exception:
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
-        _finish(
-            state,
-            store,
-            gap,
-            pending,
-            isinstance(delivered, MegolmEvent) if delivered else pending.was_encrypted,
-        )
+        if callback_error is not None:
+            raise callback_error
 
     _finish(state, store, gap)
 
@@ -885,6 +1296,8 @@ async def pump_recovery(
     store: MatrixStore | None,
     ready_room_id: str | None = None,
 ) -> None:
+    if state._deferred_dispatch_errors:
+        raise state._deferred_dispatch_errors.pop(0)
     if ready_room_id is not None:
         gaps = state.gaps.get(ready_room_id)
         if not gaps or gaps[0].cursor_token is not None:

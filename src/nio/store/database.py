@@ -35,6 +35,7 @@ from ..crypto import (
     SessionStore,
     TrustState,
 )
+from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
     DeviceKeys,
@@ -49,12 +50,15 @@ from . import (
     OlmSessions,
     OutgoingKeyRequests,
     PendingTimelineEvents,
+    SlidingWindowTokens,
     StoreVersion,
     SyncRecoveryGaps,
     SyncTokens,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
     from ..client.sync_recovery import (
         PendingEventKind,
         PendingTimelineEvent,
@@ -65,7 +69,7 @@ if TYPE_CHECKING:
 _RECOVERY_PAYLOAD_VERSION = 1
 _RECOVERY_NONCE_SIZE = 12
 _RECOVERY_TAG_SIZE = 16
-_RECOVERY_WRITE_CHUNK_SIZE = 100
+_RECOVERY_WRITE_CHUNK_SIZE = 90
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
 
@@ -129,8 +133,9 @@ class MatrixStore:
         SyncTokens,
         SyncRecoveryGaps,
         PendingTimelineEvents,
+        SlidingWindowTokens,
     ]
-    store_version = 3
+    store_version = 6
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -167,6 +172,28 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
 
+    def upgrade_to_v5(self):
+        with self.database.bind_ctx(self.models):
+            self.database.drop_tables([SlidingWindowTokens], safe=True)
+            self.database.create_tables([SlidingWindowTokens])
+        self._update_version(5)
+
+    def upgrade_to_v6(self):
+        with self.database.bind_ctx(self.models):
+            table = PendingTimelineEvents._meta.table_name
+            columns = {
+                row[1]
+                for row in self.database.execute_sql(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+            if "admission_accepted" not in columns:
+                self.database.execute_sql(
+                    f'ALTER TABLE "{table}" '
+                    "ADD COLUMN admission_accepted INTEGER NOT NULL DEFAULT 0"
+                )
+        self._update_version(6)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -181,6 +208,12 @@ class MatrixStore:
             store_version = 2
         if store_version == 2:
             self.upgrade_to_v3()
+            store_version = 3
+        if store_version in (3, 4):
+            self.upgrade_to_v5()
+            store_version = 5
+        if store_version == 5:
+            self.upgrade_to_v6()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -540,6 +573,7 @@ class MatrixStore:
             is_live=False,
             was_encrypted=True,
             was_completed=False,
+            admission_accepted=False,
         ).where(
             PendingTimelineEvents.account == account,
             PendingTimelineEvents.generation > 0,
@@ -555,25 +589,34 @@ class MatrixStore:
         gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
         events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
         clear_recovered: RecoveryGap | None,
+        window_tokens: Mapping[str, SlidingWindowToken] | None = None,
+        forgotten_rooms: Iterable[str] = (),
     ) -> None:
         account = self._get_account()
         assert account
 
+        # Window tokens ride the same transaction as the plan they belong
+        # to: a baseline stored without its plan, or the other way round,
+        # would send a restarted walk from the wrong position.
+        self._write_sliding_window_tokens(account, window_tokens, forgotten_rooms)
+
         if token:
             SyncTokens.replace(account=account, token=token).execute()
-        if clear_rooms:
+        clear_rooms = list(clear_rooms)
+        for index in range(0, len(clear_rooms), _RECOVERY_WRITE_CHUNK_SIZE):
+            room_batch = clear_rooms[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             self._restore_completed_markers(
                 account,
-                PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.room_id.in_(room_batch),
             )
             PendingTimelineEvents.delete().where(
                 PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.room_id.in_(room_batch),
                 PendingTimelineEvents.generation > 0,
             ).execute()
             SyncRecoveryGaps.delete().where(
                 SyncRecoveryGaps.account == account,
-                SyncRecoveryGaps.room_id.in_(clear_rooms),
+                SyncRecoveryGaps.room_id.in_(room_batch),
             ).execute()
         if clear_recovered:
             self._restore_completed_markers(
@@ -659,9 +702,11 @@ class MatrixStore:
             decoded = json.loads(decrypted)
             kind = decoded["kind"]
             source = decoded["source"]
-            if kind not in {"timeline", "ephemeral", "account_data"} or not isinstance(
-                source, str
-            ):
+            if kind not in {
+                "timeline",
+                "ephemeral",
+                "account_data",
+            } or not isinstance(source, str):
                 raise ValueError
             return source, kind
         except (KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
@@ -684,10 +729,19 @@ class MatrixStore:
                 "is_live": event.is_live,
                 "was_encrypted": event.was_encrypted,
                 "was_completed": event.was_completed,
+                "admission_accepted": event.admission_accepted,
             }
             for event in events
         ]
         for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            promote_completed_placeholder = (
+                (PendingTimelineEvents.generation == 0)
+                & PendingTimelineEvents.was_encrypted
+                & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
+            )
+            resequence_same_generation = (PendingTimelineEvents.generation > 0) & (
+                PendingTimelineEvents.generation == EXCLUDED.generation
+            )
             PendingTimelineEvents.insert_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).on_conflict(
@@ -696,19 +750,41 @@ class MatrixStore:
                     PendingTimelineEvents.room_id,
                     PendingTimelineEvents.event_id,
                 ],
-                preserve=[
-                    PendingTimelineEvents.generation,
-                    PendingTimelineEvents.sequence,
-                    PendingTimelineEvents.event_payload,
-                    PendingTimelineEvents.is_live,
-                    PendingTimelineEvents.was_encrypted,
-                    PendingTimelineEvents.was_completed,
-                ],
-                where=(
-                    (PendingTimelineEvents.generation == 0)
-                    & PendingTimelineEvents.was_encrypted
-                    & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
-                ),
+                update={
+                    PendingTimelineEvents.generation: EXCLUDED.generation,
+                    PendingTimelineEvents.sequence: EXCLUDED.sequence,
+                    PendingTimelineEvents.event_payload: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.event_payload),),
+                        PendingTimelineEvents.event_payload,
+                    ),
+                    PendingTimelineEvents.is_live: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.is_live),),
+                        PendingTimelineEvents.is_live,
+                    ),
+                    PendingTimelineEvents.was_encrypted: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.was_encrypted),),
+                        PendingTimelineEvents.was_encrypted,
+                    ),
+                    PendingTimelineEvents.was_completed: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.was_completed),),
+                        PendingTimelineEvents.was_completed,
+                    ),
+                    PendingTimelineEvents.admission_accepted: Case(
+                        None,
+                        (
+                            (
+                                promote_completed_placeholder,
+                                EXCLUDED.admission_accepted,
+                            ),
+                        ),
+                        PendingTimelineEvents.admission_accepted,
+                    ),
+                },
+                where=promote_completed_placeholder | resequence_same_generation,
             ).execute()
 
     @use_database
@@ -760,9 +836,98 @@ class MatrixStore:
                     row.was_encrypted,
                     row.was_completed,
                     kind,
+                    row.admission_accepted,
                 )
             )
         return gaps, events
+
+    @use_database_atomic
+    def accept_recovery_event(
+        self,
+        room_id: str,
+        generation: int,
+        event_id: str,
+    ) -> None:
+        """Durably record admission before ordinary callback fanout."""
+        account = self._get_account()
+        assert account
+        updated = (
+            PendingTimelineEvents.update(admission_accepted=True)
+            .where(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id == room_id,
+                PendingTimelineEvents.generation == generation,
+                PendingTimelineEvents.event_id == event_id,
+            )
+            .execute()
+        )
+        if updated != 1:
+            raise ValueError(f"Pending recovery event not found: {event_id}")
+
+    @use_database
+    def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
+        """Load each room's last sliding window token."""
+        account = self._get_account()
+        if not account:
+            return {}
+        return {
+            row.room_id: SlidingWindowToken(row.token, row.membership_event_id)
+            for row in SlidingWindowTokens.select().where(
+                SlidingWindowTokens.account == account
+            )
+        }
+
+    @use_database_atomic
+    def save_sliding_window_tokens(
+        self,
+        tokens: Mapping[str, SlidingWindowToken],
+        forgotten: Iterable[str] = (),
+    ) -> None:
+        """Persist window tokens, dropping the rooms that no longer have one."""
+        account = self._get_account()
+        assert account
+        self._write_sliding_window_tokens(account, tokens, forgotten)
+
+    def _write_sliding_window_tokens(
+        self,
+        account,
+        tokens: Mapping[str, SlidingWindowToken] | None,
+        forgotten: Iterable[str],
+    ) -> None:
+        """Write window tokens in chunks SQLite can bind in one statement."""
+        forgotten = list(forgotten)
+        for index in range(0, len(forgotten), _RECOVERY_WRITE_CHUNK_SIZE):
+            SlidingWindowTokens.delete().where(
+                SlidingWindowTokens.account == account,
+                SlidingWindowTokens.room_id.in_(
+                    forgotten[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+                ),
+            ).execute()
+
+        rows = [
+            {
+                "account": account,
+                "room_id": room_id,
+                "token": token.token,
+                "membership_event_id": token.membership_event_id,
+            }
+            for room_id, token in (tokens or {}).items()
+        ]
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SlidingWindowTokens.replace_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+
+    @use_database_atomic
+    def forget_sliding_window_token(self, room_id: str) -> None:
+        """Drop one room's window token, e.g. after leaving or forgetting it."""
+        account = self._get_account()
+        if not account:
+            return
+        SlidingWindowTokens.delete().where(
+            SlidingWindowTokens.account == account,
+            SlidingWindowTokens.room_id == room_id,
+        ).execute()
 
     @use_database_atomic
     def finish_recovery(
@@ -791,6 +956,7 @@ class MatrixStore:
             pending.generation = 0
             pending.event_payload = b""
             pending.is_live = pending.was_completed = False
+            pending.admission_accepted = False
             pending.was_encrypted = was_encrypted
             pending.save(force_insert=True)
             stale = (

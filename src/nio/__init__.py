@@ -13,3 +13,4 @@ from .exceptions import *
 from .monitors import *
 from .responses import *
 from .rooms import *
+from .sliding_sync_tokens import SlidingWindowToken

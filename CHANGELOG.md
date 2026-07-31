@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Persist each room's sliding window token, so a restarted client can walk the gap its downtime left behind instead of dropping it.
+  0.31.0 held the walk baseline in memory, which left the first limited or initial window after a restart unrecoverable — the one case the `/v3/sync` transport had always covered through its stored sync token.
+  Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
+  Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
+  Servers without `$ME` support provide no trusted initial membership proof, so nio retains no baseline and reports later known discontinuities as unrecovered.
+  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap except when they share the device to-device cursor; Classic and Sliding Sync cannot both consume to-device messages in one client generation because their cursor formats are incompatible.
+  Bounded per-room and type-keyed account-data floors reject stale state and baseline changes without dropping unseen timeline events.
+  Sync-family response application remains serialized within one replaceable client generation, so every accepted response slice is delivered once and a late pre-close response cannot mutate reused client state.
+  Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
+  This migrates the store from schema v3 to v6, safely discards unscoped v4 token rows, records durable event-admission acceptance, and exports `SlidingWindowTokens` from `nio.store`.
+- Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
+  which follows `store_sync_tokens` as before, and can be set to True to
+  persist recovery state while nio never reads or writes `next_batch`
+  itself. Clients that decide for themselves when a sync token may be
+  advanced — because they only trust a token once their own writes are
+  durable — previously had to choose between that ownership and durable
+  recovery. Recovery then resumes relative to whatever token the caller
+  restores.
+
+### Bug Fixes
+
+- Persist same-generation pending-event resequencing so recovered history stays
+  ahead of its held live window after a restart.
+- Give every retried sync transport attempt a fresh ordering identity so a
+  successful membership reset cannot make a later retry discard current room
+  state while exposing its advanced cursor.
+- Report a known limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched exact current own-membership proof.
+  Fresh rooms without a prior baseline are not reported as lost, and historical joins outside `num_live` do not suppress a real gap.
+- Add `AsyncClient.add_event_admission_callback()` as a pre-fanout durable admission boundary.
+  Exactly one admission owner may be registered so durable side effects cannot be partially accepted by multiple callbacks.
+  `CallbackNotAcceptedError` is valid only there and keeps the event pending when raised before acceptance or side effects.
+  The same exception from an ordinary callback is too late to reject and has ordinary error behavior.
+  Ordinary live callback errors acknowledge the event once, while ordinary recovered-history errors leave it pending for a later pump or restart.
+- Drain started room callback work before computing the response plan that replaces room recovery state.
+  This prevents a stale pre-drain plan from restoring an event whose callback already finished.
+- Continue bounded forward recovery walks until the server exhausts the range instead of stopping when an event overlaps the live window.
+- Apply successful leave or forget invalidation under response serialization without waiting for an in-flight sync long poll.
+  Recovery-enabled membership changes called from a direct or inherited event-callback context raise before network I/O, while default recovery-disabled behavior remains uncoordinated.
+- Serialize implicit Classic Sync cursor selection with its request so concurrent calls cannot send the same stale `since` token.
+- Prevent a sync request from retrying or creating a new HTTP session after `close()` replaces its client generation.
+- Preserve tuple or list caller Sliding Sync ranges when the initial recovery seed range is added.
+- Require every `SlidingWindowToken` to carry a non-empty own-membership event ID matching its non-null database column.
+- Document that `close()` cannot run from a sync-loop timeline callback; stop the sync loop there and await `close()` from its owner after the loop exits.
+- Retain one keyed task for a recovered callback that outlives its pump deadline, then durably finish it before client shutdown so started callback side effects are neither cancelled nor replayed after restart.
+
 ## 0.32.0
 
 ### Features

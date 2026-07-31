@@ -18,6 +18,7 @@ from nio.crypto import (
 )
 from nio.exceptions import OlmTrustError
 from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
+from nio.sliding_sync_tokens import SlidingWindowToken
 from nio.store import (
     DefaultStore,
     Ed25519Key,
@@ -27,6 +28,7 @@ from nio.store import (
     SqliteMemoryStore,
     SqliteStore,
     PendingTimelineEvents,
+    SlidingWindowTokens,
     SyncRecoveryGaps,
 )
 
@@ -535,7 +537,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 3
+        assert version == 6
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -580,7 +582,62 @@ class TestClass:
             events[0].generation,
             events[0].sequence,
             events[0].event_id,
-        ) == (TEST_ROOM, 1, 0, "$held")
+            events[0].admission_accepted,
+        ) == (TEST_ROOM, 1, 0, "$held", False)
+
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
+        assert sqlstore.load_sync_recovery()[1][0].admission_accepted
+
+    def test_sync_recovery_resequences_existing_generation(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+
+        def pending(
+            event_id: str,
+            sequence: int,
+            *,
+            is_live: bool,
+            admission_accepted: bool = False,
+        ) -> PendingTimelineEvent:
+            return PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                sequence,
+                event_id,
+                '{"content":{},"event_id":"%s","sender":"@a:b",'
+                '"type":"m.test"}' % event_id,
+                is_live,
+                False,
+                admission_accepted=admission_accepted,
+            )
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [pending("$held", 0, is_live=True)],
+            None,
+        )
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [
+                pending("$gap1", 0, is_live=False),
+                pending("$gap2", 1, is_live=False),
+                pending("$held", 2, is_live=True, admission_accepted=True),
+            ],
+            None,
+        )
+
+        _, events = sqlstore.load_sync_recovery()
+        assert [(event.event_id, event.sequence) for event in events] == [
+            ("$gap1", 0),
+            ("$gap2", 1),
+            ("$held", 2),
+        ]
+        assert events[-1].admission_accepted
 
     def test_v2_store_creates_recovery_tables(self, sqlstore):
         with sqlstore.database.bind_ctx(sqlstore.models):
@@ -594,10 +651,11 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 3
+        assert reopened._get_store_version() == 6
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
+            assert SlidingWindowTokens.table_exists()
             columns = {
                 row[1]: row[2]
                 for row in reopened.database.execute_sql(
@@ -605,7 +663,207 @@ class TestClass:
                 ).fetchall()
             }
         assert columns["event_payload"] == "BLOB"
+        assert columns["admission_accepted"] == "INTEGER"
         assert "source_json" not in columns
+
+    def test_v3_store_creates_sliding_window_tokens(self, sqlstore):
+        """A v3 store gains the sliding window token table on open."""
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SlidingWindowTokens])
+            sqlstore._update_version(3)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened._get_store_version() == 6
+        with reopened.database.bind_ctx(reopened.models):
+            assert SlidingWindowTokens.table_exists()
+        assert reopened.load_sliding_window_tokens() == {}
+
+    def test_v4_store_discards_unscoped_sliding_window_tokens(self, sqlstore):
+        """A token without its membership event cannot authorize a later walk."""
+        account = sqlstore._get_account()
+        assert account
+        table = SlidingWindowTokens._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SlidingWindowTokens])
+            sqlstore.database.execute_sql(f"""
+                CREATE TABLE "{table}" (
+                    "id" INTEGER NOT NULL PRIMARY KEY,
+                    "room_id" TEXT NOT NULL,
+                    "token" TEXT NOT NULL,
+                    "account_id" INTEGER NOT NULL
+                )
+                """)
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" '
+                '("room_id", "token", "account_id") VALUES (?, ?, ?)',
+                (TEST_ROOM, "w1", account.id),
+            )
+            sqlstore._update_version(4)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 6
+        assert reopened.load_sliding_window_tokens() == {}
+
+    def test_v5_store_adds_durable_admission_phase(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        table = PendingTimelineEvents._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN admission_accepted'
+            )
+            sqlstore._update_version(5)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 6
+        assert not reopened.load_sync_recovery()[1][0].admission_accepted
+
+    def test_sliding_window_tokens_roundtrip(self, sqlstore):
+        """Tokens survive a reopen, and forgotten rooms do not."""
+        sqlstore.save_sliding_window_tokens(
+            {
+                TEST_ROOM: SlidingWindowToken("w1", "$join-a"),
+                "!b:example.org": SlidingWindowToken("w2", "$join-b"),
+            }
+        )
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w1", "$join-a"),
+            "!b:example.org": SlidingWindowToken("w2", "$join-b"),
+        }
+
+        # A newer window replaces the token; a left room drops it.
+        sqlstore.save_sliding_window_tokens(
+            {TEST_ROOM: SlidingWindowToken("w3", "$join-a")},
+            ["!b:example.org"],
+        )
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w3", "$join-a")
+        }
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w3", "$join-a")
+        }
+
+    @pytest.mark.parametrize("membership_event_id", [None, ""])
+    def test_sliding_window_token_requires_membership_identity(
+        self, membership_event_id
+    ):
+        with pytest.raises(ValueError, match="membership_event_id"):
+            SlidingWindowToken("w1", membership_event_id)
+
+    def test_sliding_window_tokens_chunk_large_batches(self, sqlstore):
+        """More rooms than SQLite can bind in one statement still write."""
+        connection = sqlstore.database.connection()
+        if not hasattr(connection, "setlimit"):
+            pytest.skip("sqlite3.Connection.setlimit is unavailable")
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+        tokens = {
+            f"!room{index}:example.org": SlidingWindowToken(
+                f"w{index}", f"$join{index}"
+            )
+            for index in range(750)
+        }
+        try:
+            sqlstore.save_sliding_window_tokens(tokens)
+            assert sqlstore.load_sliding_window_tokens() == tokens
+
+            sqlstore.save_sliding_window_tokens({}, list(tokens)[:600])
+            assert len(sqlstore.load_sliding_window_tokens()) == 150
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
+
+    def test_sync_recovery_chunks_large_room_clears(self, sqlstore):
+        """A large reset response stays below SQLite's bind limit."""
+        connection = sqlstore.database.connection()
+        if not hasattr(connection, "setlimit"):
+            pytest.skip("sqlite3.Connection.setlimit is unavailable")
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+        room_ids = [f"!room{index}:example.org" for index in range(600)]
+        gaps = [RecoveryGap(room_id, 1, "target", "cursor") for room_id in room_ids]
+        try:
+            sqlstore.save_recovery(None, set(), gaps, [], None)
+            sqlstore.save_recovery(None, set(room_ids), [], [], None)
+            remaining, _ = sqlstore.load_sync_recovery()
+            assert not {gap.room_id for gap in remaining} & set(room_ids)
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
+
+    def test_save_recovery_writes_window_tokens_in_one_transaction(
+        self, sqlstore, monkeypatch
+    ):
+        """The plan and its baselines land together or not at all."""
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+
+        def fail(*args):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(sqlstore, "_upsert_pending_events", fail)
+        with pytest.raises(RuntimeError):
+            sqlstore.save_recovery(
+                "s1",
+                set(),
+                [gap],
+                [
+                    PendingTimelineEvent(
+                        TEST_ROOM,
+                        1,
+                        0,
+                        "$held",
+                        '{"content":{},"event_id":"$held","sender":"@a:b",'
+                        '"type":"m.test"}',
+                        True,
+                        False,
+                    )
+                ],
+                None,
+                {TEST_ROOM: SlidingWindowToken("w1", "$join")},
+            )
+
+        # The write failed, so neither the plan nor the token survives.
+        assert sqlstore.load_sliding_window_tokens() == {}
+        gaps, events = sqlstore.load_sync_recovery()
+        assert not gaps
+        assert not events
+
+    def test_forget_sliding_window_token(self, sqlstore):
+        sqlstore.save_sliding_window_tokens(
+            {
+                TEST_ROOM: SlidingWindowToken("w1", "$join-a"),
+                "!b:example.org": SlidingWindowToken("w2", "$join-b"),
+            }
+        )
+        sqlstore.forget_sliding_window_token(TEST_ROOM)
+        assert sqlstore.load_sliding_window_tokens() == {
+            "!b:example.org": SlidingWindowToken("w2", "$join-b")
+        }
 
     def test_pending_recovery_payload_is_encrypted_at_rest(self, tempdir):
         store = SqliteStore(
