@@ -339,7 +339,7 @@ def _adapt_event_admission_callback(
     try:
         callback_signature = inspect.signature(callback)
     except (TypeError, ValueError):
-        return with_provenance
+        return cast(EventAdmissionCallback, callback)
 
     try:
         callback_signature.bind(None, None)
