@@ -99,20 +99,16 @@ def ordered_response_view(
         if accepted_one_time_key_count_components and request_id is not None
         else None
     )
+    room_ids = response_room_ids(response)
     accepted = accept_reset_safe_rooms(
         state,
-        response_room_ids(response),
+        room_ids,
         request_id,
     )
     if isinstance(response, SyncResponse):
-        response_room_ids_set = (
-            response.rooms.join.keys()
-            | response.rooms.invite.keys()
-            | response.rooms.leave.keys()
-        )
         current_rooms, _ = accept_current_components(
             state,
-            (room_id for room_id in response_room_ids_set if room_id in accepted),
+            (room_id for room_id in room_ids if room_id in accepted),
             has_to_device_token=False,
             request_id=request_id,
         )
