@@ -57,6 +57,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
+from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
 from nio.responses import RoomMessagesResponse, SlidingSyncError
 from nio.sliding_sync_tokens import SlidingWindowToken
 
@@ -1715,6 +1716,34 @@ class TestRoomLocalRecovery:
         await asyncio.gather(first, second)
 
         assert request_cursors == [None, "s1"]
+
+    async def test_fence_rejected_classic_join_without_room_is_ignored(self, client):
+        older = issue_sync_request(client._sync_reset_fence, "classic")
+        newer = issue_sync_request(client._sync_reset_fence, "classic")
+        empty_room = RoomInfo(Timeline([], False, None), [], [], [])
+        newer_leave = sync_response("s2", {}, left={ROOM_A: empty_room})
+        older_join = sync_response("s1", {ROOM_A: empty_room})
+
+        try:
+            await client._receive_sync_family(
+                async_client_module._SyncResponseEnvelope(
+                    newer_leave,
+                    None,
+                    newer,
+                )
+            )
+            await client._receive_sync_family(
+                async_client_module._SyncResponseEnvelope(
+                    older_join,
+                    None,
+                    older,
+                )
+            )
+        finally:
+            finish_sync_request(client._sync_reset_fence, older)
+            finish_sync_request(client._sync_reset_fence, newer)
+
+        assert ROOM_A not in client.rooms
 
     @pytest.mark.parametrize(
         "nested_kind",
@@ -5374,9 +5403,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$new"]
         assert client.rooms[ROOM_A].name == "New"
         assert client._sliding_room_prev_batch == {ROOM_A: expected_token}
-        assert client.store.load_sliding_window_tokens() == {
-            ROOM_A: expected_token
-        }
+        assert client.store.load_sliding_window_tokens() == {ROOM_A: expected_token}
         assert client._sync_reset_fence.active_request_ids == set()
         await client.close()
 

@@ -27,6 +27,11 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Persist same-generation pending-event resequencing so recovered history stays
+  ahead of its held live window after a restart.
+- Give every retried sync transport attempt a fresh ordering identity so a
+  successful membership reset cannot make a later retry discard current room
+  state while exposing its advanced cursor.
 - Report a known limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched exact current own-membership proof.
   Fresh rooms without a prior baseline are not reported as lost, and historical joins outside `num_live` do not suppress a real gap.
 - Add `AsyncClient.add_event_admission_callback()` as a pre-fanout durable admission boundary.

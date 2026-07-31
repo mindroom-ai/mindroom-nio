@@ -762,6 +762,8 @@ class AsyncClient(Client):
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
         and nio's acceptance marker cannot share one transaction.
+        Events excluded by ``cb_filter`` are accepted without invoking the
+        callback.
 
         The exception propagates from sync(), receive_response(), or
         sync_forever(); the caller must continue the sync loop to retry it.
@@ -903,7 +905,11 @@ class AsyncClient(Client):
         encrypted_rooms: set[str] = set()
 
         for room_id, join_info in response.rooms.join.items():
-            if not self.config.backfill_limited_timelines:
+            if self.config.backfill_limited_timelines:
+                if not self._room_component_is_current(room_id):
+                    await self._pump_sync_recovery(room_id)
+                    continue
+            else:
                 self._handle_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
@@ -1833,10 +1839,11 @@ class AsyncClient(Client):
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
         for room_id, room in response.rooms.items():
-            if not self._room_component_is_current(room_id) or (
-                not self._sliding_sync_room_is_invite(room)
-                and room.membership not in ("leave", "ban")
-            ):
+            is_current_membership_reset = self._room_component_is_current(room_id) and (
+                self._sliding_sync_room_is_invite(room)
+                or room.membership in ("leave", "ban")
+            )
+            if not is_current_membership_reset:
                 await self._pump_sync_recovery(room_id)
 
     async def _handle_sliding_sync_invited_room(
@@ -3052,9 +3059,7 @@ class AsyncClient(Client):
                     ),
                 )
                 generation_token = self._sync_request_generation.set(generation)
-                request_id_token = self._sync_request_id.set(
-                    request_context.request_id
-                )
+                request_id_token = self._sync_request_id.set(request_context.request_id)
                 try:
                     return await send_sync(sync_token, request_context)
                 finally:
@@ -3180,9 +3185,7 @@ class AsyncClient(Client):
                     ),
                 )
                 generation_token = self._sync_request_generation.set(generation)
-                request_id_token = self._sync_request_id.set(
-                    request_context.request_id
-                )
+                request_id_token = self._sync_request_id.set(request_context.request_id)
                 scope_token = self._sliding_request_scope.set(uuid4().hex)
                 try:
                     return await send_sliding(request_context, True)

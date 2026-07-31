@@ -737,9 +737,8 @@ class MatrixStore:
                 & PendingTimelineEvents.was_encrypted
                 & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
             )
-            resequence_same_generation = (
-                (PendingTimelineEvents.generation > 0)
-                & (PendingTimelineEvents.generation == EXCLUDED.generation)
+            resequence_same_generation = (PendingTimelineEvents.generation > 0) & (
+                PendingTimelineEvents.generation == EXCLUDED.generation
             )
             PendingTimelineEvents.insert_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]

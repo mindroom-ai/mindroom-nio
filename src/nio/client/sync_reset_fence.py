@@ -48,8 +48,8 @@ def _prune_obsolete_floors(state: SyncResetFence) -> None:
         if floor > oldest_active
     }
     state.room_component_floors = {
-        room_id: floor
-        for room_id, floor in state.room_component_floors.items()
+        component: floor
+        for component, floor in state.room_component_floors.items()
         if floor > oldest_active
     }
     state.account_data_floors = {
