@@ -685,6 +685,56 @@ class TestClass:
         ]
         assert events[-1].admission_accepted
 
+    def test_sync_recovery_load_preserves_write_order_for_sequence_ties(
+        self,
+        sqlstore,
+    ):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+
+        def pending(
+            event_id: str,
+            sequence: int,
+            *,
+            is_live: bool,
+        ) -> PendingTimelineEvent:
+            return PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                sequence,
+                event_id,
+                '{"content":{},"event_id":"%s","sender":"@a:b",'
+                '"type":"m.test"}' % event_id,
+                is_live,
+                False,
+            )
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [
+                pending("$recovered-before", 0, is_live=False),
+                pending("$live-anchor", 1, is_live=True),
+                pending("$recovered-after", 2, is_live=False),
+            ],
+            None,
+        )
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [pending("$new-live", 2, is_live=True)],
+            None,
+        )
+
+        _, events = sqlstore.load_sync_recovery()
+        assert [(event.event_id, event.sequence) for event in events] == [
+            ("$recovered-before", 0),
+            ("$live-anchor", 1),
+            ("$recovered-after", 2),
+            ("$new-live", 2),
+        ]
+
     def test_v2_store_creates_recovery_tables(self, sqlstore):
         with sqlstore.database.bind_ctx(sqlstore.models):
             sqlstore.database.drop_tables(

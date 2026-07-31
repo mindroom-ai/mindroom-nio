@@ -858,6 +858,7 @@ class MatrixStore:
                     ((0, PendingTimelineEvents.id),),
                     PendingTimelineEvents.sequence,
                 ),
+                PendingTimelineEvents.id,
             )
         )
         key = self._recovery_payload_key()

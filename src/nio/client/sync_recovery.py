@@ -571,11 +571,7 @@ def _plan_timeline_events(
         else {}
     )
     sequence = 1 + max(
-        (
-            event.sequence
-            for event in state.events.get((room_id, generation), ())
-            if event.is_live
-        ),
+        (event.sequence for event in state.events.get((room_id, generation), ())),
         default=-1,
     )
     provenance_live_start = (

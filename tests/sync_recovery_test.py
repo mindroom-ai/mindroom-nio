@@ -181,7 +181,7 @@ def test_received_timeline_stays_after_a_recovered_only_prefix():
     )
 
     assert len(plan.events) == 1
-    assert plan.events[0].sequence == 0
+    assert plan.events[0].sequence == 1
     assert plan.events[0].is_live
 
 

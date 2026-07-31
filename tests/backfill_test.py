@@ -1205,6 +1205,25 @@ class TestRoomLocalRecovery:
         ):
             client.add_event_admission_callback(second, RoomMessageText)
 
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_two_argument_admission_callback_remains_supported(
+        self,
+        client,
+        protocol,
+    ):
+        calls: list[str] = []
+
+        async def admit(_room, event):
+            calls.append(event.event_id)
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+
+        await client.receive_response(
+            timeline_response(protocol, "s1", [text_event("$legacy", 1)])
+        )
+
+        assert calls == ["$legacy"]
+
     async def test_event_admission_requires_limited_timeline_recovery(self):
         client = AsyncClient("https://example.org", OWN_ID, "DEVICEID")
 

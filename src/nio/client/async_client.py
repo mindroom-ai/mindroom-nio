@@ -14,6 +14,7 @@
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
@@ -312,6 +313,47 @@ _RoomMembershipResponseT = TypeVar(
 )
 
 DataProvider = Callable[[int, int], AsyncDataT]
+EventAdmissionCallback = Callable[
+    [MatrixRoom, Event, TimelineEventProvenance],
+    Awaitable[None] | None,
+]
+LegacyEventAdmissionCallback = Callable[
+    [MatrixRoom, Event],
+    Awaitable[None] | None,
+]
+
+
+def _adapt_event_admission_callback(
+    callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
+) -> EventAdmissionCallback:
+    """Keep the released two-argument admission callback contract working."""
+    try:
+        callback_signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return cast(EventAdmissionCallback, callback)
+
+    try:
+        callback_signature.bind(None, None, TimelineEventProvenance.LIVE)
+    except TypeError:
+        try:
+            callback_signature.bind(None, None)
+        except TypeError:
+            return cast(EventAdmissionCallback, callback)
+        legacy_callback = cast(LegacyEventAdmissionCallback, callback)
+
+        @wraps(legacy_callback)
+        def with_provenance(
+            room: MatrixRoom,
+            event: Event,
+            _provenance: TimelineEventProvenance,
+        ) -> Awaitable[None] | None:
+            return legacy_callback(room, event)
+
+        return with_provenance
+
+    return cast(EventAdmissionCallback, callback)
+
+
 SynchronousFile = (
     io.TextIOBase,
     io.BufferedReader,
@@ -752,10 +794,7 @@ class AsyncClient(Client):
 
     def add_event_admission_callback(
         self,
-        callback: Callable[
-            [MatrixRoom, Event, TimelineEventProvenance],
-            Awaitable[None] | None,
-        ],
+        callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
@@ -764,6 +803,8 @@ class AsyncClient(Client):
         cannot make their durable side effects atomic.
         The callback receives the room, event, and its live-or-history
         ``TimelineEventProvenance``.
+        Two-argument callbacks registered against nio 0.33 remain supported;
+        new callbacks should accept the provenance argument.
         Classic Sync initial timelines are history, while timelines that
         continue from ``since`` are live.
         Sliding Sync uses the validated ``num_live`` tail when present.
@@ -788,7 +829,10 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "An event admission callback is already registered."
             )
-        self.event_admission_callback = ClientCallback(callback, cb_filter)
+        self.event_admission_callback = ClientCallback(
+            _adapt_event_admission_callback(callback),
+            cb_filter,
+        )
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
