@@ -1258,6 +1258,23 @@ class TestRoomLocalRecovery:
             len(inspect.signature(client.event_admission_callback.func).parameters) == 3
         )
 
+    async def test_uninspectable_admission_callback_receives_provenance(self, client):
+        calls: list[tuple[str, TimelineEventProvenance]] = []
+
+        class OpaqueAdmission:
+            __signature__ = object()
+
+            async def __call__(self, _room, event, provenance):
+                calls.append((event.event_id, provenance))
+
+        client.add_event_admission_callback(OpaqueAdmission(), RoomMessageText)
+
+        await client.receive_response(
+            timeline_response("classic", "s1", [text_event("$opaque", 1)])
+        )
+
+        assert calls == [("$opaque", TimelineEventProvenance.HISTORY)]
+
     async def test_event_admission_requires_limited_timeline_recovery(self):
         client = AsyncClient("https://example.org", OWN_ID, "DEVICEID")
 
