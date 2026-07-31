@@ -85,7 +85,7 @@ def test_ordered_response_view_rejects_room_reset_after_request() -> None:
     assert set(ordered.response.rooms.join) == {ROOM_B}
 
 
-def test_classic_join_survives_when_independent_room_components_are_stale() -> None:
+def test_ordered_response_view_does_not_duplicate_stream_ordering_for_rooms() -> None:
     state = SyncResetFence()
     older = issue_sync_request(state, "classic")
     newer = issue_sync_request(state, "classic")
@@ -114,7 +114,47 @@ def test_classic_join_survives_when_independent_room_components_are_stale() -> N
     ordered_response_view(state, newer_response, newer)
     ordered = ordered_response_view(state, older_response, older)
 
-    assert ordered.current_room_ids == frozenset()
+    assert ordered.current_room_ids == frozenset({ROOM_A, ROOM_B, ROOM_C})
     assert set(ordered.response.rooms.join) == {ROOM_A}
-    assert ordered.response.rooms.invite == {}
-    assert ordered.response.rooms.leave == {}
+    assert set(ordered.response.rooms.invite) == {ROOM_B}
+    assert set(ordered.response.rooms.leave) == {ROOM_C}
+
+
+def test_ordered_response_view_does_not_duplicate_account_data_ordering() -> None:
+    state = SyncResetFence()
+    older = issue_sync_request(state, "classic")
+    newer = issue_sync_request(state, "classic")
+    newer_event = UnknownAccountDataEvent.from_dict(
+        {"type": "org.example.settings", "content": {"value": "newer"}}
+    )
+    older_event = UnknownAccountDataEvent.from_dict(
+        {"type": "org.example.settings", "content": {"value": "older"}}
+    )
+    newer_response = SyncResponse(
+        "newer",
+        Rooms(
+            {}, {ROOM_A: RoomInfo(Timeline([], False, None), [], [], [newer_event])}, {}
+        ),
+        DeviceOneTimeKeyCount(None, None),
+        DeviceList([], []),
+        [],
+        [],
+        [newer_event],
+    )
+    older_response = SyncResponse(
+        "older",
+        Rooms(
+            {}, {ROOM_A: RoomInfo(Timeline([], False, None), [], [], [older_event])}, {}
+        ),
+        DeviceOneTimeKeyCount(None, None),
+        DeviceList([], []),
+        [],
+        [],
+        [older_event],
+    )
+
+    ordered_response_view(state, newer_response, newer)
+    ordered = ordered_response_view(state, older_response, older)
+
+    assert ordered.response.account_data_events == [older_event]
+    assert ordered.response.rooms.join[ROOM_A].account_data == [older_event]
