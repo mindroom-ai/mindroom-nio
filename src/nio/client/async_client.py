@@ -327,30 +327,26 @@ def _adapt_event_admission_callback(
     callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
 ) -> EventAdmissionCallback:
     """Keep the released two-argument admission callback contract working."""
+    legacy_callback = cast(LegacyEventAdmissionCallback, callback)
+
+    def with_provenance(
+        room: MatrixRoom,
+        event: Event,
+        _provenance: TimelineEventProvenance,
+    ) -> Awaitable[None] | None:
+        return legacy_callback(room, event)
+
     try:
         callback_signature = inspect.signature(callback)
     except (TypeError, ValueError):
-        return cast(EventAdmissionCallback, callback)
-
-    try:
-        callback_signature.bind(None, None, TimelineEventProvenance.LIVE)
-    except TypeError:
-        try:
-            callback_signature.bind(None, None)
-        except TypeError:
-            return cast(EventAdmissionCallback, callback)
-        legacy_callback = cast(LegacyEventAdmissionCallback, callback)
-
-        def with_provenance(
-            room: MatrixRoom,
-            event: Event,
-            _provenance: TimelineEventProvenance,
-        ) -> Awaitable[None] | None:
-            return legacy_callback(room, event)
-
         return with_provenance
 
-    return cast(EventAdmissionCallback, callback)
+    try:
+        callback_signature.bind(None, None)
+    except TypeError:
+        return cast(EventAdmissionCallback, callback)
+
+    return with_provenance
 
 
 SynchronousFile = (
@@ -803,7 +799,7 @@ class AsyncClient(Client):
         The callback receives the room, event, and its live-or-history
         ``TimelineEventProvenance``.
         Two-argument callbacks registered against nio 0.33 remain supported;
-        new callbacks should accept the provenance argument.
+        new callbacks should require the provenance argument.
         Classic Sync initial timelines are history, while timelines that
         continue from ``since`` are live.
         Sliding Sync uses the validated ``num_live`` tail when present.

@@ -1225,6 +1225,25 @@ class TestRoomLocalRecovery:
 
         assert calls == ["$legacy"]
 
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_two_argument_admission_callback_keeps_optional_capture(
+        self,
+        client,
+        protocol,
+    ):
+        calls: list[str] = []
+
+        async def admit(_room, event, sink=calls):
+            sink.append(event.event_id)
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+
+        await client.receive_response(
+            timeline_response(protocol, "s1", [text_event("$legacy-capture", 1)])
+        )
+
+        assert calls == ["$legacy-capture"]
+
     async def test_two_argument_admission_adapter_reports_three_arguments(
         self,
         client,
