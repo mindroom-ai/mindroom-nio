@@ -1011,11 +1011,14 @@ class TestRoomLocalRecovery:
         self, client, protocol
     ):
         calls: list[str] = []
+        storage_error = OSError("storage unavailable")
 
         async def admit(_room, event):
             calls.append(event.event_id)
             if len(calls) == 1:
-                raise CallbackNotAcceptedError("durable admission failed")
+                raise CallbackNotAcceptedError(
+                    "durable admission failed"
+                ) from storage_error
 
         client.add_event_callback(admit, RoomMessageText)
         response = timeline_response(
@@ -1027,9 +1030,10 @@ class TestRoomLocalRecovery:
         with pytest.raises(
             CallbackNotAcceptedError,
             match="durable admission failed",
-        ):
+        ) as rejected:
             await client.receive_response(response)
 
+        assert rejected.value.__cause__ is storage_error
         assert [
             (event.kind, event.event_id)
             for event in client._recovery.events[(ROOM_A, 1)]

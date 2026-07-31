@@ -1174,6 +1174,8 @@ async def _drain_gap(
             if error:
                 raise error
         except _LiveCallbackError as error:
+            if not error.accepted:
+                raise error.error from error.error.__cause__
             raise error.error from error
         except _DispatchFinishError as error:
             raise error.error from error
