@@ -2130,18 +2130,16 @@ class AsyncClient(Client):
 
         generation = self._sync_request_generation.get()
         if generation is not None and generation is not self._sync_generation:
-            if self.config.backfill_limited_timelines:
-                self._publish_waiting_sync_cancellation(
-                    sync_response,
-                    request_since,
-                )
+            self._publish_waiting_sync_cancellation(
+                sync_response,
+                request_since,
+            )
             return
         if self._closing:
-            if self.config.backfill_limited_timelines:
-                self._publish_waiting_sync_cancellation(
-                    sync_response,
-                    request_since,
-                )
+            self._publish_waiting_sync_cancellation(
+                sync_response,
+                request_since,
+            )
             return
         self._raise_on_sync_reentry()
         entered_executor = False
@@ -2150,11 +2148,10 @@ class AsyncClient(Client):
                 if self._closing or (
                     generation is not None and generation is not self._sync_generation
                 ):
-                    if self.config.backfill_limited_timelines:
-                        self._publish_waiting_sync_cancellation(
-                            sync_response,
-                            request_since,
-                        )
+                    self._publish_waiting_sync_cancellation(
+                        sync_response,
+                        request_since,
+                    )
                     return
                 entered_executor = True
                 executor = object()
@@ -2172,12 +2169,11 @@ class AsyncClient(Client):
                     else:
                         await self._handle_sliding_sync(ordered_response)
                 finally:
-                    if self.config.backfill_limited_timelines:
-                        self._publish_recovery_outcome(sync_response)
+                    self._publish_recovery_outcome(sync_response)
                     self._active_sync_executor_token = None
                     self._sync_executor_context.reset(context_token)
         except asyncio.CancelledError:
-            if not entered_executor and self.config.backfill_limited_timelines:
+            if not entered_executor:
                 self._publish_waiting_sync_cancellation(sync_response, request_since)
             raise
 
