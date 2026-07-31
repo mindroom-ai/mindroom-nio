@@ -2751,6 +2751,8 @@ class AsyncClient(Client):
 
         while True:
             generation = self._sync_generation
+            # Keep request issue, retries, and response application in one scope.
+            # Room and account-data ordering relies on this stream lock.
             async with (
                 generation.classic_request_lock,
                 self._to_device_sync_request(generation, True, "classic"),
@@ -2874,6 +2876,8 @@ class AsyncClient(Client):
         )
         while True:
             generation = self._sync_generation
+            # Keep each conn_id ordered through response application. Different
+            # connections remain independent and may overlap.
             async with (
                 self._sliding_request_lock(generation, conn_id),
                 self._to_device_sync_request(

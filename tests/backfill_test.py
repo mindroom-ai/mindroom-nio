@@ -2067,34 +2067,6 @@ class TestRoomLocalRecovery:
 
         assert request_cursors == [None, "s1"]
 
-    async def test_fence_rejected_classic_join_without_room_is_ignored(self, client):
-        older = issue_sync_request(client._sync_reset_fence, "classic")
-        newer = issue_sync_request(client._sync_reset_fence, "classic")
-        empty_room = RoomInfo(Timeline([], False, None), [], [], [])
-        newer_leave = sync_response("s2", {}, left={ROOM_A: empty_room})
-        older_join = sync_response("s1", {ROOM_A: empty_room})
-
-        try:
-            await client._receive_sync_family(
-                async_client_module._SyncResponseEnvelope(
-                    newer_leave,
-                    None,
-                    newer,
-                )
-            )
-            await client._receive_sync_family(
-                async_client_module._SyncResponseEnvelope(
-                    older_join,
-                    None,
-                    older,
-                )
-            )
-        finally:
-            finish_sync_request(client._sync_reset_fence, older)
-            finish_sync_request(client._sync_reset_fence, newer)
-
-        assert ROOM_A not in client.rooms
-
     @pytest.mark.parametrize(
         "nested_kind",
         ["sync", "sliding_sync", "receive_sync", "receive_sliding"],
@@ -4437,8 +4409,6 @@ class TestRoomLocalRecovery:
         assert client._sliding_sync_to_device_since == "newer-to-device"
         assert e2ee_positions == ["newer-response", "older-response"]
         assert client._sync_reset_fence.active_request_ids == set()
-        assert client._sync_reset_fence.room_component_floors == {}
-        assert client._sync_reset_fence.account_data_floors == {}
         assert client._sync_reset_fence.to_device_floor == 0
         await client.close()
 

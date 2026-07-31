@@ -1,6 +1,5 @@
-"""Build sync response views that cannot rewind newer client state."""
+"""Build sync response views protected from reachable reset and stream races."""
 
-from collections.abc import Hashable
 from dataclasses import dataclass, replace
 
 from ..events import AccountDataEvent, BadEventType
@@ -13,9 +12,8 @@ from ..responses import (
 from .sync_reset_fence import (
     SyncRequestId,
     SyncResetFence,
-    accept_current_account_data,
-    accept_current_components,
     accept_current_one_time_key_counts,
+    accept_current_to_device_token,
     accept_reset_safe_rooms,
 )
 
@@ -63,7 +61,7 @@ def ordered_response_view(
     response: SyncResponse | SlidingSyncResponse,
     request_id: SyncRequestId | None,
 ) -> OrderedResponseView:
-    """Filter a sync response against resets and newer applied components."""
+    """Filter a sync response against local resets and cross-stream snapshots."""
     one_time_key_count_components = frozenset(
         component
         for component, count in (
@@ -108,27 +106,7 @@ def ordered_response_view(
         request_id,
     )
     if isinstance(response, SyncResponse):
-        current_rooms, _ = accept_current_components(
-            state,
-            (room_id for room_id in room_ids if room_id in accepted),
-            has_to_device_token=False,
-            request_id=request_id,
-        )
-        account_components: list[Hashable] = [
-            ("global", *account_data_kind(event))
-            for event in response.account_data_events
-        ]
-        account_components.extend(
-            ("room", room_id, *account_data_kind(event))
-            for room_id, info in response.rooms.join.items()
-            if room_id in accepted
-            for event in info.account_data
-        )
-        accepted_account_data = accept_current_account_data(
-            state,
-            account_components,
-            request_id,
-        )
+        current_rooms = accepted
         return OrderedResponseView(
             replace(
                 response,
@@ -136,60 +114,31 @@ def ordered_response_view(
                     {
                         room_id: info
                         for room_id, info in response.rooms.invite.items()
-                        if room_id in current_rooms
+                        if room_id in accepted
                     },
                     {
-                        room_id: replace(
-                            info,
-                            account_data=[
-                                event
-                                for event in info.account_data
-                                if (
-                                    "room",
-                                    room_id,
-                                    *account_data_kind(event),
-                                )
-                                in accepted_account_data
-                            ],
-                        )
+                        room_id: info
                         for room_id, info in response.rooms.join.items()
                         if room_id in accepted
                     },
                     {
                         room_id: info
                         for room_id, info in response.rooms.leave.items()
-                        if room_id in current_rooms
+                        if room_id in accepted
                     },
                 ),
-                account_data_events=[
-                    event
-                    for event in response.account_data_events
-                    if ("global", *account_data_kind(event)) in accepted_account_data
-                ],
             ),
             current_rooms,
             one_time_key_count_commit,
         )
 
-    current_rooms, accept_to_device_token = accept_current_components(
+    current_rooms = frozenset(
+        room_id for room_id in response.rooms if room_id in accepted
+    )
+    accept_to_device_token = accept_current_to_device_token(
         state,
-        (room_id for room_id in response.rooms if room_id in accepted),
-        has_to_device_token=response.to_device_next_batch is not None,
+        present=response.to_device_next_batch is not None,
         request_id=request_id,
-    )
-    account_components = [
-        ("global", *account_data_kind(event)) for event in response.account_data_events
-    ]
-    account_components.extend(
-        ("room", room_id, *account_data_kind(event))
-        for room_id, events in response.room_account_data.items()
-        if room_id in accepted
-        for event in events
-    )
-    accepted_account_data = accept_current_account_data(
-        state,
-        account_components,
-        request_id,
     )
     return OrderedResponseView(
         replace(
@@ -199,18 +148,8 @@ def ordered_response_view(
                 for room_id, room in response.rooms.items()
                 if room_id in accepted
             },
-            account_data_events=[
-                event
-                for event in response.account_data_events
-                if ("global", *account_data_kind(event)) in accepted_account_data
-            ],
             room_account_data={
-                room_id: [
-                    event
-                    for event in events
-                    if ("room", room_id, *account_data_kind(event))
-                    in accepted_account_data
-                ]
+                room_id: events
                 for room_id, events in response.room_account_data.items()
                 if room_id in accepted
             },
