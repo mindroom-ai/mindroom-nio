@@ -939,7 +939,7 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         else:
             queued[queued.index(existing)] = event
     for key in {(event.room_id, event.generation) for event in plan.events}:
-        state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
+        state.events[key].sort(key=lambda item: item.sequence)
 
 
 def take_recovery_outcomes(
@@ -1005,7 +1005,7 @@ def load_recovery_state(
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
-        queued.sort(key=lambda event: (event.is_live, event.sequence))
+        queued.sort(key=lambda event: event.sequence)
 
 
 def persist_response_plan(

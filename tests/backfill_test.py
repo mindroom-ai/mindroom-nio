@@ -1088,7 +1088,7 @@ class TestRoomLocalRecovery:
                 raise OSError("admission marker unavailable")
             original_accept(room_id, generation, event_id)
 
-        async def admit(_room, event):
+        async def admit(_room, event, _provenance):
             calls.append(f"admit:{event.event_id}")
 
         async def ordinary(_room, event):
@@ -1129,7 +1129,7 @@ class TestRoomLocalRecovery:
     ):
         calls: list[str] = []
 
-        async def admit(_room, event):
+        async def admit(_room, event, _provenance):
             calls.append(event.event_id)
             raise RuntimeError("unexpected admission failure")
 
@@ -4814,8 +4814,8 @@ class TestRoomLocalRecovery:
             ("$older-history-name", TimelineEventProvenance.HISTORY),
             ("$older-live-name", TimelineEventProvenance.LIVE),
         ]
-        assert client.rooms[ROOM_A].name == "newer room"
-        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w0")}
+        assert client.rooms[ROOM_A].name == "Stale live"
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
         await client.close()
 
     async def test_stale_sync_event_retries_after_membership_reset(

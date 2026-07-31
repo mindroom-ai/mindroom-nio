@@ -119,6 +119,12 @@ def test_loaded_recovery_keeps_page_chronology_across_live_boundary():
             was_completed=False,
             kind="timeline",
             admission_accepted=False,
+            provenance=(
+                TimelineEventProvenance.LIVE
+                if is_live
+                else TimelineEventProvenance.HISTORY
+            ),
+            apply_room_state=is_live,
         )
 
     state = RecoveryState()
