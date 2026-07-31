@@ -24,7 +24,7 @@ class SyncResetFence:
         default_factory=dict
     )
     to_device_floor: int = 0
-    one_time_key_count_floor: int = 0
+    one_time_key_count_floors: dict[str, int] = field(default_factory=dict)
 
 
 def issue_sync_request(
@@ -59,8 +59,11 @@ def _prune_obsolete_floors(state: SyncResetFence) -> None:
     }
     if state.to_device_floor <= oldest_active:
         state.to_device_floor = 0
-    if state.one_time_key_count_floor <= oldest_active:
-        state.one_time_key_count_floor = 0
+    state.one_time_key_count_floors = {
+        component: floor
+        for component, floor in state.one_time_key_count_floors.items()
+        if floor > oldest_active
+    }
 
 
 def finish_sync_request(state: SyncResetFence, request_id: SyncRequestId) -> None:
@@ -142,24 +145,29 @@ def accept_current_account_data(
     return accepted
 
 
-def accept_current_one_time_key_count(
+def accept_current_one_time_key_counts(
     state: SyncResetFence,
-    *,
-    present: bool,
+    components: Iterable[str],
     request_id: SyncRequestId | None,
-) -> bool:
-    """Check a global count snapshot against the newest applied request."""
-    if not present or request_id is None:
-        return present
-    return request_id.sequence >= state.one_time_key_count_floor
+) -> frozenset[str]:
+    """Return count algorithms not superseded by a newer applied request."""
+    if request_id is None:
+        return frozenset(components)
+    return frozenset(
+        component
+        for component in components
+        if request_id.sequence >= state.one_time_key_count_floors.get(component, 0)
+    )
 
 
-def commit_one_time_key_count(
+def commit_one_time_key_counts(
     state: SyncResetFence,
+    components: Iterable[str],
     request_id: SyncRequestId,
 ) -> None:
-    """Commit an applied global count snapshot without rewinding its floor."""
-    state.one_time_key_count_floor = max(
-        state.one_time_key_count_floor,
-        request_id.sequence,
-    )
+    """Commit applied algorithm counts without rewinding their floors."""
+    for component in components:
+        state.one_time_key_count_floors[component] = max(
+            state.one_time_key_count_floors.get(component, 0),
+            request_id.sequence,
+        )

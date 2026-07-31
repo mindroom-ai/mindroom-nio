@@ -289,9 +289,9 @@ from .sync_reset_fence import (
     SyncResetFence,
     accept_current_account_data,
     accept_current_components,
-    accept_current_one_time_key_count,
+    accept_current_one_time_key_counts,
     accept_reset_safe_rooms,
-    commit_one_time_key_count,
+    commit_one_time_key_counts,
     finish_sync_request,
     issue_sync_request,
     mark_room_reset,
@@ -341,10 +341,16 @@ class _SyncResponseEnvelope:
 
 
 @dataclass(frozen=True)
+class _OneTimeKeyCountCommit:
+    components: frozenset[str]
+    request_id: SyncRequestId
+
+
+@dataclass(frozen=True)
 class _OrderedResponseView:
     response: SyncResponse | SlidingSyncResponse
     current_room_ids: frozenset[str]
-    one_time_key_count_request_id: SyncRequestId | None
+    one_time_key_count_commit: _OneTimeKeyCountCommit | None
 
 
 @dataclass(eq=False)
@@ -1236,7 +1242,12 @@ class AsyncClient(Client):
         for cb in self.response_callbacks:
             await cb.async_execute(response)
 
-    async def _handle_sync(self, envelope: _SyncResponseEnvelope) -> None:
+    async def _handle_sync(
+        self,
+        envelope: _SyncResponseEnvelope,
+        *,
+        one_time_key_count_commit: _OneTimeKeyCountCommit | None = None,
+    ) -> None:
         response = envelope.response
         request_since = envelope.request_since
 
@@ -1316,6 +1327,12 @@ class AsyncClient(Client):
         if self.olm:
             await self._handle_expired_verifications()
             self._handle_olm_events(response)
+            if one_time_key_count_commit is not None:
+                commit_one_time_key_counts(
+                    self._sync_reset_fence,
+                    one_time_key_count_commit.components,
+                    one_time_key_count_commit.request_id,
+                )
             await self._collect_key_requests()
         await self._pump_sync_recovery()
 
@@ -1324,7 +1341,12 @@ class AsyncClient(Client):
         for event in events:
             await self._on_to_device(event)
 
-    async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
+    async def _handle_sliding_sync(
+        self,
+        response: SlidingSyncResponse,
+        *,
+        one_time_key_count_commit: _OneTimeKeyCountCommit | None = None,
+    ) -> None:
         """Process a sliding sync response into client state."""
         if self.config.backfill_limited_timelines:
             recovery_scope = (
@@ -1463,6 +1485,12 @@ class AsyncClient(Client):
         if self.olm:
             await self._handle_expired_verifications()
             self._handle_olm_events(response)
+            if one_time_key_count_commit is not None:
+                commit_one_time_key_counts(
+                    self._sync_reset_fence,
+                    one_time_key_count_commit.components,
+                    one_time_key_count_commit.request_id,
+                )
             await self._collect_key_requests()
         await self._pump_sync_recovery()
 
@@ -2151,20 +2179,43 @@ class AsyncClient(Client):
         response: SyncResponse | SlidingSyncResponse,
         request_id: SyncRequestId | None,
     ) -> _OrderedResponseView:
-        one_time_key_count_present = (
-            response.device_key_count.curve25519 is not None
-            or response.device_key_count.signed_curve25519 is not None
+        one_time_key_count_components = frozenset(
+            component
+            for component, count in (
+                ("curve25519", response.device_key_count.curve25519),
+                ("signed_curve25519", response.device_key_count.signed_curve25519),
+            )
+            if count is not None
         )
-        accept_one_time_key_count = accept_current_one_time_key_count(
+        accepted_one_time_key_count_components = accept_current_one_time_key_counts(
             self._sync_reset_fence,
-            present=one_time_key_count_present,
-            request_id=request_id,
+            one_time_key_count_components,
+            request_id,
         )
-        if not accept_one_time_key_count:
+        if accepted_one_time_key_count_components != one_time_key_count_components:
             response = replace(
                 response,
-                device_key_count=DeviceOneTimeKeyCount(None, None),
+                device_key_count=DeviceOneTimeKeyCount(
+                    (
+                        response.device_key_count.curve25519
+                        if "curve25519" in accepted_one_time_key_count_components
+                        else None
+                    ),
+                    (
+                        response.device_key_count.signed_curve25519
+                        if "signed_curve25519" in accepted_one_time_key_count_components
+                        else None
+                    ),
+                ),
             )
+        one_time_key_count_commit = (
+            _OneTimeKeyCountCommit(
+                accepted_one_time_key_count_components,
+                request_id,
+            )
+            if accepted_one_time_key_count_components and request_id is not None
+            else None
+        )
         accepted = accept_reset_safe_rooms(
             self._sync_reset_fence,
             self._response_room_ids(response),
@@ -2237,11 +2288,7 @@ class AsyncClient(Client):
                     ],
                 ),
                 current_rooms,
-                (
-                    request_id
-                    if accept_one_time_key_count and one_time_key_count_present
-                    else None
-                ),
+                one_time_key_count_commit,
             )
         current_rooms, accept_to_device_token = accept_current_components(
             self._sync_reset_fence,
@@ -2293,11 +2340,7 @@ class AsyncClient(Client):
                 ),
             ),
             current_rooms,
-            (
-                request_id
-                if accept_one_time_key_count and one_time_key_count_present
-                else None
-            ),
+            one_time_key_count_commit,
         )
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
@@ -2350,14 +2393,17 @@ class AsyncClient(Client):
                     try:
                         if isinstance(ordered.response, SyncResponse):
                             await self._handle_sync(
-                                replace(envelope, response=ordered.response)
+                                replace(envelope, response=ordered.response),
+                                one_time_key_count_commit=(
+                                    ordered.one_time_key_count_commit
+                                ),
                             )
                         else:
-                            await self._handle_sliding_sync(ordered.response)
-                        if ordered.one_time_key_count_request_id is not None:
-                            commit_one_time_key_count(
-                                self._sync_reset_fence,
-                                ordered.one_time_key_count_request_id,
+                            await self._handle_sliding_sync(
+                                ordered.response,
+                                one_time_key_count_commit=(
+                                    ordered.one_time_key_count_commit
+                                ),
                             )
                     finally:
                         self._current_response_room_ids.reset(room_token)
