@@ -45,10 +45,17 @@ _DispatchKey = tuple[str, str, PendingEventKind]
 
 
 class _LiveCallbackError(Exception):
-    def __init__(self, error: Exception, was_encrypted: bool):
+    def __init__(
+        self,
+        error: Exception,
+        was_encrypted: bool,
+        *,
+        accepted: bool = True,
+    ):
         super().__init__(error)
         self.error = error
         self.was_encrypted = was_encrypted
+        self.accepted = accepted
 
 
 class _DispatchFinishError(Exception):
@@ -156,9 +163,6 @@ class RecoveryState:
     _dispatch_waiters: dict[asyncio.Task[_LiveCallbackError | None], int] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
-    _orphaned_dispatches: dict[
-        asyncio.Task[_LiveCallbackError | None], _DispatchKey
-    ] = field(default_factory=dict, init=False, repr=False, compare=False)
     _deferred_dispatch_errors: list[Exception] = field(
         default_factory=list, init=False, repr=False, compare=False
     )
@@ -251,20 +255,6 @@ def _report_dispatch_error(
         logger.error(message, key[1], exc_info=error)
 
 
-def _discard_orphaned_dispatches(state: RecoveryState) -> None:
-    for key, task in tuple(state._active_dispatches.items()):
-        if _has_pending_dispatch(state, key):
-            continue
-        if state._active_dispatches.pop(key, None) is not task:
-            continue
-        state._dispatch_waiters.pop(task, None)
-        if task.done():
-            _report_orphaned_dispatch(key, task)
-        else:
-            state._orphaned_dispatches[task] = key
-            task.cancel()
-
-
 async def _run_dispatch(
     state: RecoveryState,
     store: MatrixStore | None,
@@ -293,7 +283,9 @@ async def _run_dispatch(
     target = _pending_dispatch(state, key)
     if target and state._active_dispatches.get(key) is task:
         current_gap, current_pending = target
-        if error and not current_pending.is_live:
+        if error and not error.accepted:
+            pass
+        elif error and not current_pending.is_live:
             state.outcomes[current_gap.room_id] = False
         else:
             was_encrypted = (
@@ -331,9 +323,8 @@ async def _run_dispatch(
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
     """Wait for retained callback work and release its in-memory task entries."""
     finish_error: Exception | None = None
-    while state._active_dispatches or state._orphaned_dispatches:
+    while state._active_dispatches:
         tasks = set(state._active_dispatches.values())
-        tasks.update(state._orphaned_dispatches)
         await asyncio.wait(tuple(tasks))
         for key, task in tuple(state._active_dispatches.items()):
             if not task.done() or state._active_dispatches.get(key) is not task:
@@ -349,15 +340,49 @@ async def drain_recovery_dispatches(state: RecoveryState) -> None:
                 task,
                 "Recovered event callback failed while the client was closing: %s",
             )
-        for task, key in tuple(state._orphaned_dispatches.items()):
-            if not task.done():
-                continue
-            state._orphaned_dispatches.pop(task)
-            _report_orphaned_dispatch(key, task)
     if finish_error:
         raise finish_error
     if state._deferred_dispatch_errors:
         raise state._deferred_dispatch_errors.pop(0)
+
+
+async def drain_recovery_room_dispatches(
+    state: RecoveryState, room_ids: Iterable[str]
+) -> None:
+    """Finish retained callback work before replacing room recovery state."""
+    selected_rooms = set(room_ids)
+    while True:
+        selected = {
+            key: task
+            for key, task in state._active_dispatches.items()
+            if key[0] in selected_rooms
+        }
+        if not selected:
+            return
+        tasks = set(selected.values())
+        for task in tasks:
+            state._dispatch_waiters[task] = state._dispatch_waiters.get(task, 0) + 1
+        try:
+            await asyncio.wait(tuple(tasks))
+        finally:
+            for task in tasks:
+                waiters = state._dispatch_waiters.get(task, 0)
+                if waiters <= 1:
+                    state._dispatch_waiters.pop(task, None)
+                else:
+                    state._dispatch_waiters[task] = waiters - 1
+        for key, task in selected.items():
+            if state._active_dispatches.get(key) is not task:
+                continue
+            state._active_dispatches.pop(key)
+            error = task.exception()
+            if isinstance(error, _DispatchFinishError):
+                raise error.error
+            if error:
+                raise error
+            dispatch_error = task.result()
+            if dispatch_error:
+                raise dispatch_error.error
 
 
 def is_own_join(event: Event | BadEventType, user_id: str | None) -> bool:
@@ -749,7 +774,6 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
             queued.append(event)
     for key in {(event.room_id, event.generation) for event in plan.events}:
         state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
-    _discard_orphaned_dispatches(state)
 
 
 def take_recovery_outcomes(
@@ -810,7 +834,6 @@ def load_recovery_state(
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
         queued.sort(key=lambda event: (event.is_live, event.sequence))
-    _discard_orphaned_dispatches(state)
 
 
 def persist_response_plan(

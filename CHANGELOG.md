@@ -9,9 +9,9 @@ All notable changes to this project will be documented in this file.
 - Persist each room's sliding window token, so a restarted client can walk the gap its downtime left behind instead of dropping it.
   0.31.0 held the walk baseline in memory, which left the first limited or initial window after a restart unrecoverable — the one case the `/v3/sync` transport had always covered through its stored sync token.
   Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
-  Each token is scoped to the exact own-membership event that earned it, and old-token walks require the server's current `$ME` membership state to match.
-  Missing or mismatched membership state fails closed, and request inputs are copied before `$ME` is added.
-  Sliding request attempts, retries, and membership resets share a monotonic issuance clock, so an older response cannot replace a newer token.
+  Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
+  Servers without `$ME` support retain an unverified baseline only for the current run, while a post-restart discontinuity is reported as unrecovered.
+  Sync-family requests are serialized through response application within one replaceable client generation, so every unique response is delivered without stale shared-state regression and a late pre-close response cannot mutate reused client state.
   Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
   This migrates the store from schema v3 to v5, safely discards unscoped v4 token rows, and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
@@ -26,8 +26,8 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Report a restarted limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched current membership proof, while treating an own-join timeline event as a proven continuity boundary.
-- Keep recovered timeline obligations pending and mark their rooms unrecovered when an event callback fails, so callers cannot certify a checkpoint whose durable side effect did not commit.
-- Reject late Sliding Sync continuations from superseded named or default connections, release their ordering state when the last active request finishes, serialize membership resets with room recovery, preserve boundary-anchor deduplication after cache eviction, wait for active recovery execution before closing the HTTP session, and resume sync processing when a closed client is reused.
+- Add `CallbackNotAcceptedError` for callbacks that reject an event before any side effect or durable acceptance, keeping the event pending and redispatchable while ordinary callback errors retain their once-only ambiguous-side-effect behavior.
+- Drain started room callback work before a membership reset clears recovery state, abort the reset when that callback fails, and apply successful leave or forget invalidation exactly once after its network request.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.

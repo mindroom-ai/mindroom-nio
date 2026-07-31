@@ -2264,6 +2264,56 @@ class TestClass:
         assert requests == 2
         await client.close()
 
+    async def test_close_replaces_sync_generation_without_waiting_old_request(
+        self, tempdir, monkeypatch
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                encryption_enabled=False,
+                backfill_limited_timelines=True,
+            ),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        request_count = 0
+
+        async def send(*_args, **_kwargs):
+            nonlocal request_count
+            request_count += 1
+            token = "old" if request_count == 1 else "new"
+            if token == "old":
+                old_started.set()
+                await release_old.wait()
+            response = SyncResponse.from_dict({"next_batch": token, "rooms": {}})
+            await client.receive_response(response)
+            return response
+
+        monkeypatch.setattr(client, "_send", send)
+
+        old = asyncio.create_task(client.sync())
+        await old_started.wait()
+        await client.close()
+        await asyncio.wait_for(client.sync(), 1)
+        assert client.next_batch == "new"
+
+        release_old.set()
+        await asyncio.wait_for(old, 1)
+        assert client.next_batch == "new"
+        await client.close()
+
     async def test_sync_notification_counts(self, async_client, aioresponse):
         aioresponse.get(
             f"{BASE_URL_V3}/sync",

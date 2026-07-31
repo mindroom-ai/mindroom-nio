@@ -21,6 +21,15 @@ class LocalProtocolError(ProtocolError):
     pass
 
 
+class CallbackNotAcceptedError(Exception):
+    """Signal that a callback rejected an event before producing side effects.
+
+    Raise this only before durable acceptance or side effects.
+    Recovery keeps the event pending for redispatch; use an ordinary exception
+    once acceptance is ambiguous so nio does not blindly replay side effects.
+    """
+
+
 class MembersSyncError(LocalProtocolError):
     pass
 

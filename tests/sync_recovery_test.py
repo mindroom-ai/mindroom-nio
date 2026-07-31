@@ -782,79 +782,6 @@ async def test_reset_preserves_in_flight_dispatch_without_replay():
 
 
 @pytest.mark.asyncio
-async def test_stale_waiter_does_not_remove_or_close_replacement():
-    value = pending("$live", 0)
-    gap = RecoveryGap(ROOM, 1, "p1", None)
-    state = RecoveryState(
-        gaps={ROOM: [gap]},
-        events={(ROOM, 1): [value]},
-    )
-    stale_started = asyncio.Event()
-    stale_cancelled = asyncio.Event()
-    stale_release = asyncio.Event()
-    replacement_started = asyncio.Event()
-    replacement_release = asyncio.Event()
-    calls = 0
-
-    async def dispatch(_room, event, _is_live, _was_completed, _kind):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            stale_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                stale_cancelled.set()
-                await stale_release.wait()
-                return event
-        replacement_started.set()
-        await replacement_release.wait()
-        return event
-
-    async def unused_fetch(*args):
-        raise AssertionError("closed gap must not fetch")
-
-    kwargs = {
-        "state": state,
-        "user_id": "@me:example.org",
-        "options": RecoveryOptions(1, 10, 10, 10),
-        "fetch_messages": unused_fetch,
-        "dispatch_event": dispatch,
-        "store": None,
-    }
-    stale_pump = asyncio.create_task(pump_recovery(**kwargs))
-    replacement_pump = None
-    try:
-        await stale_started.wait()
-        apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
-        await stale_cancelled.wait()
-        apply_plan(state, RecoveryPlan(gaps=(gap,), events=(value,)))
-
-        replacement_pump = asyncio.create_task(pump_recovery(**kwargs))
-        await replacement_started.wait()
-        replacement = next(iter(state._active_dispatches.values()))
-
-        stale_release.set()
-        await asyncio.wait_for(stale_pump, 1)
-
-        assert (
-            state._active_dispatches[sync_recovery._dispatch_key(value)] is replacement
-        )
-        assert state.events[(ROOM, 1)] == [value]
-    finally:
-        stale_release.set()
-        replacement_release.set()
-        await asyncio.gather(
-            stale_pump,
-            *(task for task in (replacement_pump,) if task),
-            return_exceptions=True,
-        )
-
-    assert not state.gaps
-    assert not state._active_dispatches
-
-
-@pytest.mark.asyncio
 async def test_dispatch_drain_reaches_tasks_registered_while_waiting():
     state = RecoveryState()
     nested_started = asyncio.Event()
@@ -926,50 +853,19 @@ async def test_close_rejects_retained_dispatch_caller(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_close_rejects_orphaned_dispatch_caller(monkeypatch):
-    callback_task = asyncio.create_task(asyncio.sleep(0))
-    await callback_task
-    monkeypatch.setattr(
-        async_client_module.asyncio,
-        "current_task",
-        lambda: callback_task,
-    )
-    client = AsyncClient("https://example.org")
-    client._recovery._orphaned_dispatches[callback_task] = (
-        ROOM,
-        "$live",
-        "timeline",
-    )
-
-    try:
-        with pytest.raises(
-            LocalProtocolError,
-            match=r"AsyncClient\.close\(\) cannot run from a timeline callback\.",
-        ):
-            await client.close()
-    finally:
-        client._recovery._orphaned_dispatches.clear()
-
-
-@pytest.mark.asyncio
-async def test_close_drains_cleared_dispatch_that_suppresses_cancellation():
+async def test_close_drains_cleared_dispatch_without_cancelling_it():
     value = pending("$live", 0)
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
         events={(ROOM, 1): [value]},
     )
     started = asyncio.Event()
-    cancelled = asyncio.Event()
     release = asyncio.Event()
     finished = asyncio.Event()
 
     async def dispatch(_room, event, _is_live, _was_completed, _kind):
         started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
+        await release.wait()
         finished.set()
         return event
 
@@ -986,10 +882,7 @@ async def test_close_drains_cleared_dispatch_that_suppresses_cancellation():
     )
     await started.wait()
     apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
-    await cancelled.wait()
-
-    assert not state._active_dispatches
-    assert len(state._orphaned_dispatches) == 1
+    assert state._active_dispatches
 
     client = AsyncClient("https://example.org")
     client._recovery = state
@@ -1001,7 +894,7 @@ async def test_close_drains_cleared_dispatch_that_suppresses_cancellation():
     await close
 
     assert finished.is_set()
-    assert not state._orphaned_dispatches
+    assert not state._active_dispatches
 
 
 @pytest.mark.asyncio
@@ -1090,41 +983,115 @@ async def test_close_drains_dispatch_after_repeated_cancellation():
 
 
 @pytest.mark.asyncio
-async def test_clearing_room_cancels_active_dispatch():
+async def test_clearing_room_drains_active_dispatch_before_reset():
     value = pending("$live", 0)
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
         events={(ROOM, 1): [value]},
     )
+    store = InlineStore()
     started = asyncio.Event()
-    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
 
-    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
+    async def dispatch(_room, event, _is_live, _was_completed, _kind):
+        calls.append(f"start:{event.event_id}")
         started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
+        await release.wait()
+        calls.append(f"finish:{event.event_id}")
+        return event
 
     async def unused_fetch(*args):
         raise AssertionError("closed gap must not fetch")
 
-    await pump_recovery(
-        state,
-        user_id="@me:example.org",
-        options=RecoveryOptions(1, 10, 10, 0.01),
-        fetch_messages=unused_fetch,
-        dispatch_event=dispatch,
-        store=None,
+    pump = asyncio.create_task(
+        pump_recovery(
+            state,
+            user_id="@me:example.org",
+            options=RecoveryOptions(1, 10, 10, 0.01),
+            fetch_messages=unused_fetch,
+            dispatch_event=dispatch,
+            store=store,
+            ready_room_id=ROOM,
+        )
     )
     await started.wait()
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
-    await asyncio.wait_for(cancelled.wait(), 1)
+    pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pump, 1)
+
+    async def reset():
+        await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
+        apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+
+    task = asyncio.create_task(reset())
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert calls == ["start:$live"]
+
+    release.set()
+    await asyncio.wait_for(task, 1)
+
+    assert calls == ["start:$live", "finish:$live"]
+    assert store.finished == [(ROOM, 1, "$live", False)]
     assert not state._active_dispatches
+    assert ROOM not in state.gaps
 
 
 @pytest.mark.asyncio
-async def test_clearing_failed_dispatch_logs_exception(caplog):
+async def test_callback_error_aborts_room_reset_and_keeps_durable_boundary():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
+        events={(ROOM, 1): [pending("$live", 0)]},
+    )
+    store = InlineStore()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def dispatch(_room, _event, _is_live, _was_completed, _kind):
+        started.set()
+        await release.wait()
+        raise sync_recovery._LiveCallbackError(RuntimeError("callback failed"), False)
+
+    async def unused_fetch(*args):
+        raise AssertionError("closed gap must not fetch")
+
+    pump = asyncio.create_task(
+        pump_recovery(
+            state,
+            user_id="@me:example.org",
+            options=RecoveryOptions(1, 10, 10, 0.01),
+            fetch_messages=unused_fetch,
+            dispatch_event=dispatch,
+            store=store,
+            ready_room_id=ROOM,
+        )
+    )
+    await started.wait()
+    pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pump, 1)
+
+    async def reset():
+        await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
+        apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+
+    task = asyncio.create_task(reset())
+    release.set()
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await asyncio.wait_for(task, 1)
+
+    assert ROOM in state.gaps
+    assert [(item.kind, item.source_json) for item in state.events[(ROOM, 1)]] == [
+        ("boundary", "$live")
+    ]
+    assert [(item.kind, item.source_json) for item in store.boundaries] == [
+        ("boundary", "$live")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clearing_failed_dispatch_aborts_before_plan():
     value = pending("$live", 0)
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
@@ -1152,15 +1119,10 @@ async def test_clearing_failed_dispatch_logs_exception(caplog):
     done, _ = await asyncio.wait((task,), timeout=1)
     assert done
 
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+    with pytest.raises(RuntimeError, match="failed after timeout"):
+        await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
 
-    record = next(
-        record
-        for record in caplog.records
-        if record.message
-        == "Recovered event callback failed after its row was cleared: $live"
-    )
-    assert isinstance(record.exc_info[1], RuntimeError)
+    assert ROOM in state.gaps
     assert not state._active_dispatches
 
 
