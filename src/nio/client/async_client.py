@@ -14,6 +14,7 @@
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -82,6 +83,7 @@ from ..crypto.cross_signing import (
     cross_signing_sidecar_path,
 )
 from ..event_builders import ToDeviceMessage
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEventType,
@@ -751,13 +753,18 @@ class AsyncClient(Client):
 
     def add_event_admission_callback(
         self,
-        callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
+        callback: Callable[
+            [MatrixRoom, Event, TimelineEventProvenance],
+            Awaitable[None] | None,
+        ],
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
 
         Only one admission owner can be registered because multiple callbacks
         cannot make their durable side effects atomic.
+        The callback receives the room, event, and its live-or-history
+        ``TimelineEventProvenance``.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
@@ -958,6 +965,7 @@ class AsyncClient(Client):
             if not deduplicate or should_dispatch_timeline_event(
                 self._recovery, room_id, event
             ):
+                await self._on_event_admission(event, room, True)
                 await self._on_event(event, room)
 
     async def _dispatch_timeline_event(
@@ -1017,7 +1025,7 @@ class AsyncClient(Client):
             return None
         if not admission_accepted and self.event_admission_callback is not None:
             try:
-                await self._on_event_admission(event, room)
+                await self._on_event_admission(event, room, is_live)
             except CallbackNotAcceptedError as error:
                 raise _LiveCallbackError(
                     error,
@@ -1108,7 +1116,7 @@ class AsyncClient(Client):
                 timeline_events=room.timeline,
                 user_id=self.user_id,
                 membership=self._sliding_sync_recovery_membership(room),
-                live_event_count=((room.num_live or 0) if room.initial else None),
+                live_event_count=self._sliding_live_event_count(room),
                 cursor_token=self._sliding_recovery_cursor(room_id, room),
             )
         )
@@ -1210,15 +1218,27 @@ class AsyncClient(Client):
             self._event_callback_scope.reset(token)
 
     async def _on_event_admission(
-        self, event: Event | BadEventType, room: MatrixRoom
+        self,
+        event: Event | BadEventType,
+        room: MatrixRoom,
+        is_live: bool,
     ) -> None:
-        if self.event_admission_callback is None:
+        callback = self.event_admission_callback
+        if callback is None or (
+            callback.filter is not None and not isinstance(event, callback.filter)
+        ):
             return
-        await self._run_event_callbacks(
-            (self.event_admission_callback,),
-            event,
-            room,
+        provenance = (
+            TimelineEventProvenance.LIVE if is_live else TimelineEventProvenance.HISTORY
         )
+        task = asyncio.current_task()
+        token = self._event_callback_task.set(task)
+        try:
+            result = callback.func(room, event, provenance)
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            self._event_callback_task.reset(token)
 
     async def _on_event(self, event: Event | BadEventType, room: MatrixRoom):
         await self._run_event_callbacks(self.event_callbacks, event, room)
@@ -1395,7 +1415,9 @@ class AsyncClient(Client):
                             else "join"
                         ),
                         live_event_count=(
-                            (room.num_live or 0) if room.initial else None
+                            self._sliding_live_event_count(room)
+                            if self._room_component_is_current(room_id)
+                            else None
                         ),
                         cursor_token=(
                             self._sliding_recovery_cursor(room_id, room)
@@ -1607,12 +1629,20 @@ class AsyncClient(Client):
         )
 
     @staticmethod
+    def _sliding_live_event_count(room: SlidingSyncRoom) -> int | None:
+        if not room.initial:
+            return None
+        if room.num_live is None or not 0 <= room.num_live <= len(room.timeline):
+            return 0
+        return room.num_live
+
+    @staticmethod
     def _sliding_live_timeline(
         room: SlidingSyncRoom,
     ) -> Sequence[Event | BadEventType]:
-        if not room.initial:
+        live_event_count = AsyncClient._sliding_live_event_count(room)
+        if live_event_count is None:
             return room.timeline
-        live_event_count = room.num_live or 0
         return room.timeline[-live_event_count:] if live_event_count else ()
 
     def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
@@ -1922,6 +1952,7 @@ class AsyncClient(Client):
                         room_id,
                         event_id,
                         isinstance(event, MegolmEvent),
+                        TimelineEventProvenance.LIVE,
                     )
 
         if room.encrypted and self.olm is not None:

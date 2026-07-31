@@ -44,6 +44,7 @@ from nio import (
     SlidingSyncStateStub,
     SyncResponse,
     Timeline,
+    TimelineEventProvenance,
     ToDeviceEvent,
     TypingNoticeEvent,
     UnknownAccountDataEvent,
@@ -277,6 +278,19 @@ def record_events(client: AsyncClient) -> list[str]:
         seen.append(event.event_id)
 
     client.add_event_callback(callback, RoomMessageText)
+    return seen
+
+
+def record_admissions(
+    client: AsyncClient,
+    event_filter: type[Event] | tuple[type[Event], ...] = RoomMessageText,
+) -> list[tuple[str, TimelineEventProvenance]]:
+    seen: list[tuple[str, TimelineEventProvenance]] = []
+
+    async def callback(_room, event, provenance):
+        seen.append((event.event_id, provenance))
+
+    client.add_event_admission_callback(callback, event_filter)
     return seen
 
 
@@ -961,6 +975,8 @@ class TestRoomLocalRecovery:
     async def test_live_callback_error_is_acked_and_does_not_wedge(
         self, client, protocol, error_type
     ):
+        if protocol == "classic":
+            client.next_batch = "s0"
         calls = []
         failed = False
 
@@ -1014,7 +1030,7 @@ class TestRoomLocalRecovery:
         calls: list[str] = []
         storage_error = OSError("storage unavailable")
 
-        async def admit(_room, event):
+        async def admit(_room, event, _provenance):
             calls.append(event.event_id)
             if len(calls) == 1:
                 raise CallbackNotAcceptedError(
@@ -1137,7 +1153,7 @@ class TestRoomLocalRecovery:
     async def test_callback_admission_precedes_event_fanout(self, client, protocol):
         calls: list[str] = []
 
-        async def first_admission(_room, event):
+        async def first_admission(_room, event, _provenance):
             calls.append(f"admit-first:{event.event_id}")
             if calls == ["admit-first:$retry"]:
                 raise CallbackNotAcceptedError("durable admission failed")
@@ -1176,10 +1192,10 @@ class TestRoomLocalRecovery:
         assert not client._recovery.gaps
 
     async def test_only_one_event_admission_owner_can_be_registered(self, client):
-        async def first(_room, _event):
+        async def first(_room, _event, _provenance):
             pass
 
-        async def second(_room, _event):
+        async def second(_room, _event, _provenance):
             pass
 
         client.add_event_admission_callback(first, cb_filter=RoomMessageText)
@@ -1197,7 +1213,221 @@ class TestRoomLocalRecovery:
             LocalProtocolError,
             match="requires limited-timeline recovery",
         ):
-            client.add_event_admission_callback(lambda _room, _event: None)
+            client.add_event_admission_callback(lambda _room, _event, _provenance: None)
+
+    async def test_classic_initial_timeline_is_history(self, client):
+        admissions = record_admissions(client)
+
+        await client.receive_response(
+            timeline_response("classic", "s1", [text_event("$history", 1)])
+        )
+
+        assert admissions == [
+            ("$history", TimelineEventProvenance.HISTORY),
+        ]
+
+    async def test_classic_continuation_timeline_is_live(self, client):
+        admissions = record_admissions(client)
+        client.next_batch = "s0"
+
+        await client.receive_response(
+            timeline_response("classic", "s1", [text_event("$live", 1)])
+        )
+
+        assert admissions == [
+            ("$live", TimelineEventProvenance.LIVE),
+        ]
+
+    async def test_recovered_history_precedes_retained_live_provenance(
+        self,
+        client,
+        aioresponse,
+    ):
+        admissions = record_admissions(client)
+        client.next_batch = "s0"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$history", 1)], "p1"),
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        assert admissions == [
+            ("$history", TimelineEventProvenance.HISTORY),
+            ("$live", TimelineEventProvenance.LIVE),
+        ]
+
+    async def test_sliding_steady_timeline_is_live(self, client):
+        admissions = record_admissions(client)
+
+        await client.receive_response(
+            timeline_response("sliding", "s1", [text_event("$live", 1)])
+        )
+
+        assert admissions == [
+            ("$live", TimelineEventProvenance.LIVE),
+        ]
+
+    async def test_sliding_initial_num_live_marks_only_exact_tail_live(self, client):
+        admissions = record_admissions(client)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "initial": True,
+                        "membership": "join",
+                        "num_live": 2,
+                        "timeline": [
+                            text_event("$history-1", 1).source,
+                            text_event("$history-2", 2).source,
+                            text_event("$live-1", 3).source,
+                            text_event("$live-2", 4).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        await client.receive_response(response)
+
+        assert admissions == [
+            ("$history-1", TimelineEventProvenance.HISTORY),
+            ("$history-2", TimelineEventProvenance.HISTORY),
+            ("$live-1", TimelineEventProvenance.LIVE),
+            ("$live-2", TimelineEventProvenance.LIVE),
+        ]
+
+    @pytest.mark.parametrize("num_live", [None, -1, 3])
+    async def test_sliding_initial_invalid_live_count_fails_closed(
+        self,
+        client,
+        num_live,
+    ):
+        admissions = record_admissions(client)
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {
+                    ROOM_A: {
+                        "initial": True,
+                        "membership": "join",
+                        "num_live": num_live,
+                        "timeline": [
+                            text_event("$history-1", 1).source,
+                            text_event("$history-2", 2).source,
+                        ],
+                    }
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        await client.receive_response(response)
+
+        assert admissions == [
+            ("$history-1", TimelineEventProvenance.HISTORY),
+            ("$history-2", TimelineEventProvenance.HISTORY),
+        ]
+
+    @pytest.mark.parametrize(
+        ("request_since", "expected"),
+        [
+            (None, TimelineEventProvenance.HISTORY),
+            ("s0", TimelineEventProvenance.LIVE),
+        ],
+    )
+    async def test_late_decryption_after_restart_keeps_original_provenance(
+        self,
+        tempdir,
+        monkeypatch,
+        request_since,
+        expected,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        first.next_batch = request_since
+        encrypted = megolm_event("$encrypted", 1)
+        first_admissions = record_admissions(
+            first,
+            (MegolmEvent, RoomMessageText),
+        )
+
+        await first.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [encrypted],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+
+        assert first_admissions == [("$encrypted", expected)]
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        clear = text_event("$encrypted", 1)
+        assert restarted.olm
+        monkeypatch.setattr(
+            restarted.olm,
+            "_decrypt_megolm_no_error",
+            lambda _event: clear,
+        )
+        restarted_admissions = record_admissions(
+            restarted,
+            (MegolmEvent, RoomMessageText),
+        )
+
+        await restarted.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [encrypted],
+                        limited=False,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        assert restarted_admissions == [("$encrypted", expected)]
+        await restarted.close()
 
     async def test_no_admission_owner_skips_durable_acceptance_marker(self, client):
         marked = False
@@ -1222,9 +1452,11 @@ class TestRoomLocalRecovery:
     async def test_non_acceptance_from_event_fanout_does_not_replay(
         self, client, protocol
     ):
+        if protocol == "classic":
+            client.next_batch = "s0"
         calls: list[str] = []
 
-        async def admit(_room, event):
+        async def admit(_room, event, _provenance):
             calls.append(f"admit:{event.event_id}")
 
         async def first(_room, event):
@@ -1254,7 +1486,7 @@ class TestRoomLocalRecovery:
     async def test_callback_non_acceptance_preserves_implicit_context(self, client):
         storage_error = OSError("storage unavailable")
 
-        async def admit(_room, _event):
+        async def admit(_room, _event, _provenance):
             try:
                 raise storage_error
             except OSError:
@@ -2748,7 +2980,11 @@ class TestRoomLocalRecovery:
 
         encrypted = megolm_event("$encrypted", 4)
         record_completed_timeline_event(
-            client._recovery, ROOM_A, encrypted.event_id, True
+            client._recovery,
+            ROOM_A,
+            encrypted.event_id,
+            True,
+            TimelineEventProvenance.LIVE,
         )
         clear = text_event("$encrypted", 4)
         assert should_dispatch_timeline_event(client._recovery, ROOM_A, clear)
@@ -2760,7 +2996,11 @@ class TestRoomLocalRecovery:
         encrypted = megolm_event("$encrypted", 1)
         clear = text_event("$encrypted", 1)
         record_completed_timeline_event(
-            client._recovery, ROOM_A, encrypted.event_id, True
+            client._recovery,
+            ROOM_A,
+            encrypted.event_id,
+            True,
+            TimelineEventProvenance.LIVE,
         )
 
         def decrypt(event, *_args):
@@ -2774,7 +3014,7 @@ class TestRoomLocalRecovery:
             )
         )
         assert seen == ["$encrypted"]
-        assert client._recovery.completed[ROOM_A]["$encrypted"] is False
+        assert client._recovery.completed[ROOM_A]["$encrypted"].was_encrypted is False
 
     async def test_live_decryption_preserves_callback_metadata(
         self, client, monkeypatch
@@ -3174,6 +3414,7 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "After"
 
     async def test_live_callbacks_see_each_events_room_state(self, client):
+        client.next_batch = "s0"
         seen = []
 
         async def record_name(room, event):
@@ -6739,7 +6980,13 @@ class TestRoomLocalRecovery:
     ):
         encrypted = megolm_event("$shared", 2)
         clear = text_event("$shared", 2)
-        record_completed_timeline_event(client._recovery, ROOM_A, "$shared", True)
+        record_completed_timeline_event(
+            client._recovery,
+            ROOM_A,
+            "$shared",
+            True,
+            TimelineEventProvenance.LIVE,
+        )
         assert client.olm
         monkeypatch.setattr(
             client.olm,
@@ -6765,7 +7012,7 @@ class TestRoomLocalRecovery:
             )
         )
         assert seen == ["$shared", "$held"]
-        assert client._recovery.completed[ROOM_A]["$shared"] is False
+        assert client._recovery.completed[ROOM_A]["$shared"].was_encrypted is False
 
     async def test_encrypted_upgrade_needs_no_post_decrypt_commit(
         self, tempdir, monkeypatch
@@ -6819,7 +7066,7 @@ class TestRoomLocalRecovery:
         )
         assert saves == 1
         assert seen == ["$shared", "$shared"]
-        assert client._recovery.completed[ROOM_A]["$shared"] is False
+        assert client._recovery.completed[ROOM_A]["$shared"].was_encrypted is False
         await client.close()
 
     async def test_restart_replays_only_active_unacknowledged_row(
@@ -7770,8 +8017,20 @@ class TestRoomLocalRecovery:
         assert len(client._recovery.completed[ROOM_A]) == 512
 
     async def test_plaintext_overlap_state_wins_over_later_encrypted_copy(self, client):
-        record_completed_timeline_event(client._recovery, ROOM_A, "$same", False)
-        record_completed_timeline_event(client._recovery, ROOM_A, "$same", True)
+        record_completed_timeline_event(
+            client._recovery,
+            ROOM_A,
+            "$same",
+            False,
+            TimelineEventProvenance.LIVE,
+        )
+        record_completed_timeline_event(
+            client._recovery,
+            ROOM_A,
+            "$same",
+            True,
+            TimelineEventProvenance.LIVE,
+        )
         assert not should_dispatch_timeline_event(
             client._recovery, ROOM_A, text_event("$same", 1)
         )

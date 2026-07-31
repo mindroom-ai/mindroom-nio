@@ -71,6 +71,43 @@ def sqlmemorystore():
     return store
 
 
+def seed_v5_recovery_state(sqlstore):
+    gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+    completed = PendingTimelineEvent(
+        TEST_ROOM,
+        1,
+        0,
+        "$completed",
+        "{}",
+        True,
+        True,
+    )
+    pending = PendingTimelineEvent(
+        TEST_ROOM,
+        1,
+        1,
+        "$pending",
+        "{}",
+        True,
+        False,
+    )
+    sqlstore.save_recovery(
+        "s1",
+        set(),
+        [gap],
+        [completed, pending],
+        None,
+    )
+    sqlstore.finish_recovery(
+        TEST_ROOM,
+        gap.generation,
+        completed.event_id,
+        True,
+    )
+    sqlstore.save_sliding_window_tokens({TEST_ROOM: SlidingWindowToken("w1", "$join")})
+    sqlstore._update_version(5)
+
+
 class TestClass:
     @property
     def ephemeral_store(self):

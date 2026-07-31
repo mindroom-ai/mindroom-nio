@@ -570,7 +570,6 @@ class MatrixStore:
             generation=0,
             sequence=0,
             event_payload=b"",
-            is_live=False,
             was_encrypted=True,
             was_completed=False,
             admission_accepted=False,
@@ -812,9 +811,8 @@ class MatrixStore:
                 Case(
                     PendingTimelineEvents.generation,
                     ((0, PendingTimelineEvents.id),),
-                    PendingTimelineEvents.is_live,
+                    PendingTimelineEvents.sequence,
                 ),
-                PendingTimelineEvents.sequence,
             )
         )
         key = self._recovery_payload_key()

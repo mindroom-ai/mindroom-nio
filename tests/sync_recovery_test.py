@@ -10,7 +10,13 @@ from types import SimpleNamespace
 import nio.client.sync_recovery as sync_recovery
 import pytest
 
-from nio import AsyncClient, Event, LocalProtocolError, RoomMessageText
+from nio import (
+    AsyncClient,
+    Event,
+    LocalProtocolError,
+    RoomMessageText,
+    TimelineEventProvenance,
+)
 from nio.client import async_client as async_client_module
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
@@ -27,6 +33,7 @@ from nio.responses import RoomMessagesResponse
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
+HELD_SEQUENCE_BASE = RecoveryState().max_held_events
 
 
 def event(event_id: str, ts: int, room_id: str = ROOM) -> RoomMessageText:
@@ -45,8 +52,13 @@ def event(event_id: str, ts: int, room_id: str = ROOM) -> RoomMessageText:
 
 
 def pending(event_id: str, sequence: int) -> PendingTimelineEvent:
+    is_live = event_id.startswith("$live")
     value = PendingTimelineEvent.from_event(
-        ROOM, 1, sequence, event(event_id, sequence), event_id.startswith("$live")
+        ROOM,
+        1,
+        sequence + HELD_SEQUENCE_BASE if is_live else sequence,
+        event(event_id, sequence),
+        is_live,
     )
     assert value
     return value
@@ -202,7 +214,13 @@ async def test_later_generation_suffix_does_not_deadlock_older_gap():
         events={
             (ROOM, 1): [pending("$live1", 0)],
             (ROOM, 2): [
-                PendingTimelineEvent.from_event(ROOM, 2, 0, event("$live2", 4), True)
+                PendingTimelineEvent.from_event(
+                    ROOM,
+                    2,
+                    HELD_SEQUENCE_BASE,
+                    event("$live2", 4),
+                    True,
+                )
             ],
         },
     )
@@ -299,7 +317,11 @@ async def test_slow_room_does_not_consume_another_rooms_budget():
 @pytest.mark.asyncio
 async def test_ready_callback_does_not_consume_recovering_room_budget():
     other_live = PendingTimelineEvent.from_event(
-        ROOM_B, 1, 0, event("$other-live", 2, ROOM_B), True
+        ROOM_B,
+        1,
+        HELD_SEQUENCE_BASE,
+        event("$other-live", 2, ROOM_B),
+        True,
     )
     assert other_live
     state = RecoveryState(
@@ -497,7 +519,9 @@ async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
         store=None,
     )
     assert not state.gaps
-    assert state.completed[ROOM] == {"$bad": True}
+    completed = state.completed[ROOM]["$bad"]
+    assert completed.was_encrypted
+    assert completed.provenance is TimelineEventProvenance.HISTORY
 
 
 @pytest.mark.asyncio
@@ -1254,7 +1278,13 @@ def test_abandonment_restores_promoted_completed_marker(clear_mode):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overlap_first", [False, True])
 async def test_room_cap_abandons_over_cap_page_despite_overlap(overlap_first):
-    held = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$held", 3), True)
+    held = PendingTimelineEvent.from_event(
+        ROOM,
+        1,
+        HELD_SEQUENCE_BASE,
+        event("$held", 3),
+        True,
+    )
     assert held
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
