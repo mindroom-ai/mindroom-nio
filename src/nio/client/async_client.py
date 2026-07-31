@@ -1121,7 +1121,7 @@ class AsyncClient(Client):
                 timeline_events=room.timeline,
                 user_id=self.user_id,
                 membership=self._sliding_sync_recovery_membership(room),
-                live_event_count=self._sliding_live_event_count(room),
+                live_event_count=self._sliding_membership_live_event_count(room),
                 cursor_token=self._sliding_recovery_cursor(room_id, room),
             )
         )
@@ -1414,15 +1414,15 @@ class AsyncClient(Client):
                             else "join"
                         ),
                         live_event_count=(
-                            self._sliding_live_event_count(room)
+                            self._sliding_membership_live_event_count(room)
                             if self._room_component_is_current(room_id)
                             else None
                         ),
-                        provenance_live_event_count=self._sliding_live_event_count(
-                            room
+                        provenance_live_event_count=(
+                            self._sliding_provenance_live_event_count(room)
                         ),
                         apply_state_live_event_count=(
-                            self._sliding_live_event_count(room)
+                            self._sliding_provenance_live_event_count(room)
                             if self._room_component_is_current(room_id)
                             and room.expanded_timeline
                             and not room.initial
@@ -1642,16 +1642,28 @@ class AsyncClient(Client):
         )
 
     @staticmethod
-    def _sliding_live_event_count(room: SlidingSyncRoom) -> int:
+    def _sliding_provenance_live_event_count(room: SlidingSyncRoom) -> int:
+        """Return the exact validated live tail, failing closed to history."""
         if room.num_live is None or not 0 <= room.num_live <= len(room.timeline):
             return 0
         return room.num_live
 
     @staticmethod
+    def _sliding_membership_live_event_count(
+        room: SlidingSyncRoom,
+    ) -> int | None:
+        """Limit membership evidence only when history can share the timeline."""
+        if room.num_live is None:
+            return 0 if room.initial or room.expanded_timeline else None
+        return AsyncClient._sliding_provenance_live_event_count(room)
+
+    @staticmethod
     def _sliding_live_timeline(
         room: SlidingSyncRoom,
     ) -> Sequence[Event | BadEventType]:
-        live_event_count = AsyncClient._sliding_live_event_count(room)
+        live_event_count = AsyncClient._sliding_membership_live_event_count(room)
+        if live_event_count is None:
+            return room.timeline
         return room.timeline[-live_event_count:] if live_event_count else ()
 
     def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
@@ -1953,7 +1965,7 @@ class AsyncClient(Client):
         )
 
         if not self.config.backfill_limited_timelines:
-            live_event_count = self._sliding_live_event_count(sliding_room)
+            live_event_count = self._sliding_provenance_live_event_count(sliding_room)
             live_start = len(sliding_room.timeline) - live_event_count
             for index, event in enumerate(sliding_room.timeline):
                 event_id = getattr(event, "event_id", None)

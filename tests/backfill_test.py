@@ -3601,7 +3601,7 @@ class TestRoomLocalRecovery:
         calls: list[str] = []
         admissions: list[str] = []
 
-        async def admit_first(_room, event):
+        async def admit_first(_room, event, _provenance):
             admissions.append(f"first:{event.event_id}")
 
         async def before(_room, event):
@@ -3663,7 +3663,7 @@ class TestRoomLocalRecovery:
         async def replay(_room, event):
             replayed.append(event.event_id)
 
-        async def admit_restarted(_room, event):
+        async def admit_restarted(_room, event, _provenance):
             admissions.append(f"restarted:{event.event_id}")
 
         restarted.add_event_callback(replay, RoomMessageText)
