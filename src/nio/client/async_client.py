@@ -766,8 +766,9 @@ class AsyncClient(Client):
         ``TimelineEventProvenance``.
         Classic Sync initial timelines are history, while timelines that
         continue from ``since`` are live.
-        Sliding Sync uses the exact validated ``num_live`` tail on every
-        response; earlier events are history.
+        Sliding Sync uses the validated ``num_live`` tail when present.
+        Ordinary continuations without it are live, while initial or expanded
+        responses without it are history.
         Events recovered through ``/messages`` are history.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
@@ -1121,7 +1122,7 @@ class AsyncClient(Client):
                 timeline_events=room.timeline,
                 user_id=self.user_id,
                 membership=self._sliding_sync_recovery_membership(room),
-                live_event_count=self._sliding_membership_live_event_count(room),
+                live_event_count=self._sliding_live_event_count(room),
                 cursor_token=self._sliding_recovery_cursor(room_id, room),
             )
         )
@@ -1414,15 +1415,15 @@ class AsyncClient(Client):
                             else "join"
                         ),
                         live_event_count=(
-                            self._sliding_membership_live_event_count(room)
+                            self._sliding_live_event_count(room)
                             if self._room_component_is_current(room_id)
                             else None
                         ),
                         provenance_live_event_count=(
-                            self._sliding_provenance_live_event_count(room)
+                            self._sliding_live_event_count(room)
                         ),
                         apply_state_live_event_count=(
-                            self._sliding_provenance_live_event_count(room)
+                            self._sliding_live_event_count(room)
                             if self._room_component_is_current(room_id)
                             and room.expanded_timeline
                             and not room.initial
@@ -1642,28 +1643,21 @@ class AsyncClient(Client):
         )
 
     @staticmethod
-    def _sliding_provenance_live_event_count(room: SlidingSyncRoom) -> int:
-        """Return the exact validated live tail, failing closed to history."""
-        if room.num_live is None or not 0 <= room.num_live <= len(room.timeline):
-            return 0
-        return room.num_live
+    def _sliding_live_event_count(room: SlidingSyncRoom) -> int:
+        """Normalize the live tail represented by deployed server responses.
 
-    @staticmethod
-    def _sliding_membership_live_event_count(
-        room: SlidingSyncRoom,
-    ) -> int | None:
-        """Limit membership evidence only when history can share the timeline."""
+        Tuwunel omits ``num_live`` on ordinary continuations and reports the
+        total live count when a truncated window can contain only its tail.
+        """
         if room.num_live is None:
-            return 0 if room.initial or room.expanded_timeline else None
-        return AsyncClient._sliding_provenance_live_event_count(room)
+            return 0 if room.initial or room.expanded_timeline else len(room.timeline)
+        return min(max(room.num_live, 0), len(room.timeline))
 
     @staticmethod
     def _sliding_live_timeline(
         room: SlidingSyncRoom,
     ) -> Sequence[Event | BadEventType]:
-        live_event_count = AsyncClient._sliding_membership_live_event_count(room)
-        if live_event_count is None:
-            return room.timeline
+        live_event_count = AsyncClient._sliding_live_event_count(room)
         return room.timeline[-live_event_count:] if live_event_count else ()
 
     def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
@@ -1965,7 +1959,7 @@ class AsyncClient(Client):
         )
 
         if not self.config.backfill_limited_timelines:
-            live_event_count = self._sliding_provenance_live_event_count(sliding_room)
+            live_event_count = self._sliding_live_event_count(sliding_room)
             live_start = len(sliding_room.timeline) - live_event_count
             for index, event in enumerate(sliding_room.timeline):
                 event_id = getattr(event, "event_id", None)

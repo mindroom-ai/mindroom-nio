@@ -1343,13 +1343,24 @@ class TestRoomLocalRecovery:
         ]
         assert client.rooms[ROOM_A].name == "Current"
 
-    @pytest.mark.parametrize("initial", [False, True])
-    @pytest.mark.parametrize("num_live", [None, -1, 3])
-    async def test_sliding_invalid_live_count_fails_closed(
+    @pytest.mark.parametrize(
+        ("initial", "expanded_timeline", "num_live", "expected"),
+        [
+            (False, False, None, TimelineEventProvenance.LIVE),
+            (True, False, None, TimelineEventProvenance.HISTORY),
+            (False, True, None, TimelineEventProvenance.HISTORY),
+            (False, False, -1, TimelineEventProvenance.HISTORY),
+            (False, False, 3, TimelineEventProvenance.LIVE),
+            (True, False, 3, TimelineEventProvenance.LIVE),
+        ],
+    )
+    async def test_sliding_live_count_matches_deployed_response_shapes(
         self,
         client,
         initial,
+        expanded_timeline,
         num_live,
+        expected,
     ):
         admissions = record_admissions(client)
         response = SlidingSyncResponse.from_dict(
@@ -1358,6 +1369,7 @@ class TestRoomLocalRecovery:
                 "rooms": {
                     ROOM_A: {
                         "initial": initial,
+                        "expanded_timeline": expanded_timeline,
                         "membership": "join",
                         "num_live": num_live,
                         "timeline": [
@@ -1373,8 +1385,8 @@ class TestRoomLocalRecovery:
         await client.receive_response(response)
 
         assert admissions == [
-            ("$history-1", TimelineEventProvenance.HISTORY),
-            ("$history-2", TimelineEventProvenance.HISTORY),
+            ("$history-1", expected),
+            ("$history-2", expected),
         ]
 
     @pytest.mark.parametrize(
@@ -5709,7 +5721,7 @@ class TestRoomLocalRecovery:
                         "membership": "join",
                         "initial": True,
                         "limited": True,
-                        "num_live": 2,
+                        "num_live": 500,
                         "prev_batch": "w2",
                         "timeline": [
                             member_event("$join", 2, "join", OWN_ID).source,

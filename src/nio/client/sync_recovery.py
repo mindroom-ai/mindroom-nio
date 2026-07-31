@@ -93,6 +93,8 @@ class PendingTimelineEvent:
     rows. Sync-origin rows survive room resets, count toward the held-event
     cap, and acknowledge ordinary callback failures. ``provenance`` is the
     independent live-or-history classification exposed at admission.
+    ``apply_room_state`` keeps historical Sliding Sync expansions from
+    replacing current room state; Classic Sync timelines always apply state.
     """
 
     room_id: str
@@ -859,6 +861,8 @@ def plan_sync_response(
                 else ""
             ),
             provenance_live_event_count=None if request_since is not None else 0,
+            # Classic timeline events advance room state even when the initial
+            # response classifies their callback provenance as history.
             apply_state_live_event_count=(
                 None
                 if current_room_ids is None or room_id in current_room_ids

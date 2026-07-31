@@ -791,7 +791,7 @@ class TestClass:
         assert sqlstore._get_store_version() == 6
         assert not sqlstore.load_sync_recovery()[1][0].admission_accepted
 
-    def test_v6_store_adds_provenance_without_dropping_transport_tokens(
+    def test_v6_store_adds_provenance_without_dropping_recovery(
         self,
         sqlstore,
     ):
@@ -817,7 +817,23 @@ class TestClass:
         assert reopened.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
         }
-        assert reopened.load_sync_recovery() == ([], [])
+        gaps, events = reopened.load_sync_recovery()
+        assert [
+            (gap.room_id, gap.generation, gap.target_token, gap.cursor_token)
+            for gap in gaps
+        ] == [(TEST_ROOM, 1, "p1", None)]
+        assert [
+            (
+                event.event_id,
+                event.generation,
+                event.provenance,
+                event.apply_room_state,
+            )
+            for event in events
+        ] == [
+            ("$completed", 0, TimelineEventProvenance.HISTORY, False),
+            ("$pending", 1, TimelineEventProvenance.HISTORY, True),
+        ]
         with reopened.database.bind_ctx(reopened.models):
             columns = {
                 row[1]

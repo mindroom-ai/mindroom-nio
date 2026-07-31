@@ -215,11 +215,12 @@ class MatrixStore:
                 "ADD COLUMN apply_room_state INTEGER NOT NULL DEFAULT 1"
             )
 
-        # Old recovery rows cannot recover the two independent meanings that
-        # v6 encoded together in is_live. Keep transport cursors, but discard
-        # only the ambiguous callback obligations.
-        PendingTimelineEvents.delete().execute()
-        SyncRecoveryGaps.delete().execute()
+        # Legacy rows predate public provenance, so classify them conservatively
+        # as history while preserving their exact callback obligations.
+        PendingTimelineEvents.update(
+            provenance=TimelineEventProvenance.HISTORY.value,
+            apply_room_state=PendingTimelineEvents.is_live,
+        ).execute()
         self._update_version(7)
 
     def __post_init__(self):
