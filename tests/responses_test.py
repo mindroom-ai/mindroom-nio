@@ -231,6 +231,17 @@ class TestClass:
         assert isinstance(response, SlidingSyncError)
         assert "!room:example.org" in response.message
 
+    def test_sliding_sync_malformed_num_live_returns_error(self):
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "s1",
+                "rooms": {"!room:example.org": {"num_live": "1"}},
+            }
+        )
+
+        assert isinstance(response, SlidingSyncError)
+        assert "!room:example.org" in response.message
+
     def test_sliding_sync_parse(self):
         parsed_dict = {
             "pos": "s58_224_0_13_10_1_1_16_0_1",
