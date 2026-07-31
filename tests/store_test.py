@@ -800,6 +800,22 @@ class TestClass:
         finally:
             connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
 
+    def test_sync_recovery_chunks_large_room_clears(self, sqlstore):
+        """A large reset response stays below SQLite's bind limit."""
+        connection = sqlstore.database.connection()
+        if not hasattr(connection, "setlimit"):
+            pytest.skip("sqlite3.Connection.setlimit is unavailable")
+        old_limit = connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+        room_ids = [f"!room{index}:example.org" for index in range(600)]
+        gaps = [RecoveryGap(room_id, 1, "target", "cursor") for room_id in room_ids]
+        try:
+            sqlstore.save_recovery(None, set(), gaps, [], None)
+            sqlstore.save_recovery(None, set(room_ids), [], [], None)
+            remaining, _ = sqlstore.load_sync_recovery()
+            assert not {gap.room_id for gap in remaining} & set(room_ids)
+        finally:
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
+
     def test_save_recovery_writes_window_tokens_in_one_transaction(
         self, sqlstore, monkeypatch
     ):

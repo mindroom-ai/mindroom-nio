@@ -602,19 +602,21 @@ class MatrixStore:
 
         if token:
             SyncTokens.replace(account=account, token=token).execute()
-        if clear_rooms:
+        clear_rooms = list(clear_rooms)
+        for index in range(0, len(clear_rooms), _RECOVERY_WRITE_CHUNK_SIZE):
+            room_batch = clear_rooms[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             self._restore_completed_markers(
                 account,
-                PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.room_id.in_(room_batch),
             )
             PendingTimelineEvents.delete().where(
                 PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id.in_(clear_rooms),
+                PendingTimelineEvents.room_id.in_(room_batch),
                 PendingTimelineEvents.generation > 0,
             ).execute()
             SyncRecoveryGaps.delete().where(
                 SyncRecoveryGaps.account == account,
-                SyncRecoveryGaps.room_id.in_(clear_rooms),
+                SyncRecoveryGaps.room_id.in_(room_batch),
             ).execute()
         if clear_recovered:
             self._restore_completed_markers(
