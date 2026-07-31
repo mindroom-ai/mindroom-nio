@@ -750,7 +750,6 @@ def plan_room_timeline(
                 (
                     event.sequence
                     for event in state.events.get((room_id, generation), ())
-                    if event.is_live
                 ),
                 default=-1,
             ),

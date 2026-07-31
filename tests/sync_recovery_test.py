@@ -20,6 +20,7 @@ from nio import (
     RoomInfo,
     Timeline,
     TimelineEventProvenance,
+    TypingNoticeEvent,
 )
 from nio.client import async_client as async_client_module
 from nio.client.sync_recovery import (
@@ -183,6 +184,34 @@ def test_received_timeline_stays_after_a_recovered_only_prefix():
     assert len(plan.events) == 1
     assert plan.events[0].sequence == 1
     assert plan.events[0].is_live
+
+
+def test_received_ancillary_event_stays_after_a_recovered_only_prefix():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", None)]},
+        events={(ROOM, 1): [pending("$gap", 7)]},
+    )
+    notice = TypingNoticeEvent(["@sender:example.org"])
+    notice.source = {
+        "type": "m.typing",
+        "content": {"user_ids": ["@sender:example.org"]},
+    }
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="join",
+        batch_id="sync:s2",
+        ephemeral_events=[notice],
+    )
+    apply_plan(state, plan)
+
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == [
+        "$gap",
+        "~sync:s2:ephemeral:0",
+    ]
 
 
 def test_classic_initial_own_join_clears_stale_recovery():

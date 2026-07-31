@@ -61,6 +61,8 @@ These only apply when `backfill_limited_timelines=True`; default behaviour is un
 
 ### Bug Fixes
 
+- Persist same-generation pending-event resequencing so recovered history stays
+  ahead of its held live window after a restart.
 - Give every retried sync transport attempt a fresh ordering identity so a
   successful membership reset cannot make a later retry discard current room
   state while exposing its advanced cursor.
