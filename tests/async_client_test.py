@@ -2048,6 +2048,54 @@ class TestClass:
         assert room.fully_read_marker == "$mark:example.org"
         assert room.tags == {"u.work": {}}
 
+    async def test_pending_unknown_account_data_keeps_each_wire_type(
+        self, async_client
+    ):
+        received = []
+
+        async def account_data_cb(room, event):
+            received.append((room.room_id, event.type))
+
+        async_client.add_room_account_data_callback(
+            account_data_cb, UnknownAccountDataEvent
+        )
+
+        for pos, event_type in (
+            ("p1", "org.example.first"),
+            ("p2", "org.example.second"),
+        ):
+            event = UnknownAccountDataEvent.from_dict(
+                {"type": event_type, "content": {}}
+            )
+            await async_client.receive_response(
+                SlidingSyncResponse(
+                    pos,
+                    room_account_data={TEST_ROOM_ID: [event]},
+                )
+            )
+
+        assert received == []
+
+        await async_client.receive_response(
+            SlidingSyncResponse.from_dict(
+                {
+                    "pos": "p3",
+                    "rooms": {
+                        TEST_ROOM_ID: {
+                            "membership": "join",
+                            "required_state": [],
+                            "timeline": [],
+                        },
+                    },
+                }
+            )
+        )
+
+        assert received == [
+            (TEST_ROOM_ID, "org.example.first"),
+            (TEST_ROOM_ID, "org.example.second"),
+        ]
+
     async def test_sliding_sync_forever_error_backoff(self, async_client, aioresponse):
         aioresponse.post(
             f"{BASE_URL_V3}/keys/upload",
