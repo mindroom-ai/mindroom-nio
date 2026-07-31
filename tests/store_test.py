@@ -843,7 +843,7 @@ class TestClass:
             }
         assert {"provenance", "apply_room_state"} <= columns
 
-    def test_v7_recovery_reset_is_atomic(self, sqlstore, monkeypatch):
+    def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)
         sqlstore.upgrade_to_v6()
         table = PendingTimelineEvents._meta.table_name

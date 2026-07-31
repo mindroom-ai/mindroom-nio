@@ -970,7 +970,6 @@ class AsyncClient(Client):
             if not deduplicate or should_dispatch_timeline_event(
                 self._recovery, room_id, event
             ):
-                await self._on_event_admission(event, room, True)
                 await self._on_event(event, room)
 
     async def _dispatch_timeline_event(
@@ -1450,7 +1449,6 @@ class AsyncClient(Client):
                                 )
                                 + tuple(response.room_account_data.get(room_id, ()))
                             ),
-                            timeline_events_live=True,
                         )
                     )
                 plans.extend(

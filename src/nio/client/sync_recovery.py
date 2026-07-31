@@ -702,7 +702,6 @@ def plan_room_timeline(
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
-    timeline_events_live: bool = True,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
@@ -871,7 +870,6 @@ def plan_sync_response(
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,
             account_data_events=room_info.account_data,
-            timeline_events_live=True,
         )
         for room_id, room_info in joined_rooms.items()
     ]
