@@ -1,0 +1,10 @@
+{
+    "content": {
+        "from_device": "DEVICEID",
+        "methods": ["m.sas.v1"],
+        "timestamp": 1754000000000,
+        "transaction_id": "transaction_id"
+    },
+    "sender": "@alice:example.org",
+    "type": "m.key.verification.request"
+}

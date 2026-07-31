@@ -23,6 +23,7 @@ from nio.events import (
     KeyVerificationCancel,
     KeyVerificationKey,
     KeyVerificationMac,
+    KeyVerificationRequest,
     KeyVerificationStart,
     MegolmEvent,
     OlmEvent,
@@ -463,6 +464,17 @@ class TestClass:
             event = ToDeviceEvent.parse_event(parsed_dict)
             assert isinstance(event, event_type)
 
+    def test_key_verification_request_event(self):
+        parsed_dict = TestClass._load_response("tests/data/events/key_request.json")
+        event = ToDeviceEvent.parse_event(parsed_dict)
+
+        assert isinstance(event, KeyVerificationRequest)
+        assert isinstance(event, UnknownToDeviceEvent)
+        assert event.transaction_id == "transaction_id"
+        assert event.from_device == "DEVICEID"
+        assert event.methods == ["m.sas.v1"]
+        assert event.timestamp == 1754000000000
+
     def test_invalid_key_verification(self):
         for _, event_file in [
             (KeyVerificationStart, "key_start.json"),
@@ -470,6 +482,7 @@ class TestClass:
             (KeyVerificationKey, "key_key.json"),
             (KeyVerificationMac, "key_mac.json"),
             (KeyVerificationCancel, "key_cancel.json"),
+            (None, "key_request.json"),
         ]:
             parsed_dict = TestClass._load_response(f"tests/data/events/{event_file}")
             parsed_dict["content"].pop("transaction_id")
