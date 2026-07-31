@@ -201,8 +201,9 @@ def verify(schema, error_class, pass_arguments=True):
                 # server sent alongside the missing success field. Only these two
                 # fields are logged; the rest of the body may hold user content.
                 body = parsed_dict if isinstance(parsed_dict, dict) else {}
+                # repr escapes controls; precision bounds untrusted server output.
                 logger.warning(
-                    "Error validating response: %s (errcode=%s, error=%s)",
+                    "Error validating response: %s (errcode=%.128r, error=%.512r)",
                     e.message,
                     body.get("errcode"),
                     body.get("error"),
