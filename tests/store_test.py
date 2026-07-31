@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
-from helpers import ephemeral, ephemeral_dir, faker
+from helpers import faker
 
 from nio.crypto import (
     InboundGroupSession,
@@ -72,9 +72,17 @@ def sqlmemorystore():
 
 
 class TestClass:
+    @pytest.fixture(autouse=True)
+    def _store_path(self, tempdir):
+        self.store_path = tempdir
+
     @property
     def ephemeral_store(self):
-        return MatrixStore("@ephemeral:example.org", "DEVICEID", ephemeral_dir)
+        return MatrixStore("@ephemeral:example.org", "DEVICEID", self.store_path)
+
+    def test_writable_store_uses_pytest_tmp_path(self, tmp_path):
+        store = self.ephemeral_store
+        assert Path(store.database_path).parent == tmp_path
 
     @property
     def example_devices(self):
@@ -193,13 +201,11 @@ class TestClass:
         for key in keys:
             assert key not in store2
 
-    @ephemeral
     def test_store_opening(self):
         store = self.ephemeral_store
         account = store.load_account()
         assert not account
 
-    @ephemeral
     def test_store_account_saving(self):
         account = self._create_ephemeral_account()
 
@@ -208,7 +214,6 @@ class TestClass:
 
         assert account.identity_keys == loaded_account.identity_keys
 
-    @ephemeral
     def test_store_session(self):
         account = self._create_ephemeral_account()
         store = self.ephemeral_store
@@ -224,7 +229,6 @@ class TestClass:
         assert loaded_session
         assert session.id == loaded_session.id
 
-    @ephemeral
     def test_store_group_session(self):
         account = self._create_ephemeral_account()
         store = self.ephemeral_store
@@ -250,7 +254,6 @@ class TestClass:
         assert in_group.id == loaded_session.id
         assert sorted(loaded_session.forwarding_chain) == sorted(TEST_FORWARDING_CHAIN)
 
-    @ephemeral
     def test_store_device_keys(self):
         self._create_ephemeral_account()
         store = self.ephemeral_store
@@ -272,30 +275,23 @@ class TestClass:
         assert not bob_device.deleted
         assert len(device_store.users) == 11
 
-    @ephemeral
     def test_two_stores(self):
-        try:
-            account = self._create_ephemeral_account()
-            store = self.ephemeral_store
-            loaded_account = store.load_account()
-            assert account.identity_keys == loaded_account.identity_keys
+        account = self._create_ephemeral_account()
+        store = self.ephemeral_store
+        loaded_account = store.load_account()
+        assert account.identity_keys == loaded_account.identity_keys
 
-            store2 = MatrixStore("ephemeral2", "DEVICEID2", ephemeral_dir)
-            assert not store2.load_account()
+        store2 = MatrixStore("ephemeral2", "DEVICEID2", self.store_path)
+        assert not store2.load_account()
 
-            loaded_account = store.load_account()
-            assert account.identity_keys == loaded_account.identity_keys
+        loaded_account = store.load_account()
+        assert account.identity_keys == loaded_account.identity_keys
 
-        finally:
-            os.remove(os.path.join(ephemeral_dir, "ephemeral2_DEVICEID2.db"))
-
-    @ephemeral
     def test_empty_device_keys(self):
         self._create_ephemeral_account()
         store = self.ephemeral_store
         store.save_device_keys({})
 
-    @ephemeral
     def test_saving_account_twice(self):
         account = self._create_ephemeral_account()
         store = self.ephemeral_store
@@ -312,7 +308,6 @@ class TestClass:
         assert loaded_session
         assert session.id == loaded_session.id
 
-    @ephemeral
     def test_encrypted_room_saving(self):
         self._create_ephemeral_account()
         store = self.ephemeral_store
@@ -326,7 +321,6 @@ class TestClass:
         encrypted_rooms = store.load_encrypted_rooms()
         assert TEST_ROOM in encrypted_rooms
 
-    @ephemeral
     def test_key_request_saving(self):
         self._create_ephemeral_account()
         store = self.ephemeral_store

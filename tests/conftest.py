@@ -1,6 +1,3 @@
-import shutil
-import tempfile
-
 import helpers
 import pytest
 from conftest_async import (  # noqa: F401
@@ -23,10 +20,8 @@ BOB_DEVICE_ID = "JLAFKJWSRS"
 
 
 @pytest.fixture
-def tempdir():
-    newpath = tempfile.mkdtemp()
-    yield newpath
-    shutil.rmtree(newpath)
+def tempdir(tmp_path):
+    return str(tmp_path)
 
 
 @pytest.fixture

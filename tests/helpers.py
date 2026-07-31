@@ -5,7 +5,6 @@ helpers
 This module contains helpers for the nio tests.
 """
 
-import os
 from random import choice
 from string import ascii_letters, ascii_uppercase
 
@@ -70,20 +69,6 @@ class Provider(BaseProvider):
 
 
 faker.add_provider(Provider)
-
-
-ephemeral_dir = os.path.join(os.curdir, "tests/data/encryption")
-
-
-def ephemeral(func):
-    def wrapper(*args, **kwargs):
-        try:
-            ret = func(*args, **kwargs)
-        finally:
-            os.remove(os.path.join(ephemeral_dir, "@ephemeral:example.org_DEVICEID.db"))
-        return ret
-
-    return wrapper
 
 
 class FrameFactory:
