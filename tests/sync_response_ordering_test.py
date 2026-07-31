@@ -29,12 +29,22 @@ def room_info() -> RoomInfo:
     return RoomInfo(Timeline([], False, None), [], [], [])
 
 
-def test_account_data_kind_falls_back_to_the_parsed_class() -> None:
-    event = UnknownAccountDataEvent.from_dict(
+def test_account_data_kind_keeps_unknown_wire_types_distinct() -> None:
+    first = UnknownAccountDataEvent.from_dict(
         {"type": "org.example.first", "content": {}}
     )
+    second = UnknownAccountDataEvent.from_dict(
+        {"type": "org.example.second", "content": {}}
+    )
 
-    assert account_data_kind(event) == ("UnknownAccountDataEvent", None)
+    assert account_data_kind(first) == (
+        "UnknownAccountDataEvent",
+        "org.example.first",
+    )
+    assert account_data_kind(second) == (
+        "UnknownAccountDataEvent",
+        "org.example.second",
+    )
 
 
 def test_response_room_ids_include_room_account_data_outside_the_window() -> None:
