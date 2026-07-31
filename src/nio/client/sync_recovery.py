@@ -525,11 +525,7 @@ def _plan_live_events(
         else {}
     )
     sequence = 1 + max(
-        (
-            event.sequence
-            for event in state.events.get((room_id, generation), ())
-            if event.is_live
-        ),
+        (event.sequence for event in state.events.get((room_id, generation), ())),
         default=-1,
     )
     planned = []
@@ -666,7 +662,6 @@ def plan_room_timeline(
                 (
                     event.sequence
                     for event in state.events.get((room_id, generation), ())
-                    if event.is_live
                 ),
                 default=-1,
             ),
@@ -829,10 +824,16 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.completed.get(event.room_id, {}).pop(event.event_id, None)
         key = (event.room_id, event.generation)
         queued = state.events.setdefault(key, [])
-        if not any(item.event_id == event.event_id for item in queued):
+        existing = next(
+            (item for item in queued if item.event_id == event.event_id),
+            None,
+        )
+        if existing is None:
             queued.append(event)
+        else:
+            queued[queued.index(existing)] = event
     for key in {(event.room_id, event.generation) for event in plan.events}:
-        state.events[key].sort(key=lambda item: (item.is_live, item.sequence))
+        state.events[key].sort(key=lambda item: item.sequence)
 
 
 def take_recovery_outcomes(
@@ -893,7 +894,7 @@ def load_recovery_state(
         )
         state.events.setdefault((row.room_id, row.generation), []).append(event)
     for queued in state.events.values():
-        queued.sort(key=lambda event: (event.is_live, event.sequence))
+        queued.sort(key=lambda event: event.sequence)
 
 
 def persist_response_plan(
@@ -955,6 +956,67 @@ def _finish(
         state.gaps.pop(gap.room_id)
     if gap.target_token:
         state.outcomes.setdefault(gap.room_id, True)
+
+
+def _merge_recovery_page_order(
+    queued: Iterable[PendingTimelineEvent],
+    page: Iterable[PendingTimelineEvent],
+) -> tuple[PendingTimelineEvent, ...]:
+    """Place page overlap anchors between recovered history and later live work."""
+    page_events = list(page)
+    queued_events = list(queued)
+    if not page_events:
+        return tuple(
+            replace(event, sequence=index) for index, event in enumerate(queued_events)
+        )
+
+    queued_indexes = {
+        event.event_id: index for index, event in enumerate(queued_events)
+    }
+    anchors = [
+        (page_index, queued_indexes[event.event_id])
+        for page_index, event in enumerate(page_events)
+        if event.event_id in queued_indexes
+    ]
+    if any(
+        previous[1] >= current[1]
+        for previous, current in zip(anchors, anchors[1:], strict=False)
+    ):
+        page_events = [
+            event for event in page_events if event.event_id not in queued_indexes
+        ]
+        anchors = []
+    page_ids = {event.event_id for event in page_events}
+    if not anchors:
+        insert_at = 1 + max(
+            (index for index, event in enumerate(queued_events) if not event.is_live),
+            default=-1,
+        )
+        ordered = [
+            *queued_events[:insert_at],
+            *page_events,
+            *queued_events[insert_at:],
+        ]
+    else:
+        ordered = []
+        queued_start = 0
+        page_start = 0
+        for page_end, queued_end in anchors:
+            ordered.extend(
+                event
+                for event in queued_events[queued_start:queued_end]
+                if event.event_id not in page_ids
+            )
+            ordered.extend(page_events[page_start : page_end + 1])
+            queued_start = queued_end + 1
+            page_start = page_end + 1
+        ordered.extend(page_events[page_start:])
+        ordered.extend(
+            event
+            for event in queued_events[queued_start:]
+            if event.event_id not in page_ids
+        )
+    return tuple(replace(event, sequence=index) for index, event in enumerate(ordered))
 
 
 async def _collect_slice(
@@ -1025,40 +1087,47 @@ async def _collect_slice(
             return gap
 
         recovered: list[PendingTimelineEvent] = []
-        next_sequence = 1 + max(
-            (
-                event.sequence
-                for event in state.events.get((gap.room_id, gap.generation), ())
-                if not event.is_live
-            ),
-            default=-1,
-        )
+        page_events: list[PendingTimelineEvent] = []
+        page_ids: set[str] = set()
+        queued = state.events.get((gap.room_id, gap.generation), ())
+        queued_by_id = {event.event_id: event for event in queued}
         for event in response.chunk:
             event_id = getattr(event, "event_id", None)
             if not event_id:
                 continue
             if is_own_join(event, user_id):
                 recovered.clear()
+                page_events.clear()
+                page_ids.clear()
                 clear_recovered = True
-                next_sequence = 0
             was_completed = bool(state.completed.get(gap.room_id, {}).get(event_id))
-            if event_id in pending_ids or (
-                not should_dispatch_timeline_event(state, gap.room_id, event)
-                and not (was_completed and isinstance(event, MegolmEvent))
+            if event_id in pending_ids:
+                existing = queued_by_id.get(event_id)
+                if (
+                    existing
+                    and (existing.is_live or not clear_recovered)
+                    and event_id not in page_ids
+                ):
+                    page_events.append(existing)
+                    page_ids.add(event_id)
+                continue
+            if not should_dispatch_timeline_event(state, gap.room_id, event) and not (
+                was_completed and isinstance(event, MegolmEvent)
             ):
                 continue
-            pending = PendingTimelineEvent.from_event(
+            pending_event = PendingTimelineEvent.from_event(
                 gap.room_id,
                 gap.generation,
-                next_sequence,
+                0,
                 event,
                 False,
                 was_completed=was_completed,
             )
-            if pending:
-                recovered.append(pending)
+            if pending_event:
+                recovered.append(pending_event)
+                page_events.append(pending_event)
+                page_ids.add(event_id)
                 pending_ids.add(event_id)
-                next_sequence += 1
 
         current_recovered_count = sum(
             not event.is_live
@@ -1070,6 +1139,7 @@ async def _collect_slice(
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
+            page_events.clear()
             clear_recovered = True
             abandoned = True
             next_cursor = None
@@ -1099,6 +1169,12 @@ async def _collect_slice(
         else:
             next_cursor = response.end
 
+        retained = (
+            [event for event in queued if event.is_live] if clear_recovered else queued
+        )
+        ordered_events = (
+            () if abandoned else _merge_recovery_page_order(retained, page_events)
+        )
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
             state,
@@ -1106,7 +1182,7 @@ async def _collect_slice(
             token=None,
             plan=RecoveryPlan(
                 gaps=(updated,),
-                events=tuple(recovered),
+                events=ordered_events,
                 clear_recovered=updated if clear_recovered else None,
                 unrecovered_room_ids=(
                     frozenset({gap.room_id}) if abandoned else frozenset()

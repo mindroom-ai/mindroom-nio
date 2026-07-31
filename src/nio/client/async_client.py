@@ -291,6 +291,7 @@ from .sync_reset_fence import (
     accept_current_components,
     accept_current_one_time_key_count,
     accept_reset_safe_rooms,
+    commit_one_time_key_count,
     finish_sync_request,
     issue_sync_request,
     mark_room_reset,
@@ -343,6 +344,7 @@ class _SyncResponseEnvelope:
 class _OrderedResponseView:
     response: SyncResponse | SlidingSyncResponse
     current_room_ids: frozenset[str]
+    one_time_key_count_request_id: SyncRequestId | None
 
 
 @dataclass(eq=False)
@@ -2149,9 +2151,13 @@ class AsyncClient(Client):
         response: SyncResponse | SlidingSyncResponse,
         request_id: SyncRequestId | None,
     ) -> _OrderedResponseView:
+        one_time_key_count_present = (
+            response.device_key_count.curve25519 is not None
+            or response.device_key_count.signed_curve25519 is not None
+        )
         accept_one_time_key_count = accept_current_one_time_key_count(
             self._sync_reset_fence,
-            present=response.device_key_count.signed_curve25519 is not None,
+            present=one_time_key_count_present,
             request_id=request_id,
         )
         if not accept_one_time_key_count:
@@ -2231,6 +2237,11 @@ class AsyncClient(Client):
                     ],
                 ),
                 current_rooms,
+                (
+                    request_id
+                    if accept_one_time_key_count and one_time_key_count_present
+                    else None
+                ),
             )
         current_rooms, accept_to_device_token = accept_current_components(
             self._sync_reset_fence,
@@ -2282,6 +2293,11 @@ class AsyncClient(Client):
                 ),
             ),
             current_rooms,
+            (
+                request_id
+                if accept_one_time_key_count and one_time_key_count_present
+                else None
+            ),
         )
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
@@ -2338,6 +2354,11 @@ class AsyncClient(Client):
                             )
                         else:
                             await self._handle_sliding_sync(ordered.response)
+                        if ordered.one_time_key_count_request_id is not None:
+                            commit_one_time_key_count(
+                                self._sync_reset_fence,
+                                ordered.one_time_key_count_request_id,
+                            )
                     finally:
                         self._current_response_room_ids.reset(room_token)
                 finally:

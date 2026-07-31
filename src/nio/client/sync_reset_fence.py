@@ -148,10 +148,18 @@ def accept_current_one_time_key_count(
     present: bool,
     request_id: SyncRequestId | None,
 ) -> bool:
-    """Accept a global count snapshot only from the newest issued request."""
+    """Check a global count snapshot against the newest applied request."""
     if not present or request_id is None:
         return present
-    if request_id.sequence < state.one_time_key_count_floor:
-        return False
-    state.one_time_key_count_floor = request_id.sequence
-    return True
+    return request_id.sequence >= state.one_time_key_count_floor
+
+
+def commit_one_time_key_count(
+    state: SyncResetFence,
+    request_id: SyncRequestId,
+) -> None:
+    """Commit an applied global count snapshot without rewinding its floor."""
+    state.one_time_key_count_floor = max(
+        state.one_time_key_count_floor,
+        request_id.sequence,
+    )

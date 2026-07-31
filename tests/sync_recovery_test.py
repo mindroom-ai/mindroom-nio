@@ -1,9 +1,11 @@
 """Owning-seam tests for durable room recovery state."""
 
 import asyncio
+import json
 import threading
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import nio.client.sync_recovery as sync_recovery
 import pytest
@@ -48,6 +50,37 @@ def pending(event_id: str, sequence: int) -> PendingTimelineEvent:
     )
     assert value
     return value
+
+
+def test_loaded_recovery_keeps_page_chronology_across_live_boundary():
+    def row(value, sequence, is_live):
+        return SimpleNamespace(
+            room_id=ROOM,
+            generation=1,
+            sequence=sequence,
+            event_id=value.event_id,
+            source_json=json.dumps(value.source),
+            is_live=is_live,
+            was_encrypted=False,
+            was_completed=False,
+            kind="timeline",
+            admission_accepted=False,
+        )
+
+    state = RecoveryState()
+    events = [
+        row(event("$gap", 1), 0, False),
+        row(event("$held", 2), 1, True),
+        row(event("$overflow", 3), 2, False),
+    ]
+
+    sync_recovery.load_recovery_state(state, (), events)
+
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == [
+        "$gap",
+        "$held",
+        "$overflow",
+    ]
 
 
 def test_no_id_keys_are_scoped_to_the_sliding_connection():
@@ -351,7 +384,7 @@ async def test_expired_budget_commits_exhausted_page_without_dispatch():
         "$untrusted",
         "$live",
     ]
-    assert value in state.events[(ROOM, 1)]
+    assert state.events[(ROOM, 1)][-1].source_json == value.source_json
 
 
 @pytest.mark.asyncio

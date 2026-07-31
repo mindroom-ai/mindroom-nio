@@ -1574,7 +1574,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$overflow", "$held"]
+        assert seen == ["$gap", "$held", "$overflow"]
         assert not client._recovery.gaps
         await client.receive_response(
             sync_response(
@@ -1588,7 +1588,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
-        assert seen == ["$gap", "$overflow", "$held"]
+        assert seen == ["$gap", "$held", "$overflow"]
         await client.close()
 
     @pytest.mark.parametrize("second_protocol", ["classic", "sliding"])
@@ -4162,6 +4162,130 @@ class TestRoomLocalRecovery:
         await lower
 
         assert uploaded_key_count == 0
+
+    async def test_curve_only_one_time_key_count_reaches_olm(self, client, monkeypatch):
+        counts = []
+
+        async def no_expired_verifications():
+            pass
+
+        async def no_key_requests():
+            pass
+
+        def handle_olm(response):
+            counts.append(response.device_key_count)
+
+        response = SlidingSyncResponse.from_dict(
+            {
+                "pos": "curve-only",
+                "rooms": {},
+                "extensions": {
+                    "e2ee": {"device_one_time_keys_count": {"curve25519": 7}}
+                },
+            }
+        )
+        assert isinstance(response, SlidingSyncResponse)
+
+        async def send(*_args, **_kwargs):
+            await client.receive_response(response)
+            return response
+
+        client.olm = object()
+        monkeypatch.setattr(
+            client,
+            "_handle_expired_verifications",
+            no_expired_verifications,
+        )
+        monkeypatch.setattr(client, "_collect_key_requests", no_key_requests)
+        monkeypatch.setattr(client, "_handle_olm_events", handle_olm)
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sliding_sync(pos="before")
+
+        assert counts == [DeviceOneTimeKeyCount(7, None)]
+
+    async def test_failed_newer_response_does_not_suppress_older_key_count(
+        self, client, monkeypatch
+    ):
+        lower_started = asyncio.Event()
+        release_lower = asyncio.Event()
+        uploaded_key_count = None
+
+        async def no_expired_verifications():
+            pass
+
+        async def no_key_requests():
+            pass
+
+        def handle_olm(response):
+            nonlocal uploaded_key_count
+            count = response.device_key_count.signed_curve25519
+            if count is not None:
+                uploaded_key_count = count
+
+        async def fail_account_data(_event):
+            raise RuntimeError("callback failed")
+
+        def response(label, count, *, fail=False):
+            value = SlidingSyncResponse.from_dict(
+                {
+                    "pos": label,
+                    "rooms": {},
+                    "extensions": {
+                        "account_data": {
+                            "global": (
+                                [
+                                    {
+                                        "content": {},
+                                        "type": "org.example.fail",
+                                    }
+                                ]
+                                if fail
+                                else []
+                            )
+                        },
+                        "e2ee": {
+                            "device_one_time_keys_count": {"signed_curve25519": count}
+                        },
+                    },
+                }
+            )
+            assert isinstance(value, SlidingSyncResponse)
+            return value
+
+        async def send(*args, **_kwargs):
+            request_pos = parse_qs(urlparse(args[2]).query)["pos"][0]
+            if request_pos == "lower":
+                lower_started.set()
+                await release_lower.wait()
+                value = response("lower", 50)
+            else:
+                value = response("higher", 0, fail=True)
+            await client.receive_response(value)
+            return value
+
+        client.olm = object()
+        client.add_global_account_data_callback(
+            fail_account_data,
+            UnknownAccountDataEvent,
+        )
+        monkeypatch.setattr(
+            client,
+            "_handle_expired_verifications",
+            no_expired_verifications,
+        )
+        monkeypatch.setattr(client, "_collect_key_requests", no_key_requests)
+        monkeypatch.setattr(client, "_handle_olm_events", handle_olm)
+        monkeypatch.setattr(client, "_send", send)
+
+        lower = asyncio.create_task(client.sliding_sync(conn_id="lower", pos="lower"))
+        await lower_started.wait()
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.sliding_sync(conn_id="higher", pos="higher")
+        release_lower.set()
+        await lower
+
+        assert uploaded_key_count == 50
 
     async def test_independent_transport_deltas_apply_in_arrival_order(
         self, tempdir, monkeypatch
