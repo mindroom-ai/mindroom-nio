@@ -11,7 +11,8 @@ All notable changes to this project will be documented in this file.
   Live, a sliding reader torn down mid-flood and rebuilt from its store now loses nothing where it previously lost every event written while it was down.
   Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
   Servers without `$ME` support provide no trusted initial membership proof, so nio retains no baseline and reports later known discontinuities as unrecovered.
-  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap and bounded per-room issuance floors reject stale snapshots and baselines without dropping unseen timeline events.
+  Classic Sync serializes its opaque cursor selection and long poll, while Sliding Sync connections overlap except when they share the device to-device cursor; Classic and Sliding Sync cannot both consume to-device messages in one client generation because their cursor formats are incompatible.
+  Bounded per-room and type-keyed account-data floors reject stale state and baseline changes without dropping unseen timeline events.
   Sync-family response application remains serialized within one replaceable client generation, so every accepted response slice is delivered once and a late pre-close response cannot mutate reused client state.
   Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
   This migrates the store from schema v3 to v6, safely discards unscoped v4 token rows, records durable event-admission acceptance, and exports `SlidingWindowTokens` from `nio.store`.

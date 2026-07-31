@@ -1,6 +1,6 @@
 """Reject room slices issued before a successful local membership reset."""
 
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
 
 
@@ -12,6 +12,7 @@ class SyncResetFence:
     active_request_ids: set[int] = field(default_factory=set)
     room_cutoffs: dict[str, int] = field(default_factory=dict)
     room_component_floors: dict[str, int] = field(default_factory=dict)
+    account_data_floors: dict[Hashable, int] = field(default_factory=dict)
     to_device_floor: int = 0
 
 
@@ -31,6 +32,11 @@ def _prune_obsolete_floors(state: SyncResetFence) -> None:
     state.room_component_floors = {
         room_id: floor
         for room_id, floor in state.room_component_floors.items()
+        if floor > oldest_active
+    }
+    state.account_data_floors = {
+        component: floor
+        for component, floor in state.account_data_floors.items()
         if floor > oldest_active
     }
     if state.to_device_floor <= oldest_active:
@@ -86,3 +92,22 @@ def accept_current_components(
     if accept_to_device_token:
         state.to_device_floor = request_id
     return accepted_rooms, accept_to_device_token
+
+
+def accept_current_account_data(
+    state: SyncResetFence,
+    components: Iterable[Hashable],
+    request_id: int | None,
+) -> frozenset[Hashable]:
+    """Accept type-keyed account data not superseded by a newer request."""
+    if request_id is None:
+        return frozenset(components)
+
+    accepted = frozenset(
+        component
+        for component in components
+        if request_id >= state.account_data_floors.get(component, 0)
+    )
+    for component in accepted:
+        state.account_data_floors[component] = request_id
+    return accepted

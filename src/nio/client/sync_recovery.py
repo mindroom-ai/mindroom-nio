@@ -333,19 +333,25 @@ def _mark_admission_accepted(
     gap: RecoveryGap,
     pending: PendingTimelineEvent,
 ) -> None:
+    key = (gap.room_id, gap.generation)
+    queued = state.events[key]
+    index = next(
+        (
+            index
+            for index, current in enumerate(queued)
+            if current.event_id == pending.event_id and current.kind == pending.kind
+        ),
+        None,
+    )
+    if index is None:
+        raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
     if store:
         store.accept_recovery_event(
             gap.room_id,
             gap.generation,
             pending.event_id,
         )
-    key = (gap.room_id, gap.generation)
-    queued = state.events[key]
-    for index, current in enumerate(queued):
-        if current.event_id == pending.event_id and current.kind == pending.kind:
-            queued[index] = replace(current, admission_accepted=True)
-            return
-    raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
+    queued[index] = replace(queued[index], admission_accepted=True)
 
 
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
@@ -506,6 +512,7 @@ def _plan_live_events(
     *,
     include_pending: bool,
     batch_id: str | None,
+    is_live: bool = True,
 ) -> list[PendingTimelineEvent]:
     known = (
         {
@@ -531,7 +538,7 @@ def _plan_live_events(
             f"~{batch_id}:{index}" if batch_id is not None else None
         )
         pending = PendingTimelineEvent.from_event(
-            room_id, generation, sequence, event, True, event_id
+            room_id, generation, sequence, event, is_live, event_id
         )
         if not event_id or not pending:
             continue
@@ -620,6 +627,7 @@ def plan_room_timeline(
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
+    timeline_events_live: bool = True,
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
         return _plan_room_reset(state, room_id)
@@ -647,6 +655,7 @@ def plan_room_timeline(
         timeline_events,
         include_pending=not clear,
         batch_id=batch_id,
+        is_live=timeline_events_live,
     )
     if ephemeral_events or account_data_events:
         if batch_id is None:
@@ -737,21 +746,39 @@ def plan_sync_response(
     response_token: str,
     joined_rooms: Mapping[str, Any],
     reset_room_ids: Iterable[str] = (),
+    current_room_ids: frozenset[str] | None = None,
 ) -> RecoveryPlan:
     plans = [
         plan_room_timeline(
             state,
             room_id=room_id,
             timeline_events=tuple(room_info.timeline.events),
-            user_id=user_id,
+            user_id=(
+                user_id
+                if current_room_ids is None or room_id in current_room_ids
+                else None
+            ),
             membership="join",
             cursor_token=(
-                request_since if room_info.timeline.limited and request_since else None
+                (
+                    request_since
+                    if room_info.timeline.limited and request_since
+                    else None
+                )
+                if current_room_ids is None or room_id in current_room_ids
+                else None
             ),
-            target_token=room_info.timeline.prev_batch or response_token,
+            target_token=(
+                room_info.timeline.prev_batch or response_token
+                if current_room_ids is None or room_id in current_room_ids
+                else ""
+            ),
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,
             account_data_events=room_info.account_data,
+            timeline_events_live=(
+                current_room_ids is None or room_id in current_room_ids
+            ),
         )
         for room_id, room_info in joined_rooms.items()
     ]
