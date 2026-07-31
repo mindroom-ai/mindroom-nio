@@ -1094,7 +1094,7 @@ class TestRoomLocalRecovery:
         async def second(_room, _event):
             pass
 
-        client.add_event_admission_callback(first, RoomMessageText)
+        client.add_event_admission_callback(first, cb_filter=RoomMessageText)
 
         with pytest.raises(
             LocalProtocolError,

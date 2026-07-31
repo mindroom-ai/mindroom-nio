@@ -657,7 +657,7 @@ class AsyncClient(Client):
     def add_event_admission_callback(
         self,
         callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
-        filter: type[Event] | tuple[type[Event], ...] | None = None,
+        cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
 
@@ -670,7 +670,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "An event admission callback is already registered."
             )
-        self.event_admission_callback = ClientCallback(callback, filter)
+        self.event_admission_callback = ClientCallback(callback, cb_filter)
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
