@@ -313,19 +313,6 @@ class _SyncResponseEnvelope:
     request_since: str | None
 
 
-@dataclass(frozen=True)
-class _SlidingRequestConnection:
-    conn_id: str | None
-    recovery_scope: str
-    is_continuation: bool
-
-
-@dataclass
-class _SlidingConnectionRecoveryOwner:
-    recovery_scope: str
-    active_requests: int = 1
-
-
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -559,6 +546,7 @@ class AsyncClient(Client):
         self.config: AsyncClientConfig = config or AsyncClientConfig()
 
         self._stop_sync_forever = False
+        self._sync_forever_generation = 0
         self._closing = False
 
         self._sync_response_lock = asyncio.Lock()
@@ -589,23 +577,16 @@ class AsyncClient(Client):
         # membership change.
         self._sliding_reset_rooms: dict[str, int] = {}
         self._sliding_room_reset_issuance_floor: dict[str, int] = {}
-        # The oldest request issuance each logical Sliding Sync connection
-        # still accepts for a room and for a whole response.
-        self._sliding_room_issuance_floor: dict[tuple[str, str], int] = {}
-        self._sliding_response_issuance_floor: dict[str, int] = {}
+        # The newest request issuance accepted by the client-wide Sliding
+        # Sync response stream.
+        self._sliding_response_issuance_floor = 0
         self._sliding_issuance_clock = 0
         self._sliding_request_issuance: ContextVar[int | None] = ContextVar(
             f"nio_sliding_request_issuance_{id(self)}", default=None
         )
-        self._sliding_request_connection: ContextVar[
-            _SlidingRequestConnection | None
-        ] = ContextVar(f"nio_sliding_request_connection_{id(self)}", default=None)
 
         # Device-scoped token surviving sliding connection expiry.
         self._sliding_sync_to_device_since: str | None = None
-        self._sliding_connection_recovery_scopes: dict[
-            str | None, _SlidingConnectionRecoveryOwner
-        ] = {}
         self._sliding_receive_recovery_scope = uuid4().hex
 
         super().__init__(user, device_id, store_path, self.config)
@@ -1170,7 +1151,10 @@ class AsyncClient(Client):
         ):
             return
         if self.config.backfill_limited_timelines:
-            recovery_scope = self._current_sliding_recovery_scope()
+            recovery_scope = (
+                self._sliding_request_issuance.get()
+                or self._sliding_receive_recovery_scope
+            )
             batch_id = f"sliding:{recovery_scope}:{response.pos}"
             planned_room_ids = set(response.rooms)
             planned_room_ids.update(
@@ -1389,10 +1373,17 @@ class AsyncClient(Client):
         own_membership_events = [
             event
             for event in (*room.required_state, *room.timeline)
-            if isinstance(event, RoomMemberEvent) and event.state_key == self.user_id
+            if (isinstance(event, RoomMemberEvent) and event.state_key == self.user_id)
+            or (
+                isinstance(event, SlidingSyncStateStub)
+                and event.type == "m.room.member"
+                and event.state_key == self.user_id
+            )
         ]
         if own_membership_events:
             event = own_membership_events[-1]
+            if isinstance(event, SlidingSyncStateStub):
+                return None
             return event.event_id if event.membership == "join" else None
         return self._sliding_verified_membership_event_ids.get(room_id)
 
@@ -1438,90 +1429,25 @@ class AsyncClient(Client):
     def _sliding_response_is_stale(self, room_id: str) -> bool:
         """Whether this response's request predates what the room accepted."""
         request_issuance = self._sliding_request_issuance.get()
-        scope = self._current_sliding_recovery_scope()
-        accepted_floor = self._sliding_room_issuance_floor.get((scope, room_id))
         reset_floor = self._sliding_room_reset_issuance_floor.get(room_id)
-        floor = max(accepted_floor or 0, reset_floor or 0)
-        # Responses can finish out of order, so the floor rises with every
-        # reset and every token taken in their logical connection; anything
-        # older than it describes a state this room has already moved past.
-        return request_issuance is not None and request_issuance < floor
+        # Whole responses are globally ordered before room planning. The
+        # room-specific check only needs to catch a membership reset that
+        # happened while this request was in flight.
+        return (
+            request_issuance is not None
+            and reset_floor is not None
+            and request_issuance < reset_floor
+        )
 
     def _accept_sliding_response(self) -> bool:
         """Reject a response older than one already accepted in full."""
         request_issuance = self._sliding_request_issuance.get()
         if request_issuance is None:
             return True
-        connection = self._sliding_request_connection.get()
-        # Fresh unnamed requests have no shared connection identity, but an
-        # unnamed continuation still belongs to the active default owner.
-        if (
-            connection is not None
-            and (connection.conn_id is not None or connection.is_continuation)
-            and (
-                (
-                    owner := self._sliding_connection_recovery_scopes.get(
-                        connection.conn_id
-                    )
-                )
-                is None
-                or owner.recovery_scope != connection.recovery_scope
-            )
-        ):
+        if request_issuance < self._sliding_response_issuance_floor:
             return False
-        scope = self._current_sliding_recovery_scope()
-        floor = self._sliding_response_issuance_floor.get(scope, 0)
-        if request_issuance < floor:
-            return False
-        self._sliding_response_issuance_floor[scope] = request_issuance
+        self._sliding_response_issuance_floor = request_issuance
         return True
-
-    def _current_sliding_recovery_scope(self) -> str:
-        """Return the logical Sliding Sync connection handling this response."""
-        connection = self._sliding_request_connection.get()
-        return (
-            connection.recovery_scope
-            if connection
-            else self._sliding_receive_recovery_scope
-        )
-
-    def _sliding_connection_recovery_scope(
-        self, conn_id: str | None, pos: str | None
-    ) -> str:
-        """Return one recovery scope for a logical Sliding Sync connection."""
-        owner = self._sliding_connection_recovery_scopes.get(conn_id)
-        if pos is not None:
-            if owner is not None:
-                owner.active_requests += 1
-                return owner.recovery_scope
-
-        old_scope = owner.recovery_scope if owner is not None else None
-        scope = uuid4().hex
-        self._sliding_connection_recovery_scopes[conn_id] = (
-            _SlidingConnectionRecoveryOwner(scope)
-        )
-        if old_scope is not None:
-            self._retire_sliding_recovery_scope(old_scope)
-        return scope
-
-    def _release_sliding_connection_recovery_scope(
-        self, conn_id: str | None, scope: str
-    ) -> None:
-        """Release ownership once the scope has no active requests."""
-        owner = self._sliding_connection_recovery_scopes.get(conn_id)
-        if owner is not None and owner.recovery_scope == scope:
-            owner.active_requests -= 1
-            if owner.active_requests:
-                return
-            self._sliding_connection_recovery_scopes.pop(conn_id)
-        self._retire_sliding_recovery_scope(scope)
-
-    def _retire_sliding_recovery_scope(self, scope: str) -> None:
-        """Discard ordering floors once no connection owns their scope."""
-        self._sliding_response_issuance_floor.pop(scope, None)
-        for key in tuple(self._sliding_room_issuance_floor):
-            if key[0] == scope:
-                self._sliding_room_issuance_floor.pop(key)
 
     def _sliding_token_predates_reset(
         self, room_id: str, room: SlidingSyncRoom
@@ -1564,19 +1490,12 @@ class AsyncClient(Client):
                 self._forget_sliding_window_token(room_id)
             else:
                 self._reset_sliding_room(room_id)
-        request_issuance = self._sliding_request_issuance.get()
         for room_id, token in recorded.items():
             self._sliding_room_prev_batch[room_id] = token
             self._sliding_verified_membership_event_ids[room_id] = (
                 token.membership_event_id
             )
             self._sliding_reset_rooms.pop(room_id, None)
-            if request_issuance is not None:
-                key = self._current_sliding_recovery_scope(), room_id
-                self._sliding_room_issuance_floor[key] = max(
-                    self._sliding_room_issuance_floor.get(key, 0),
-                    request_issuance,
-                )
 
     def _forget_sliding_window_token(self, room_id: str) -> None:
         """Drop a room's walk baseline once we are no longer in it.
@@ -2651,20 +2570,11 @@ class AsyncClient(Client):
             extensions=extensions,
             unstable=unstable,
         )
-        recovery_scope = self._sliding_connection_recovery_scope(conn_id, pos)
-
         # Stamped before the request leaves, and read again while its
         # response is handled, so a membership reset that lands in between
         # can tell this response's tokens are stale.
         issuance_token = self._sliding_request_issuance.set(
             self._next_sliding_issuance()
-        )
-        connection_token = self._sliding_request_connection.set(
-            _SlidingRequestConnection(
-                conn_id,
-                recovery_scope,
-                is_continuation=pos is not None,
-            )
         )
         try:
             response = await self._send(
@@ -2676,9 +2586,7 @@ class AsyncClient(Client):
                 sliding_request=True,
             )
         finally:
-            self._sliding_request_connection.reset(connection_token)
             self._sliding_request_issuance.reset(issuance_token)
-            self._release_sliding_connection_recovery_scope(conn_id, recovery_scope)
 
         return response
 
@@ -2777,9 +2685,13 @@ class AsyncClient(Client):
                 One of: ["online", "offline", "unavailable"]
         """
 
+        sync_generation = self._sync_forever_generation
         first_sync = True
 
-        while not self._stop_sync_forever:
+        while (
+            not self._stop_sync_forever
+            and sync_generation == self._sync_forever_generation
+        ):
             try:
                 use_filter = (
                     first_sync_filter
@@ -2840,12 +2752,15 @@ class AsyncClient(Client):
             except asyncio.CancelledError:  # noqa: PERF203
                 for task in tasks:
                     task.cancel()
-                self._stop_sync_forever = False
+                if sync_generation == self._sync_forever_generation:
+                    self._stop_sync_forever = False
                 raise
             except:
-                self._stop_sync_forever = False
+                if sync_generation == self._sync_forever_generation:
+                    self._stop_sync_forever = False
                 raise
-        self._stop_sync_forever = False
+        if sync_generation == self._sync_forever_generation:
+            self._stop_sync_forever = False
 
     def _sliding_sync_request_extensions(
         self, extensions: dict[str, Any] | None
@@ -2958,6 +2873,7 @@ class AsyncClient(Client):
             loop_sleep_time (int, optional): The sleep time, if any, between
                 successful sync loop iterations in milliseconds.
         """
+        sync_generation = self._sync_forever_generation
         first_sync = True
         pos: str | None = None
         consecutive_errors = 0
@@ -2976,7 +2892,10 @@ class AsyncClient(Client):
                     # independent of pos and is deliberately kept.
                     pos = None
 
-        while not self._stop_sync_forever:
+        while (
+            not self._stop_sync_forever
+            and sync_generation == self._sync_forever_generation
+        ):
             try:
                 use_timeout = 0 if first_sync else timeout
 
@@ -3062,9 +2981,11 @@ class AsyncClient(Client):
                 # still be applied to client state after the loop has died.
                 for task in tasks:
                     task.cancel()
-                self._stop_sync_forever = False
+                if sync_generation == self._sync_forever_generation:
+                    self._stop_sync_forever = False
                 raise
-        self._stop_sync_forever = False
+        if sync_generation == self._sync_forever_generation:
+            self._stop_sync_forever = False
 
     def stop_sync_forever(self):
         """Request that a running `sync_forever` or `sliding_sync_forever` loop exits gracefully or the next call
@@ -4228,7 +4149,7 @@ class AsyncClient(Client):
             )
 
         self._closing = True
-        self._stop_sync_forever = True
+        self._sync_forever_generation += 1
 
         async def finish_close() -> None:
             try:

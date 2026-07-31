@@ -79,6 +79,7 @@ class InlineStore:
     def __init__(self):
         self.thread_ids: list[int] = []
         self.finished: list[tuple[str, int, str | None, bool]] = []
+        self.boundaries: list[PendingTimelineEvent] = []
 
     def save_recovery(self, *args):
         self.thread_ids.append(threading.get_ident())
@@ -88,6 +89,8 @@ class InlineStore:
     ):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
+        if boundary:
+            self.boundaries.append(boundary)
 
 
 @pytest.mark.asyncio
@@ -1319,6 +1322,80 @@ async def test_boundary_anchor_dedupes_after_completed_cache_eviction():
     )
 
     assert seen == ["$gap-before", "$gap-suffix"]
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_first_live_callback_failure_retains_boundary_after_completed_eviction():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", None)]},
+        events={(ROOM, 1): [pending("$live-anchor", 0)]},
+    )
+    store = InlineStore()
+    failed = False
+    replayed: list[str] = []
+
+    async def dispatch(_room, value, _is_live, _was_completed, _kind):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise sync_recovery._LiveCallbackError(
+                RuntimeError("callback failed"),
+                False,
+            )
+        replayed.append(value.event_id)
+        return value
+
+    async def unused_fetch(*_args):
+        raise AssertionError("live phase must not fetch")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await pump_recovery(
+            state,
+            user_id="@me:example.org",
+            options=RecoveryOptions(1, 10, 10, 10),
+            fetch_messages=unused_fetch,
+            dispatch_event=dispatch,
+            store=store,
+            ready_room_id=ROOM,
+        )
+
+    assert [(boundary.kind, boundary.source_json) for boundary in store.boundaries] == [
+        ("boundary", "$live-anchor")
+    ]
+
+    for index in range(512):
+        sync_recovery.record_completed_timeline_event(
+            state,
+            ROOM,
+            f"$newer-{index}",
+            False,
+        )
+    state.gaps[ROOM][0] = RecoveryGap(ROOM, 1, "target", "cursor")
+
+    async def fetch(_room_id, _start, *_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "target",
+                "chunk": [
+                    event("$live-anchor", 1).source,
+                    event("$gap-suffix", 2).source,
+                ],
+            },
+            ROOM,
+        )
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=store,
+    )
+
+    assert replayed == ["$gap-suffix"]
     assert not state.gaps
 
 

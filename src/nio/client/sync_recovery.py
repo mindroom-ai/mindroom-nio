@@ -312,7 +312,7 @@ async def _run_dispatch(
                     current_gap,
                     current_pending,
                     was_encrypted,
-                    retain_boundary=retain_boundary and error is None,
+                    retain_boundary=retain_boundary,
                 )
             except Exception as finish_error:
                 raise _DispatchFinishError(finish_error) from finish_error

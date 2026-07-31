@@ -944,51 +944,6 @@ class TestClass:
         assert resp.pos == "s1"
         assert resp.lists["main"].count == 1
 
-    async def test_sliding_connection_scope_lives_only_while_requests_are_active(
-        self, async_client, monkeypatch
-    ):
-        started = [asyncio.Event() for _ in range(3)]
-        releases = [asyncio.Event() for _ in range(3)]
-        request_count = 0
-
-        async def send(*args, **kwargs):
-            nonlocal request_count
-            index = request_count
-            request_count += 1
-            started[index].set()
-            await releases[index].wait()
-            return SlidingSyncResponse.from_dict({"pos": "p1"})
-
-        monkeypatch.setattr(async_client, "_send", send)
-        fresh = asyncio.create_task(async_client.sliding_sync(conn_id="main", pos=None))
-        await started[0].wait()
-        current = async_client._sliding_connection_recovery_scopes[
-            "main"
-        ].recovery_scope
-
-        continuation = asyncio.create_task(
-            async_client.sliding_sync(conn_id="main", pos="p1")
-        )
-        await started[1].wait()
-        assert (
-            async_client._sliding_connection_recovery_scopes["main"].recovery_scope
-            == current
-        )
-
-        replacement = asyncio.create_task(
-            async_client.sliding_sync(conn_id="main", pos=None)
-        )
-        await started[2].wait()
-        assert (
-            async_client._sliding_connection_recovery_scopes["main"].recovery_scope
-            != current
-        )
-
-        for release in releases:
-            release.set()
-        await asyncio.gather(fresh, continuation, replacement)
-        assert not async_client._sliding_connection_recovery_scopes
-
     sliding_sync_url = re.compile(
         rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"
         r"/org\.matrix\.simplified_msc3575/sync.*$"
@@ -2262,6 +2217,51 @@ class TestClass:
             await asyncio.wait_for(async_client.sliding_sync_forever(), 30)
 
         await asyncio.wait_for(long_poll_cancelled.wait(), 30)
+
+    async def test_sliding_sync_forever_restarts_after_close(self, tempdir):
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(encryption_enabled=False),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        requests = 0
+        old_request_started = asyncio.Event()
+        release_old_request = asyncio.Event()
+
+        async def sliding_sync(**_kwargs):
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                old_request_started.set()
+                await release_old_request.wait()
+            else:
+                client.stop_sync_forever()
+            return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
+
+        client.sliding_sync = sliding_sync
+
+        old_loop = asyncio.create_task(client.sliding_sync_forever())
+        await old_request_started.wait()
+        await client.close()
+        release_old_request.set()
+        await asyncio.wait_for(old_loop, 1)
+
+        assert requests == 1
+        await asyncio.wait_for(client.sliding_sync_forever(), 1)
+
+        assert requests == 2
+        await client.close()
 
     async def test_sync_notification_counts(self, async_client, aioresponse):
         aioresponse.get(
