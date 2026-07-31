@@ -6942,6 +6942,9 @@ class TestRoomLocalRecovery:
             }
         )
         assert isinstance(sliding, SlidingSyncResponse)
+        # The sliding response pumps the open gap too; without a page for it
+        # the walk burns the whole backfill deadline before moving on.
+        aioresponse.get(MESSAGES_URL, payload=messages([], "more2"))
         await client.receive_response(sliding)
         assert seen == ["$old"]
 
