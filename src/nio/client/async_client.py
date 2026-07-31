@@ -1399,63 +1399,55 @@ class AsyncClient(Client):
                 unrecoverable_room_ids = (
                     self._sliding_unrecoverable_discontinuity_room_ids(response)
                 )
-                plans = [
-                    plan_room_timeline(
-                        self._recovery,
-                        room_id=room_id,
-                        timeline_events=room.timeline,
-                        user_id=(
-                            self.user_id
-                            if self._room_component_is_current(room_id)
-                            else None
-                        ),
-                        membership=(
-                            self._sliding_sync_recovery_membership(room)
-                            if self._room_component_is_current(room_id)
-                            else "join"
-                        ),
-                        live_event_count=(
-                            self._sliding_live_event_count(room)
-                            if self._room_component_is_current(room_id)
-                            else None
-                        ),
-                        provenance_live_event_count=(
-                            self._sliding_live_event_count(room)
-                        ),
-                        apply_state_live_event_count=(
-                            self._sliding_live_event_count(room)
-                            if self._room_component_is_current(room_id)
-                            and room.expanded_timeline
-                            and not room.initial
-                            else (
-                                0
-                                if not self._room_component_is_current(room_id)
-                                else None
-                            )
-                        ),
-                        cursor_token=(
-                            self._sliding_recovery_cursor(room_id, room)
-                            if self._room_component_is_current(room_id)
-                            else None
-                        ),
-                        target_token=(
-                            room.prev_batch or ""
-                            if self._room_component_is_current(room_id)
-                            else ""
-                        ),
-                        batch_id=batch_id,
-                        account_data_events=(
-                            tuple(
-                                self._pending_sliding_room_account_data.get(
-                                    room_id, {}
-                                ).values()
-                            )
-                            + tuple(response.room_account_data.get(room_id, ()))
-                        ),
-                        timeline_events_live=self._room_component_is_current(room_id),
+                plans = []
+                for room_id, room in response.rooms.items():
+                    component_is_current = self._room_component_is_current(room_id)
+                    live_event_count = self._sliding_live_event_count(room)
+                    membership_live_event_count = (
+                        (room.num_live or 0) if room.initial else None
                     )
-                    for room_id, room in response.rooms.items()
-                ]
+                    apply_state_live_event_count = (
+                        live_event_count
+                        if room.expanded_timeline and not room.initial
+                        else None
+                    )
+                    if not component_is_current:
+                        membership_live_event_count = 0
+                        apply_state_live_event_count = 0
+                    plans.append(
+                        plan_room_timeline(
+                            self._recovery,
+                            room_id=room_id,
+                            timeline_events=room.timeline,
+                            user_id=self.user_id if component_is_current else None,
+                            membership=(
+                                self._sliding_sync_recovery_membership(room)
+                                if component_is_current
+                                else "join"
+                            ),
+                            live_event_count=membership_live_event_count,
+                            provenance_live_event_count=live_event_count,
+                            apply_state_live_event_count=apply_state_live_event_count,
+                            cursor_token=(
+                                self._sliding_recovery_cursor(room_id, room)
+                                if component_is_current
+                                else None
+                            ),
+                            target_token=(
+                                room.prev_batch or "" if component_is_current else ""
+                            ),
+                            batch_id=batch_id,
+                            account_data_events=(
+                                tuple(
+                                    self._pending_sliding_room_account_data.get(
+                                        room_id, {}
+                                    ).values()
+                                )
+                                + tuple(response.room_account_data.get(room_id, ()))
+                            ),
+                            timeline_events_live=component_is_current,
+                        )
+                    )
                 plans.extend(
                     plan_room_timeline(
                         self._recovery,

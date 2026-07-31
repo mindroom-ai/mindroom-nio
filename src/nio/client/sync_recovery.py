@@ -864,9 +864,7 @@ def plan_sync_response(
             # Classic timeline events advance room state even when the initial
             # response classifies their callback provenance as history.
             apply_state_live_event_count=(
-                None
-                if current_room_ids is None or room_id in current_room_ids
-                else 0
+                None if current_room_ids is None or room_id in current_room_ids else 0
             ),
             batch_id=f"sync:{response_token}",
             ephemeral_events=room_info.ephemeral,

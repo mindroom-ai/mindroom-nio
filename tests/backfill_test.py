@@ -4756,6 +4756,10 @@ class TestRoomLocalRecovery:
         older_started = asyncio.Event()
         release_older = asyncio.Event()
         seen = record_events(client)
+        admissions = record_admissions(
+            client,
+            (RoomMessageText, RoomNameEvent),
+        )
         names: list[str] = []
 
         async def name_callback(_room, event):
@@ -4770,10 +4774,12 @@ class TestRoomLocalRecovery:
                 response = self._sliding(
                     "older",
                     [
-                        name_event("$older-timeline-name", 2, "older timeline"),
-                        text_event("$older", 3),
+                        name_event("$older-history-name", 2, "Historic"),
+                        name_event("$older-live-name", 3, "Stale live"),
                     ],
                     prev_batch="w1",
+                    expanded_timeline=True,
+                    num_live=1,
                 )
                 response.rooms[ROOM_A].required_state.append(
                     name_event("$older-name", 2, "older room")
@@ -4800,10 +4806,15 @@ class TestRoomLocalRecovery:
         release_older.set()
         await older
 
-        assert seen == ["$newer", "$older"]
-        assert names == ["older timeline"]
-        assert client.rooms[ROOM_A].name == "older timeline"
-        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        assert seen == ["$newer"]
+        assert names == ["Historic", "Stale live"]
+        assert admissions == [
+            ("$newer", TimelineEventProvenance.HISTORY),
+            ("$older-history-name", TimelineEventProvenance.HISTORY),
+            ("$older-live-name", TimelineEventProvenance.LIVE),
+        ]
+        assert client.rooms[ROOM_A].name == "newer room"
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w0")}
         await client.close()
 
     async def test_independent_initial_snapshot_does_not_clear_existing_gap(
@@ -7261,6 +7272,7 @@ class TestRoomLocalRecovery:
         limited: bool = False,
         prev_batch: str | None = None,
         initial: bool = False,
+        expanded_timeline: bool = False,
         num_live: int | None = None,
         membership: str = "join",
         membership_event_id: str | None = "$membership",
@@ -7278,6 +7290,8 @@ class TestRoomLocalRecovery:
             room["prev_batch"] = prev_batch
         if initial:
             room["initial"] = True
+        if expanded_timeline:
+            room["expanded_timeline"] = True
         if num_live is not None:
             room["num_live"] = num_live
         response = SlidingSyncResponse.from_dict({"pos": pos, "rooms": {ROOM_A: room}})
