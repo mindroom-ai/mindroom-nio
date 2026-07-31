@@ -341,7 +341,6 @@ def _adapt_event_admission_callback(
             return cast(EventAdmissionCallback, callback)
         legacy_callback = cast(LegacyEventAdmissionCallback, callback)
 
-        @wraps(legacy_callback)
         def with_provenance(
             room: MatrixRoom,
             event: Event,

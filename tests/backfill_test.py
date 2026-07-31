@@ -1,6 +1,7 @@
 """Integration tests for durable room-local limited-sync recovery."""
 
 import asyncio
+import inspect
 import json
 import re
 import sys
@@ -1223,6 +1224,20 @@ class TestRoomLocalRecovery:
         )
 
         assert calls == ["$legacy"]
+
+    async def test_two_argument_admission_adapter_reports_three_arguments(
+        self,
+        client,
+    ):
+        async def admit(_room, _event):
+            pass
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+
+        assert client.event_admission_callback
+        assert (
+            len(inspect.signature(client.event_admission_callback.func).parameters) == 3
+        )
 
     async def test_event_admission_requires_limited_timeline_recovery(self):
         client = AsyncClient("https://example.org", OWN_ID, "DEVICEID")

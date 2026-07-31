@@ -835,7 +835,7 @@ class TestClass:
         assert sqlstore._get_store_version() == 6
         assert not sqlstore.load_sync_recovery()[1][0].admission_accepted
 
-    def test_v6_store_adds_provenance_without_dropping_recovery(
+    def test_v7_store_adds_provenance_without_dropping_recovery(
         self,
         sqlstore,
     ):

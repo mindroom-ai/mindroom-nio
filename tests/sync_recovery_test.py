@@ -280,7 +280,7 @@ def test_room_reset_preserves_unaccepted_sync_history():
     assert [item.event_id for item in reset.events] == ["$history"]
 
 
-def test_stale_classic_sync_history_remains_sync_origin():
+def test_stale_classic_sync_remains_live_without_applying_room_state():
     plan = plan_sync_response(
         RecoveryState(),
         user_id="@me:example.org",

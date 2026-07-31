@@ -70,6 +70,8 @@ if TYPE_CHECKING:
 _RECOVERY_PAYLOAD_VERSION = 1
 _RECOVERY_NONCE_SIZE = 12
 _RECOVERY_TAG_SIZE = 16
+# Widest recovery write binds 12 values per row; 80 * 12 stays below
+# SQLite's legacy 999-variable statement limit.
 _RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
@@ -602,6 +604,7 @@ class MatrixStore:
             generation=0,
             sequence=0,
             event_payload=b"",
+            is_live=False,
             was_encrypted=True,
             was_completed=False,
             admission_accepted=False,
