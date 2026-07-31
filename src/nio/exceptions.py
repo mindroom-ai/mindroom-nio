@@ -22,11 +22,17 @@ class LocalProtocolError(ProtocolError):
 
 
 class CallbackNotAcceptedError(Exception):
-    """Signal that a callback rejected an event before producing side effects.
+    """Signal that an event admission callback rejected an event.
 
-    Raise this only before durable acceptance or side effects.
-    Recovery keeps the event pending for redispatch; use an ordinary exception
-    once acceptance is ambiguous so nio does not blindly replay side effects.
+    Raise this only from a callback registered with
+    ``AsyncClient.add_event_admission_callback()``, before durable acceptance
+    and before producing or scheduling side effects.
+    Limited-timeline recovery keeps the event pending for redispatch.
+    Raising this from an ordinary event callback is too late to reject the
+    event and therefore has ordinary callback-error behavior.
+    An ordinary error from a live callback acknowledges that event once, while
+    an ordinary error from recovered history leaves it pending for a later
+    pump or restart.
     """
 
 

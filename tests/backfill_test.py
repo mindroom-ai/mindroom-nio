@@ -1020,7 +1020,7 @@ class TestRoomLocalRecovery:
                     "durable admission failed"
                 ) from storage_error
 
-        client.add_event_callback(admit, RoomMessageText)
+        client.add_event_admission_callback(admit, RoomMessageText)
         response = timeline_response(
             protocol,
             "s1",
@@ -1044,6 +1044,111 @@ class TestRoomLocalRecovery:
 
         assert calls == ["$retry", "$retry"]
         assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_callback_admission_precedes_event_fanout(self, client, protocol):
+        calls: list[str] = []
+
+        async def first_admission(_room, event):
+            calls.append(f"admit-first:{event.event_id}")
+            if calls == ["admit-first:$retry"]:
+                raise CallbackNotAcceptedError("durable admission failed")
+
+        async def second_admission(_room, event):
+            calls.append(f"admit-second:{event.event_id}")
+
+        async def first(_room, event):
+            calls.append(f"first:{event.event_id}")
+
+        async def second(_room, event):
+            calls.append(f"second:{event.event_id}")
+
+        client.add_event_admission_callback(first_admission, RoomMessageText)
+        client.add_event_admission_callback(second_admission, RoomMessageText)
+        client.add_event_callback(first, RoomMessageText)
+        client.add_event_callback(second, RoomMessageText)
+        response = timeline_response(
+            protocol,
+            "s1",
+            [text_event("$retry", 1)],
+        )
+
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable admission failed",
+        ):
+            await client.receive_response(response)
+
+        assert calls == ["admit-first:$retry"]
+
+        await client.receive_response(response)
+
+        assert calls == [
+            "admit-first:$retry",
+            "admit-first:$retry",
+            "admit-second:$retry",
+            "first:$retry",
+            "second:$retry",
+        ]
+        assert not client._recovery.gaps
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_non_acceptance_from_event_fanout_does_not_replay(
+        self, client, protocol
+    ):
+        calls: list[str] = []
+
+        async def admit(_room, event):
+            calls.append(f"admit:{event.event_id}")
+
+        async def first(_room, event):
+            calls.append(f"first:{event.event_id}")
+
+        async def second(_room, event):
+            calls.append(f"second:{event.event_id}")
+            raise CallbackNotAcceptedError("too late to reject")
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+        client.add_event_callback(first, RoomMessageText)
+        client.add_event_callback(second, RoomMessageText)
+        response = timeline_response(
+            protocol,
+            "s1",
+            [text_event("$once", 1)],
+        )
+
+        with pytest.raises(CallbackNotAcceptedError, match="too late to reject"):
+            await client.receive_response(response)
+
+        await client.receive_response(response)
+
+        assert calls == ["admit:$once", "first:$once", "second:$once"]
+        assert not client._recovery.gaps
+
+    async def test_callback_non_acceptance_preserves_implicit_context(self, client):
+        storage_error = OSError("storage unavailable")
+
+        async def admit(_room, _event):
+            try:
+                raise storage_error
+            except OSError:
+                raise CallbackNotAcceptedError("durable admission failed")
+
+        client.add_event_admission_callback(admit, RoomMessageText)
+        response = timeline_response(
+            "classic",
+            "s1",
+            [text_event("$retry", 1)],
+        )
+
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable admission failed",
+        ) as rejected:
+            await client.receive_response(response)
+
+        assert rejected.value.__cause__ is None
+        assert rejected.value.__context__ is storage_error
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_all_room_state_is_ready_before_live_callbacks(
@@ -4180,6 +4285,96 @@ class TestRoomLocalRecovery:
         assert client.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
         await client.close()
 
+    @pytest.mark.parametrize("backfill", [False, True])
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_membership_change_from_timeline_callback_rejects_before_network(
+        self, tempdir, monkeypatch, backfill, operation
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(backfill_limited_timelines=backfill),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        membership_requests = 0
+
+        async def callback(_room, _event):
+            await getattr(client, operation)(ROOM_A)
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            if response_class is SyncResponse:
+                response = sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$leave", 1)],
+                            limited=False,
+                            prev_batch=None,
+                        )
+                    },
+                )
+                await client.receive_response(response)
+                return response
+            membership_requests += 1
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        client.add_event_callback(callback, RoomMessageText)
+        monkeypatch.setattr(client, "_send", send)
+
+        with pytest.raises(
+            LocalProtocolError,
+            match="cannot run from an event callback",
+        ):
+            await asyncio.wait_for(client.sync(), 0.5)
+
+        assert membership_requests == 0
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_membership_change_scheduled_from_timeline_callback(
+        self, client, monkeypatch, operation
+    ):
+        membership_requests = 0
+        membership_task = None
+
+        async def callback(_room, _event):
+            nonlocal membership_task
+            membership_task = asyncio.create_task(getattr(client, operation)(ROOM_A))
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            if response_class is SyncResponse:
+                response = sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$leave", 1)],
+                            limited=False,
+                            prev_batch=None,
+                        )
+                    },
+                )
+                await client.receive_response(response)
+                return response
+            membership_requests += 1
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        client.add_event_callback(callback, RoomMessageText)
+        monkeypatch.setattr(client, "_send", send)
+
+        await client.sync()
+        assert membership_task is not None
+        await asyncio.wait_for(membership_task, 1)
+
+        assert membership_requests == 1
+
     @pytest.mark.parametrize("status", [403, 500])
     @pytest.mark.parametrize(
         ("operation", "error_type"),
@@ -6283,6 +6478,54 @@ class TestRecoveryOutcome:
 
         assert not closed_before_release
         assert callback_saw_closed == [False]
+
+    async def test_close_fences_retry_from_old_sync_generation(
+        self, client, monkeypatch
+    ):
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+        sessions = []
+
+        class Connector:
+            connect = None
+
+        class Transport:
+            status = 200
+            content_type = "application/json"
+            content_disposition = None
+
+            async def json(self):
+                return {"next_batch": "late", "rooms": {}}
+
+        class Session:
+            def __init__(self, **_kwargs):
+                self.closed = False
+                self.connector = Connector()
+                sessions.append(self)
+
+            async def request(self, *_args, **_kwargs):
+                if len(sessions) == 1:
+                    request_started.set()
+                    await release_request.wait()
+                    raise asyncio.TimeoutError
+                return Transport()
+
+            async def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(async_client_module, "ClientSession", Session)
+
+        sync = asyncio.create_task(client.sync())
+        await request_started.wait()
+        await client.close()
+        release_request.set()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(sync, 1)
+
+        assert len(sessions) == 1
+        assert sessions[0].closed
+        assert client.client_session is None
 
     async def test_sync_response_processing_resumes_after_close(self, client):
         seen = record_events(client)

@@ -22,6 +22,7 @@ import warnings
 from asyncio import Event as AsyncioEvent
 from collections.abc import (
     AsyncIterator,
+    Awaitable,
     Callable,
     Coroutine,
     Iterable,
@@ -344,6 +345,10 @@ def client_session(func):
 
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
+        if self._sync_request_generation_is_stale():
+            raise LocalProtocolError(
+                "Sync request belongs to a closed client generation."
+            )
         if not self.client_session:
             trace = TraceConfig()
             trace.on_request_chunk_sent.append(on_request_chunk_sent)
@@ -408,9 +413,15 @@ class AsyncClientConfig(ClientConfig):
             Limited lanes block sends until their history obligation clears.
             Live timeline callbacks run before the history walk; recovered
             history callbacks may therefore arrive later.
-            Generic live callback errors stop fanout after acknowledging the event.
-            CallbackNotAcceptedError is only for pre-side-effect rejection;
-            nio keeps that event pending and may dispatch it again.
+            Event admission callbacks finish before ordinary callback fanout.
+            CallbackNotAcceptedError is valid only from that pre-side-effect
+            admission boundary and keeps the event pending for redispatch.
+            Ordinary live callback errors acknowledge the event once, while
+            ordinary recovered-history errors leave it pending for a later
+            pump or restart.
+            Sync-family requests on one client serialize their long poll and
+            response application, so multiple connections do not overlap;
+            use separate clients when those long polls must run concurrently.
             Stored crypto and sync tokens enable persistence; disabled mode is unchanged.
             Both transports recover: /v3/sync walks from the token the sync
             continued from, Simplified Sliding Sync between consecutive
@@ -542,6 +553,10 @@ class AsyncClient(Client):
 
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
+        self.event_admission_callbacks: list[ClientCallback] = []
+        self._event_callback_task: ContextVar[asyncio.Task[Any] | None] = ContextVar(
+            f"nio_event_callback_task_{id(self)}", default=None
+        )
 
         self.sharing_session: dict[str, AsyncioEvent] = {}
 
@@ -639,6 +654,20 @@ class AsyncClient(Client):
         """
         cb = ClientCallback(func, cb_filter)
         self.response_callbacks.append(cb)
+
+    def add_event_admission_callback(
+        self,
+        callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
+        filter: type[Event] | tuple[type[Event], ...] | None = None,
+    ) -> None:
+        """Add a callback that durably accepts a timeline event before fanout.
+
+        All matching admission callbacks finish before any matching event
+        callback runs.
+        Raise CallbackNotAcceptedError before producing side effects to keep
+        the event pending for redispatch when limited-timeline recovery is on.
+        """
+        self.event_admission_callbacks.append(ClientCallback(callback, filter))
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -815,6 +844,7 @@ class AsyncClient(Client):
             if not deduplicate or should_dispatch_timeline_event(
                 self._recovery, room_id, event
             ):
+                await self._on_event_admission(event, room)
                 await self._on_event(event, room)
 
     async def _dispatch_timeline_event(
@@ -838,8 +868,6 @@ class AsyncClient(Client):
             room.handle_ephemeral_event(event)
             try:
                 await self._on_ephemeral(event, room)
-            except CallbackNotAcceptedError as error:
-                raise _LiveCallbackError(error, False, accepted=False) from error
             except Exception as error:
                 raise _LiveCallbackError(error, False) from error
             return event
@@ -849,8 +877,6 @@ class AsyncClient(Client):
             room.handle_account_data(event)
             try:
                 await self._on_room_account_data(event, room)
-            except CallbackNotAcceptedError as error:
-                raise _LiveCallbackError(error, False, accepted=False) from error
             except Exception as error:
                 raise _LiveCallbackError(error, False) from error
             return event
@@ -876,19 +902,20 @@ class AsyncClient(Client):
             event = self.olm._decrypt_megolm_no_error(event) or event
         if was_completed and isinstance(event, MegolmEvent):
             return None
-        for callback in self.event_callbacks:
-            try:
-                await callback.async_execute(event, room)
-            except CallbackNotAcceptedError as error:  # noqa: PERF203
-                raise _LiveCallbackError(
-                    error,
-                    isinstance(event, MegolmEvent),
-                    accepted=False,
-                ) from error
-            except Exception as error:  # noqa: PERF203
-                raise _LiveCallbackError(
-                    error, isinstance(event, MegolmEvent)
-                ) from error
+        try:
+            await self._on_event_admission(event, room)
+        except CallbackNotAcceptedError as error:
+            raise _LiveCallbackError(
+                error,
+                isinstance(event, MegolmEvent),
+                accepted=False,
+            ) from error
+        except Exception as error:
+            raise _LiveCallbackError(error, isinstance(event, MegolmEvent)) from error
+        try:
+            await self._on_event(event, room)
+        except Exception as error:
+            raise _LiveCallbackError(error, isinstance(event, MegolmEvent)) from error
         return event
 
     async def _pump_sync_recovery(self, ready_room_id: str | None = None) -> None:
@@ -1035,38 +1062,57 @@ class AsyncClient(Client):
             await self._on_expired_verifications(event)
 
     async def _on_to_device(self, event: ToDeviceEvent):
-        for callback in self.to_device_callbacks:
-            await callback.async_execute(event)
+        await self._run_event_callbacks(self.to_device_callbacks, event)
 
     async def _on_invited_rooms(self, event: Event, room: MatrixRoom):
-        for callback in self.event_callbacks:
-            await callback.async_execute(event, room)
+        await self._run_event_callbacks(self.event_callbacks, event, room)
 
-    async def _on_event(self, event: Event, room: MatrixRoom):
-        for callback in self.event_callbacks:
-            await callback.async_execute(event, room)
+    async def _run_event_callbacks(
+        self,
+        callbacks: Iterable[ClientCallback],
+        event: object,
+        room: MatrixRoom | None = None,
+    ) -> None:
+        task = asyncio.current_task()
+        token = self._event_callback_task.set(task)
+        try:
+            for callback in callbacks:
+                await callback.async_execute(event, room)
+        finally:
+            self._event_callback_task.reset(token)
+
+    async def _on_event_admission(
+        self, event: Event | BadEventType, room: MatrixRoom
+    ) -> None:
+        await self._run_event_callbacks(
+            self.event_admission_callbacks,
+            event,
+            room,
+        )
+
+    async def _on_event(self, event: Event | BadEventType, room: MatrixRoom):
+        await self._run_event_callbacks(self.event_callbacks, event, room)
 
     async def _on_ephemeral(self, event: EphemeralEvent, room: MatrixRoom):
-        for callback in self.ephemeral_callbacks:
-            await callback.async_execute(event, room)
+        await self._run_event_callbacks(self.ephemeral_callbacks, event, room)
 
     async def _on_room_account_data(
         self, event: AccountDataEvent | BadEventType, room: MatrixRoom
     ):
-        for callback in self.room_account_data_callbacks:
-            await callback.async_execute(event, room)
+        await self._run_event_callbacks(
+            self.room_account_data_callbacks,
+            event,
+            room,
+        )
 
     async def _on_presence(self, event: PresenceEvent):
-        for callback in self.presence_callbacks:
-            await callback.async_execute(event)
+        await self._run_event_callbacks(self.presence_callbacks, event)
 
     async def _on_global_account_data(self, event: AccountDataEvent):
-        for callback in self.global_account_data_callbacks:
-            await callback.async_execute(event)
+        await self._run_event_callbacks(self.global_account_data_callbacks, event)
 
     async def _on_expired_verifications(self, event: ToDeviceEvent):
-        for callback in self.to_device_callbacks:
-            await callback.async_execute(event)
+        await self._run_event_callbacks(self.to_device_callbacks, event)
 
     async def _on_response(self, response: Response | ErrorResponse):
         for cb in self.response_callbacks:
@@ -1290,6 +1336,19 @@ class AsyncClient(Client):
             await self._collect_key_requests()
         await self._pump_sync_recovery()
 
+    @staticmethod
+    def _sliding_seed_ranges(
+        ranges: Sequence[Sequence[int]],
+        limit: int,
+    ) -> list[list[int]]:
+        merged: list[list[int]] = []
+        for start, end in sorted([[0, limit - 1], *ranges]):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return merged
+
     def _sliding_seed_lists(
         self, lists: dict[str, Any] | None
     ) -> dict[str, Any] | None:
@@ -1311,7 +1370,14 @@ class AsyncClient(Client):
         if not (self.config.backfill_limited_timelines and limit and lists):
             return lists
         return {
-            name: {**spec, "ranges": [[0, limit - 1]]} if spec.get("ranges") else spec
+            name: (
+                {
+                    **spec,
+                    "ranges": self._sliding_seed_ranges(spec["ranges"], limit),
+                }
+                if spec.get("ranges")
+                else spec
+            )
             for name, spec in lists.items()
         }
 
@@ -1515,6 +1581,12 @@ class AsyncClient(Client):
         send_request: Callable[[], Coroutine[Any, Any, _RoomMembershipResponseT]],
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
+        task = asyncio.current_task()
+        if task is not None and task is self._event_callback_task.get():
+            raise LocalProtocolError(
+                "Room membership changes cannot run from an event callback; "
+                "schedule the operation in a separate task."
+            )
         response = await send_request()
         if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
             return response
@@ -1869,6 +1941,10 @@ class AsyncClient(Client):
                 "Sync-family requests cannot run from a timeline callback."
             )
 
+    def _sync_request_generation_is_stale(self) -> bool:
+        generation = self._sync_request_generation.get()
+        return generation is not None and generation is not self._sync_generation
+
     async def _receive_sync_family(
         self,
         response: _SyncResponseEnvelope | SlidingSyncResponse,
@@ -2018,9 +2094,7 @@ class AsyncClient(Client):
         got_timeouts = 0
         max_timeouts = self.config.max_timeouts
 
-        attempt = 0
         while True:
-            attempt += 1
             if data_provider:
                 # mypy expects an "Awaitable[Any]" but data_provider is a
                 # method generated during runtime that may or may not be
@@ -2062,6 +2136,8 @@ class AsyncClient(Client):
                         retry_after_ms,
                     )
                     await asyncio.sleep(retry_after_ms / 1000)
+                    if self._sync_request_generation_is_stale():
+                        break
                 else:
                     break
 
@@ -2074,6 +2150,8 @@ class AsyncClient(Client):
                 wait = await self.get_timeout_retry_wait_time(got_timeouts)
                 logger.warning("Timed out, sleeping for %ds", wait)
                 await asyncio.sleep(wait)
+                if self._sync_request_generation_is_stale():
+                    raise
 
         if process_response:
             if isinstance(resp, SyncResponse) and sync_request_context is not None:
@@ -2515,6 +2593,9 @@ class AsyncClient(Client):
         processed like their /v3/sync counterparts.
         Sync-family requests on one client are intentionally serialized through
         response application so every successful response is delivered once.
+        The serialization includes each long poll, so multiple connections on
+        one client do not overlap; use separate clients when they must run
+        concurrently.
 
         By default this targets the unstable
         ``org.matrix.simplified_msc3575`` endpoint, the only one deployed
@@ -4100,7 +4181,15 @@ class AsyncClient(Client):
         )
 
     async def close(self):
-        """Close the underlying http session."""
+        """Drain recovery callbacks and close the underlying HTTP session.
+
+        Call ``stop_sync_forever()`` from a timeline callback, then await
+        ``close()`` from the task that owns the sync loop after that loop exits.
+
+        Raises:
+            LocalProtocolError: If called from a timeline callback while
+                limited-timeline recovery is active.
+        """
         caller = asyncio.current_task()
         if (
             caller is not None and caller in self._recovery._active_dispatches.values()
@@ -4423,6 +4512,10 @@ class AsyncClient(Client):
 
         Args:
             room_id: The room id of the room to leave.
+
+        Raises:
+            LocalProtocolError: If directly awaited by an event callback.
+                Schedule it in a separate task from the callback instead.
         """
         method, path = Api.room_leave(self.access_token, room_id)
 
@@ -4446,6 +4539,10 @@ class AsyncClient(Client):
 
         Args:
             room_id (str): The room id of the room to forget.
+
+        Raises:
+            LocalProtocolError: If directly awaited by an event callback.
+                Schedule it in a separate task from the callback instead.
         """
         method, path = Api.room_forget(self.access_token, room_id)
 

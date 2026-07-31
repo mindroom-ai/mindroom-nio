@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
   Persisted tokens are scoped to the own-membership event that earned them, join-to-join profile changes rotate that proof, and explicit membership loss fails closed.
   Servers without `$ME` support retain an unverified baseline only for the current run, while a post-restart discontinuity is reported as unrecovered.
   Sync-family requests are serialized through response application within one replaceable client generation, so every unique response is delivered without stale shared-state regression and a late pre-close response cannot mutate reused client state.
+  The serialization includes the long poll, so multiple sync connections on one client do not overlap and latency-sensitive independent connections need separate clients.
   Persistence requires `backfill_limited_timelines=True`, a store, and `backfill_persist_recovery` resolving to `True`; when unset, the latter follows `store_sync_tokens`.
   This migrates the store from schema v3 to v5, safely discards unscoped v4 token rows, and exports `SlidingWindowTokens` from `nio.store`.
 - Add `AsyncClientConfig.backfill_persist_recovery`. It defaults to None,
@@ -26,8 +27,15 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Report a restarted limited Sliding Sync room as unrecovered when its persisted walk baseline cannot be trusted under missing or mismatched current membership proof, while treating an own-join timeline event as a proven continuity boundary.
-- Add `CallbackNotAcceptedError` for callbacks that reject an event before any side effect or durable acceptance, keeping the event pending and redispatchable while ordinary callback errors retain their once-only ambiguous-side-effect behavior.
+- Add `AsyncClient.add_event_admission_callback()` as a pre-fanout durable admission boundary.
+  `CallbackNotAcceptedError` is valid only there and keeps the event pending when raised before acceptance or side effects.
+  The same exception from an ordinary callback is too late to reject and has ordinary error behavior.
+  Ordinary live callback errors acknowledge the event once, while ordinary recovered-history errors leave it pending for a later pump or restart.
 - Drain started room callback work before a membership reset clears recovery state, abort the reset when that callback fails, and apply successful leave or forget invalidation exactly once after its network request.
+  Directly awaiting `room_leave()` or `room_forget()` from an event callback now raises before sending the request; schedule the membership operation in a separate task instead.
+- Prevent a sync request from retrying or creating a new HTTP session after `close()` replaces its client generation.
+- Preserve caller Sliding Sync list ranges when the initial recovery seed range is added.
+- Document that recovery-aware `close()` cannot run from a timeline callback; stop the sync loop there and await `close()` from its owner after the loop exits.
 - Dispatch live timeline events before walking a limited-timeline gap, so a
   slow or retrying history backfill cannot delay new-message callbacks.
   Recovered history still follows in its durable per-room lane.

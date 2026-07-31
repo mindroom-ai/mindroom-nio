@@ -1175,7 +1175,10 @@ class TestClass:
 
         aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
 
-        lists = {"main": {"ranges": [[0, 9]], "timeline_limit": 5}}
+        lists = {
+            "main": {"ranges": [[0, 9]], "timeline_limit": 5},
+            "archive": {"ranges": [[1000, 1010]], "timeline_limit": 1},
+        }
         await asyncio.wait_for(
             async_client.sliding_sync_forever(
                 timeout=30_000, conn_id="seed", lists=lists
@@ -1184,9 +1187,15 @@ class TestClass:
         )
 
         assert requests[0]["lists"]["main"]["ranges"] == [[0, 499]]
+        assert requests[0]["lists"]["archive"]["ranges"] == [
+            [0, 499],
+            [1000, 1010],
+        ]
         assert requests[1]["lists"]["main"]["ranges"] == [[0, 9]]
+        assert requests[1]["lists"]["archive"]["ranges"] == [[1000, 1010]]
         # Widening is a copy; the caller's lists are untouched.
         assert lists["main"]["ranges"] == [[0, 9]]
+        assert lists["archive"]["ranges"] == [[1000, 1010]]
         assert requests[0]["lists"]["main"]["timeline_limit"] == 5
 
     async def test_sliding_sync_forever_without_backfill_keeps_ranges(

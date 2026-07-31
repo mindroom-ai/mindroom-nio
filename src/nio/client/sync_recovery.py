@@ -1105,6 +1105,7 @@ async def _drain_gap(
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
+        callback_error: Exception | None = None
         if live_timeline_only and (not pending.is_live or pending.kind != "timeline"):
             continue
         if pending.kind == "boundary":
@@ -1174,9 +1175,7 @@ async def _drain_gap(
             if error:
                 raise error
         except _LiveCallbackError as error:
-            if not error.accepted:
-                raise error.error from error.error.__cause__
-            raise error.error from error
+            callback_error = error.error
         except _DispatchFinishError as error:
             raise error.error from error
         except asyncio.TimeoutError:
@@ -1185,6 +1184,8 @@ async def _drain_gap(
         except Exception:
             logger.exception("Recovered event callback failed: %s", pending.event_id)
             return
+        if callback_error is not None:
+            raise callback_error
 
     if not live_timeline_only:
         _finish(state, store, gap)
