@@ -3305,7 +3305,7 @@ class TestRoomLocalRecovery:
 
         async def fail(_room, event):
             calls.append(f"fail:{event.event_id}")
-            if event.event_id == "$gap":
+            if event.event_id == "$gap1":
                 raise RuntimeError("callback failed")
 
         async def after(_room, event):
@@ -3317,7 +3317,11 @@ class TestRoomLocalRecovery:
         aioresponse.get(
             MESSAGES_URL,
             payload=messages(
-                [text_event("$gap", 2), text_event("$held", 3)],
+                [
+                    text_event("$gap1", 1),
+                    text_event("$gap2", 2),
+                    text_event("$held", 3),
+                ],
                 "p1",
             ),
         )
@@ -3332,8 +3336,8 @@ class TestRoomLocalRecovery:
         with pytest.raises(RuntimeError, match="callback failed"):
             await first.receive_response(response)
         assert calls == [
-            "before:$gap",
-            "fail:$gap",
+            "before:$gap1",
+            "fail:$gap1",
         ]
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset({ROOM_A})
@@ -3362,8 +3366,12 @@ class TestRoomLocalRecovery:
         restarted.add_event_admission_callback(admit_restarted, RoomMessageText)
         await restarted.receive_response(sync_response("s2", {}))
 
-        assert replayed == ["$gap", "$held"]
-        assert admissions == ["first:$gap", "restarted:$held"]
+        assert replayed == ["$gap1", "$gap2", "$held"]
+        assert admissions == [
+            "first:$gap1",
+            "restarted:$gap2",
+            "restarted:$held",
+        ]
         assert not restarted._recovery.gaps
         await restarted.close()
 

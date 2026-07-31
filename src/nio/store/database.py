@@ -732,6 +732,15 @@ class MatrixStore:
             for event in events
         ]
         for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            promote_completed_placeholder = (
+                (PendingTimelineEvents.generation == 0)
+                & PendingTimelineEvents.was_encrypted
+                & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
+            )
+            resequence_same_generation = (
+                (PendingTimelineEvents.generation > 0)
+                & (PendingTimelineEvents.generation == EXCLUDED.generation)
+            )
             PendingTimelineEvents.insert_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).on_conflict(
@@ -740,20 +749,41 @@ class MatrixStore:
                     PendingTimelineEvents.room_id,
                     PendingTimelineEvents.event_id,
                 ],
-                preserve=[
-                    PendingTimelineEvents.generation,
-                    PendingTimelineEvents.sequence,
-                    PendingTimelineEvents.event_payload,
-                    PendingTimelineEvents.is_live,
-                    PendingTimelineEvents.was_encrypted,
-                    PendingTimelineEvents.was_completed,
-                    PendingTimelineEvents.admission_accepted,
-                ],
-                where=(
-                    (PendingTimelineEvents.generation == 0)
-                    & PendingTimelineEvents.was_encrypted
-                    & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
-                ),
+                update={
+                    PendingTimelineEvents.generation: EXCLUDED.generation,
+                    PendingTimelineEvents.sequence: EXCLUDED.sequence,
+                    PendingTimelineEvents.event_payload: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.event_payload),),
+                        PendingTimelineEvents.event_payload,
+                    ),
+                    PendingTimelineEvents.is_live: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.is_live),),
+                        PendingTimelineEvents.is_live,
+                    ),
+                    PendingTimelineEvents.was_encrypted: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.was_encrypted),),
+                        PendingTimelineEvents.was_encrypted,
+                    ),
+                    PendingTimelineEvents.was_completed: Case(
+                        None,
+                        ((promote_completed_placeholder, EXCLUDED.was_completed),),
+                        PendingTimelineEvents.was_completed,
+                    ),
+                    PendingTimelineEvents.admission_accepted: Case(
+                        None,
+                        (
+                            (
+                                promote_completed_placeholder,
+                                EXCLUDED.admission_accepted,
+                            ),
+                        ),
+                        PendingTimelineEvents.admission_accepted,
+                    ),
+                },
+                where=promote_completed_placeholder | resequence_same_generation,
             ).execute()
 
     @use_database

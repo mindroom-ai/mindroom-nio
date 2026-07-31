@@ -588,6 +588,57 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
+    def test_sync_recovery_resequences_existing_generation(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+
+        def pending(
+            event_id: str,
+            sequence: int,
+            *,
+            is_live: bool,
+            admission_accepted: bool = False,
+        ) -> PendingTimelineEvent:
+            return PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                sequence,
+                event_id,
+                '{"content":{},"event_id":"%s","sender":"@a:b",'
+                '"type":"m.test"}' % event_id,
+                is_live,
+                False,
+                admission_accepted=admission_accepted,
+            )
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [pending("$held", 0, is_live=True)],
+            None,
+        )
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [gap],
+            [
+                pending("$gap1", 0, is_live=False),
+                pending("$gap2", 1, is_live=False),
+                pending("$held", 2, is_live=True, admission_accepted=True),
+            ],
+            None,
+        )
+
+        _, events = sqlstore.load_sync_recovery()
+        assert [(event.event_id, event.sequence) for event in events] == [
+            ("$gap1", 0),
+            ("$gap2", 1),
+            ("$held", 2),
+        ]
+        assert events[-1].admission_accepted
+
     def test_v2_store_creates_recovery_tables(self, sqlstore):
         with sqlstore.database.bind_ctx(sqlstore.models):
             sqlstore.database.drop_tables(
