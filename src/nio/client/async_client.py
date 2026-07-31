@@ -117,7 +117,6 @@ from ..responses import (
     DeleteDevicesResponse,
     DeletePushRuleError,
     DeletePushRuleResponse,
-    DeviceOneTimeKeyCount,
     DevicesError,
     DevicesResponse,
     DirectRoomsErrorResponse,
@@ -213,7 +212,6 @@ from ..responses import (
     RoomRedactResponse,
     RoomResolveAliasError,
     RoomResolveAliasResponse,
-    Rooms,
     RoomSendError,
     RoomSendResponse,
     RoomSummary,
@@ -264,6 +262,14 @@ from .base_client import (
     logged_in_async,
     store_loaded,
 )
+from .sliding_membership import (
+    plan_sliding_prev_batches,
+    sliding_live_event_count,
+    sliding_recovery_cursor,
+    sliding_recovery_membership,
+    sliding_room_is_invite,
+    sliding_unrecoverable_discontinuity_room_ids,
+)
 from .sync_recovery import (
     PendingEventKind,
     RecoveryOptions,
@@ -273,7 +279,6 @@ from .sync_recovery import (
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
-    is_own_join,
     is_recovery_dispatch_task,
     load_recovery_state,
     merge_recovery_plans,
@@ -289,14 +294,15 @@ from .sync_recovery import (
 from .sync_reset_fence import (
     SyncRequestId,
     SyncResetFence,
-    accept_current_account_data,
-    accept_current_components,
-    accept_current_one_time_key_counts,
-    accept_reset_safe_rooms,
     commit_one_time_key_counts,
     finish_sync_request,
     issue_sync_request,
     mark_room_reset,
+)
+from .sync_response_ordering import (
+    OneTimeKeyCountCommit,
+    account_data_kind,
+    ordered_response_view,
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
@@ -376,19 +382,6 @@ class _SyncResponseEnvelope:
     response: SyncResponse | SlidingSyncResponse
     request_since: str | None
     request_id: SyncRequestId | None
-
-
-@dataclass(frozen=True)
-class _OneTimeKeyCountCommit:
-    components: frozenset[str]
-    request_id: SyncRequestId
-
-
-@dataclass(frozen=True)
-class _OrderedResponseView:
-    response: SyncResponse | SlidingSyncResponse
-    current_room_ids: frozenset[str]
-    one_time_key_count_commit: _OneTimeKeyCountCommit | None
 
 
 @dataclass(eq=False)
@@ -1162,13 +1155,22 @@ class AsyncClient(Client):
             and would_plan_real_gap(
                 timeline_events=room.timeline,
                 user_id=self.user_id,
-                membership=self._sliding_sync_recovery_membership(room),
-                live_event_count=self._sliding_live_event_count(room),
-                cursor_token=self._sliding_recovery_cursor(room_id, room),
+                membership=sliding_recovery_membership(room),
+                live_event_count=sliding_live_event_count(room),
+                cursor_token=sliding_recovery_cursor(
+                    room_id,
+                    room,
+                    user_id=self.user_id,
+                    window_tokens=self._sliding_room_prev_batch,
+                ),
             )
         )
-        return recoverable | self._sliding_unrecoverable_discontinuity_room_ids(
-            response
+        return recoverable | sliding_unrecoverable_discontinuity_room_ids(
+            response,
+            user_id=self.user_id,
+            window_tokens=self._sliding_room_prev_batch,
+            known_room_ids=self.rooms.keys(),
+            current_room_ids=self._current_response_room_ids.get(),
         )
 
     def _publish_waiting_sync_cancellation(
@@ -1313,7 +1315,7 @@ class AsyncClient(Client):
         self,
         envelope: _SyncResponseEnvelope,
         *,
-        one_time_key_count_commit: _OneTimeKeyCountCommit | None = None,
+        one_time_key_count_commit: OneTimeKeyCountCommit | None = None,
     ) -> None:
         response = envelope.response
         request_since = envelope.request_since
@@ -1412,7 +1414,7 @@ class AsyncClient(Client):
         self,
         response: SlidingSyncResponse,
         *,
-        one_time_key_count_commit: _OneTimeKeyCountCommit | None = None,
+        one_time_key_count_commit: OneTimeKeyCountCommit | None = None,
     ) -> None:
         """Process a sliding sync response into client state."""
         if self.config.backfill_limited_timelines:
@@ -1437,13 +1439,17 @@ class AsyncClient(Client):
                 planned_room_ids,
                 new_gap_room_ids,
             ):
-                unrecoverable_room_ids = (
-                    self._sliding_unrecoverable_discontinuity_room_ids(response)
+                unrecoverable_room_ids = sliding_unrecoverable_discontinuity_room_ids(
+                    response,
+                    user_id=self.user_id,
+                    window_tokens=self._sliding_room_prev_batch,
+                    known_room_ids=self.rooms.keys(),
+                    current_room_ids=self._current_response_room_ids.get(),
                 )
                 plans = []
                 for room_id, room in response.rooms.items():
                     component_is_current = self._room_component_is_current(room_id)
-                    live_event_count = self._sliding_live_event_count(room)
+                    live_event_count = sliding_live_event_count(room)
                     membership_live_event_count = (
                         live_event_count
                         if room.initial or room.expanded_timeline
@@ -1464,7 +1470,7 @@ class AsyncClient(Client):
                             timeline_events=room.timeline,
                             user_id=self.user_id if component_is_current else None,
                             membership=(
-                                self._sliding_sync_recovery_membership(room)
+                                sliding_recovery_membership(room)
                                 if component_is_current
                                 else "join"
                             ),
@@ -1472,7 +1478,12 @@ class AsyncClient(Client):
                             provenance_live_event_count=live_event_count,
                             apply_state_live_event_count=apply_state_live_event_count,
                             cursor_token=(
-                                self._sliding_recovery_cursor(room_id, room)
+                                sliding_recovery_cursor(
+                                    room_id,
+                                    room,
+                                    user_id=self.user_id,
+                                    window_tokens=self._sliding_room_prev_batch,
+                                )
                                 if component_is_current
                                 else None
                             ),
@@ -1510,7 +1521,12 @@ class AsyncClient(Client):
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
                 plans.append(RecoveryPlan(unrecovered_room_ids=unrecoverable_room_ids))
-                recorded, forgotten = self._plan_sliding_prev_batches(response)
+                recorded, forgotten = plan_sliding_prev_batches(
+                    response,
+                    user_id=self.user_id,
+                    window_tokens=self._sliding_room_prev_batch,
+                    current_room_ids=self._current_response_room_ids.get(),
+                )
                 plan = merge_recovery_plans(plans)
                 persist_response_plan(
                     self._recovery,
@@ -1529,8 +1545,7 @@ class AsyncClient(Client):
         if self.config.backfill_limited_timelines:
             for room_id, room in response.rooms.items():
                 if not self._room_component_is_current(room_id) or (
-                    self._sliding_sync_room_is_invite(room)
-                    or room.membership in ("leave", "ban")
+                    sliding_room_is_invite(room) or room.membership in ("leave", "ban")
                 ):
                     continue
                 await self._handle_sliding_sync_joined_room(
@@ -1541,7 +1556,7 @@ class AsyncClient(Client):
         await self._handle_to_device(response)
         if self.config.backfill_limited_timelines:
             for room_id, room in response.rooms.items():
-                if self._sliding_sync_room_is_invite(room) or room.membership in (
+                if sliding_room_is_invite(room) or room.membership in (
                     "leave",
                     "ban",
                 ):
@@ -1615,194 +1630,6 @@ class AsyncClient(Client):
             )
             for name, spec in lists.items()
         }
-
-    def _sliding_recovery_cursor(
-        self, room_id: str, room: SlidingSyncRoom
-    ) -> str | None:
-        """The token a limited sliding window's recovery walk starts from.
-
-        Simplified Sliding Sync has no equivalent of the ``since`` token a
-        /v3/sync gap walks forward from: a ``pos`` is a connection cursor,
-        not a /messages token. What it does give is ``prev_batch``, which
-        is one — it points into the window the server just sent. Chaining
-        it across responses turns two consecutive windows into an ordinary
-        forward walk: from the previous window's ``prev_batch`` to this
-        one's. The overlap that leaves (the tail of the previous window)
-        is re-fetched and dropped by the usual de-duplication, so the walk
-        covers the gap without needing a backwards pagination mode.
-
-        A walk is planned whenever the server signals a discontinuity for a
-        room already seen this run: ``limited``, or ``initial`` for a room
-        re-entering a list window or arriving on a connection the server
-        expired. Both leave the same hole, and the token held for the room
-        is the far side of it. A steady window continues the last one and
-        has no gap; a room seen for the first time this run has no token to
-        walk from.
-
-        The token is persisted when recovery persistence is enabled (see
-        backfill_persist_recovery), so both a connection reset and a client
-        restart are covered. Without a store — encryption disabled, or
-        persistence off — it lives only in memory and the first
-        discontinuity after a restart has no baseline to walk from.
-        """
-        if not (room.limited or room.initial) or not room.prev_batch:
-            return None
-        if self._sliding_sync_room_is_invite(room) or room.membership in (
-            "leave",
-            "ban",
-        ):
-            return None
-        window_token = self._sliding_room_prev_batch.get(room_id)
-        if not window_token:
-            return None
-        if not self._sliding_membership_continues(room_id, room):
-            return None
-        return window_token.token
-
-    def _sliding_unrecoverable_discontinuity_room_ids(
-        self,
-        response: SlidingSyncResponse,
-    ) -> frozenset[str]:
-        """Return discontinuities whose held baseline cannot be trusted."""
-        return frozenset(
-            room_id
-            for room_id, room in response.rooms.items()
-            if self._room_component_is_current(room_id)
-            and (room.limited or room.initial)
-            and (room_id in self._sliding_room_prev_batch or room_id in self.rooms)
-            and not self._sliding_live_own_join(room)
-            and not self._sliding_sync_room_is_invite(room)
-            and room.membership not in ("leave", "ban")
-            and self._sliding_recovery_cursor(room_id, room) is None
-        )
-
-    @staticmethod
-    def _sliding_live_event_count(room: SlidingSyncRoom) -> int:
-        """Normalize the live tail represented by deployed server responses.
-
-        Tuwunel omits ``num_live`` on ordinary continuations and reports the
-        total live count when a truncated window can contain only its tail.
-        """
-        if room.num_live is None:
-            return 0 if room.initial or room.expanded_timeline else len(room.timeline)
-        return min(max(room.num_live, 0), len(room.timeline))
-
-    @staticmethod
-    def _sliding_live_timeline(
-        room: SlidingSyncRoom,
-    ) -> Sequence[Event | BadEventType]:
-        live_event_count = AsyncClient._sliding_live_event_count(room)
-        return room.timeline[-live_event_count:] if live_event_count else ()
-
-    def _sliding_live_own_join(self, room: SlidingSyncRoom) -> bool:
-        return any(
-            is_own_join(event, self.user_id)
-            for event in self._sliding_live_timeline(room)
-        )
-
-    def _sliding_membership_event(
-        self, room: SlidingSyncRoom
-    ) -> RoomMemberEvent | SlidingSyncStateStub | None:
-        """Return exact current own membership, excluding historical timeline."""
-        events = (*room.required_state, *self._sliding_live_timeline(room))
-        return next(
-            (
-                event
-                for event in reversed(events)
-                if (
-                    isinstance(event, RoomMemberEvent)
-                    and event.state_key == self.user_id
-                )
-                or (
-                    isinstance(event, SlidingSyncStateStub)
-                    and event.type == "m.room.member"
-                    and event.state_key == self.user_id
-                )
-            ),
-            None,
-        )
-
-    def _sliding_membership_proof(
-        self,
-        room_id: str,
-        room: SlidingSyncRoom,
-    ) -> str | None:
-        """Return exact current own-membership identity for this room delta."""
-        membership_event = self._sliding_membership_event(room)
-        if isinstance(membership_event, RoomMemberEvent):
-            if membership_event.membership != "join":
-                return None
-            held = self._sliding_room_prev_batch.get(room_id)
-            if (
-                held is None
-                or membership_event.event_id == held.membership_event_id
-                or self._sliding_live_own_join(room)
-            ):
-                return membership_event.event_id
-            unsigned = membership_event.source.get("unsigned", {})
-            if (
-                membership_event.prev_membership == "join"
-                and isinstance(unsigned, dict)
-                and unsigned.get("replaces_state") == held.membership_event_id
-            ):
-                return membership_event.event_id
-            return None
-        if membership_event is not None or room.initial:
-            return None
-        held = self._sliding_room_prev_batch.get(room_id)
-        return held.membership_event_id if held else None
-
-    def _sliding_membership_continues(
-        self,
-        room_id: str,
-        room: SlidingSyncRoom,
-    ) -> bool:
-        return self._sliding_membership_proof(
-            room_id, room
-        ) is not None and not self._sliding_live_own_join(room)
-
-    def _plan_sliding_prev_batches(
-        self, response: SlidingSyncResponse
-    ) -> tuple[dict[str, SlidingWindowToken], list[str]]:
-        """Work out each room's next walk baseline, without applying it.
-
-        Returns the tokens to store and the rooms whose token is gone, so
-        the caller can commit them alongside the recovery plan they belong
-        to: a baseline persisted without its plan would send a restarted
-        walk from the wrong position.
-        """
-        recorded: dict[str, SlidingWindowToken] = {}
-        forgotten: list[str] = []
-        for room_id, room in response.rooms.items():
-            if not self._room_component_is_current(room_id):
-                continue
-            membership_event_id = self._sliding_membership_proof(room_id, room)
-            window_token = self._sliding_room_prev_batch.get(room_id)
-            if self._sliding_sync_room_is_invite(room) or room.membership in (
-                "leave",
-                "ban",
-            ):
-                # The room is no longer tracked; a stale token would make
-                # the next join walk history from before it.
-                forgotten.append(room_id)
-            elif membership_event_id is None:
-                forgotten.append(room_id)
-            else:
-                if self._sliding_live_own_join(room):
-                    forgotten.append(room_id)
-                if room.prev_batch:
-                    recorded[room_id] = SlidingWindowToken(
-                        room.prev_batch, membership_event_id
-                    )
-                elif (
-                    window_token
-                    and window_token.membership_event_id != membership_event_id
-                ):
-                    recorded[room_id] = SlidingWindowToken(
-                        window_token.token,
-                        membership_event_id,
-                    )
-        return recorded, forgotten
 
     def _apply_sliding_prev_batches(
         self,
@@ -1883,25 +1710,12 @@ class AsyncClient(Client):
                 )
                 self._sliding_room_prev_batch.pop(room_id, None)
 
-    @staticmethod
-    def _sliding_sync_room_is_invite(room: SlidingSyncRoom) -> bool:
-        return room.membership == "invite" or (
-            room.membership is None and bool(room.stripped_state)
-        )
-
-    def _sliding_sync_recovery_membership(self, room: SlidingSyncRoom) -> str:
-        return (
-            "invite"
-            if self._sliding_sync_room_is_invite(room)
-            else room.membership or "join"
-        )
-
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
         encrypted_rooms: set[str] = set()
         for room_id, sliding_room in response.rooms.items():
             if not self._room_component_is_current(room_id):
                 continue
-            if self._sliding_sync_room_is_invite(sliding_room):
+            if sliding_room_is_invite(sliding_room):
                 await self._handle_sliding_sync_invited_room(room_id, sliding_room)
 
             # Parity with /v3/sync, which parses left rooms but never
@@ -1919,8 +1733,7 @@ class AsyncClient(Client):
             self.store.save_encrypted_rooms(encrypted_rooms)
         for room_id, room in response.rooms.items():
             is_current_membership_reset = self._room_component_is_current(room_id) and (
-                self._sliding_sync_room_is_invite(room)
-                or room.membership in ("leave", "ban")
+                sliding_room_is_invite(room) or room.membership in ("leave", "ban")
             )
             if not is_current_membership_reset:
                 await self._pump_sync_recovery(room_id)
@@ -1993,7 +1806,7 @@ class AsyncClient(Client):
         )
 
         if not self.config.backfill_limited_timelines:
-            live_event_count = self._sliding_live_event_count(sliding_room)
+            live_event_count = sliding_live_event_count(sliding_room)
             live_start = len(sliding_room.timeline) - live_event_count
             for index, event in enumerate(sliding_room.timeline):
                 event_id = getattr(event, "event_id", None)
@@ -2140,7 +1953,7 @@ class AsyncClient(Client):
                 and (
                     room_id not in response.rooms
                     or (
-                        not self._sliding_sync_room_is_invite(response.rooms[room_id])
+                        not sliding_room_is_invite(response.rooms[room_id])
                         and response.rooms[room_id].membership not in ("leave", "ban")
                     )
                 )
@@ -2178,7 +1991,7 @@ class AsyncClient(Client):
                     room_id, {}
                 )
                 for event in events:
-                    pending[self._account_data_kind(event)] = event
+                    pending[account_data_kind(event)] = event
                 continue
 
             if room_id in deferred_room_ids:
@@ -2186,18 +1999,6 @@ class AsyncClient(Client):
             for event in events:
                 room.handle_account_data(event)
                 await self._on_room_account_data(event, room)
-
-    @staticmethod
-    def _account_data_kind(
-        event: AccountDataEvent | BadEventType,
-    ) -> tuple[str, str | None]:
-        # The wire type disambiguates events that parse to the same
-        # catch-all class.
-        wire_type = event.source.get("type")
-        return (
-            type(event).__name__,
-            wire_type if isinstance(wire_type, str) else None,
-        )
 
     async def receive_response(self, response: Response) -> None:
         """Receive a Matrix Response and change the client state accordingly.
@@ -2270,187 +2071,6 @@ class AsyncClient(Client):
         current = self._current_response_room_ids.get()
         return current is None or room_id in current
 
-    @staticmethod
-    def _response_room_ids(
-        response: SyncResponse | SlidingSyncResponse,
-    ) -> frozenset[str]:
-        if isinstance(response, SyncResponse):
-            return frozenset(
-                response.rooms.join.keys()
-                | response.rooms.invite.keys()
-                | response.rooms.leave.keys()
-            )
-        return frozenset(response.rooms.keys() | response.room_account_data.keys())
-
-    def _ordered_response_view(
-        self,
-        response: SyncResponse | SlidingSyncResponse,
-        request_id: SyncRequestId | None,
-    ) -> _OrderedResponseView:
-        one_time_key_count_components = frozenset(
-            component
-            for component, count in (
-                ("curve25519", response.device_key_count.curve25519),
-                ("signed_curve25519", response.device_key_count.signed_curve25519),
-            )
-            if count is not None
-        )
-        accepted_one_time_key_count_components = accept_current_one_time_key_counts(
-            self._sync_reset_fence,
-            one_time_key_count_components,
-            request_id,
-        )
-        if accepted_one_time_key_count_components != one_time_key_count_components:
-            response = replace(
-                response,
-                device_key_count=DeviceOneTimeKeyCount(
-                    (
-                        response.device_key_count.curve25519
-                        if "curve25519" in accepted_one_time_key_count_components
-                        else None
-                    ),
-                    (
-                        response.device_key_count.signed_curve25519
-                        if "signed_curve25519" in accepted_one_time_key_count_components
-                        else None
-                    ),
-                ),
-            )
-        one_time_key_count_commit = (
-            _OneTimeKeyCountCommit(
-                accepted_one_time_key_count_components,
-                request_id,
-            )
-            if accepted_one_time_key_count_components and request_id is not None
-            else None
-        )
-        accepted = accept_reset_safe_rooms(
-            self._sync_reset_fence,
-            self._response_room_ids(response),
-            request_id,
-        )
-        if isinstance(response, SyncResponse):
-            response_room_ids = (
-                response.rooms.join.keys()
-                | response.rooms.invite.keys()
-                | response.rooms.leave.keys()
-            )
-            current_rooms, _ = accept_current_components(
-                self._sync_reset_fence,
-                (room_id for room_id in response_room_ids if room_id in accepted),
-                has_to_device_token=False,
-                request_id=request_id,
-            )
-            account_components = [
-                ("global", *self._account_data_kind(event))
-                for event in response.account_data_events
-            ]
-            account_components.extend(
-                ("room", room_id, *self._account_data_kind(event))
-                for room_id, info in response.rooms.join.items()
-                if room_id in accepted
-                for event in info.account_data
-            )
-            accepted_account_data = accept_current_account_data(
-                self._sync_reset_fence,
-                account_components,
-                request_id,
-            )
-            return _OrderedResponseView(
-                replace(
-                    response,
-                    rooms=Rooms(
-                        {
-                            room_id: info
-                            for room_id, info in response.rooms.invite.items()
-                            if room_id in current_rooms
-                        },
-                        {
-                            room_id: replace(
-                                info,
-                                account_data=[
-                                    event
-                                    for event in info.account_data
-                                    if (
-                                        "room",
-                                        room_id,
-                                        *self._account_data_kind(event),
-                                    )
-                                    in accepted_account_data
-                                ],
-                            )
-                            for room_id, info in response.rooms.join.items()
-                            if room_id in accepted
-                        },
-                        {
-                            room_id: info
-                            for room_id, info in response.rooms.leave.items()
-                            if room_id in current_rooms
-                        },
-                    ),
-                    account_data_events=[
-                        event
-                        for event in response.account_data_events
-                        if ("global", *self._account_data_kind(event))
-                        in accepted_account_data
-                    ],
-                ),
-                current_rooms,
-                one_time_key_count_commit,
-            )
-        current_rooms, accept_to_device_token = accept_current_components(
-            self._sync_reset_fence,
-            (room_id for room_id in response.rooms if room_id in accepted),
-            has_to_device_token=response.to_device_next_batch is not None,
-            request_id=request_id,
-        )
-        account_components = [
-            ("global", *self._account_data_kind(event))
-            for event in response.account_data_events
-        ]
-        account_components.extend(
-            ("room", room_id, *self._account_data_kind(event))
-            for room_id, events in response.room_account_data.items()
-            if room_id in accepted
-            for event in events
-        )
-        accepted_account_data = accept_current_account_data(
-            self._sync_reset_fence,
-            account_components,
-            request_id,
-        )
-        return _OrderedResponseView(
-            replace(
-                response,
-                rooms={
-                    room_id: room
-                    for room_id, room in response.rooms.items()
-                    if room_id in accepted
-                },
-                account_data_events=[
-                    event
-                    for event in response.account_data_events
-                    if ("global", *self._account_data_kind(event))
-                    in accepted_account_data
-                ],
-                room_account_data={
-                    room_id: [
-                        event
-                        for event in events
-                        if ("room", room_id, *self._account_data_kind(event))
-                        in accepted_account_data
-                    ]
-                    for room_id, events in response.room_account_data.items()
-                    if room_id in accepted
-                },
-                to_device_next_batch=(
-                    response.to_device_next_batch if accept_to_device_token else None
-                ),
-            ),
-            current_rooms,
-            one_time_key_count_commit,
-        )
-
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
         sync_response = envelope.response
         request_since = envelope.request_since
@@ -2491,7 +2111,8 @@ class AsyncClient(Client):
                 self._active_sync_executor_token = executor
                 context_token = self._sync_executor_context.set(executor)
                 try:
-                    ordered = self._ordered_response_view(
+                    ordered = ordered_response_view(
+                        self._sync_reset_fence,
                         sync_response,
                         envelope.request_id,
                     )
