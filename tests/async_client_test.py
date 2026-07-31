@@ -227,6 +227,11 @@ class TestClass:
             config=AsyncClientConfig(),
         )
         client.restore_login("example", "DEVICEID", "token")
+        assert client.olm
+        assert client.olm.account.identity_keys == {
+            "curve25519": "Xjuu9d2KjHLGIHpCOCHS7hONQahapiwI1MhVmlPlCFM",
+            "ed25519": "FEfrmWlasr4tcMtbNX/BU5lbdjmpt3ptg8ApTD8YAh4",
+        }
         seen = []
 
         async def callback(event):
