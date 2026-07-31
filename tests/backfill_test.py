@@ -2070,7 +2070,7 @@ class TestRoomLocalRecovery:
         second = asyncio.create_task(client.receive_response(self._sliding("s2", [])))
         await asyncio.sleep(0)
         release_callback.set()
-        done, _ = await asyncio.wait((second,), timeout=0.1)
+        done, _ = await asyncio.wait((second,), timeout=5)
         if second in done:
             await second
             assert callback_finished.is_set()
