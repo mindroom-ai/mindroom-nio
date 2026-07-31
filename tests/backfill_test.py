@@ -61,6 +61,10 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     should_dispatch_timeline_event,
 )
+from nio.client.sliding_membership import (
+    sliding_membership_continues,
+    sliding_membership_proof,
+)
 from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
 from nio.responses import RoomMessagesResponse, SlidingSyncError
 from nio.sliding_sync_tokens import SlidingWindowToken
@@ -9195,18 +9199,50 @@ class TestSlidingMembershipProof:
         if held is not None:
             client._sliding_room_prev_batch[ROOM_A] = window_token("w1", held)
 
-        assert client._sliding_membership_proof(ROOM_A, room) == expected
+        assert (
+            sliding_membership_proof(
+                ROOM_A,
+                room,
+                user_id=client.user_id,
+                window_tokens=client._sliding_room_prev_batch,
+            )
+            == expected
+        )
 
     async def test_live_own_join_proves_membership_but_breaks_continuity(self, client):
         """A rejoin dates the new membership yet invalidates the old baseline."""
         client._sliding_room_prev_batch[ROOM_A] = window_token("w1", "$old")
         room = proof_room(timeline=[own_member_event("$new")])
 
-        assert client._sliding_membership_proof(ROOM_A, room) == "$new"
-        assert client._sliding_membership_continues(ROOM_A, room) is False
+        assert (
+            sliding_membership_proof(
+                ROOM_A,
+                room,
+                user_id=client.user_id,
+                window_tokens=client._sliding_room_prev_batch,
+            )
+            == "$new"
+        )
+        assert (
+            sliding_membership_continues(
+                ROOM_A,
+                room,
+                user_id=client.user_id,
+                window_tokens=client._sliding_room_prev_batch,
+            )
+            is False
+        )
 
     async def test_unchanged_membership_continues(self, client):
         client._sliding_room_prev_batch[ROOM_A] = window_token("w1", "$m1")
         room = proof_room(required_state=[own_member_event("$m1")])
 
-        assert client._sliding_membership_continues(ROOM_A, room) is True
+        assert (
+            sliding_membership_continues(
+                ROOM_A,
+                room,
+                user_id=client.user_id,
+                window_tokens=client._sliding_room_prev_batch,
+            )
+            is True
+        )
