@@ -1474,9 +1474,10 @@ class TestRoomLocalRecovery:
         await client._dispatch_timeline_event(
             ROOM_A,
             text_event("$plain", 1),
-            True,
             False,
             "timeline",
+            TimelineEventProvenance.LIVE,
+            True,
             False,
             mark,
         )
