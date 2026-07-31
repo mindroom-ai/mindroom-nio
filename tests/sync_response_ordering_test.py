@@ -22,6 +22,7 @@ from nio.client.sync_response_ordering import (
 
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
+ROOM_C = "!c:example.org"
 
 
 def room_info() -> RoomInfo:
@@ -72,3 +73,38 @@ def test_ordered_response_view_rejects_room_reset_after_request() -> None:
 
     assert ordered.current_room_ids == frozenset({ROOM_B})
     assert set(ordered.response.rooms.join) == {ROOM_B}
+
+
+def test_classic_join_survives_when_independent_room_components_are_stale() -> None:
+    state = SyncResetFence()
+    older = issue_sync_request(state, "classic")
+    newer = issue_sync_request(state, "classic")
+    rooms = Rooms(
+        {ROOM_B: room_info()},
+        {ROOM_A: room_info()},
+        {ROOM_C: room_info()},
+    )
+    newer_response = SyncResponse(
+        "newer",
+        rooms,
+        DeviceOneTimeKeyCount(None, None),
+        DeviceList([], []),
+        [],
+        [],
+    )
+    older_response = SyncResponse(
+        "older",
+        rooms,
+        DeviceOneTimeKeyCount(None, None),
+        DeviceList([], []),
+        [],
+        [],
+    )
+
+    ordered_response_view(state, newer_response, newer)
+    ordered = ordered_response_view(state, older_response, older)
+
+    assert ordered.current_room_ids == frozenset()
+    assert set(ordered.response.rooms.join) == {ROOM_A}
+    assert ordered.response.rooms.invite == {}
+    assert ordered.response.rooms.leave == {}

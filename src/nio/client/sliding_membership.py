@@ -23,7 +23,11 @@ def sliding_recovery_membership(room: SlidingSyncRoom) -> str:
 
 
 def sliding_live_event_count(room: SlidingSyncRoom) -> int:
-    """Normalize the live tail represented by deployed server responses."""
+    """Normalize the live tail represented by deployed server responses.
+
+    Tuwunel omits ``num_live`` on ordinary continuations and reports the
+    total live count when a truncated window can contain only its tail.
+    """
     if room.num_live is None:
         return 0 if room.initial or room.expanded_timeline else len(room.timeline)
     return min(max(room.num_live, 0), len(room.timeline))
@@ -116,17 +120,31 @@ def sliding_recovery_cursor(
     user_id: str | None,
     window_tokens: Mapping[str, SlidingWindowToken],
 ) -> str | None:
-    """Return the token a limited sliding window's recovery walk starts from.
+    """The token a limited sliding window's recovery walk starts from.
 
     Simplified Sliding Sync has no equivalent of the ``since`` token a
-    /v3/sync gap walks forward from: a ``pos`` is a connection cursor, not a
-    /messages token. Chaining each room's ``prev_batch`` across responses
-    turns consecutive windows into an ordinary forward walk. The overlap is
-    re-fetched and removed by the usual de-duplication.
+    /v3/sync gap walks forward from: a ``pos`` is a connection cursor,
+    not a /messages token. What it does give is ``prev_batch``, which
+    is one — it points into the window the server just sent. Chaining
+    it across responses turns two consecutive windows into an ordinary
+    forward walk: from the previous window's ``prev_batch`` to this
+    one's. The overlap that leaves (the tail of the previous window)
+    is re-fetched and dropped by the usual de-duplication, so the walk
+    covers the gap without needing a backwards pagination mode.
 
-    A walk is planned for a discontinuity only when the held token belongs to
-    the same proven membership. The token may be durable when recovery
-    persistence is enabled, or memory-only otherwise.
+    A walk is planned whenever the server signals a discontinuity for a
+    room already seen this run: ``limited``, or ``initial`` for a room
+    re-entering a list window or arriving on a connection the server
+    expired. Both leave the same hole, and the token held for the room
+    is the far side of it. A steady window continues the last one and
+    has no gap; a room seen for the first time this run has no token to
+    walk from.
+
+    The token is persisted when recovery persistence is enabled (see
+    backfill_persist_recovery), so both a connection reset and a client
+    restart are covered. Without a store — encryption disabled, or
+    persistence off — it lives only in memory and the first
+    discontinuity after a restart has no baseline to walk from.
     """
     if not (room.limited or room.initial) or not room.prev_batch:
         return None
@@ -180,7 +198,13 @@ def plan_sliding_prev_batches(
     window_tokens: Mapping[str, SlidingWindowToken],
     current_room_ids: frozenset[str] | None,
 ) -> tuple[dict[str, SlidingWindowToken], list[str]]:
-    """Work out each room's next walk baseline, without applying it."""
+    """Work out each room's next walk baseline, without applying it.
+
+    Returns the tokens to store and the rooms whose token is gone, so
+    the caller can commit them alongside the recovery plan they belong
+    to: a baseline persisted without its plan would send a restarted
+    walk from the wrong position.
+    """
     recorded: dict[str, SlidingWindowToken] = {}
     forgotten: list[str] = []
     for room_id, room in response.rooms.items():
@@ -194,7 +218,8 @@ def plan_sliding_prev_batches(
         )
         window_token = window_tokens.get(room_id)
         if sliding_room_is_invite(room) or room.membership in ("leave", "ban"):
-            # A later join must not reuse a token from the old membership.
+            # The room is no longer tracked; a stale token would make
+            # the next join walk history from before it.
             forgotten.append(room_id)
         elif membership_event_id is None:
             forgotten.append(room_id)
