@@ -56,6 +56,7 @@ from . import (
     SyncRecoveryGaps,
     SyncTokens,
 )
+from .log import logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -897,7 +898,16 @@ class MatrixStore:
         generation: int,
         event_id: str,
     ) -> None:
-        """Durably record admission before ordinary callback fanout."""
+        """Durably record admission before ordinary callback fanout.
+
+        The row is matched without its generation: after a crashed sync
+        iteration the store can hold the event under a different generation
+        than the running loop believes, and the event has at most one row
+        either way. A missing row is tolerated for the same reason — raising
+        here poisons every following sync iteration with the same error,
+        while the worst case of continuing is one duplicate callback
+        dispatch, which admission dedup already absorbs.
+        """
         account = self._get_account()
         assert account
         updated = (
@@ -905,13 +915,19 @@ class MatrixStore:
             .where(
                 PendingTimelineEvents.account == account,
                 PendingTimelineEvents.room_id == room_id,
-                PendingTimelineEvents.generation == generation,
+                PendingTimelineEvents.generation > 0,
                 PendingTimelineEvents.event_id == event_id,
             )
             .execute()
         )
         if updated != 1:
-            raise ValueError(f"Pending recovery event not found: {event_id}")
+            logger.warning(
+                "Pending recovery event already cleared at admission: %s "
+                "(generation %d in %s)",
+                event_id,
+                generation,
+                room_id,
+            )
 
     @use_database
     def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
@@ -994,21 +1010,40 @@ class MatrixStore:
             PendingTimelineEvents.generation == generation,
         )
         if event_id:
-            pending = PendingTimelineEvents.get(
-                *event_filter,
+            # Completion must tolerate a crashed iteration's leftovers: the
+            # row may already be gone, sit under another generation, or
+            # already be a generation-0 marker. INSERT OR REPLACE collapses
+            # every such state into the single marker row, where the old
+            # fetch/delete/insert sequence raised DoesNotExist or violated
+            # the UNIQUE(account_id, room_id, event_id) constraint.
+            pending = PendingTimelineEvents.get_or_none(
+                PendingTimelineEvents.account == account,
+                PendingTimelineEvents.room_id == room_id,
+                PendingTimelineEvents.generation > 0,
                 PendingTimelineEvents.event_id == event_id,
             )
-            pending.delete_instance()
             if event_id.startswith("~"):
+                if pending:
+                    pending.delete_instance()
                 return
-            pending.id = None
-            pending.generation = 0
-            pending.event_payload = b""
-            pending.is_live = pending.was_completed = False
-            pending.admission_accepted = False
-            pending.apply_room_state = False
-            pending.was_encrypted = was_encrypted
-            pending.save(force_insert=True)
+            PendingTimelineEvents.replace(
+                account=account,
+                room_id=room_id,
+                generation=0,
+                sequence=0,
+                event_id=event_id,
+                event_payload=b"",
+                is_live=False,
+                was_encrypted=was_encrypted,
+                was_completed=False,
+                admission_accepted=False,
+                provenance=(
+                    pending.provenance
+                    if pending
+                    else TimelineEventProvenance.HISTORY.value
+                ),
+                apply_room_state=False,
+            ).execute()
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)
                 .where(
