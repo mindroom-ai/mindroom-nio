@@ -685,6 +685,79 @@ class TestClass:
         ]
         assert events[-1].admission_accepted
 
+    def test_accept_recovery_event_survives_missing_row(self, sqlstore):
+        """A retained dispatch from a crashed iteration can clear a row
+        before admission is recorded; acceptance must not poison every
+        later sync iteration with the same ValueError."""
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$vanished")
+
+        assert sqlstore.load_sync_recovery() == ([], [])
+
+    def test_accept_recovery_event_survives_generation_divergence(self, sqlstore):
+        """The store can hold an event under a different generation than
+        the sync loop believes after a crashed iteration; the event still
+        has exactly one row, so admission must land on it."""
+        gap = RecoveryGap(TEST_ROOM, 2, "p1", None)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            2,
+            0,
+            "$held",
+            '{"content":{},"event_id":"$held","sender":"@a:b","type":"m.test"}',
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+
+        sqlstore.accept_recovery_event(TEST_ROOM, 5, "$held")
+
+        _, events = sqlstore.load_sync_recovery()
+        assert events[0].admission_accepted
+
+    def test_finish_recovery_survives_missing_row(self, sqlstore):
+        """Completing an event whose row a concurrent iteration already
+        cleared still records the completed marker instead of raising."""
+        sqlstore.finish_recovery(TEST_ROOM, 3, "$vanished", False)
+
+        _, events = sqlstore.load_sync_recovery()
+        assert [(event.event_id, event.generation) for event in events] == [
+            ("$vanished", 0)
+        ]
+
+    def test_finish_recovery_survives_repeated_completion(self, sqlstore):
+        """A second completion of the same event keeps its single
+        generation-0 marker instead of raising on the UNIQUE constraint,
+        and mirrors record_completed_timeline_event: the marker keeps its
+        original provenance and combines encryption state with AND, so an
+        event once delivered decrypted cannot be re-dispatched as pending
+        decryption after a restart."""
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$done",
+            '{"content":{},"event_id":"$done","sender":"@a:b","type":"m.test"}',
+            True,
+            False,
+            provenance=TimelineEventProvenance.LIVE,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$done", False)
+
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$done", True)
+
+        _, events = sqlstore.load_sync_recovery()
+        assert [
+            (
+                event.event_id,
+                event.generation,
+                event.provenance,
+                bool(event.was_encrypted),
+            )
+            for event in events
+        ] == [("$done", 0, TimelineEventProvenance.LIVE, False)]
+
     def test_sync_recovery_load_preserves_write_order_for_sequence_ties(
         self,
         sqlstore,
