@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.34.1
+
+### Bug Fixes
+
+- Make persisted sync recovery admission and completion tolerate missing, generation-divergent, and already-completed event rows after a crashed sync iteration, preventing permanent sync-loop crashes and duplicate-row constraint failures.
+
 ## 0.34.0
 
 ### Features
