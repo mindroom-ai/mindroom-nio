@@ -726,7 +726,11 @@ class TestClass:
 
     def test_finish_recovery_survives_repeated_completion(self, sqlstore):
         """A second completion of the same event keeps its single
-        generation-0 marker instead of raising on the UNIQUE constraint."""
+        generation-0 marker instead of raising on the UNIQUE constraint,
+        and mirrors record_completed_timeline_event: the marker keeps its
+        original provenance and combines encryption state with AND, so an
+        event once delivered decrypted cannot be re-dispatched as pending
+        decryption after a restart."""
         gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
         event = PendingTimelineEvent(
             TEST_ROOM,
@@ -736,16 +740,23 @@ class TestClass:
             '{"content":{},"event_id":"$done","sender":"@a:b","type":"m.test"}',
             True,
             False,
+            provenance=TimelineEventProvenance.LIVE,
         )
         sqlstore.save_recovery(None, set(), [gap], [event], None)
         sqlstore.finish_recovery(TEST_ROOM, 1, "$done", False)
 
-        sqlstore.finish_recovery(TEST_ROOM, 1, "$done", False)
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$done", True)
 
         _, events = sqlstore.load_sync_recovery()
-        assert [(event.event_id, event.generation) for event in events] == [
-            ("$done", 0)
-        ]
+        assert [
+            (
+                event.event_id,
+                event.generation,
+                event.provenance,
+                bool(event.was_encrypted),
+            )
+            for event in events
+        ] == [("$done", 0, TimelineEventProvenance.LIVE, False)]
 
     def test_sync_recovery_load_preserves_write_order_for_sequence_ties(
         self,

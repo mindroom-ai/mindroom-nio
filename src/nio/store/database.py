@@ -1019,13 +1019,17 @@ class MatrixStore:
             pending = PendingTimelineEvents.get_or_none(
                 PendingTimelineEvents.account == account,
                 PendingTimelineEvents.room_id == room_id,
-                PendingTimelineEvents.generation > 0,
                 PendingTimelineEvents.event_id == event_id,
             )
             if event_id.startswith("~"):
                 if pending:
                     pending.delete_instance()
                 return
+            # The marker mirrors record_completed_timeline_event: the first
+            # completion's provenance sticks, and encryption state combines
+            # with AND so an event once delivered decrypted is never
+            # re-dispatched as pending decryption.
+            already_completed = pending is not None and pending.generation == 0
             PendingTimelineEvents.replace(
                 account=account,
                 room_id=room_id,
@@ -1034,7 +1038,11 @@ class MatrixStore:
                 event_id=event_id,
                 event_payload=b"",
                 is_live=False,
-                was_encrypted=was_encrypted,
+                was_encrypted=(
+                    bool(pending.was_encrypted) and was_encrypted
+                    if already_completed
+                    else was_encrypted
+                ),
                 was_completed=False,
                 admission_accepted=False,
                 provenance=(
