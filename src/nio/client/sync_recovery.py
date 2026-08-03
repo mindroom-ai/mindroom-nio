@@ -1237,7 +1237,7 @@ async def _collect_slice(
                 provenance=(
                     completed.provenance
                     if completed is not None
-                    else TimelineEventProvenance.HISTORY
+                    else TimelineEventProvenance.RECOVERED
                 ),
                 apply_room_state=False,
             )

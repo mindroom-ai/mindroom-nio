@@ -1378,7 +1378,7 @@ class TestRoomLocalRecovery:
             ("$live", TimelineEventProvenance.LIVE),
         ]
 
-    async def test_recovered_history_precedes_retained_live_provenance(
+    async def test_recovered_gap_precedes_retained_live_provenance(
         self,
         client,
         aioresponse,
@@ -1404,7 +1404,7 @@ class TestRoomLocalRecovery:
         )
 
         assert admissions == [
-            ("$history", TimelineEventProvenance.HISTORY),
+            ("$history", TimelineEventProvenance.RECOVERED),
             ("$live", TimelineEventProvenance.LIVE),
         ]
 

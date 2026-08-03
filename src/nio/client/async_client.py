@@ -798,7 +798,9 @@ class AsyncClient(Client):
         Sliding Sync uses the validated ``num_live`` tail when present.
         Ordinary continuations without it are live, while initial or expanded
         responses without it are history.
-        Events recovered through ``/messages`` are history.
+        Events recovered through ``/messages`` to close a continuity gap are
+        recovered: they are not cold history, but callers may still reserve
+        live-only side effects for events present in the sync response itself.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
