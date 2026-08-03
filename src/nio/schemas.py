@@ -1206,10 +1206,19 @@ class Schemas:
             "redacts": {"type": "string"},
             "content": {
                 "type": "object",
-                "properties": {"reason": {"type": "string"}},
+                "properties": {
+                    "reason": {"type": "string"},
+                    "redacts": {"type": "string"},
+                },
             },
         },
-        "required": ["sender", "redacts"],
+        "required": ["sender", "content"],
+        "anyOf": [
+            {"required": ["redacts"]},
+            {
+                "properties": {"content": {"required": ["redacts"]}},
+            },
+        ],
     }
 
     sticker = {

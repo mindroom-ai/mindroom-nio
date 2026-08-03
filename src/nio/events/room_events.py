@@ -1445,10 +1445,11 @@ class RedactionEvent(Event):
     def from_dict(cls, parsed_dict: dict[Any, Any]) -> RedactionEvent | BadEventType:
         content = parsed_dict.get("content", {})
         reason = content.get("reason", None)
+        redacts = parsed_dict.get("redacts", content.get("redacts"))
 
         return cls(
             parsed_dict,
-            parsed_dict["redacts"],
+            redacts,
             reason,
         )
 

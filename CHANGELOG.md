@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Allow an active recovery callback to send into its own room while preserving recovery ordering guards for other rooms and external sends.
+- Parse redaction targets from `content.redacts` in room version 11 and newer while retaining the legacy top-level form.
 
 ## 0.34.1
 
