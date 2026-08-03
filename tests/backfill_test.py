@@ -1015,6 +1015,54 @@ class TestRoomLocalRecovery:
             client._recovery._active_dispatches.clear()
             client._recovery.gaps.clear()
 
+    async def test_recovery_callback_child_task_cannot_inherit_send_bypass(
+        self, client, aioresponse
+    ):
+        blocked = []
+
+        async def send(_room, event):
+            if event.event_id != "$gap":
+                return
+            with pytest.raises(SendRetryError, match="recovery is still pending"):
+                await asyncio.create_task(
+                    client.room_send(
+                        ROOM_A,
+                        "m.room.message",
+                        {"body": "unsafe", "msgtype": "m.text"},
+                    )
+                )
+            blocked.append(event.event_id)
+
+        client.add_event_callback(send, RoomMessageText)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2), text_event("$held", 3)], "p1"),
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+
+        assert blocked == ["$gap"]
+        assert not client._recovery.gaps
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_live_callback_can_send_without_recovery_gap(
         self, client, aioresponse, protocol

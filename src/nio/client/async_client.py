@@ -3845,6 +3845,10 @@ class AsyncClient(Client):
         If timeline recovery is pending or encrypted state cannot be fully
         synced after a couple of retries, this raises `SendRetryError`.
 
+        The exact callback task draining this room's recovery gap may send to
+        the same room. Child tasks and sends to other recovering rooms remain
+        blocked so recovery authority cannot outlive or escape its callback.
+
         Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
