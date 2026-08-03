@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.34.2
+
+### Features
+
+- Classify events fetched to close a live timeline gap as `RECOVERED`, distinct from cold `HISTORY` and sync-tail `LIVE` provenance.
+
+### Bug Fixes
+
+- Allow an active recovery callback to send into its own room while preserving recovery ordering guards for other rooms and external sends.
+
 ## 0.34.1
 
 ### Bug Fixes
@@ -13,7 +23,7 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Add typed `TimelineEventProvenance` metadata to the single durable timeline admission callback.
-  Classic Sync distinguishes initial history from `since` continuations, and `/messages` recovery stays historical.
+  Classic Sync distinguishes initial history from `since` continuations, and `/messages` continuity recovery is classified separately as recovered.
   Sliding Sync uses the validated `num_live` tail when present, clamps server counts to the returned timeline, treats ordinary continuations without the optional count as live, and treats initial or expanded responses without it as history.
   Historical sync rows retain their independent sync-origin durability and room-state behavior instead of overloading provenance.
   Store schema v7 preserves legacy recovery obligations and transport tokens, classifies their previously unrecorded provenance conservatively as history, and derives room-state application from their existing sync origin.
