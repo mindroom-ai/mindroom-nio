@@ -214,9 +214,13 @@ def has_pending_recovery_work(state: RecoveryState) -> bool:
 def is_recovery_dispatch_task(
     state: RecoveryState,
     task: asyncio.Task[Any] | None,
+    room_id: str | None = None,
 ) -> bool:
-    """Whether task owns a retained recovery callback."""
-    return task is not None and task in state._active_dispatches.values()
+    """Whether task owns a retained recovery callback, optionally for one room."""
+    return task is not None and any(
+        active is task and (room_id is None or key[0] == room_id)
+        for key, active in state._active_dispatches.items()
+    )
 
 
 def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:

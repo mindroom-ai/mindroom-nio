@@ -3879,6 +3879,10 @@ class AsyncClient(Client):
         if any(
             gap.cursor_token is not None or gap.target_token
             for gap in self._recovery.gaps.get(room_id, ())
+        ) and not is_recovery_dispatch_task(
+            self._recovery,
+            asyncio.current_task(),
+            room_id,
         ):
             raise SendRetryError("Room timeline recovery is still pending.")
 

@@ -943,6 +943,78 @@ class TestRoomLocalRecovery:
                 {"body": "secret", "msgtype": "m.text"},
             )
 
+    async def test_recovery_callback_can_send_while_own_gap_is_pending(
+        self, client, aioresponse
+    ):
+        sent = []
+        aioresponse.put(SEND_URL, payload={"event_id": "$sent"})
+
+        async def send(_room, event):
+            if event.event_id != "$gap":
+                return
+            sent.append(
+                await client.room_send(
+                    ROOM_A,
+                    "m.room.message",
+                    {"body": "reply", "msgtype": "m.text"},
+                    "tx",
+                )
+            )
+
+        client.add_event_callback(send, RoomMessageText)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            callback=Pages(
+                {
+                    "s1": messages(
+                        [text_event("$gap", 2), text_event("$held", 3)],
+                        "p1",
+                    )
+                }
+            ),
+            repeat=True,
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+
+        assert [response.event_id for response in sent] == ["$sent"]
+        assert not client._recovery.gaps
+
+    async def test_recovery_callback_cannot_bypass_another_room_gap(self, client):
+        task = asyncio.current_task()
+        assert task is not None
+        client._recovery._active_dispatches[(ROOM_A, "$active", "timeline")] = task
+        client._recovery.gaps[ROOM_B] = [RecoveryGap(ROOM_B, 1, "target", "cursor")]
+        try:
+            with pytest.raises(SendRetryError, match="recovery is still pending"):
+                await client.room_send(
+                    ROOM_B,
+                    "m.room.message",
+                    {"body": "unsafe", "msgtype": "m.text"},
+                )
+        finally:
+            client._recovery._active_dispatches.clear()
+            client._recovery.gaps.clear()
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_live_callback_can_send_without_recovery_gap(
         self, client, aioresponse, protocol
