@@ -6,10 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Add a startup-only `AsyncClient.rewind_sync_recovery_for_startup()` operation for aligning nio's persisted Classic Sync cursor with an application-supplied trusted checkpoint.
-  The operation atomically clears recovery state and invalidated Sliding Sync window tokens so replay from the checkpoint is the sole ordering authority, including when the stored cursor is equal or the supplied cursor is absent.
-  Passing no cursor explicitly chooses a cold rebuild and accepts that a pre-admission event omitted from the initial sync cannot be recovered.
-  Events above a checkpoint are admitted again when replay returns them, so admission callbacks must be idempotent.
+- Add `AsyncClient.reset_classic_sync_state()` for applications that disable nio sync persistence and durably own the Classic Sync checkpoint.
+  The operation drains started callbacks and clears transient response, room, recovery, and replay-suppression state so the application can replay from its committed cursor.
+- Add `AsyncClient.clear_persisted_sync_recovery()` for removing legacy cursor, recovery, and Sliding Sync window rows when migrating to application-owned Classic Sync.
 
 ## 0.34.1
 

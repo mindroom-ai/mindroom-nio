@@ -600,15 +600,12 @@ class MatrixStore:
         return None
 
     @use_database_atomic
-    def _rewind_sync_recovery(self, token: str | None) -> None:
-        """Replace the cursor and clear its recovery lane atomically."""
+    def _clear_sync_recovery(self) -> None:
+        """Clear the persisted sync cursor and recovery lane atomically."""
         account = self._get_account()
         assert account
 
-        if token is None:
-            SyncTokens.delete().where(SyncTokens.account == account).execute()
-        else:
-            SyncTokens.replace(account=account, token=token).execute()
+        SyncTokens.delete().where(SyncTokens.account == account).execute()
         PendingTimelineEvents.delete().where(
             PendingTimelineEvents.account == account
         ).execute()

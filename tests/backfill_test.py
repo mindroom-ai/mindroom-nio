@@ -341,124 +341,11 @@ async def client(tempdir):
 
 @pytest.mark.asyncio
 class TestRoomLocalRecovery:
-    async def test_rewind_sync_recovery_for_startup_clears_and_replays_work(
-        self,
-        tempdir,
-        aioresponse,
-        monkeypatch,
-    ):
-        config = AsyncClientConfig(
-            backfill_limited_timelines=True,
-            store_sync_tokens=True,
-        )
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=config,
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        gap = RecoveryGap(ROOM_A, 1, "", None)
-        earlier = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            0,
-            name_event("$earlier", 1, "Earlier"),
-            True,
-        )
-        later = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            1,
-            name_event("$later", 2, "Later"),
-            True,
-        )
-        assert earlier is not None
-        assert later is not None
-        later = replace(
-            later,
-            is_live=False,
-            provenance=TimelineEventProvenance.HISTORY,
-            apply_room_state=False,
-        )
-        client.store.save_recovery(
-            "s_advanced",
-            set(),
-            [gap],
-            [earlier, later],
-            None,
-        )
-        client.store.accept_recovery_event(ROOM_A, 1, "$later")
-        client.store.finish_recovery(ROOM_A, 1, "$earlier", False)
-        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
-        record_completed_timeline_event(
-            client._recovery,
-            ROOM_B,
-            "$stale",
-            False,
-            TimelineEventProvenance.LIVE,
-        )
-        client._sliding_room_prev_batch[ROOM_B] = window_token("w2")
-
-        def fail_after_commit():
-            raise AssertionError("startup rewind must not read after committing")
-
-        monkeypatch.setattr(client.store, "load_sync_recovery", fail_after_commit)
-        client.rewind_sync_recovery_for_startup("s_safe")
-        monkeypatch.undo()
-
-        assert client.loaded_sync_token == "s_safe"
-        assert client.next_batch == ""
-        assert client.store.load_sync_token() == "s_safe"
-        assert client.store.load_sync_recovery() == ([], [])
-        assert not client._recovery.gaps
-        assert not client._recovery.events
-        assert not client._recovery.completed
-        assert client._sliding_room_prev_batch == {}
-        assert client.store.load_sliding_window_tokens() == {}
-        seen = record_events(client, RoomNameEvent)
-        admissions = record_admissions(client, RoomNameEvent)
-
-        requested: list[str | None] = []
-
-        def replay_sync(url, **kwargs):
-            requested.append(parse_qs(urlparse(str(url)).query).get("since", [None])[0])
-            return CallbackResult(
-                status=200,
-                payload=sync_json(
-                    "s_safe",
-                    {
-                        ROOM_A: room_info(
-                            [
-                                name_event("$earlier", 1, "Earlier"),
-                                name_event("$later", 2, "Later"),
-                            ],
-                            limited=False,
-                            prev_batch="p0",
-                            state=[name_event("$baseline", 0, "Baseline")],
-                        )
-                    },
-                ),
-            )
-
-        aioresponse.get(SYNC_URL, callback=replay_sync)
-        await client.sync(full_state=True)
-
-        assert requested == ["s_safe"]
-        assert admissions == [
-            ("$earlier", TimelineEventProvenance.LIVE),
-            ("$later", TimelineEventProvenance.LIVE),
-        ]
-        assert seen == ["$earlier", "$later"]
-        assert client.rooms[ROOM_A].name == "Later"
-        await client.close()
-
-    async def test_rewind_sync_recovery_for_startup_clears_tokenless_work(
+    async def test_reset_classic_sync_state_replays_from_a_clean_in_memory_world(
         self,
         tempdir,
     ):
+        """An application-owned cursor can replay without nio marker suppression."""
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
@@ -466,221 +353,53 @@ class TestRoomLocalRecovery:
             tempdir,
             config=AsyncClientConfig(
                 backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        gap = RecoveryGap(ROOM_A, 1, "", None)
-        unaccepted = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            0,
-            text_event("$unaccepted", 1),
-            True,
-        )
-        accepted = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            1,
-            text_event("$accepted", 2),
-            True,
-        )
-        assert unaccepted is not None
-        assert accepted is not None
-        client.store.save_recovery(
-            "s_equal",
-            set(),
-            [gap],
-            [unaccepted, accepted],
-            None,
-        )
-        client.store.accept_recovery_event(ROOM_A, 1, "$accepted")
-        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
-
-        client.rewind_sync_recovery_for_startup(None)
-
-        gaps, events = client.store.load_sync_recovery()
-        assert gaps == []
-        assert events == []
-        assert client._recovery.events == {}
-        assert client.store.load_sliding_window_tokens() == {}
-        admissions = record_admissions(client, RoomMessageText)
-
-        await client.receive_response(
-            sync_response(
-                "s_after",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$newer", 3)],
-                        limited=True,
-                        prev_batch="p0",
-                    )
-                },
-            )
-        )
-
-        assert [event_id for event_id, _provenance in admissions] == ["$newer"]
-        await client.close()
-
-    async def test_tokenless_rewind_replays_overlap_in_server_order(
-        self,
-        tempdir,
-    ):
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        earlier = name_event("$earlier", 1, "Earlier")
-        later = name_event("$later", 2, "Later")
-        pending_earlier = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            0,
-            earlier,
-            True,
-        )
-        pending_later = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            1,
-            later,
-            True,
-        )
-        assert pending_earlier is not None
-        assert pending_later is not None
-        client.store.save_recovery(
-            "s_rejected",
-            set(),
-            [RecoveryGap(ROOM_A, 1, "", None)],
-            [pending_earlier, pending_later],
-            None,
-        )
-        client.store.finish_recovery(ROOM_A, 1, "$earlier", False)
-
-        client.rewind_sync_recovery_for_startup(None)
-
-        seen = record_events(client, RoomNameEvent)
-        await client.receive_response(
-            sync_response(
-                "s_rebuilt",
-                {
-                    ROOM_A: room_info(
-                        [earlier, later],
-                        limited=True,
-                        prev_batch="p0",
-                        state=[earlier],
-                    )
-                },
-            )
-        )
-
-        assert seen == ["$earlier", "$later"]
-        assert client.rooms[ROOM_A].name == "Later"
-        await client.close()
-
-    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
-    async def test_rewind_sync_recovery_for_startup_rejects_processed_response(
-        self,
-        tempdir,
-        protocol,
-    ):
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        client.store.save_sync_token("s_advanced")
-        response = (
-            sync_response("s_seen", {})
-            if protocol == "classic"
-            else SlidingSyncResponse.from_dict({"pos": "slide_seen", "rooms": {}})
-        )
-
-        await client.receive_response(response)
-        completed = PendingTimelineEvent.from_event(
-            ROOM_A,
-            1,
-            0,
-            text_event("$completed", 1),
-            True,
-        )
-        assert completed is not None
-        client.store.save_recovery(
-            client.store.load_sync_token(),
-            set(),
-            [],
-            [completed],
-            None,
-        )
-        client.store.finish_recovery(ROOM_A, 1, completed.event_id, False)
-        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
-        expected = (
-            client.loaded_sync_token,
-            client.next_batch,
-            client.store.load_sync_token(),
-            client.store.load_sync_recovery(),
-            client.store.load_sliding_window_tokens(),
-        )
-
-        with pytest.raises(LocalProtocolError, match="before sync starts"):
-            client.rewind_sync_recovery_for_startup("s_safe")
-
-        assert (
-            client.loaded_sync_token,
-            client.next_batch,
-            client.store.load_sync_token(),
-            client.store.load_sync_recovery(),
-            client.store.load_sliding_window_tokens(),
-        ) == expected
-        await client.close()
-
-    async def test_rewind_sync_recovery_for_startup_rejects_external_token_owner(
-        self,
-        tempdir,
-    ):
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
                 store_sync_tokens=False,
-                backfill_persist_recovery=True,
             ),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        assert client.store.load_sync_token() is None
+        seen = record_events(client, RoomNameEvent)
+        client.next_batch = "s_committed"
 
-        with pytest.raises(LocalProtocolError, match="store_sync_tokens"):
-            client.rewind_sync_recovery_for_startup("s_safe")
+        response = sync_response(
+            "s_uncommitted",
+            {
+                ROOM_A: room_info(
+                    [name_event("$later", 2, "Later")],
+                    limited=False,
+                    prev_batch="p0",
+                    state=[name_event("$baseline", 1, "Baseline")],
+                )
+            },
+        )
+        await client.receive_response(response)
 
-        assert client.store.load_sync_token() is None
-        assert client.loaded_sync_token == ""
+        assert seen == ["$later"]
+        assert "$later" in client._recovery.completed[ROOM_A]
+        assert client.rooms[ROOM_A].name == "Later"
+
+        await client.reset_classic_sync_state()
+
         assert client.next_batch == ""
+        assert client.loaded_sync_token == ""
+        assert client.rooms == {}
+        assert client.invited_rooms == {}
+        assert client._recovery.completed == {}
+        assert client._recovery.events == {}
+        assert client._recovery.gaps == {}
+
+        client.next_batch = "s_committed"
+        await client.receive_response(response)
+
+        assert seen == ["$later", "$later"]
+        assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
-    async def test_rewind_sync_recovery_for_startup_rejects_issued_request(
+    async def test_reset_classic_sync_state_drains_started_dispatches(
         self,
         tempdir,
     ):
+        """Reset never discards callback work that has already started."""
         client = AsyncClient(
             "https://example.org",
             OWN_ID,
@@ -688,48 +407,92 @@ class TestRoomLocalRecovery:
             tempdir,
             config=AsyncClientConfig(
                 backfill_limited_timelines=True,
-                store_sync_tokens=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
             ),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        client.store.save_sync_token("s_advanced")
-        request_id = issue_sync_request(client._sync_reset_fence, "classic")
-        finish_sync_request(client._sync_reset_fence, request_id)
+        release = asyncio.Event()
 
-        with pytest.raises(LocalProtocolError, match="before sync starts"):
-            client.rewind_sync_recovery_for_startup("s_safe")
+        async def wait_for_release() -> None:
+            await release.wait()
 
-        assert client.store.load_sync_token() == "s_advanced"
-        await client.close()
-
-    async def test_rewind_sync_recovery_for_startup_rejects_active_dispatch(
-        self,
-        tempdir,
-    ):
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        assert client.store
-        client.store.save_sync_token("s_advanced")
-        dispatch = asyncio.create_task(asyncio.Event().wait())
+        dispatch = asyncio.create_task(wait_for_release())
         client._recovery._active_dispatches[(ROOM_A, "$pending", "timeline")] = dispatch
-        try:
-            with pytest.raises(LocalProtocolError, match="before sync starts"):
-                client.rewind_sync_recovery_for_startup("s_safe")
-            assert client.store.load_sync_token() == "s_advanced"
-        finally:
-            client._recovery._active_dispatches.clear()
-            dispatch.cancel()
-            await asyncio.gather(dispatch, return_exceptions=True)
+
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+
+        assert not reset.done()
+        release.set()
+        await reset
+        assert dispatch.done()
+        assert client._recovery._active_dispatches == {}
+        await client.close()
+
+    async def test_reset_classic_sync_state_rejects_a_durable_recovery_lane(
+        self,
+        tempdir,
+    ):
+        """A reset cannot hide rows owned by nio's persisted recovery lane."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        with pytest.raises(LocalProtocolError, match="persisted recovery"):
+            await client.reset_classic_sync_state()
+
+        await client.close()
+
+    async def test_clear_persisted_sync_recovery_removes_cross_mode_residue(
+        self,
+        tempdir,
+    ):
+        """Classic startup can discard rows left by an earlier persisted lane."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        pending = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            text_event("$stale", 1),
+            True,
+        )
+        assert pending is not None
+        client.store.save_recovery(
+            "s_stale",
+            set(),
+            [RecoveryGap(ROOM_A, 1, "p0", None)],
+            [pending],
+            None,
+        )
+        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
+
+        client.clear_persisted_sync_recovery()
+
+        assert client.store.load_sync_token() is None
+        assert client.store.load_sync_recovery() == ([], [])
+        assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 
     async def test_deferred_callback_error_surfaces_without_recovery_gap(self, client):

@@ -754,70 +754,110 @@ class AsyncClient(Client):
             )
             self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
 
-    def rewind_sync_recovery_for_startup(self, token: str | None) -> None:
-        """Align persisted sync recovery with a trusted Classic Sync cursor.
+    def clear_persisted_sync_recovery(self) -> None:
+        """Remove durable sync residue before application-owned Classic Sync.
 
-        This operation is only valid after the store is loaded and before this
-        client issues or processes any Classic or Sliding Sync operation. It
-        replaces the stored sync token, or deletes it when ``token`` is
-        ``None``, installs that token as the startup request cursor, and clears
-        the marker for the last applied Classic Sync response.
-
-        Recovery gaps, pending events, completed-event markers, and Sliding
-        Sync window tokens are removed so replay has one ordering authority,
-        including when the stored cursor is equal or the supplied cursor is
-        ``None``. The caller must guarantee that a non-null trusted cursor
-        predates every discarded event. Passing ``None`` explicitly chooses a
-        cold rebuild and accepts that a pre-admission event omitted from the
-        initial sync cannot be recovered. Admission callbacks must be idempotent
-        for replayed work.
-
-        ``backfill_limited_timelines`` and ``store_sync_tokens`` must both be
-        enabled, recovery persistence must resolve to enabled, and the client
-        store must already be loaded.
-
-        Args:
-            token (str | None): The trusted Classic Sync ``next_batch`` token,
-                or ``None`` to restart without a persisted cursor.
+        This is a startup migration boundary for clients that disable both nio
+        token storage and recovery persistence. It prevents rows left by an
+        earlier persisted or Sliding lane from becoming authoritative if that
+        lane is enabled again after a Classic run.
 
         Raises:
-            LocalProtocolError: If persistence is not configured and loaded,
-                or if sync or recovery activity has already started.
+            LocalProtocolError: If the store is unavailable, nio still owns
+                durable sync state, or sync processing has already started.
         """
-        if not self.config.store_sync_tokens:
+        if self.config.store_sync_tokens or self._recovery_store is not None:
             raise LocalProtocolError(
-                "Sync recovery rewind requires store_sync_tokens=True."
+                "Persisted sync recovery can only be cleared when nio sync persistence is disabled."
             )
-        store = self._recovery_store
+        store = self.store
         if store is None:
             raise LocalProtocolError(
-                "Persisted sync recovery must be loaded before it can be rewound."
+                "Persisted sync recovery can only be cleared after the store is loaded."
             )
         if (
             self._closing
-            or self._sync_reset_fence.request_id
             or self._sync_response_seen
             or self._sync_response_lock.locked()
             or self._active_sync_executor_token is not None
+            or self._sync_reset_fence.active_request_ids
             or self._recovery._active_dispatches
-            or self._recovery._dispatch_waiters
-            or self._recovery._deferred_dispatch_errors
             or self.rooms
             or self.invited_rooms
         ):
             raise LocalProtocolError(
-                "Sync recovery can only be rewound before sync starts."
+                "Persisted sync recovery can only be cleared before sync starts."
+            )
+        store._clear_sync_recovery()
+
+    async def reset_classic_sync_state(self) -> None:
+        """Discard uncommitted Classic Sync state owned only in memory.
+
+        Applications that durably own the Classic Sync checkpoint can disable
+        nio's token and recovery persistence, process one response, and advance
+        their checkpoint only after every required side effect succeeds. If the
+        response is rejected, this method drains callbacks that already started
+        and restores a clean in-memory world for replay from that checkpoint.
+
+        The caller must stop issuing sync-family requests before resetting and
+        must install its committed cursor in ``next_batch`` afterwards. Olm and
+        encrypted-room persistence are retained because they are replay-safe
+        transport state rather than Classic ingress position.
+
+        Raises:
+            LocalProtocolError: If nio owns durable sync state, a sync-family
+                request or response is active, or the reset is called from a
+                serialized timeline callback.
+            Exception: The first retained callback failure encountered while
+                draining work that had already started.
+        """
+        caller = asyncio.current_task()
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Classic Sync reset requires backfill_limited_timelines=True."
+            )
+        if self.config.store_sync_tokens or self._recovery_store is not None:
+            raise LocalProtocolError(
+                "Classic Sync reset requires token and persisted recovery ownership to be disabled."
+            )
+        if is_recovery_dispatch_task(self._recovery, caller) or (
+            self._active_sync_executor_token is not None
+            and self._sync_executor_context.get() is self._active_sync_executor_token
+        ):
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset from a timeline callback."
+            )
+        if (
+            self._closing
+            or self._sync_response_lock.locked()
+            or self._active_sync_executor_token is not None
+            or self._sync_reset_fence.active_request_ids
+        ):
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset while sync work is active."
             )
 
-        recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
-        store._rewind_sync_recovery(token)
-        self._recovery = recovery
-        self._recovery_room_gates.clear()
-        self._sliding_room_prev_batch.clear()
-        self._pending_sliding_room_account_data.clear()
-        self._sliding_sync_to_device_since = None
-        self.loaded_sync_token = token or ""
-        self.next_batch = ""
+        self._sync_generation = _SyncGeneration()
+        self._stop_sync_forever = False
+
+        async def reset() -> None:
+            async with self._sync_response_lock:
+                try:
+                    await drain_recovery_dispatches(self._recovery)
+                finally:
+                    self._recovery = RecoveryState(
+                        max_held_events=self.config.backfill_max_events
+                    )
+                    self._recovery_room_gates.clear()
+                    self._sliding_room_prev_batch.clear()
+                    self._pending_sliding_room_account_data.clear()
+                    self._sliding_sync_to_device_since = None
+                    self.loaded_sync_token = ""
+                    self.next_batch = ""
+                    self.rooms.clear()
+                    self.invited_rooms.clear()
+
+        await _run_to_completion(reset())
 
     def add_response_callback(
         self,

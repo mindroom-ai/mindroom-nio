@@ -634,11 +634,9 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
-    @pytest.mark.parametrize("target_token", ["s_safe", "s_advanced", None])
-    def test_rewind_sync_recovery_for_startup_clears_recovery_at_checkpoint(
+    def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
         self,
         sqlstore,
-        target_token,
     ):
         gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
 
@@ -671,18 +669,18 @@ class TestClass:
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
         )
 
-        sqlstore._rewind_sync_recovery(target_token)
+        sqlstore._clear_sync_recovery()
 
         reopened = SqliteStore(
             sqlstore.user_id,
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened.load_sync_token() == target_token
+        assert reopened.load_sync_token() is None
         assert reopened.load_sync_recovery() == ([], [])
         assert reopened.load_sliding_window_tokens() == {}
 
-    def test_rewind_sync_recovery_for_startup_is_atomic(
+    def test_clear_sync_recovery_is_atomic(
         self,
         sqlstore,
         monkeypatch,
@@ -713,7 +711,7 @@ class TestClass:
         monkeypatch.setattr(sqlstore.database, "execute_sql", fail_window_delete)
 
         with pytest.raises(RuntimeError, match="window delete failed"):
-            sqlstore._rewind_sync_recovery("s_safe")
+            sqlstore._clear_sync_recovery()
 
         assert sqlstore.load_sync_token() == "s_advanced"
         _, events = sqlstore.load_sync_recovery()
