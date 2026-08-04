@@ -449,6 +449,81 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
+    @pytest.mark.parametrize("target_token", ["s_equal", None])
+    async def test_rewind_sync_recovery_for_startup_retains_unaccepted_work(
+        self,
+        tempdir,
+        target_token,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        gap = RecoveryGap(ROOM_A, 1, "", None)
+        unaccepted = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            text_event("$unaccepted", 1),
+            True,
+        )
+        accepted = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            1,
+            text_event("$accepted", 2),
+            True,
+        )
+        assert unaccepted is not None
+        assert accepted is not None
+        client.store.save_recovery(
+            "s_equal",
+            set(),
+            [gap],
+            [unaccepted, accepted],
+            None,
+        )
+        client.store.accept_recovery_event(ROOM_A, 1, "$accepted")
+        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
+
+        client.rewind_sync_recovery_for_startup(target_token)
+
+        gaps, events = client.store.load_sync_recovery()
+        assert [(item.room_id, item.generation) for item in gaps] == [(ROOM_A, 1)]
+        assert [item.event_id for item in events] == ["$unaccepted"]
+        assert [item.event_id for item in client._recovery.events[(ROOM_A, 1)]] == [
+            "$unaccepted"
+        ]
+        assert client.store.load_sliding_window_tokens() == {}
+        admissions = record_admissions(client, RoomMessageText)
+
+        await client.receive_response(
+            sync_response(
+                "s_after",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$newer", 3)],
+                        limited=target_token is None,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+
+        assert [event_id for event_id, _provenance in admissions] == [
+            "$unaccepted",
+            "$newer",
+        ]
+        await client.close()
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_rewind_sync_recovery_for_startup_rejects_processed_response(
         self,

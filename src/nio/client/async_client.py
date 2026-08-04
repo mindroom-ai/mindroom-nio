@@ -763,10 +763,13 @@ class AsyncClient(Client):
         ``None``, installs that token as the startup request cursor, and clears
         the marker for the last applied Classic Sync response.
 
-        Recovery gaps, pending events, completed-event markers, and Sliding
-        Sync window tokens are removed so replay has one ordering authority:
-        the trusted cursor. Events above that cursor are admitted again when
-        replay returns them, so admission callbacks must be idempotent.
+        A different non-null cursor discards recovery gaps, pending events,
+        completed-event markers, and Sliding Sync window tokens so replay has
+        one ordering authority. Reusing the stored cursor or restarting without
+        one retains only unaccepted events and unfinished recovery walks because
+        those events are not guaranteed to appear after that position. Accepted
+        work, completed-event markers, and Sliding Sync window tokens are always
+        cleared. Admission callbacks must be idempotent for replayed work.
 
         ``backfill_limited_timelines`` and ``store_sync_tokens`` must both be
         enabled, recovery persistence must resolve to enabled, and the client
@@ -807,6 +810,8 @@ class AsyncClient(Client):
 
         store._rewind_sync_recovery(token)
         recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
+        gaps, events = store.load_sync_recovery()
+        load_recovery_state(recovery, gaps, events)
         self._recovery = recovery
         self._recovery_room_gates.clear()
         self._sliding_room_prev_batch.clear()
