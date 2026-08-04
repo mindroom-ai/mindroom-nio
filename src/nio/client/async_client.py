@@ -753,6 +753,39 @@ class AsyncClient(Client):
             )
             self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
 
+    def rewind_sync_recovery_for_startup(self, token: str | None) -> None:
+        """Rewind persisted sync recovery before this client starts syncing."""
+        store = self._recovery_store
+        if store is None:
+            raise LocalProtocolError(
+                "Persisted sync recovery must be loaded before it can be rewound."
+            )
+        if (
+            self._closing
+            or self._sync_reset_fence.request_id
+            or self._sync_response_lock.locked()
+            or self._active_sync_executor_token is not None
+            or self._recovery._active_dispatches
+            or self._recovery._dispatch_waiters
+            or self._recovery._deferred_dispatch_errors
+            or self.rooms
+            or self.invited_rooms
+        ):
+            raise LocalProtocolError(
+                "Sync recovery can only be rewound before sync starts."
+            )
+
+        store.rewind_sync_recovery_for_startup(token)
+        recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
+        load_recovery_state(recovery, *store.load_sync_recovery())
+        self._recovery = recovery
+        self._recovery_room_gates.clear()
+        self._sliding_room_prev_batch.clear()
+        self._pending_sliding_room_account_data.clear()
+        self._sliding_sync_to_device_since = None
+        self.loaded_sync_token = token or ""
+        self.next_batch = token or ""
+
     def add_response_callback(
         self,
         func: Coroutine[Any, Any, Response],

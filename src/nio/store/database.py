@@ -599,6 +599,24 @@ class MatrixStore:
 
         return None
 
+    @use_database_atomic
+    def rewind_sync_recovery_for_startup(self, token: str | None) -> None:
+        """Rewind the transport cursor without dropping unsettled callbacks."""
+        account = self._get_account()
+        assert account
+
+        if token is None:
+            SyncTokens.delete().where(SyncTokens.account == account).execute()
+        else:
+            SyncTokens.replace(account=account, token=token).execute()
+        PendingTimelineEvents.delete().where(
+            PendingTimelineEvents.account == account,
+            PendingTimelineEvents.generation == 0,
+        ).execute()
+        SlidingWindowTokens.delete().where(
+            SlidingWindowTokens.account == account,
+        ).execute()
+
     @staticmethod
     def _restore_completed_markers(account, *conditions) -> None:
         PendingTimelineEvents.update(

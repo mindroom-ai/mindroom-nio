@@ -634,6 +634,106 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
+    @pytest.mark.parametrize("target_token", ["s_safe", None])
+    def test_rewind_sync_recovery_for_startup_preserves_unsettled_rows(
+        self,
+        sqlstore,
+        target_token,
+    ):
+        gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
+
+        def pending(event_id, sequence):
+            return PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                sequence,
+                event_id,
+                '{"content":{},"event_id":"%s","sender":"@a:b",'
+                '"type":"m.test"}' % event_id,
+                True,
+                False,
+            )
+
+        sqlstore.save_recovery(
+            "s_advanced",
+            set(),
+            [gap],
+            [
+                pending("$accepted", 0),
+                pending("$unaccepted", 1),
+                pending("$completed", 2),
+            ],
+            None,
+        )
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
+        sqlstore.save_sliding_window_tokens(
+            {TEST_ROOM: SlidingWindowToken("w1", "$join")}
+        )
+
+        sqlstore.rewind_sync_recovery_for_startup(target_token)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened.load_sync_token() == target_token
+        gaps, events = reopened.load_sync_recovery()
+        assert [
+            (item.room_id, item.generation, item.target_token, item.cursor_token)
+            for item in gaps
+        ] == [(TEST_ROOM, 1, "s_advanced", "s_cursor")]
+        assert [
+            (item.event_id, item.generation, item.admission_accepted) for item in events
+        ] == [
+            ("$accepted", 1, True),
+            ("$unaccepted", 1, False),
+        ]
+        assert reopened.load_sliding_window_tokens() == {}
+
+    def test_rewind_sync_recovery_for_startup_is_atomic(
+        self,
+        sqlstore,
+        monkeypatch,
+    ):
+        gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$completed",
+            '{"content":{},"event_id":"$completed","sender":"@a:b",' '"type":"m.test"}',
+            True,
+            False,
+        )
+        sqlstore.save_recovery("s_advanced", set(), [gap], [event], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
+        sqlstore.save_sliding_window_tokens(
+            {TEST_ROOM: SlidingWindowToken("w1", "$join")}
+        )
+        original_execute = sqlstore.database.execute_sql
+        window_table = SlidingWindowTokens._meta.table_name
+
+        def fail_window_delete(sql, *args, **kwargs):
+            if sql.startswith(f'DELETE FROM "{window_table}"'):
+                raise RuntimeError("window delete failed")
+            return original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(sqlstore.database, "execute_sql", fail_window_delete)
+
+        with pytest.raises(RuntimeError, match="window delete failed"):
+            sqlstore.rewind_sync_recovery_for_startup("s_safe")
+
+        assert sqlstore.load_sync_token() == "s_advanced"
+        _, events = sqlstore.load_sync_recovery()
+        assert [(item.event_id, item.generation) for item in events] == [
+            ("$completed", 0)
+        ]
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w1", "$join")
+        }
+
     def test_sync_recovery_resequences_existing_generation(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
 
