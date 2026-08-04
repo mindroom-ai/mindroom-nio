@@ -635,7 +635,7 @@ class TestClass:
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
     @pytest.mark.parametrize("target_token", ["s_safe", None])
-    def test_rewind_sync_recovery_for_startup_preserves_unsettled_rows(
+    def test_rewind_sync_recovery_for_startup_clears_recovery_state(
         self,
         sqlstore,
         target_token,
@@ -679,17 +679,7 @@ class TestClass:
             sqlstore.store_path,
         )
         assert reopened.load_sync_token() == target_token
-        gaps, events = reopened.load_sync_recovery()
-        assert [
-            (item.room_id, item.generation, item.target_token, item.cursor_token)
-            for item in gaps
-        ] == [(TEST_ROOM, 1, "s_advanced", "s_cursor")]
-        assert [
-            (item.event_id, item.generation, item.admission_accepted) for item in events
-        ] == [
-            ("$accepted", 1, True),
-            ("$unaccepted", 1, False),
-        ]
+        assert reopened.load_sync_recovery() == ([], [])
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_rewind_sync_recovery_for_startup_is_atomic(

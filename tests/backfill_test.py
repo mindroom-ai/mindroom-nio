@@ -272,13 +272,16 @@ class Pages:
         return CallbackResult(status=200, payload=self.pages[start])
 
 
-def record_events(client: AsyncClient) -> list[str]:
+def record_events(
+    client: AsyncClient,
+    event_filter: type[Event] | tuple[type[Event], ...] = RoomMessageText,
+) -> list[str]:
     seen: list[str] = []
 
     async def callback(_room, event):
         seen.append(event.event_id)
 
-    client.add_event_callback(callback, RoomMessageText)
+    client.add_event_callback(callback, event_filter)
     return seen
 
 
@@ -338,7 +341,7 @@ async def client(tempdir):
 
 @pytest.mark.asyncio
 class TestRoomLocalRecovery:
-    async def test_rewind_sync_recovery_for_startup_reloads_and_deduplicates_work(
+    async def test_rewind_sync_recovery_for_startup_clears_and_replays_work(
         self,
         tempdir,
         aioresponse,
@@ -357,30 +360,37 @@ class TestRoomLocalRecovery:
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         assert client.store
         gap = RecoveryGap(ROOM_A, 1, "", None)
-        pending = PendingTimelineEvent.from_event(
+        earlier = PendingTimelineEvent.from_event(
             ROOM_A,
             1,
             0,
-            text_event("$pending", 1),
+            name_event("$earlier", 1, "Earlier"),
             True,
         )
-        completed = PendingTimelineEvent.from_event(
+        later = PendingTimelineEvent.from_event(
             ROOM_A,
             1,
             1,
-            text_event("$completed", 2),
+            name_event("$later", 2, "Later"),
             True,
         )
-        assert pending is not None
-        assert completed is not None
+        assert earlier is not None
+        assert later is not None
+        later = replace(
+            later,
+            is_live=False,
+            provenance=TimelineEventProvenance.HISTORY,
+            apply_room_state=False,
+        )
         client.store.save_recovery(
             "s_advanced",
             set(),
             [gap],
-            [pending, completed],
+            [earlier, later],
             None,
         )
-        client.store.finish_recovery(ROOM_A, 1, "$completed", False)
+        client.store.accept_recovery_event(ROOM_A, 1, "$later")
+        client.store.finish_recovery(ROOM_A, 1, "$earlier", False)
         client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
         record_completed_timeline_event(
             client._recovery,
@@ -396,17 +406,14 @@ class TestRoomLocalRecovery:
         assert client.loaded_sync_token == "s_safe"
         assert client.next_batch == ""
         assert client.store.load_sync_token() == "s_safe"
-        gaps, events = client.store.load_sync_recovery()
-        assert [(item.room_id, item.generation) for item in gaps] == [(ROOM_A, 1)]
-        assert [(item.event_id, item.generation) for item in events] == [
-            ("$pending", 1)
-        ]
-        assert list(client._recovery.gaps) == [ROOM_A]
-        assert list(client._recovery.events) == [(ROOM_A, 1)]
+        assert client.store.load_sync_recovery() == ([], [])
+        assert not client._recovery.gaps
+        assert not client._recovery.events
         assert not client._recovery.completed
         assert client._sliding_room_prev_batch == {}
         assert client.store.load_sliding_window_tokens() == {}
-        seen = record_events(client)
+        seen = record_events(client, RoomNameEvent)
+        admissions = record_admissions(client, RoomNameEvent)
 
         requested: list[str | None] = []
 
@@ -418,10 +425,13 @@ class TestRoomLocalRecovery:
                     "s_safe",
                     {
                         ROOM_A: room_info(
-                            [text_event("$pending", 1), text_event("$new", 2)],
+                            [
+                                name_event("$earlier", 1, "Earlier"),
+                                name_event("$later", 2, "Later"),
+                            ],
                             limited=False,
                             prev_batch="p0",
-                            state=[name_event("$name", 0, "Replay room")],
+                            state=[name_event("$baseline", 0, "Baseline")],
                         )
                     },
                 ),
@@ -431,8 +441,12 @@ class TestRoomLocalRecovery:
         await client.sync(full_state=True)
 
         assert requested == ["s_safe"]
-        assert seen == ["$pending", "$new"]
-        assert client.rooms[ROOM_A].name == "Replay room"
+        assert admissions == [
+            ("$earlier", TimelineEventProvenance.LIVE),
+            ("$later", TimelineEventProvenance.LIVE),
+        ]
+        assert seen == ["$earlier", "$later"]
+        assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])

@@ -601,7 +601,7 @@ class MatrixStore:
 
     @use_database_atomic
     def _rewind_sync_recovery(self, token: str | None) -> None:
-        """Rewind the transport cursor without dropping unsettled callbacks."""
+        """Rewind the transport cursor and discard recovery past it."""
         account = self._get_account()
         assert account
 
@@ -610,9 +610,9 @@ class MatrixStore:
         else:
             SyncTokens.replace(account=account, token=token).execute()
         PendingTimelineEvents.delete().where(
-            PendingTimelineEvents.account == account,
-            PendingTimelineEvents.generation == 0,
+            PendingTimelineEvents.account == account
         ).execute()
+        SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
         SlidingWindowTokens.delete().where(
             SlidingWindowTokens.account == account,
         ).execute()
