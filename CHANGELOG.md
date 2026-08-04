@@ -2,12 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.34.1
+## Unreleased
 
 ### Features
 
 - Add a startup-only `AsyncClient.rewind_sync_recovery_for_startup()` operation for aligning nio's persisted Classic Sync cursor with an application-supplied trusted checkpoint.
   The operation preserves unsettled callback work while clearing completed-event markers and invalidated Sliding Sync window tokens.
+
+## 0.34.1
 
 ### Bug Fixes
 
