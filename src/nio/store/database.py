@@ -605,41 +605,10 @@ class MatrixStore:
         account = self._get_account()
         assert account
 
-        stored = SyncTokens.get_or_none(SyncTokens.account == account)
-        preserve_unaccepted = token is None or (
-            stored is not None and stored.token == token
-        )
-
         if token is None:
             SyncTokens.delete().where(SyncTokens.account == account).execute()
         else:
             SyncTokens.replace(account=account, token=token).execute()
-        if preserve_unaccepted:
-            PendingTimelineEvents.delete().where(
-                PendingTimelineEvents.account == account,
-                (PendingTimelineEvents.generation == 0)
-                | PendingTimelineEvents.admission_accepted,
-            ).execute()
-            pending_generations = {
-                (row.room_id, row.generation)
-                for row in PendingTimelineEvents.select(
-                    PendingTimelineEvents.room_id,
-                    PendingTimelineEvents.generation,
-                ).where(PendingTimelineEvents.account == account)
-            }
-            for gap in SyncRecoveryGaps.select().where(
-                SyncRecoveryGaps.account == account
-            ):
-                if (
-                    gap.cursor_token is None
-                    and (
-                        gap.room_id,
-                        gap.generation,
-                    )
-                    not in pending_generations
-                ):
-                    gap.delete_instance()
-        else:
             PendingTimelineEvents.delete().where(
                 PendingTimelineEvents.account == account
             ).execute()

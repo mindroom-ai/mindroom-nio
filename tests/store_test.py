@@ -634,9 +634,11 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
-    def test_rewind_sync_recovery_for_startup_clears_recovery_after_rollback(
+    @pytest.mark.parametrize("target_token", ["s_safe", "s_advanced"])
+    def test_rewind_sync_recovery_for_startup_clears_recovery_at_checkpoint(
         self,
         sqlstore,
+        target_token,
     ):
         gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
 
@@ -669,22 +671,20 @@ class TestClass:
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
         )
 
-        sqlstore._rewind_sync_recovery("s_safe")
+        sqlstore._rewind_sync_recovery(target_token)
 
         reopened = SqliteStore(
             sqlstore.user_id,
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened.load_sync_token() == "s_safe"
+        assert reopened.load_sync_token() == target_token
         assert reopened.load_sync_recovery() == ([], [])
         assert reopened.load_sliding_window_tokens() == {}
 
-    @pytest.mark.parametrize("target_token", ["s_advanced", None])
-    def test_rewind_sync_recovery_for_startup_retains_unaccepted_without_rollback(
+    def test_rewind_sync_recovery_for_startup_preserves_tokenless_recovery(
         self,
         sqlstore,
-        target_token,
     ):
         gap = RecoveryGap(TEST_ROOM, 1, "", None)
         cursor_room = "!cursor:example.org"
@@ -719,21 +719,26 @@ class TestClass:
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
         )
 
-        sqlstore._rewind_sync_recovery(target_token)
+        sqlstore._rewind_sync_recovery(None)
 
         reopened = SqliteStore(
             sqlstore.user_id,
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened.load_sync_token() == target_token
+        assert reopened.load_sync_token() is None
         gaps, events = reopened.load_sync_recovery()
         assert sorted((item.room_id, item.generation) for item in gaps) == [
             (cursor_room, 2),
             (TEST_ROOM, 1),
         ]
-        assert [item.event_id for item in events] == ["$unaccepted"]
-        assert not events[0].admission_accepted
+        assert sorted(
+            (item.event_id, item.generation, item.admission_accepted) for item in events
+        ) == [
+            ("$accepted", 1, True),
+            ("$completed", 0, False),
+            ("$unaccepted", 1, False),
+        ]
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_rewind_sync_recovery_for_startup_is_atomic(

@@ -763,13 +763,14 @@ class AsyncClient(Client):
         ``None``, installs that token as the startup request cursor, and clears
         the marker for the last applied Classic Sync response.
 
-        A different non-null cursor discards recovery gaps, pending events,
+        A non-null cursor discards recovery gaps, pending events,
         completed-event markers, and Sliding Sync window tokens so replay has
-        one ordering authority. Reusing the stored cursor or restarting without
-        one retains only unaccepted events and unfinished recovery walks because
-        those events are not guaranteed to appear after that position. Accepted
-        work, completed-event markers, and Sliding Sync window tokens are always
-        cleared. Admission callbacks must be idempotent for replayed work.
+        one ordering authority, even when the stored cursor is equal. The caller
+        must guarantee that the trusted cursor predates every discarded event.
+        Restarting without a cursor preserves the complete recovery lane because
+        an initial limited sync cannot replay it exhaustively, while still
+        clearing Sliding Sync window tokens. Admission callbacks must be
+        idempotent for replayed work.
 
         ``backfill_limited_timelines`` and ``store_sync_tokens`` must both be
         enabled, recovery persistence must resolve to enabled, and the client

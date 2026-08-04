@@ -449,11 +449,9 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
-    @pytest.mark.parametrize("target_token", ["s_equal", None])
-    async def test_rewind_sync_recovery_for_startup_retains_unaccepted_work(
+    async def test_rewind_sync_recovery_for_startup_preserves_tokenless_work(
         self,
         tempdir,
-        target_token,
     ):
         client = AsyncClient(
             "https://example.org",
@@ -494,13 +492,14 @@ class TestRoomLocalRecovery:
         client.store.accept_recovery_event(ROOM_A, 1, "$accepted")
         client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
 
-        client.rewind_sync_recovery_for_startup(target_token)
+        client.rewind_sync_recovery_for_startup(None)
 
         gaps, events = client.store.load_sync_recovery()
         assert [(item.room_id, item.generation) for item in gaps] == [(ROOM_A, 1)]
-        assert [item.event_id for item in events] == ["$unaccepted"]
+        assert [item.event_id for item in events] == ["$unaccepted", "$accepted"]
         assert [item.event_id for item in client._recovery.events[(ROOM_A, 1)]] == [
-            "$unaccepted"
+            "$unaccepted",
+            "$accepted",
         ]
         assert client.store.load_sliding_window_tokens() == {}
         admissions = record_admissions(client, RoomMessageText)
@@ -511,7 +510,7 @@ class TestRoomLocalRecovery:
                 {
                     ROOM_A: room_info(
                         [text_event("$newer", 3)],
-                        limited=target_token is None,
+                        limited=True,
                         prev_batch="p0",
                     )
                 },
@@ -522,6 +521,70 @@ class TestRoomLocalRecovery:
             "$unaccepted",
             "$newer",
         ]
+        await client.close()
+
+    async def test_tokenless_rewind_preserves_overlap_order(
+        self,
+        tempdir,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        earlier = name_event("$earlier", 1, "Earlier")
+        later = name_event("$later", 2, "Later")
+        pending_earlier = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            earlier,
+            True,
+        )
+        pending_later = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            1,
+            later,
+            True,
+        )
+        assert pending_earlier is not None
+        assert pending_later is not None
+        client.store.save_recovery(
+            "s_rejected",
+            set(),
+            [RecoveryGap(ROOM_A, 1, "", None)],
+            [pending_earlier, pending_later],
+            None,
+        )
+        client.store.finish_recovery(ROOM_A, 1, "$earlier", False)
+
+        client.rewind_sync_recovery_for_startup(None)
+
+        seen = record_events(client, RoomNameEvent)
+        await client.receive_response(
+            sync_response(
+                "s_rebuilt",
+                {
+                    ROOM_A: room_info(
+                        [earlier, later],
+                        limited=True,
+                        prev_batch="p0",
+                        state=[earlier],
+                    )
+                },
+            )
+        )
+
+        assert seen == ["$later"]
+        assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])

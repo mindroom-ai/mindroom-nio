@@ -7,9 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Add a startup-only `AsyncClient.rewind_sync_recovery_for_startup()` operation for aligning nio's persisted Classic Sync cursor with an application-supplied trusted checkpoint.
-  A different non-null cursor atomically clears recovery state and invalidated Sliding Sync window tokens so replay from the checkpoint is the sole ordering authority.
-  Reusing the stored cursor or restarting without one retains unaccepted events and unfinished recovery walks that replay may omit, while clearing accepted work, completed markers, and Sliding Sync window tokens.
-  Events above a replaced checkpoint are admitted again when replay returns them, so admission callbacks must be idempotent.
+  A non-null cursor atomically clears recovery state and invalidated Sliding Sync window tokens so replay from the checkpoint is the sole ordering authority, including when the stored cursor is equal.
+  Restarting without a cursor preserves the complete recovery lane because an initial limited sync cannot replay it exhaustively, while still clearing invalidated Sliding Sync window tokens.
+  Events above a non-null checkpoint are admitted again when replay returns them, so admission callbacks must be idempotent.
 
 ## 0.34.1
 
