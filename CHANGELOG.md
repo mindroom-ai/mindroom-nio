@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## 0.34.1
 
+### Features
+
+- Add a startup-only `AsyncClient.rewind_sync_recovery_for_startup()` operation for aligning nio's persisted Classic Sync cursor with an application-supplied trusted checkpoint.
+  The operation preserves unsettled callback work while clearing completed-event markers and invalidated Sliding Sync window tokens.
+
 ### Bug Fixes
 
 - Make persisted sync recovery admission and completion tolerate missing, generation-divergent, and already-completed event rows after a crashed sync iteration, preventing permanent sync-loop crashes and duplicate-row constraint failures.

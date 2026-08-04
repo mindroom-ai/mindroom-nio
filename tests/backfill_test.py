@@ -341,6 +341,7 @@ class TestRoomLocalRecovery:
     async def test_rewind_sync_recovery_for_startup_reloads_and_deduplicates_work(
         self,
         tempdir,
+        aioresponse,
     ):
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -407,20 +408,119 @@ class TestRoomLocalRecovery:
         assert client.store.load_sliding_window_tokens() == {}
         seen = record_events(client)
 
-        await client.receive_response(
-            sync_response(
-                "s_replay",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$pending", 1), text_event("$new", 2)],
-                        limited=False,
-                        prev_batch="p0",
-                    )
-                },
+        requested: list[str | None] = []
+
+        def replay_sync(url, **kwargs):
+            requested.append(parse_qs(urlparse(str(url)).query).get("since", [None])[0])
+            return CallbackResult(
+                status=200,
+                payload=sync_json(
+                    "s_replay",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$pending", 1), text_event("$new", 2)],
+                            limited=False,
+                            prev_batch="p0",
+                        )
+                    },
+                ),
             )
+
+        aioresponse.get(SYNC_URL, callback=replay_sync)
+        await client.sync()
+
+        assert requested == ["s_safe"]
+        assert seen == ["$pending", "$new"]
+        await client.close()
+
+    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
+    async def test_rewind_sync_recovery_for_startup_rejects_processed_response(
+        self,
+        tempdir,
+        protocol,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        client.store.save_sync_token("s_advanced")
+        response = (
+            sync_response("s_seen", {})
+            if protocol == "classic"
+            else SlidingSyncResponse.from_dict({"pos": "slide_seen", "rooms": {}})
         )
 
-        assert seen == ["$pending", "$new"]
+        await client.receive_response(response)
+        completed = PendingTimelineEvent.from_event(
+            ROOM_A,
+            1,
+            0,
+            text_event("$completed", 1),
+            True,
+        )
+        assert completed is not None
+        client.store.save_recovery(
+            client.store.load_sync_token(),
+            set(),
+            [],
+            [completed],
+            None,
+        )
+        client.store.finish_recovery(ROOM_A, 1, completed.event_id, False)
+        client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
+        expected = (
+            client.loaded_sync_token,
+            client.next_batch,
+            client.store.load_sync_token(),
+            client.store.load_sync_recovery(),
+            client.store.load_sliding_window_tokens(),
+        )
+
+        with pytest.raises(LocalProtocolError, match="before sync starts"):
+            client.rewind_sync_recovery_for_startup("s_safe")
+
+        assert (
+            client.loaded_sync_token,
+            client.next_batch,
+            client.store.load_sync_token(),
+            client.store.load_sync_recovery(),
+            client.store.load_sliding_window_tokens(),
+        ) == expected
+        await client.close()
+
+    async def test_rewind_sync_recovery_for_startup_rejects_external_token_owner(
+        self,
+        tempdir,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=False,
+                backfill_persist_recovery=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        assert client.store.load_sync_token() is None
+
+        with pytest.raises(LocalProtocolError, match="store_sync_tokens"):
+            client.rewind_sync_recovery_for_startup("s_safe")
+
+        assert client.store.load_sync_token() is None
+        assert client.loaded_sync_token == ""
+        assert client.next_batch == ""
         await client.close()
 
     async def test_rewind_sync_recovery_for_startup_rejects_issued_request(

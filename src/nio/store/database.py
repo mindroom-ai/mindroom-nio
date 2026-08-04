@@ -600,7 +600,7 @@ class MatrixStore:
         return None
 
     @use_database_atomic
-    def rewind_sync_recovery_for_startup(self, token: str | None) -> None:
+    def _rewind_sync_recovery(self, token: str | None) -> None:
         """Rewind the transport cursor without dropping unsettled callbacks."""
         account = self._get_account()
         assert account

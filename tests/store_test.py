@@ -671,7 +671,7 @@ class TestClass:
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
         )
 
-        sqlstore.rewind_sync_recovery_for_startup(target_token)
+        sqlstore._rewind_sync_recovery(target_token)
 
         reopened = SqliteStore(
             sqlstore.user_id,
@@ -723,7 +723,7 @@ class TestClass:
         monkeypatch.setattr(sqlstore.database, "execute_sql", fail_window_delete)
 
         with pytest.raises(RuntimeError, match="window delete failed"):
-            sqlstore.rewind_sync_recovery_for_startup("s_safe")
+            sqlstore._rewind_sync_recovery("s_safe")
 
         assert sqlstore.load_sync_token() == "s_advanced"
         _, events = sqlstore.load_sync_recovery()

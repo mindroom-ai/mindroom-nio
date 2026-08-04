@@ -703,6 +703,7 @@ class AsyncClient(Client):
             f"nio_sync_request_id_{id(self)}", default=None
         )
         self._sync_reset_fence = SyncResetFence()
+        self._sync_response_seen = False
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -754,7 +755,35 @@ class AsyncClient(Client):
             self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
 
     def rewind_sync_recovery_for_startup(self, token: str | None) -> None:
-        """Rewind persisted sync recovery before this client starts syncing."""
+        """Align persisted sync recovery with a trusted Classic Sync cursor.
+
+        This operation is only valid after the store is loaded and before this
+        client issues or processes any Classic or Sliding Sync operation. It
+        replaces the stored sync token, or deletes it when ``token`` is
+        ``None``, and aligns both in-memory Classic Sync cursors.
+
+        Completed-event markers and Sliding Sync window tokens are removed so
+        replay can begin from the trusted cursor. Recovery gaps and unsettled
+        timeline events are preserved, including events whose admission was
+        already accepted. Callers must therefore deduplicate externally
+        durable callback effects when replay delivers an accepted event again.
+
+        ``backfill_limited_timelines`` and ``store_sync_tokens`` must both be
+        enabled, recovery persistence must resolve to enabled, and the client
+        store must already be loaded.
+
+        Args:
+            token (str | None): The trusted Classic Sync ``next_batch`` token,
+                or ``None`` to restart without a persisted cursor.
+
+        Raises:
+            LocalProtocolError: If persistence is not configured and loaded,
+                or if sync or recovery activity has already started.
+        """
+        if not self.config.store_sync_tokens:
+            raise LocalProtocolError(
+                "Sync recovery rewind requires store_sync_tokens=True."
+            )
         store = self._recovery_store
         if store is None:
             raise LocalProtocolError(
@@ -763,6 +792,7 @@ class AsyncClient(Client):
         if (
             self._closing
             or self._sync_reset_fence.request_id
+            or self._sync_response_seen
             or self._sync_response_lock.locked()
             or self._active_sync_executor_token is not None
             or self._recovery._active_dispatches
@@ -775,7 +805,7 @@ class AsyncClient(Client):
                 "Sync recovery can only be rewound before sync starts."
             )
 
-        store.rewind_sync_recovery_for_startup(token)
+        store._rewind_sync_recovery(token)
         recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
         load_recovery_state(recovery, *store.load_sync_recovery())
         self._recovery = recovery
@@ -2105,6 +2135,7 @@ class AsyncClient(Client):
         return current is None or room_id in current
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
+        self._sync_response_seen = True
         sync_response = envelope.response
         request_since = envelope.request_since
         if not self.config.backfill_limited_timelines:
