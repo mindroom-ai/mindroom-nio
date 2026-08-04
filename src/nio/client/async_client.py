@@ -760,7 +760,8 @@ class AsyncClient(Client):
         This operation is only valid after the store is loaded and before this
         client issues or processes any Classic or Sliding Sync operation. It
         replaces the stored sync token, or deletes it when ``token`` is
-        ``None``, and aligns both in-memory Classic Sync cursors.
+        ``None``, installs that token as the startup request cursor, and clears
+        the marker for the last applied Classic Sync response.
 
         Completed-event markers and Sliding Sync window tokens are removed so
         replay can begin from the trusted cursor. Recovery gaps and unsettled
@@ -814,7 +815,7 @@ class AsyncClient(Client):
         self._pending_sliding_room_account_data.clear()
         self._sliding_sync_to_device_since = None
         self.loaded_sync_token = token or ""
-        self.next_batch = token or ""
+        self.next_batch = ""
 
     def add_response_callback(
         self,

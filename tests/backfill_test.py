@@ -212,7 +212,7 @@ def sync_json(token: str, joined: dict[str, RoomInfo]) -> dict:
                         "limited": info.timeline.limited,
                         "prev_batch": info.timeline.prev_batch,
                     },
-                    "state": {"events": []},
+                    "state": {"events": [event.source for event in info.state]},
                     "ephemeral": {"events": []},
                     "account_data": {"events": []},
                 }
@@ -394,7 +394,7 @@ class TestRoomLocalRecovery:
         client.rewind_sync_recovery_for_startup("s_safe")
 
         assert client.loaded_sync_token == "s_safe"
-        assert client.next_batch == "s_safe"
+        assert client.next_batch == ""
         assert client.store.load_sync_token() == "s_safe"
         gaps, events = client.store.load_sync_recovery()
         assert [(item.room_id, item.generation) for item in gaps] == [(ROOM_A, 1)]
@@ -415,22 +415,24 @@ class TestRoomLocalRecovery:
             return CallbackResult(
                 status=200,
                 payload=sync_json(
-                    "s_replay",
+                    "s_safe",
                     {
                         ROOM_A: room_info(
                             [text_event("$pending", 1), text_event("$new", 2)],
                             limited=False,
                             prev_batch="p0",
+                            state=[name_event("$name", 0, "Replay room")],
                         )
                     },
                 ),
             )
 
         aioresponse.get(SYNC_URL, callback=replay_sync)
-        await client.sync()
+        await client.sync(full_state=True)
 
         assert requested == ["s_safe"]
         assert seen == ["$pending", "$new"]
+        assert client.rooms[ROOM_A].name == "Replay room"
         await client.close()
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
