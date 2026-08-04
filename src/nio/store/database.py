@@ -601,7 +601,7 @@ class MatrixStore:
 
     @use_database_atomic
     def _rewind_sync_recovery(self, token: str | None) -> None:
-        """Replace the cursor and retain work that cannot be replayed safely."""
+        """Replace the cursor and clear its recovery lane atomically."""
         account = self._get_account()
         assert account
 
