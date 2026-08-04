@@ -609,12 +609,10 @@ class MatrixStore:
             SyncTokens.delete().where(SyncTokens.account == account).execute()
         else:
             SyncTokens.replace(account=account, token=token).execute()
-            PendingTimelineEvents.delete().where(
-                PendingTimelineEvents.account == account
-            ).execute()
-            SyncRecoveryGaps.delete().where(
-                SyncRecoveryGaps.account == account
-            ).execute()
+        PendingTimelineEvents.delete().where(
+            PendingTimelineEvents.account == account
+        ).execute()
+        SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
         SlidingWindowTokens.delete().where(
             SlidingWindowTokens.account == account,
         ).execute()

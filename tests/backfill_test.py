@@ -449,7 +449,7 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
-    async def test_rewind_sync_recovery_for_startup_preserves_tokenless_work(
+    async def test_rewind_sync_recovery_for_startup_clears_tokenless_work(
         self,
         tempdir,
     ):
@@ -495,12 +495,9 @@ class TestRoomLocalRecovery:
         client.rewind_sync_recovery_for_startup(None)
 
         gaps, events = client.store.load_sync_recovery()
-        assert [(item.room_id, item.generation) for item in gaps] == [(ROOM_A, 1)]
-        assert [item.event_id for item in events] == ["$unaccepted", "$accepted"]
-        assert [item.event_id for item in client._recovery.events[(ROOM_A, 1)]] == [
-            "$unaccepted",
-            "$accepted",
-        ]
+        assert gaps == []
+        assert events == []
+        assert client._recovery.events == {}
         assert client.store.load_sliding_window_tokens() == {}
         admissions = record_admissions(client, RoomMessageText)
 
@@ -517,13 +514,10 @@ class TestRoomLocalRecovery:
             )
         )
 
-        assert [event_id for event_id, _provenance in admissions] == [
-            "$unaccepted",
-            "$newer",
-        ]
+        assert [event_id for event_id, _provenance in admissions] == ["$newer"]
         await client.close()
 
-    async def test_tokenless_rewind_preserves_overlap_order(
+    async def test_tokenless_rewind_replays_overlap_in_server_order(
         self,
         tempdir,
     ):
@@ -583,7 +577,7 @@ class TestRoomLocalRecovery:
             )
         )
 
-        assert seen == ["$later"]
+        assert seen == ["$earlier", "$later"]
         assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 

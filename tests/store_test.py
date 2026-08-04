@@ -634,7 +634,7 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
-    @pytest.mark.parametrize("target_token", ["s_safe", "s_advanced"])
+    @pytest.mark.parametrize("target_token", ["s_safe", "s_advanced", None])
     def test_rewind_sync_recovery_for_startup_clears_recovery_at_checkpoint(
         self,
         sqlstore,
@@ -680,65 +680,6 @@ class TestClass:
         )
         assert reopened.load_sync_token() == target_token
         assert reopened.load_sync_recovery() == ([], [])
-        assert reopened.load_sliding_window_tokens() == {}
-
-    def test_rewind_sync_recovery_for_startup_preserves_tokenless_recovery(
-        self,
-        sqlstore,
-    ):
-        gap = RecoveryGap(TEST_ROOM, 1, "", None)
-        cursor_room = "!cursor:example.org"
-        cursor_gap = RecoveryGap(cursor_room, 2, "s_target", "s_cursor")
-
-        def pending(event_id, sequence):
-            return PendingTimelineEvent(
-                TEST_ROOM,
-                1,
-                sequence,
-                event_id,
-                '{"content":{},"event_id":"%s","sender":"@a:b",'
-                '"type":"m.test"}' % event_id,
-                True,
-                False,
-            )
-
-        sqlstore.save_recovery(
-            "s_advanced",
-            set(),
-            [gap, cursor_gap],
-            [
-                pending("$accepted", 0),
-                pending("$unaccepted", 1),
-                pending("$completed", 2),
-            ],
-            None,
-        )
-        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
-        sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
-        sqlstore.save_sliding_window_tokens(
-            {TEST_ROOM: SlidingWindowToken("w1", "$join")}
-        )
-
-        sqlstore._rewind_sync_recovery(None)
-
-        reopened = SqliteStore(
-            sqlstore.user_id,
-            sqlstore.device_id,
-            sqlstore.store_path,
-        )
-        assert reopened.load_sync_token() is None
-        gaps, events = reopened.load_sync_recovery()
-        assert sorted((item.room_id, item.generation) for item in gaps) == [
-            (cursor_room, 2),
-            (TEST_ROOM, 1),
-        ]
-        assert sorted(
-            (item.event_id, item.generation, item.admission_accepted) for item in events
-        ) == [
-            ("$accepted", 1, True),
-            ("$completed", 0, False),
-            ("$unaccepted", 1, False),
-        ]
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_rewind_sync_recovery_for_startup_is_atomic(
