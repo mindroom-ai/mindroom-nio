@@ -345,6 +345,7 @@ class TestRoomLocalRecovery:
         self,
         tempdir,
         aioresponse,
+        monkeypatch,
     ):
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -401,7 +402,12 @@ class TestRoomLocalRecovery:
         )
         client._sliding_room_prev_batch[ROOM_B] = window_token("w2")
 
+        def fail_after_commit():
+            raise AssertionError("startup rewind must not read after committing")
+
+        monkeypatch.setattr(client.store, "load_sync_recovery", fail_after_commit)
         client.rewind_sync_recovery_for_startup("s_safe")
+        monkeypatch.undo()
 
         assert client.loaded_sync_token == "s_safe"
         assert client.next_batch == ""

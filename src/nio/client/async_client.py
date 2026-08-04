@@ -809,10 +809,8 @@ class AsyncClient(Client):
                 "Sync recovery can only be rewound before sync starts."
             )
 
-        store._rewind_sync_recovery(token)
         recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
-        gaps, events = store.load_sync_recovery()
-        load_recovery_state(recovery, gaps, events)
+        store._rewind_sync_recovery(token)
         self._recovery = recovery
         self._recovery_room_gates.clear()
         self._sliding_room_prev_batch.clear()
