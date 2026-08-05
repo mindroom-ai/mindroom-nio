@@ -776,6 +776,68 @@ class TestRoomLocalRecovery:
         assert client.has_uncommitted_classic_sync_state
         await client.close()
 
+    async def test_application_owned_classic_state_rejects_ack_while_callback_is_active(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A timed-out retained callback keeps the response unacknowledgeable."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                backfill_timeout=0.01,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+
+        async def fetch_messages(*_args, **_kwargs):
+            return RoomMessagesResponse.from_dict(
+                {"start": "p0", "end": "p1", "chunk": []},
+                ROOM_A,
+            )
+
+        async def callback(_room, _event):
+            callback_started.set()
+            await release_callback.wait()
+
+        monkeypatch.setattr(client, "_recovery_room_messages", fetch_messages)
+        client.add_event_callback(callback, RoomMessageText)
+        client.next_batch = "s0"
+        response_task = asyncio.create_task(
+            client.receive_response(
+                sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$event", 1)],
+                            limited=True,
+                            prev_batch="p1",
+                        )
+                    },
+                )
+            )
+        )
+
+        try:
+            await callback_started.wait()
+            await asyncio.wait_for(response_task, 1)
+            assert client._recovery._active_dispatches
+            assert client.has_uncommitted_classic_sync_state
+            with pytest.raises(LocalProtocolError, match="does not match"):
+                client.acknowledge_classic_sync("s1")
+        finally:
+            release_callback.set()
+        await client._pump_sync_recovery()
+        await client.close()
+
     async def test_application_owned_classic_state_honors_recovery_config_before_store_load(
         self,
         tempdir,

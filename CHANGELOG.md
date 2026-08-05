@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
   It waits behind non-sync membership cleanup while continuing to reject active sync-family requests and response callbacks.
   The first response after reset is applied as a rebuild even when its opaque token equals the restored checkpoint.
 - Add `AsyncClient.has_uncommitted_classic_sync_state` and `AsyncClient.acknowledge_classic_sync()` so an application can distinguish a clean transport restart from partially applied Classic state and acknowledge only the exact token it durably committed.
-  Acknowledgement remains unavailable until nio finishes applying the response, so failed processing cannot clear the dirty state through an older or partially advanced cursor.
+  Acknowledgement remains unavailable until nio finishes applying the response and no retained recovery callback or failure remains, so failed processing cannot clear the dirty state through an older or partially advanced cursor.
 - Add `AsyncClient.clear_persisted_sync_recovery()` for removing legacy cursor, recovery, and Sliding Sync window rows when migrating to application-owned Classic Sync.
   Its first response also bypasses same-token suppression so startup full state always rebuilds the in-memory room model.
 

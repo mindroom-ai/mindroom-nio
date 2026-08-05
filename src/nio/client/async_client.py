@@ -833,6 +833,8 @@ class AsyncClient(Client):
             or self._classic_sync_acknowledgeable_token is None
             or next_batch != self._classic_sync_acknowledgeable_token
             or next_batch != self.next_batch
+            or self._recovery._active_dispatches
+            or has_pending_recovery_work(self._recovery)
         ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
@@ -1604,7 +1606,11 @@ class AsyncClient(Client):
             await self._collect_key_requests()
         await self._pump_sync_recovery()
         self._classic_sync_rebuild_pending = False
-        if application_owned_classic_state:
+        if (
+            application_owned_classic_state
+            and not self._recovery._active_dispatches
+            and not has_pending_recovery_work(self._recovery)
+        ):
             self._classic_sync_acknowledgeable_token = response.next_batch
 
     async def _collect_key_requests(self):
