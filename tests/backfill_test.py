@@ -625,6 +625,209 @@ class TestRoomLocalRecovery:
         assert client._recovery_room_gate(ROOM_B) is room_b_gate
         await client.close()
 
+    async def test_reset_classic_sync_state_waits_for_membership_cleanup(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A non-sync membership mutation is a quiescence wait, not a reset error."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def block_room_dispatch_drain(*_args, **_kwargs):
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        monkeypatch.setattr(
+            async_client_module,
+            "drain_recovery_room_dispatches",
+            block_room_dispatch_drain,
+        )
+        cleanup = asyncio.create_task(client._apply_room_membership_reset(ROOM_A))
+        await cleanup_started.wait()
+
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+
+        assert not reset.done()
+        release_cleanup.set()
+        await cleanup
+        await reset
+
+        client.next_batch = "s1"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$rebuilt", 2, "Rebuilt")],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        assert client.rooms[ROOM_A].name == "Rebuilt"
+        await client.close()
+
+    async def test_application_owned_classic_state_requires_exact_acknowledgement(
+        self,
+        tempdir,
+    ):
+        """Nio exposes staged Classic state until its application commits that token."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+
+        assert client.has_uncommitted_classic_sync_state
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s0")
+        assert client.has_uncommitted_classic_sync_state
+
+        client.acknowledge_classic_sync("s1")
+        assert not client.has_uncommitted_classic_sync_state
+        await client.close()
+
+    async def test_reset_classic_sync_state_rejects_an_active_sync_request(
+        self,
+        tempdir,
+    ):
+        """Waiting behind membership work must not permit an in-flight sync request."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        request_id = issue_sync_request(client._sync_reset_fence, "classic")
+        try:
+            with pytest.raises(LocalProtocolError, match="sync work is active"):
+                await client.reset_classic_sync_state()
+        finally:
+            finish_sync_request(client._sync_reset_fence, request_id)
+        await client.close()
+
+    async def test_failed_classic_response_remains_uncommitted_until_reset(
+        self,
+        tempdir,
+    ):
+        """A callback failure cannot make partially applied Classic state look committed."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def fail_callback(_room, _event):
+            raise RuntimeError("application admission failed")
+
+        client.add_event_callback(fail_callback, RoomNameEvent)
+        with pytest.raises(RuntimeError, match="application admission failed"):
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    {
+                        ROOM_A: room_info(
+                            [name_event("$name", 2, "Staged")],
+                            limited=False,
+                            prev_batch="p0",
+                        )
+                    },
+                )
+            )
+
+        assert client.has_uncommitted_classic_sync_state
+        await client.reset_classic_sync_state()
+        assert not client.has_uncommitted_classic_sync_state
+        await client.close()
+
+    async def test_room_send_is_retryable_while_classic_room_state_rebuilds(
+        self,
+        tempdir,
+    ):
+        """Encrypted delivery can use its bounded retry lane across a real reset."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.olm is not None
+        await client.reset_classic_sync_state()
+
+        with pytest.raises(SendRetryError, match="being rebuilt"):
+            await client._prepare_room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "wait", "msgtype": "m.text"},
+                "tx-rebuild",
+                True,
+            )
+
+        client._classic_sync_rebuild_pending = False
+        with pytest.raises(LocalProtocolError, match="No such room"):
+            await client._prepare_room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "missing", "msgtype": "m.text"},
+                "tx-missing",
+                True,
+            )
+        await client.close()
+
     async def test_reset_classic_sync_state_drains_started_dispatches(
         self,
         tempdir,

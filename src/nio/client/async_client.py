@@ -713,6 +713,7 @@ class AsyncClient(Client):
         self._sync_reset_fence = SyncResetFence()
         self._sync_response_seen = False
         self._classic_sync_rebuild_pending = False
+        self._classic_sync_state_staged = False
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -799,6 +800,32 @@ class AsyncClient(Client):
             )
         store._clear_sync_recovery()
         self._classic_sync_rebuild_pending = True
+        self._classic_sync_state_staged = False
+
+    @property
+    def has_uncommitted_classic_sync_state(self) -> bool:
+        """Return whether application-owned Classic state still needs acknowledgement."""
+        return self._classic_sync_state_staged
+
+    def acknowledge_classic_sync(self, next_batch: str) -> None:
+        """Acknowledge that the application durably committed one Classic response."""
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement requires backfill_limited_timelines=True."
+            )
+        if self.config.store_sync_tokens or self._recovery_store is not None:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement requires token and persisted recovery ownership to be disabled."
+            )
+        if self._active_sync_executor_token is not None:
+            raise LocalProtocolError(
+                "Classic Sync state cannot be acknowledged while a response is active."
+            )
+        if next_batch != self.next_batch:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement token does not match the staged response."
+            )
+        self._classic_sync_state_staged = False
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -845,7 +872,6 @@ class AsyncClient(Client):
             )
         if (
             self._closing
-            or self._sync_response_lock.locked()
             or self._active_sync_executor_token is not None
             or self._sync_reset_fence.active_request_ids
         ):
@@ -890,6 +916,7 @@ class AsyncClient(Client):
                         self.rooms.clear()
                         self.invited_rooms.clear()
                         self._classic_sync_rebuild_pending = True
+                        self._classic_sync_state_staged = False
                     finally:
                         for gate in reversed(acquired):
                             gate.release()
@@ -1472,6 +1499,13 @@ class AsyncClient(Client):
         ):
             await self._pump_sync_recovery()
             return
+
+        if (
+            self.config.backfill_limited_timelines
+            and not self.config.store_sync_tokens
+            and self._recovery_store is None
+        ):
+            self._classic_sync_state_staged = True
 
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
@@ -4037,6 +4071,10 @@ class AsyncClient(Client):
             try:
                 room = self.rooms[room_id]
             except KeyError:
+                if self._classic_sync_rebuild_pending:
+                    raise SendRetryError(
+                        "Classic Sync room state is being rebuilt."
+                    ) from None
                 raise LocalProtocolError(f"No such room with id {room_id} found.")
 
             if room.encrypted:
