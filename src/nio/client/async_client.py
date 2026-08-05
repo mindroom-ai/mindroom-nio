@@ -714,6 +714,7 @@ class AsyncClient(Client):
         self._sync_response_seen = False
         self._classic_sync_rebuild_pending = False
         self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token: str | None = None
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -806,6 +807,7 @@ class AsyncClient(Client):
         store._clear_sync_recovery()
         self._classic_sync_rebuild_pending = True
         self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token = None
 
     @property
     def has_uncommitted_classic_sync_state(self) -> bool:
@@ -826,11 +828,17 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync state cannot be acknowledged while a response is active."
             )
-        if next_batch != self.next_batch:
+        if (
+            not self._classic_sync_state_staged
+            or self._classic_sync_acknowledgeable_token is None
+            or next_batch != self._classic_sync_acknowledgeable_token
+            or next_batch != self.next_batch
+        ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
             )
         self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token = None
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -922,6 +930,7 @@ class AsyncClient(Client):
                         self.invited_rooms.clear()
                         self._classic_sync_rebuild_pending = True
                         self._classic_sync_state_staged = False
+                        self._classic_sync_acknowledgeable_token = None
                     finally:
                         for gate in reversed(acquired):
                             gate.release()
@@ -1505,12 +1514,14 @@ class AsyncClient(Client):
             await self._pump_sync_recovery()
             return
 
-        if (
+        application_owned_classic_state = (
             self.config.backfill_limited_timelines
             and not self.config.store_sync_tokens
             and not self._recovery_persistence_enabled
-        ):
+        )
+        if application_owned_classic_state:
             self._classic_sync_state_staged = True
+            self._classic_sync_acknowledgeable_token = None
 
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
@@ -1593,6 +1604,8 @@ class AsyncClient(Client):
             await self._collect_key_requests()
         await self._pump_sync_recovery()
         self._classic_sync_rebuild_pending = False
+        if application_owned_classic_state:
+            self._classic_sync_acknowledgeable_token = response.next_batch
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()

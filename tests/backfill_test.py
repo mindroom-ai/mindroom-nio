@@ -706,6 +706,9 @@ class TestRoomLocalRecovery:
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
 
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("")
+
         await client.receive_response(
             sync_response(
                 "s1",
@@ -720,6 +723,57 @@ class TestRoomLocalRecovery:
 
         client.acknowledge_classic_sync("s1")
         assert not client.has_uncommitted_classic_sync_state
+        await client.close()
+
+    @pytest.mark.parametrize("failure_phase", ["plan", "post_cursor"])
+    async def test_application_owned_classic_state_rejects_ack_after_failed_response(
+        self,
+        tempdir,
+        monkeypatch,
+        failure_phase,
+    ):
+        """A response becomes acknowledgeable only after all nio processing succeeds."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+
+        if failure_phase == "plan":
+
+            def fail_plan(*_args, **_kwargs):
+                raise RuntimeError("response failed")
+
+            monkeypatch.setattr(async_client_module, "plan_sync_response", fail_plan)
+        else:
+
+            async def fail_to_device(_response):
+                raise RuntimeError("response failed")
+
+            monkeypatch.setattr(client, "_handle_to_device", fail_to_device)
+
+        with pytest.raises(RuntimeError, match="response failed"):
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+                )
+            )
+
+        cursor_after_failure = "s0" if failure_phase == "plan" else "s1"
+        assert client.next_batch == cursor_after_failure
+        assert client.has_uncommitted_classic_sync_state
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync(cursor_after_failure)
+        assert client.has_uncommitted_classic_sync_state
         await client.close()
 
     async def test_application_owned_classic_state_honors_recovery_config_before_store_load(
