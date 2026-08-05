@@ -975,8 +975,8 @@ class AsyncClient(Client):
 
         Only one admission owner can be registered because multiple callbacks
         cannot make their durable side effects atomic.
-        The callback receives the room, event, and its live-or-history
-        ``TimelineEventProvenance``.
+        The callback receives the room, event, and its live, recovered, or
+        history ``TimelineEventProvenance``.
         Two-argument callbacks registered against nio 0.33 remain supported;
         new callbacks should require the provenance argument.
         Classic Sync initial timelines are history, while timelines that
@@ -984,7 +984,8 @@ class AsyncClient(Client):
         Sliding Sync uses the validated ``num_live`` tail when present.
         Ordinary continuations without it are live, while initial or expanded
         responses without it are history.
-        Events recovered through ``/messages`` are history.
+        Events proven to follow the held room baseline by reaching the exact
+        ``/messages`` target or a sync-origin overlap are recovered.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
@@ -4055,6 +4056,10 @@ class AsyncClient(Client):
         If timeline recovery is pending or encrypted state cannot be fully
         synced after a couple of retries, this raises `SendRetryError`.
 
+        The exact callback task draining this room's recovery gap may send to
+        the same room. Child tasks and sends to other recovering rooms remain
+        blocked so recovery authority cannot outlive or escape its callback.
+
         Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
@@ -4091,6 +4096,10 @@ class AsyncClient(Client):
         if any(
             gap.cursor_token is not None or gap.target_token
             for gap in self._recovery.gaps.get(room_id, ())
+        ) and not is_recovery_dispatch_task(
+            self._recovery,
+            asyncio.current_task(),
+            room_id,
         ):
             raise SendRetryError("Room timeline recovery is still pending.")
 

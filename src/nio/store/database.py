@@ -795,6 +795,15 @@ class MatrixStore:
             resequence_same_generation = (PendingTimelineEvents.generation > 0) & (
                 PendingTimelineEvents.generation == EXCLUDED.generation
             )
+            promote_recovered_continuity = (
+                resequence_same_generation
+                & ~PendingTimelineEvents.was_completed
+                & (
+                    PendingTimelineEvents.provenance
+                    == TimelineEventProvenance.HISTORY.value
+                )
+                & (EXCLUDED.provenance == TimelineEventProvenance.RECOVERED.value)
+            )
             PendingTimelineEvents.insert_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).on_conflict(
@@ -838,7 +847,10 @@ class MatrixStore:
                     ),
                     PendingTimelineEvents.provenance: Case(
                         None,
-                        ((promote_completed_placeholder, EXCLUDED.provenance),),
+                        (
+                            (promote_completed_placeholder, EXCLUDED.provenance),
+                            (promote_recovered_continuity, EXCLUDED.provenance),
+                        ),
                         PendingTimelineEvents.provenance,
                     ),
                     PendingTimelineEvents.apply_room_state: Case(

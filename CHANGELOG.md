@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Bug Fixes
+
+- Classify timeline events as `RECOVERED` when a bounded `/messages` walk proves they follow the held room baseline, distinguishing them from both direct `LIVE` activity and unverified cold `HISTORY`.
+  The exact callback task draining such a recovery gap may reply to the same room while child tasks and cross-room sends remain blocked.
+
 ## 0.35.0
 
 ### Features

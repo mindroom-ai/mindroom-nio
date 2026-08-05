@@ -93,7 +93,7 @@ class PendingTimelineEvent:
     ``is_live`` distinguishes sync-origin rows from ``/messages`` recovery
     rows. Sync-origin rows survive room resets, count toward the held-event
     cap, and acknowledge ordinary callback failures. ``provenance`` is the
-    independent live-or-history classification exposed at admission.
+    independent live, recovered, or history classification exposed at admission.
     ``apply_room_state`` keeps historical Sliding Sync expansions from
     replacing current room state; Classic Sync timelines always apply state.
     """
@@ -214,9 +214,13 @@ def has_pending_recovery_work(state: RecoveryState) -> bool:
 def is_recovery_dispatch_task(
     state: RecoveryState,
     task: asyncio.Task[Any] | None,
+    room_id: str | None = None,
 ) -> bool:
-    """Whether task owns a retained recovery callback."""
-    return task is not None and task in state._active_dispatches.values()
+    """Whether task owns a retained recovery callback, optionally for one room."""
+    return task is not None and any(
+        active is task and (room_id is None or key[0] == room_id)
+        for key, active in state._active_dispatches.items()
+    )
 
 
 def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:
@@ -1149,6 +1153,7 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     recovered_count = sum(not event.is_live for event in pending)
+    continuity_proven = cursor == gap.target_token
 
     while cursor and pages < options.max_pages:
         clear_recovered = False
@@ -1207,10 +1212,13 @@ async def _collect_slice(
                 page_events.clear()
                 page_ids.clear()
                 clear_recovered = True
+                continuity_proven = False
             completed = state.completed.get(gap.room_id, {}).get(event_id)
             was_completed = bool(completed and completed.was_encrypted)
             if event_id in pending_ids:
                 existing = queued_by_id.get(event_id)
+                if existing and existing.is_live:
+                    continuity_proven = True
                 if (
                     existing
                     and (existing.is_live or not clear_recovered)
@@ -1257,6 +1265,11 @@ async def _collect_slice(
             clear_recovered = True
             abandoned = True
             next_cursor = None
+        elif continuity_proven:
+            # Equal bounds or overlap with a sync-origin event bridge the
+            # persisted baseline to the current window. No later page can
+            # strengthen that proof, so finish within this pump.
+            next_cursor = None
         elif response.end is None and gap.target_token:
             # A bounded walk that runs out of events has reached the sync
             # window: the spec omits `end` exactly when no further events
@@ -1270,7 +1283,7 @@ async def _collect_slice(
             # The spec also omits `end` when the user may not see any more
             # events, which this cannot distinguish; a gap truncated by
             # history visibility is dispatched as if complete rather than
-            # dropped whole.
+            # dropped whole, but does not gain recovered provenance.
             next_cursor = None
         elif response.end in (None, cursor):
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
@@ -1279,6 +1292,7 @@ async def _collect_slice(
             abandoned = True
             next_cursor = None
         elif response.end == gap.target_token:
+            continuity_proven = True
             next_cursor = None
         else:
             next_cursor = response.end
@@ -1289,6 +1303,17 @@ async def _collect_slice(
         ordered_events = (
             () if abandoned else _merge_recovery_page_order(retained, page_events)
         )
+        if continuity_proven and next_cursor is None and not abandoned:
+            ordered_events = tuple(
+                (
+                    replace(event, provenance=TimelineEventProvenance.RECOVERED)
+                    if event.kind == "timeline"
+                    and event.provenance is TimelineEventProvenance.HISTORY
+                    and not event.was_completed
+                    else event
+                )
+                for event in ordered_events
+            )
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
             state,
