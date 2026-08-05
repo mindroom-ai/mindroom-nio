@@ -1427,7 +1427,7 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
 
 
 @pytest.mark.asyncio
-async def test_conflicting_overlap_order_does_not_prove_continuity():
+async def test_conflicting_overlap_order_keeps_gap_open_without_target():
     held_a = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$held-a", 2), True)
     held_b = PendingTimelineEvent.from_event(ROOM, 1, 1, event("$held-b", 4), True)
     assert held_a and held_b
@@ -1475,10 +1475,10 @@ async def test_conflicting_overlap_order_does_not_prove_continuity():
         store=None,
     )
 
-    assert admissions == [
-        ("$held-a", TimelineEventProvenance.LIVE),
-        ("$held-b", TimelineEventProvenance.LIVE),
-    ]
+    assert admissions == []
+    [gap] = state.gaps[ROOM]
+    assert gap.cursor_token == "more"
+    assert gap.target_token == "target"
     assert take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),

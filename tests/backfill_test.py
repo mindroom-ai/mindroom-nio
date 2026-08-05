@@ -2596,9 +2596,15 @@ class TestRoomLocalRecovery:
         assert seen == ["$old", "$held"]
         assert not client._recovery.gaps
 
-    @pytest.mark.parametrize("end", [None, "p1"])
-    async def test_token_or_exhaustion_closes_gap_without_end_progress(
-        self, client, aioresponse, end
+    @pytest.mark.parametrize(
+        ("end", "gap_provenance"),
+        [
+            (None, TimelineEventProvenance.HISTORY),
+            ("p1", TimelineEventProvenance.RECOVERED),
+        ],
+    )
+    async def test_only_exact_target_proves_gap_continuity(
+        self, client, aioresponse, end, gap_provenance
     ):
         seen = record_events(client)
         await client.receive_response(
@@ -2631,7 +2637,7 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$old", "$gap", "$held"]
         assert admissions == [
-            ("$gap", TimelineEventProvenance.RECOVERED),
+            ("$gap", gap_provenance),
             ("$held", TimelineEventProvenance.LIVE),
         ]
         assert not client._recovery.gaps
@@ -4775,7 +4781,7 @@ class TestRoomLocalRecovery:
         assert completed.provenance is TimelineEventProvenance.RECOVERED
         await restarted.close()
 
-    async def test_sliding_restart_gap_overlap_closes_with_one_page_budget(
+    async def test_sliding_restart_gap_overlap_does_not_prove_continuity(
         self,
         tempdir,
         aioresponse,
@@ -4823,15 +4829,26 @@ class TestRoomLocalRecovery:
             )
         )
 
-        assert admissions == [("$during-restart", "recovered")]
+        assert admissions == []
         assert pages.from_tokens == ["w1"]
         assert pages.to_tokens == ["w2"]
+        [gap] = restarted._recovery.gaps[ROOM_A]
+        assert gap.cursor_token == "more"
+        assert gap.target_token == "w2"
+
+        follow_up = SlidingSyncResponse.from_dict({"pos": "s3", "rooms": {}})
+        assert isinstance(follow_up, SlidingSyncResponse)
+        await restarted.receive_response(follow_up)
+
+        assert admissions == [("$during-restart", "history")]
+        assert pages.from_tokens == ["w1", "more"]
+        assert pages.to_tokens == ["w2", "w2"]
         assert not restarted._recovery.gaps
         assert restarted.store
         _, stored = restarted.store.load_sync_recovery()
         completed = next(item for item in stored if item.event_id == "$during-restart")
         assert completed.generation == 0
-        assert completed.provenance.value == "recovered"
+        assert completed.provenance.value == "history"
         await restarted.close()
 
     async def test_sliding_restart_equal_baseline_proves_continuity(
