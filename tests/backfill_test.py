@@ -4972,9 +4972,20 @@ class TestRoomLocalRecovery:
         assert completed.provenance is TimelineEventProvenance.HISTORY
         await restarted.close()
 
-    async def test_sliding_restart_membership_mismatch_resets_persisted_gap(
+    @pytest.mark.parametrize(
+        ("prev_batch", "membership_event_id"),
+        [
+            ("w2", "$new-membership"),
+            ("w2", None),
+            (None, "$old-membership"),
+        ],
+        ids=["membership-mismatch", "missing-membership", "missing-prev-batch"],
+    )
+    async def test_sliding_restart_unrecoverable_snapshot_stays_history(
         self,
         tempdir,
+        prev_batch,
+        membership_event_id,
     ):
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
@@ -5012,9 +5023,9 @@ class TestRoomLocalRecovery:
         response = self._sliding(
             "s2",
             [text_event("$new-event", 2)],
-            prev_batch="w2",
+            prev_batch=prev_batch,
             initial=True,
-            membership_event_id="$new-membership",
+            membership_event_id=membership_event_id,
         )
 
         await restarted.receive_response(response)
@@ -9150,7 +9161,7 @@ class TestRoomLocalRecovery:
         [{"initial": True}, {"expanded_timeline": True}],
         ids=["initial", "expanded"],
     )
-    async def test_sliding_historical_join_keeps_classic_gap(
+    async def test_sliding_historical_join_isolated_from_classic_gap(
         self, client, aioresponse, timeline_shape
     ):
         seen = record_events(client)
@@ -9192,10 +9203,15 @@ class TestRoomLocalRecovery:
         assert isinstance(sliding, SlidingSyncResponse)
         await client.receive_response(sliding)
         assert seen == []
-        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more2"
+        [classic_gap, sliding_history] = client._recovery.gaps[ROOM_A]
+        assert classic_gap.cursor_token == "more2"
+        assert sliding_history.cursor_token is None
+        assert sliding_history.target_token == ""
         assert [event.event_id for event in client._recovery.events[(ROOM_A, 1)]] == [
             "$gap",
             "$held",
+        ]
+        assert [event.event_id for event in client._recovery.events[(ROOM_A, 2)]] == [
             "$join",
             "$after",
         ]
