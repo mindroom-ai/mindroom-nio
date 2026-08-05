@@ -761,8 +761,14 @@ def plan_room_timeline(
         live_event_count=live_event_count,
         cursor_token=cursor_token,
     )
+    separate_history = (
+        bool(existing)
+        and not new_gap
+        and provenance_live_event_count is not None
+        and provenance_live_event_count < len(timeline_events)
+    )
     generation = existing[-1].generation if existing else 0
-    if new_gap or not existing:
+    if new_gap or not existing or separate_history:
         generation += 1
     events = _plan_timeline_events(
         state,
@@ -826,7 +832,7 @@ def plan_room_timeline(
             target_token if new_gap else "",
             cursor_token if new_gap else None,
         )
-        if new_gap or events and not existing
+        if new_gap or events and (not existing or separate_history)
         else None
     )
     return RecoveryPlan(

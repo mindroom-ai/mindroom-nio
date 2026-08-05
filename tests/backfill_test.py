@@ -5029,6 +5029,9 @@ class TestRoomLocalRecovery:
         )
 
         await restarted.receive_response(response)
+        follow_up = SlidingSyncResponse.from_dict({"pos": "s3", "rooms": {}})
+        assert isinstance(follow_up, SlidingSyncResponse)
+        await restarted.receive_response(follow_up)
 
         assert admissions == [
             ("$new-event", TimelineEventProvenance.HISTORY),

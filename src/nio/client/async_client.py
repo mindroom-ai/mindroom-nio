@@ -987,7 +987,7 @@ class AsyncClient(Client):
         Ordinary continuations without it are live, while initial or expanded
         responses without it are history.
         Events proven to follow the held room baseline by reaching the exact
-        ``/messages`` target or a sync-origin overlap are recovered.
+        ``/messages`` target are recovered.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
