@@ -1700,6 +1700,72 @@ class TestRoomLocalRecovery:
                 {"body": "secret", "msgtype": "m.text"},
             )
 
+    async def test_recovery_callback_cannot_bypass_another_room_gap(self, client):
+        task = asyncio.current_task()
+        assert task is not None
+        client._recovery._active_dispatches[(ROOM_A, "$active", "timeline")] = task
+        client._recovery.gaps[ROOM_B] = [RecoveryGap(ROOM_B, 1, "target", "cursor")]
+        try:
+            with pytest.raises(SendRetryError, match="recovery is still pending"):
+                await client.room_send(
+                    ROOM_B,
+                    "m.room.message",
+                    {"body": "unsafe", "msgtype": "m.text"},
+                )
+        finally:
+            client._recovery._active_dispatches.clear()
+            client._recovery.gaps.clear()
+
+    async def test_recovery_callback_child_task_cannot_inherit_send_bypass(
+        self,
+        client,
+        aioresponse,
+    ):
+        blocked = []
+
+        async def send(_room, event):
+            if event.event_id != "$gap":
+                return
+            with pytest.raises(SendRetryError, match="recovery is still pending"):
+                await asyncio.create_task(
+                    client.room_send(
+                        ROOM_A,
+                        "m.room.message",
+                        {"body": "unsafe", "msgtype": "m.text"},
+                    )
+                )
+            blocked.append(event.event_id)
+
+        client.add_event_callback(send, RoomMessageText)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "p1"),
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+
+        assert blocked == ["$gap"]
+        assert not client._recovery.gaps
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_live_callback_can_send_without_recovery_gap(
         self, client, aioresponse, protocol
@@ -2063,7 +2129,7 @@ class TestRoomLocalRecovery:
             ("$live", TimelineEventProvenance.LIVE),
         ]
 
-    async def test_recovered_history_precedes_retained_live_provenance(
+    async def test_recovered_gap_precedes_retained_live_provenance(
         self,
         client,
         aioresponse,
@@ -2089,7 +2155,7 @@ class TestRoomLocalRecovery:
         )
 
         assert admissions == [
-            ("$history", TimelineEventProvenance.HISTORY),
+            ("$history", TimelineEventProvenance.RECOVERED),
             ("$live", TimelineEventProvenance.LIVE),
         ]
 
@@ -2515,6 +2581,7 @@ class TestRoomLocalRecovery:
                 },
             )
         )
+        admissions = record_admissions(client)
         aioresponse.get(
             MESSAGES_URL,
             payload=messages(
@@ -2533,6 +2600,10 @@ class TestRoomLocalRecovery:
             )
         )
         assert seen == ["$old", "$gap", "$held"]
+        assert admissions == [
+            ("$gap", TimelineEventProvenance.RECOVERED),
+            ("$held", TimelineEventProvenance.LIVE),
+        ]
         assert not client._recovery.gaps
 
     async def test_exhausted_bounded_page_closes_gap(self, tempdir, aioresponse):
@@ -4601,6 +4672,241 @@ class TestRoomLocalRecovery:
         assert pages.from_tokens == ["w1"]
         assert not second._recovery.gaps
         await second.close()
+
+    async def test_sliding_restart_gap_initial_event_is_admitted_and_can_reply(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        admissions: list[tuple[str, str]] = []
+        sent = []
+
+        async def admit(_room, event, provenance):
+            admissions.append((event.event_id, provenance.value))
+            if provenance is TimelineEventProvenance.HISTORY:
+                raise CallbackNotAcceptedError("cold history fenced")
+
+        async def reply(_room, event):
+            if event.event_id != "$during-restart":
+                return
+            sent.append(
+                await restarted.room_send(
+                    ROOM_A,
+                    "m.room.message",
+                    {"body": "reply", "msgtype": "m.text"},
+                    tx_id="tx",
+                )
+            )
+
+        restarted.add_event_admission_callback(admit, RoomMessageText)
+        restarted.add_event_callback(reply, RoomMessageText)
+        pages = Pages({"w1": messages([], "w2")})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        aioresponse.put(SEND_URL, payload={"event_id": "$reply"})
+        response = self._sliding(
+            "s2",
+            [text_event("$during-restart", 2)],
+            prev_batch="w2",
+            initial=True,
+        )
+
+        await restarted.receive_response(response)
+
+        assert admissions == [("$during-restart", "recovered")]
+        assert [item.event_id for item in sent] == ["$reply"]
+        assert pages.from_tokens == ["w1"]
+        assert pages.to_tokens == ["w2"]
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert not restarted._recovery.gaps
+        assert restarted.store
+        _, stored = restarted.store.load_sync_recovery()
+        completed = next(item for item in stored if item.event_id == "$during-restart")
+        assert completed.generation == 0
+        assert completed.provenance is TimelineEventProvenance.RECOVERED
+        await restarted.close()
+
+    async def test_sliding_restart_gap_overlap_closes_with_one_page_budget(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_max_pages=1,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        admissions: list[tuple[str, str]] = []
+
+        async def admit(_room, event, provenance):
+            admissions.append((event.event_id, provenance.value))
+
+        restarted.add_event_admission_callback(admit, RoomMessageText)
+        pages = Pages(
+            {
+                "w1": messages([text_event("$during-restart", 2)], "more"),
+                "more": messages([], None),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await restarted.receive_response(
+            self._sliding(
+                "s2",
+                [text_event("$during-restart", 2)],
+                prev_batch="w2",
+                initial=True,
+            )
+        )
+
+        assert admissions == [("$during-restart", "recovered")]
+        assert pages.from_tokens == ["w1"]
+        assert pages.to_tokens == ["w2"]
+        assert not restarted._recovery.gaps
+        assert restarted.store
+        _, stored = restarted.store.load_sync_recovery()
+        completed = next(item for item in stored if item.event_id == "$during-restart")
+        assert completed.generation == 0
+        assert completed.provenance.value == "recovered"
+        await restarted.close()
+
+    async def test_sliding_restart_equal_baseline_proves_continuity(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        admissions: list[tuple[str, str]] = []
+
+        async def admit(_room, event, provenance):
+            admissions.append((event.event_id, provenance.value))
+
+        restarted.add_event_admission_callback(admit, RoomMessageText)
+        pages = Pages({"w1": messages([], None)})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        await restarted.receive_response(
+            self._sliding(
+                "s2",
+                [text_event("$during-restart", 2)],
+                prev_batch="w1",
+                initial=True,
+            )
+        )
+
+        assert admissions == [("$during-restart", "recovered")]
+        assert pages.from_tokens == ["w1"]
+        assert pages.to_tokens == ["w1"]
+        assert not restarted._recovery.gaps
+        assert restarted.store
+        _, stored = restarted.store.load_sync_recovery()
+        completed = next(item for item in stored if item.event_id == "$during-restart")
+        assert completed.generation == 0
+        assert completed.provenance.value == "recovered"
+        await restarted.close()
+
+    async def test_sliding_restart_gap_exhaustion_keeps_initial_event_history(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            store_sync_tokens=True,
+        )
+        first = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+        await first.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        admissions = record_admissions(restarted)
+        pages = Pages({"w1": messages([], None)})
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        response = self._sliding(
+            "s2",
+            [text_event("$during-restart", 2)],
+            prev_batch="w2",
+            initial=True,
+        )
+
+        await restarted.receive_response(response)
+
+        assert admissions == [
+            ("$during-restart", TimelineEventProvenance.HISTORY),
+        ]
+        assert pages.from_tokens == ["w1"]
+        assert pages.to_tokens == ["w2"]
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert not restarted._recovery.gaps
+        assert restarted.store
+        _, stored = restarted.store.load_sync_recovery()
+        completed = next(item for item in stored if item.event_id == "$during-restart")
+        assert completed.generation == 0
+        assert completed.provenance is TimelineEventProvenance.HISTORY
+        await restarted.close()
 
     @pytest.mark.parametrize(
         "membership_event_id",
