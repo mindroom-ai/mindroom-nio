@@ -256,6 +256,34 @@ def _pending_dispatch(
     return None
 
 
+def is_recovered_dispatch_task(
+    state: RecoveryState,
+    task: asyncio.Task[Any] | None,
+    room_id: str,
+) -> bool:
+    """Whether task owns the room's only continuity-proven callback gap."""
+    if task is None:
+        return False
+    for key, active in state._active_dispatches.items():
+        if active is not task or key[0] != room_id:
+            continue
+        target = _pending_dispatch(state, key)
+        if target is None:
+            continue
+        gap, pending = target
+        if (
+            pending.provenance is TimelineEventProvenance.RECOVERED
+            and gap.cursor_token is None
+            and not any(
+                other.generation != gap.generation
+                and (other.cursor_token is not None or other.target_token)
+                for other in state.gaps.get(room_id, ())
+            )
+        ):
+            return True
+    return False
+
+
 def _dispatch_finished(
     state: RecoveryState,
     key: _DispatchKey,
@@ -694,6 +722,7 @@ def plan_room_timeline(
     timeline_events: Sequence[Event | BadEventType],
     user_id: str | None,
     membership: str,
+    reset_recovery: bool = False,
     live_event_count: int | None = None,
     provenance_live_event_count: int | None = None,
     apply_state_live_event_count: int | None = None,
@@ -719,7 +748,7 @@ def plan_room_timeline(
     ):
         apply_state_live_event_count = 0
 
-    clear = _timeline_clears_recovery(
+    clear = reset_recovery or _timeline_clears_recovery(
         timeline_events,
         user_id,
         live_event_count,
@@ -1070,6 +1099,20 @@ def _finish(
         state.outcomes.setdefault(gap.room_id, True)
 
 
+def _recovery_page_overlap_anchors(
+    queued_events: Sequence[PendingTimelineEvent],
+    page_events: Sequence[PendingTimelineEvent],
+) -> list[tuple[int, int]]:
+    queued_indexes = {
+        event.event_id: index for index, event in enumerate(queued_events)
+    }
+    return [
+        (page_index, queued_indexes[event.event_id])
+        for page_index, event in enumerate(page_events)
+        if event.event_id in queued_indexes
+    ]
+
+
 def _merge_recovery_page_order(
     queued: Iterable[PendingTimelineEvent],
     page: Iterable[PendingTimelineEvent],
@@ -1082,19 +1125,13 @@ def _merge_recovery_page_order(
             replace(event, sequence=index) for index, event in enumerate(queued_events)
         )
 
-    queued_indexes = {
-        event.event_id: index for index, event in enumerate(queued_events)
-    }
-    anchors = [
-        (page_index, queued_indexes[event.event_id])
-        for page_index, event in enumerate(page_events)
-        if event.event_id in queued_indexes
-    ]
+    queued_ids = {event.event_id for event in queued_events}
+    anchors = _recovery_page_overlap_anchors(queued_events, page_events)
     # Conflicting overlap order cannot be spliced safely. Insert only the
     # page's new events at the normal recovered/live boundary instead.
     if any(previous[1] >= current[1] for previous, current in pairwise(anchors)):
         page_events = [
-            event for event in page_events if event.event_id not in queued_indexes
+            event for event in page_events if event.event_id not in queued_ids
         ]
         anchors = []
     page_ids = {event.event_id for event in page_events}
@@ -1288,6 +1325,10 @@ async def _collect_slice(
         retained_recovered_count = recovered_count - (
             current_recovered_count if clear_recovered else 0
         )
+        anchors = _recovery_page_overlap_anchors(queued, page_events)
+        overlap_conflicts = any(
+            previous[1] >= current[1] for previous, current in pairwise(anchors)
+        )
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
@@ -1298,6 +1339,16 @@ async def _collect_slice(
         elif response.end == cursor:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
+            clear_recovered = True
+            abandoned = True
+            next_cursor = None
+        elif response.end == gap.target_token:
+            continuity_proven = True
+            next_cursor = None
+        elif overlap_conflicts:
+            logger.error("Abandoning conflicting recovery overlap in %s", gap.room_id)
+            recovered.clear()
+            page_events.clear()
             clear_recovered = True
             abandoned = True
             next_cursor = None
@@ -1326,9 +1377,6 @@ async def _collect_slice(
             recovered.clear()
             clear_recovered = True
             abandoned = True
-            next_cursor = None
-        elif response.end == gap.target_token:
-            continuity_proven = True
             next_cursor = None
         else:
             next_cursor = response.end

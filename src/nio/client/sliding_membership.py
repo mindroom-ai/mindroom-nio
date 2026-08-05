@@ -113,6 +113,27 @@ def sliding_membership_continues(
     ) is not None and not sliding_live_own_join(room, user_id)
 
 
+def sliding_membership_proof_mismatch(
+    room_id: str,
+    room: SlidingSyncRoom,
+    *,
+    user_id: str | None,
+    window_tokens: Mapping[str, SlidingWindowToken],
+) -> bool:
+    """Whether an exact current membership contradicts the held baseline."""
+    return (
+        room_id in window_tokens
+        and sliding_membership_event(room, user_id) is not None
+        and sliding_membership_proof(
+            room_id,
+            room,
+            user_id=user_id,
+            window_tokens=window_tokens,
+        )
+        is None
+    )
+
+
 def sliding_recovery_cursor(
     room_id: str,
     room: SlidingSyncRoom,

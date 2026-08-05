@@ -265,6 +265,7 @@ from .base_client import (
 from .sliding_membership import (
     plan_sliding_prev_batches,
     sliding_live_event_count,
+    sliding_membership_proof_mismatch,
     sliding_recovery_cursor,
     sliding_recovery_membership,
     sliding_room_is_invite,
@@ -279,6 +280,7 @@ from .sync_recovery import (
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
+    is_recovered_dispatch_task,
     is_recovery_dispatch_task,
     load_recovery_state,
     merge_recovery_plans,
@@ -1682,6 +1684,15 @@ class AsyncClient(Client):
                                 sliding_recovery_membership(room)
                                 if component_is_current
                                 else "join"
+                            ),
+                            reset_recovery=(
+                                room_id in unrecoverable_room_ids
+                                and sliding_membership_proof_mismatch(
+                                    room_id,
+                                    room,
+                                    user_id=self.user_id,
+                                    window_tokens=self._sliding_room_prev_batch,
+                                )
                             ),
                             live_event_count=membership_live_event_count,
                             provenance_live_event_count=live_event_count,
@@ -4096,7 +4107,7 @@ class AsyncClient(Client):
         if any(
             gap.cursor_token is not None or gap.target_token
             for gap in self._recovery.gaps.get(room_id, ())
-        ) and not is_recovery_dispatch_task(
+        ) and not is_recovered_dispatch_task(
             self._recovery,
             asyncio.current_task(),
             room_id,
