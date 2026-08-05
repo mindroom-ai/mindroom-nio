@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Classify timeline events as `RECOVERED` when a bounded `/messages` walk proves they follow the held room baseline, distinguishing them from both direct `LIVE` activity and unverified cold `HISTORY`.
+  A Sliding Sync walk bound to one exact own-membership identity treats the servers' normal empty response without an `end` token as successful bounded exhaustion, while unbound history remains fenced.
+  Store schema v8 persists that narrow authority across interrupted recovery.
   The exact callback task draining such a recovery gap may reply to the same room while child tasks and sends to other recovering rooms remain blocked.
 
 ## 0.35.0

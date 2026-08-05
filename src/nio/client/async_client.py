@@ -1660,6 +1660,16 @@ class AsyncClient(Client):
                 plans = []
                 for room_id, room in response.rooms.items():
                     component_is_current = self._room_component_is_current(room_id)
+                    recovery_cursor = (
+                        sliding_recovery_cursor(
+                            room_id,
+                            room,
+                            user_id=self.user_id,
+                            window_tokens=self._sliding_room_prev_batch,
+                        )
+                        if component_is_current
+                        else None
+                    )
                     live_event_count = sliding_live_event_count(room)
                     membership_live_event_count = (
                         live_event_count
@@ -1697,19 +1707,11 @@ class AsyncClient(Client):
                             live_event_count=membership_live_event_count,
                             provenance_live_event_count=live_event_count,
                             apply_state_live_event_count=apply_state_live_event_count,
-                            cursor_token=(
-                                sliding_recovery_cursor(
-                                    room_id,
-                                    room,
-                                    user_id=self.user_id,
-                                    window_tokens=self._sliding_room_prev_batch,
-                                )
-                                if component_is_current
-                                else None
-                            ),
+                            cursor_token=recovery_cursor,
                             target_token=(
                                 room.prev_batch or "" if component_is_current else ""
                             ),
+                            membership_bound=recovery_cursor is not None,
                             batch_id=batch_id,
                             account_data_events=(
                                 tuple(

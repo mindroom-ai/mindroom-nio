@@ -139,7 +139,7 @@ class MatrixStore:
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 7
+    store_version = 8
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -226,6 +226,22 @@ class MatrixStore:
         ).execute()
         self._update_version(7)
 
+    @use_database_atomic
+    def upgrade_to_v8(self):
+        table = SyncRecoveryGaps._meta.table_name
+        columns = {
+            row[1]
+            for row in self.database.execute_sql(
+                f'PRAGMA table_info("{table}")'
+            ).fetchall()
+        }
+        if "membership_bound" not in columns:
+            self.database.execute_sql(
+                f'ALTER TABLE "{table}" '
+                "ADD COLUMN membership_bound INTEGER NOT NULL DEFAULT 0"
+            )
+        self._update_version(8)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -249,6 +265,9 @@ class MatrixStore:
             store_version = 6
         if store_version == 6:
             self.upgrade_to_v7()
+            store_version = 7
+        if store_version == 7:
+            self.upgrade_to_v8()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)

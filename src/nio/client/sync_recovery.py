@@ -84,6 +84,8 @@ class RecoveryGap:
     generation: int
     target_token: str
     cursor_token: str | None
+    # The bounded tokens were issued under one proven own-membership identity.
+    membership_bound: bool = False
 
 
 @dataclass(frozen=True)
@@ -728,6 +730,7 @@ def plan_room_timeline(
     apply_state_live_event_count: int | None = None,
     cursor_token: str | None = None,
     target_token: str = "",
+    membership_bound: bool = False,
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
@@ -831,6 +834,7 @@ def plan_room_timeline(
             generation,
             target_token if new_gap else "",
             cursor_token if new_gap else None,
+            membership_bound if new_gap else False,
         )
         if new_gap or events and (not existing or separate_history)
         else None
@@ -1006,7 +1010,11 @@ def load_recovery_state(
     state.outcomes.clear()
     for row in gaps:
         gap = RecoveryGap(
-            row.room_id, row.generation, row.target_token, row.cursor_token
+            row.room_id,
+            row.generation,
+            row.target_token,
+            row.cursor_token,
+            row.membership_bound,
         )
         state.gaps.setdefault(row.room_id, []).append(gap)
     for room_gaps in state.gaps.values():
@@ -1319,6 +1327,13 @@ async def _collect_slice(
             current_recovered_count if clear_recovered else 0
         )
         target_reached = bool(gap.target_token and response.end == gap.target_token)
+        bounded_exhausted = bool(
+            gap.membership_bound
+            and gap.target_token
+            and response.end is None
+            and not clear_recovered
+        )
+        continuity_proven = target_reached or bounded_exhausted
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
@@ -1332,10 +1347,10 @@ async def _collect_slice(
             clear_recovered = True
             abandoned = True
             next_cursor = None
-        elif target_reached:
+        elif continuity_proven:
             next_cursor = None
         elif response.end is None and gap.target_token:
-            # Exhaustion closes the walk but does not prove target continuity.
+            # Unbound exhaustion closes the walk without proving continuity.
             next_cursor = None
         elif response.end is None:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
@@ -1352,7 +1367,7 @@ async def _collect_slice(
         ordered_events = (
             () if abandoned else _merge_recovery_page_order(retained, page_events)
         )
-        if target_reached and next_cursor is None and not abandoned:
+        if continuity_proven and next_cursor is None and not abandoned:
             ordered_events = _promote_recovered_continuity(ordered_events)
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
