@@ -35,6 +35,7 @@ from nio.client.sync_recovery import (
     plan_sync_response,
     pump_recovery,
     record_completed_timeline_event,
+    take_recovery_outcomes,
 )
 from nio.responses import RoomMessagesResponse
 
@@ -1423,6 +1424,65 @@ async def test_repeated_end_overlap_does_not_recover_suffix():
     )
     assert seen == ["$present-one", "$present-two"]
     assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_conflicting_overlap_order_keeps_gap_open_without_target():
+    held_a = PendingTimelineEvent.from_event(ROOM, 1, 0, event("$held-a", 2), True)
+    held_b = PendingTimelineEvent.from_event(ROOM, 1, 1, event("$held-b", 4), True)
+    assert held_a and held_b
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [held_a, held_b]},
+    )
+    admissions: list[tuple[str, TimelineEventProvenance]] = []
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "more",
+                "chunk": [
+                    event("$gap-one", 1).source,
+                    event("$held-b", 4).source,
+                    event("$gap-two", 3).source,
+                    event("$held-a", 2).source,
+                ],
+            },
+            ROOM,
+        )
+
+    async def dispatch(
+        _room,
+        value,
+        _was_completed,
+        _kind,
+        provenance,
+        _sync_origin,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        admissions.append((value.event_id, provenance))
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert admissions == []
+    [gap] = state.gaps[ROOM]
+    assert gap.cursor_token == "more"
+    assert gap.target_token == "target"
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+    )
 
 
 @pytest.mark.asyncio

@@ -569,11 +569,11 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 7
+        assert version == 8
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
-        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1", membership_bound=True)
         event = PendingTimelineEvent(
             TEST_ROOM,
             1,
@@ -608,9 +608,15 @@ class TestClass:
         assert sqlstore.load_sync_token() == "s2"
         gaps, events = sqlstore.load_sync_recovery()
         assert [
-            (gap.room_id, gap.generation, gap.target_token, gap.cursor_token)
+            (
+                gap.room_id,
+                gap.generation,
+                gap.target_token,
+                gap.cursor_token,
+                gap.membership_bound,
+            )
             for gap in gaps
-        ] == [(TEST_ROOM, 1, "p1", "s1")]
+        ] == [(TEST_ROOM, 1, "p1", "s1", True)]
         assert (
             events[0].room_id,
             events[0].generation,
@@ -908,7 +914,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 7
+        assert reopened._get_store_version() == 8
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
@@ -936,7 +942,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 7
+        assert reopened._get_store_version() == 8
         with reopened.database.bind_ctx(reopened.models):
             assert SlidingWindowTokens.table_exists()
         assert reopened.load_sliding_window_tokens() == {}
@@ -969,7 +975,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 7
+        assert reopened._get_store_version() == 8
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_v5_store_adds_durable_admission_phase(self, sqlstore):
@@ -1017,7 +1023,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 7
+        assert reopened._get_store_version() == 8
         assert reopened.load_sync_token() == "s1"
         assert reopened.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
@@ -1047,6 +1053,35 @@ class TestClass:
                 ).fetchall()
             }
         assert {"provenance", "apply_room_state"} <= columns
+
+    def test_v8_store_adds_conservative_membership_binding(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
+        sqlstore.save_recovery(None, set(), [gap], [], None)
+        table = SyncRecoveryGaps._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'ALTER TABLE "{table}" DROP COLUMN membership_bound'
+            )
+            sqlstore._update_version(7)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 8
+        gaps, _ = reopened.load_sync_recovery()
+        assert len(gaps) == 1
+        assert not gaps[0].membership_bound
+        with reopened.database.bind_ctx(reopened.models):
+            columns = {
+                row[1]
+                for row in reopened.database.execute_sql(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+        assert "membership_bound" in columns
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)

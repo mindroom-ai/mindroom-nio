@@ -265,6 +265,7 @@ from .base_client import (
 from .sliding_membership import (
     plan_sliding_prev_batches,
     sliding_live_event_count,
+    sliding_membership_proof_mismatch,
     sliding_recovery_cursor,
     sliding_recovery_membership,
     sliding_room_is_invite,
@@ -279,6 +280,7 @@ from .sync_recovery import (
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
+    is_recovered_dispatch_task,
     is_recovery_dispatch_task,
     load_recovery_state,
     merge_recovery_plans,
@@ -975,8 +977,8 @@ class AsyncClient(Client):
 
         Only one admission owner can be registered because multiple callbacks
         cannot make their durable side effects atomic.
-        The callback receives the room, event, and its live-or-history
-        ``TimelineEventProvenance``.
+        The callback receives the room, event, and its live, recovered, or
+        history ``TimelineEventProvenance``.
         Two-argument callbacks registered against nio 0.33 remain supported;
         new callbacks should require the provenance argument.
         Classic Sync initial timelines are history, while timelines that
@@ -984,7 +986,8 @@ class AsyncClient(Client):
         Sliding Sync uses the validated ``num_live`` tail when present.
         Ordinary continuations without it are live, while initial or expanded
         responses without it are history.
-        Events recovered through ``/messages`` are history.
+        Events proven to follow the held room baseline by reaching the exact
+        ``/messages`` target are recovered.
         Raise CallbackNotAcceptedError before producing side effects to keep the
         event pending for redispatch.
         The callback must be idempotent by event ID because its external write
@@ -1657,6 +1660,16 @@ class AsyncClient(Client):
                 plans = []
                 for room_id, room in response.rooms.items():
                     component_is_current = self._room_component_is_current(room_id)
+                    recovery_cursor = (
+                        sliding_recovery_cursor(
+                            room_id,
+                            room,
+                            user_id=self.user_id,
+                            window_tokens=self._sliding_room_prev_batch,
+                        )
+                        if component_is_current
+                        else None
+                    )
                     live_event_count = sliding_live_event_count(room)
                     membership_live_event_count = (
                         live_event_count
@@ -1682,22 +1695,23 @@ class AsyncClient(Client):
                                 if component_is_current
                                 else "join"
                             ),
-                            live_event_count=membership_live_event_count,
-                            provenance_live_event_count=live_event_count,
-                            apply_state_live_event_count=apply_state_live_event_count,
-                            cursor_token=(
-                                sliding_recovery_cursor(
+                            reset_recovery=(
+                                room_id in unrecoverable_room_ids
+                                and sliding_membership_proof_mismatch(
                                     room_id,
                                     room,
                                     user_id=self.user_id,
                                     window_tokens=self._sliding_room_prev_batch,
                                 )
-                                if component_is_current
-                                else None
                             ),
+                            live_event_count=membership_live_event_count,
+                            provenance_live_event_count=live_event_count,
+                            apply_state_live_event_count=apply_state_live_event_count,
+                            cursor_token=recovery_cursor,
                             target_token=(
                                 room.prev_batch or "" if component_is_current else ""
                             ),
+                            membership_bound=recovery_cursor is not None,
                             batch_id=batch_id,
                             account_data_events=(
                                 tuple(
@@ -4055,6 +4069,10 @@ class AsyncClient(Client):
         If timeline recovery is pending or encrypted state cannot be fully
         synced after a couple of retries, this raises `SendRetryError`.
 
+        The exact callback task draining this room's recovery gap may send to
+        the same room. Child tasks and sends to other recovering rooms remain
+        blocked so recovery authority cannot outlive or escape its callback.
+
         Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
@@ -4091,6 +4109,10 @@ class AsyncClient(Client):
         if any(
             gap.cursor_token is not None or gap.target_token
             for gap in self._recovery.gaps.get(room_id, ())
+        ) and not is_recovered_dispatch_task(
+            self._recovery,
+            asyncio.current_task(),
+            room_id,
         ):
             raise SendRetryError("Room timeline recovery is still pending.")
 

@@ -218,6 +218,7 @@ class SyncRecoveryGaps(Model):
     generation = IntegerField()
     target_token = TextField()
     cursor_token = TextField(null=True)
+    membership_bound = BooleanField(default=False)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

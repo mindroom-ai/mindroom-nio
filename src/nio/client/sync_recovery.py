@@ -84,6 +84,8 @@ class RecoveryGap:
     generation: int
     target_token: str
     cursor_token: str | None
+    # The bounded tokens were issued under one proven own-membership identity.
+    membership_bound: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ class PendingTimelineEvent:
     ``is_live`` distinguishes sync-origin rows from ``/messages`` recovery
     rows. Sync-origin rows survive room resets, count toward the held-event
     cap, and acknowledge ordinary callback failures. ``provenance`` is the
-    independent live-or-history classification exposed at admission.
+    independent live, recovered, or history classification exposed at admission.
     ``apply_room_state`` keeps historical Sliding Sync expansions from
     replacing current room state; Classic Sync timelines always apply state.
     """
@@ -214,9 +216,13 @@ def has_pending_recovery_work(state: RecoveryState) -> bool:
 def is_recovery_dispatch_task(
     state: RecoveryState,
     task: asyncio.Task[Any] | None,
+    room_id: str | None = None,
 ) -> bool:
-    """Whether task owns a retained recovery callback."""
-    return task is not None and task in state._active_dispatches.values()
+    """Whether task owns a retained recovery callback, optionally for one room."""
+    return task is not None and any(
+        active is task and (room_id is None or key[0] == room_id)
+        for key, active in state._active_dispatches.items()
+    )
 
 
 def _dispatch_key(pending: PendingTimelineEvent) -> _DispatchKey:
@@ -250,6 +256,34 @@ def _pending_dispatch(
         if gap:
             return gap, pending
     return None
+
+
+def is_recovered_dispatch_task(
+    state: RecoveryState,
+    task: asyncio.Task[Any] | None,
+    room_id: str,
+) -> bool:
+    """Whether task owns the room's only continuity-proven callback gap."""
+    if task is None:
+        return False
+    for key, active in state._active_dispatches.items():
+        if active is not task or key[0] != room_id:
+            continue
+        target = _pending_dispatch(state, key)
+        if target is None:
+            continue
+        gap, pending = target
+        if (
+            pending.provenance is TimelineEventProvenance.RECOVERED
+            and gap.cursor_token is None
+            and not any(
+                other.generation != gap.generation
+                and (other.cursor_token is not None or other.target_token)
+                for other in state.gaps.get(room_id, ())
+            )
+        ):
+            return True
+    return False
 
 
 def _dispatch_finished(
@@ -690,11 +724,13 @@ def plan_room_timeline(
     timeline_events: Sequence[Event | BadEventType],
     user_id: str | None,
     membership: str,
+    reset_recovery: bool = False,
     live_event_count: int | None = None,
     provenance_live_event_count: int | None = None,
     apply_state_live_event_count: int | None = None,
     cursor_token: str | None = None,
     target_token: str = "",
+    membership_bound: bool = False,
     batch_id: str | None = None,
     ephemeral_events: Sequence[EphemeralEvent] = (),
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
@@ -715,7 +751,7 @@ def plan_room_timeline(
     ):
         apply_state_live_event_count = 0
 
-    clear = _timeline_clears_recovery(
+    clear = reset_recovery or _timeline_clears_recovery(
         timeline_events,
         user_id,
         live_event_count,
@@ -728,8 +764,14 @@ def plan_room_timeline(
         live_event_count=live_event_count,
         cursor_token=cursor_token,
     )
+    separate_history = (
+        bool(existing)
+        and not new_gap
+        and provenance_live_event_count is not None
+        and provenance_live_event_count < len(timeline_events)
+    )
     generation = existing[-1].generation if existing else 0
-    if new_gap or not existing:
+    if new_gap or not existing or separate_history:
         generation += 1
     events = _plan_timeline_events(
         state,
@@ -792,8 +834,9 @@ def plan_room_timeline(
             generation,
             target_token if new_gap else "",
             cursor_token if new_gap else None,
+            membership_bound if new_gap else False,
         )
-        if new_gap or events and not existing
+        if new_gap or events and (not existing or separate_history)
         else None
     )
     return RecoveryPlan(
@@ -967,7 +1010,11 @@ def load_recovery_state(
     state.outcomes.clear()
     for row in gaps:
         gap = RecoveryGap(
-            row.room_id, row.generation, row.target_token, row.cursor_token
+            row.room_id,
+            row.generation,
+            row.target_token,
+            row.cursor_token,
+            row.membership_bound,
         )
         state.gaps.setdefault(row.room_id, []).append(gap)
     for room_gaps in state.gaps.values():
@@ -1126,6 +1173,21 @@ def _merge_recovery_page_order(
     return tuple(replace(event, sequence=index) for index, event in enumerate(ordered))
 
 
+def _promote_recovered_continuity(
+    events: Iterable[PendingTimelineEvent],
+) -> tuple[PendingTimelineEvent, ...]:
+    return tuple(
+        (
+            replace(event, provenance=TimelineEventProvenance.RECOVERED)
+            if event.kind == "timeline"
+            and event.provenance is TimelineEventProvenance.HISTORY
+            and not event.was_completed
+            else event
+        )
+        for event in events
+    )
+
+
 async def _collect_slice(
     state: RecoveryState,
     gap: RecoveryGap,
@@ -1141,6 +1203,21 @@ async def _collect_slice(
 
     pages = 0
     cursor = gap.cursor_token
+    if gap.target_token and cursor == gap.target_token:
+        updated = replace(gap, cursor_token=None)
+        persist_response_plan(
+            state,
+            store,
+            token=None,
+            plan=RecoveryPlan(
+                gaps=(updated,),
+                events=_promote_recovered_continuity(
+                    state.events.get((gap.room_id, gap.generation), ())
+                ),
+            ),
+        )
+        return updated
+
     pending = [
         event
         for (event_room, generation), queued in state.events.items()
@@ -1149,7 +1226,6 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     recovered_count = sum(not event.is_live for event in pending)
-
     while cursor and pages < options.max_pages:
         clear_recovered = False
         abandoned = False
@@ -1250,6 +1326,14 @@ async def _collect_slice(
         retained_recovered_count = recovered_count - (
             current_recovered_count if clear_recovered else 0
         )
+        target_reached = bool(gap.target_token and response.end == gap.target_token)
+        bounded_exhausted = bool(
+            gap.membership_bound
+            and gap.target_token
+            and response.end is None
+            and not clear_recovered
+        )
+        continuity_proven = target_reached or bounded_exhausted
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
@@ -1257,28 +1341,22 @@ async def _collect_slice(
             clear_recovered = True
             abandoned = True
             next_cursor = None
-        elif response.end is None and gap.target_token:
-            # A bounded walk that runs out of events has reached the sync
-            # window: the spec omits `end` exactly when no further events
-            # are available in the requested direction, and the request
-            # was bounded by the token the window starts at. Both Synapse
-            # and Tuwunel answer the last page of a `to`-bounded forward
-            # walk this way — with an empty chunk and no token — and they
-            # stop short of the window's own events. Treating the exhausted
-            # page as failure discarded every recovered event instead.
-            #
-            # The spec also omits `end` when the user may not see any more
-            # events, which this cannot distinguish; a gap truncated by
-            # history visibility is dispatched as if complete rather than
-            # dropped whole.
-            next_cursor = None
-        elif response.end in (None, cursor):
+        elif response.end == cursor:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
             abandoned = True
             next_cursor = None
-        elif response.end == gap.target_token:
+        elif continuity_proven:
+            next_cursor = None
+        elif response.end is None and gap.target_token:
+            # Unbound exhaustion closes the walk without proving continuity.
+            next_cursor = None
+        elif response.end is None:
+            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
+            recovered.clear()
+            clear_recovered = True
+            abandoned = True
             next_cursor = None
         else:
             next_cursor = response.end
@@ -1289,6 +1367,8 @@ async def _collect_slice(
         ordered_events = (
             () if abandoned else _merge_recovery_page_order(retained, page_events)
         )
+        if continuity_proven and next_cursor is None and not abandoned:
+            ordered_events = _promote_recovered_continuity(ordered_events)
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
             state,
