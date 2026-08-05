@@ -4847,8 +4847,8 @@ class TestRoomLocalRecovery:
         )
 
         assert admissions == [("$during-restart", "recovered")]
-        assert pages.from_tokens == ["w1"]
-        assert pages.to_tokens == ["w1"]
+        assert pages.from_tokens == []
+        assert pages.to_tokens == []
         assert not restarted._recovery.gaps
         assert restarted.store
         _, stored = restarted.store.load_sync_recovery()

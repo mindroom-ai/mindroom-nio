@@ -1130,6 +1130,21 @@ def _merge_recovery_page_order(
     return tuple(replace(event, sequence=index) for index, event in enumerate(ordered))
 
 
+def _promote_recovered_continuity(
+    events: Iterable[PendingTimelineEvent],
+) -> tuple[PendingTimelineEvent, ...]:
+    return tuple(
+        (
+            replace(event, provenance=TimelineEventProvenance.RECOVERED)
+            if event.kind == "timeline"
+            and event.provenance is TimelineEventProvenance.HISTORY
+            and not event.was_completed
+            else event
+        )
+        for event in events
+    )
+
+
 async def _collect_slice(
     state: RecoveryState,
     gap: RecoveryGap,
@@ -1145,6 +1160,21 @@ async def _collect_slice(
 
     pages = 0
     cursor = gap.cursor_token
+    if gap.target_token and cursor == gap.target_token:
+        updated = replace(gap, cursor_token=None)
+        persist_response_plan(
+            state,
+            store,
+            token=None,
+            plan=RecoveryPlan(
+                gaps=(updated,),
+                events=_promote_recovered_continuity(
+                    state.events.get((gap.room_id, gap.generation), ())
+                ),
+            ),
+        )
+        return updated
+
     pending = [
         event
         for (event_room, generation), queued in state.events.items()
@@ -1153,7 +1183,7 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     recovered_count = sum(not event.is_live for event in pending)
-    continuity_proven = cursor == gap.target_token
+    continuity_proven = False
 
     while cursor and pages < options.max_pages:
         clear_recovered = False
@@ -1265,10 +1295,16 @@ async def _collect_slice(
             clear_recovered = True
             abandoned = True
             next_cursor = None
+        elif response.end == cursor:
+            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
+            recovered.clear()
+            clear_recovered = True
+            abandoned = True
+            next_cursor = None
         elif continuity_proven:
-            # Equal bounds or overlap with a sync-origin event bridge the
-            # persisted baseline to the current window. No later page can
-            # strengthen that proof, so finish within this pump.
+            # Overlap with a sync-origin event bridges the persisted
+            # baseline to the current window. No later page can strengthen
+            # that proof, so finish within this pump.
             next_cursor = None
         elif response.end is None and gap.target_token:
             # A bounded walk that runs out of events has reached the sync
@@ -1285,7 +1321,7 @@ async def _collect_slice(
             # history visibility is dispatched as if complete rather than
             # dropped whole, but does not gain recovered provenance.
             next_cursor = None
-        elif response.end in (None, cursor):
+        elif response.end is None:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
             clear_recovered = True
@@ -1304,16 +1340,7 @@ async def _collect_slice(
             () if abandoned else _merge_recovery_page_order(retained, page_events)
         )
         if continuity_proven and next_cursor is None and not abandoned:
-            ordered_events = tuple(
-                (
-                    replace(event, provenance=TimelineEventProvenance.RECOVERED)
-                    if event.kind == "timeline"
-                    and event.provenance is TimelineEventProvenance.HISTORY
-                    and not event.was_completed
-                    else event
-                )
-                for event in ordered_events
-            )
+            ordered_events = _promote_recovered_continuity(ordered_events)
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
             state,
