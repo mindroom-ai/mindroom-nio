@@ -1312,9 +1312,7 @@ async def _collect_slice(
         retained_recovered_count = recovered_count - (
             current_recovered_count if clear_recovered else 0
         )
-        target_reached = bool(
-            gap.target_token and response.end == gap.target_token
-        )
+        target_reached = bool(gap.target_token and response.end == gap.target_token)
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
