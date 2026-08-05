@@ -1099,20 +1099,6 @@ def _finish(
         state.outcomes.setdefault(gap.room_id, True)
 
 
-def _recovery_page_overlap_anchors(
-    queued_events: Sequence[PendingTimelineEvent],
-    page_events: Sequence[PendingTimelineEvent],
-) -> list[tuple[int, int]]:
-    queued_indexes = {
-        event.event_id: index for index, event in enumerate(queued_events)
-    }
-    return [
-        (page_index, queued_indexes[event.event_id])
-        for page_index, event in enumerate(page_events)
-        if event.event_id in queued_indexes
-    ]
-
-
 def _merge_recovery_page_order(
     queued: Iterable[PendingTimelineEvent],
     page: Iterable[PendingTimelineEvent],
@@ -1125,13 +1111,19 @@ def _merge_recovery_page_order(
             replace(event, sequence=index) for index, event in enumerate(queued_events)
         )
 
-    queued_ids = {event.event_id for event in queued_events}
-    anchors = _recovery_page_overlap_anchors(queued_events, page_events)
+    queued_indexes = {
+        event.event_id: index for index, event in enumerate(queued_events)
+    }
+    anchors = [
+        (page_index, queued_indexes[event.event_id])
+        for page_index, event in enumerate(page_events)
+        if event.event_id in queued_indexes
+    ]
     # Conflicting overlap order cannot be spliced safely. Insert only the
     # page's new events at the normal recovered/live boundary instead.
     if any(previous[1] >= current[1] for previous, current in pairwise(anchors)):
         page_events = [
-            event for event in page_events if event.event_id not in queued_ids
+            event for event in page_events if event.event_id not in queued_indexes
         ]
         anchors = []
     page_ids = {event.event_id for event in page_events}
@@ -1220,8 +1212,6 @@ async def _collect_slice(
     ]
     pending_ids = {event.event_id for event in pending}
     recovered_count = sum(not event.is_live for event in pending)
-    continuity_proven = False
-
     while cursor and pages < options.max_pages:
         clear_recovered = False
         abandoned = False
@@ -1279,13 +1269,10 @@ async def _collect_slice(
                 page_events.clear()
                 page_ids.clear()
                 clear_recovered = True
-                continuity_proven = False
             completed = state.completed.get(gap.room_id, {}).get(event_id)
             was_completed = bool(completed and completed.was_encrypted)
             if event_id in pending_ids:
                 existing = queued_by_id.get(event_id)
-                if existing and existing.is_live:
-                    continuity_proven = True
                 if (
                     existing
                     and (existing.is_live or not clear_recovered)
@@ -1325,9 +1312,8 @@ async def _collect_slice(
         retained_recovered_count = recovered_count - (
             current_recovered_count if clear_recovered else 0
         )
-        anchors = _recovery_page_overlap_anchors(queued, page_events)
-        overlap_conflicts = any(
-            previous[1] >= current[1] for previous, current in pairwise(anchors)
+        target_reached = bool(
+            gap.target_token and response.end == gap.target_token
         )
         if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
@@ -1342,35 +1328,10 @@ async def _collect_slice(
             clear_recovered = True
             abandoned = True
             next_cursor = None
-        elif response.end == gap.target_token:
-            continuity_proven = True
-            next_cursor = None
-        elif overlap_conflicts:
-            logger.error("Abandoning conflicting recovery overlap in %s", gap.room_id)
-            recovered.clear()
-            page_events.clear()
-            clear_recovered = True
-            abandoned = True
-            next_cursor = None
-        elif continuity_proven:
-            # Overlap with a sync-origin event bridges the persisted
-            # baseline to the current window. No later page can strengthen
-            # that proof, so finish within this pump.
+        elif target_reached:
             next_cursor = None
         elif response.end is None and gap.target_token:
-            # A bounded walk that runs out of events has reached the sync
-            # window: the spec omits `end` exactly when no further events
-            # are available in the requested direction, and the request
-            # was bounded by the token the window starts at. Both Synapse
-            # and Tuwunel answer the last page of a `to`-bounded forward
-            # walk this way — with an empty chunk and no token — and they
-            # stop short of the window's own events. Treating the exhausted
-            # page as failure discarded every recovered event instead.
-            #
-            # The spec also omits `end` when the user may not see any more
-            # events, which this cannot distinguish; a gap truncated by
-            # history visibility is dispatched as if complete rather than
-            # dropped whole, but does not gain recovered provenance.
+            # Exhaustion closes the walk but does not prove target continuity.
             next_cursor = None
         elif response.end is None:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
@@ -1387,7 +1348,7 @@ async def _collect_slice(
         ordered_events = (
             () if abandoned else _merge_recovery_page_order(retained, page_events)
         )
-        if continuity_proven and next_cursor is None and not abandoned:
+        if target_reached and next_cursor is None and not abandoned:
             ordered_events = _promote_recovered_continuity(ordered_events)
         updated = replace(gap, cursor_token=next_cursor)
         persist_response_plan(
