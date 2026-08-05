@@ -437,6 +437,14 @@ async def _run_to_completion(
     return result
 
 
+async def _cancel_and_drain_tasks(tasks: Sequence[asyncio.Future[Any]]) -> None:
+    """Cancel owned child tasks and wait until every child is quiescent."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -704,6 +712,7 @@ class AsyncClient(Client):
         )
         self._sync_reset_fence = SyncResetFence()
         self._sync_response_seen = False
+        self._classic_sync_rebuild_pending = False
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -789,6 +798,7 @@ class AsyncClient(Client):
                 "Persisted sync recovery can only be cleared before sync starts."
             )
         store._clear_sync_recovery()
+        self._classic_sync_rebuild_pending = True
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -807,11 +817,12 @@ class AsyncClient(Client):
         Raises:
             LocalProtocolError: If nio owns durable sync state, a sync-family
                 request or response is active, or the reset is called from a
-                serialized timeline callback.
+                serialized event callback.
             Exception: The first retained callback failure encountered while
                 draining work that had already started.
         """
         caller = asyncio.current_task()
+        callback_scope = self._event_callback_scope.get()
         if not self.config.backfill_limited_timelines:
             raise LocalProtocolError(
                 "Classic Sync reset requires backfill_limited_timelines=True."
@@ -820,12 +831,17 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires token and persisted recovery ownership to be disabled."
             )
-        if is_recovery_dispatch_task(self._recovery, caller) or (
-            self._active_sync_executor_token is not None
-            and self._sync_executor_context.get() is self._active_sync_executor_token
+        if (
+            (callback_scope is not None and callback_scope.active)
+            or is_recovery_dispatch_task(self._recovery, caller)
+            or (
+                self._active_sync_executor_token is not None
+                and self._sync_executor_context.get()
+                is self._active_sync_executor_token
+            )
         ):
             raise LocalProtocolError(
-                "Classic Sync state cannot be reset from a timeline callback."
+                "Classic Sync state cannot be reset from an event callback."
             )
         if (
             self._closing
@@ -845,17 +861,38 @@ class AsyncClient(Client):
                 try:
                     await drain_recovery_dispatches(self._recovery)
                 finally:
-                    self._recovery = RecoveryState(
-                        max_held_events=self.config.backfill_max_events
-                    )
-                    self._recovery_room_gates.clear()
-                    self._sliding_room_prev_batch.clear()
-                    self._pending_sliding_room_account_data.clear()
-                    self._sliding_sync_to_device_since = None
-                    self.loaded_sync_token = ""
-                    self.next_batch = ""
-                    self.rooms.clear()
-                    self.invited_rooms.clear()
+                    acquired: list[asyncio.Lock] = []
+                    acquired_room_ids: set[str] = set()
+                    try:
+                        # Gate interning is synchronous. Re-snapshot after each
+                        # awaited acquisition until no racing room operation
+                        # owns or waits on an unseen gate.
+                        while True:
+                            pending_room_ids = sorted(
+                                set(self._recovery_room_gates) - acquired_room_ids
+                            )
+                            if not pending_room_ids:
+                                break
+                            for room_id in pending_room_ids:
+                                gate = self._recovery_room_gates[room_id]
+                                await gate.acquire()
+                                acquired.append(gate)
+                                acquired_room_ids.add(room_id)
+
+                        self._recovery = RecoveryState(
+                            max_held_events=self.config.backfill_max_events
+                        )
+                        self._sliding_room_prev_batch.clear()
+                        self._pending_sliding_room_account_data.clear()
+                        self._sliding_sync_to_device_since = None
+                        self.loaded_sync_token = ""
+                        self.next_batch = ""
+                        self.rooms.clear()
+                        self.invited_rooms.clear()
+                        self._classic_sync_rebuild_pending = True
+                    finally:
+                        for gate in reversed(acquired):
+                            gate.release()
 
         await _run_to_completion(reset())
 
@@ -1231,7 +1268,10 @@ class AsyncClient(Client):
         response: SyncResponse,
         request_since: str | None,
     ) -> frozenset[str]:
-        if self.next_batch == response.next_batch:
+        if (
+            not self._classic_sync_rebuild_pending
+            and self.next_batch == response.next_batch
+        ):
             return frozenset()
 
         return frozenset(
@@ -1426,7 +1466,10 @@ class AsyncClient(Client):
         response = envelope.response
         request_since = envelope.request_since
 
-        if self.next_batch == response.next_batch:
+        if (
+            not self._classic_sync_rebuild_pending
+            and self.next_batch == response.next_batch
+        ):
             await self._pump_sync_recovery()
             return
 
@@ -1510,6 +1553,7 @@ class AsyncClient(Client):
                 )
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+        self._classic_sync_rebuild_pending = False
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -3173,13 +3217,11 @@ class AsyncClient(Client):
                 if loop_sleep_time:
                     await asyncio.sleep(loop_sleep_time / 1000)
 
-            except asyncio.CancelledError:  # noqa: PERF203
-                for task in tasks:
-                    task.cancel()
-                if sync_generation is self._sync_generation:
-                    self._stop_sync_forever = False
-                raise
-            except:
+            except BaseException:  # noqa: PERF203
+                try:
+                    await _run_to_completion(_cancel_and_drain_tasks(tasks))
+                except asyncio.CancelledError:
+                    pass
                 if sync_generation is self._sync_generation:
                     self._stop_sync_forever = False
                 raise
@@ -3402,8 +3444,10 @@ class AsyncClient(Client):
                 # Cancel the sibling requests: a failed key request must
                 # not leave the long-poll running, or its response would
                 # still be applied to client state after the loop has died.
-                for task in tasks:
-                    task.cancel()
+                try:
+                    await _run_to_completion(_cancel_and_drain_tasks(tasks))
+                except asyncio.CancelledError:
+                    pass
                 if sync_generation is self._sync_generation:
                     self._stop_sync_forever = False
                 raise

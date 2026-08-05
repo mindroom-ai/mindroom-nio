@@ -389,10 +389,240 @@ class TestRoomLocalRecovery:
         assert client._recovery.gaps == {}
 
         client.next_batch = "s_committed"
-        await client.receive_response(response)
+        await client.receive_response(
+            sync_response(
+                "s_committed",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$later", 2, "Later")],
+                        limited=False,
+                        prev_batch="p0",
+                        state=[name_event("$baseline", 1, "Baseline")],
+                    )
+                },
+            )
+        )
 
         assert seen == ["$later", "$later"]
         assert client.rooms[ROOM_A].name == "Later"
+
+        await client.receive_response(
+            sync_response(
+                "s_committed",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$duplicate", 3, "Duplicate")],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        assert seen == ["$later", "$later"]
+        assert client.rooms[ROOM_A].name == "Later"
+        await client.close()
+
+    async def test_reset_classic_sync_state_rejects_an_inherited_callback_scope(
+        self,
+        tempdir,
+    ):
+        """A callback child cannot deadlock reset while its parent is retained."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+
+        async def reset_from_child(_room, _event):
+            await asyncio.create_task(client.reset_classic_sync_state())
+
+        client.add_event_callback(reset_from_child, RoomNameEvent)
+        with pytest.raises(LocalProtocolError, match="event callback"):
+            await client._on_event(
+                name_event("$callback", 2, "Callback"),
+                client.rooms[ROOM_A],
+            )
+
+        assert ROOM_A in client.rooms
+        await client.close()
+
+    async def test_reset_classic_sync_state_waits_for_active_and_queued_room_operations(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """Reset cannot invalidate a room while a gated operation uses it."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        room_gate = client._recovery_room_gate(ROOM_A)
+        prepare_started = asyncio.Event()
+        queued_prepare_started = asyncio.Event()
+        release_prepare = asyncio.Event()
+        release_queued_prepare = asyncio.Event()
+        sent = object()
+        prepare_calls = 0
+
+        async def prepare(*_args, **_kwargs):
+            nonlocal prepare_calls
+            prepare_calls += 1
+            if prepare_calls == 1:
+                prepare_started.set()
+                await release_prepare.wait()
+            else:
+                queued_prepare_started.set()
+                await release_queued_prepare.wait()
+            return "PUT", "/send", "{}"
+
+        async def send(*_args, **_kwargs):
+            return sent
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        room_send = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "safe", "msgtype": "m.text"},
+            )
+        )
+        await prepare_started.wait()
+        queued_room_send = asyncio.create_task(
+            client.room_send(
+                ROOM_A,
+                "m.room.message",
+                {"body": "queued", "msgtype": "m.text"},
+            )
+        )
+        await asyncio.sleep(0)
+
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+
+        assert not reset.done()
+        assert ROOM_A in client.rooms
+        release_prepare.set()
+        assert await room_send is sent
+        await queued_prepare_started.wait()
+        reset_waited_for_queue = not reset.done()
+        room_survived_until_queue_finished = ROOM_A in client.rooms
+        release_queued_prepare.set()
+        assert await queued_room_send is sent
+        await reset
+
+        assert reset_waited_for_queue
+        assert room_survived_until_queue_finished
+        assert client.rooms == {}
+        assert client._recovery_room_gate(ROOM_A) is room_gate
+        await client.close()
+
+    async def test_reset_classic_sync_state_captures_a_racing_room_gate(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """Reset re-snapshots gates interned while an earlier gate blocks it."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info([], limited=False, prev_batch="a0"),
+                    ROOM_B: room_info([], limited=False, prev_batch="b0"),
+                },
+            )
+        )
+        reset_waiting_on_room_a = asyncio.Event()
+
+        class ObservedLock(asyncio.Lock):
+            attempts = 0
+
+            async def acquire(self):
+                self.attempts += 1
+                if self.attempts == 2:
+                    reset_waiting_on_room_a.set()
+                return await super().acquire()
+
+        room_a_gate = ObservedLock()
+        client._recovery_room_gates[ROOM_A] = room_a_gate
+        del client._recovery_room_gates[ROOM_B]
+        await room_a_gate.acquire()
+        room_b_prepare_started = asyncio.Event()
+        release_room_b_prepare = asyncio.Event()
+        sent = object()
+
+        async def prepare(room_id, *_args, **_kwargs):
+            assert room_id == ROOM_B
+            room_b_prepare_started.set()
+            await release_room_b_prepare.wait()
+            return "PUT", "/send", "{}"
+
+        async def send(*_args, **_kwargs):
+            return sent
+
+        monkeypatch.setattr(client, "_prepare_room_send", prepare)
+        monkeypatch.setattr(client, "_send", send)
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await reset_waiting_on_room_a.wait()
+
+        room_send = asyncio.create_task(
+            client.room_send(
+                ROOM_B,
+                "m.room.message",
+                {"body": "racing", "msgtype": "m.text"},
+            )
+        )
+        await room_b_prepare_started.wait()
+        room_b_gate = client._recovery_room_gate(ROOM_B)
+        room_a_gate.release()
+        await asyncio.sleep(0)
+
+        assert not reset.done()
+        assert ROOM_B in client.rooms
+        release_room_b_prepare.set()
+        assert await room_send is sent
+        await reset
+        assert client.rooms == {}
+        assert client._recovery_room_gate(ROOM_B) is room_b_gate
         await client.close()
 
     async def test_reset_classic_sync_state_drains_started_dispatches(
@@ -487,12 +717,29 @@ class TestRoomLocalRecovery:
             None,
         )
         client.store.save_sliding_window_tokens({ROOM_A: window_token("w1")})
+        client.next_batch = "s_committed"
+        seen = record_events(client, RoomNameEvent)
 
         client.clear_persisted_sync_recovery()
 
         assert client.store.load_sync_token() is None
         assert client.store.load_sync_recovery() == ([], [])
         assert client.store.load_sliding_window_tokens() == {}
+
+        await client.receive_response(
+            sync_response(
+                "s_committed",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$current", 2, "Current")],
+                        limited=False,
+                        prev_batch="p0",
+                    )
+                },
+            )
+        )
+        assert seen == ["$current"]
+        assert client.rooms[ROOM_A].name == "Current"
         await client.close()
 
     async def test_deferred_callback_error_surfaces_without_recovery_gap(self, client):

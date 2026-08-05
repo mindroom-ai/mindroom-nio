@@ -7,8 +7,14 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Add `AsyncClient.reset_classic_sync_state()` for applications that disable nio sync persistence and durably own the Classic Sync checkpoint.
-  The operation drains started callbacks and clears transient response, room, recovery, and replay-suppression state so the application can replay from its committed cursor.
+  The operation drains started callbacks and active or queued room-state users before clearing transient response, room, recovery, and replay-suppression state so the application can replay from its committed cursor.
+  The first response after reset is applied as a rebuild even when its opaque token equals the restored checkpoint.
 - Add `AsyncClient.clear_persisted_sync_recovery()` for removing legacy cursor, recovery, and Sliding Sync window rows when migrating to application-owned Classic Sync.
+  Its first response also bypasses same-token suppression so startup full state always rebuilds the in-memory room model.
+
+### Bug Fixes
+
+- Wait for cancelled Classic and Sliding Sync sibling tasks to finish before their outer loop exits, making loop completion a quiescence boundary for application-owned resets.
 
 ## 0.34.1
 
