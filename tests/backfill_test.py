@@ -722,6 +722,40 @@ class TestRoomLocalRecovery:
         assert not client.has_uncommitted_classic_sync_state
         await client.close()
 
+    async def test_application_owned_classic_state_honors_recovery_config_before_store_load(
+        self,
+        tempdir,
+    ):
+        """Configured durable recovery cannot look application-owned before login."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        assert client.store is None
+
+        with pytest.raises(LocalProtocolError, match="disabled"):
+            client.clear_persisted_sync_recovery()
+        with pytest.raises(LocalProtocolError, match="disabled"):
+            client.acknowledge_classic_sync("")
+        with pytest.raises(LocalProtocolError, match="disabled"):
+            await client.reset_classic_sync_state()
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        assert not client.has_uncommitted_classic_sync_state
+        await client.close()
+
     async def test_reset_classic_sync_state_rejects_an_active_sync_request(
         self,
         tempdir,

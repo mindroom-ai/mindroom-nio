@@ -745,14 +745,19 @@ class AsyncClient(Client):
         super().__init__(user, device_id, store_path, self.config)
 
     @property
-    def _recovery_store(self) -> "MatrixStore | None":
-        """The store to persist recovery state in, if that is enabled."""
-        if not (self.config.backfill_limited_timelines and self.store):
-            return None
+    def _recovery_persistence_enabled(self) -> bool:
+        """Return whether configuration gives nio durable recovery ownership."""
+        if not self.config.backfill_limited_timelines:
+            return False
         persist = self.config.backfill_persist_recovery
-        if persist is None:
-            persist = self.config.store_sync_tokens
-        return self.store if persist else None
+        return self.config.store_sync_tokens if persist is None else persist
+
+    @property
+    def _recovery_store(self) -> "MatrixStore | None":
+        """Return the loaded recovery store when configured persistence is enabled."""
+        if not self._recovery_persistence_enabled:
+            return None
+        return self.store
 
     def load_store(self):
         super().load_store()
@@ -776,7 +781,7 @@ class AsyncClient(Client):
             LocalProtocolError: If the store is unavailable, nio still owns
                 durable sync state, or sync processing has already started.
         """
-        if self.config.store_sync_tokens or self._recovery_store is not None:
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
             raise LocalProtocolError(
                 "Persisted sync recovery can only be cleared when nio sync persistence is disabled."
             )
@@ -813,7 +818,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_store is not None:
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
             raise LocalProtocolError(
                 "Classic Sync acknowledgement requires token and persisted recovery ownership to be disabled."
             )
@@ -854,7 +859,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_store is not None:
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
             raise LocalProtocolError(
                 "Classic Sync reset requires token and persisted recovery ownership to be disabled."
             )
@@ -1503,7 +1508,7 @@ class AsyncClient(Client):
         if (
             self.config.backfill_limited_timelines
             and not self.config.store_sync_tokens
-            and self._recovery_store is None
+            and not self._recovery_persistence_enabled
         ):
             self._classic_sync_state_staged = True
 
@@ -3165,14 +3170,14 @@ class AsyncClient(Client):
                 state for all rooms the user is a member of. If this is set to
                 true, then all state events will be returned, even if since is
                 non-empty. The timeline will still be limited by the since
-                parameter. This argument will be used only for the first sync
-                request.
+                parameter. This argument remains active until the first
+                successful sync response.
 
             since (str, optional): A token specifying a point in time where to
                 continue the sync from. Defaults to the last sync token we
                 received from the server using this API call. This argument
-                will be used only for the first sync request, the subsequent
-                sync requests will use the token from the last sync response.
+                remains active until the first successful sync response; later
+                requests use the token from that response.
 
             loop_sleep_time (int, optional): The sleep time, if any, between
                 successful sync loop iterations in milliseconds.
@@ -3180,7 +3185,7 @@ class AsyncClient(Client):
             first_sync_filter (Union[None, str, Dict[Any, Any]):
                 A filter ID that can be obtained from
                 ``AsyncClient.upload_filter()`` (preferred),
-                or filter dict to use for the first sync request only.
+                or filter dict to use until the first successful sync response.
                 If `None` (default), the `sync_filter` parameter's value
                 is used.
                 To have no filtering for the first sync regardless of
@@ -3195,6 +3200,7 @@ class AsyncClient(Client):
 
         while not self._stop_sync_forever and sync_generation is self._sync_generation:
             try:
+                initial_sync_complete = not first_sync
                 use_filter = (
                     first_sync_filter
                     if first_sync and first_sync_filter is not None
@@ -3213,6 +3219,7 @@ class AsyncClient(Client):
                         use_timeout, use_filter, since, full_state, presence
                     )
                     await self.run_response_callbacks([sync_response])
+                    initial_sync_complete = isinstance(sync_response, SyncResponse)
                 else:
                     presence = set_presence or self._presence
                     tasks = [
@@ -3241,12 +3248,13 @@ class AsyncClient(Client):
                 for response in asyncio.as_completed(tasks):
                     await self.run_response_callbacks([await response])
 
-                first_sync = False
-                full_state = None
-                since = None
+                if initial_sync_complete:
+                    first_sync = False
+                    full_state = None
+                    since = None
 
-                self.synced.set()
-                self.synced.clear()
+                    self.synced.set()
+                    self.synced.clear()
 
                 if loop_sleep_time:
                     await asyncio.sleep(loop_sleep_time / 1000)

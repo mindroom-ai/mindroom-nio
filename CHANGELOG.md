@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Wait for cancelled Classic and Sliding Sync sibling tasks to finish before their outer loop exits, making loop completion a quiescence boundary for application-owned resets.
+- Retain Classic first-sync filters, cursors, and full-state requests across transient sync errors until a successful response rebuilds the room model.
 - Raise `SendRetryError` for encrypted room sends while a rejected Classic response is rebuilding the room cache, allowing callers to use their existing bounded recovery retry.
 
 ## 0.34.1
