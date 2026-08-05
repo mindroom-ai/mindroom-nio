@@ -599,6 +599,21 @@ class MatrixStore:
 
         return None
 
+    @use_database_atomic
+    def _clear_sync_recovery(self) -> None:
+        """Clear the persisted sync cursor and recovery lane atomically."""
+        account = self._get_account()
+        assert account
+
+        SyncTokens.delete().where(SyncTokens.account == account).execute()
+        PendingTimelineEvents.delete().where(
+            PendingTimelineEvents.account == account
+        ).execute()
+        SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
+        SlidingWindowTokens.delete().where(
+            SlidingWindowTokens.account == account,
+        ).execute()
+
     @staticmethod
     def _restore_completed_markers(account, *conditions) -> None:
         PendingTimelineEvents.update(

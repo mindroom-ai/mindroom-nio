@@ -634,6 +634,94 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
+    def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
+        self,
+        sqlstore,
+    ):
+        gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
+
+        def pending(event_id, sequence):
+            return PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                sequence,
+                event_id,
+                '{"content":{},"event_id":"%s","sender":"@a:b",'
+                '"type":"m.test"}' % event_id,
+                True,
+                False,
+            )
+
+        sqlstore.save_recovery(
+            "s_advanced",
+            set(),
+            [gap],
+            [
+                pending("$accepted", 0),
+                pending("$unaccepted", 1),
+                pending("$completed", 2),
+            ],
+            None,
+        )
+        sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
+        sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
+        sqlstore.save_sliding_window_tokens(
+            {TEST_ROOM: SlidingWindowToken("w1", "$join")}
+        )
+
+        sqlstore._clear_sync_recovery()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened.load_sync_token() is None
+        assert reopened.load_sync_recovery() == ([], [])
+        assert reopened.load_sliding_window_tokens() == {}
+
+    def test_clear_sync_recovery_is_atomic(
+        self,
+        sqlstore,
+        monkeypatch,
+    ):
+        gap = RecoveryGap(TEST_ROOM, 1, "s_advanced", "s_cursor")
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$completed",
+            '{"content":{},"event_id":"$completed","sender":"@a:b",' '"type":"m.test"}',
+            True,
+            False,
+        )
+        sqlstore.save_recovery("s_advanced", set(), [gap], [event], None)
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
+        sqlstore.save_sliding_window_tokens(
+            {TEST_ROOM: SlidingWindowToken("w1", "$join")}
+        )
+        original_execute = sqlstore.database.execute_sql
+        window_table = SlidingWindowTokens._meta.table_name
+
+        def fail_window_delete(sql, *args, **kwargs):
+            if sql.startswith(f'DELETE FROM "{window_table}"'):
+                raise RuntimeError("window delete failed")
+            return original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(sqlstore.database, "execute_sql", fail_window_delete)
+
+        with pytest.raises(RuntimeError, match="window delete failed"):
+            sqlstore._clear_sync_recovery()
+
+        assert sqlstore.load_sync_token() == "s_advanced"
+        _, events = sqlstore.load_sync_recovery()
+        assert [(item.event_id, item.generation) for item in events] == [
+            ("$completed", 0)
+        ]
+        assert sqlstore.load_sliding_window_tokens() == {
+            TEST_ROOM: SlidingWindowToken("w1", "$join")
+        }
+
     def test_sync_recovery_resequences_existing_generation(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "p1", "s1")
 

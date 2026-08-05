@@ -437,6 +437,14 @@ async def _run_to_completion(
     return result
 
 
+async def _cancel_and_drain_tasks(tasks: Sequence[asyncio.Future[Any]]) -> None:
+    """Cancel owned child tasks and wait until every child is quiescent."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -703,6 +711,10 @@ class AsyncClient(Client):
             f"nio_sync_request_id_{id(self)}", default=None
         )
         self._sync_reset_fence = SyncResetFence()
+        self._sync_response_seen = False
+        self._classic_sync_rebuild_pending = False
+        self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token: str | None = None
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -734,14 +746,19 @@ class AsyncClient(Client):
         super().__init__(user, device_id, store_path, self.config)
 
     @property
-    def _recovery_store(self) -> "MatrixStore | None":
-        """The store to persist recovery state in, if that is enabled."""
-        if not (self.config.backfill_limited_timelines and self.store):
-            return None
+    def _recovery_persistence_enabled(self) -> bool:
+        """Return whether configuration gives nio durable recovery ownership."""
+        if not self.config.backfill_limited_timelines:
+            return False
         persist = self.config.backfill_persist_recovery
-        if persist is None:
-            persist = self.config.store_sync_tokens
-        return self.store if persist else None
+        return self.config.store_sync_tokens if persist is None else persist
+
+    @property
+    def _recovery_store(self) -> "MatrixStore | None":
+        """Return the loaded recovery store when configured persistence is enabled."""
+        if not self._recovery_persistence_enabled:
+            return None
+        return self.store
 
     def load_store(self):
         super().load_store()
@@ -752,6 +769,175 @@ class AsyncClient(Client):
                 *store.load_sync_recovery(),
             )
             self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
+
+    def clear_persisted_sync_recovery(self) -> None:
+        """Remove durable sync residue before application-owned Classic Sync.
+
+        This is a startup migration boundary for clients that disable both nio
+        token storage and recovery persistence. It prevents rows left by an
+        earlier persisted or Sliding lane from becoming authoritative if that
+        lane is enabled again after a Classic run.
+
+        Raises:
+            LocalProtocolError: If the store is unavailable, nio still owns
+                durable sync state, or sync processing has already started.
+        """
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+            raise LocalProtocolError(
+                "Persisted sync recovery can only be cleared when nio sync persistence is disabled."
+            )
+        store = self.store
+        if store is None:
+            raise LocalProtocolError(
+                "Persisted sync recovery can only be cleared after the store is loaded."
+            )
+        if (
+            self._closing
+            or self._sync_response_seen
+            or self._sync_response_lock.locked()
+            or self._active_sync_executor_token is not None
+            or self._sync_reset_fence.active_request_ids
+            or self._recovery._active_dispatches
+            or self.rooms
+            or self.invited_rooms
+        ):
+            raise LocalProtocolError(
+                "Persisted sync recovery can only be cleared before sync starts."
+            )
+        store._clear_sync_recovery()
+        self._classic_sync_rebuild_pending = True
+        self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token = None
+
+    @property
+    def has_uncommitted_classic_sync_state(self) -> bool:
+        """Return whether application-owned Classic state still needs acknowledgement."""
+        return self._classic_sync_state_staged
+
+    def acknowledge_classic_sync(self, next_batch: str) -> None:
+        """Acknowledge that the application durably committed one Classic response."""
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement requires backfill_limited_timelines=True."
+            )
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement requires token and persisted recovery ownership to be disabled."
+            )
+        if self._active_sync_executor_token is not None:
+            raise LocalProtocolError(
+                "Classic Sync state cannot be acknowledged while a response is active."
+            )
+        if (
+            not self._classic_sync_state_staged
+            or self._classic_sync_acknowledgeable_token is None
+            or next_batch != self._classic_sync_acknowledgeable_token
+            or next_batch != self.next_batch
+            or self._recovery._active_dispatches
+            or has_pending_recovery_work(self._recovery)
+        ):
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement token does not match the staged response."
+            )
+        self._classic_sync_state_staged = False
+        self._classic_sync_acknowledgeable_token = None
+
+    async def reset_classic_sync_state(self) -> None:
+        """Discard uncommitted Classic Sync state owned only in memory.
+
+        Applications that durably own the Classic Sync checkpoint can disable
+        nio's token and recovery persistence, process one response, and advance
+        their checkpoint only after every required side effect succeeds. If the
+        response is rejected, this method drains callbacks that already started
+        and restores a clean in-memory world for replay from that checkpoint.
+
+        The caller must stop issuing sync-family requests before resetting and
+        must install its committed cursor in ``next_batch`` afterwards. Olm and
+        encrypted-room persistence are retained because they are replay-safe
+        transport state rather than Classic ingress position.
+
+        Raises:
+            LocalProtocolError: If nio owns durable sync state, a sync-family
+                request or response is active, or the reset is called from a
+                serialized event callback.
+            Exception: The first retained callback failure encountered while
+                draining work that had already started.
+        """
+        caller = asyncio.current_task()
+        callback_scope = self._event_callback_scope.get()
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Classic Sync reset requires backfill_limited_timelines=True."
+            )
+        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+            raise LocalProtocolError(
+                "Classic Sync reset requires token and persisted recovery ownership to be disabled."
+            )
+        if (
+            (callback_scope is not None and callback_scope.active)
+            or is_recovery_dispatch_task(self._recovery, caller)
+            or (
+                self._active_sync_executor_token is not None
+                and self._sync_executor_context.get()
+                is self._active_sync_executor_token
+            )
+        ):
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset from an event callback."
+            )
+        if (
+            self._closing
+            or self._active_sync_executor_token is not None
+            or self._sync_reset_fence.active_request_ids
+        ):
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset while sync work is active."
+            )
+
+        self._sync_generation = _SyncGeneration()
+        self._stop_sync_forever = False
+
+        async def reset() -> None:
+            async with self._sync_response_lock:
+                try:
+                    await drain_recovery_dispatches(self._recovery)
+                finally:
+                    acquired: list[asyncio.Lock] = []
+                    acquired_room_ids: set[str] = set()
+                    try:
+                        # Gate interning is synchronous. Re-snapshot after each
+                        # awaited acquisition until no racing room operation
+                        # owns or waits on an unseen gate.
+                        while True:
+                            pending_room_ids = sorted(
+                                set(self._recovery_room_gates) - acquired_room_ids
+                            )
+                            if not pending_room_ids:
+                                break
+                            for room_id in pending_room_ids:
+                                gate = self._recovery_room_gates[room_id]
+                                await gate.acquire()
+                                acquired.append(gate)
+                                acquired_room_ids.add(room_id)
+
+                        self._recovery = RecoveryState(
+                            max_held_events=self.config.backfill_max_events
+                        )
+                        self._sliding_room_prev_batch.clear()
+                        self._pending_sliding_room_account_data.clear()
+                        self._sliding_sync_to_device_since = None
+                        self.loaded_sync_token = ""
+                        self.next_batch = ""
+                        self.rooms.clear()
+                        self.invited_rooms.clear()
+                        self._classic_sync_rebuild_pending = True
+                        self._classic_sync_state_staged = False
+                        self._classic_sync_acknowledgeable_token = None
+                    finally:
+                        for gate in reversed(acquired):
+                            gate.release()
+
+        await _run_to_completion(reset())
 
     def add_response_callback(
         self,
@@ -1125,7 +1311,10 @@ class AsyncClient(Client):
         response: SyncResponse,
         request_since: str | None,
     ) -> frozenset[str]:
-        if self.next_batch == response.next_batch:
+        if (
+            not self._classic_sync_rebuild_pending
+            and self.next_batch == response.next_batch
+        ):
             return frozenset()
 
         return frozenset(
@@ -1320,9 +1509,21 @@ class AsyncClient(Client):
         response = envelope.response
         request_since = envelope.request_since
 
-        if self.next_batch == response.next_batch:
+        if (
+            not self._classic_sync_rebuild_pending
+            and self.next_batch == response.next_batch
+        ):
             await self._pump_sync_recovery()
             return
+
+        application_owned_classic_state = (
+            self.config.backfill_limited_timelines
+            and not self.config.store_sync_tokens
+            and not self._recovery_persistence_enabled
+        )
+        if application_owned_classic_state:
+            self._classic_sync_state_staged = True
+            self._classic_sync_acknowledgeable_token = None
 
         if self.config.backfill_limited_timelines:
             reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
@@ -1404,6 +1605,13 @@ class AsyncClient(Client):
                 )
             await self._collect_key_requests()
         await self._pump_sync_recovery()
+        self._classic_sync_rebuild_pending = False
+        if (
+            application_owned_classic_state
+            and not self._recovery._active_dispatches
+            and not has_pending_recovery_work(self._recovery)
+        ):
+            self._classic_sync_acknowledgeable_token = response.next_batch
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -2072,6 +2280,7 @@ class AsyncClient(Client):
         return current is None or room_id in current
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
+        self._sync_response_seen = True
         sync_response = envelope.response
         request_since = envelope.request_since
         if not self.config.backfill_limited_timelines:
@@ -2980,14 +3189,14 @@ class AsyncClient(Client):
                 state for all rooms the user is a member of. If this is set to
                 true, then all state events will be returned, even if since is
                 non-empty. The timeline will still be limited by the since
-                parameter. This argument will be used only for the first sync
-                request.
+                parameter. This argument remains active until the first
+                successful sync response.
 
             since (str, optional): A token specifying a point in time where to
                 continue the sync from. Defaults to the last sync token we
                 received from the server using this API call. This argument
-                will be used only for the first sync request, the subsequent
-                sync requests will use the token from the last sync response.
+                remains active until the first successful sync response; later
+                requests use the token from that response.
 
             loop_sleep_time (int, optional): The sleep time, if any, between
                 successful sync loop iterations in milliseconds.
@@ -2995,7 +3204,7 @@ class AsyncClient(Client):
             first_sync_filter (Union[None, str, Dict[Any, Any]):
                 A filter ID that can be obtained from
                 ``AsyncClient.upload_filter()`` (preferred),
-                or filter dict to use for the first sync request only.
+                or filter dict to use until the first successful sync response.
                 If `None` (default), the `sync_filter` parameter's value
                 is used.
                 To have no filtering for the first sync regardless of
@@ -3010,6 +3219,7 @@ class AsyncClient(Client):
 
         while not self._stop_sync_forever and sync_generation is self._sync_generation:
             try:
+                initial_sync_complete = not first_sync
                 use_filter = (
                     first_sync_filter
                     if first_sync and first_sync_filter is not None
@@ -3028,6 +3238,7 @@ class AsyncClient(Client):
                         use_timeout, use_filter, since, full_state, presence
                     )
                     await self.run_response_callbacks([sync_response])
+                    initial_sync_complete = isinstance(sync_response, SyncResponse)
                 else:
                     presence = set_presence or self._presence
                     tasks = [
@@ -3056,23 +3267,22 @@ class AsyncClient(Client):
                 for response in asyncio.as_completed(tasks):
                     await self.run_response_callbacks([await response])
 
-                first_sync = False
-                full_state = None
-                since = None
+                if initial_sync_complete:
+                    first_sync = False
+                    full_state = None
+                    since = None
 
-                self.synced.set()
-                self.synced.clear()
+                    self.synced.set()
+                    self.synced.clear()
 
                 if loop_sleep_time:
                     await asyncio.sleep(loop_sleep_time / 1000)
 
-            except asyncio.CancelledError:  # noqa: PERF203
-                for task in tasks:
-                    task.cancel()
-                if sync_generation is self._sync_generation:
-                    self._stop_sync_forever = False
-                raise
-            except:
+            except BaseException:  # noqa: PERF203
+                try:
+                    await _run_to_completion(_cancel_and_drain_tasks(tasks))
+                except asyncio.CancelledError:
+                    pass
                 if sync_generation is self._sync_generation:
                     self._stop_sync_forever = False
                 raise
@@ -3295,8 +3505,10 @@ class AsyncClient(Client):
                 # Cancel the sibling requests: a failed key request must
                 # not leave the long-poll running, or its response would
                 # still be applied to client state after the loop has died.
-                for task in tasks:
-                    task.cancel()
+                try:
+                    await _run_to_completion(_cancel_and_drain_tasks(tasks))
+                except asyncio.CancelledError:
+                    pass
                 if sync_generation is self._sync_generation:
                     self._stop_sync_forever = False
                 raise
@@ -3886,6 +4098,10 @@ class AsyncClient(Client):
             try:
                 room = self.rooms[room_id]
             except KeyError:
+                if self._classic_sync_rebuild_pending:
+                    raise SendRetryError(
+                        "Classic Sync room state is being rebuilt."
+                    ) from None
                 raise LocalProtocolError(f"No such room with id {room_id} found.")
 
             if room.encrypted:

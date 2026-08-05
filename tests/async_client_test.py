@@ -118,6 +118,7 @@ from nio import (
     SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
+    SyncError,
     SyncResponse,
     TagEvent,
     ThumbnailError,
@@ -132,6 +133,7 @@ from nio import (
     UploadFilterResponse,
     UploadResponse,
 )
+from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
 from nio.api import (
     MATRIX_API_PATH_UNSTABLE,
     MATRIX_API_PATH_V1,
@@ -2274,6 +2276,148 @@ class TestClass:
             await asyncio.wait_for(async_client.sliding_sync_forever(), 30)
 
         await asyncio.wait_for(long_poll_cancelled.wait(), 30)
+
+    @pytest.mark.parametrize("transport", ["classic", "sliding"])
+    async def test_sync_forever_waits_for_cancelled_child_teardown(
+        self,
+        tempdir,
+        transport,
+    ):
+        """Loop completion means every owned sync request is quiescent."""
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                encryption_enabled=False,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        request_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_cancelled_request = asyncio.Event()
+        request_finished = asyncio.Event()
+        calls = 0
+
+        async def request(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                if transport == "classic":
+                    return SyncResponse.from_dict(
+                        {
+                            "next_batch": "s1",
+                            "rooms": {"join": {}, "invite": {}, "leave": {}},
+                        }
+                    )
+                return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
+
+            request_id = issue_sync_request(
+                client._sync_reset_fence,
+                (transport, None),
+            )
+            request_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cancelled_request.wait()
+                raise
+            finally:
+                finish_sync_request(client._sync_reset_fence, request_id)
+                request_finished.set()
+
+        async def send_to_device_messages():
+            await asyncio.Event().wait()
+
+        if transport == "classic":
+            client.sync = request
+            loop = asyncio.create_task(client.sync_forever())
+        else:
+            client.sliding_sync = request
+            loop = asyncio.create_task(client.sliding_sync_forever())
+        client.send_to_device_messages = send_to_device_messages
+
+        await request_started.wait()
+        loop.cancel()
+        await cancellation_seen.wait()
+        try:
+            await asyncio.sleep(0)
+            assert not loop.done()
+        finally:
+            release_cancelled_request.set()
+            await request_finished.wait()
+            await asyncio.gather(loop, return_exceptions=True)
+
+        assert not client._sync_reset_fence.active_request_ids
+        await client.reset_classic_sync_state()
+        await client.close()
+
+    async def test_sync_forever_retries_initial_full_state_after_sync_error(
+        self,
+        tempdir,
+    ):
+        """A transient error cannot consume the only full-state rebuild request."""
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(encryption_enabled=False),
+        )
+        await client.receive_response(
+            LoginResponse.from_dict(
+                {
+                    "user_id": ALICE_ID,
+                    "device_id": "DEVICEID",
+                    "access_token": "token",
+                }
+            )
+        )
+        calls = []
+
+        async def sync(timeout, sync_filter, since, full_state, set_presence):
+            calls.append((timeout, sync_filter, since, full_state, set_presence))
+            if len(calls) == 1:
+                return SyncError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry the initial request",
+                    }
+                )
+            client.stop_sync_forever()
+            return SyncResponse.from_dict(
+                {
+                    "next_batch": "s1",
+                    "rooms": {"join": {}, "invite": {}, "leave": {}},
+                }
+            )
+
+        client.sync = sync
+        await client.sync_forever(
+            since="s0",
+            full_state=True,
+            first_sync_filter={"room": {"timeline": {"limit": 1}}},
+            set_presence="offline",
+        )
+
+        assert calls == [
+            (0, {"room": {"timeline": {"limit": 1}}}, "s0", True, "offline"),
+            (0, {"room": {"timeline": {"limit": 1}}}, "s0", True, "offline"),
+        ]
+        await client.close()
 
     async def test_sliding_sync_forever_restarts_after_close(self, tempdir):
         client = AsyncClient(
