@@ -48,6 +48,25 @@ class RemoteProtocolError(ProtocolError):
     pass
 
 
+class InsufficientRecursionDepthError(RemoteProtocolError):
+    """Signal that a recursive relations page did not meet the required depth.
+
+    Raised by ``AsyncClient.room_get_event_relations()`` when a caller passes
+    ``minimum_recursion_depth`` and the server either omits ``recursion_depth``
+    or reports a value below the requirement. The page's events are not
+    yielded, because a caller that needs a guaranteed traversal depth cannot
+    distinguish a shallow page from a complete one.
+    """
+
+    def __init__(self, required: int, reported: int | None) -> None:
+        self.required = required
+        self.reported = reported
+        super().__init__(
+            f"Server reported recursion depth {reported!r}, "
+            f"but at least {required} is required"
+        )
+
+
 class LocalTransportError(ProtocolError):
     pass
 

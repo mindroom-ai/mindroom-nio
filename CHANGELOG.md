@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.37.0
+
+### Features
+
+- Support recursive event relations, as described by the Matrix 1.10 recursive relations extension.
+  `Api.room_get_event_relations()` and `AsyncClient.room_get_event_relations()` take `recurse`, and `RoomEventRelationsResponse` exposes the server-reported `recursion_depth`.
+  A caller that depends on a traversal depth passes `minimum_recursion_depth`, and every page that omits `recursion_depth` or reports less than the requirement raises `InsufficientRecursionDepthError` before any of that page's events are yielded.
+  A server's advertised Matrix version does not imply the depth it actually traverses, so a caller that needs a guaranteed depth must require it explicitly rather than infer it.
+
 ## 0.36.0
 
 ### Bug Fixes

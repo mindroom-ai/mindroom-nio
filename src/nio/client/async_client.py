@@ -102,6 +102,7 @@ from ..events import (
 )
 from ..exceptions import (
     CallbackNotAcceptedError,
+    InsufficientRecursionDepthError,
     LocalProtocolError,
     SendRetryError,
     TransferCancelledError,
@@ -4190,6 +4191,8 @@ class AsyncClient(Client):
         event_type: str | None = None,
         direction: MessageDirection = MessageDirection.back,
         limit: int | None = None,
+        recurse: bool = False,
+        minimum_recursion_depth: int | None = None,
     ) -> AsyncIterator[Event]:
         """Iterate through all related events of a given parent event.
 
@@ -4204,7 +4207,22 @@ class AsyncClient(Client):
             limit (int, optional): The maximum events per request that will be
                 fetched per chunk while iterating. Changing this value can affect performance.
                 Homeservers will apply a default value, and override this with a maximum value.
+            recurse (bool, optional): Whether to ask the server for indirectly
+                related events as well, as described by the Matrix 1.10
+                recursive relations extension.
+            minimum_recursion_depth (int, optional): The recursion depth the
+                caller requires. Every page must report at least this depth in
+                ``recursion_depth`` or ``InsufficientRecursionDepthError`` is
+                raised before any of that page's events are yielded. Requires
+                ``recurse``. The depth a server actually traverses is not
+                implied by its advertised Matrix version, so a caller that
+                depends on it must require it here.
         """
+        if minimum_recursion_depth is not None and not recurse:
+            raise LocalProtocolError(
+                "minimum_recursion_depth requires recurse=True"
+            )
+
         paginate_from, paginate_to = None, None
         while True:
             method, path = Api.room_get_event_relations(
@@ -4217,6 +4235,7 @@ class AsyncClient(Client):
                 paginate_from,
                 paginate_to,
                 limit,
+                recurse,
             )
             response = await self._send(
                 RoomEventRelationsResponse,
@@ -4226,6 +4245,13 @@ class AsyncClient(Client):
             )
 
             if isinstance(response, RoomEventRelationsResponse):
+                if minimum_recursion_depth is not None and (
+                    response.recursion_depth is None
+                    or response.recursion_depth < minimum_recursion_depth
+                ):
+                    raise InsufficientRecursionDepthError(
+                        minimum_recursion_depth, response.recursion_depth
+                    )
                 for event in response.events:
                     yield event
             if response.next_batch is None:

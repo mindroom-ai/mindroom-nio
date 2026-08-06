@@ -40,6 +40,7 @@ from nio import (
     ErrorResponse,
     FullyReadEvent,
     GetOpenIDTokenResponse,
+    InsufficientRecursionDepthError,
     InviteNameEvent,
     JoinedMembersResponse,
     JoinedRoomsResponse,
@@ -2848,6 +2849,144 @@ class TestClass:
         )
         for event in events:
             assert isinstance(event, ReactionEvent)
+
+    @staticmethod
+    def _relations_page(
+        parent_event_id: str,
+        event_id: str,
+        *,
+        recursion_depth: int | None,
+        next_batch: str | None = None,
+    ) -> dict:
+        page = {
+            "chunk": [
+                {
+                    "content": {
+                        "body": "child",
+                        "msgtype": "m.text",
+                        "m.relates_to": {
+                            "event_id": parent_event_id,
+                            "rel_type": "m.thread",
+                        },
+                    },
+                    "origin_server_ts": 1709740386997,
+                    "room_id": TEST_ROOM_ID,
+                    "sender": "@bob:example.org",
+                    "type": "m.room.message",
+                    "unsigned": {},
+                    "event_id": event_id,
+                }
+            ]
+        }
+        if recursion_depth is not None:
+            page["recursion_depth"] = recursion_depth
+        if next_batch is not None:
+            page["next_batch"] = next_batch
+        return page
+
+    async def test_room_get_event_relations_recurse(
+        self, async_client: AsyncClient, aioresponse: aioresponses
+    ):
+        """recurse=True asks for indirect relations and exposes the depth."""
+        parent = "$parent"
+
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{parent}?dir=b&recurse=true",
+            status=200,
+            payload=self._relations_page("$parent", "$child", recursion_depth=3),
+        )
+
+        events = [
+            e
+            async for e in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id=parent,
+                recurse=True,
+                minimum_recursion_depth=3,
+            )
+        ]
+        assert [e.event_id for e in events] == ["$child"]
+
+    @pytest.mark.parametrize("reported_depth", [None, 1])
+    async def test_room_get_event_relations_rejects_shallow_depth(
+        self,
+        async_client: AsyncClient,
+        aioresponse: aioresponses,
+        reported_depth: int | None,
+    ):
+        """A page below the required depth yields nothing at all.
+
+        A caller cannot tell a shallow page apart from a complete one, so
+        partial results are worse than an error.
+        """
+        parent = "$parent"
+
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{parent}?dir=b&recurse=true",
+            status=200,
+            payload=self._relations_page(
+                "$parent", "$child", recursion_depth=reported_depth
+            ),
+        )
+
+        events = []
+        with pytest.raises(InsufficientRecursionDepthError) as excinfo:
+            async for event in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id=parent,
+                recurse=True,
+                minimum_recursion_depth=3,
+            ):
+                events.append(event)
+
+        assert events == []
+        assert excinfo.value.required == 3
+        assert excinfo.value.reported == reported_depth
+
+    async def test_room_get_event_relations_checks_every_page(
+        self, async_client: AsyncClient, aioresponse: aioresponses
+    ):
+        """Depth is a per-page property, so a later shallow page still fails."""
+        parent = "$parent"
+        next_batch = "73_4305826"
+
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{parent}?dir=b&recurse=true",
+            status=200,
+            payload=self._relations_page(
+                "$parent", "$first", recursion_depth=3, next_batch=next_batch
+            ),
+        )
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{parent}"
+            f"?dir=b&from={next_batch}&recurse=true",
+            status=200,
+            payload=self._relations_page("$parent", "$second", recursion_depth=1),
+        )
+
+        events = []
+        with pytest.raises(InsufficientRecursionDepthError):
+            async for event in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id=parent,
+                recurse=True,
+                minimum_recursion_depth=3,
+            ):
+                events.append(event)
+
+        assert [e.event_id for e in events] == ["$first"]
+
+    async def test_room_get_event_relations_minimum_depth_requires_recurse(
+        self, async_client: AsyncClient
+    ):
+        """A non-recursive request has no depth to check."""
+        with pytest.raises(LocalProtocolError):
+            async for _ in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id="$parent",
+                minimum_recursion_depth=3,
+            ):
+                pass
 
     async def test_room_get_threads(
         self, async_client: AsyncClient, aioresponse: aioresponses

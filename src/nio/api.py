@@ -798,6 +798,7 @@ class Api:
         paginate_from: str | None = None,
         paginate_to: str | None = None,
         limit: int | None = None,
+        recurse: bool = False,
     ) -> tuple[str, str]:
         """Get all child events of a given parent event.
 
@@ -819,8 +820,14 @@ class Api:
                 If not supplied, results continue until 'limit', or until there no more events.
             limit (int, optional): Limit for the maximum thread roots to include per paginated response.
                 Homeservers will apply a default value, and override this with a maximum value.
+            recurse (bool, optional): Whether to include events related indirectly to
+                the parent event, as described by the Matrix 1.10 recursive relations
+                extension. Servers report the depth they actually traversed as
+                ``recursion_depth`` on the response.
         """
         query_parameters = {"access_token": access_token, "dir": direction.value}
+        if recurse:
+            query_parameters["recurse"] = "true"
         if paginate_from:
             query_parameters["from"] = paginate_from
         if paginate_to:

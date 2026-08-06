@@ -1005,6 +1005,7 @@ class Schemas:
             },
             "prev_batch": {"type": "string"},
             "next_batch": {"type": "string"},
+            "recursion_depth": {"type": "integer"},
         },
         "required": ["chunk"],
     }
