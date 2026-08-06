@@ -2599,13 +2599,30 @@ class TestRoomLocalRecovery:
     @pytest.mark.parametrize(
         ("end", "gap_provenance"),
         [
-            (None, TimelineEventProvenance.HISTORY),
+            (None, TimelineEventProvenance.RECOVERED),
             ("p1", TimelineEventProvenance.RECOVERED),
         ],
     )
-    async def test_only_exact_target_proves_gap_continuity(
+    async def test_a_bounded_gap_is_proven_by_the_target_or_by_exhaustion(
         self, client, aioresponse, end, gap_provenance
     ):
+        """Running out of history closes a bounded gap as surely as the token.
+
+        This walk is bounded at both ends: the target token above, and the
+        `since` of the sync that opened it below, since everything at or
+        before that arrived in an earlier response. A page with no `end`
+        therefore means no further event is obtainable, not that the walk
+        gave up -- so more paging cannot improve on it either way.
+
+        Which leaves only what to call the events, and the two mistakes are
+        not symmetric. Calling recovered history `RECOVERED` costs nothing:
+        a consumer that has already handled one of these events recognises
+        it by ID and drops it. Calling a genuinely missed message `HISTORY`
+        is unrecoverable -- it is delivered as context nobody may act on,
+        and the reply the user is waiting for never happens. Requiring the
+        end token to match exactly made that second mistake every time a
+        server ran out of history mid-recovery.
+        """
         seen = record_events(client)
         await client.receive_response(
             sync_response(
