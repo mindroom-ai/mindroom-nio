@@ -2976,6 +2976,34 @@ class TestClass:
 
         assert [e.event_id for e in events] == ["$first"]
 
+    async def test_room_get_event_relations_accepts_an_empty_page(
+        self, async_client: AsyncClient, aioresponse: aioresponses
+    ):
+        """An empty page has no depth to report and nothing to truncate.
+
+        A server that reports the deepest event it returned reports nothing at
+        all when it returned nothing, and rejecting that would make every
+        message without relations look like a broken server.
+        """
+        parent = "$parent"
+
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{parent}?dir=b&recurse=true",
+            status=200,
+            payload={"chunk": []},
+        )
+
+        events = [
+            e
+            async for e in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id=parent,
+                recurse=True,
+                minimum_recursion_depth=3,
+            )
+        ]
+        assert events == []
+
     async def test_room_get_event_relations_minimum_depth_requires_recurse(
         self, async_client: AsyncClient
     ):

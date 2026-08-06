@@ -4211,12 +4211,20 @@ class AsyncClient(Client):
                 related events as well, as described by the Matrix 1.10
                 recursive relations extension.
             minimum_recursion_depth (int, optional): The recursion depth the
-                caller requires. Every page must report at least this depth in
-                ``recursion_depth`` or ``InsufficientRecursionDepthError`` is
-                raised before any of that page's events are yielded. Requires
-                ``recurse``. The depth a server actually traverses is not
-                implied by its advertised Matrix version, so a caller that
-                depends on it must require it here.
+                caller requires. Every non-empty page must report at least this
+                depth in ``recursion_depth`` or
+                ``InsufficientRecursionDepthError`` is raised before any of
+                that page's events are yielded. Requires ``recurse``.
+
+                Servers disagree about what the reported number means. Some
+                report the depth they are willing to traverse, which is a
+                constant capability. Others report the depth of the deepest
+                event they actually returned, which for a shallow relation tree
+                is legitimately ``0``. A caller that wants only "the server
+                honored ``recurse``" should therefore pass ``0``, and a caller
+                that imposes a higher floor should know which servers it talks
+                to. An empty page is never rejected, because it has no depth to
+                report and nothing that could have been truncated.
         """
         if minimum_recursion_depth is not None and not recurse:
             raise LocalProtocolError(
@@ -4245,9 +4253,16 @@ class AsyncClient(Client):
             )
 
             if isinstance(response, RoomEventRelationsResponse):
-                if minimum_recursion_depth is not None and (
-                    response.recursion_depth is None
-                    or response.recursion_depth < minimum_recursion_depth
+                # An empty page carries no depth information: servers that
+                # report the deepest event they returned have nothing to
+                # report, and there is nothing that could have been truncated.
+                if (
+                    minimum_recursion_depth is not None
+                    and response.events
+                    and (
+                        response.recursion_depth is None
+                        or response.recursion_depth < minimum_recursion_depth
+                    )
                 ):
                     raise InsufficientRecursionDepthError(
                         minimum_recursion_depth, response.recursion_depth
