@@ -996,6 +996,146 @@ class TestRoomLocalRecovery:
         assert response.admitted_through_token is None
         await client.close()
 
+    async def test_abandoning_a_stalled_gap_releases_the_frozen_watermark(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """A wedged walk holds the checkpoint until someone ends it deliberately.
+
+        Nothing discharges a stalled gap on its own, so the watermark stays put
+        and the application's durable checkpoint ages without bound. Abandoning
+        it names the span given up, keeps the live events the room did receive,
+        and lets the watermark move once those are dispatched.
+        """
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        client.acknowledge_classic_sync("s1")
+        aioresponse.get(MESSAGES_URL, status=500, repeat=True)
+
+        wedged = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(wedged)
+        assert wedged.room_recovery == {ROOM_A: RoomRecoveryStatus.CONVERGING}
+        with pytest.raises(LocalProtocolError, match="Only a stalled recovery"):
+            client.abandon_recovery(ROOM_A)
+
+        stalled = sync_response(
+            "s3",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(stalled)
+        assert stalled.room_recovery == {ROOM_A: RoomRecoveryStatus.STALLED}
+        # Two responses on, the checkpoint has not moved and never will.
+        assert stalled.admitted_through_token == "s1"
+        assert seen == ["$old"]
+
+        abandoned = client.abandon_recovery(ROOM_A)
+
+        assert abandoned.room_id == ROOM_A
+        assert abandoned.unwalked_from_token == "s1"
+        assert abandoned.unwalked_to_token == "p1"
+        # nio never fetched that span, so it cannot say how much is in it.
+        assert abandoned.unwalked_event_count is None
+        assert abandoned.discarded_recovered_events == 0
+        assert abandoned.retained_live_events == 1
+
+        # The debt is discharged, so it cannot be discharged again.
+        with pytest.raises(LocalProtocolError, match="not outstanding"):
+            client.abandon_recovery(ROOM_A)
+
+        released = sync_response(
+            "s4",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(released)
+
+        # The retained live event is delivered, the loss is reported once, and
+        # the watermark is free again.
+        assert seen == ["$old", "$held"]
+        assert released.room_recovery == {ROOM_A: RoomRecoveryStatus.LOST}
+        assert released.admitted_through_token == "s4"
+        client.acknowledge_classic_sync("s4")
+        await client.close()
+
+    async def test_a_converging_walk_cannot_be_abandoned(self, tempdir, aioresponse):
+        """Discharging a walk that is still moving is the original bug renamed."""
+        client = self._owned_classic_client(tempdir, backfill_max_pages=1)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2)], "more"),
+                "more": messages([text_event("$held", 4)], "p1"),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert response.room_recovery == {ROOM_A: RoomRecoveryStatus.CONVERGING}
+        with pytest.raises(LocalProtocolError, match="Only a stalled recovery"):
+            client.abandon_recovery(ROOM_A)
+        # A room with no recovery at all is refused for a different reason.
+        with pytest.raises(LocalProtocolError, match="not outstanding"):
+            client.abandon_recovery(ROOM_B)
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        await client.close()
+
+    async def test_a_retained_callback_blocks_abandoning_its_room(self, tempdir):
+        """A wedged callback is a different failure from a wedged walk."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client._recovery.gaps[ROOM_A] = [RecoveryGap(ROOM_A, 1, "p1", "s1")]
+        # Two classifications with nothing moving is what makes it stalled.
+        client._publish_recovery_outcome(sync_response("s2", {}))
+        client._publish_recovery_outcome(sync_response("s3", {}))
+
+        task = asyncio.current_task()
+        assert task is not None
+        client._recovery._active_dispatches[(ROOM_A, "$active", "timeline")] = task
+        try:
+            with pytest.raises(LocalProtocolError, match="retained recovery callback"):
+                client.abandon_recovery(ROOM_A)
+        finally:
+            client._recovery._active_dispatches.clear()
+
+        assert client._recovery.gaps[ROOM_A]
+        await client.close()
+
     async def test_a_failed_response_cannot_advance_the_watermark(
         self,
         tempdir,

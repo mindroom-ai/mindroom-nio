@@ -12,6 +12,7 @@ from .event_provenance import TimelineEventProvenance
 from .events import *
 from .exceptions import *
 from .monitors import *
+from .client.sync_recovery import AbandonedRecovery
 from .recovery_status import RoomRecoveryStatus
 from .responses import *
 from .rooms import *

@@ -275,11 +275,13 @@ from .sliding_membership import (
     sliding_unrecoverable_discontinuity_room_ids,
 )
 from .sync_recovery import (
+    AbandonedRecovery,
     PendingEventKind,
     RecoveryOptions,
     RecoveryPlan,
     RecoveryState,
     _LiveCallbackError,
+    abandon_recovery,
     classify_recovery_obligations,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
@@ -887,6 +889,61 @@ class AsyncClient(Client):
             )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+
+    def abandon_recovery(self, room_id: str) -> AbandonedRecovery:
+        """Give up on one room's stalled recovery so the watermark can move on.
+
+        A gap holds ``admitted_through_token`` back until it is discharged, and
+        a walk that has genuinely stopped moving never discharges itself. This
+        ends it deliberately: the unreachable history is abandoned, the room is
+        recorded as ``LOST`` for the next response, and the returned record
+        names the span given up. Live events the room already received are
+        retained and still dispatched, so the watermark advances only once they
+        have been.
+
+        This is not the automatic escape it replaces. It acts only on a gap nio
+        has already classified :attr:`RoomRecoveryStatus.STALLED` by observing a
+        walk that stopped moving, it never acts on a converging one, and it
+        names the loss instead of certifying past it.
+
+        Nothing durable is written: in application-owned mode nio persists no
+        recovery state, so the returned record is the only trace and the caller
+        must persist it. A crash before that means the discharge never happened
+        and the gap is re-derived from the checkpoint, which is safe.
+
+        Raises:
+            LocalProtocolError: If limited-timeline backfill is disabled, if the
+                room's recovery is not stalled, or if a retained callback for
+                the room is still outstanding. A retained callback is a
+                different failure from a wedged walk, and clearing recovery
+                state underneath one would risk delivering its event twice.
+        """
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Abandoning recovery requires backfill_limited_timelines=True."
+            )
+        status = self._recovery._published_status.get(room_id)
+        if status is not RoomRecoveryStatus.STALLED:
+            raise LocalProtocolError(
+                f"Only a stalled recovery can be abandoned; {room_id} is "
+                f"{status.value if status else 'not outstanding'}."
+            )
+        if any(key[0] == room_id for key in self._recovery._active_dispatches):
+            raise LocalProtocolError(
+                f"A retained recovery callback for {room_id} must finish before "
+                "its recovery can be abandoned."
+            )
+        abandoned = abandon_recovery(self._recovery, self._recovery_store, room_id)
+        logger.warning(
+            "Abandoned stalled recovery in %s across %s..%s; "
+            "%s recovered events discarded, %s live events retained",
+            abandoned.room_id,
+            abandoned.unwalked_from_token,
+            abandoned.unwalked_to_token,
+            abandoned.discarded_recovered_events,
+            abandoned.retained_live_events,
+        )
+        return abandoned
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.

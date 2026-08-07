@@ -1848,6 +1848,32 @@ def test_a_new_gap_is_not_stalled_by_a_discharged_predecessor():
     }
 
 
+def test_abandoning_a_gap_does_not_stall_the_next_one():
+    """An abandoned generation is reused, so its marks must not outlive it."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]})
+
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.STALLED
+    }
+
+    abandoned = sync_recovery.abandon_recovery(state, None, ROOM)
+    assert abandoned.unwalked_from_token == "s1"
+    assert abandoned.unwalked_to_token == "p1"
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.LOST
+    }
+
+    # A later response opens generation 1 again. It is a different walk, and
+    # one sample of it cannot show a wedge.
+    state.gaps[ROOM] = [RecoveryGap(ROOM, 1, "p1", "s1")]
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
+
+
 def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
     state = RecoveryState(
         gaps={

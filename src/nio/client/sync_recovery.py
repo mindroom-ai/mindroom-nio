@@ -205,6 +205,12 @@ class RecoveryState:
     _walk_marks: dict[tuple[str, int], tuple[str | None, int]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    # The classification the last settled response actually published. An
+    # operator acts on what it was told, and recomputing on demand would always
+    # read STALLED, because nothing moves between a response and the next one.
+    _published_status: dict[str, RoomRecoveryStatus] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
         field(default_factory=dict, init=False, repr=False, compare=False)
     )
@@ -738,6 +744,70 @@ def _plan_room_reset(
     )
 
 
+@dataclass(frozen=True)
+class AbandonedRecovery:
+    """One room's continuity debt, given up on deliberately.
+
+    ``unwalked_from_token`` and ``unwalked_to_token`` bound the span the walk
+    never covered, in the server's own token space.
+    ``unwalked_event_count`` is ``None`` when the walk never reached its
+    target: nio never fetched that span and cannot say how much is in it. It is
+    ``0`` when the walk had already finished and only undelivered callbacks
+    remained, where the whole loss is ``discarded_recovered_events``.
+    """
+
+    room_id: str
+    unwalked_from_token: str | None
+    unwalked_to_token: str
+    unwalked_event_count: int | None
+    discarded_recovered_events: int
+    retained_live_events: int
+
+
+def abandon_recovery(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    room_id: str,
+) -> AbandonedRecovery:
+    """Discharge one room's stalled gap and name exactly what that skipped.
+
+    Live events the room already received are retained and still dispatched;
+    only the unreachable history is given up. The room is recorded as ``LOST``
+    so the next response reports the loss through the same channel as every
+    other one.
+
+    The caller is responsible for checking that the gap is stalled. Discharging
+    a converging walk is the defect this contract exists to remove.
+    """
+    owed = [gap for gap in state.gaps[room_id] if gap.target_token]
+    queued = [
+        event
+        for gap in state.gaps[room_id]
+        for event in state.events.get((room_id, gap.generation), ())
+    ]
+    walking = next((gap for gap in owed if gap.cursor_token is not None), owed[0])
+    # Clearing a room that held a targeted gap already records the loss, so the
+    # plan does not need to say so twice.
+    persist_response_plan(
+        state,
+        store,
+        token=None,
+        plan=_plan_room_reset(state, room_id),
+    )
+    # The room's walk marks are released by the next classification, which no
+    # longer observes its gap. The published status is not, and leaving it
+    # would let the same room be abandoned twice.
+    state._published_status.pop(room_id, None)
+    return AbandonedRecovery(
+        room_id,
+        walking.cursor_token,
+        walking.target_token,
+        None if walking.cursor_token is not None else 0,
+        sum(not event.is_live for event in queued),
+        sum(event.is_live for event in queued),
+    )
+
+
 def plan_room_timeline(
     state: RecoveryState,
     *,
@@ -1076,6 +1146,7 @@ def take_recovery_outcomes(
             room_recovery[room_id] = RoomRecoveryStatus.LOST
         elif room_id not in room_recovery:
             room_recovery[room_id] = RoomRecoveryStatus.RECOVERED
+    state._published_status = dict(room_recovery)
     return room_recovery
 
 
@@ -1111,6 +1182,7 @@ def load_recovery_state(
     state.completed.clear()
     state.outcomes.clear()
     state._walk_marks.clear()
+    state._published_status.clear()
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,
