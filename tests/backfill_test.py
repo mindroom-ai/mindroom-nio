@@ -7798,6 +7798,51 @@ class TestRoomLocalRecovery:
         await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_application_owned_membership_change_does_not_write_recovery_store(
+        self,
+        tempdir,
+        monkeypatch,
+        operation,
+    ):
+        """Memory-only Classic cleanup must not mutate stale recovery rows."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        gap = RecoveryGap(ROOM_A, 1, "target", "cursor")
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token="stored",
+            plan=RecoveryPlan(gaps=(gap,)),
+        )
+        stored_before = client.store.load_sync_recovery()
+        token_before = client.store.load_sync_token()
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {ROOM_A}
+        assert client.store.load_sync_token() == token_before
+        assert client.store.load_sync_recovery() == stored_before
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_disabled_membership_change_clears_prior_recovery_durably(
         self, tempdir, monkeypatch, operation
     ):

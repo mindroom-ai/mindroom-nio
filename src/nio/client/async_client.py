@@ -1964,7 +1964,7 @@ class AsyncClient(Client):
             async with self._recovery_room_state((room_id,)):
                 persist_response_plan(
                     self._recovery,
-                    self.store,
+                    self._recovery_store,
                     token=None,
                     plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
                     forgotten_rooms=(room_id,),
