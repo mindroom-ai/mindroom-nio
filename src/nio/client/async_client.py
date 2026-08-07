@@ -109,6 +109,7 @@ from ..exceptions import (
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
+from ..recovery_status import RoomRecoveryStatus
 from ..responses import (
     ChangePasswordError,
     ChangePasswordResponse,
@@ -274,13 +275,17 @@ from .sliding_membership import (
     sliding_unrecoverable_discontinuity_room_ids,
 )
 from .sync_recovery import (
+    AbandonedRecovery,
     PendingEventKind,
     RecoveryOptions,
     RecoveryPlan,
     RecoveryState,
     _LiveCallbackError,
+    abandon_recovery,
+    classify_recovery_obligations,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
+    has_deferred_recovery_failure,
     has_pending_recovery_work,
     is_recovered_dispatch_task,
     is_recovery_dispatch_task,
@@ -291,8 +296,11 @@ from .sync_recovery import (
     plan_sync_response,
     pump_recovery,
     record_completed_timeline_event,
+    recovered_room_ids,
     should_dispatch_timeline_event,
+    take_abandoned_recoveries,
     take_recovery_outcomes,
+    unrecovered_room_ids,
     would_plan_real_gap,
 )
 from .sync_reset_fence import (
@@ -719,6 +727,14 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = False
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token: str | None = None
+        # The highest response token behind which nothing is outstanding. It
+        # only advances, never rewinds with the resume cursor, which is what
+        # lets an application keep syncing while a gap stays owed.
+        self._classic_sync_admitted_through: str | None = None
+        # Applied responses since the watermark last moved. A wedged room holds
+        # it forever, and nothing else makes that visible before a healthy room
+        # starts losing backlog on restart.
+        self._classic_sync_admitted_through_held = 0
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -812,14 +828,40 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = True
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+        self._classic_sync_admitted_through = None
+        self._classic_sync_admitted_through_held = 0
 
     @property
     def has_uncommitted_classic_sync_state(self) -> bool:
         """Return whether application-owned Classic state still needs acknowledgement."""
         return self._classic_sync_state_staged
 
-    def acknowledge_classic_sync(self, next_batch: str) -> None:
-        """Acknowledge that the application durably committed one Classic response."""
+    def acknowledge_classic_sync(
+        self,
+        next_batch: str,
+        admitted_through: str | None = None,
+    ) -> None:
+        """Acknowledge that the application durably committed one Classic response.
+
+        ``next_batch`` is the resume position. ``admitted_through`` is the
+        checkpoint the application actually persisted, which must be the
+        ``admitted_through_token`` nio published on that response. The two are
+        equal whenever nothing is outstanding, so the released one-argument
+        call keeps working in exactly the cases where it was already correct.
+
+        A response carrying an outstanding recovery obligation is
+        acknowledgeable, because the obligation outlives the response: nio
+        holds the watermark behind the resume position until the gap closes,
+        and a restart from the watermark re-derives it. Rejecting such a
+        response instead destroys the walk's progress and cannot converge.
+
+        Raises:
+            LocalProtocolError: If the configuration does not give the
+                application Classic ownership, if a response is active, if the
+                staged response does not match ``next_batch``, if a retained
+                callback or deferred callback failure remains, or if
+                ``admitted_through`` is not the watermark nio published.
+        """
         if not self.config.backfill_limited_timelines:
             raise LocalProtocolError(
                 "Classic Sync acknowledgement requires backfill_limited_timelines=True."
@@ -838,13 +880,76 @@ class AsyncClient(Client):
             or next_batch != self._classic_sync_acknowledgeable_token
             or next_batch != self.next_batch
             or self._recovery._active_dispatches
-            or has_pending_recovery_work(self._recovery)
+            or has_deferred_recovery_failure(self._recovery)
         ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
             )
+        # Omitting the watermark asserts there was nothing to hold back, which
+        # is only true when it reached this very response.
+        committed = next_batch if admitted_through is None else admitted_through
+        if committed != self._classic_sync_admitted_through:
+            raise LocalProtocolError(
+                "Classic Sync acknowledgement did not commit the published "
+                "admitted-through watermark."
+            )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+
+    def abandon_recovery(self, room_id: str) -> AbandonedRecovery:
+        """Give up on one room's stalled recovery so the watermark can move on.
+
+        A gap holds ``admitted_through_token`` back until it is discharged, and
+        a walk that has genuinely stopped moving never discharges itself. This
+        ends it deliberately: the unreachable history is abandoned, the room is
+        recorded as ``LOST`` for the next response, and the returned record
+        names the span given up. Live events the room already received are
+        retained and still dispatched, so the watermark advances only once they
+        have been.
+
+        This is not the automatic escape it replaces. It acts only on a gap nio
+        has already classified :attr:`RoomRecoveryStatus.STALLED` by observing a
+        walk that stopped moving, it never acts on a converging one, and it
+        names the loss instead of certifying past it.
+
+        Nothing durable is written: in application-owned mode nio persists no
+        recovery state, so the returned record is the only trace and the caller
+        must persist it. A crash before that means the discharge never happened
+        and the gap is re-derived from the checkpoint, which is safe.
+
+        Raises:
+            LocalProtocolError: If limited-timeline backfill is disabled, if the
+                room's recovery is not stalled, or if a retained callback for
+                the room is still outstanding. A retained callback is a
+                different failure from a wedged walk, and clearing recovery
+                state underneath one would risk delivering its event twice.
+        """
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Abandoning recovery requires backfill_limited_timelines=True."
+            )
+        status = self._recovery._published_status.get(room_id)
+        if status is not RoomRecoveryStatus.STALLED:
+            raise LocalProtocolError(
+                f"Only a stalled recovery can be abandoned; {room_id} is "
+                f"{status.value if status else 'not outstanding'}."
+            )
+        if any(key[0] == room_id for key in self._recovery._active_dispatches):
+            raise LocalProtocolError(
+                f"A retained recovery callback for {room_id} must finish before "
+                "its recovery can be abandoned."
+            )
+        abandoned = abandon_recovery(self._recovery, self._recovery_store, room_id)
+        logger.warning(
+            "Abandoned stalled recovery in %s across %s..%s; "
+            "%s recovered events discarded, %s live events retained",
+            abandoned.room_id,
+            abandoned.unwalked_from_token,
+            abandoned.unwalked_to_token,
+            abandoned.discarded_recovered_events,
+            abandoned.retained_live_events,
+        )
+        return abandoned
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -859,6 +964,17 @@ class AsyncClient(Client):
         must install its committed cursor in ``next_batch`` afterwards. Olm and
         encrypted-room persistence are retained because they are replay-safe
         transport state rather than Classic ingress position.
+
+        This discards any recovery walk in flight, including its cursor and the
+        pages it already fetched, and that is deliberate: keeping room state,
+        held events, or completed markers from a rejected response would
+        suppress the very redispatch the replay exists to produce. The cost is
+        that a reset restarts every open walk from its beginning, so a walk
+        bounded by a per-pump budget can never finish if the application resets
+        on every incomplete response. Do not reset because recovery is still
+        owed. An outstanding obligation does not block
+        :meth:`acknowledge_classic_sync`; ``admitted_through_token`` keeps the
+        durable checkpoint behind the resume position instead.
 
         Raises:
             LocalProtocolError: If nio owns durable sync state, a sync-family
@@ -924,9 +1040,24 @@ class AsyncClient(Client):
                                 acquired.append(gate)
                                 acquired_room_ids.add(room_id)
 
+                        for room_id, gaps in self._recovery.gaps.items():
+                            walking = [
+                                gap.cursor_token
+                                for gap in gaps
+                                if gap.target_token and gap.cursor_token is not None
+                            ]
+                            if walking:
+                                logger.warning(
+                                    "Discarding in-flight recovery for %s at %s; "
+                                    "the next attempt restarts the whole walk",
+                                    room_id,
+                                    walking,
+                                )
                         self._recovery = RecoveryState(
                             max_held_events=self.config.backfill_max_events
                         )
+                        self._classic_sync_admitted_through = None
+                        self._classic_sync_admitted_through_held = 0
                         self._sliding_room_prev_batch.clear()
                         self._pending_sliding_room_account_data.clear()
                         self._sliding_sync_to_device_since = None
@@ -1302,14 +1433,51 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def _advance_admitted_through(self, next_batch: str) -> None:
+        """Move the watermark onto a fully applied response with nothing owed.
+
+        The strict "nothing outstanding" condition used to gate acknowledgement,
+        which is what forced an application to reject a response it had
+        processed correctly. It gates the watermark instead, because it answers
+        the question an application-owned checkpoint actually depends on: is
+        every event at or before this token dispatched. A response that is
+        merely quiet is not enough -- only ``_handle_sync`` knows the response
+        was applied to the end, so only ``_handle_sync`` calls this.
+        """
+        if self._recovery._active_dispatches or has_pending_recovery_work(
+            self._recovery
+        ):
+            self._classic_sync_admitted_through_held += 1
+            return
+        self._classic_sync_admitted_through = next_batch
+        self._classic_sync_admitted_through_held = 0
+
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
     ) -> None:
         if not self.config.backfill_limited_timelines:
             return
-        recovered, unrecovered = take_recovery_outcomes(self._recovery)
-        response.recovered_room_ids = recovered
-        response.unrecovered_room_ids = unrecovered
+        room_recovery = take_recovery_outcomes(self._recovery)
+        response.room_recovery = room_recovery
+        response.recovered_room_ids = recovered_room_ids(room_recovery)
+        response.unrecovered_room_ids = unrecovered_room_ids(room_recovery)
+        response.abandoned_recovery = take_abandoned_recoveries(self._recovery)
+        if isinstance(response, SyncResponse):
+            response.admitted_through_held_responses = (
+                self._classic_sync_admitted_through_held
+            )
+            # Publication runs even for a response whose handling raised, so it
+            # only reads the watermark. Advancing it is _handle_sync's job,
+            # because only there is the response known to be fully applied.
+            response.admitted_through_token = self._classic_sync_admitted_through
+
+    def _publish_recovery_obligations_without_pump(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> dict[str, RoomRecoveryStatus]:
+        """Classify outstanding gaps for a response no pump ever settled."""
+        room_recovery = classify_recovery_obligations(self._recovery, record=False)
+        response.room_recovery = room_recovery
+        return room_recovery
 
     def _classic_response_real_gap_room_ids(
         self,
@@ -1372,12 +1540,14 @@ class AsyncClient(Client):
         response: SyncResponse | SlidingSyncResponse,
         request_since: str | None,
     ) -> None:
-        """Publish a fail-closed snapshot without draining the active executor."""
-        unrecovered = {
-            room_id
-            for room_id, gaps in self._recovery.gaps.items()
-            if any(gap.target_token for gap in gaps)
-        }
+        """Publish a fail-closed snapshot without draining the active executor.
+
+        The response was abandoned, so its own gap was never planned and its
+        rooms cannot be classified. They are reported unrecovered without a
+        status, which is the honest answer: nio does not know.
+        """
+        room_recovery = self._publish_recovery_obligations_without_pump(response)
+        unrecovered = set(room_recovery)
         if isinstance(response, SyncResponse):
             unrecovered.update(
                 self._classic_response_real_gap_room_ids(response, request_since)
@@ -1519,6 +1689,7 @@ class AsyncClient(Client):
             and self.next_batch == response.next_batch
         ):
             await self._pump_sync_recovery()
+            self._advance_admitted_through(response.next_batch)
             return
 
         application_owned_classic_state = (
@@ -1611,10 +1782,11 @@ class AsyncClient(Client):
             await self._collect_key_requests()
         await self._pump_sync_recovery()
         self._classic_sync_rebuild_pending = False
+        self._advance_admitted_through(response.next_batch)
         if (
             application_owned_classic_state
             and not self._recovery._active_dispatches
-            and not has_pending_recovery_work(self._recovery)
+            and not has_deferred_recovery_failure(self._recovery)
         ):
             self._classic_sync_acknowledgeable_token = response.next_batch
 

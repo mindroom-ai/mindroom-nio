@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Distinguish a continuity recovery that is still converging from one that is stalled, and both from history nio has lost.
+  `SyncResponse.room_recovery` and `SlidingSyncResponse.room_recovery` map each room to a `RoomRecoveryStatus` of `RECOVERED`, `CONVERGING`, `STALLED`, or `LOST`.
+  A walk that exhausted its per-pump page or time budget is `CONVERGING` and will resume; a walk whose cursor and pending queue did not move between two classifications is `STALLED` and will not fix itself.
+  `recovered_room_ids` and `unrecovered_room_ids` keep their exact previous meanings as the two-way view of that map, so existing consumers are unaffected.
+- Add `SyncResponse.admitted_through_token`, the highest response token at or before which every event has been dispatched and nothing remains outstanding.
+  An application that owns its own durable Classic Sync checkpoint persists this instead of `next_batch`: `next_batch` says where to resume the live stream, and the watermark says how far the stream is actually admitted.
+  The two are equal whenever nothing is owed, so a healthy client never replays, and a restart from the watermark re-derives any outstanding gap rather than losing it.
+  It is `None` before the first fully settled response of a sync generation, which means the application must keep the checkpoint it already holds.
+
+- Add `AsyncClient.abandon_recovery()` for discharging a recovery gap nio has classified `STALLED`.
+  A gap holds `admitted_through_token` back until it is discharged, and a walk that has stopped moving never discharges itself, so a permanently stalled room freezes an application-owned checkpoint forever.
+  That is not only a slower restart: the Classic checkpoint is account-wide, so every room re-derives a gap spanning the frozen token to now, and a room whose backlog crosses `backfill_max_events` is abandoned outright. A single wedged room therefore becomes history loss in rooms that never stalled, and nio ends the freeze by taking that loss.
+  The discharge acts only on a published `STALLED` classification, never a converging one, and returns an `AbandonedRecovery` naming the unwalked token span, the recovered events discarded, and the live events retained. Live events the room already received are kept and still dispatched.
+  A retained callback for the room is refused rather than waited on, because a wedged callback is a different failure from a wedged walk.
+- Add `SyncResponse.admitted_through_held_responses`, the number of applied responses since the watermark last moved, so a held checkpoint is visible before a healthy room starts losing backlog.
+- Add `SyncResponse.abandoned_recovery` and `SlidingSyncResponse.abandoned_recovery`, naming every loss accepted while handling one response.
+  nio's internal abandonments -- the room event cap, the held-event cap, an unretryable `/messages` error, and an unverifiable gap -- now report the same span and counts a deliberate discharge does, so an automatic loss is no harder to see than a chosen one.
+
+### Bug Fixes
+
+- Stop an outstanding recovery gap from blocking `acknowledge_classic_sync()`.
+  A gap is a durable obligation that outlives the response that opened it, but acknowledgement refused while one was open, leaving `reset_classic_sync_state()` as an application's only remedy for a response it had in fact processed correctly.
+  Reset replaces the whole recovery state, so it discards the half-walked cursor and every page already fetched. Replaying the same checkpoint then repeats the identical walk under the identical budget and stalls at the identical page, and the gap only grows as traffic accrues, so the loop can never converge.
+  Acknowledgement now blocks only on a retained callback or a deferred callback failure, both of which belong to the response itself.
+  `acknowledge_classic_sync()` takes the watermark the application committed as an optional second argument, and requires it to be the `admitted_through_token` nio published; omitting it continues to assert that the watermark reached this very response, which is exactly when the released one-argument call was already correct.
+- Reset still clears an in-flight walk, because keeping held events or completed markers from a rejected response would suppress the redispatch the replay exists to produce. It now logs each discarded cursor at warning level so the cost is visible.
+
 - Support recursive event relations, as described by the Matrix 1.10 recursive relations extension.
   `Api.room_get_event_relations()` and `AsyncClient.room_get_event_relations()` take `recurse`, and `RoomEventRelationsResponse` exposes the server-reported `recursion_depth`.
   A caller that depends on a traversal depth passes `minimum_recursion_depth`, and every non-empty page that omits `recursion_depth` or reports less than the requirement raises `InsufficientRecursionDepthError` before any of that page's events are yielded.

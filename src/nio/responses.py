@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
@@ -37,6 +37,7 @@ from .events import (
 )
 from .events.presence import PresenceEvent
 from .http import TransportResponse
+from .recovery_status import AbandonedRecovery, RoomRecoveryStatus
 from .schemas import Schemas, validate_json
 
 logger = logging.getLogger(__name__)
@@ -2073,13 +2074,34 @@ class RoomContextResponse(Response):
 class SyncResponse(Response):
     """A response for a /sync request.
 
-    ``recovered_room_ids`` contains rooms whose limited-timeline gaps nio
-    closed while handling this response after dispatching every recovered
-    event. ``unrecovered_room_ids`` contains rooms with a gap still open or
-    abandoned. Both fields are populated only when limited-timeline backfill
-    is enabled. They can include rooms absent from ``rooms`` when earlier
-    recovery completes while handling this response. ``timeline.limited``
-    remains the unmodified server value.
+    ``room_recovery`` maps each room this response settled something about to
+    a :class:`RoomRecoveryStatus`, distinguishing a walk that is still
+    converging from one that is stalled and from history nio has lost.
+    ``recovered_room_ids`` and ``unrecovered_room_ids`` are the two-way view of
+    that same map: the rooms whose limited-timeline gaps nio closed while
+    handling this response after dispatching every recovered event, and every
+    room it did not, for any reason. All three are populated only when
+    limited-timeline backfill is enabled, and can include rooms absent from
+    ``rooms`` when earlier recovery completes while handling this response.
+    ``timeline.limited`` remains the unmodified server value.
+
+    ``admitted_through_token`` is the highest ``next_batch`` at or before which
+    every event has been dispatched and nothing remains outstanding. It is the
+    value an application that owns its own durable Classic Sync checkpoint must
+    persist, as distinct from ``next_batch``, which only says where to resume
+    the live stream. The two are equal whenever nothing is owed, so a healthy
+    client never replays. It is ``None`` before the first fully settled
+    response of a sync generation, which means the application must keep the
+    checkpoint it already holds.
+
+    ``admitted_through_held_responses`` counts the applied responses since the
+    watermark last moved. A permanently stalled gap holds it forever, and every
+    restart then resumes from an older token, so this is the signal an operator
+    acts on before a room that never stalled starts losing backlog.
+
+    ``abandoned_recovery`` names every loss accepted while handling this
+    response, whether nio hit an internal cap or the application discharged a
+    stalled gap deliberately.
     """
 
     next_batch: str = field()
@@ -2091,6 +2113,10 @@ class SyncResponse(Response):
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
     recovered_room_ids: frozenset[str] = frozenset()
     unrecovered_room_ids: frozenset[str] = frozenset()
+    room_recovery: Mapping[str, RoomRecoveryStatus] = field(default_factory=dict)
+    admitted_through_token: str | None = None
+    admitted_through_held_responses: int = 0
+    abandoned_recovery: tuple[AbandonedRecovery, ...] = ()
 
     def __str__(self) -> str:
         result = []
@@ -2340,9 +2366,21 @@ class SlidingSyncResponse(Response):
             earlier recovery completes while handling this response.
         unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window gap
             still open or abandoned.
+        room_recovery (Mapping[str, RoomRecoveryStatus]): Per-room recovery
+            status, distinguishing a walk that is still converging from one
+            that is stalled and from history nio has lost. The two id sets
+            above are the two-way view of this map.
+        abandoned_recovery (Tuple[AbandonedRecovery, ...]): Every loss accepted
+            while handling this response, whether nio hit an internal cap or
+            the application discharged a stalled gap deliberately.
 
     Recovery outcomes are populated only when limited-timeline backfill is
     enabled. The room's ``limited`` field remains the unmodified server value.
+
+    Sliding Sync has no ``admitted_through_token``: its resume position is an
+    opaque connection ``pos`` rather than a durable stream checkpoint, so there
+    is no token an application could hold a watermark at. It therefore has no
+    ``admitted_through_held_responses`` either: nothing here can be held.
     """
 
     pos: str = field()
@@ -2359,6 +2397,8 @@ class SlidingSyncResponse(Response):
     room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
     recovered_room_ids: frozenset[str] = frozenset()
     unrecovered_room_ids: frozenset[str] = frozenset()
+    room_recovery: Mapping[str, RoomRecoveryStatus] = field(default_factory=dict)
+    abandoned_recovery: tuple[AbandonedRecovery, ...] = ()
 
     @staticmethod
     def _parse_list(
