@@ -351,6 +351,8 @@ class TestPerRoomRecoveryContract:
         await open_a_stuck_gap(client, fetch, monkeypatch)
         gap = client._recovery.gaps[ROOM_A][0]
         await client.close()
+        assert client.store
+        client.store.database.close()
 
         restarted = application_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
@@ -463,7 +465,7 @@ class TestPerRoomRecoveryContract:
         )
         await client.receive_response(second)
 
-        assert "$missed" not in delivered.provenance
+        assert delivered.ids(ROOM_A) == ["$live"]
         assert (
             ROOM_A in second.unrecovered_room_ids
         ), "an unrepaid loss must not read as a healthy room on the next response"
@@ -489,6 +491,8 @@ class TestPerRoomRecoveryContract:
         await open_a_stuck_gap(client, fetch, monkeypatch)
         assert client._recovery.abandoned == {ROOM_A}
         await client.close()
+        assert client.store
+        client.store.database.close()
 
         restarted = application_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
@@ -513,6 +517,8 @@ class TestPerRoomRecoveryContract:
         await restarted.receive_response(settled)
         assert ROOM_A not in settled.unrecovered_room_ids
         await restarted.close()
+        assert restarted.store
+        restarted.store.database.close()
 
         reopened = application_owned_client(tempdir)
         await reopened.receive_response(LoginResponse.from_dict(LOGIN))
