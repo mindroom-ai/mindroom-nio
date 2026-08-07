@@ -81,6 +81,7 @@ from nio import (
     PushUnknownCondition,
     ReactionEvent,
     RegisterResponse,
+    RemoteProtocolError,
     RoomBanResponse,
     RoomContextResponse,
     RoomCreateEvent,
@@ -2849,6 +2850,27 @@ class TestClass:
         )
         for event in events:
             assert isinstance(event, ReactionEvent)
+
+    async def test_room_get_event_relations_raises_remote_protocol_error(
+        self, async_client: AsyncClient, aioresponse: aioresponses
+    ):
+        event_id = "$missing-parent"
+
+        aioresponse.get(
+            f"{BASE_URL_V1}/rooms/{TEST_ROOM_ID}/relations/{event_id}?dir=b",
+            status=404,
+            payload={
+                "errcode": "M_NOT_FOUND",
+                "error": "Parent event not found",
+            },
+        )
+
+        with pytest.raises(RemoteProtocolError, match="Parent event not found"):
+            async for _ in async_client.room_get_event_relations(
+                room_id=TEST_ROOM_ID,
+                event_id=event_id,
+            ):
+                pass
 
     @staticmethod
     def _relations_page(

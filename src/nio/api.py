@@ -822,8 +822,9 @@ class Api:
                 Homeservers will apply a default value, and override this with a maximum value.
             recurse (bool, optional): Whether to include events related indirectly to
                 the parent event, as described by the Matrix 1.10 recursive relations
-                extension. Servers report the depth they actually traversed as
-                ``recursion_depth`` on the response.
+                extension. Servers report traversal depth as ``recursion_depth`` on
+                the response. Some report traversal capability, while others report
+                the deepest returned event.
         """
         query_parameters = {"access_token": access_token, "dir": direction.value}
         if recurse:

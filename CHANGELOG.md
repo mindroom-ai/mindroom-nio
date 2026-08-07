@@ -13,6 +13,12 @@ All notable changes to this project will be documented in this file.
   Note that servers disagree about what the number means: some report the depth they are willing to traverse, others the depth of the deepest event they actually returned, which for a shallow relation tree is legitimately `0`.
   An empty page is never rejected, since it has no depth to report and nothing that could have been truncated.
 
+### Bug Fixes
+
+- Classic limited-sync gaps bounded by the prior `since` token now treat `/messages`
+  exhaustion without an `end` token as proven continuity and classify recovered events
+  as `RECOVERED`.
+
 ## 0.36.0
 
 ### Bug Fixes

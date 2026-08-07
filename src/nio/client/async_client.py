@@ -104,6 +104,7 @@ from ..exceptions import (
     CallbackNotAcceptedError,
     InsufficientRecursionDepthError,
     LocalProtocolError,
+    RemoteProtocolError,
     SendRetryError,
     TransferCancelledError,
 )
@@ -4250,23 +4251,25 @@ class AsyncClient(Client):
                 response_data=(room_id, event_id),
             )
 
-            if isinstance(response, RoomEventRelationsResponse):
-                # An empty page carries no depth information: servers that
-                # report the deepest event they returned have nothing to
-                # report, and there is nothing that could have been truncated.
-                if (
-                    minimum_recursion_depth is not None
-                    and response.events
-                    and (
-                        response.recursion_depth is None
-                        or response.recursion_depth < minimum_recursion_depth
-                    )
-                ):
-                    raise InsufficientRecursionDepthError(
-                        minimum_recursion_depth, response.recursion_depth
-                    )
-                for event in response.events:
-                    yield event
+            if not isinstance(response, RoomEventRelationsResponse):
+                raise RemoteProtocolError(str(response))
+
+            # An empty page carries no depth information: servers that
+            # report the deepest event they returned have nothing to
+            # report, and there is nothing that could have been truncated.
+            if (
+                minimum_recursion_depth is not None
+                and response.events
+                and (
+                    response.recursion_depth is None
+                    or response.recursion_depth < minimum_recursion_depth
+                )
+            ):
+                raise InsufficientRecursionDepthError(
+                    minimum_recursion_depth, response.recursion_depth
+                )
+            for event in response.events:
+                yield event
             if response.next_batch is None:
                 return
             paginate_from = response.next_batch
