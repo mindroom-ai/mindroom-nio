@@ -920,6 +920,112 @@ class TestRoomLocalRecovery:
         assert client._classic_sync_acknowledgeable_token == "s1"
         await client.close()
 
+    @pytest.mark.parametrize("settlement", ["acknowledge", "reset"])
+    async def test_sliding_response_requires_staged_classic_settlement(
+        self,
+        tempdir,
+        settlement,
+    ):
+        """Sliding cannot split one staged Classic snapshot across store writes."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        assert client.store
+        seen = record_events(client, RoomNameEvent)
+        sliding = self._sliding(
+            "slide1",
+            [name_event("$sliding", 2, "Sliding")],
+            prev_batch="w1",
+        )
+
+        with pytest.raises(LocalProtocolError, match="acknowledge or reset"):
+            await client.receive_response(sliding)
+
+        assert client.has_uncommitted_classic_sync_state
+        assert client.next_batch == "s1"
+        assert client.rooms == {}
+        assert client._recovery.gaps == {}
+        assert client._recovery.events == {}
+        assert client._recovery.completed == {}
+        assert client._sliding_room_prev_batch == {}
+        assert client.store.load_sync_recovery() == ([], [], [])
+        assert client.store.load_sliding_window_tokens() == {}
+        assert seen == []
+
+        if settlement == "acknowledge":
+            client.acknowledge_classic_sync("s1")
+        else:
+            await client.reset_classic_sync_state()
+        await client.receive_response(sliding)
+
+        assert seen == ["$sliding"]
+        assert client.rooms[ROOM_A].name == "Sliding"
+        assert client._sliding_room_prev_batch == {ROOM_A: window_token("w1")}
+        await client.close()
+
+    async def test_sliding_rechecks_staged_classic_after_waiting_for_executor(
+        self,
+        tempdir,
+    ):
+        """A queued Classic response can stage while Sliding waits for the lock."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client, RoomNameEvent)
+        sliding = self._sliding(
+            "slide1",
+            [name_event("$sliding", 2, "Sliding")],
+            prev_batch="w1",
+        )
+
+        await client._sync_response_lock.acquire()
+        classic_task = asyncio.create_task(
+            client.receive_response(sync_response("s1", {}))
+        )
+        await asyncio.sleep(0)
+        sliding_task = asyncio.create_task(client.receive_response(sliding))
+        await asyncio.sleep(0)
+        assert not classic_task.done()
+        assert not sliding_task.done()
+        client._sync_response_lock.release()
+
+        await classic_task
+        with pytest.raises(LocalProtocolError, match="acknowledge or reset"):
+            await sliding_task
+
+        assert client.has_uncommitted_classic_sync_state
+        assert client.rooms == {}
+        assert client._sliding_room_prev_batch == {}
+        assert client.store
+        assert client.store.load_sync_recovery() == ([], [], [])
+        assert client.store.load_sliding_window_tokens() == {}
+        assert seen == []
+
+        client.acknowledge_classic_sync("s1")
+        await client.receive_response(sliding)
+        assert seen == ["$sliding"]
+        assert client.rooms[ROOM_A].name == "Sliding"
+        await client.close()
+
     async def test_reset_classic_sync_state_rejects_an_active_sync_request(
         self,
         tempdir,
@@ -6734,7 +6840,10 @@ class TestRoomLocalRecovery:
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(backfill_limited_timelines=True),
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         requests: list[type[SyncResponse] | type[SlidingSyncResponse]] = []
@@ -6851,7 +6960,10 @@ class TestRoomLocalRecovery:
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(backfill_limited_timelines=True),
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         classic_started = asyncio.Event()

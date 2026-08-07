@@ -2393,6 +2393,16 @@ class AsyncClient(Client):
                         request_since,
                     )
                     return
+                if (
+                    isinstance(sync_response, SlidingSyncResponse)
+                    and self._classic_sync_state_staged
+                    and not self.config.store_sync_tokens
+                ):
+                    raise LocalProtocolError(
+                        "Sliding Sync cannot be applied while application-owned "
+                        "Classic Sync state is staged; acknowledge or reset the "
+                        "Classic response first."
+                    )
                 entered_executor = True
                 executor = object()
                 self._active_sync_executor_token = executor
