@@ -2,54 +2,87 @@
 
 ## Scope
 
-Fix every verified issue from the PR 53 re-review:
+Fix the verified PR 53 correctness defects without inventing a transaction
+protocol between nio's store and an application's checkpoint store:
 
-- rejected application-owned Classic Sync responses must replay after reset or restart;
+- Classic Sync cursor and recovery state must have one durable owner;
 - clearing a real room gap must persist sticky abandonment;
-- only explicitly capable stores may authorize checkpoint advancement;
-- non-atomic stores must fail before abandonment settlement mutates persistence;
-- the v9 migration and cleanup tests must exercise the abandonment table;
-- recovery fetch tests must fail on unscripted calls and cover 408, 429, and 5xx retries;
-- the live recovery-slam wrapper must match the current dispatch signature.
+- a store used for nio-owned recovery must explicitly support atomic writes;
+- the v9 migration and cleanup tests must exercise abandonment;
+- recovery fetch tests must reject unscripted calls and cover transient retries;
+- the live recovery recorder must exactly mirror the dispatch signature.
 
-## Recovery transaction boundary
+Prepared snapshots, checkpoint promotion, and application checkpoint blobs are
+not part of this change.
 
-Application-owned Classic Sync recovery changes are provisional until
-`acknowledge_classic_sync()` succeeds. While a response is staged, nio mutates
-only the in-memory `RecoveryState`; it does not incrementally mutate the last
-acknowledged recovery snapshot in the store.
+## One-owner Classic boundary
 
-Acknowledgement writes a complete recovery snapshot atomically and store-first,
-then clears the staged-response flag. If the write fails, memory stays staged
-and acknowledgement can be retried. Reset and process restart therefore reload
-the last acknowledged snapshot: previously committed gaps survive, while
-completion markers created by a rejected response do not suppress replay.
+Limited-timeline Classic Sync supports two configurations:
 
-Nio-owned Classic tokens and Sliding Sync retain their existing incremental
-persistence because their token and recovery state already share one owner and
-one transaction boundary.
+1. With `store_sync_tokens=True`, nio owns both the Classic cursor and recovery
+   rows. `backfill_persist_recovery` must be `None` or `True`, and the token,
+   gaps, pending events, abandonment, and Sliding baselines use nio's atomic
+   store operations.
+2. With `store_sync_tokens=False`, the application owns the Classic cursor and
+   nio writes no recovery rows. `backfill_persist_recovery` must be `None` or
+   `False`. The existing staged-response API remains memory-only, and
+   `acknowledge_classic_sync()` refuses to advance while any gap or deferred
+   recovery failure remains.
+
+The two mixed configurations are rejected before a Classic HTTP request is
+sent and again before a manually supplied Classic response can mutate state:
+
+- nio-owned cursor with recovery persistence disabled;
+- application-owned cursor with nio recovery persistence enabled.
+
+There is no safe ordering for separate cursor and recovery writes. If the
+application writes its cursor first, a crash can lose an unstored gap. If nio
+writes recovery first, a crash can load completion markers from a response the
+application will replay. Making that hybrid safe requires an application-owned
+checkpoint backend or another explicit transaction design and belongs in a
+separate change.
+
+Pure Sliding Sync may continue to persist its nio-owned room-window recovery
+state. A client configured for persisted Sliding recovery cannot process
+application-owned Classic Sync without first choosing a valid Classic
+ownership configuration.
 
 ## Gap clearing and abandonment
 
 Before any `RecoveryPlan` is written, `persist_response_plan()` adds every
 cleared room containing a real target-token gap to `unrecovered_room_ids`.
-That normalization happens before the store write, so gap deletion and sticky
-abandonment are atomic for all callers, including `room_leave()` and
-`room_forget()`.
+Store and memory receive the same normalized immutable plan, so deleting a gap
+and recording sticky abandonment is one transition for recovery resets,
+`room_leave()`, and `room_forget()`.
 
-## Store capabilities
+Abandonment remains in `RecoveryState.abandoned` and the v9
+`SyncRecoveryAbandonedRooms` table until the application explicitly calls
+`acknowledge_unrecovered_rooms()`.
 
-`MatrixStore` defaults to neither durable nor atomically recovery-capable.
-The built-in disk stores opt into both capabilities; `SqliteMemoryStore` opts
-into atomic recovery but remains non-durable. Custom stores must opt in
-explicitly. Client acknowledgement and abandonment settlement fail before
-mutation when atomic recovery is unavailable.
+## Atomic store boundary
 
-These are explicit capabilities, not heuristics based on backend class names.
+`MatrixStore.supports_atomic_recovery` defaults to `False`, and every subclass
+must redeclare the capability rather than inheriting an optimistic value.
+`DefaultStore`, `SqliteStore`, and `SqliteMemoryStore` explicitly opt in.
+Recovery operations fail before mutation when a custom backend does not opt in;
+this excludes `SqliteQueueDatabase`, whose writer intentionally cannot provide
+a multi-statement transaction.
+
+This is a capability declaration, not backend-name inference. No separate
+durability heuristic is needed once hybrid Classic ownership is rejected.
+
+## Explicit non-goals
+
+- Durable application-owned gaps are not supported by this PR.
+- Application-owned Sliding checkpoints and Classic/Sliding cursor conversion
+  are not supported.
+- Arbitrary callback side effects and to-device processing are not made
+  exactly-once by the Classic cursor acknowledgement API.
+- Room caches and crypto state are not rollback snapshots.
 
 ## Verification
 
-Each defect gets a regression test that fails on PR head before implementation.
-After targeted tests pass, run the full pytest suite, pre-commit, and the
-disposable Tuwunel live checks: wire/encryption checks, Classic and Sliding
-restart probes, the multi-room recovery slam, and targeted reset/leave probes.
+Every production correction is preceded by a regression that fails for the
+intended reason. Final verification includes focused ownership, abandonment,
+store, retry, and wrapper tests; the complete pytest suite and pre-commit; and
+the disposable Tuwunel Classic/Sliding restart and recovery-slam probes.
