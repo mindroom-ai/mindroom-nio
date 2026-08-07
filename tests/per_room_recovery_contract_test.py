@@ -39,6 +39,11 @@ from nio import (
     TimelineEventProvenance,
 )
 from nio.responses import RoomMessagesError, RoomMessagesResponse
+from nio.client.sync_recovery import (
+    RecoveryGap,
+    RecoveryPlan,
+    persist_response_plan,
+)
 from nio.store import SqliteMemoryStore
 
 ROOM_A = "!a:example.org"
@@ -213,6 +218,34 @@ async def open_a_stuck_gap(
 
 @pytest.mark.asyncio
 class TestPerRoomRecoveryContract:
+    async def test_clearing_a_real_gap_persists_sticky_abandonment(self, tempdir):
+        """Every real-gap deletion records loss in memory and on disk."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(
+                gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),),
+            ),
+        )
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+        )
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {ROOM_A}
+        gaps, _events, abandoned = client.store.load_sync_recovery()
+        assert gaps == []
+        assert abandoned == [ROOM_A]
+        await client.close()
+
     async def test_unresolved_gap_does_not_block_the_global_cursor(
         self,
         tempdir,

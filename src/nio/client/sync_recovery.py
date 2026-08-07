@@ -1160,6 +1160,15 @@ def persist_response_plan(
     window_tokens: Mapping[str, SlidingWindowToken] | None = None,
     forgotten_rooms: Iterable[str] = (),
 ) -> None:
+    plan = replace(
+        plan,
+        unrecovered_room_ids=plan.unrecovered_room_ids
+        | frozenset(
+            room_id
+            for room_id in plan.clear_rooms
+            if any(gap.target_token for gap in state.gaps.get(room_id, ()))
+        ),
+    )
     try:
         if store:
             store.save_recovery(

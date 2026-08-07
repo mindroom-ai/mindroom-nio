@@ -8181,6 +8181,81 @@ class TestRoomLocalRecovery:
         await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_successful_membership_change_persists_acknowledged_gap_loss(
+        self, tempdir, monkeypatch, operation
+    ):
+        """Leaving or forgetting cannot erase an acknowledged gap silently."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_persist_recovery=True,
+            store_sync_tokens=False,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        class Transport:
+            status = 429
+
+        async def failing_messages(*_args, **_kwargs):
+            error = RoomMessagesError.from_dict(
+                {"errcode": "M_LIMIT_EXCEEDED", "error": "slow down"},
+                ROOM_A,
+            )
+            error.transport_response = Transport()
+            return error
+
+        monkeypatch.setattr(client, "_recovery_room_messages", failing_messages)
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        client.acknowledge_classic_sync("s1")
+        assert client.store
+        assert [gap.room_id for gap in client.store.load_sync_recovery()[0]] == [ROOM_A]
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {ROOM_A}
+        assert client.store.load_sync_recovery()[2] == [ROOM_A]
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        assert ROOM_A not in restarted._recovery.gaps
+        assert restarted._recovery.abandoned == {ROOM_A}
+        await restarted.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_disabled_membership_change_clears_prior_recovery_durably(
         self, tempdir, monkeypatch, operation
     ):
