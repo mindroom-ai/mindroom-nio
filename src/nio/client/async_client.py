@@ -279,9 +279,11 @@ from .sync_recovery import (
     RecoveryPlan,
     RecoveryState,
     _LiveCallbackError,
+    acknowledge_unrecovered_rooms,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
+    has_uncommitted_recovery_work,
     is_recovered_dispatch_task,
     is_recovery_dispatch_task,
     load_recovery_state,
@@ -824,9 +826,9 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+        if self.config.store_sync_tokens:
             raise LocalProtocolError(
-                "Classic Sync acknowledgement requires token and persisted recovery ownership to be disabled."
+                "Classic Sync acknowledgement requires token ownership to be disabled."
             )
         if self._active_sync_executor_token is not None:
             raise LocalProtocolError(
@@ -838,7 +840,10 @@ class AsyncClient(Client):
             or next_batch != self._classic_sync_acknowledgeable_token
             or next_batch != self.next_batch
             or self._recovery._active_dispatches
-            or has_pending_recovery_work(self._recovery)
+            or has_uncommitted_recovery_work(
+                self._recovery,
+                durable=self._recovery_store is not None,
+            )
         ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
@@ -873,9 +878,9 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+        if self.config.store_sync_tokens:
             raise LocalProtocolError(
-                "Classic Sync reset requires token and persisted recovery ownership to be disabled."
+                "Classic Sync reset requires token ownership to be disabled."
             )
         if (
             (callback_scope is not None and callback_scope.active)
@@ -927,6 +932,20 @@ class AsyncClient(Client):
                         self._recovery = RecoveryState(
                             max_held_events=self.config.backfill_max_events
                         )
+                        # A rejected response rewinds the application to its
+                        # committed checkpoint, which is already past any gap
+                        # acknowledged earlier. Dropping those gaps would strand
+                        # them: nothing in the replay reaches back far enough to
+                        # plan them again. Rows this response wrote come back
+                        # too, which is harmless -- they are keyed by their own
+                        # bounded tokens, so replaying the response re-plans the
+                        # same rows and apply_plan matches them by event ID.
+                        recovery_store = self._recovery_store
+                        if recovery_store:
+                            load_recovery_state(
+                                self._recovery,
+                                *recovery_store.load_sync_recovery(),
+                            )
                         self._sliding_room_prev_batch.clear()
                         self._pending_sliding_room_account_data.clear()
                         self._sliding_sync_to_device_since = None
@@ -1302,6 +1321,28 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def acknowledge_unrecovered_rooms(self, room_ids: Iterable[str]) -> frozenset[str]:
+        """Stop reporting these rooms as degraded, and return the ones that were.
+
+        A room whose gap nio gave up on keeps appearing in
+        ``unrecovered_room_ids`` on every later response, because a loss
+        announced once and then forgotten cannot be told apart from a recovery.
+        Call this once the loss is recorded somewhere the application owns.
+
+        Returns:
+            The subset that was actually degraded, so a caller can log exactly
+            what it settled rather than what it asked about.
+        """
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Unrecovered rooms require limited-timeline recovery."
+            )
+        settled = acknowledge_unrecovered_rooms(self._recovery, room_ids)
+        store = self._recovery_store
+        if store and settled:
+            store.clear_recovery_abandonment(settled)
+        return settled
+
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
     ) -> None:
@@ -1522,9 +1563,7 @@ class AsyncClient(Client):
             return
 
         application_owned_classic_state = (
-            self.config.backfill_limited_timelines
-            and not self.config.store_sync_tokens
-            and not self._recovery_persistence_enabled
+            self.config.backfill_limited_timelines and not self.config.store_sync_tokens
         )
         if application_owned_classic_state:
             self._classic_sync_state_staged = True
@@ -1614,7 +1653,10 @@ class AsyncClient(Client):
         if (
             application_owned_classic_state
             and not self._recovery._active_dispatches
-            and not has_pending_recovery_work(self._recovery)
+            and not has_uncommitted_recovery_work(
+                self._recovery,
+                durable=self._recovery_store is not None,
+            )
         ):
             self._classic_sync_acknowledgeable_token = response.next_batch
 

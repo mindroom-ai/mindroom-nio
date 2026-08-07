@@ -195,6 +195,11 @@ class RecoveryState:
     )
     # Outcomes since the last take; False stays sticky when _finish records True.
     outcomes: dict[str, bool] = field(default_factory=dict)
+    # Rooms whose gap was given up on. Unlike ``outcomes`` this is not drained
+    # by a read: a loss that is announced once and then forgotten is
+    # indistinguishable from a recovery, so the application would have no way
+    # to tell a room with permanently missing work from a healthy one.
+    abandoned: set[str] = field(default_factory=set)
     room_offset: int = 0
     max_held_events: int = 200
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
@@ -211,6 +216,42 @@ class RecoveryState:
 def has_pending_recovery_work(state: RecoveryState) -> bool:
     """Whether a recovery pump has gaps or deferred callback failures."""
     return bool(state.gaps or state._deferred_dispatch_errors)
+
+
+def has_uncommitted_recovery_work(state: RecoveryState, *, durable: bool) -> bool:
+    """Whether recovery work must fence an application-owned checkpoint.
+
+    A gap is bounded at both ends the moment it is planned -- ``cursor_token``
+    is the ``since`` the limited response was measured from and ``target_token``
+    is its ``prev_batch`` -- so it describes the same walk no matter how far the
+    global cursor has moved. When such a gap is durable the checkpoint may
+    advance past it, and *must* be allowed to: holding the cursor back makes the
+    next request re-measure the gap against a live position that has moved on,
+    which grows it without bound and never converges.
+
+    Without durability the same advance is silent data loss, because the only
+    record that those events are owed dies with the process. So an in-memory
+    gap still fences the checkpoint, and a deferred callback failure always
+    does -- that is an event the application has not accepted yet.
+    """
+    if state._deferred_dispatch_errors:
+        return True
+    return bool(state.gaps) and not durable
+
+
+def acknowledge_unrecovered_rooms(
+    state: RecoveryState,
+    room_ids: Iterable[str],
+) -> frozenset[str]:
+    """Stop reporting these rooms as degraded and return the ones that were.
+
+    Abandonment is sticky precisely so that it cannot be missed, which means
+    something has to clear it. Only the application can, because only it knows
+    whether it has recorded the loss somewhere durable.
+    """
+    settled = state.abandoned & set(room_ids)
+    state.abandoned -= settled
+    return frozenset(settled)
 
 
 def is_recovery_dispatch_task(
@@ -991,6 +1032,11 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     for key in {(event.room_id, event.generation) for event in plan.events}:
         state.events[key].sort(key=lambda item: item.sequence)
 
+    # Order matters: a room can be cleared and abandoned by one plan when the
+    # held-event cap forces a reset, and that reset is a real loss.
+    state.abandoned -= plan.clear_rooms
+    state.abandoned |= plan.unrecovered_room_ids
+
 
 def take_recovery_outcomes(
     state: RecoveryState,
@@ -1005,10 +1051,12 @@ def take_recovery_outcomes(
     recovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if complete)
         - pending
+        - state.abandoned
     )
     unrecovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if not complete)
         | pending
+        | frozenset(state.abandoned)
     )
     return recovered, unrecovered
 
@@ -1017,11 +1065,14 @@ def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
     events: Iterable[Any],
+    abandoned: Iterable[str] = (),
 ) -> None:
     state.gaps.clear()
     state.events.clear()
     state.completed.clear()
     state.outcomes.clear()
+    state.abandoned.clear()
+    state.abandoned.update(abandoned)
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,
@@ -1081,6 +1132,7 @@ def persist_response_plan(
                 plan.clear_recovered,
                 window_tokens,
                 forgotten_rooms,
+                plan.unrecovered_room_ids,
             )
         apply_plan(state, plan)
     except BaseException:

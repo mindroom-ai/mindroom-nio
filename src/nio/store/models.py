@@ -229,6 +229,26 @@ class SyncRecoveryGaps(Model):
         constraints = [SQL("UNIQUE(account_id,room_id,generation)")]
 
 
+class SyncRecoveryAbandonedRooms(Model):
+    """Rooms whose limited-timeline gap was given up on.
+
+    Kept apart from ``SyncRecoveryGaps`` because abandonment outlives the gap
+    row it came from: the gap is deleted when the walk is abandoned, and the
+    record that work was lost has to survive that deletion or the room silently
+    reads as healthy on the next response.
+    """
+
+    room_id = TextField()
+    account = ForeignKeyField(
+        model=Accounts,
+        on_delete="CASCADE",
+        backref="sync_recovery_abandoned_rooms",
+    )
+
+    class Meta:
+        constraints = [SQL("UNIQUE(account_id,room_id)")]
+
+
 class PendingTimelineEvents(Model):
     room_id = TextField()
     generation = IntegerField()

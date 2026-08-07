@@ -109,14 +109,19 @@ def messages_error(status: int, room_id: str = ROOM_A) -> RoomMessagesError:
     return response
 
 
-def application_owned_client(tempdir: str) -> AsyncClient:
+def application_owned_client(tempdir: str, *, durable: bool = True) -> AsyncClient:
     """A client configured the way an application that owns the checkpoint runs.
 
-    Token persistence and nio-owned recovery persistence are both off, because
-    the application commits its own durable cursor and acknowledges nio only
-    once that commit succeeded. Every contract below is stated against this
-    configuration; a client that lets nio own the cursor never has to reconcile
-    a rejected response against a checkpoint nio does not know about.
+    Token persistence is off because the application commits its own durable
+    cursor and acknowledges nio only once that commit succeeded. Recovery
+    persistence is on, which is the combination the contract needs and which
+    nio has to permit: a checkpoint may only advance past an open gap if that
+    gap outlives the process.
+
+    ``durable=False`` is the same application without persisted gaps. It exists
+    to pin the safety half of the contract -- that configuration must keep
+    fencing the checkpoint, because advancing past a gap nobody wrote down is
+    silent loss rather than forward progress.
     """
     return AsyncClient(
         "https://example.org",
@@ -125,7 +130,7 @@ def application_owned_client(tempdir: str) -> AsyncClient:
         tempdir,
         config=AsyncClientConfig(
             backfill_limited_timelines=True,
-            backfill_persist_recovery=False,
+            backfill_persist_recovery=durable,
             store_sync_tokens=False,
         ),
     )
@@ -225,6 +230,28 @@ class TestPerRoomRecoveryContract:
         assert client._recovery.gaps[ROOM_A], "the gap must stay open for this room"
         client.acknowledge_classic_sync("s1")
         assert not client.has_uncommitted_classic_sync_state
+        await client.close()
+
+    async def test_gap_without_durability_still_fences_the_cursor(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """The safety half of contract 1: only a *durable* gap may be passed.
+
+        Advancing the checkpoint past an in-memory gap is not forward progress,
+        it is silent loss -- the committed cursor is already beyond the limited
+        response, so nothing in a replay reaches back to plan the walk again and
+        the only record that those events were owed dies with the process.
+        """
+        client = application_owned_client(tempdir, durable=False)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        fetch = RecordingFetch([messages_error(429)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
+
+        assert client._recovery_store is None
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s1")
         await client.close()
 
     async def test_other_rooms_keep_delivering_while_one_room_is_blocked(
@@ -332,9 +359,9 @@ class TestPerRoomRecoveryContract:
             )
         )
 
-        assert delivered.ids(ROOM_A) == [], (
-            "nothing from this room may be delivered while its gap is open"
-        )
+        assert (
+            delivered.ids(ROOM_A) == []
+        ), "nothing from this room may be delivered while its gap is open"
         await client.close()
 
     async def test_recovered_events_arrive_once_in_order_with_provenance(
@@ -403,10 +430,62 @@ class TestPerRoomRecoveryContract:
         await client.receive_response(second)
 
         assert "$missed" not in delivered.provenance
-        assert ROOM_A in second.unrecovered_room_ids, (
-            "an unrepaid loss must not read as a healthy room on the next response"
-        )
+        assert (
+            ROOM_A in second.unrecovered_room_ids
+        ), "an unrepaid loss must not read as a healthy room on the next response"
         await client.close()
+
+    async def test_abandonment_outlives_a_restart_until_acknowledged(
+        self,
+        tempdir,
+        monkeypatch,
+        delivered,
+    ):
+        """A loss is durable, and only the application may retire it.
+
+        Restarting is the easiest way to lose a degraded-room signal, and the
+        one most likely to happen while nobody is looking. Clearing has to be an
+        explicit act because only the application knows whether it recorded the
+        loss anywhere.
+        """
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        delivered.install(client)
+        fetch = RecordingFetch([messages_error(403)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
+        assert client._recovery.abandoned == {ROOM_A}
+        await client.close()
+
+        restarted = application_owned_client(tempdir)
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        assert restarted._recovery.abandoned == {ROOM_A}
+
+        restarted.next_batch = "s1"
+        after_restart = sync_response(
+            "s2",
+            {ROOM_A: room_info([], limited=False, prev_batch="p2")},
+        )
+        await restarted.receive_response(after_restart)
+        assert ROOM_A in after_restart.unrecovered_room_ids
+
+        assert restarted.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
+        assert restarted.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset()
+
+        restarted.next_batch = "s2"
+        settled = sync_response(
+            "s3",
+            {ROOM_A: room_info([], limited=False, prev_batch="p3")},
+        )
+        await restarted.receive_response(settled)
+        assert ROOM_A not in settled.unrecovered_room_ids
+        await restarted.close()
+
+        reopened = application_owned_client(tempdir)
+        await reopened.receive_response(LoginResponse.from_dict(LOGIN))
+        assert (
+            reopened._recovery.abandoned == set()
+        ), "acknowledgement must be durable too, or the loss returns on restart"
+        await reopened.close()
 
     @pytest.mark.parametrize("last_page", ["empty", "final_events"])
     async def test_page_without_end_closes_a_bounded_walk_as_exhausted(
@@ -443,9 +522,7 @@ class TestPerRoomRecoveryContract:
         fetch = RecordingFetch(pages)
         response = await open_a_stuck_gap(client, fetch, monkeypatch)
 
-        expected = (
-            ["$live"] if last_page == "empty" else ["$missed", "$older", "$live"]
-        )
+        expected = ["$live"] if last_page == "empty" else ["$missed", "$older", "$live"]
         assert delivered.ids(ROOM_A) == expected
         for event_id in expected[:-1]:
             assert (
@@ -488,7 +565,9 @@ class TestPerRoomRecoveryContract:
 
         assert delivered.ids(ROOM_A) == ["$missed", "$live"]
         assert delivered.provenance["$missed"] is TimelineEventProvenance.RECOVERED
-        assert [call[1] for call in fetch.calls] == ["s0", "s0", "s0"], (
-            "a transient failure must restart from the same bounded cursor"
-        )
+        assert [call[1] for call in fetch.calls] == [
+            "s0",
+            "s0",
+            "s0",
+        ], "a transient failure must restart from the same bounded cursor"
         await client.close()
