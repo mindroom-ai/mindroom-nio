@@ -26,7 +26,7 @@ Defect B is why it cannot simply be removed: acknowledging past a gap is only sa
 
 ## The exact contract, against real names
 
-Stated for a client configured the way an application that owns its own durable cursor runs it: `backfill_limited_timelines=True`, `store_sync_tokens=False`, `backfill_persist_recovery=False`.
+Stated for a client configured the way an application that owns its own durable cursor runs it: `backfill_limited_timelines=True`, `store_sync_tokens=False`, `backfill_persist_recovery=True`, with a store whose data survives client and process recreation.
 
 1. **A `RecoveryGap` with a non-`None` `cursor_token` blocks only its own room.**
    `acknowledge_classic_sync(next_batch)` must succeed while `state.gaps[room]` is non-empty for some room.
@@ -125,6 +125,23 @@ event ID.
 
 It is a separate table rather than a column on `SyncRecoveryGaps` because abandonment outlives the
 gap row it came from -- the gap is deleted when the walk is abandoned.
+
+### 5. Review hardening invariants
+
+The checkpoint gate must distinguish a recovery store that merely exists from one that is actually
+durable. In particular, `SqliteMemoryStore` must continue fencing an application-owned checkpoint:
+its rows disappear when the client is recreated, so advancing past one of its gaps would be silent
+loss. The store interface exposes this distinction explicitly rather than making the client infer it
+from a concrete store class.
+
+Room recovery resets and abandonment settlement are separate operations. A reset may discard gap
+and pending-event rows, but it must not clear an existing abandonment record. If the reset discards
+a real gap, that loss becomes abandoned in the same atomic recovery plan. Only
+`AsyncClient.acknowledge_unrecovered_rooms` settles abandonment.
+
+Acknowledgement follows the same store-first ordering as every other durable recovery transition.
+The durable abandonment row is cleared before the in-memory set; if persistence fails, memory stays
+unchanged so the next response remains degraded and the caller can retry the acknowledgement.
 
 ## Mutation testing
 
