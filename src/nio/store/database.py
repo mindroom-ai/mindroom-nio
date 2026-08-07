@@ -18,7 +18,7 @@ import os
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from Crypto.Cipher import AES
 from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
@@ -53,6 +53,7 @@ from . import (
     PendingTimelineEvents,
     SlidingWindowTokens,
     StoreVersion,
+    SyncRecoveryAbandonedRooms,
     SyncRecoveryGaps,
     SyncTokens,
 )
@@ -124,6 +125,7 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
+    supports_atomic_recovery: ClassVar[bool] = False
     models = [
         Accounts,
         OlmSessions,
@@ -136,10 +138,11 @@ class MatrixStore:
         Keys,
         SyncTokens,
         SyncRecoveryGaps,
+        SyncRecoveryAbandonedRooms,
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 8
+    store_version = 9
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -147,6 +150,11 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "supports_atomic_recovery" not in cls.__dict__:
+            cls.supports_atomic_recovery = False
 
     def _create_database(self):
         return SqliteDatabase(
@@ -242,6 +250,12 @@ class MatrixStore:
             )
         self._update_version(8)
 
+    @use_database_atomic
+    def upgrade_to_v9(self):
+        with self.database.bind_ctx(self.models):
+            self.database.create_tables([SyncRecoveryAbandonedRooms])
+        self._update_version(9)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -268,6 +282,9 @@ class MatrixStore:
             store_version = 7
         if store_version == 7:
             self.upgrade_to_v8()
+            store_version = 8
+        if store_version == 8:
+            self.upgrade_to_v9()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -629,6 +646,9 @@ class MatrixStore:
             PendingTimelineEvents.account == account
         ).execute()
         SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
+        SyncRecoveryAbandonedRooms.delete().where(
+            SyncRecoveryAbandonedRooms.account == account,
+        ).execute()
         SlidingWindowTokens.delete().where(
             SlidingWindowTokens.account == account,
         ).execute()
@@ -661,6 +681,7 @@ class MatrixStore:
         clear_recovered: RecoveryGap | None,
         window_tokens: Mapping[str, SlidingWindowToken] | None = None,
         forgotten_rooms: Iterable[str] = (),
+        abandoned_rooms: Iterable[str] = (),
     ) -> None:
         account = self._get_account()
         assert account
@@ -706,7 +727,29 @@ class MatrixStore:
             SyncRecoveryGaps.replace_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).execute()
+        abandoned = [
+            {"account": account, "room_id": room_id} for room_id in abandoned_rooms
+        ]
+        for index in range(0, len(abandoned), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryAbandonedRooms.replace_many(
+                abandoned[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
         self._upsert_pending_events(account, events)
+
+    @use_database_atomic
+    def clear_recovery_abandonment(self, room_ids: Iterable[str]) -> None:
+        """Forget that these rooms lost history, once the application says so."""
+        account = self._get_account()
+        assert account
+
+        room_ids = list(room_ids)
+        for index in range(0, len(room_ids), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryAbandonedRooms.delete().where(
+                SyncRecoveryAbandonedRooms.account == account,
+                SyncRecoveryAbandonedRooms.room_id.in_(
+                    room_ids[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+                ),
+            ).execute()
 
     def _recovery_payload_key(self) -> bytes:
         return hashlib.sha256(_RECOVERY_KEY_DOMAIN + self.pickle_key.encode()).digest()
@@ -884,14 +927,20 @@ class MatrixStore:
     @use_database
     def load_sync_recovery(
         self,
-    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvent]]:
-        """Load room obligations and their ordered pending callbacks."""
+    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvent], list[str]]:
+        """Load room obligations, their ordered pending callbacks, and lost rooms."""
         from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
 
         account = self._get_account()
         if not account:
-            return [], []
+            return [], [], []
 
+        abandoned = [
+            row.room_id
+            for row in SyncRecoveryAbandonedRooms.select()
+            .where(SyncRecoveryAbandonedRooms.account == account)
+            .order_by(SyncRecoveryAbandonedRooms.room_id)
+        ]
         gaps = list(
             SyncRecoveryGaps.select()
             .where(SyncRecoveryGaps.account == account)
@@ -935,7 +984,7 @@ class MatrixStore:
                     row.apply_room_state,
                 )
             )
-        return gaps, events
+        return gaps, events, abandoned
 
     @use_database_atomic
     def accept_recovery_event(
@@ -1256,6 +1305,7 @@ class DefaultStore(MatrixStore):
             should be used.
     """
 
+    supports_atomic_recovery: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
@@ -1394,6 +1444,7 @@ class SqliteStore(MatrixStore):
             should be used.
     """
 
+    supports_atomic_recovery: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
     def _get_device(self, device):
@@ -1643,6 +1694,8 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
+
+    supports_atomic_recovery: ClassVar[bool] = True
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

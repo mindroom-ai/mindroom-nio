@@ -21,6 +21,7 @@ from ..events import (
     MegolmEvent,
     RoomMemberEvent,
 )
+from ..exceptions import LocalProtocolError
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -195,6 +196,11 @@ class RecoveryState:
     )
     # Outcomes since the last take; False stays sticky when _finish records True.
     outcomes: dict[str, bool] = field(default_factory=dict)
+    # Rooms whose gap was given up on. Unlike ``outcomes`` this is not drained
+    # by a read: a loss that is announced once and then forgotten is
+    # indistinguishable from a recovery, so the application would have no way
+    # to tell a room with permanently missing work from a healthy one.
+    abandoned: set[str] = field(default_factory=set)
     room_offset: int = 0
     max_held_events: int = 200
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
@@ -211,6 +217,21 @@ class RecoveryState:
 def has_pending_recovery_work(state: RecoveryState) -> bool:
     """Whether a recovery pump has gaps or deferred callback failures."""
     return bool(state.gaps or state._deferred_dispatch_errors)
+
+
+def acknowledge_unrecovered_rooms(
+    state: RecoveryState,
+    room_ids: Iterable[str],
+) -> frozenset[str]:
+    """Stop reporting these rooms as degraded and return the ones that were.
+
+    Abandonment is sticky precisely so that it cannot be missed, which means
+    something has to clear it. Only the application can, because only it knows
+    whether it has recorded the loss somewhere durable.
+    """
+    settled = state.abandoned & set(room_ids)
+    state.abandoned -= settled
+    return frozenset(settled)
 
 
 def is_recovery_dispatch_task(
@@ -751,12 +772,13 @@ def plan_room_timeline(
     ):
         apply_state_live_event_count = 0
 
+    previous_gaps = state.gaps.get(room_id, ())
     clear = reset_recovery or _timeline_clears_recovery(
         timeline_events,
         user_id,
         live_event_count,
     )
-    existing = () if clear else state.gaps.get(room_id, ())
+    existing = () if clear else previous_gaps
     new_gap = would_plan_real_gap(
         timeline_events=timeline_events,
         user_id=user_id,
@@ -826,7 +848,7 @@ def plan_room_timeline(
             state,
             room_id,
             events,
-            unrecovered=new_gap or any(gap.target_token for gap in existing),
+            unrecovered=new_gap,
         )
     gap = (
         RecoveryGap(
@@ -991,6 +1013,10 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     for key in {(event.room_id, event.generation) for event in plan.events}:
         state.events[key].sort(key=lambda item: item.sequence)
 
+    # Clearing room recovery does not settle a loss. Only the application can
+    # do that after recording the missing work somewhere it owns.
+    state.abandoned |= plan.unrecovered_room_ids
+
 
 def take_recovery_outcomes(
     state: RecoveryState,
@@ -1005,10 +1031,12 @@ def take_recovery_outcomes(
     recovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if complete)
         - pending
+        - state.abandoned
     )
     unrecovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if not complete)
         | pending
+        | frozenset(state.abandoned)
     )
     return recovered, unrecovered
 
@@ -1017,11 +1045,14 @@ def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
     events: Iterable[Any],
+    abandoned: Iterable[str] = (),
 ) -> None:
     state.gaps.clear()
     state.events.clear()
     state.completed.clear()
     state.outcomes.clear()
+    state.abandoned.clear()
+    state.abandoned.update(abandoned)
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,
@@ -1071,6 +1102,23 @@ def persist_response_plan(
     window_tokens: Mapping[str, SlidingWindowToken] | None = None,
     forgotten_rooms: Iterable[str] = (),
 ) -> None:
+    real_gap_clear_rooms = frozenset(
+        room_id
+        for room_id in plan.clear_rooms
+        if any(gap.target_token for gap in state.gaps.get(room_id, ()))
+    )
+    plan = replace(
+        plan,
+        unrecovered_room_ids=plan.unrecovered_room_ids | real_gap_clear_rooms,
+    )
+    if (
+        store
+        and real_gap_clear_rooms
+        and not getattr(store, "supports_atomic_recovery", False)
+    ):
+        raise LocalProtocolError(
+            "The configured store does not support atomic recovery writes."
+        )
     try:
         if store:
             store.save_recovery(
@@ -1081,6 +1129,7 @@ def persist_response_plan(
                 plan.clear_recovered,
                 window_tokens,
                 forgotten_rooms,
+                plan.unrecovered_room_ids,
             )
         apply_plan(state, plan)
     except BaseException:

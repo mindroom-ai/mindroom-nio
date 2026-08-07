@@ -279,6 +279,7 @@ from .sync_recovery import (
     RecoveryPlan,
     RecoveryState,
     _LiveCallbackError,
+    acknowledge_unrecovered_rooms,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
@@ -574,12 +575,12 @@ class AsyncClientConfig(ClientConfig):
             existed. Turning it off leaves rows an earlier run wrote in
             place rather than deleting them, so switching it back on can
             resume from state that has gone stale in the meantime.
-            Set it to True to persist recovery state while keeping
-            ownership of the sync token: nio then never reads or writes
-            next_batch itself, which matters for clients that decide for
-            themselves when a token may be advanced. Recovery then resumes
-            relative to whatever token the caller restores, so a caller that
-            rewinds its token replays the window that follows it.
+            With limited-timeline recovery, Classic Sync requires this setting
+            to select the same owner as store_sync_tokens. When both are false,
+            the application owns a memory-only Classic checkpoint; when both
+            are true, nio atomically stores the cursor and recovery plan.
+            Simplified Sliding Sync may persist its recovery state without
+            giving nio ownership of an application-managed Classic cursor.
         backfill_sliding_seed_rooms (int): How many rooms the first request
             of a Simplified Sliding Sync connection widens its list ranges
             to, so that rooms outside the configured window still hand back
@@ -764,6 +765,23 @@ class AsyncClient(Client):
             return None
         return self.store
 
+    def _require_valid_classic_recovery_ownership(self) -> None:
+        """Require one owner for the Classic cursor and its recovery state."""
+        if not self.config.backfill_limited_timelines:
+            return
+        if self.config.store_sync_tokens != self._recovery_persistence_enabled:
+            raise LocalProtocolError(
+                "Classic Sync recovery ownership conflict: store_sync_tokens "
+                "and backfill_persist_recovery must select the same owner."
+            )
+
+    @staticmethod
+    def _require_atomic_recovery_store(store: "MatrixStore") -> None:
+        if not store.supports_atomic_recovery:
+            raise LocalProtocolError(
+                "The configured store does not support atomic recovery writes."
+            )
+
     def load_store(self):
         super().load_store()
         store = self._recovery_store
@@ -824,9 +842,9 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+        if self.config.store_sync_tokens:
             raise LocalProtocolError(
-                "Classic Sync acknowledgement requires token and persisted recovery ownership to be disabled."
+                "Classic Sync acknowledgement requires token ownership to be disabled."
             )
         if self._active_sync_executor_token is not None:
             raise LocalProtocolError(
@@ -873,9 +891,9 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires backfill_limited_timelines=True."
             )
-        if self.config.store_sync_tokens or self._recovery_persistence_enabled:
+        if self.config.store_sync_tokens:
             raise LocalProtocolError(
-                "Classic Sync reset requires token and persisted recovery ownership to be disabled."
+                "Classic Sync reset requires token ownership to be disabled."
             )
         if (
             (callback_scope is not None and callback_scope.active)
@@ -1302,6 +1320,29 @@ class AsyncClient(Client):
             ready_room_id=ready_room_id,
         )
 
+    def acknowledge_unrecovered_rooms(self, room_ids: Iterable[str]) -> frozenset[str]:
+        """Stop reporting these rooms as degraded, and return the ones that were.
+
+        A room whose gap nio gave up on keeps appearing in
+        ``unrecovered_room_ids`` on every later response, because a loss
+        announced once and then forgotten cannot be told apart from a recovery.
+        Call this once the loss is recorded somewhere the application owns.
+
+        Returns:
+            The subset that was actually degraded, so a caller can log exactly
+            what it settled rather than what it asked about.
+        """
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Unrecovered rooms require limited-timeline recovery."
+            )
+        candidates = frozenset(self._recovery.abandoned & set(room_ids))
+        store = self._recovery_store
+        if store and candidates:
+            self._require_atomic_recovery_store(store)
+            store.clear_recovery_abandonment(candidates)
+        return acknowledge_unrecovered_rooms(self._recovery, candidates)
+
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
     ) -> None:
@@ -1523,7 +1564,6 @@ class AsyncClient(Client):
 
         application_owned_classic_state = (
             self.config.backfill_limited_timelines
-            and not self.config.store_sync_tokens
             and not self._recovery_persistence_enabled
         )
         if application_owned_classic_state:
@@ -1552,9 +1592,6 @@ class AsyncClient(Client):
                 persist_response_plan(
                     self._recovery,
                     self._recovery_store,
-                    # Only the owner of the sync token writes it. A client
-                    # persisting recovery state while keeping the token to
-                    # itself gets rows without nio recording its position.
                     token=(
                         response.next_batch if self.config.store_sync_tokens else None
                     ),
@@ -1888,6 +1925,9 @@ class AsyncClient(Client):
         send_request: Callable[[], Coroutine[Any, Any, _RoomMembershipResponseT]],
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
+        recovery_store = self._recovery_store
+        if recovery_store:
+            self._require_atomic_recovery_store(recovery_store)
         callback_scope = self._event_callback_scope.get()
         if (
             self.config.backfill_limited_timelines
@@ -1927,7 +1967,7 @@ class AsyncClient(Client):
             async with self._recovery_room_state((room_id,)):
                 persist_response_plan(
                     self._recovery,
-                    self.store,
+                    self._recovery_store,
                     token=None,
                     plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
                     forgotten_rooms=(room_id,),
@@ -2296,10 +2336,10 @@ class AsyncClient(Client):
         return current is None or room_id in current
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
-        self._sync_response_seen = True
         sync_response = envelope.response
         request_since = envelope.request_since
         if not self.config.backfill_limited_timelines:
+            self._sync_response_seen = True
             if isinstance(sync_response, SyncResponse):
                 await self._handle_sync(envelope)
             else:
@@ -2331,6 +2371,12 @@ class AsyncClient(Client):
                         request_since,
                     )
                     return
+                if isinstance(sync_response, SyncResponse):
+                    self._require_valid_classic_recovery_ownership()
+                recovery_store = self._recovery_store
+                if recovery_store:
+                    self._require_atomic_recovery_store(recovery_store)
+                self._sync_response_seen = True
                 entered_executor = True
                 executor = object()
                 self._active_sync_executor_token = executor
@@ -2939,6 +2985,7 @@ class AsyncClient(Client):
         a `SyncError` if there was an error with the request.
         """
 
+        self._require_valid_classic_recovery_ownership()
         self._raise_on_sync_reentry()
         presence = set_presence or self._presence
 

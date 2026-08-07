@@ -61,7 +61,7 @@ from nio.client.sync_recovery import (
     should_dispatch_timeline_event,
 )
 from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
-from nio.responses import RoomMessagesResponse, SlidingSyncError
+from nio.responses import RoomMessagesError, RoomMessagesResponse, SlidingSyncError
 from nio.sliding_sync_tokens import SlidingWindowToken
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -341,6 +341,124 @@ async def client(tempdir):
 
 @pytest.mark.asyncio
 class TestRoomLocalRecovery:
+    @pytest.mark.parametrize(
+        "ownership_config",
+        (
+            {"store_sync_tokens": False, "backfill_persist_recovery": True},
+            {"store_sync_tokens": True, "backfill_persist_recovery": False},
+        ),
+    )
+    async def test_classic_sync_request_rejects_mixed_recovery_ownership(
+        self,
+        tempdir,
+        monkeypatch,
+        ownership_config,
+    ):
+        """A conflicting Classic owner is rejected before transport I/O."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                **ownership_config,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        async def unexpected_send(*_args, **_kwargs):
+            pytest.fail("Classic ownership conflict reached _send")
+
+        monkeypatch.setattr(client, "_send", unexpected_send)
+
+        with pytest.raises(
+            LocalProtocolError,
+            match="Classic Sync recovery ownership conflict",
+        ):
+            await client.sync()
+
+        await client.close()
+
+    @pytest.mark.parametrize(
+        "ownership_config",
+        (
+            {"store_sync_tokens": False, "backfill_persist_recovery": True},
+            {"store_sync_tokens": True, "backfill_persist_recovery": False},
+        ),
+    )
+    async def test_classic_sync_response_rejects_mixed_ownership_without_mutation(
+        self,
+        tempdir,
+        ownership_config,
+    ):
+        """A conflicting Classic owner is rejected before response state changes."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                **ownership_config,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token="stored",
+            plan=RecoveryPlan(
+                gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),),
+            ),
+        )
+        client.next_batch = "s0"
+        callbacks: list[str] = []
+
+        async def record(_room, event):
+            callbacks.append(event.event_id)
+
+        client.add_event_callback(record, RoomMessageText)
+        response = sync_response(
+            "s1",
+            {
+                ROOM_B: room_info(
+                    [text_event("$new", 2, ROOM_B)],
+                    limited=False,
+                    prev_batch="p0",
+                )
+            },
+        )
+        rooms_before = dict(client.rooms)
+        gaps_before = {
+            room_id: list(gaps) for room_id, gaps in client._recovery.gaps.items()
+        }
+        events_before = dict(client._recovery.events)
+        completed_before = {
+            room_id: dict(events)
+            for room_id, events in client._recovery.completed.items()
+        }
+        stored_before = client.store.load_sync_recovery()
+        token_before = client.store.load_sync_token()
+
+        with pytest.raises(
+            LocalProtocolError,
+            match="Classic Sync recovery ownership conflict",
+        ):
+            await client.receive_response(response)
+
+        assert not client._sync_response_seen
+        assert client.next_batch == "s0"
+        assert client.rooms == rooms_before
+        assert client._recovery.gaps == gaps_before
+        assert client._recovery.events == events_before
+        assert client._recovery.completed == completed_before
+        assert client.store.load_sync_token() == token_before
+        assert client.store.load_sync_recovery() == stored_before
+        assert callbacks == []
+        await client.close()
+
     async def test_reset_classic_sync_state_replays_from_a_clean_in_memory_world(
         self,
         tempdir,
@@ -838,40 +956,6 @@ class TestRoomLocalRecovery:
         await client._pump_sync_recovery()
         await client.close()
 
-    async def test_application_owned_classic_state_honors_recovery_config_before_store_load(
-        self,
-        tempdir,
-    ):
-        """Configured durable recovery cannot look application-owned before login."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=True,
-                store_sync_tokens=False,
-            ),
-        )
-        assert client.store is None
-
-        with pytest.raises(LocalProtocolError, match="disabled"):
-            client.clear_persisted_sync_recovery()
-        with pytest.raises(LocalProtocolError, match="disabled"):
-            client.acknowledge_classic_sync("")
-        with pytest.raises(LocalProtocolError, match="disabled"):
-            await client.reset_classic_sync_state()
-
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
-            )
-        )
-        assert not client.has_uncommitted_classic_sync_state
-        await client.close()
-
     async def test_reset_classic_sync_state_rejects_an_active_sync_request(
         self,
         tempdir,
@@ -1013,29 +1097,6 @@ class TestRoomLocalRecovery:
         assert client._recovery._active_dispatches == {}
         await client.close()
 
-    async def test_reset_classic_sync_state_rejects_a_durable_recovery_lane(
-        self,
-        tempdir,
-    ):
-        """A reset cannot hide rows owned by nio's persisted recovery lane."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=True,
-                store_sync_tokens=False,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-
-        with pytest.raises(LocalProtocolError, match="persisted recovery"):
-            await client.reset_classic_sync_state()
-
-        await client.close()
-
     async def test_clear_persisted_sync_recovery_removes_cross_mode_residue(
         self,
         tempdir,
@@ -1076,7 +1137,7 @@ class TestRoomLocalRecovery:
         client.clear_persisted_sync_recovery()
 
         assert client.store.load_sync_token() is None
-        assert client.store.load_sync_recovery() == ([], [])
+        assert client.store.load_sync_recovery() == ([], [], [])
         assert client.store.load_sliding_window_tokens() == {}
 
         await client.receive_response(
@@ -4792,7 +4853,7 @@ class TestRoomLocalRecovery:
         assert response.unrecovered_room_ids == frozenset()
         assert not restarted._recovery.gaps
         assert restarted.store
-        _, stored = restarted.store.load_sync_recovery()
+        _, stored, _ = restarted.store.load_sync_recovery()
         completed = next(item for item in stored if item.event_id == "$during-restart")
         assert completed.generation == 0
         assert completed.provenance is TimelineEventProvenance.RECOVERED
@@ -4862,7 +4923,7 @@ class TestRoomLocalRecovery:
         assert pages.to_tokens == ["w2", "w2"]
         assert not restarted._recovery.gaps
         assert restarted.store
-        _, stored = restarted.store.load_sync_recovery()
+        _, stored, _ = restarted.store.load_sync_recovery()
         completed = next(item for item in stored if item.event_id == "$during-restart")
         assert completed.generation == 0
         assert completed.provenance.value == "recovered"
@@ -4915,7 +4976,7 @@ class TestRoomLocalRecovery:
         assert pages.to_tokens == []
         assert not restarted._recovery.gaps
         assert restarted.store
-        _, stored = restarted.store.load_sync_recovery()
+        _, stored, _ = restarted.store.load_sync_recovery()
         completed = next(item for item in stored if item.event_id == "$during-restart")
         assert completed.generation == 0
         assert completed.provenance.value == "recovered"
@@ -4989,7 +5050,7 @@ class TestRoomLocalRecovery:
         assert response.unrecovered_room_ids == frozenset({ROOM_A})
         assert not restarted._recovery.gaps
         assert restarted.store
-        _, stored = restarted.store.load_sync_recovery()
+        _, stored, _ = restarted.store.load_sync_recovery()
         completed = next(item for item in stored if item.event_id == "$new-event")
         assert completed.generation == 0
         assert completed.provenance is TimelineEventProvenance.HISTORY
@@ -5269,64 +5330,6 @@ class TestRoomLocalRecovery:
         )
         assert client._sliding_room_prev_batch == {ROOM_A: window_token("w3")}
         await client.close()
-
-    async def test_sync_token_is_stored_without_recovery_persistence(self, tempdir):
-        """Turning recovery rows off must not stop the sync token being saved."""
-        config = AsyncClientConfig(
-            backfill_limited_timelines=True,
-            store_sync_tokens=True,
-            backfill_persist_recovery=False,
-        )
-        client = AsyncClient(
-            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=config
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        await client.receive_response(sync_response("s1", {}))
-
-        assert client.store.load_sync_token() == "s1"
-        await client.close()
-
-    @pytest.mark.parametrize("protocol", ["classic", "sliding"])
-    async def test_membership_reset_deletes_a_token_stored_by_an_earlier_run(
-        self, tempdir, protocol
-    ):
-        """A token on disk outlives the run that wrote it, so deletion must too."""
-        persisting = AsyncClientConfig(
-            backfill_limited_timelines=True,
-            store_sync_tokens=True,
-        )
-        first = AsyncClient(
-            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=persisting
-        )
-        await first.receive_response(LoginResponse.from_dict(LOGIN))
-        await first.receive_response(
-            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
-        )
-        assert first.store.load_sliding_window_tokens() == {ROOM_A: window_token("w1")}
-        await first.close()
-
-        # This run refuses to write recovery rows, but the stale baseline
-        # from the previous one still has to go.
-        not_persisting = AsyncClientConfig(
-            backfill_limited_timelines=True,
-            store_sync_tokens=True,
-            backfill_persist_recovery=False,
-        )
-        second = AsyncClient(
-            "https://example.org", OWN_ID, "DEVICEID", tempdir, config=not_persisting
-        )
-        await second.receive_response(LoginResponse.from_dict(LOGIN))
-        if protocol == "classic":
-            response = sync_response("s2", {})
-            response.rooms.leave[ROOM_A] = RoomInfo(
-                Timeline([], False, None), [], [], []
-            )
-        else:
-            response = self._sliding("s2", [], membership="leave")
-        await second.receive_response(response)
-
-        assert second.store.load_sliding_window_tokens() == {}
-        await second.close()
 
     async def test_initial_direct_response_after_reset_is_accepted(self, tempdir):
         """A direct snapshot has no old request generation to reject."""
@@ -7783,15 +7786,76 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in client._recovery.gaps
         assert not any(room_id == ROOM_A for room_id, _ in client._recovery.events)
+        assert client._recovery.abandoned == {ROOM_A}
         assert client._sliding_room_prev_batch == {}
-        gaps, events = client.store.load_sync_recovery()
+        gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
         assert [
             event
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
+        assert abandoned == [ROOM_A]
         assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=client.config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        assert ROOM_A not in restarted._recovery.gaps
+        assert restarted._recovery.abandoned == {ROOM_A}
+        await restarted.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_application_owned_membership_change_does_not_write_recovery_store(
+        self,
+        tempdir,
+        monkeypatch,
+        operation,
+    ):
+        """Memory-only Classic cleanup must not mutate stale recovery rows."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        gap = RecoveryGap(ROOM_A, 1, "target", "cursor")
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token="stored",
+            plan=RecoveryPlan(gaps=(gap,)),
+        )
+        stored_before = client.store.load_sync_recovery()
+        token_before = client.store.load_sync_token()
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {ROOM_A}
+        assert client.store.load_sync_token() == token_before
+        assert client.store.load_sync_recovery() == stored_before
         await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
@@ -7846,7 +7910,7 @@ class TestRoomLocalRecovery:
         monkeypatch.setattr(client, "_send", send)
         await getattr(client, operation)(ROOM_A)
 
-        gaps, events = client.store.load_sync_recovery()
+        gaps, events, _ = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
         assert [
             event
@@ -8286,8 +8350,10 @@ class TestRoomLocalRecovery:
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 
-    async def test_persist_recovery_without_owning_the_sync_token(self, tempdir):
-        """Recovery state can be durable while the caller owns next_batch."""
+    async def test_sliding_persists_recovery_without_owning_classic_token(
+        self, tempdir
+    ):
+        """Sliding recovery can persist without a nio-owned Classic cursor."""
         config = AsyncClientConfig(
             backfill_limited_timelines=True,
             store_sync_tokens=False,
@@ -9269,7 +9335,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$seen", "$held"]
         assert reset.recovered_room_ids == frozenset()
         assert reset.unrecovered_room_ids == frozenset({ROOM_A})
-        gaps, events = client.store.load_sync_recovery()
+        gaps, events, _ = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
         assert [(event.event_id, event.generation) for event in events] == [
@@ -9355,7 +9421,7 @@ class TestRoomLocalRecovery:
         assert seen == ["$seen", "$held"]
         assert reset.recovered_room_ids == frozenset()
         assert reset.unrecovered_room_ids == frozenset({ROOM_A})
-        gaps, events = client.store.load_sync_recovery()
+        gaps, events, _ = client.store.load_sync_recovery()
         assert gaps == []
         assert list(client._recovery.completed[ROOM_A]) == ["$seen", "$held"]
         assert [(event.event_id, event.generation) for event in events] == [

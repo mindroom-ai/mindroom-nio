@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from helpers import faker
+from peewee import SqliteDatabase
 
 from nio import TimelineEventProvenance
 from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
@@ -30,6 +31,7 @@ from nio.store import (
     SqliteStore,
     PendingTimelineEvents,
     SlidingWindowTokens,
+    SyncRecoveryAbandonedRooms,
     SyncRecoveryGaps,
 )
 
@@ -109,6 +111,13 @@ def seed_v5_recovery_state(sqlstore):
     sqlstore._update_version(5)
 
 
+class UndeclaredAtomicStore(SqliteStore):
+    """A SQLite-backed subclass that has not declared its recovery contract."""
+
+    def _create_database(self):
+        return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
 class TestClass:
     @pytest.fixture(autouse=True)
     def _store_path(self, tempdir):
@@ -121,6 +130,13 @@ class TestClass:
     def test_writable_store_uses_pytest_tmp_path(self, tmp_path):
         store = self.ephemeral_store
         assert Path(store.database_path).parent == tmp_path
+
+    def test_atomic_recovery_capability_requires_each_subclass_to_opt_in(self):
+        assert MatrixStore.supports_atomic_recovery is False
+        assert DefaultStore.supports_atomic_recovery is True
+        assert SqliteStore.supports_atomic_recovery is True
+        assert SqliteMemoryStore.supports_atomic_recovery is True
+        assert UndeclaredAtomicStore.supports_atomic_recovery is False
 
     @property
     def example_devices(self):
@@ -569,7 +585,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 8
+        assert version == 9
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -601,12 +617,12 @@ class TestClass:
                 None,
             )
         assert sqlstore.load_sync_token() == "s1"
-        assert sqlstore.load_sync_recovery() == ([], [])
+        assert sqlstore.load_sync_recovery() == ([], [], [])
 
         monkeypatch.setattr(sqlstore, "_upsert_pending_events", original)
         sqlstore.save_recovery("s2", set(), [gap], [event], None)
         assert sqlstore.load_sync_token() == "s2"
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert [
             (
                 gap.room_id,
@@ -640,6 +656,20 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
+    def test_clearing_recovery_rows_does_not_clear_abandonment(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_rooms={TEST_ROOM},
+        )
+
+        sqlstore.save_recovery(None, {TEST_ROOM}, [], [], None)
+
+        assert sqlstore.load_sync_recovery()[2] == [TEST_ROOM]
+
     def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
         self,
         sqlstore,
@@ -668,6 +698,7 @@ class TestClass:
                 pending("$completed", 2),
             ],
             None,
+            abandoned_rooms={TEST_ROOM},
         )
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
         sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
@@ -683,7 +714,7 @@ class TestClass:
             sqlstore.store_path,
         )
         assert reopened.load_sync_token() is None
-        assert reopened.load_sync_recovery() == ([], [])
+        assert reopened.load_sync_recovery() == ([], [], [])
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_clear_sync_recovery_is_atomic(
@@ -697,11 +728,18 @@ class TestClass:
             1,
             0,
             "$completed",
-            '{"content":{},"event_id":"$completed","sender":"@a:b",' '"type":"m.test"}',
+            '{"content":{},"event_id":"$completed","sender":"@a:b","type":"m.test"}',
             True,
             False,
         )
-        sqlstore.save_recovery("s_advanced", set(), [gap], [event], None)
+        sqlstore.save_recovery(
+            "s_advanced",
+            set(),
+            [gap],
+            [event],
+            None,
+            abandoned_rooms={TEST_ROOM},
+        )
         sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
         sqlstore.save_sliding_window_tokens(
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
@@ -720,10 +758,11 @@ class TestClass:
             sqlstore._clear_sync_recovery()
 
         assert sqlstore.load_sync_token() == "s_advanced"
-        _, events = sqlstore.load_sync_recovery()
+        _, events, abandoned = sqlstore.load_sync_recovery()
         assert [(item.event_id, item.generation) for item in events] == [
             ("$completed", 0)
         ]
+        assert abandoned == [TEST_ROOM]
         assert sqlstore.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
         }
@@ -771,7 +810,7 @@ class TestClass:
             None,
         )
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert [(event.event_id, event.sequence) for event in events] == [
             ("$gap1", 0),
             ("$gap2", 1),
@@ -785,7 +824,7 @@ class TestClass:
         later sync iteration with the same ValueError."""
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$vanished")
 
-        assert sqlstore.load_sync_recovery() == ([], [])
+        assert sqlstore.load_sync_recovery() == ([], [], [])
 
     def test_accept_recovery_event_survives_generation_divergence(self, sqlstore):
         """The store can hold an event under a different generation than
@@ -805,7 +844,7 @@ class TestClass:
 
         sqlstore.accept_recovery_event(TEST_ROOM, 5, "$held")
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert events[0].admission_accepted
 
     def test_finish_recovery_survives_missing_row(self, sqlstore):
@@ -813,7 +852,7 @@ class TestClass:
         cleared still records the completed marker instead of raising."""
         sqlstore.finish_recovery(TEST_ROOM, 3, "$vanished", False)
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert [(event.event_id, event.generation) for event in events] == [
             ("$vanished", 0)
         ]
@@ -841,7 +880,7 @@ class TestClass:
 
         sqlstore.finish_recovery(TEST_ROOM, 1, "$done", True)
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert [
             (
                 event.event_id,
@@ -894,7 +933,7 @@ class TestClass:
             None,
         )
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert [(event.event_id, event.sequence) for event in events] == [
             ("$recovered-before", 0),
             ("$live-anchor", 1),
@@ -914,7 +953,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 8
+        assert reopened._get_store_version() == 9
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
@@ -942,7 +981,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 8
+        assert reopened._get_store_version() == 9
         with reopened.database.bind_ctx(reopened.models):
             assert SlidingWindowTokens.table_exists()
         assert reopened.load_sliding_window_tokens() == {}
@@ -975,7 +1014,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 8
+        assert reopened._get_store_version() == 9
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_v5_store_adds_durable_admission_phase(self, sqlstore):
@@ -1023,12 +1062,12 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 8
+        assert reopened._get_store_version() == 9
         assert reopened.load_sync_token() == "s1"
         assert reopened.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
         }
-        gaps, events = reopened.load_sync_recovery()
+        gaps, events, _ = reopened.load_sync_recovery()
         assert [
             (gap.room_id, gap.generation, gap.target_token, gap.cursor_token)
             for gap in gaps
@@ -1054,11 +1093,21 @@ class TestClass:
             }
         assert {"provenance", "apply_room_state"} <= columns
 
-    def test_v8_store_adds_conservative_membership_binding(self, sqlstore):
+    def test_v7_store_adds_conservative_membership_binding(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
-        sqlstore.save_recovery(None, set(), [gap], [], None)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
         table = SyncRecoveryGaps._meta.table_name
         with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
             sqlstore.database.execute_sql(
                 f'ALTER TABLE "{table}" DROP COLUMN membership_bound'
             )
@@ -1070,10 +1119,14 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 8
-        gaps, _ = reopened.load_sync_recovery()
+        assert reopened._get_store_version() == 9
+        gaps, events, abandoned = reopened.load_sync_recovery()
         assert len(gaps) == 1
         assert not gaps[0].membership_bound
+        assert [(item.room_id, item.generation, item.event_id) for item in events] == [
+            (TEST_ROOM, 1, "$pending")
+        ]
+        assert abandoned == []
         with reopened.database.bind_ctx(reopened.models):
             columns = {
                 row[1]
@@ -1081,7 +1134,50 @@ class TestClass:
                     f'PRAGMA table_info("{table}")'
                 ).fetchall()
             }
+            assert SyncRecoveryAbandonedRooms.table_exists()
         assert "membership_bound" in columns
+
+    def test_v8_store_adds_abandonment_without_dropping_recovery(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor", membership_bound=True)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+            sqlstore._update_version(8)
+            assert not SyncRecoveryAbandonedRooms.table_exists()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 9
+        gaps, events, abandoned = reopened.load_sync_recovery()
+        assert [
+            (
+                item.room_id,
+                item.generation,
+                item.target_token,
+                item.cursor_token,
+                item.membership_bound,
+            )
+            for item in gaps
+        ] == [(TEST_ROOM, 1, "target", "cursor", True)]
+        assert [(item.room_id, item.generation, item.event_id) for item in events] == [
+            (TEST_ROOM, 1, "$pending")
+        ]
+        assert abandoned == []
+        with reopened.database.bind_ctx(reopened.models):
+            assert SyncRecoveryAbandonedRooms.table_exists()
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)
@@ -1197,7 +1293,7 @@ class TestClass:
         try:
             sqlstore.save_recovery(None, set(), gaps, [], None)
             sqlstore.save_recovery(None, set(room_ids), [], [], None)
-            remaining, _ = sqlstore.load_sync_recovery()
+            remaining, _, _ = sqlstore.load_sync_recovery()
             assert not {gap.room_id for gap in remaining} & set(room_ids)
         finally:
             connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
@@ -1235,7 +1331,7 @@ class TestClass:
 
         # The write failed, so neither the plan nor the token survives.
         assert sqlstore.load_sliding_window_tokens() == {}
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert not gaps
         assert not events
 
@@ -1286,7 +1382,7 @@ class TestClass:
             store.store_path,
             pickle_key="recovery-secret",
         )
-        _, events = reopened.load_sync_recovery()
+        _, events, _ = reopened.load_sync_recovery()
         assert events == [event]
 
     def test_pending_recovery_payload_rejects_wrong_key(self, tempdir):
@@ -1465,7 +1561,7 @@ class TestClass:
         sqlstore.save_recovery("s2", set(), [gap], [encrypted], None)
         sqlstore.save_recovery(None, set(), [gap], [decrypted], None)
 
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert len(gaps) == 1
         assert len(events) == 1
         assert events[0].was_encrypted
@@ -1498,7 +1594,7 @@ class TestClass:
         next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
         sqlstore.save_recovery("s3", set(), [next_gap], [decrypted], None)
 
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert len(gaps) == 2
         assert len(events) == 1
         assert events[0].generation == 2
@@ -1508,7 +1604,7 @@ class TestClass:
         sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
         sqlstore.finish_recovery(TEST_ROOM, 1, None, False)
         sqlstore.finish_recovery(TEST_ROOM, 2, None, False)
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert gaps == []
         assert len(events) == 1
         assert events[0].generation == 0
@@ -1523,13 +1619,13 @@ class TestClass:
         next_gap = RecoveryGap(TEST_ROOM, 2, "p2", None)
         sqlstore.save_recovery("s2", set(), [next_gap], [retry], None)
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert len(events) == 1
         assert events[0].generation == 2
         assert events[0].was_completed
 
         sqlstore.finish_recovery(TEST_ROOM, 2, "$event", False)
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert events[0].generation == 0
         assert events[0].source_json == ""
         assert not events[0].was_completed
@@ -1564,7 +1660,7 @@ class TestClass:
             retry_gap if clear_mode == "recovered" else None,
         )
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         assert len(events) == 1
         assert events[0].generation == 0
         assert events[0].was_encrypted
@@ -1578,7 +1674,7 @@ class TestClass:
         sqlstore.save_recovery(None, set(), [gap], [event], None)
         sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
 
-        gaps, events = sqlstore.load_sync_recovery()
+        gaps, events, _ = sqlstore.load_sync_recovery()
         assert len(gaps) == 1
         assert events == []
 
@@ -1617,7 +1713,7 @@ class TestClass:
                     old_limit,
                 )
 
-        loaded_gaps, loaded_events = sqlstore.load_sync_recovery()
+        loaded_gaps, loaded_events, _ = sqlstore.load_sync_recovery()
         assert sqlstore.load_sync_token() == "bulk-token"
         assert len(loaded_gaps) == row_count
         assert len(loaded_events) == row_count
@@ -1638,7 +1734,7 @@ class TestClass:
         complete("$same", False)
         complete("$new", False)
 
-        _, events = sqlstore.load_sync_recovery()
+        _, events, _ = sqlstore.load_sync_recovery()
         event_ids = [event.event_id for event in events]
         assert len(event_ids) == 512
         assert "$same" in event_ids

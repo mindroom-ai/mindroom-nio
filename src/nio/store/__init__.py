@@ -34,6 +34,7 @@ if package_installed("vodozemac"):
         PendingTimelineEvents,
         SlidingWindowTokens,
         StoreVersion,
+        SyncRecoveryAbandonedRooms,
         SyncRecoveryGaps,
         SyncTokens,
     )
