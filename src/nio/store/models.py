@@ -24,6 +24,7 @@ from peewee import (
 )
 
 from ..crypto import TrustState
+from ..recovery_abandonment import RecoveryAbandonment
 
 
 class ByteField(BlobField):
@@ -239,6 +240,10 @@ class SyncRecoveryAbandonedRooms(Model):
     """
 
     room_id = TextField()
+    # Why the walk was given up on. Defaults to the strongest claim, because a
+    # row that predates the column records a loss of unknown cause, and
+    # under-claiming one is the failure this table exists to prevent.
+    reason = TextField(default=RecoveryAbandonment.UNVERIFIABLE.value)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

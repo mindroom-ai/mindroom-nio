@@ -36,6 +36,7 @@ from ..crypto import (
     TrustState,
 )
 from ..event_provenance import TimelineEventProvenance
+from ..recovery_abandonment import RecoveryAbandonment
 from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
@@ -142,7 +143,7 @@ class MatrixStore:
         PendingTimelineEvents,
         SlidingWindowTokens,
     ]
-    store_version = 9
+    store_version = 10
     user_id: str = field()
     device_id: str = field()
     store_path: str = field()
@@ -256,6 +257,26 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryAbandonedRooms])
         self._update_version(9)
 
+    @use_database_atomic
+    def upgrade_to_v10(self):
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        columns = {
+            row[1]
+            for row in self.database.execute_sql(
+                f'PRAGMA table_info("{table}")'
+            ).fetchall()
+        }
+        if "reason" not in columns:
+            # Rows written before the reason existed record a loss of unknown
+            # cause. Claiming the least would tell the application it may still
+            # fetch history that nio may have proven unreachable.
+            default = RecoveryAbandonment.UNVERIFIABLE.value
+            self.database.execute_sql(
+                f'ALTER TABLE "{table}" '
+                f"ADD COLUMN reason TEXT NOT NULL DEFAULT '{default}'"
+            )
+        self._update_version(10)
+
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
@@ -285,6 +306,9 @@ class MatrixStore:
             store_version = 8
         if store_version == 8:
             self.upgrade_to_v9()
+            store_version = 9
+        if store_version == 9:
+            self.upgrade_to_v10()
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
@@ -681,7 +705,7 @@ class MatrixStore:
         clear_recovered: RecoveryGap | None,
         window_tokens: Mapping[str, SlidingWindowToken] | None = None,
         forgotten_rooms: Iterable[str] = (),
-        abandoned_rooms: Iterable[str] = (),
+        abandoned_rooms: Mapping[str, RecoveryAbandonment] | None = None,
     ) -> None:
         account = self._get_account()
         assert account
@@ -728,7 +752,8 @@ class MatrixStore:
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).execute()
         abandoned = [
-            {"account": account, "room_id": room_id} for room_id in abandoned_rooms
+            {"account": account, "room_id": room_id, "reason": reason.value}
+            for room_id, reason in (abandoned_rooms or {}).items()
         ]
         for index in range(0, len(abandoned), _RECOVERY_WRITE_CHUNK_SIZE):
             SyncRecoveryAbandonedRooms.replace_many(
@@ -927,20 +952,24 @@ class MatrixStore:
     @use_database
     def load_sync_recovery(
         self,
-    ) -> tuple[list[SyncRecoveryGaps], list[PendingTimelineEvent], list[str]]:
+    ) -> tuple[
+        list[SyncRecoveryGaps],
+        list[PendingTimelineEvent],
+        dict[str, RecoveryAbandonment],
+    ]:
         """Load room obligations, their ordered pending callbacks, and lost rooms."""
         from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
 
         account = self._get_account()
         if not account:
-            return [], [], []
+            return [], [], {}
 
-        abandoned = [
-            row.room_id
+        abandoned = {
+            row.room_id: RecoveryAbandonment(row.reason)
             for row in SyncRecoveryAbandonedRooms.select()
             .where(SyncRecoveryAbandonedRooms.account == account)
             .order_by(SyncRecoveryAbandonedRooms.room_id)
-        ]
+        }
         gaps = list(
             SyncRecoveryGaps.select()
             .where(SyncRecoveryGaps.account == account)

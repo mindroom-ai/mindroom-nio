@@ -37,7 +37,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     take_recovery_outcomes,
 )
-from nio.responses import RoomMessagesResponse
+from nio.responses import RoomMessagesError, RoomMessagesResponse
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
@@ -232,7 +232,7 @@ def test_classic_initial_own_join_clears_stale_recovery():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.unrecovered_room_ids == frozenset()
+    assert plan.abandoned_rooms == {}
 
 
 def test_membership_reset_leaves_real_gap_loss_for_persistence():
@@ -249,7 +249,7 @@ def test_membership_reset_leaves_real_gap_loss_for_persistence():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.unrecovered_room_ids == frozenset()
+    assert plan.abandoned_rooms == {}
 
 
 def test_sync_history_counts_toward_held_cap():
@@ -1548,6 +1548,7 @@ async def test_conflicting_overlap_order_keeps_gap_open_without_target():
     assert take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        {},
     )
 
 
@@ -1814,10 +1815,12 @@ def test_recovery_outcome_keeps_open_real_gap_unrecovered():
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM, ROOM_B}),
+        {},
     )
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        {},
     )
 
 
@@ -1835,4 +1838,154 @@ def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        {},
     )
+
+
+async def _pump_one_page(state: RecoveryState, page, *, options=None) -> list[str]:
+    """Run one recovery pump against a scripted ``/messages`` reply."""
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return page
+
+    async def dispatch(
+        _room,
+        value,
+        _was_completed,
+        _kind,
+        _provenance,
+        _sync_origin,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=options or RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_room_event_cap_is_reported_as_a_budget_not_a_loss():
+    """Running out of nio's event budget is not evidence the history is gone.
+
+    The cap is a bound nio sets on itself, exactly like an application-side
+    page limit. An application told only that the room was abandoned would
+    mark it permanently incompletable for what is really a spending decision,
+    so the reason has to say which of the two happened.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "more",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        ),
+        options=RecoveryOptions(1, 0, 10, 10),
+    )
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.EVENT_LIMIT}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_backfill_is_reported_apart_from_a_broken_walk():
+    """A server that says no is a different finding from a walk that cannot work.
+
+    Nothing about a refusal shows the events are unreachable: a later session
+    with different permissions may fetch them. Folding it in with the
+    unverifiable walks would overstate what nio actually established.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+    refusal = RoomMessagesError.from_dict(
+        {"errcode": "M_FORBIDDEN", "error": "not allowed"},
+        ROOM,
+    )
+    refusal.transport_response = SimpleNamespace(status=403)
+
+    await _pump_one_page(state, refusal)
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.FETCH_FAILED}
+
+
+@pytest.mark.asyncio
+async def test_a_walk_that_cannot_advance_is_reported_as_permanent():
+    """A cursor the server will not move past is the one genuinely lost case.
+
+    Retrying cannot help, so this is the reason an application may treat as
+    permanent -- and the only one. Reporting it the same way as a budget stop
+    would throw the distinction away in the other direction.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {"start": "cursor", "end": "cursor", "chunk": []},
+            ROOM,
+        ),
+    )
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+
+
+def test_held_event_cap_is_reported_as_a_budget_not_a_loss():
+    """The other cost ceiling has to answer the same way as the first.
+
+    Dropping a room because too many of its events are held is the same
+    spending decision as the per-gap cap, reached from the ingress side.
+    """
+    state = RecoveryState(max_held_events=0)
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$live", 1)],
+        user_id="@me:example.org",
+        membership="join",
+        cursor_token="since",
+        target_token="p1",
+    )
+
+    assert plan.abandoned_rooms == {ROOM: sync_recovery.RecoveryAbandonment.EVENT_LIMIT}
+
+
+def test_a_second_loss_cannot_downgrade_an_unsettled_permanent_one():
+    """A standing loss keeps the strongest claim made about it.
+
+    A room can be abandoned again before the application settles the first
+    loss. Taking whichever reason arrived last would let a proven-unreachable
+    gap be relabelled as merely over budget, and an application acting on that
+    would go refetch history nio has already shown it cannot reach.
+    """
+    state = RecoveryState()
+    unverifiable = sync_recovery.RecoveryAbandonment.UNVERIFIABLE
+    budget = sync_recovery.RecoveryAbandonment.EVENT_LIMIT
+
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: unverifiable}))
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: budget}))
+
+    assert state.abandoned == {ROOM: unverifiable}
+
+    assert sync_recovery.acknowledge_unrecovered_rooms(state, [ROOM]) == frozenset(
+        {ROOM}
+    )
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: budget}))
+
+    assert state.abandoned == {
+        ROOM: budget
+    }, "settling the loss must let the next one be reported on its own terms"

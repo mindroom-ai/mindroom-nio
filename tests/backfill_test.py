@@ -28,6 +28,7 @@ from nio import (
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
+    RecoveryAbandonment,
     RoomEncryptedImage,
     RoomEncryptionEvent,
     RoomForgetError,
@@ -1137,7 +1138,7 @@ class TestRoomLocalRecovery:
         client.clear_persisted_sync_recovery()
 
         assert client.store.load_sync_token() is None
-        assert client.store.load_sync_recovery() == ([], [], [])
+        assert client.store.load_sync_recovery() == ([], [], {})
         assert client.store.load_sliding_window_tokens() == {}
 
         await client.receive_response(
@@ -7786,7 +7787,7 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in client._recovery.gaps
         assert not any(room_id == ROOM_A for room_id, _ in client._recovery.events)
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
         assert client._sliding_room_prev_batch == {}
         gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
@@ -7795,7 +7796,7 @@ class TestRoomLocalRecovery:
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
-        assert abandoned == [ROOM_A]
+        assert abandoned == {ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
         client.store.database.close()
@@ -7810,7 +7811,9 @@ class TestRoomLocalRecovery:
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
 
         assert ROOM_A not in restarted._recovery.gaps
-        assert restarted._recovery.abandoned == {ROOM_A}
+        assert restarted._recovery.abandoned == {
+            ROOM_A: RecoveryAbandonment.UNVERIFIABLE
+        }
         await restarted.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
@@ -7853,7 +7856,7 @@ class TestRoomLocalRecovery:
         await getattr(client, operation)(ROOM_A)
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
         assert client.store.load_sync_token() == token_before
         assert client.store.load_sync_recovery() == stored_before
         await client.close()

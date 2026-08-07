@@ -109,6 +109,7 @@ from ..exceptions import (
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
+from ..recovery_abandonment import RecoveryAbandonment
 from ..responses import (
     ChangePasswordError,
     ChangePasswordResponse,
@@ -1324,9 +1325,11 @@ class AsyncClient(Client):
         """Stop reporting these rooms as degraded, and return the ones that were.
 
         A room whose gap nio gave up on keeps appearing in
-        ``unrecovered_room_ids`` on every later response, because a loss
-        announced once and then forgotten cannot be told apart from a recovery.
-        Call this once the loss is recorded somewhere the application owns.
+        ``unrecovered_room_ids`` and ``abandoned_rooms`` on every later
+        response, because a loss announced once and then forgotten cannot be
+        told apart from a recovery. Call this once the loss is recorded
+        somewhere the application owns; read ``abandoned_rooms`` to learn what
+        was lost and why, which does not require settling anything.
 
         Returns:
             The subset that was actually degraded, so a caller can log exactly
@@ -1336,7 +1339,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Unrecovered rooms require limited-timeline recovery."
             )
-        candidates = frozenset(self._recovery.abandoned & set(room_ids))
+        candidates = frozenset(self._recovery.abandoned.keys() & set(room_ids))
         store = self._recovery_store
         if store and candidates:
             self._require_atomic_recovery_store(store)
@@ -1348,9 +1351,10 @@ class AsyncClient(Client):
     ) -> None:
         if not self.config.backfill_limited_timelines:
             return
-        recovered, unrecovered = take_recovery_outcomes(self._recovery)
+        recovered, unrecovered, abandoned = take_recovery_outcomes(self._recovery)
         response.recovered_room_ids = recovered
         response.unrecovered_room_ids = unrecovered
+        response.abandoned_rooms = abandoned
 
     def _classic_response_real_gap_room_ids(
         self,
@@ -1425,8 +1429,14 @@ class AsyncClient(Client):
             )
         else:
             unrecovered.update(self._sliding_response_real_gap_room_ids(response))
+        # Abandonment deletes the gap row this snapshot is built from, so an
+        # abandoned room names itself nowhere here. Without the sticky set
+        # folded in, a cancelled sync would be the one response that reports a
+        # permanently lost room as healthy.
+        abandoned = dict(self._recovery.abandoned)
         response.recovered_room_ids = frozenset()
-        response.unrecovered_room_ids = frozenset(unrecovered)
+        response.unrecovered_room_ids = frozenset(unrecovered) | abandoned.keys()
+        response.abandoned_rooms = abandoned
 
     async def _recovery_room_messages(
         self,
@@ -1781,7 +1791,15 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
-                plans.append(RecoveryPlan(unrecovered_room_ids=unrecoverable_room_ids))
+                # A discontinuity with no usable baseline has nothing to walk
+                # from, so continuity can never be proven for it.
+                plans.append(
+                    RecoveryPlan(
+                        abandoned_rooms=dict.fromkeys(
+                            unrecoverable_room_ids, RecoveryAbandonment.UNVERIFIABLE
+                        )
+                    )
+                )
                 recorded, forgotten = plan_sliding_prev_batches(
                     response,
                     user_id=self.user_id,
