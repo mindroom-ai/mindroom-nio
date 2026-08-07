@@ -243,6 +243,15 @@ class TestClass:
         event = RedactionEvent.from_dict(parsed_dict)
         assert isinstance(event, RedactionEvent)
 
+    def test_redaction_room_version_11(self):
+        parsed_dict = TestClass._load_response("tests/data/events/redaction.json")
+        parsed_dict["content"]["redacts"] = parsed_dict.pop("redacts")
+
+        event = RedactionEvent.from_dict(parsed_dict)
+
+        assert isinstance(event, RedactionEvent)
+        assert event.redacts == "$151957878228ssqrj:localhost"
+
     def test_sticker(self):
         parsed_dict = TestClass._load_response("tests/data/events/sticker.json")
         event = StickerEvent.from_dict(parsed_dict)
