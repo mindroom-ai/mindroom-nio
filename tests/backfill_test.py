@@ -883,6 +883,43 @@ class TestRoomLocalRecovery:
         assert client.store.load_sync_token() is None
         await client.close()
 
+    async def test_durable_acknowledgement_keeps_staged_state_when_snapshot_write_fails(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """The durable snapshot commits before acknowledgement becomes visible."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        assert client.store
+
+        def fail_snapshot(*_args, **_kwargs):
+            raise RuntimeError("snapshot failed")
+
+        monkeypatch.setattr(
+            client.store,
+            "save_recovery_snapshot",
+            fail_snapshot,
+            raising=False,
+        )
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            client.acknowledge_classic_sync("s1")
+
+        assert client.has_uncommitted_classic_sync_state
+        assert client._classic_sync_acknowledgeable_token == "s1"
+        await client.close()
+
     async def test_reset_classic_sync_state_rejects_an_active_sync_request(
         self,
         tempdir,
@@ -1082,6 +1119,196 @@ class TestRoomLocalRecovery:
 
         assert client._recovery.gaps[ROOM_A] == [gap]
         await client.close()
+
+    async def test_durable_reset_replays_completed_events_from_rejected_response(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A reset reloads only recovery state acknowledged with the cursor."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+
+        class Transport:
+            status = 429
+
+        async def failing_messages(*_args, **_kwargs):
+            error = RoomMessagesError.from_dict(
+                {"errcode": "M_LIMIT_EXCEEDED", "error": "slow down"},
+                ROOM_B,
+            )
+            error.transport_response = Transport()
+            return error
+
+        monkeypatch.setattr(client, "_recovery_room_messages", failing_messages)
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_B: room_info(
+                        [text_event("$gap-live", 1, ROOM_B)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        acknowledged_gap = client._recovery.gaps[ROOM_B][0]
+        client.acknowledge_classic_sync("s1")
+
+        seen = record_events(client, RoomNameEvent)
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$later", 2, "Later")],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+        assert seen == ["$later"]
+        assert client.rooms[ROOM_A].name == "Later"
+
+        await client.reset_classic_sync_state()
+        assert client._recovery.gaps[ROOM_B] == [acknowledged_gap]
+
+        client.next_batch = "s1"
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$later", 2, "Later")],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+
+        assert seen == ["$later", "$later"]
+        assert client.rooms[ROOM_A].name == "Later"
+        assert client._recovery.gaps[ROOM_B] == [acknowledged_gap]
+        await client.close()
+
+    async def test_durable_restart_replays_completed_events_from_uncommitted_response(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A new client loads the acknowledged snapshot, not later response state."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_persist_recovery=True,
+            store_sync_tokens=False,
+        )
+        first = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await first.receive_response(LoginResponse.from_dict(LOGIN))
+
+        class Transport:
+            status = 429
+
+        async def failing_messages(*_args, **_kwargs):
+            error = RoomMessagesError.from_dict(
+                {"errcode": "M_LIMIT_EXCEEDED", "error": "slow down"},
+                ROOM_B,
+            )
+            error.transport_response = Transport()
+            return error
+
+        monkeypatch.setattr(first, "_recovery_room_messages", failing_messages)
+        first.next_batch = "s0"
+        await first.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_B: room_info(
+                        [text_event("$gap-live", 1, ROOM_B)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+        acknowledged_gap = first._recovery.gaps[ROOM_B][0]
+        first.acknowledge_classic_sync("s1")
+
+        seen = record_events(first, RoomNameEvent)
+        await first.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$later", 2, "Later")],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+        assert seen == ["$later"]
+        assert first.rooms[ROOM_A].name == "Later"
+        await first.close()
+        assert first.store
+        first.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+        monkeypatch.setattr(
+            restarted,
+            "_recovery_room_messages",
+            failing_messages,
+        )
+        assert restarted._recovery.gaps[ROOM_B] == [acknowledged_gap]
+        restarted.next_batch = "s1"
+
+        async def record_replayed_name(_room, event):
+            seen.append(event.event_id)
+
+        restarted.add_event_callback(record_replayed_name, RoomNameEvent)
+        await restarted.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [name_event("$later", 2, "Later")],
+                        limited=False,
+                        prev_batch="p2",
+                    )
+                },
+            )
+        )
+
+        assert seen == ["$later", "$later"]
+        assert restarted.rooms[ROOM_A].name == "Later"
+        assert restarted._recovery.gaps[ROOM_B] == [acknowledged_gap]
+        await restarted.close()
 
     async def test_clear_persisted_sync_recovery_removes_cross_mode_residue(
         self,

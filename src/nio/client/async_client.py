@@ -294,6 +294,7 @@ from .sync_recovery import (
     pump_recovery,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
+    snapshot_recovery_state,
     take_recovery_outcomes,
     would_plan_real_gap,
 )
@@ -767,6 +768,13 @@ class AsyncClient(Client):
         return self.store
 
     @property
+    def _recovery_write_store(self) -> "MatrixStore | None":
+        """Return the store only when recovery writes are already committed."""
+        if self._classic_sync_state_staged and not self.config.store_sync_tokens:
+            return None
+        return self._recovery_store
+
+    @property
     def _recovery_store_is_durable(self) -> bool:
         """Return whether recovery rows survive client and process recreation."""
         store = self._recovery_store
@@ -853,6 +861,11 @@ class AsyncClient(Client):
         ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
+            )
+        recovery_store = self._recovery_store
+        if recovery_store:
+            recovery_store.save_recovery_snapshot(
+                *snapshot_recovery_state(self._recovery)
             )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
@@ -942,10 +955,10 @@ class AsyncClient(Client):
                         # committed checkpoint, which is already past any gap
                         # acknowledged earlier. Dropping those gaps would strand
                         # them: nothing in the replay reaches back far enough to
-                        # plan them again. Rows this response wrote come back
-                        # too, which is harmless -- they are keyed by their own
-                        # bounded tokens, so replaying the response re-plans the
-                        # same rows and apply_plan matches them by event ID.
+                        # plan them again. Application-owned Classic responses
+                        # do not write this snapshot until acknowledgement, so
+                        # rejected response markers cannot suppress their own
+                        # replay.
                         recovery_store = self._recovery_store
                         if recovery_store:
                             load_recovery_state(
@@ -1323,7 +1336,7 @@ class AsyncClient(Client):
             ),
             fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
-            store=self._recovery_store,
+            store=self._recovery_write_store,
             ready_room_id=ready_room_id,
         )
 
@@ -1594,9 +1607,10 @@ class AsyncClient(Client):
                     reset_room_ids=reset_rooms,
                     current_room_ids=self._current_response_room_ids.get(),
                 )
+                recovery_write_store = self._recovery_write_store
                 persist_response_plan(
                     self._recovery,
-                    self._recovery_store,
+                    recovery_write_store,
                     # Only the owner of the sync token writes it. A client
                     # persisting recovery state while keeping the token to
                     # itself gets rows without nio recording its position.
@@ -1610,7 +1624,7 @@ class AsyncClient(Client):
                     forgotten_rooms=reset_rooms,
                 )
                 for room_id in reset_rooms:
-                    if self._recovery_store is None:
+                    if recovery_write_store is None:
                         self._forget_sliding_window_token(room_id)
                     else:
                         self._sliding_room_prev_batch.pop(room_id, None)

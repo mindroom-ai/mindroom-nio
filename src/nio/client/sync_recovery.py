@@ -213,6 +213,38 @@ class RecoveryState:
     )
 
 
+def snapshot_recovery_state(
+    state: RecoveryState,
+) -> tuple[
+    tuple[RecoveryGap, ...],
+    tuple[PendingTimelineEvent, ...],
+    frozenset[str],
+]:
+    """Serialize the complete recovery state at an acknowledged boundary."""
+    gaps = tuple(gap for room_gaps in state.gaps.values() for gap in room_gaps)
+    pending = tuple(
+        event
+        for generation_events in state.events.values()
+        for event in generation_events
+    )
+    completed = tuple(
+        PendingTimelineEvent(
+            room_id,
+            0,
+            0,
+            event_id,
+            "",
+            False,
+            marker.was_encrypted,
+            provenance=marker.provenance,
+            apply_room_state=False,
+        )
+        for room_id, room_completed in state.completed.items()
+        for event_id, marker in room_completed.items()
+    )
+    return gaps, pending + completed, frozenset(state.abandoned)
+
+
 def has_pending_recovery_work(state: RecoveryState) -> bool:
     """Whether a recovery pump has gaps or deferred callback failures."""
     return bool(state.gaps or state._deferred_dispatch_errors)

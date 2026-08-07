@@ -732,6 +732,41 @@ class MatrixStore:
         self._upsert_pending_events(account, events)
 
     @use_database_atomic
+    def save_recovery_snapshot(
+        self,
+        gaps: tuple[RecoveryGap, ...],
+        events: tuple[PendingTimelineEvent, ...],
+        abandoned_rooms: frozenset[str],
+    ) -> None:
+        """Atomically replace the account's complete recovery checkpoint."""
+        account = self._get_account()
+        assert account
+
+        PendingTimelineEvents.delete().where(
+            PendingTimelineEvents.account == account
+        ).execute()
+        SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
+        SyncRecoveryAbandonedRooms.delete().where(
+            SyncRecoveryAbandonedRooms.account == account,
+        ).execute()
+
+        gap_rows = [{"account": account, **asdict(gap)} for gap in gaps]
+        for index in range(0, len(gap_rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryGaps.insert_many(
+                gap_rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+
+        abandoned_rows = [
+            {"account": account, "room_id": room_id} for room_id in abandoned_rooms
+        ]
+        for index in range(0, len(abandoned_rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryAbandonedRooms.insert_many(
+                abandoned_rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+
+        self._upsert_pending_events(account, events)
+
+    @use_database_atomic
     def clear_recovery_abandonment(self, room_ids: Iterable[str]) -> None:
         """Forget that these rooms lost history, once the application says so."""
         account = self._get_account()

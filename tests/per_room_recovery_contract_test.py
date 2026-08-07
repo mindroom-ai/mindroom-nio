@@ -350,6 +350,7 @@ class TestPerRoomRecoveryContract:
         fetch = RecordingFetch([messages_error(429)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         gap = client._recovery.gaps[ROOM_A][0]
+        client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
         client.store.database.close()
@@ -490,6 +491,7 @@ class TestPerRoomRecoveryContract:
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         assert client._recovery.abandoned == {ROOM_A}
+        client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
         client.store.database.close()
@@ -550,11 +552,11 @@ class TestPerRoomRecoveryContract:
             left={ROOM_A: room_info([], limited=False, prev_batch=None)},
         )
         await client.receive_response(reset)
+        client.acknowledge_classic_sync("s2")
 
         assert client._recovery.abandoned == {ROOM_A}
         assert client.store
         assert client.store.load_sync_recovery()[2] == [ROOM_A]
-        client.acknowledge_classic_sync("s2")
 
         later = sync_response("s3", {})
         await client.receive_response(later)
