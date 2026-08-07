@@ -1075,6 +1075,219 @@ class TestRoomLocalRecovery:
         client.acknowledge_classic_sync("s4")
         await client.close()
 
+    async def test_the_held_watermark_counts_the_responses_it_is_stuck_for(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """An operator cannot act on a deadline they cannot see."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        settled = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [text_event("$old", 1)], limited=False, prev_batch="p0"
+                )
+            },
+        )
+        await client.receive_response(settled)
+        assert settled.admitted_through_held_responses == 0
+        client.acknowledge_classic_sync("s1")
+
+        aioresponse.get(MESSAGES_URL, status=500, repeat=True)
+        held = []
+        for index, token in enumerate(("s2", "s3", "s4")):
+            response = sync_response(
+                token,
+                (
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 3)], limited=True, prev_batch="p1"
+                        )
+                    }
+                    if index == 0
+                    else {ROOM_A: room_info([], limited=False, prev_batch="p1")}
+                ),
+            )
+            await client.receive_response(response)
+            held.append(
+                (
+                    response.admitted_through_token,
+                    response.admitted_through_held_responses,
+                )
+            )
+
+        # The token names where it is stuck; the count says for how long.
+        assert held == [("s1", 1), ("s1", 2), ("s1", 3)]
+
+        client.abandon_recovery(ROOM_A)
+        released = sync_response(
+            "s5",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(released)
+
+        assert released.admitted_through_token == "s5"
+        assert released.admitted_through_held_responses == 0
+        await client.close()
+
+    def test_a_response_answers_both_questions_before_any_client_touches_it(self):
+        """A documented field that only exists once nio assigns it is a lie.
+
+        Every caller that builds a response itself -- every test in this file,
+        and any application replaying a captured sync -- reads the attribute
+        before recovery publication ever runs. Undeclared, that read raises
+        instead of saying "nothing held, nothing lost".
+        """
+        response = sync_response("s1", {})
+        assert response.admitted_through_held_responses == 0
+        assert response.abandoned_recovery == ()
+
+        sliding = SlidingSyncResponse("pos1")
+        assert sliding.abandoned_recovery == ()
+        assert not hasattr(sliding, "admitted_through_held_responses")
+
+    async def test_an_automatic_abandonment_reports_what_a_deliberate_one_does(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """A cap that drops history must be as legible as a chosen discharge."""
+        client = self._owned_classic_client(tempdir, backfill_max_events=1)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2)], "more"),
+                "more": messages([text_event("$gap2", 3)], "p1"),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        capped = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(capped)
+
+        # nio gave up on its own, and says so in the same shape.
+        assert capped.room_recovery == {ROOM_A: RoomRecoveryStatus.LOST}
+        [abandoned] = capped.abandoned_recovery
+        assert abandoned.room_id == ROOM_A
+        assert abandoned.unwalked_from_token == "more"
+        assert abandoned.unwalked_to_token == "p1"
+        assert abandoned.unwalked_event_count is None
+        assert abandoned.discarded_recovered_events == 1
+        assert abandoned.retained_live_events == 1
+        # The live event the room did receive is still delivered.
+        assert seen == ["$old", "$held"]
+
+        # A loss is reported once, not on every response after it.
+        later = sync_response(
+            "s3",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(later)
+        assert later.abandoned_recovery == ()
+        await client.close()
+
+    async def test_an_unretryable_messages_error_reports_the_span_it_gave_up(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """The failed-gap exit is a loss too, and says so in the same shape."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        # 403 is not one of the statuses nio retries, so the walk gives up.
+        aioresponse.get(MESSAGES_URL, status=403, repeat=True)
+
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert response.room_recovery == {ROOM_A: RoomRecoveryStatus.LOST}
+        [abandoned] = response.abandoned_recovery
+        assert abandoned.room_id == ROOM_A
+        assert abandoned.unwalked_from_token == "s1"
+        assert abandoned.unwalked_to_token == "p1"
+        assert abandoned.unwalked_event_count is None
+        assert abandoned.discarded_recovered_events == 0
+        assert abandoned.retained_live_events == 1
+        assert seen == ["$old", "$held"]
+        await client.close()
+
+    async def test_a_deliberate_discharge_reports_on_the_same_channel(
+        self, tempdir, aioresponse
+    ):
+        """One response lists every loss it accepted, however it was decided."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500, repeat=True)
+        for token in ("s2", "s3"):
+            await client.receive_response(
+                sync_response(
+                    token,
+                    (
+                        {
+                            ROOM_A: room_info(
+                                [text_event("$held", 3)], limited=True, prev_batch="p1"
+                            )
+                        }
+                        if token == "s2"
+                        else {ROOM_A: room_info([], limited=False, prev_batch="p1")}
+                    ),
+                )
+            )
+
+        returned = client.abandon_recovery(ROOM_A)
+        published = sync_response(
+            "s4",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(published)
+
+        assert published.abandoned_recovery == (returned,)
+        await client.close()
+
     async def test_a_converging_walk_cannot_be_abandoned(self, tempdir, aioresponse):
         """Discharging a walk that is still moving is the original bug renamed."""
         client = self._owned_classic_client(tempdir, backfill_max_pages=1)

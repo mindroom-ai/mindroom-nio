@@ -21,7 +21,7 @@ from ..events import (
     MegolmEvent,
     RoomMemberEvent,
 )
-from ..recovery_status import RoomRecoveryStatus
+from ..recovery_status import AbandonedRecovery, RoomRecoveryStatus
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -177,6 +177,9 @@ class RecoveryPlan:
     clear_recovered: RecoveryGap | None = None
     # Explicit real-gap failures; synthetic empty-token drains never enter this set.
     unrecovered_room_ids: frozenset[str] = frozenset()
+    # What each of those failures gave up, in the same shape a deliberate
+    # discharge reports. An automatic loss should be no harder to see.
+    abandoned: tuple[AbandonedRecovery, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -210,6 +213,10 @@ class RecoveryState:
     # read STALLED, because nothing moves between a response and the next one.
     _published_status: dict[str, RoomRecoveryStatus] = field(
         default_factory=dict, init=False, repr=False, compare=False
+    )
+    # Losses accepted since the last publication, deliberate or automatic.
+    _abandoned: list[AbandonedRecovery] = field(
+        default_factory=list, init=False, repr=False, compare=False
     )
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
         field(default_factory=dict, init=False, repr=False, compare=False)
@@ -710,6 +717,28 @@ def _plan_ancillary_events(
     ]
 
 
+def _abandonment_record(
+    state: RecoveryState,
+    gap: RecoveryGap,
+) -> AbandonedRecovery:
+    """Describe what giving up on one gap skipped.
+
+    The unwalked span is reported in the server's own tokens because that is
+    all nio has: it never fetched that history, so it cannot say how many
+    events are in it. A walk that had already finished has nothing unwalked,
+    and its whole loss is the recovered events that were never dispatched.
+    """
+    events = state.events.get((gap.room_id, gap.generation), ())
+    return AbandonedRecovery(
+        gap.room_id,
+        gap.cursor_token,
+        gap.target_token,
+        None if gap.cursor_token is not None else 0,
+        sum(not event.is_live for event in events),
+        sum(event.is_live for event in events),
+    )
+
+
 def _plan_room_reset(
     state: RecoveryState,
     room_id: str,
@@ -726,10 +755,16 @@ def _plan_room_reset(
     ] + list(additional_events)
     clear = frozenset({room_id})
     unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
+    # apply_plan already treats clearing a targeted gap as a loss, so the same
+    # condition decides what the loss is called.
+    abandoned = tuple(
+        _abandonment_record(state, gap) for gap in gaps if gap.target_token
+    )
     if not live:
         return RecoveryPlan(
             clear_rooms=clear,
             unrecovered_room_ids=unrecovered_room_ids,
+            abandoned=abandoned,
         )
     generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
@@ -741,27 +776,8 @@ def _plan_room_reset(
         (RecoveryGap(room_id, generation, "", None),),
         events,
         unrecovered_room_ids=unrecovered_room_ids,
+        abandoned=abandoned,
     )
-
-
-@dataclass(frozen=True)
-class AbandonedRecovery:
-    """One room's continuity debt, given up on deliberately.
-
-    ``unwalked_from_token`` and ``unwalked_to_token`` bound the span the walk
-    never covered, in the server's own token space.
-    ``unwalked_event_count`` is ``None`` when the walk never reached its
-    target: nio never fetched that span and cannot say how much is in it. It is
-    ``0`` when the walk had already finished and only undelivered callbacks
-    remained, where the whole loss is ``discarded_recovered_events``.
-    """
-
-    room_id: str
-    unwalked_from_token: str | None
-    unwalked_to_token: str
-    unwalked_event_count: int | None
-    discarded_recovered_events: int
-    retained_live_events: int
 
 
 def abandon_recovery(
@@ -779,33 +795,13 @@ def abandon_recovery(
     The caller is responsible for checking that the gap is stalled. Discharging
     a converging walk is the defect this contract exists to remove.
     """
-    owed = [gap for gap in state.gaps[room_id] if gap.target_token]
-    queued = [
-        event
-        for gap in state.gaps[room_id]
-        for event in state.events.get((room_id, gap.generation), ())
-    ]
-    walking = next((gap for gap in owed if gap.cursor_token is not None), owed[0])
-    # Clearing a room that held a targeted gap already records the loss, so the
-    # plan does not need to say so twice.
-    persist_response_plan(
-        state,
-        store,
-        token=None,
-        plan=_plan_room_reset(state, room_id),
-    )
+    plan = _plan_room_reset(state, room_id)
+    persist_response_plan(state, store, token=None, plan=plan)
     # The room's walk marks are released by the next classification, which no
     # longer observes its gap. The published status is not, and leaving it
     # would let the same room be abandoned twice.
     state._published_status.pop(room_id, None)
-    return AbandonedRecovery(
-        room_id,
-        walking.cursor_token,
-        walking.target_token,
-        None if walking.cursor_token is not None else 0,
-        sum(not event.is_live for event in queued),
-        sum(event.is_live for event in queued),
-    )
+    return plan.abandoned[0]
 
 
 def plan_room_timeline(
@@ -942,16 +938,19 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
     unrecovered_room_ids: set[str] = set()
+    abandoned: list[AbandonedRecovery] = []
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
         unrecovered_room_ids.update(plan.unrecovered_room_ids)
+        abandoned.extend(plan.abandoned)
     return RecoveryPlan(
         frozenset(clear_rooms),
         tuple(gaps),
         tuple(events),
         unrecovered_room_ids=frozenset(unrecovered_room_ids),
+        abandoned=tuple(abandoned),
     )
 
 
@@ -1021,6 +1020,7 @@ def plan_sync_response(
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
+    state._abandoned.extend(plan.abandoned)
     for room_id in plan.unrecovered_room_ids:
         state.outcomes[room_id] = False
 
@@ -1150,6 +1150,13 @@ def take_recovery_outcomes(
     return room_recovery
 
 
+def take_abandoned_recoveries(state: RecoveryState) -> tuple[AbandonedRecovery, ...]:
+    """Consume every loss accepted since the last publication."""
+    abandoned = tuple(state._abandoned)
+    state._abandoned.clear()
+    return abandoned
+
+
 def recovered_room_ids(
     room_recovery: Mapping[str, RoomRecoveryStatus],
 ) -> frozenset[str]:
@@ -1183,6 +1190,7 @@ def load_recovery_state(
     state.outcomes.clear()
     state._walk_marks.clear()
     state._published_status.clear()
+    state._abandoned.clear()
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,
@@ -1431,6 +1439,7 @@ async def _collect_slice(
                 if status in (408, 429) or status >= 500:
                     break
             logger.error("Abandoning failed gap in %s", gap.room_id)
+            record = _abandonment_record(state, gap)
             gap = replace(gap, cursor_token=None)
             persist_response_plan(
                 state,
@@ -1440,6 +1449,7 @@ async def _collect_slice(
                     gaps=(gap,),
                     clear_recovered=gap,
                     unrecovered_room_ids=frozenset({gap.room_id}),
+                    abandoned=(record,),
                 ),
             )
             return gap
@@ -1556,6 +1566,9 @@ async def _collect_slice(
                 unrecovered_room_ids=(
                     frozenset({gap.room_id}) if abandoned else frozenset()
                 ),
+                # The cap and the two unverifiable-gap exits all land here, and
+                # all of them give up on the span the walk had not reached.
+                abandoned=((_abandonment_record(state, gap),) if abandoned else ()),
             ),
         )
         gap = updated

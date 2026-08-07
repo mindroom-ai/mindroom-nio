@@ -37,7 +37,7 @@ from .events import (
 )
 from .events.presence import PresenceEvent
 from .http import TransportResponse
-from .recovery_status import RoomRecoveryStatus
+from .recovery_status import AbandonedRecovery, RoomRecoveryStatus
 from .schemas import Schemas, validate_json
 
 logger = logging.getLogger(__name__)
@@ -2093,6 +2093,15 @@ class SyncResponse(Response):
     client never replays. It is ``None`` before the first fully settled
     response of a sync generation, which means the application must keep the
     checkpoint it already holds.
+
+    ``admitted_through_held_responses`` counts the applied responses since the
+    watermark last moved. A permanently stalled gap holds it forever, and every
+    restart then resumes from an older token, so this is the signal an operator
+    acts on before a room that never stalled starts losing backlog.
+
+    ``abandoned_recovery`` names every loss accepted while handling this
+    response, whether nio hit an internal cap or the application discharged a
+    stalled gap deliberately.
     """
 
     next_batch: str = field()
@@ -2106,6 +2115,8 @@ class SyncResponse(Response):
     unrecovered_room_ids: frozenset[str] = frozenset()
     room_recovery: Mapping[str, RoomRecoveryStatus] = field(default_factory=dict)
     admitted_through_token: str | None = None
+    admitted_through_held_responses: int = 0
+    abandoned_recovery: tuple[AbandonedRecovery, ...] = ()
 
     def __str__(self) -> str:
         result = []
@@ -2359,13 +2370,17 @@ class SlidingSyncResponse(Response):
             status, distinguishing a walk that is still converging from one
             that is stalled and from history nio has lost. The two id sets
             above are the two-way view of this map.
+        abandoned_recovery (Tuple[AbandonedRecovery, ...]): Every loss accepted
+            while handling this response, whether nio hit an internal cap or
+            the application discharged a stalled gap deliberately.
 
     Recovery outcomes are populated only when limited-timeline backfill is
     enabled. The room's ``limited`` field remains the unmodified server value.
 
     Sliding Sync has no ``admitted_through_token``: its resume position is an
     opaque connection ``pos`` rather than a durable stream checkpoint, so there
-    is no token an application could hold a watermark at.
+    is no token an application could hold a watermark at. It therefore has no
+    ``admitted_through_held_responses`` either: nothing here can be held.
     """
 
     pos: str = field()
@@ -2383,6 +2398,7 @@ class SlidingSyncResponse(Response):
     recovered_room_ids: frozenset[str] = frozenset()
     unrecovered_room_ids: frozenset[str] = frozenset()
     room_recovery: Mapping[str, RoomRecoveryStatus] = field(default_factory=dict)
+    abandoned_recovery: tuple[AbandonedRecovery, ...] = ()
 
     @staticmethod
     def _parse_list(

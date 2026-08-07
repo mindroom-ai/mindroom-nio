@@ -15,6 +15,15 @@ All notable changes to this project will be documented in this file.
   The two are equal whenever nothing is owed, so a healthy client never replays, and a restart from the watermark re-derives any outstanding gap rather than losing it.
   It is `None` before the first fully settled response of a sync generation, which means the application must keep the checkpoint it already holds.
 
+- Add `AsyncClient.abandon_recovery()` for discharging a recovery gap nio has classified `STALLED`.
+  A gap holds `admitted_through_token` back until it is discharged, and a walk that has stopped moving never discharges itself, so a permanently stalled room freezes an application-owned checkpoint forever.
+  That is not only a slower restart: the Classic checkpoint is account-wide, so every room re-derives a gap spanning the frozen token to now, and a room whose backlog crosses `backfill_max_events` is abandoned outright. A single wedged room therefore becomes history loss in rooms that never stalled, and nio ends the freeze by taking that loss.
+  The discharge acts only on a published `STALLED` classification, never a converging one, and returns an `AbandonedRecovery` naming the unwalked token span, the recovered events discarded, and the live events retained. Live events the room already received are kept and still dispatched.
+  A retained callback for the room is refused rather than waited on, because a wedged callback is a different failure from a wedged walk.
+- Add `SyncResponse.admitted_through_held_responses`, the number of applied responses since the watermark last moved, so a held checkpoint is visible before a healthy room starts losing backlog.
+- Add `SyncResponse.abandoned_recovery` and `SlidingSyncResponse.abandoned_recovery`, naming every loss accepted while handling one response.
+  nio's internal abandonments -- the room event cap, the held-event cap, an unretryable `/messages` error, and an unverifiable gap -- now report the same span and counts a deliberate discharge does, so an automatic loss is no harder to see than a chosen one.
+
 ### Bug Fixes
 
 - Stop an outstanding recovery gap from blocking `acknowledge_classic_sync()`.

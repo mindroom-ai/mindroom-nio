@@ -298,6 +298,7 @@ from .sync_recovery import (
     record_completed_timeline_event,
     recovered_room_ids,
     should_dispatch_timeline_event,
+    take_abandoned_recoveries,
     take_recovery_outcomes,
     unrecovered_room_ids,
     would_plan_real_gap,
@@ -730,6 +731,10 @@ class AsyncClient(Client):
         # only advances, never rewinds with the resume cursor, which is what
         # lets an application keep syncing while a gap stays owed.
         self._classic_sync_admitted_through: str | None = None
+        # Applied responses since the watermark last moved. A wedged room holds
+        # it forever, and nothing else makes that visible before a healthy room
+        # starts losing backlog on restart.
+        self._classic_sync_admitted_through_held = 0
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -824,6 +829,7 @@ class AsyncClient(Client):
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
         self._classic_sync_admitted_through = None
+        self._classic_sync_admitted_through_held = 0
 
     @property
     def has_uncommitted_classic_sync_state(self) -> bool:
@@ -1051,6 +1057,7 @@ class AsyncClient(Client):
                             max_held_events=self.config.backfill_max_events
                         )
                         self._classic_sync_admitted_through = None
+                        self._classic_sync_admitted_through_held = 0
                         self._sliding_room_prev_batch.clear()
                         self._pending_sliding_room_account_data.clear()
                         self._sliding_sync_to_device_since = None
@@ -1440,8 +1447,10 @@ class AsyncClient(Client):
         if self._recovery._active_dispatches or has_pending_recovery_work(
             self._recovery
         ):
+            self._classic_sync_admitted_through_held += 1
             return
         self._classic_sync_admitted_through = next_batch
+        self._classic_sync_admitted_through_held = 0
 
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
@@ -1452,7 +1461,11 @@ class AsyncClient(Client):
         response.room_recovery = room_recovery
         response.recovered_room_ids = recovered_room_ids(room_recovery)
         response.unrecovered_room_ids = unrecovered_room_ids(room_recovery)
+        response.abandoned_recovery = take_abandoned_recoveries(self._recovery)
         if isinstance(response, SyncResponse):
+            response.admitted_through_held_responses = (
+                self._classic_sync_admitted_through_held
+            )
             # Publication runs even for a response whose handling raised, so it
             # only reads the watermark. Advancing it is _handle_sync's job,
             # because only there is the response known to be fully applied.
