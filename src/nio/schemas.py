@@ -1207,10 +1207,20 @@ class Schemas:
             "redacts": {"type": "string"},
             "content": {
                 "type": "object",
-                "properties": {"reason": {"type": "string"}},
+                "properties": {
+                    "reason": {"type": "string"},
+                    "redacts": {"type": "string"},
+                },
             },
         },
-        "required": ["sender", "redacts"],
+        "required": ["sender"],
+        "anyOf": [
+            {"required": ["redacts"]},
+            {
+                "required": ["content"],
+                "properties": {"content": {"required": ["redacts"]}},
+            },
+        ],
     }
 
     sticker = {
