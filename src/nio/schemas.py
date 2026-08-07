@@ -1881,6 +1881,7 @@ class Schemas:
         "type": "object",
         "properties": {
             "sender": {"type": "string"},
+            "type": {"type": "string", "enum": ["m.key.verification.request"]},
             "content": {
                 "type": "object",
                 "properties": {
@@ -1900,7 +1901,7 @@ class Schemas:
                 ],
             },
         },
-        "required": ["sender", "content"],
+        "required": ["sender", "type", "content"],
     }
 
     key_verification_start = {

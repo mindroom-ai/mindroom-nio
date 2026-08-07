@@ -475,6 +475,17 @@ class TestClass:
         assert event.methods == ["m.sas.v1"]
         assert event.timestamp == 1754000000000
 
+    def test_key_verification_request_rejects_invalid_type(self):
+        parsed_dict = TestClass._load_response("tests/data/events/key_request.json")
+        parsed_dict.pop("type")
+        event = KeyVerificationRequest.from_dict(parsed_dict)
+        assert isinstance(event, UnknownBadEvent)
+
+        parsed_dict = TestClass._load_response("tests/data/events/key_request.json")
+        parsed_dict["type"] = "m.not.a.verification.request"
+        event = KeyVerificationRequest.from_dict(parsed_dict)
+        assert isinstance(event, UnknownBadEvent)
+
     def test_invalid_key_verification(self):
         for _, event_file in [
             (KeyVerificationStart, "key_start.json"),
