@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 from os import path
 from pathlib import Path
+from shutil import copyfile
 from typing import Tuple
 from unittest.mock import AsyncMock
 from urllib.parse import urlparse
@@ -45,6 +46,7 @@ from nio import (
     JoinedMembersResponse,
     JoinedRoomsResponse,
     JoinResponse,
+    KeyVerificationRequest,
     KeysClaimResponse,
     KeysUploadResponse,
     LocalProtocolError,
@@ -215,6 +217,52 @@ class TestClass:
     @property
     def sync_response(self):
         return self._load_response("tests/data/sync.json")
+
+    async def test_migrated_libolm_store_dispatches_verification_request(self, tempdir):
+        source = Path(
+            "tests/data/encryption/example_DEVICEID.libolm_account_pickle_v4.db"
+        )
+        copyfile(source, Path(tempdir) / "example_DEVICEID.db")
+        client = AsyncClient(
+            "https://example.org",
+            "example",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(),
+        )
+        client.restore_login("example", "DEVICEID", "token")
+        assert client.olm
+        assert client.olm.account.identity_keys == {
+            "curve25519": "Xjuu9d2KjHLGIHpCOCHS7hONQahapiwI1MhVmlPlCFM",
+            "ed25519": "FEfrmWlasr4tcMtbNX/BU5lbdjmpt3ptg8ApTD8YAh4",
+        }
+        seen = []
+
+        async def callback(event):
+            seen.append(event)
+
+        client.add_to_device_callback(callback, UnknownToDeviceEvent)
+        response = SyncResponse.from_dict(
+            {
+                "next_batch": "s1",
+                "rooms": {"invite": {}, "join": {}, "leave": {}},
+                "device_one_time_keys_count": {},
+                "device_lists": {"changed": [], "left": []},
+                "to_device": {
+                    "events": [
+                        self._load_response("tests/data/events/key_request.json")
+                    ]
+                },
+                "presence": {"events": []},
+                "account_data": {"events": []},
+            }
+        )
+
+        await client.receive_response(response)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], KeyVerificationRequest)
+        await client.close()
 
     @property
     def context_response(self):

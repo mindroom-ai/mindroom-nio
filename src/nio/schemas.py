@@ -1888,6 +1888,33 @@ class Schemas:
         "required": ["avatar_url"],
     }
 
+    key_verification_request = {
+        "type": "object",
+        "properties": {
+            "sender": {"type": "string"},
+            "type": {"type": "string", "enum": ["m.key.verification.request"]},
+            "content": {
+                "type": "object",
+                "properties": {
+                    "transaction_id": {"type": "string"},
+                    "from_device": {"type": "string"},
+                    "methods": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "timestamp": {"type": "integer"},
+                },
+                "required": [
+                    "transaction_id",
+                    "from_device",
+                    "methods",
+                    "timestamp",
+                ],
+            },
+        },
+        "required": ["sender", "type", "content"],
+    }
+
     key_verification_start = {
         "type": "object",
         "properties": {
