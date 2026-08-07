@@ -874,6 +874,20 @@ def plan_sync_response(
     reset_room_ids: Iterable[str] = (),
     current_room_ids: frozenset[str] | None = None,
 ) -> RecoveryPlan:
+    def recovery_cursor(room_id: str, room_info: Any) -> str | None:
+        """Return the token a limited classic timeline must backfill down to.
+
+        This is a genuine lower bound, not a hint: everything at or before
+        ``since`` was delivered by an earlier sync and is already processed.
+        A gap that carries one is bounded at both ends, which is what lets
+        running out of pages count as having seen all of it.
+        """
+        if current_room_ids is not None and room_id not in current_room_ids:
+            return None
+        if not room_info.timeline.limited or not request_since:
+            return None
+        return request_since
+
     plans = [
         plan_room_timeline(
             state,
@@ -885,15 +899,15 @@ def plan_sync_response(
                 else None
             ),
             membership="join",
-            cursor_token=(
-                (
-                    request_since
-                    if room_info.timeline.limited and request_since
-                    else None
-                )
-                if current_room_ids is None or room_id in current_room_ids
-                else None
-            ),
+            cursor_token=recovery_cursor(room_id, room_info),
+            # Derived from the same cursor as the sliding path, and for the
+            # same reason. Without it ``bounded_exhausted`` can never be true
+            # on this path, so a backfill that reaches the start of the
+            # server's history without the end token happening to equal the
+            # target leaves every recovered event classified as history --
+            # which means a burst of messages the bot has never seen arrives
+            # as context it is not allowed to answer.
+            membership_bound=recovery_cursor(room_id, room_info) is not None,
             target_token=(
                 room_info.timeline.prev_batch or response_token
                 if current_room_ids is None or room_id in current_room_ids

@@ -304,6 +304,54 @@ def test_stale_classic_sync_remains_live_without_applying_room_state():
     assert not plan.events[0].apply_room_state
 
 
+def test_a_limited_classic_timeline_records_a_membership_bounded_gap():
+    """A limited classic sync knows both ends of the gap it just opened.
+
+    Everything at or before ``since`` arrived in an earlier sync, so a
+    backfill that runs out of pages before matching the target token has
+    still seen all of it. Without this the walk can only ever be proven by
+    the end token happening to equal the target, and a burst of genuinely
+    new messages stays classified as history.
+    """
+    plan = plan_sync_response(
+        RecoveryState(),
+        user_id="@me:example.org",
+        request_since="s0",
+        response_token="s1",
+        joined_rooms={
+            ROOM: RoomInfo(
+                Timeline([event("$new", 1)], True, "p1"),
+                [],
+                [],
+                [],
+            )
+        },
+    )
+
+    assert [gap.membership_bound for gap in plan.gaps] == [True]
+    assert [gap.cursor_token for gap in plan.gaps] == ["s0"]
+
+
+def test_an_unlimited_classic_timeline_records_no_bounded_gap():
+    """Nothing was skipped, so there is no bound to claim."""
+    plan = plan_sync_response(
+        RecoveryState(),
+        user_id="@me:example.org",
+        request_since="s0",
+        response_token="s1",
+        joined_rooms={
+            ROOM: RoomInfo(
+                Timeline([event("$new", 1)], False, "p1"),
+                [],
+                [],
+                [],
+            )
+        },
+    )
+
+    assert not any(gap.membership_bound for gap in plan.gaps)
+
+
 class InlineStore:
     supports_threaded_writes = False
 

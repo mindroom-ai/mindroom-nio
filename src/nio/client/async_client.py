@@ -102,7 +102,9 @@ from ..events import (
 )
 from ..exceptions import (
     CallbackNotAcceptedError,
+    InsufficientRecursionDepthError,
     LocalProtocolError,
+    RemoteProtocolError,
     SendRetryError,
     TransferCancelledError,
 )
@@ -4190,6 +4192,8 @@ class AsyncClient(Client):
         event_type: str | None = None,
         direction: MessageDirection = MessageDirection.back,
         limit: int | None = None,
+        recurse: bool = False,
+        minimum_recursion_depth: int | None = None,
     ) -> AsyncIterator[Event]:
         """Iterate through all related events of a given parent event.
 
@@ -4204,7 +4208,28 @@ class AsyncClient(Client):
             limit (int, optional): The maximum events per request that will be
                 fetched per chunk while iterating. Changing this value can affect performance.
                 Homeservers will apply a default value, and override this with a maximum value.
+            recurse (bool, optional): Whether to ask the server for indirectly
+                related events as well, as described by the Matrix 1.10
+                recursive relations extension.
+            minimum_recursion_depth (int, optional): The recursion depth the
+                caller requires. Every non-empty page must report at least this
+                depth in ``recursion_depth`` or
+                ``InsufficientRecursionDepthError`` is raised before any of
+                that page's events are yielded. Requires ``recurse``.
+
+                Servers disagree about what the reported number means. Some
+                report the depth they are willing to traverse, which is a
+                constant capability. Others report the depth of the deepest
+                event they actually returned, which for a shallow relation tree
+                is legitimately ``0``. A caller that wants only "the server
+                honored ``recurse``" should therefore pass ``0``, and a caller
+                that imposes a higher floor should know which servers it talks
+                to. An empty page is never rejected, because it has no depth to
+                report and nothing that could have been truncated.
         """
+        if minimum_recursion_depth is not None and not recurse:
+            raise LocalProtocolError("minimum_recursion_depth requires recurse=True")
+
         paginate_from, paginate_to = None, None
         while True:
             method, path = Api.room_get_event_relations(
@@ -4217,6 +4242,7 @@ class AsyncClient(Client):
                 paginate_from,
                 paginate_to,
                 limit,
+                recurse,
             )
             response = await self._send(
                 RoomEventRelationsResponse,
@@ -4225,9 +4251,25 @@ class AsyncClient(Client):
                 response_data=(room_id, event_id),
             )
 
-            if isinstance(response, RoomEventRelationsResponse):
-                for event in response.events:
-                    yield event
+            if not isinstance(response, RoomEventRelationsResponse):
+                raise RemoteProtocolError(str(response))
+
+            # An empty page carries no depth information: servers that
+            # report the deepest event they returned have nothing to
+            # report, and there is nothing that could have been truncated.
+            if (
+                minimum_recursion_depth is not None
+                and response.events
+                and (
+                    response.recursion_depth is None
+                    or response.recursion_depth < minimum_recursion_depth
+                )
+            ):
+                raise InsufficientRecursionDepthError(
+                    minimum_recursion_depth, response.recursion_depth
+                )
+            for event in response.events:
+                yield event
             if response.next_batch is None:
                 return
             paginate_from = response.next_batch
