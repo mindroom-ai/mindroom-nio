@@ -1925,6 +1925,9 @@ class AsyncClient(Client):
         send_request: Callable[[], Coroutine[Any, Any, _RoomMembershipResponseT]],
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
+        recovery_store = self._recovery_store
+        if recovery_store:
+            self._require_atomic_recovery_store(recovery_store)
         callback_scope = self._event_callback_scope.get()
         if (
             self.config.backfill_limited_timelines
@@ -2370,6 +2373,9 @@ class AsyncClient(Client):
                     return
                 if isinstance(sync_response, SyncResponse):
                     self._require_valid_classic_recovery_ownership()
+                recovery_store = self._recovery_store
+                if recovery_store:
+                    self._require_atomic_recovery_store(recovery_store)
                 self._sync_response_seen = True
                 entered_executor = True
                 executor = object()

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from helpers import faker
+from peewee import SqliteDatabase
 
 from nio import TimelineEventProvenance
 from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
@@ -110,6 +111,13 @@ def seed_v5_recovery_state(sqlstore):
     sqlstore._update_version(5)
 
 
+class UndeclaredAtomicStore(SqliteStore):
+    """A SQLite-backed subclass that has not declared its recovery contract."""
+
+    def _create_database(self):
+        return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
 class TestClass:
     @pytest.fixture(autouse=True)
     def _store_path(self, tempdir):
@@ -122,6 +130,13 @@ class TestClass:
     def test_writable_store_uses_pytest_tmp_path(self, tmp_path):
         store = self.ephemeral_store
         assert Path(store.database_path).parent == tmp_path
+
+    def test_atomic_recovery_capability_requires_each_subclass_to_opt_in(self):
+        assert MatrixStore.supports_atomic_recovery is False
+        assert DefaultStore.supports_atomic_recovery is True
+        assert SqliteStore.supports_atomic_recovery is True
+        assert SqliteMemoryStore.supports_atomic_recovery is True
+        assert UndeclaredAtomicStore.supports_atomic_recovery is False
 
     @property
     def example_devices(self):
@@ -1078,7 +1093,7 @@ class TestClass:
             }
         assert {"provenance", "apply_room_state"} <= columns
 
-    def test_v8_store_adds_conservative_membership_binding(self, sqlstore):
+    def test_v7_store_adds_conservative_membership_binding(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
         event = PendingTimelineEvent(
             TEST_ROOM,
@@ -1121,6 +1136,48 @@ class TestClass:
             }
             assert SyncRecoveryAbandonedRooms.table_exists()
         assert "membership_bound" in columns
+
+    def test_v8_store_adds_abandonment_without_dropping_recovery(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor", membership_bound=True)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+            sqlstore._update_version(8)
+            assert not SyncRecoveryAbandonedRooms.table_exists()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 9
+        gaps, events, abandoned = reopened.load_sync_recovery()
+        assert [
+            (
+                item.room_id,
+                item.generation,
+                item.target_token,
+                item.cursor_token,
+                item.membership_bound,
+            )
+            for item in gaps
+        ] == [(TEST_ROOM, 1, "target", "cursor", True)]
+        assert [(item.room_id, item.generation, item.event_id) for item in events] == [
+            (TEST_ROOM, 1, "$pending")
+        ]
+        assert abandoned == []
+        with reopened.database.bind_ctx(reopened.models):
+            assert SyncRecoveryAbandonedRooms.table_exists()
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)

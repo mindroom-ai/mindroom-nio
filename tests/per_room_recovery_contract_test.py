@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from nio import (
@@ -154,6 +155,13 @@ class RecordingFetch:
         if not self.pages:
             pytest.fail("unscripted recovery fetch")
         return self.pages.pop(0)
+
+
+class UndeclaredAtomicStore(SqliteStore):
+    """A SQLite-backed subclass that has not declared its recovery contract."""
+
+    def _create_database(self):
+        return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
 
 
 class QueueStore(SqliteStore):
@@ -424,6 +432,88 @@ class TestPerRoomRecoveryContract:
         with pytest.raises(LocalProtocolError, match="does not match"):
             client.acknowledge_classic_sync("s1")
         await client.close()
+
+    async def test_non_atomic_store_rejects_sync_response_before_mutation(
+        self,
+        tempdir,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=UndeclaredAtomicStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=True,
+            ),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            assert client.store.supports_atomic_recovery is False
+            before_next_batch = client.next_batch
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                await client.receive_response(
+                    sync_response(
+                        "s1",
+                        {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+                    )
+                )
+
+            assert not client._sync_response_seen
+            assert client.next_batch == before_next_batch
+            assert client.rooms == {}
+            assert client._recovery.gaps == {}
+            assert client._recovery.events == {}
+            assert client._recovery.outcomes == {}
+            assert client.store.load_sync_token() is None
+            assert client.store.load_sync_recovery() == ([], [], [])
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_non_atomic_store_rejects_membership_reset_before_network_io(
+        self,
+        tempdir,
+    ):
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=UndeclaredAtomicStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=True,
+            ),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return object()
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert not network_called
+            assert client._recovery.gaps == {}
+            assert client._recovery.abandoned == set()
+            assert client.store.load_sync_recovery() == ([], [], [])
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
 
     async def test_non_atomic_queue_store_rejects_abandonment_before_mutation(
         self,

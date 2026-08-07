@@ -125,7 +125,6 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
-    is_durable: ClassVar[bool] = False
     supports_atomic_recovery: ClassVar[bool] = False
     models = [
         Accounts,
@@ -151,6 +150,11 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "supports_atomic_recovery" not in cls.__dict__:
+            cls.supports_atomic_recovery = False
 
     def _create_database(self):
         return SqliteDatabase(
@@ -1301,7 +1305,6 @@ class DefaultStore(MatrixStore):
             should be used.
     """
 
-    is_durable: ClassVar[bool] = True
     supports_atomic_recovery: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
@@ -1441,7 +1444,6 @@ class SqliteStore(MatrixStore):
             should be used.
     """
 
-    is_durable: ClassVar[bool] = True
     supports_atomic_recovery: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
@@ -1693,7 +1695,7 @@ class SqliteMemoryStore(SqliteStore):
             encryption keys while they are in storage.
     """
 
-    is_durable: ClassVar[bool] = False
+    supports_atomic_recovery: ClassVar[bool] = True
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)
