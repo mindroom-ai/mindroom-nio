@@ -776,6 +776,98 @@ class TestRoomLocalRecovery:
         assert client.has_uncommitted_classic_sync_state
         await client.close()
 
+    async def test_page_bound_gap_cannot_converge_under_an_application_owned_checkpoint(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """A gap that only needs another pump is reported like one that failed.
+
+        Recovery is incremental by design: a walk that exhausts its page budget
+        keeps its cursor and resumes on the next pump, which is what
+        ``test_empty_page_and_page_bound_resume`` proves when nio owns the
+        cursor. But the room stays in ``unrecovered_room_ids`` meanwhile, and
+        the response stays unacknowledgeable, so an application that owns the
+        checkpoint has no way to tell "still walking" from "gave up". Its only
+        remedy, ``reset_classic_sync_state``, throws the half-walked cursor
+        away, so replaying the same checkpoint repeats the identical walk and
+        stalls at the identical page forever.
+        """
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+                backfill_max_pages=1,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        client.acknowledge_classic_sync("s1")
+        assert not client.has_uncommitted_classic_sync_state
+
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2)], "more"),
+                "more": messages(
+                    [text_event("$gap2", 3), text_event("$held", 4)],
+                    "p1",
+                ),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+
+        def limited_response() -> SyncResponse:
+            return sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 4)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+
+        first = limited_response()
+        await client.receive_response(first)
+
+        # Every request succeeded; the walk simply ran out of pages.
+        assert pages.from_tokens == ["s1"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        assert first.unrecovered_room_ids == frozenset({ROOM_A})
+        assert seen == ["$old"]
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s2")
+
+        await client.reset_classic_sync_state()
+        assert client._recovery.gaps == {}
+        client.next_batch = "s1"
+
+        second = limited_response()
+        await client.receive_response(second)
+
+        # The resume cursor is gone, so the second attempt asks the identical
+        # question and stalls in the identical place.
+        assert pages.from_tokens == ["s1", "s1"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        assert second.unrecovered_room_ids == frozenset({ROOM_A})
+        assert seen == ["$old"]
+        await client.close()
+
     async def test_application_owned_classic_state_rejects_ack_while_callback_is_active(
         self,
         tempdir,
