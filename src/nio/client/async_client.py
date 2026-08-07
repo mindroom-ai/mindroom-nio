@@ -780,6 +780,13 @@ class AsyncClient(Client):
         store = self._recovery_store
         return store is not None and store.is_durable
 
+    @staticmethod
+    def _require_atomic_recovery_store(store: "MatrixStore") -> None:
+        if not store.supports_atomic_recovery:
+            raise LocalProtocolError(
+                "The configured store does not support atomic recovery writes."
+            )
+
     def load_store(self):
         super().load_store()
         store = self._recovery_store
@@ -864,6 +871,7 @@ class AsyncClient(Client):
             )
         recovery_store = self._recovery_store
         if recovery_store:
+            self._require_atomic_recovery_store(recovery_store)
             recovery_store.save_recovery_snapshot(
                 *snapshot_recovery_state(self._recovery)
             )
@@ -1359,6 +1367,7 @@ class AsyncClient(Client):
         candidates = frozenset(self._recovery.abandoned & set(room_ids))
         store = self._recovery_store
         if store and candidates:
+            self._require_atomic_recovery_store(store)
             store.clear_recovery_abandonment(candidates)
         return acknowledge_unrecovered_rooms(self._recovery, candidates)
 

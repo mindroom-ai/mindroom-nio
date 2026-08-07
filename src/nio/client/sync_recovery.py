@@ -21,6 +21,7 @@ from ..events import (
     MegolmEvent,
     RoomMemberEvent,
 )
+from ..exceptions import LocalProtocolError
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -1160,15 +1161,23 @@ def persist_response_plan(
     window_tokens: Mapping[str, SlidingWindowToken] | None = None,
     forgotten_rooms: Iterable[str] = (),
 ) -> None:
+    real_gap_clear_rooms = frozenset(
+        room_id
+        for room_id in plan.clear_rooms
+        if any(gap.target_token for gap in state.gaps.get(room_id, ()))
+    )
     plan = replace(
         plan,
-        unrecovered_room_ids=plan.unrecovered_room_ids
-        | frozenset(
-            room_id
-            for room_id in plan.clear_rooms
-            if any(gap.target_token for gap in state.gaps.get(room_id, ()))
-        ),
+        unrecovered_room_ids=plan.unrecovered_room_ids | real_gap_clear_rooms,
     )
+    if (
+        store
+        and real_gap_clear_rooms
+        and not getattr(store, "supports_atomic_recovery", False)
+    ):
+        raise LocalProtocolError(
+            "The configured store does not support atomic recovery writes."
+        )
     try:
         if store:
             store.save_recovery(

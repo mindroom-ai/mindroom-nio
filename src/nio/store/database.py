@@ -125,7 +125,8 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
-    is_durable: ClassVar[bool] = True
+    is_durable: ClassVar[bool] = False
+    supports_atomic_recovery: ClassVar[bool] = False
     models = [
         Accounts,
         OlmSessions,
@@ -1335,6 +1336,8 @@ class DefaultStore(MatrixStore):
             should be used.
     """
 
+    is_durable: ClassVar[bool] = True
+    supports_atomic_recovery: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
@@ -1473,6 +1476,8 @@ class SqliteStore(MatrixStore):
             should be used.
     """
 
+    is_durable: ClassVar[bool] = True
+    supports_atomic_recovery: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
     def _get_device(self, device):

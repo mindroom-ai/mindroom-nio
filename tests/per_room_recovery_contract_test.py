@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 
 import pytest
+from peewee import SqliteDatabase
+from playhouse.sqliteq import SqliteQueueDatabase
 
 from nio import (
     AsyncClient,
@@ -44,7 +46,7 @@ from nio.client.sync_recovery import (
     RecoveryPlan,
     persist_response_plan,
 )
-from nio.store import SqliteMemoryStore
+from nio.store import MatrixStore, SqliteMemoryStore, SqliteStore
 
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
@@ -157,8 +159,28 @@ class RecordingFetch:
     async def __call__(self, room_id, start, end, _direction, _limit):
         self.calls.append((room_id, start, end))
         if not self.pages:
-            raise AssertionError(f"unscripted /messages call for {room_id}")
+            pytest.fail("unscripted recovery fetch")
         return self.pages.pop(0)
+
+
+class VolatileMatrixStore(MatrixStore):
+    """A custom store whose database disappears with the process."""
+
+    def _create_database(self):
+        return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
+class QueueStore(SqliteStore):
+    """A real-file queued store whose multi-statement writes are not atomic."""
+
+    supports_atomic_recovery = False
+
+    def _create_database(self):
+        return SqliteQueueDatabase(
+            self.database_path,
+            pragmas={"foreign_keys": 1, "journal_mode": "wal"},
+            autostart=True,
+        )
 
 
 class Delivered:
@@ -267,6 +289,7 @@ class TestPerRoomRecoveryContract:
         await open_a_stuck_gap(client, fetch, monkeypatch)
 
         assert client._recovery.gaps[ROOM_A], "the gap must stay open for this room"
+        assert fetch.pages == []
         client.acknowledge_classic_sync("s1")
         assert not client.has_uncommitted_classic_sync_state
         await client.close()
@@ -289,6 +312,7 @@ class TestPerRoomRecoveryContract:
         await open_a_stuck_gap(client, fetch, monkeypatch)
 
         assert client._recovery_store is None
+        assert fetch.pages == []
         with pytest.raises(LocalProtocolError, match="does not match"):
             client.acknowledge_classic_sync("s1")
         await client.close()
@@ -310,16 +334,236 @@ class TestPerRoomRecoveryContract:
             ),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        await open_a_stuck_gap(
-            client,
-            RecordingFetch([messages_error(429)]),
-            monkeypatch,
-        )
+        fetch = RecordingFetch([messages_error(429)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
 
         assert client._recovery_store is not None
+        assert fetch.pages == []
         with pytest.raises(LocalProtocolError, match="does not match"):
             client.acknowledge_classic_sync("s1")
         await client.close()
+
+    async def test_unknown_volatile_store_does_not_make_an_open_gap_durable(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A custom store must explicitly opt into durable recovery."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=VolatileMatrixStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            fetch = RecordingFetch([messages_error(429)])
+            await open_a_stuck_gap(client, fetch, monkeypatch)
+
+            assert client._recovery.gaps[ROOM_A]
+            assert fetch.pages == []
+            with pytest.raises(LocalProtocolError, match="does not match"):
+                client.acknowledge_classic_sync("s1")
+            assert client.has_uncommitted_classic_sync_state
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_non_atomic_store_rejects_snapshot_ack_before_mutation(
+        self,
+        tempdir,
+    ):
+        """A staged snapshot cannot commit through an unknown store contract."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=VolatileMatrixStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            client.store.save_recovery(
+                None,
+                set(),
+                [],
+                [],
+                None,
+                abandoned_rooms={ROOM_B},
+            )
+
+            await client.receive_response(
+                sync_response(
+                    "s1",
+                    {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+                )
+            )
+            before_memory = client._recovery.abandoned.copy()
+            before_rows = client.store.load_sync_recovery()
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                client.acknowledge_classic_sync("s1")
+
+            assert client.has_uncommitted_classic_sync_state
+            assert client._recovery.abandoned == before_memory
+            assert client.store.load_sync_recovery() == before_rows
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_non_atomic_queue_store_rejects_abandonment_before_mutation(
+        self,
+        tempdir,
+    ):
+        """Multi-chunk loss settlement requires an explicitly atomic store."""
+        bootstrap = SqliteStore(OWN_ID, LOGIN["device_id"], tempdir)
+        bootstrap.database.close()
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=QueueStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        store = None
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert isinstance(client.store, QueueStore)
+            store = client.store
+            room_ids = frozenset(
+                f"!abandoned-{index}:example.org" for index in range(81)
+            )
+            store.save_recovery(
+                None,
+                set(),
+                [],
+                [],
+                None,
+                abandoned_rooms=room_ids,
+            )
+            store.database.stop()
+            client._recovery.abandoned.update(room_ids)
+            before_memory = client._recovery.abandoned.copy()
+            before_rows = store.load_sync_recovery()[2]
+            assert len(before_rows) == 81
+            assert set(before_rows) == room_ids
+            store.database.start()
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                client.acknowledge_unrecovered_rooms(room_ids)
+
+            assert client._recovery.abandoned == before_memory
+            assert store.load_sync_recovery()[2] == before_rows
+        finally:
+            try:
+                await client.close()
+            finally:
+                if store is not None:
+                    if not store.database.is_stopped():
+                        store.database.stop()
+                    if not store.database.is_closed():
+                        store.database.close()
+
+    async def test_non_atomic_queue_store_rejects_real_gap_clear_before_mutation(
+        self,
+        tempdir,
+    ):
+        """Deleting a real gap and recording its loss must be one transaction."""
+        bootstrap = SqliteStore(OWN_ID, LOGIN["device_id"], tempdir)
+        bootstrap.database.close()
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                store=QueueStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        store = None
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert isinstance(client.store, QueueStore)
+            store = client.store
+            gap = RecoveryGap(ROOM_A, 1, "target", "cursor")
+            persist_response_plan(
+                client._recovery,
+                store,
+                token=None,
+                plan=RecoveryPlan(gaps=(gap,)),
+            )
+            store.database.stop()
+
+            def persisted_recovery():
+                gaps, events, abandoned = store.load_sync_recovery()
+                return (
+                    [
+                        (
+                            item.room_id,
+                            item.generation,
+                            item.target_token,
+                            item.cursor_token,
+                            bool(item.membership_bound),
+                        )
+                        for item in gaps
+                    ],
+                    events,
+                    abandoned,
+                )
+
+            expected_rows = ([(ROOM_A, 1, "target", "cursor", False)], [], [])
+            assert persisted_recovery() == expected_rows
+            before_gaps = {
+                room_id: list(room_gaps)
+                for room_id, room_gaps in client._recovery.gaps.items()
+            }
+            before_abandoned = client._recovery.abandoned.copy()
+            before_outcomes = client._recovery.outcomes.copy()
+            store.database.start()
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                persist_response_plan(
+                    client._recovery,
+                    store,
+                    token=None,
+                    plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+                )
+
+            assert client._recovery.gaps == before_gaps
+            assert client._recovery.abandoned == before_abandoned
+            assert client._recovery.outcomes == before_outcomes
+            assert persisted_recovery() == expected_rows
+        finally:
+            try:
+                await client.close()
+            finally:
+                if store is not None:
+                    if not store.database.is_stopped():
+                        store.database.stop()
+                    if not store.database.is_closed():
+                        store.database.close()
 
     async def test_other_rooms_keep_delivering_while_one_room_is_blocked(
         self,
@@ -368,6 +612,7 @@ class TestPerRoomRecoveryContract:
         assert delivered.provenance["$b2"] is TimelineEventProvenance.LIVE
         assert ROOM_B not in second.unrecovered_room_ids
         assert ROOM_A in second.unrecovered_room_ids
+        assert fetch.pages == []
         await client.close()
 
     async def test_recovery_obligation_survives_a_restart(self, tempdir, monkeypatch):
@@ -383,6 +628,7 @@ class TestPerRoomRecoveryContract:
         fetch = RecordingFetch([messages_error(429)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         gap = client._recovery.gaps[ROOM_A][0]
+        assert fetch.pages == []
         client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
@@ -432,6 +678,7 @@ class TestPerRoomRecoveryContract:
         assert (
             delivered.ids(ROOM_A) == []
         ), "nothing from this room may be delivered while its gap is open"
+        assert fetch.pages == []
         await client.close()
 
     async def test_recovered_events_arrive_once_in_order_with_provenance(
@@ -469,6 +716,7 @@ class TestPerRoomRecoveryContract:
         assert delivered.provenance["$live"] is TimelineEventProvenance.LIVE
         assert ROOM_A in third.recovered_room_ids
         assert ROOM_A not in third.unrecovered_room_ids
+        assert fetch.pages == []
         await client.close()
 
     async def test_abandoned_gap_stays_explicitly_degraded(
@@ -503,6 +751,7 @@ class TestPerRoomRecoveryContract:
         assert (
             ROOM_A in second.unrecovered_room_ids
         ), "an unrepaid loss must not read as a healthy room on the next response"
+        assert fetch.pages == []
         await client.close()
 
     async def test_abandonment_outlives_a_restart_until_acknowledged(
@@ -524,6 +773,7 @@ class TestPerRoomRecoveryContract:
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         assert client._recovery.abandoned == {ROOM_A}
+        assert fetch.pages == []
         client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
@@ -572,11 +822,9 @@ class TestPerRoomRecoveryContract:
         """Resetting room recovery cannot stand in for application settlement."""
         client = application_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        await open_a_stuck_gap(
-            client,
-            RecordingFetch([messages_error(recovery_status)]),
-            monkeypatch,
-        )
+        fetch = RecordingFetch([messages_error(recovery_status)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
+        assert fetch.pages == []
         client.acknowledge_classic_sync("s1")
 
         reset = sync_response(
@@ -604,11 +852,9 @@ class TestPerRoomRecoveryContract:
         """A failed durable clear must leave memory available for a retry."""
         client = application_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
-        await open_a_stuck_gap(
-            client,
-            RecordingFetch([messages_error(403)]),
-            monkeypatch,
-        )
+        fetch = RecordingFetch([messages_error(403)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
+        assert fetch.pages == []
         assert client.store
         store = client.store
         original = store.clear_recovery_abandonment
@@ -671,15 +917,18 @@ class TestPerRoomRecoveryContract:
         assert ROOM_A in response.recovered_room_ids
         assert ROOM_A not in response.unrecovered_room_ids
         assert ROOM_A not in client._recovery.gaps
+        assert fetch.pages == []
         await client.close()
 
+    @pytest.mark.parametrize("transient_status", [408, 429, 503])
     async def test_transient_failure_retries_without_loss_or_duplication(
         self,
         tempdir,
         monkeypatch,
         delivered,
+        transient_status,
     ):
-        """Contract 8: 429 and 5xx are retried, and the retry is not a replay.
+        """Contract 8: transient failures retry, without replaying delivery.
 
         A retry that re-dispatches an already-delivered event makes the bot answer
         twice; one that skips the un-dispatched remainder loses the question
@@ -690,8 +939,7 @@ class TestPerRoomRecoveryContract:
         delivered.install(client)
         fetch = RecordingFetch(
             [
-                messages_error(429),
-                messages_error(503),
+                messages_error(transient_status),
                 messages_page([text_event("$missed", 1)], start="s0", end="p1"),
             ]
         )
@@ -699,15 +947,9 @@ class TestPerRoomRecoveryContract:
         assert delivered.ids(ROOM_A) == []
 
         await client._pump_sync_recovery()
-        assert delivered.ids(ROOM_A) == []
-
-        await client._pump_sync_recovery()
 
         assert delivered.ids(ROOM_A) == ["$missed", "$live"]
         assert delivered.provenance["$missed"] is TimelineEventProvenance.RECOVERED
-        assert [call[1] for call in fetch.calls] == [
-            "s0",
-            "s0",
-            "s0",
-        ], "a transient failure must restart from the same bounded cursor"
+        assert [call[1] for call in fetch.calls] == ["s0", "s0"]
+        assert fetch.pages == []
         await client.close()

@@ -30,6 +30,7 @@ from nio.store import (
     SqliteStore,
     PendingTimelineEvents,
     SlidingWindowTokens,
+    SyncRecoveryAbandonedRooms,
     SyncRecoveryGaps,
 )
 
@@ -682,6 +683,7 @@ class TestClass:
                 pending("$completed", 2),
             ],
             None,
+            abandoned_rooms={TEST_ROOM},
         )
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
         sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
@@ -715,7 +717,14 @@ class TestClass:
             True,
             False,
         )
-        sqlstore.save_recovery("s_advanced", set(), [gap], [event], None)
+        sqlstore.save_recovery(
+            "s_advanced",
+            set(),
+            [gap],
+            [event],
+            None,
+            abandoned_rooms={TEST_ROOM},
+        )
         sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
         sqlstore.save_sliding_window_tokens(
             {TEST_ROOM: SlidingWindowToken("w1", "$join")}
@@ -734,10 +743,11 @@ class TestClass:
             sqlstore._clear_sync_recovery()
 
         assert sqlstore.load_sync_token() == "s_advanced"
-        _, events, _ = sqlstore.load_sync_recovery()
+        _, events, abandoned = sqlstore.load_sync_recovery()
         assert [(item.event_id, item.generation) for item in events] == [
             ("$completed", 0)
         ]
+        assert abandoned == [TEST_ROOM]
         assert sqlstore.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
         }
@@ -1070,9 +1080,19 @@ class TestClass:
 
     def test_v8_store_adds_conservative_membership_binding(self, sqlstore):
         gap = RecoveryGap(TEST_ROOM, 1, "target", "cursor")
-        sqlstore.save_recovery(None, set(), [gap], [], None)
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$pending",
+            "{}",
+            True,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
         table = SyncRecoveryGaps._meta.table_name
         with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
             sqlstore.database.execute_sql(
                 f'ALTER TABLE "{table}" DROP COLUMN membership_bound'
             )
@@ -1085,9 +1105,13 @@ class TestClass:
         )
 
         assert reopened._get_store_version() == 9
-        gaps, _, _ = reopened.load_sync_recovery()
+        gaps, events, abandoned = reopened.load_sync_recovery()
         assert len(gaps) == 1
         assert not gaps[0].membership_bound
+        assert [(item.room_id, item.generation, item.event_id) for item in events] == [
+            (TEST_ROOM, 1, "$pending")
+        ]
+        assert abandoned == []
         with reopened.database.bind_ctx(reopened.models):
             columns = {
                 row[1]
@@ -1095,6 +1119,7 @@ class TestClass:
                     f'PRAGMA table_info("{table}")'
                 ).fetchall()
             }
+            assert SyncRecoveryAbandonedRooms.table_exists()
         assert "membership_bound" in columns
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
