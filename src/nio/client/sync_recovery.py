@@ -214,62 +214,9 @@ class RecoveryState:
     )
 
 
-def snapshot_recovery_state(
-    state: RecoveryState,
-) -> tuple[
-    tuple[RecoveryGap, ...],
-    tuple[PendingTimelineEvent, ...],
-    frozenset[str],
-]:
-    """Serialize the complete recovery state at an acknowledged boundary."""
-    gaps = tuple(gap for room_gaps in state.gaps.values() for gap in room_gaps)
-    pending = tuple(
-        event
-        for generation_events in state.events.values()
-        for event in generation_events
-    )
-    completed = tuple(
-        PendingTimelineEvent(
-            room_id,
-            0,
-            0,
-            event_id,
-            "",
-            False,
-            marker.was_encrypted,
-            provenance=marker.provenance,
-            apply_room_state=False,
-        )
-        for room_id, room_completed in state.completed.items()
-        for event_id, marker in room_completed.items()
-    )
-    return gaps, pending + completed, frozenset(state.abandoned)
-
-
 def has_pending_recovery_work(state: RecoveryState) -> bool:
     """Whether a recovery pump has gaps or deferred callback failures."""
     return bool(state.gaps or state._deferred_dispatch_errors)
-
-
-def has_uncommitted_recovery_work(state: RecoveryState, *, durable: bool) -> bool:
-    """Whether recovery work must fence an application-owned checkpoint.
-
-    A gap is bounded at both ends the moment it is planned -- ``cursor_token``
-    is the ``since`` the limited response was measured from and ``target_token``
-    is its ``prev_batch`` -- so it describes the same walk no matter how far the
-    global cursor has moved. When such a gap is durable the checkpoint may
-    advance past it, and *must* be allowed to: holding the cursor back makes the
-    next request re-measure the gap against a live position that has moved on,
-    which grows it without bound and never converges.
-
-    Without durability the same advance is silent data loss, because the only
-    record that those events are owed dies with the process. So an in-memory
-    gap still fences the checkpoint, and a deferred callback failure always
-    does -- that is an event the application has not accepted yet.
-    """
-    if state._deferred_dispatch_errors:
-        return True
-    return bool(state.gaps) and not durable
 
 
 def acknowledge_unrecovered_rooms(

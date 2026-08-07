@@ -1,17 +1,8 @@
 """Contract tests for per-room limited-timeline recovery.
 
-A limited timeline that nio cannot close is a *room-local* problem, but today
-it is settled against a *global* boundary: ``acknowledge_classic_sync`` refuses
-while ``has_pending_recovery_work`` is true for any room at all. An application
-that owns the Classic checkpoint therefore cannot advance it past a response in
-which one room went limited, so its next request repeats the same ``since``.
-The gap that request must close is measured against a live position that has
-moved on, so it is strictly larger than the one that just failed. Nothing in
-that cycle shrinks it, and the principal falls further behind forever.
-
-These tests pin what the transport must guarantee instead: an unresolved gap is
-one room's obligation, carried in that room's own bounded tokens, and neither
-the global cursor nor any other room waits on it.
+Nio-owned Classic commits its cursor and per-room recovery obligations in one
+transaction. Application-owned Classic keeps both in memory and cannot
+acknowledge a cursor while any recovery obligation remains.
 
 Each test names the invariant it protects and what breaks without it, because
 the failure modes here are silent -- a missed event is never delivered, and no
@@ -23,7 +14,6 @@ import json
 from pathlib import Path
 
 import pytest
-from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from nio import (
@@ -46,7 +36,7 @@ from nio.client.sync_recovery import (
     RecoveryPlan,
     persist_response_plan,
 )
-from nio.store import MatrixStore, SqliteMemoryStore, SqliteStore
+from nio.store import SqliteStore
 
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
@@ -122,20 +112,8 @@ def messages_error(status: int, room_id: str = ROOM_A) -> RoomMessagesError:
     return response
 
 
-def application_owned_client(tempdir: str, *, durable: bool = True) -> AsyncClient:
-    """A client configured the way an application that owns the checkpoint runs.
-
-    Token persistence is off because the application commits its own durable
-    cursor and acknowledges nio only once that commit succeeded. Recovery
-    persistence is on, which is the combination the contract needs and which
-    nio has to permit: a checkpoint may only advance past an open gap if that
-    gap outlives the process.
-
-    ``durable=False`` is the same application without persisted gaps. It exists
-    to pin the safety half of the contract -- that configuration must keep
-    fencing the checkpoint, because advancing past a gap nobody wrote down is
-    silent loss rather than forward progress.
-    """
+def application_owned_client(tempdir: str) -> AsyncClient:
+    """Return a memory-only Classic client whose application owns the cursor."""
     return AsyncClient(
         "https://example.org",
         OWN_ID,
@@ -143,8 +121,23 @@ def application_owned_client(tempdir: str, *, durable: bool = True) -> AsyncClie
         tempdir,
         config=AsyncClientConfig(
             backfill_limited_timelines=True,
-            backfill_persist_recovery=durable,
+            backfill_persist_recovery=False,
             store_sync_tokens=False,
+        ),
+    )
+
+
+def nio_owned_client(tempdir: str) -> AsyncClient:
+    """Return a Classic client that atomically owns its cursor and recovery."""
+    return AsyncClient(
+        "https://example.org",
+        OWN_ID,
+        "DEVICEID",
+        tempdir,
+        config=AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_persist_recovery=True,
+            store_sync_tokens=True,
         ),
     )
 
@@ -161,13 +154,6 @@ class RecordingFetch:
         if not self.pages:
             pytest.fail("unscripted recovery fetch")
         return self.pages.pop(0)
-
-
-class VolatileMatrixStore(MatrixStore):
-    """A custom store whose database disappears with the process."""
-
-    def _create_database(self):
-        return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
 
 
 class QueueStore(SqliteStore):
@@ -240,9 +226,131 @@ async def open_a_stuck_gap(
 
 @pytest.mark.asyncio
 class TestPerRoomRecoveryContract:
+    async def test_application_owned_classic_replays_after_reset_and_fences_open_gap(
+        self,
+        tempdir,
+        monkeypatch,
+        delivered,
+    ):
+        """Memory-only Classic can rewind, replay, and cannot commit past a gap."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        delivered.install(client)
+        fetch = RecordingFetch([messages_error(429)])
+        monkeypatch.setattr(client, "_recovery_room_messages", fetch)
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s1")
+
+        await client.reset_classic_sync_state()
+        client.next_batch = "s0"
+        fetch.pages.append(
+            messages_page([text_event("$missed", 1)], start="s0", end="p1")
+        )
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$live", 2)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        assert delivered.ids(ROOM_A) == ["$missed", "$live"]
+        client.acknowledge_classic_sync("s1")
+        await client.close()
+
+    async def test_nio_owned_classic_atomically_persists_token_and_gap_for_restart(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """Nio commits a Classic cursor with its gap and restores both together."""
+        config = AsyncClientConfig(
+            backfill_limited_timelines=True,
+            backfill_persist_recovery=True,
+            store_sync_tokens=True,
+        )
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+        writes: list[tuple[str | None, tuple[RecoveryGap, ...]]] = []
+        original_save = client.store.save_recovery
+
+        def record_save(token, clear_rooms, gaps, events, clear_recovered, *args):
+            writes.append((token, tuple(gaps)))
+            return original_save(
+                token,
+                clear_rooms,
+                gaps,
+                events,
+                clear_recovered,
+                *args,
+            )
+
+        monkeypatch.setattr(client.store, "save_recovery", record_save)
+        fetch = RecordingFetch([messages_error(429)])
+        await open_a_stuck_gap(client, fetch, monkeypatch)
+        gap = client._recovery.gaps[ROOM_A][0]
+
+        assert writes[0] == ("s1", (gap,))
+        assert client.store.load_sync_token() == "s1"
+        [stored_gap] = client.store.load_sync_recovery()[0]
+        assert (
+            stored_gap.room_id,
+            stored_gap.generation,
+            stored_gap.target_token,
+            stored_gap.cursor_token,
+            stored_gap.membership_bound,
+        ) == (
+            gap.room_id,
+            gap.generation,
+            gap.target_token,
+            gap.cursor_token,
+            gap.membership_bound,
+        )
+        await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        assert restarted.loaded_sync_token == "s1"
+        assert restarted._recovery.gaps[ROOM_A] == [gap]
+        await restarted.close()
+
     async def test_clearing_a_real_gap_persists_sticky_abandonment(self, tempdir):
         """Every real-gap deletion records loss in memory and on disk."""
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         assert client.store
 
@@ -283,15 +391,15 @@ class TestPerRoomRecoveryContract:
         for the same ``since`` against a live position that moved, so the gap
         grows every cycle and never converges.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         fetch = RecordingFetch([messages_error(429)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
 
         assert client._recovery.gaps[ROOM_A], "the gap must stay open for this room"
         assert fetch.pages == []
-        client.acknowledge_classic_sync("s1")
-        assert not client.has_uncommitted_classic_sync_state
+        assert client.store
+        assert client.store.load_sync_token() == "s1"
         await client.close()
 
     async def test_gap_without_durability_still_fences_the_cursor(
@@ -306,7 +414,7 @@ class TestPerRoomRecoveryContract:
         response, so nothing in a replay reaches back to plan the walk again and
         the only record that those events were owed dies with the process.
         """
-        client = application_owned_client(tempdir, durable=False)
+        client = application_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         fetch = RecordingFetch([messages_error(429)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
@@ -316,114 +424,6 @@ class TestPerRoomRecoveryContract:
         with pytest.raises(LocalProtocolError, match="does not match"):
             client.acknowledge_classic_sync("s1")
         await client.close()
-
-    async def test_memory_store_does_not_make_an_open_gap_durable(
-        self,
-        monkeypatch,
-    ):
-        """A store that dies with the client cannot justify cursor advance."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            config=AsyncClientConfig(
-                store=SqliteMemoryStore,
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=True,
-                store_sync_tokens=False,
-            ),
-        )
-        await client.receive_response(LoginResponse.from_dict(LOGIN))
-        fetch = RecordingFetch([messages_error(429)])
-        await open_a_stuck_gap(client, fetch, monkeypatch)
-
-        assert client._recovery_store is not None
-        assert fetch.pages == []
-        with pytest.raises(LocalProtocolError, match="does not match"):
-            client.acknowledge_classic_sync("s1")
-        await client.close()
-
-    async def test_unknown_volatile_store_does_not_make_an_open_gap_durable(
-        self,
-        tempdir,
-        monkeypatch,
-    ):
-        """A custom store must explicitly opt into durable recovery."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                store=VolatileMatrixStore,
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=True,
-                store_sync_tokens=False,
-            ),
-        )
-        try:
-            await client.receive_response(LoginResponse.from_dict(LOGIN))
-            fetch = RecordingFetch([messages_error(429)])
-            await open_a_stuck_gap(client, fetch, monkeypatch)
-
-            assert client._recovery.gaps[ROOM_A]
-            assert fetch.pages == []
-            with pytest.raises(LocalProtocolError, match="does not match"):
-                client.acknowledge_classic_sync("s1")
-            assert client.has_uncommitted_classic_sync_state
-        finally:
-            await client.close()
-            if client.store:
-                client.store.database.close()
-
-    async def test_non_atomic_store_rejects_snapshot_ack_before_mutation(
-        self,
-        tempdir,
-    ):
-        """A staged snapshot cannot commit through an unknown store contract."""
-        client = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                store=VolatileMatrixStore,
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=True,
-                store_sync_tokens=False,
-            ),
-        )
-        try:
-            await client.receive_response(LoginResponse.from_dict(LOGIN))
-            assert client.store
-            client.store.save_recovery(
-                None,
-                set(),
-                [],
-                [],
-                None,
-                abandoned_rooms={ROOM_B},
-            )
-
-            await client.receive_response(
-                sync_response(
-                    "s1",
-                    {ROOM_A: room_info([], limited=False, prev_batch="p0")},
-                )
-            )
-            before_memory = client._recovery.abandoned.copy()
-            before_rows = client.store.load_sync_recovery()
-
-            with pytest.raises(LocalProtocolError, match="atomic recovery"):
-                client.acknowledge_classic_sync("s1")
-
-            assert client.has_uncommitted_classic_sync_state
-            assert client._recovery.abandoned == before_memory
-            assert client.store.load_sync_recovery() == before_rows
-        finally:
-            await client.close()
-            if client.store:
-                client.store.database.close()
 
     async def test_non_atomic_queue_store_rejects_abandonment_before_mutation(
         self,
@@ -441,7 +441,7 @@ class TestPerRoomRecoveryContract:
                 store=QueueStore,
                 backfill_limited_timelines=True,
                 backfill_persist_recovery=True,
-                store_sync_tokens=False,
+                store_sync_tokens=True,
             ),
         )
         store = None
@@ -499,7 +499,7 @@ class TestPerRoomRecoveryContract:
                 store=QueueStore,
                 backfill_limited_timelines=True,
                 backfill_persist_recovery=True,
-                store_sync_tokens=False,
+                store_sync_tokens=True,
             ),
         )
         store = None
@@ -576,7 +576,7 @@ class TestPerRoomRecoveryContract:
         Without this, one wedged room silences an entire principal: every other
         conversation stops being answered even though nothing is wrong with it.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch([messages_error(429), messages_error(429)])
@@ -593,8 +593,6 @@ class TestPerRoomRecoveryContract:
             },
         )
 
-        # Deliberately not acknowledging: this test isolates delivery from the
-        # checkpoint boundary that contract 1 covers.
         client.next_batch = "s1"
         second = sync_response(
             "s2",
@@ -618,23 +616,22 @@ class TestPerRoomRecoveryContract:
     async def test_recovery_obligation_survives_a_restart(self, tempdir, monkeypatch):
         """Contract 3: the obligation is recoverable from disk, not only memory.
 
-        A process that dies with an open gap must not lose it. The application's
-        committed checkpoint is already past the limited response, so nothing in
+        A process that dies with an open gap must not lose it. Nio's committed
+        checkpoint is already past the limited response, so nothing in
         a replay from that checkpoint would ever ask for those events again --
         the only record that they are owed is the persisted gap row.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         fetch = RecordingFetch([messages_error(429)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         gap = client._recovery.gaps[ROOM_A][0]
         assert fetch.pages == []
-        client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
         client.store.database.close()
 
-        restarted = application_owned_client(tempdir)
+        restarted = nio_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
 
         assert ROOM_A in restarted._recovery.gaps, "the gap must outlive the process"
@@ -655,7 +652,7 @@ class TestPerRoomRecoveryContract:
         application a conversation it cannot read: an answer arrives before its
         question, and any thread built from delivery order is wrong.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch([messages_error(429), messages_error(429)])
@@ -693,7 +690,7 @@ class TestPerRoomRecoveryContract:
         "this is backdrop the bot is reading". A missed question delivered as
         HISTORY is never answered, and one delivered twice is answered twice.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch(
@@ -733,7 +730,7 @@ class TestPerRoomRecoveryContract:
         with permanently lost work from one that recovered. The room must stay
         distinguishable until the missed events are actually delivered.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch([messages_error(403)])
@@ -767,19 +764,18 @@ class TestPerRoomRecoveryContract:
         explicit act because only the application knows whether it recorded the
         loss anywhere.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         assert client._recovery.abandoned == {ROOM_A}
         assert fetch.pages == []
-        client.acknowledge_classic_sync("s1")
         await client.close()
         assert client.store
         client.store.database.close()
 
-        restarted = application_owned_client(tempdir)
+        restarted = nio_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         assert restarted._recovery.abandoned == {ROOM_A}
 
@@ -805,7 +801,7 @@ class TestPerRoomRecoveryContract:
         assert restarted.store
         restarted.store.database.close()
 
-        reopened = application_owned_client(tempdir)
+        reopened = nio_owned_client(tempdir)
         await reopened.receive_response(LoginResponse.from_dict(LOGIN))
         assert (
             reopened._recovery.abandoned == set()
@@ -820,12 +816,11 @@ class TestPerRoomRecoveryContract:
         recovery_status,
     ):
         """Resetting room recovery cannot stand in for application settlement."""
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         fetch = RecordingFetch([messages_error(recovery_status)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
         assert fetch.pages == []
-        client.acknowledge_classic_sync("s1")
 
         reset = sync_response(
             "s2",
@@ -833,7 +828,6 @@ class TestPerRoomRecoveryContract:
             left={ROOM_A: room_info([], limited=False, prev_batch=None)},
         )
         await client.receive_response(reset)
-        client.acknowledge_classic_sync("s2")
 
         assert client._recovery.abandoned == {ROOM_A}
         assert client.store
@@ -850,7 +844,7 @@ class TestPerRoomRecoveryContract:
         monkeypatch,
     ):
         """A failed durable clear must leave memory available for a retry."""
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
@@ -894,7 +888,7 @@ class TestPerRoomRecoveryContract:
         stronger half -- exhausting a bounded walk is continuity *proof*, so its
         events are work the bot missed, not backdrop.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         pages = (
@@ -934,7 +928,7 @@ class TestPerRoomRecoveryContract:
         twice; one that skips the un-dispatched remainder loses the question
         entirely. Both are invisible without pinning the exact delivered sequence.
         """
-        client = application_owned_client(tempdir)
+        client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         delivered.install(client)
         fetch = RecordingFetch(

@@ -283,7 +283,6 @@ from .sync_recovery import (
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
-    has_uncommitted_recovery_work,
     is_recovered_dispatch_task,
     is_recovery_dispatch_task,
     load_recovery_state,
@@ -294,7 +293,6 @@ from .sync_recovery import (
     pump_recovery,
     record_completed_timeline_event,
     should_dispatch_timeline_event,
-    snapshot_recovery_state,
     take_recovery_outcomes,
     would_plan_real_gap,
 )
@@ -577,12 +575,12 @@ class AsyncClientConfig(ClientConfig):
             existed. Turning it off leaves rows an earlier run wrote in
             place rather than deleting them, so switching it back on can
             resume from state that has gone stale in the meantime.
-            Set it to True to persist recovery state while keeping
-            ownership of the sync token: nio then never reads or writes
-            next_batch itself, which matters for clients that decide for
-            themselves when a token may be advanced. Recovery then resumes
-            relative to whatever token the caller restores, so a caller that
-            rewinds its token replays the window that follows it.
+            With limited-timeline recovery, Classic Sync requires this setting
+            to select the same owner as store_sync_tokens. When both are false,
+            the application owns a memory-only Classic checkpoint; when both
+            are true, nio atomically stores the cursor and recovery plan.
+            Simplified Sliding Sync may persist its recovery state without
+            giving nio ownership of an application-managed Classic cursor.
         backfill_sliding_seed_rooms (int): How many rooms the first request
             of a Simplified Sliding Sync connection widens its list ranges
             to, so that rooms outside the configured window still hand back
@@ -767,18 +765,15 @@ class AsyncClient(Client):
             return None
         return self.store
 
-    @property
-    def _recovery_write_store(self) -> "MatrixStore | None":
-        """Return the store only when recovery writes are already committed."""
-        if self._classic_sync_state_staged and not self.config.store_sync_tokens:
-            return None
-        return self._recovery_store
-
-    @property
-    def _recovery_store_is_durable(self) -> bool:
-        """Return whether recovery rows survive client and process recreation."""
-        store = self._recovery_store
-        return store is not None and store.is_durable
+    def _require_valid_classic_recovery_ownership(self) -> None:
+        """Require one owner for the Classic cursor and its recovery state."""
+        if not self.config.backfill_limited_timelines:
+            return
+        if self.config.store_sync_tokens != self._recovery_persistence_enabled:
+            raise LocalProtocolError(
+                "Classic Sync recovery ownership conflict: store_sync_tokens "
+                "and backfill_persist_recovery must select the same owner."
+            )
 
     @staticmethod
     def _require_atomic_recovery_store(store: "MatrixStore") -> None:
@@ -861,19 +856,10 @@ class AsyncClient(Client):
             or next_batch != self._classic_sync_acknowledgeable_token
             or next_batch != self.next_batch
             or self._recovery._active_dispatches
-            or has_uncommitted_recovery_work(
-                self._recovery,
-                durable=self._recovery_store_is_durable,
-            )
+            or has_pending_recovery_work(self._recovery)
         ):
             raise LocalProtocolError(
                 "Classic Sync acknowledgement token does not match the staged response."
-            )
-        recovery_store = self._recovery_store
-        if recovery_store:
-            self._require_atomic_recovery_store(recovery_store)
-            recovery_store.save_recovery_snapshot(
-                *snapshot_recovery_state(self._recovery)
             )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
@@ -959,20 +945,6 @@ class AsyncClient(Client):
                         self._recovery = RecoveryState(
                             max_held_events=self.config.backfill_max_events
                         )
-                        # A rejected response rewinds the application to its
-                        # committed checkpoint, which is already past any gap
-                        # acknowledged earlier. Dropping those gaps would strand
-                        # them: nothing in the replay reaches back far enough to
-                        # plan them again. Application-owned Classic responses
-                        # do not write this snapshot until acknowledgement, so
-                        # rejected response markers cannot suppress their own
-                        # replay.
-                        recovery_store = self._recovery_store
-                        if recovery_store:
-                            load_recovery_state(
-                                self._recovery,
-                                *recovery_store.load_sync_recovery(),
-                            )
                         self._sliding_room_prev_batch.clear()
                         self._pending_sliding_room_account_data.clear()
                         self._sliding_sync_to_device_since = None
@@ -1344,7 +1316,7 @@ class AsyncClient(Client):
             ),
             fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
-            store=self._recovery_write_store,
+            store=self._recovery_store,
             ready_room_id=ready_room_id,
         )
 
@@ -1591,7 +1563,8 @@ class AsyncClient(Client):
             return
 
         application_owned_classic_state = (
-            self.config.backfill_limited_timelines and not self.config.store_sync_tokens
+            self.config.backfill_limited_timelines
+            and not self._recovery_persistence_enabled
         )
         if application_owned_classic_state:
             self._classic_sync_state_staged = True
@@ -1616,13 +1589,9 @@ class AsyncClient(Client):
                     reset_room_ids=reset_rooms,
                     current_room_ids=self._current_response_room_ids.get(),
                 )
-                recovery_write_store = self._recovery_write_store
                 persist_response_plan(
                     self._recovery,
-                    recovery_write_store,
-                    # Only the owner of the sync token writes it. A client
-                    # persisting recovery state while keeping the token to
-                    # itself gets rows without nio recording its position.
+                    self._recovery_store,
                     token=(
                         response.next_batch if self.config.store_sync_tokens else None
                     ),
@@ -1633,7 +1602,7 @@ class AsyncClient(Client):
                     forgotten_rooms=reset_rooms,
                 )
                 for room_id in reset_rooms:
-                    if recovery_write_store is None:
+                    if self._recovery_store is None:
                         self._forget_sliding_window_token(room_id)
                     else:
                         self._sliding_room_prev_batch.pop(room_id, None)
@@ -1682,10 +1651,7 @@ class AsyncClient(Client):
         if (
             application_owned_classic_state
             and not self._recovery._active_dispatches
-            and not has_uncommitted_recovery_work(
-                self._recovery,
-                durable=self._recovery_store_is_durable,
-            )
+            and not has_pending_recovery_work(self._recovery)
         ):
             self._classic_sync_acknowledgeable_token = response.next_batch
 
@@ -2367,10 +2333,10 @@ class AsyncClient(Client):
         return current is None or room_id in current
 
     async def _receive_sync_family(self, envelope: _SyncResponseEnvelope) -> None:
-        self._sync_response_seen = True
         sync_response = envelope.response
         request_since = envelope.request_since
         if not self.config.backfill_limited_timelines:
+            self._sync_response_seen = True
             if isinstance(sync_response, SyncResponse):
                 await self._handle_sync(envelope)
             else:
@@ -2402,17 +2368,9 @@ class AsyncClient(Client):
                         request_since,
                     )
                     return
-                if (
-                    isinstance(sync_response, SlidingSyncResponse)
-                    and self._classic_sync_state_staged
-                    and not self.config.store_sync_tokens
-                    and self._recovery_store is not None
-                ):
-                    raise LocalProtocolError(
-                        "Sliding Sync cannot be applied while application-owned "
-                        "Classic Sync state is staged; acknowledge or reset the "
-                        "Classic response first."
-                    )
+                if isinstance(sync_response, SyncResponse):
+                    self._require_valid_classic_recovery_ownership()
+                self._sync_response_seen = True
                 entered_executor = True
                 executor = object()
                 self._active_sync_executor_token = executor
@@ -3021,6 +2979,7 @@ class AsyncClient(Client):
         a `SyncError` if there was an error with the request.
         """
 
+        self._require_valid_classic_recovery_ownership()
         self._raise_on_sync_reentry()
         presence = set_presence or self._presence
 
