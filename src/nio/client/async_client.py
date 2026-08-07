@@ -4227,9 +4227,7 @@ class AsyncClient(Client):
                 report and nothing that could have been truncated.
         """
         if minimum_recursion_depth is not None and not recurse:
-            raise LocalProtocolError(
-                "minimum_recursion_depth requires recurse=True"
-            )
+            raise LocalProtocolError("minimum_recursion_depth requires recurse=True")
 
         paginate_from, paginate_to = None, None
         while True:

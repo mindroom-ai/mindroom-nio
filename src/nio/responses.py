@@ -1394,9 +1394,7 @@ class RoomEventRelationsResponse(Response):
         prev_batch = parsed_dict.get("prev_batch")
         next_batch = parsed_dict.get("next_batch")
         recursion_depth = parsed_dict.get("recursion_depth")
-        return cls(
-            room_id, event_id, events, prev_batch, next_batch, recursion_depth
-        )
+        return cls(room_id, event_id, events, prev_batch, next_batch, recursion_depth)
 
 
 @dataclass
