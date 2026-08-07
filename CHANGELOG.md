@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.38.0
+
+### Breaking Changes
+
+These only apply when `backfill_limited_timelines=True`.
+
+- Classic Sync token and recovery state must now have one owner.
+  `store_sync_tokens` and the resolved `backfill_persist_recovery` setting must
+  agree; mixed configurations raise `LocalProtocolError` before a Classic
+  request is sent or a supplied response mutates state. Application-owned
+  Classic recovery stays in memory and cannot acknowledge an open gap, while
+  nio-owned Classic recovery persists its cursor and room obligations together.
+- Custom `MatrixStore` subclasses used for persisted recovery must explicitly
+  declare `supports_atomic_recovery = True` in their own class body. The
+  built-in `DefaultStore`, `SqliteStore`, and `SqliteMemoryStore` opt in;
+  backends that cannot provide multi-statement recovery transactions are
+  rejected before network or state mutation.
+
+### Features
+
+- Add `AsyncClient.acknowledge_unrecovered_rooms()` and store schema v9's
+  `SyncRecoveryAbandonedRooms`. A room whose history gap was abandoned remains
+  in `unrecovered_room_ids` across later responses and restarts until the
+  application explicitly records and acknowledges the loss.
+
+### Bug Fixes
+
+- Clearing a real recovery gap during a recovery reset, successful
+  `room_leave()`, or successful `room_forget()` now records sticky abandonment
+  atomically with deleting the gap, so permanent history loss cannot silently
+  make the room appear healthy.
+- Reject recovery-enabled sync processing, membership cleanup, and abandonment
+  settlement before mutation when the configured store has not explicitly
+  promised atomic recovery writes.
+
 ## 0.37.0
 
 ### Features
