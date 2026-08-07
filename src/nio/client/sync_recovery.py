@@ -21,6 +21,7 @@ from ..events import (
     MegolmEvent,
     RoomMemberEvent,
 )
+from ..recovery_status import RoomRecoveryStatus
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -197,6 +198,13 @@ class RecoveryState:
     outcomes: dict[str, bool] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
+    # The observable position of each owed gap at the last publication, used
+    # only to tell a walk that advanced from one that did not. Deriving it
+    # from the gap itself keeps stall detection free of separate bookkeeping,
+    # and losing it across a restart only costs one conservative CONVERGING.
+    _walk_marks: dict[tuple[str, int], tuple[str | None, int]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
         field(default_factory=dict, init=False, repr=False, compare=False)
     )
@@ -211,6 +219,19 @@ class RecoveryState:
 def has_pending_recovery_work(state: RecoveryState) -> bool:
     """Whether a recovery pump has gaps or deferred callback failures."""
     return bool(state.gaps or state._deferred_dispatch_errors)
+
+
+def has_deferred_recovery_failure(state: RecoveryState) -> bool:
+    """Whether a callback failure is still owed to the next pump.
+
+    This is the part of :func:`has_pending_recovery_work` that a response
+    cannot be acknowledged through, because the failure belongs to work this
+    response started. An outstanding gap is deliberately excluded: a gap is a
+    durable obligation that outlives the response that opened it, and blocking
+    acknowledgement on one only forces the application to reject a response it
+    processed correctly.
+    """
+    return bool(state._deferred_dispatch_errors)
 
 
 def is_recovery_dispatch_task(
@@ -992,25 +1013,92 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
         state.events[key].sort(key=lambda item: item.sequence)
 
 
+def _walk_mark(state: RecoveryState, gap: RecoveryGap) -> tuple[str | None, int]:
+    """Return the observable position of one gap's outstanding work.
+
+    The pair moves whenever the walk fetched another page or the drain
+    delivered another callback, which is exactly what separates a bounded
+    budget from a wedge.
+    """
+    return gap.cursor_token, len(state.events.get((gap.room_id, gap.generation), ()))
+
+
+def classify_recovery_obligations(
+    state: RecoveryState,
+    *,
+    record: bool,
+) -> dict[str, RoomRecoveryStatus]:
+    """Classify every room that still owes continuity work.
+
+    A room is ``CONVERGING`` when any of its owed gaps moved since the last
+    classification and ``STALLED`` when none did. The first classification of a
+    gap is always ``CONVERGING``, because one sample cannot show a wedge.
+
+    ``record`` advances the comparison marks. An aborted response classifies
+    without recording, since it observed no pump.
+    """
+    obligations: dict[str, RoomRecoveryStatus] = {}
+    observed: set[tuple[str, int]] = set()
+    for room_id, gaps in state.gaps.items():
+        owed = [gap for gap in gaps if gap.target_token]
+        if not owed:
+            continue
+        status = RoomRecoveryStatus.STALLED
+        for gap in owed:
+            key = (room_id, gap.generation)
+            observed.add(key)
+            mark = _walk_mark(state, gap)
+            if state._walk_marks.get(key) != mark:
+                status = RoomRecoveryStatus.CONVERGING
+            if record:
+                state._walk_marks[key] = mark
+        obligations[room_id] = status
+    if record:
+        for key in tuple(state._walk_marks):
+            if key not in observed:
+                del state._walk_marks[key]
+    return obligations
+
+
 def take_recovery_outcomes(
     state: RecoveryState,
-) -> tuple[frozenset[str], frozenset[str]]:
+) -> dict[str, RoomRecoveryStatus]:
+    """Consume and classify what this response settled about each room.
+
+    Loss outranks an outstanding gap for the same room: the dropped history is
+    irreversible, while the gap is reported again next response.
+    """
     outcomes = state.outcomes
     state.outcomes = {}
-    pending = frozenset(
+    room_recovery = classify_recovery_obligations(state, record=True)
+    for room_id, complete in outcomes.items():
+        if not complete:
+            room_recovery[room_id] = RoomRecoveryStatus.LOST
+        elif room_id not in room_recovery:
+            room_recovery[room_id] = RoomRecoveryStatus.RECOVERED
+    return room_recovery
+
+
+def recovered_room_ids(
+    room_recovery: Mapping[str, RoomRecoveryStatus],
+) -> frozenset[str]:
+    """Return the rooms this response proved complete."""
+    return frozenset(
         room_id
-        for room_id, gaps in state.gaps.items()
-        if any(gap.target_token for gap in gaps)
+        for room_id, status in room_recovery.items()
+        if status is RoomRecoveryStatus.RECOVERED
     )
-    recovered = (
-        frozenset(room_id for room_id, complete in outcomes.items() if complete)
-        - pending
+
+
+def unrecovered_room_ids(
+    room_recovery: Mapping[str, RoomRecoveryStatus],
+) -> frozenset[str]:
+    """Return the rooms this response did not prove complete, for any reason."""
+    return frozenset(
+        room_id
+        for room_id, status in room_recovery.items()
+        if status is not RoomRecoveryStatus.RECOVERED
     )
-    unrecovered = (
-        frozenset(room_id for room_id, complete in outcomes.items() if not complete)
-        | pending
-    )
-    return recovered, unrecovered
 
 
 def load_recovery_state(
@@ -1022,6 +1110,7 @@ def load_recovery_state(
     state.events.clear()
     state.completed.clear()
     state.outcomes.clear()
+    state._walk_marks.clear()
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,

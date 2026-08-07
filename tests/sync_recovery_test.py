@@ -18,6 +18,7 @@ from nio import (
     RoomMemberEvent,
     RoomMessageText,
     RoomInfo,
+    RoomRecoveryStatus,
     Timeline,
     TimelineEventProvenance,
     TypingNoticeEvent,
@@ -1527,10 +1528,8 @@ async def test_conflicting_overlap_order_keeps_gap_open_without_target():
     [gap] = state.gaps[ROOM]
     assert gap.cursor_token == "more"
     assert gap.target_token == "target"
-    assert take_recovery_outcomes(state) == (
-        frozenset(),
-        frozenset({ROOM}),
-    )
+    # The walk moved off "cursor", so the room owes work rather than losing it.
+    assert take_recovery_outcomes(state) == {ROOM: RoomRecoveryStatus.CONVERGING}
 
 
 @pytest.mark.asyncio
@@ -1793,14 +1792,60 @@ def test_recovery_outcome_keeps_open_real_gap_unrecovered():
     )
     state.outcomes = {ROOM: True, ROOM_B: False}
 
-    assert sync_recovery.take_recovery_outcomes(state) == (
-        frozenset(),
-        frozenset({ROOM, ROOM_B}),
+    # A room whose gap reopened is not recovered even though a gap closed, and
+    # a first sample of an owed walk cannot yet show a wedge.
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING,
+        ROOM_B: RoomRecoveryStatus.LOST,
+    }
+    # Nothing moved between the two takes, and the loss is not resurrected.
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.STALLED
+    }
+
+
+def test_a_drain_that_delivers_keeps_the_room_converging():
+    """Progress after the walk finishes shows in the queue, not the cursor."""
+    queued = [pending("$one", 1), pending("$two", 2)]
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", None)]},
+        events={(ROOM, 1): queued},
     )
-    assert sync_recovery.take_recovery_outcomes(state) == (
-        frozenset(),
-        frozenset({ROOM}),
-    )
+
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
+    # A drain bounded by its deadline delivers some callbacks and returns with
+    # the gap still open. The cursor cannot move in this phase.
+    queued.pop(0)
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.STALLED
+    }
+
+
+def test_a_new_gap_is_not_stalled_by_a_discharged_predecessor():
+    """A cleared room reuses generation 1, so its marks must not outlive it."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]})
+
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.STALLED
+    }
+
+    state.gaps.clear()
+    assert sync_recovery.take_recovery_outcomes(state) == {}
+
+    # A later response opens generation 1 again from the same position. It is a
+    # different walk, and one sample of it cannot show a wedge.
+    state.gaps[ROOM] = [RecoveryGap(ROOM, 1, "p1", "s1")]
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.CONVERGING
+    }
 
 
 def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
@@ -1814,7 +1859,7 @@ def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
 
     apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM, ROOM_B})))
 
-    assert sync_recovery.take_recovery_outcomes(state) == (
-        frozenset(),
-        frozenset({ROOM}),
-    )
+    # Clearing a targeted gap drops history; clearing a synthetic one does not.
+    assert sync_recovery.take_recovery_outcomes(state) == {
+        ROOM: RoomRecoveryStatus.LOST
+    }

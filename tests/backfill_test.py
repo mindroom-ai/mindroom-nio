@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import re
 import sys
 from dataclasses import replace
@@ -38,6 +39,7 @@ from nio import (
     RoomMemberEvent,
     RoomMessageText,
     RoomNameEvent,
+    RoomRecoveryStatus,
     Rooms,
     SendRetryError,
     SlidingSyncResponse,
@@ -776,24 +778,9 @@ class TestRoomLocalRecovery:
         assert client.has_uncommitted_classic_sync_state
         await client.close()
 
-    async def test_page_bound_gap_cannot_converge_under_an_application_owned_checkpoint(
-        self,
-        tempdir,
-        aioresponse,
-    ):
-        """A gap that only needs another pump is reported like one that failed.
-
-        Recovery is incremental by design: a walk that exhausts its page budget
-        keeps its cursor and resumes on the next pump, which is what
-        ``test_empty_page_and_page_bound_resume`` proves when nio owns the
-        cursor. But the room stays in ``unrecovered_room_ids`` meanwhile, and
-        the response stays unacknowledgeable, so an application that owns the
-        checkpoint has no way to tell "still walking" from "gave up". Its only
-        remedy, ``reset_classic_sync_state``, throws the half-walked cursor
-        away, so replaying the same checkpoint repeats the identical walk and
-        stalls at the identical page forever.
-        """
-        client = AsyncClient(
+    @staticmethod
+    def _owned_classic_client(tempdir, **config) -> AsyncClient:
+        return AsyncClient(
             "https://example.org",
             OWN_ID,
             "DEVICEID",
@@ -802,24 +789,39 @@ class TestRoomLocalRecovery:
                 backfill_limited_timelines=True,
                 backfill_persist_recovery=False,
                 store_sync_tokens=False,
-                backfill_max_pages=1,
+                **config,
             ),
         )
+
+    async def test_page_bound_gap_converges_across_responses_while_owed(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """A converging walk keeps its cursor because the response is committable.
+
+        A walk that exhausts its page budget keeps its cursor and resumes on the
+        next pump. The application can commit the response that opened the gap
+        because ``admitted_through_token`` stays at the last fully settled token
+        while ``next_batch`` moves on, so the obligation survives without the
+        application ever rejecting a response it processed correctly.
+        """
+        client = self._owned_classic_client(tempdir, backfill_max_pages=1)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         seen = record_events(client)
 
-        await client.receive_response(
-            sync_response(
-                "s1",
-                {
-                    ROOM_A: room_info(
-                        [text_event("$old", 1)], limited=False, prev_batch="p0"
-                    )
-                },
-            )
+        baseline = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [text_event("$old", 1)], limited=False, prev_batch="p0"
+                )
+            },
         )
+        await client.receive_response(baseline)
+        assert baseline.room_recovery == {}
+        assert baseline.admitted_through_token == "s1"
         client.acknowledge_classic_sync("s1")
-        assert not client.has_uncommitted_classic_sync_state
 
         pages = Pages(
             {
@@ -832,8 +834,257 @@ class TestRoomLocalRecovery:
         )
         aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
 
-        def limited_response() -> SyncResponse:
-            return sync_response(
+        limited = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(limited)
+
+        # One page succeeded and the budget ran out. The gap is owed, not lost.
+        assert pages.from_tokens == ["s1"]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        assert limited.room_recovery == {ROOM_A: RoomRecoveryStatus.CONVERGING}
+        assert limited.unrecovered_room_ids == frozenset({ROOM_A})
+        assert seen == ["$old"]
+
+        # The watermark stays behind the resume position, so committing the
+        # response cannot strand the gap's events.
+        assert limited.admitted_through_token == "s1"
+        with pytest.raises(LocalProtocolError, match="admitted-through watermark"):
+            client.acknowledge_classic_sync("s2")
+        client.acknowledge_classic_sync("s2", "s1")
+        assert not client.has_uncommitted_classic_sync_state
+
+        # No reset, so the next response resumes the walk instead of restarting it.
+        settled = sync_response(
+            "s3",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(settled)
+
+        assert pages.from_tokens == ["s1", "more"]
+        assert client._recovery.gaps == {}
+        assert settled.room_recovery == {ROOM_A: RoomRecoveryStatus.RECOVERED}
+        assert settled.unrecovered_room_ids == frozenset()
+        assert seen == ["$old", "$gap1", "$gap2", "$held"]
+        assert settled.admitted_through_token == "s3"
+        client.acknowledge_classic_sync("s3")
+        await client.close()
+
+    async def test_a_walk_that_stops_advancing_is_reported_stalled(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """Two pumps against an unmoved cursor separate a wedge from slowness."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500, repeat=True)
+
+        first = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(first)
+
+        # One sample cannot show a wedge, so the first classification is generous.
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert first.room_recovery == {ROOM_A: RoomRecoveryStatus.CONVERGING}
+        assert first.admitted_through_token == "s1"
+
+        second = sync_response(
+            "s3",
+            {ROOM_A: room_info([], limited=False, prev_batch="p1")},
+        )
+        await client.receive_response(second)
+
+        # The cursor has not moved and nothing was delivered, so retrying it
+        # again is not going to help.
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "s1"
+        assert second.room_recovery == {ROOM_A: RoomRecoveryStatus.STALLED}
+        assert second.unrecovered_room_ids == frozenset({ROOM_A})
+        assert second.admitted_through_token == "s1"
+        await client.close()
+
+    async def test_a_stalled_walk_that_resumes_is_converging_again(
+        self,
+        tempdir,
+        aioresponse,
+    ):
+        """A stall is a live observation, not a verdict a room is stuck with."""
+        client = self._owned_classic_client(tempdir, backfill_max_pages=1)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        aioresponse.get(MESSAGES_URL, status=500)
+        aioresponse.get(MESSAGES_URL, status=500)
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages([text_event("$gap", 2)], "more"),
+        )
+
+        statuses = []
+        for index, token in enumerate(("s2", "s3", "s4")):
+            response = sync_response(
+                token,
+                (
+                    {
+                        ROOM_A: room_info(
+                            [text_event("$held", 3)], limited=True, prev_batch="p1"
+                        )
+                    }
+                    if index == 0
+                    else {ROOM_A: room_info([], limited=False, prev_batch="p1")}
+                ),
+            )
+            await client.receive_response(response)
+            statuses.append(response.room_recovery[ROOM_A])
+
+        assert statuses == [
+            RoomRecoveryStatus.CONVERGING,
+            RoomRecoveryStatus.STALLED,
+            RoomRecoveryStatus.CONVERGING,
+        ]
+        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
+        await client.close()
+
+    async def test_lost_history_outranks_an_outstanding_gap(self, tempdir):
+        """A room that dropped history reports the loss, not the pending walk."""
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client._recovery.gaps[ROOM_A] = [RecoveryGap(ROOM_A, 1, "target", "cursor")]
+        client._recovery.outcomes[ROOM_A] = False
+        client._recovery.outcomes[ROOM_B] = True
+
+        response = sync_response("s2", {})
+        client._publish_recovery_outcome(response)
+
+        assert response.room_recovery == {
+            ROOM_A: RoomRecoveryStatus.LOST,
+            ROOM_B: RoomRecoveryStatus.RECOVERED,
+        }
+        assert response.recovered_room_ids == frozenset({ROOM_B})
+        assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        # An outstanding gap keeps the watermark back even when the room's
+        # more urgent news is the loss.
+        assert response.admitted_through_token is None
+        await client.close()
+
+    async def test_a_failed_response_cannot_advance_the_watermark(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A quiet recovery is not proof that the response was applied.
+
+        Recovery outcomes are published from a ``finally``, so a response whose
+        handling raised still reports. The dangerous shape is a failure *after*
+        recovery drained: the timeline is delivered and nothing is owed, so the
+        recovery state alone looks settled, while the rest of the response --
+        here its global account data -- was never applied. A watermark taken
+        from recovery quietness would certify past it.
+        """
+        client = self._owned_classic_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        seen = record_events(client)
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {ROOM_A: room_info([], limited=False, prev_batch="p0")},
+            )
+        )
+        client.acknowledge_classic_sync("s1")
+
+        async def fail_account_data(_response):
+            raise RuntimeError("response failed")
+
+        monkeypatch.setattr(
+            client,
+            "_handle_global_account_data_events",
+            fail_account_data,
+        )
+        failed = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$delivered", 2)], limited=False, prev_batch="p0"
+                )
+            },
+        )
+        with pytest.raises(RuntimeError, match="response failed"):
+            await client.receive_response(failed)
+
+        # Recovery really is finished, and the cursor really did move.
+        assert seen == ["$delivered"]
+        assert client.next_batch == "s2"
+        assert client._recovery.gaps == {}
+        assert failed.room_recovery == {}
+        # The response still failed, so the watermark stays where it was.
+        assert failed.admitted_through_token == "s1"
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s2", "s1")
+        await client.close()
+
+    async def test_reset_still_discards_an_in_flight_walk(
+        self,
+        tempdir,
+        aioresponse,
+        caplog,
+    ):
+        """Reset stays destructive, so the loop it used to cause stays visible.
+
+        Nothing here is a fix: a reset must clear held events and completed
+        markers or the replay it exists to enable cannot redispatch them. The
+        point is that the cost is now logged and no longer forced, because a
+        converging gap does not block acknowledgement.
+        """
+        client = self._owned_classic_client(tempdir, backfill_max_pages=1)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$old", 1)], limited=False, prev_batch="p0"
+                    )
+                },
+            )
+        )
+        pages = Pages(
+            {
+                "s1": messages([text_event("$gap1", 2)], "more"),
+                "more": messages([text_event("$held", 4)], "p1"),
+            }
+        )
+        aioresponse.get(MESSAGES_URL, callback=pages, repeat=True)
+        await client.receive_response(
+            sync_response(
                 "s2",
                 {
                     ROOM_A: room_info(
@@ -841,31 +1092,16 @@ class TestRoomLocalRecovery:
                     )
                 },
             )
-
-        first = limited_response()
-        await client.receive_response(first)
-
-        # Every request succeeded; the walk simply ran out of pages.
-        assert pages.from_tokens == ["s1"]
+        )
         assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
-        assert first.unrecovered_room_ids == frozenset({ROOM_A})
-        assert seen == ["$old"]
-        with pytest.raises(LocalProtocolError, match="does not match"):
-            client.acknowledge_classic_sync("s2")
 
-        await client.reset_classic_sync_state()
+        with caplog.at_level(logging.WARNING, logger="nio.client.async_client"):
+            await client.reset_classic_sync_state()
+
+        assert "Discarding in-flight recovery" in caplog.text
+        assert "'more'" in caplog.text
         assert client._recovery.gaps == {}
-        client.next_batch = "s1"
-
-        second = limited_response()
-        await client.receive_response(second)
-
-        # The resume cursor is gone, so the second attempt asks the identical
-        # question and stalls in the identical place.
-        assert pages.from_tokens == ["s1", "s1"]
-        assert client._recovery.gaps[ROOM_A][0].cursor_token == "more"
-        assert second.unrecovered_room_ids == frozenset({ROOM_A})
-        assert seen == ["$old"]
+        assert client._classic_sync_admitted_through is None
         await client.close()
 
     async def test_application_owned_classic_state_rejects_ack_while_callback_is_active(
