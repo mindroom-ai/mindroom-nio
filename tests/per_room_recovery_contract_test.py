@@ -39,6 +39,7 @@ from nio import (
     TimelineEventProvenance,
 )
 from nio.responses import RoomMessagesError, RoomMessagesResponse
+from nio.store import SqliteMemoryStore
 
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"
@@ -72,10 +73,15 @@ def room_info(events: list, *, limited: bool, prev_batch: str | None) -> RoomInf
     return RoomInfo(Timeline(events, limited, prev_batch), [], [], [])
 
 
-def sync_response(token: str, joined: dict[str, RoomInfo]) -> SyncResponse:
+def sync_response(
+    token: str,
+    joined: dict[str, RoomInfo],
+    *,
+    left: dict[str, RoomInfo] | None = None,
+) -> SyncResponse:
     return SyncResponse(
         token,
-        Rooms({}, joined, {}),
+        Rooms({}, joined, left or {}),
         DeviceOneTimeKeyCount(49, 50),
         DeviceList([], []),
         [],
@@ -250,6 +256,34 @@ class TestPerRoomRecoveryContract:
         await open_a_stuck_gap(client, fetch, monkeypatch)
 
         assert client._recovery_store is None
+        with pytest.raises(LocalProtocolError, match="does not match"):
+            client.acknowledge_classic_sync("s1")
+        await client.close()
+
+    async def test_memory_store_does_not_make_an_open_gap_durable(
+        self,
+        monkeypatch,
+    ):
+        """A store that dies with the client cannot justify cursor advance."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            config=AsyncClientConfig(
+                store=SqliteMemoryStore,
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=True,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(429)]),
+            monkeypatch,
+        )
+
+        assert client._recovery_store is not None
         with pytest.raises(LocalProtocolError, match="does not match"):
             client.acknowledge_classic_sync("s1")
         await client.close()
@@ -486,6 +520,71 @@ class TestPerRoomRecoveryContract:
             reopened._recovery.abandoned == set()
         ), "acknowledgement must be durable too, or the loss returns on restart"
         await reopened.close()
+
+    @pytest.mark.parametrize("recovery_status", [403, 429])
+    async def test_membership_reset_never_settles_or_hides_a_real_loss(
+        self,
+        tempdir,
+        monkeypatch,
+        recovery_status,
+    ):
+        """Resetting room recovery cannot stand in for application settlement."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(recovery_status)]),
+            monkeypatch,
+        )
+        client.acknowledge_classic_sync("s1")
+
+        reset = sync_response(
+            "s2",
+            {},
+            left={ROOM_A: room_info([], limited=False, prev_batch=None)},
+        )
+        await client.receive_response(reset)
+
+        assert client._recovery.abandoned == {ROOM_A}
+        assert client.store
+        assert client.store.load_sync_recovery()[2] == [ROOM_A]
+        client.acknowledge_classic_sync("s2")
+
+        later = sync_response("s3", {})
+        await client.receive_response(later)
+        assert later.unrecovered_room_ids == frozenset({ROOM_A})
+        await client.close()
+
+    async def test_failed_abandonment_acknowledgement_is_retryable(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A failed durable clear must leave memory available for a retry."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(403)]),
+            monkeypatch,
+        )
+        assert client.store
+        store = client.store
+        original = store.clear_recovery_abandonment
+
+        def fail(_room_ids):
+            raise OSError("disk failure")
+
+        monkeypatch.setattr(store, "clear_recovery_abandonment", fail)
+        with pytest.raises(OSError, match="disk failure"):
+            client.acknowledge_unrecovered_rooms([ROOM_A])
+        assert client._recovery.abandoned == {ROOM_A}
+
+        monkeypatch.setattr(store, "clear_recovery_abandonment", original)
+        assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
+        assert client._recovery.abandoned == set()
+        assert store.load_sync_recovery()[2] == []
+        await client.close()
 
     @pytest.mark.parametrize("last_page", ["empty", "final_events"])
     async def test_page_without_end_closes_a_bounded_walk_as_exhausted(

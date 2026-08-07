@@ -640,6 +640,20 @@ class TestClass:
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$held")
         assert sqlstore.load_sync_recovery()[1][0].admission_accepted
 
+    def test_clearing_recovery_rows_does_not_clear_abandonment(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_rooms={TEST_ROOM},
+        )
+
+        sqlstore.save_recovery(None, {TEST_ROOM}, [], [], None)
+
+        assert sqlstore.load_sync_recovery()[2] == [TEST_ROOM]
+
     def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
         self,
         sqlstore,

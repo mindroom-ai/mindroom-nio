@@ -18,7 +18,7 @@ import os
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from Crypto.Cipher import AES
 from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
@@ -125,6 +125,7 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
+    is_durable: ClassVar[bool] = True
     models = [
         Accounts,
         OlmSessions,
@@ -703,10 +704,6 @@ class MatrixStore:
                 SyncRecoveryGaps.account == account,
                 SyncRecoveryGaps.room_id.in_(room_batch),
             ).execute()
-            SyncRecoveryAbandonedRooms.delete().where(
-                SyncRecoveryAbandonedRooms.account == account,
-                SyncRecoveryAbandonedRooms.room_id.in_(room_batch),
-            ).execute()
         if clear_recovered:
             self._restore_completed_markers(
                 account,
@@ -725,9 +722,6 @@ class MatrixStore:
             SyncRecoveryGaps.replace_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).execute()
-        # After the clear above, for the same reason the in-memory set applies
-        # them in this order: one plan can both reset a room and declare its
-        # held events lost, and the loss is what has to survive.
         abandoned = [
             {"account": account, "room_id": room_id} for room_id in abandoned_rooms
         ]
@@ -1693,6 +1687,8 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
+
+    is_durable: ClassVar[bool] = False
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

@@ -739,6 +739,7 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
+    unrecovered = unrecovered or any(gap.target_token for gap in gaps)
     unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
     if not live:
         return RecoveryPlan(
@@ -792,12 +793,13 @@ def plan_room_timeline(
     ):
         apply_state_live_event_count = 0
 
+    previous_gaps = state.gaps.get(room_id, ())
     clear = reset_recovery or _timeline_clears_recovery(
         timeline_events,
         user_id,
         live_event_count,
     )
-    existing = () if clear else state.gaps.get(room_id, ())
+    existing = () if clear else previous_gaps
     new_gap = would_plan_real_gap(
         timeline_events=timeline_events,
         user_id=user_id,
@@ -884,6 +886,11 @@ def plan_room_timeline(
         frozenset({room_id}) if clear else frozenset(),
         (gap,) if gap else (),
         tuple(events),
+        unrecovered_room_ids=(
+            frozenset({room_id})
+            if clear and any(gap.target_token for gap in previous_gaps)
+            else frozenset()
+        ),
     )
 
 
@@ -1032,9 +1039,8 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     for key in {(event.room_id, event.generation) for event in plan.events}:
         state.events[key].sort(key=lambda item: item.sequence)
 
-    # Order matters: a room can be cleared and abandoned by one plan when the
-    # held-event cap forces a reset, and that reset is a real loss.
-    state.abandoned -= plan.clear_rooms
+    # Clearing room recovery does not settle a loss. Only the application can
+    # do that after recording the missing work somewhere it owns.
     state.abandoned |= plan.unrecovered_room_ids
 
 

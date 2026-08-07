@@ -766,6 +766,12 @@ class AsyncClient(Client):
             return None
         return self.store
 
+    @property
+    def _recovery_store_is_durable(self) -> bool:
+        """Return whether recovery rows survive client and process recreation."""
+        store = self._recovery_store
+        return store is not None and store.is_durable
+
     def load_store(self):
         super().load_store()
         store = self._recovery_store
@@ -842,7 +848,7 @@ class AsyncClient(Client):
             or self._recovery._active_dispatches
             or has_uncommitted_recovery_work(
                 self._recovery,
-                durable=self._recovery_store is not None,
+                durable=self._recovery_store_is_durable,
             )
         ):
             raise LocalProtocolError(
@@ -1337,11 +1343,11 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Unrecovered rooms require limited-timeline recovery."
             )
-        settled = acknowledge_unrecovered_rooms(self._recovery, room_ids)
+        candidates = frozenset(self._recovery.abandoned & set(room_ids))
         store = self._recovery_store
-        if store and settled:
-            store.clear_recovery_abandonment(settled)
-        return settled
+        if store and candidates:
+            store.clear_recovery_abandonment(candidates)
+        return acknowledge_unrecovered_rooms(self._recovery, candidates)
 
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
@@ -1655,7 +1661,7 @@ class AsyncClient(Client):
             and not self._recovery._active_dispatches
             and not has_uncommitted_recovery_work(
                 self._recovery,
-                durable=self._recovery_store is not None,
+                durable=self._recovery_store_is_durable,
             )
         ):
             self._classic_sync_acknowledgeable_token = response.next_batch
