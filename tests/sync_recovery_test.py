@@ -232,6 +232,24 @@ def test_classic_initial_own_join_clears_stale_recovery():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
+    assert plan.unrecovered_room_ids == frozenset()
+
+
+def test_membership_reset_leaves_real_gap_loss_for_persistence():
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="leave",
+    )
+
+    assert plan.clear_rooms == frozenset({ROOM})
+    assert plan.unrecovered_room_ids == frozenset()
 
 
 def test_sync_history_counts_toward_held_cap():

@@ -713,7 +713,7 @@ class TestClass:
             1,
             0,
             "$completed",
-            '{"content":{},"event_id":"$completed","sender":"@a:b",' '"type":"m.test"}',
+            '{"content":{},"event_id":"$completed","sender":"@a:b","type":"m.test"}',
             True,
             False,
         )
@@ -1277,135 +1277,6 @@ class TestClass:
         gaps, events, _ = sqlstore.load_sync_recovery()
         assert not gaps
         assert not events
-
-    def test_save_recovery_snapshot_replaces_state_atomically(
-        self,
-        sqlstore,
-        monkeypatch,
-    ):
-        """A complete checkpoint replaces all recovery rows or none of them."""
-        old_gap = RecoveryGap(TEST_ROOM, 1, "old-target", "old-cursor")
-        old_pending = PendingTimelineEvent(
-            TEST_ROOM,
-            1,
-            0,
-            "$old-pending",
-            "{}",
-            True,
-            False,
-        )
-        old_completed = PendingTimelineEvent(
-            TEST_ROOM,
-            1,
-            1,
-            "$old-completed",
-            "{}",
-            True,
-            False,
-        )
-        sqlstore.save_recovery(
-            None,
-            set(),
-            [old_gap],
-            [old_pending, old_completed],
-            None,
-            abandoned_rooms={"!old-lost:example.org"},
-        )
-        sqlstore.finish_recovery(
-            old_gap.room_id,
-            old_gap.generation,
-            old_completed.event_id,
-            False,
-        )
-
-        replacement_gap = RecoveryGap(
-            TEST_ROOM_2,
-            3,
-            "new-target",
-            "new-cursor",
-        )
-        replacement_pending = PendingTimelineEvent(
-            TEST_ROOM_2,
-            3,
-            0,
-            "$new-pending",
-            "{}",
-            True,
-            False,
-        )
-        replacement_marker = PendingTimelineEvent(
-            TEST_ROOM_2,
-            0,
-            0,
-            "$new-completed",
-            "",
-            False,
-            True,
-            provenance=TimelineEventProvenance.RECOVERED,
-            apply_room_state=False,
-        )
-        replacement = (
-            (replacement_gap,),
-            (replacement_pending, replacement_marker),
-            frozenset({"!new-lost:example.org"}),
-        )
-
-        sqlstore.save_recovery_snapshot(*replacement)
-
-        gaps, events, abandoned = sqlstore.load_sync_recovery()
-        assert [
-            (
-                gap.room_id,
-                gap.generation,
-                gap.target_token,
-                gap.cursor_token,
-                bool(gap.membership_bound),
-            )
-            for gap in gaps
-        ] == [
-            (
-                replacement_gap.room_id,
-                replacement_gap.generation,
-                replacement_gap.target_token,
-                replacement_gap.cursor_token,
-                replacement_gap.membership_bound,
-            )
-        ]
-        assert events == [replacement_marker, replacement_pending]
-        assert abandoned == sorted(replacement[2])
-
-        def fail_after_deletes(*_args, **_kwargs):
-            raise RuntimeError("snapshot interrupted")
-
-        monkeypatch.setattr(sqlstore, "_upsert_pending_events", fail_after_deletes)
-        with pytest.raises(RuntimeError, match="snapshot interrupted"):
-            sqlstore.save_recovery_snapshot(
-                (RecoveryGap(TEST_ROOM, 9, "failed-target", None),),
-                (),
-                frozenset(),
-            )
-
-        gaps, events, abandoned = sqlstore.load_sync_recovery()
-        assert [
-            (
-                gap.room_id,
-                gap.generation,
-                gap.target_token,
-                gap.cursor_token,
-                bool(gap.membership_bound),
-            )
-            for gap in gaps
-        ] == [
-            (
-                replacement_gap.room_id,
-                replacement_gap.generation,
-                replacement_gap.target_token,
-                replacement_gap.cursor_token,
-                replacement_gap.membership_bound,
-            )
-        ]
-        assert events == [replacement_marker, replacement_pending]
-        assert abandoned == sorted(replacement[2])
 
     def test_forget_sliding_window_token(self, sqlstore):
         sqlstore.save_sliding_window_tokens(

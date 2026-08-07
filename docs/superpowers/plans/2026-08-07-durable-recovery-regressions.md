@@ -69,7 +69,7 @@ at the beginning of `sync()` and inside the serialized response path before
 ordering floors or client state mutate.
 
 Restore application-owned staging to the memory-only condition. Remove
-`_recovery_write_store`, acknowledgement-time `save_recovery_snapshot()`, reset
+`_recovery_write_store`, acknowledgement-time snapshot persistence, reset
 reloads from nio's store, and durability-dependent acknowledgement logic.
 
 - [ ] **Step 5: Run Task 1 tests**

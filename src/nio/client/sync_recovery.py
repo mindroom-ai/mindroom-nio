@@ -719,7 +719,6 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
-    unrecovered = unrecovered or any(gap.target_token for gap in gaps)
     unrecovered_room_ids = frozenset({room_id}) if unrecovered else frozenset()
     if not live:
         return RecoveryPlan(
@@ -849,7 +848,7 @@ def plan_room_timeline(
             state,
             room_id,
             events,
-            unrecovered=new_gap or any(gap.target_token for gap in existing),
+            unrecovered=new_gap,
         )
     gap = (
         RecoveryGap(
@@ -866,11 +865,6 @@ def plan_room_timeline(
         frozenset({room_id}) if clear else frozenset(),
         (gap,) if gap else (),
         tuple(events),
-        unrecovered_room_ids=(
-            frozenset({room_id})
-            if clear and any(gap.target_token for gap in previous_gaps)
-            else frozenset()
-        ),
     )
 
 
