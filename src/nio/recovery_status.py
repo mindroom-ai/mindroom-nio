@@ -8,7 +8,32 @@ wedged, and both of those from history nio has already given up on. A single
 that produces silent history loss.
 """
 
+from dataclasses import dataclass
 from enum import Enum
+
+
+@dataclass(frozen=True)
+class AbandonedRecovery:
+    """One room's continuity debt, given up on.
+
+    ``unwalked_from_token`` and ``unwalked_to_token`` bound the span the walk
+    never covered, in the server's own token space.
+    ``unwalked_event_count`` is ``None`` when the walk never reached its
+    target: nio never fetched that span and cannot say how much is in it. It is
+    ``0`` when the walk had already finished and only undelivered callbacks
+    remained, where the whole loss is ``discarded_recovered_events``.
+
+    This lives beside :class:`RoomRecoveryStatus` rather than with the recovery
+    machinery because a response carries it, and ``responses`` is imported by
+    that machinery rather than the other way round.
+    """
+
+    room_id: str
+    unwalked_from_token: str | None
+    unwalked_to_token: str
+    unwalked_event_count: int | None
+    discarded_recovered_events: int
+    retained_live_events: int
 
 
 class RoomRecoveryStatus(str, Enum):
