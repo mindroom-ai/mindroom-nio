@@ -1,11 +1,49 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from nio import TimelineEventProvenance
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "live_sliding_sync_check.py"
 SPEC = importlib.util.spec_from_file_location("live_sliding_sync_check", SCRIPT)
 assert SPEC and SPEC.loader
 live_check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(live_check)
+
+
+@pytest.mark.asyncio
+async def test_recorder_observe_recovery_forwards_all_dispatch_arguments():
+    recorder = live_check.Recorder("test")
+    forwarded = []
+    result = object()
+
+    async def original(*args):
+        forwarded.append(args)
+        return result
+
+    client = SimpleNamespace(_dispatch_timeline_event=original)
+    recorder.observe_recovery(client)
+
+    room_id = "!room:example.org"
+    event = SimpleNamespace(event_id="$event")
+    mark = lambda: None
+    args = (
+        room_id,
+        event,
+        False,
+        "timeline",
+        TimelineEventProvenance.LIVE,
+        True,
+        False,
+        True,
+        mark,
+    )
+
+    assert await client._dispatch_timeline_event(*args) is result
+    assert forwarded == [args]
+    assert recorder.recovery_live == {"$event": True}
 
 
 def test_recovery_order_allows_live_events_to_overtake_history():

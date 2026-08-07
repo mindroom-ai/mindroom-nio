@@ -629,9 +629,11 @@ class Recorder:
         async def record_lane(
             room_id,
             event,
-            is_live,
             was_completed,
             kind,
+            provenance,
+            is_live,
+            apply_room_state,
             admission_accepted,
             mark_admission_accepted,
         ):
@@ -641,9 +643,11 @@ class Recorder:
             return await dispatch(
                 room_id,
                 event,
-                is_live,
                 was_completed,
                 kind,
+                provenance,
+                is_live,
+                apply_room_state,
                 admission_accepted,
                 mark_admission_accepted,
             )
