@@ -6840,10 +6840,7 @@ class TestRoomLocalRecovery:
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
+            config=AsyncClientConfig(backfill_limited_timelines=True),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         requests: list[type[SyncResponse] | type[SlidingSyncResponse]] = []
@@ -6960,10 +6957,7 @@ class TestRoomLocalRecovery:
             OWN_ID,
             "DEVICEID",
             tempdir,
-            config=AsyncClientConfig(
-                backfill_limited_timelines=True,
-                store_sync_tokens=True,
-            ),
+            config=AsyncClientConfig(backfill_limited_timelines=True),
         )
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         classic_started = asyncio.Event()

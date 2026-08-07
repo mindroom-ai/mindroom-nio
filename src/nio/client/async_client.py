@@ -2397,6 +2397,7 @@ class AsyncClient(Client):
                     isinstance(sync_response, SlidingSyncResponse)
                     and self._classic_sync_state_staged
                     and not self.config.store_sync_tokens
+                    and self._recovery_store is not None
                 ):
                     raise LocalProtocolError(
                         "Sliding Sync cannot be applied while application-owned "
