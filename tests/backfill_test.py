@@ -7786,16 +7786,32 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in client._recovery.gaps
         assert not any(room_id == ROOM_A for room_id, _ in client._recovery.events)
+        assert client._recovery.abandoned == {ROOM_A}
         assert client._sliding_room_prev_batch == {}
-        gaps, events, _ = client.store.load_sync_recovery()
+        gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
         assert [
             event
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
+        assert abandoned == [ROOM_A]
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
+        client.store.database.close()
+
+        restarted = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=client.config,
+        )
+        await restarted.receive_response(LoginResponse.from_dict(LOGIN))
+
+        assert ROOM_A not in restarted._recovery.gaps
+        assert restarted._recovery.abandoned == {ROOM_A}
+        await restarted.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_application_owned_membership_change_does_not_write_recovery_store(
