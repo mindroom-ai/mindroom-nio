@@ -632,21 +632,21 @@ class Recorder:
             was_completed,
             kind,
             provenance,
-            is_live,
+            sync_origin,
             apply_room_state,
             admission_accepted,
             mark_admission_accepted,
         ):
             event_id = getattr(event, "event_id", None)
             if event_id and kind == "timeline":
-                self.recovery_live[event_id] = is_live
+                self.recovery_live[event_id] = sync_origin
             return await dispatch(
                 room_id,
                 event,
                 was_completed,
                 kind,
                 provenance,
-                is_live,
+                sync_origin,
                 apply_room_state,
                 admission_accepted,
                 mark_admission_accepted,
