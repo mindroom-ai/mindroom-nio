@@ -1176,7 +1176,7 @@ def take_recovery_outcomes(
         | pending
         | abandoned_ids
     )
-    return recovered, unrecovered, abandoned
+    return recovered, unrecovered, dict(abandoned)
 
 
 def load_recovery_state(

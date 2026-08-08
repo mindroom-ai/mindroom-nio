@@ -182,6 +182,7 @@ class LegacyRecoveryStore(UndeclaredAtomicStore):
         forgotten_rooms=(),
         abandoned_rooms=(),
     ):
+        self.last_legacy_abandoned_rooms = tuple(abandoned_rooms)
         return super().save_recovery(
             token,
             clear_rooms,
@@ -737,7 +738,6 @@ class TestPerRoomRecoveryContract:
         "response",
         [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
     )
-    @pytest.mark.expects_anonymous_recovery_clear
     async def test_legacy_atomic_store_receives_released_call_shapes_after_reset(
         self,
         tempdir,
@@ -773,6 +773,7 @@ class TestPerRoomRecoveryContract:
 
             assert result is response
             assert network_called
+            assert client.store.last_legacy_abandoned_rooms == (ROOM_A,)
             gaps, _, abandoned = client.store.load_sync_recovery()
             assert gaps == []
             assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})}
@@ -1298,6 +1299,53 @@ class TestPerRoomRecoveryContract:
         await client.receive_response(settled)
         assert settled.abandoned_rooms == {}
         assert settled.unrecovered_room_ids == frozenset()
+        await client.close()
+
+    async def test_published_abandonment_is_a_snapshot(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """Settling current state must not rewrite an earlier response."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        response = await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(403)]),
+            monkeypatch,
+        )
+        expected = {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED}),
+        }
+        assert response.abandoned_rooms == expected
+
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+        current = {
+            ROOM_A: frozenset(
+                {
+                    RecoveryAbandonment.EVENT_LIMIT,
+                    RecoveryAbandonment.FETCH_FAILED,
+                }
+            ),
+        }
+        assert client._recovery.abandoned == current
+        assert response.abandoned_rooms == expected
+
+        response.abandoned_rooms[ROOM_B] = frozenset({RecoveryAbandonment.UNKNOWN})
+        assert client._recovery.abandoned == current
+        del response.abandoned_rooms[ROOM_B]
+
+        assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
+
+        assert client._recovery.abandoned == {}
+        assert response.abandoned_rooms == expected
         await client.close()
 
     async def test_a_cancelled_sync_still_names_an_abandoned_room(

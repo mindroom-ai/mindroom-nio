@@ -405,7 +405,7 @@ class _SyncGeneration:
 
 
 @dataclass
-class _EventCallbackScope:
+class _CallbackScope:
     active: bool = True
 
 
@@ -687,8 +687,11 @@ class AsyncClient(Client):
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
         self.event_admission_callback: ClientCallback | None = None
-        self._event_callback_scope: ContextVar[_EventCallbackScope | None] = ContextVar(
+        self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
+        )
+        self._response_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
+            f"nio_response_callback_scope_{id(self)}", default=None
         )
 
         self.sharing_session: dict[str, AsyncioEvent] = {}
@@ -1532,7 +1535,7 @@ class AsyncClient(Client):
         room: MatrixRoom | None = None,
         *callback_args: object,
     ) -> None:
-        scope = _EventCallbackScope()
+        scope = _CallbackScope()
         token = self._event_callback_scope.set(scope)
         try:
             for callback in callbacks:
@@ -1583,7 +1586,13 @@ class AsyncClient(Client):
 
     async def _on_response(self, response: Response | ErrorResponse):
         for cb in self.response_callbacks:
-            await cb.async_execute(response)
+            scope = _CallbackScope()
+            token = self._response_callback_scope.set(scope)
+            try:
+                await cb.async_execute(response)
+            finally:
+                scope.active = False
+                self._response_callback_scope.reset(token)
 
     async def _handle_sync(
         self,
@@ -2000,6 +2009,16 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Room membership changes cannot run from an active Classic Sync operation."
             )
+        response_callback_scope = self._response_callback_scope.get()
+        if (
+            response_callback_scope is not None
+            and response_callback_scope.active
+            and self._active_sync_executor_token is not None
+            and self._sync_executor_context.get() is self._active_sync_executor_token
+        ):
+            raise LocalProtocolError(
+                "Room membership changes cannot run from an active sync response."
+            )
 
         async def reset_after_response() -> _RoomMembershipResponseT:
             response = await send_request()
@@ -2036,17 +2055,21 @@ class AsyncClient(Client):
                 # cannot create this row itself, but failing here is safer than
                 # silently clearing work written by another store owner.
                 self._require_atomic_recovery_store(store)
+            clear_room_reasons = (
+                {room_id: RecoveryAbandonment.BASELINE_LOST} if has_real_gap else {}
+            )
             persist_response_plan(
                 self._recovery,
                 store,
                 token=None,
                 plan=RecoveryPlan(
                     clear_rooms=frozenset({room_id}),
-                    clear_room_reasons=(
-                        {room_id: RecoveryAbandonment.BASELINE_LOST}
-                        if has_real_gap
+                    abandoned_rooms=(
+                        clear_room_reasons
+                        if store and not store.supports_recovery_abandonment_reasons
                         else {}
                     ),
+                    clear_room_reasons=clear_room_reasons,
                 ),
                 forgotten_rooms=(room_id,),
             )
@@ -5233,8 +5256,8 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
 
         Raises:
-            LocalProtocolError: If called from an event callback context while
-                limited-timeline recovery is enabled.
+            LocalProtocolError: If called from an event callback or active sync
+                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_leave(self.access_token, room_id)
 
@@ -5260,8 +5283,8 @@ class AsyncClient(Client):
             room_id (str): The room id of the room to forget.
 
         Raises:
-            LocalProtocolError: If called from an event callback context while
-                limited-timeline recovery is enabled.
+            LocalProtocolError: If called from an event callback or active sync
+                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_forget(self.access_token, room_id)
 

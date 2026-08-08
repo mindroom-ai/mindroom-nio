@@ -52,7 +52,7 @@ from nio import (
     UnknownBadEvent,
     UnknownToDeviceEvent,
 )
-from nio.api import MATRIX_API_PATH_V3, Api
+from nio.api import MATRIX_API_PATH_V3, Api, MessageDirection
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
     RecoveryGap,
@@ -869,6 +869,179 @@ class TestRoomLocalRecovery:
         assert attempts == 2
         assert callback_errors
         await client.close()
+
+    async def test_messages_retry_callback_rejects_membership_from_sync_executor(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A retry callback cannot make its owning sync await itself."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                max_limit_exceeded=1,
+                store_sync_tokens=False,
+            ),
+        )
+        client.access_token = "token"
+        callback_entered = asyncio.Event()
+        message_attempts = 0
+        leave_attempts = 0
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(_method, path, *_args, **_kwargs):
+            nonlocal leave_attempts, message_attempts
+            if path.endswith("/leave"):
+                leave_attempts += 1
+                return Transport(200)
+            message_attempts += 1
+            return Transport(429 if message_attempts == 1 else 200)
+
+        async def create_matrix_response(*, response_class, data=None, **_kwargs):
+            if response_class is RoomLeaveResponse:
+                return RoomLeaveResponse.from_dict({})
+            if message_attempts == 1:
+                return RoomMessagesError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry",
+                        "retry_after_ms": 1,
+                    },
+                    data[0],
+                )
+            return RoomMessagesResponse.from_dict(
+                {"start": "p1", "end": "s0", "chunk": []},
+                data[0],
+            )
+
+        async def reenter(_response):
+            callback_entered.set()
+            await client.room_leave(ROOM_A)
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+        client.add_response_callback(reenter, RoomMessagesError)
+
+        executor = object()
+        context_token = client._sync_executor_context.set(executor)
+        client._active_sync_executor_token = executor
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(
+            client._recovery_room_messages(
+                ROOM_A,
+                "p1",
+                "s0",
+                MessageDirection.back,
+                10,
+            )
+        )
+        try:
+            await asyncio.wait_for(callback_entered.wait(), 0.5)
+            done, _ = await asyncio.wait((task,), timeout=0.05)
+            assert done == {task}, "429 callback deadlocked on sync-response lock"
+            with pytest.raises(LocalProtocolError, match="active sync"):
+                await task
+            assert leave_attempts == 0
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+            if client._sync_response_lock.locked():
+                client._sync_response_lock.release()
+            if not task.done():
+                await task
+            await client.close()
+
+    async def test_detached_response_callback_membership_runs_after_scope_exits(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """A child the response callback does not await may run afterward."""
+        child: asyncio.Task | None = None
+        release_child = asyncio.Event()
+        membership_requests = 0
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            membership_requests += 1
+            assert response_class is RoomLeaveResponse
+            return RoomLeaveResponse.from_dict({})
+
+        async def spawn_child(_response):
+            nonlocal child
+
+            async def leave_later():
+                await release_child.wait()
+                return await client.room_leave(ROOM_A)
+
+            child = asyncio.create_task(leave_later())
+
+        monkeypatch.setattr(client, "_send", send)
+        client.add_response_callback(spawn_child, RoomMessagesError)
+        response = RoomMessagesError.from_dict(
+            {"errcode": "M_UNKNOWN", "error": "failed"},
+            ROOM_A,
+        )
+
+        executor = object()
+        context_token = client._sync_executor_context.set(executor)
+        client._active_sync_executor_token = executor
+        try:
+            await client.run_response_callbacks([response])
+            assert child is not None
+            release_child.set()
+            result = await asyncio.wait_for(child, 0.5)
+            assert isinstance(result, RoomLeaveResponse)
+            assert membership_requests == 1
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+
+    async def test_response_callback_membership_from_other_executor_is_allowed(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """Only a callback descended from the lock owner can form the cycle."""
+        membership_requests = 0
+        results = []
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            membership_requests += 1
+            assert response_class is RoomLeaveResponse
+            return RoomLeaveResponse.from_dict({})
+
+        async def leave_room(_response):
+            results.append(await client.room_leave(ROOM_A))
+
+        monkeypatch.setattr(client, "_send", send)
+        client.add_response_callback(leave_room, RoomMessagesError)
+        response = RoomMessagesError.from_dict(
+            {"errcode": "M_UNKNOWN", "error": "failed"},
+            ROOM_A,
+        )
+
+        owner = object()
+        context_token = client._sync_executor_context.set(object())
+        client._active_sync_executor_token = owner
+        try:
+            await client.run_response_callbacks([response])
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+
+        assert len(results) == 1
+        assert isinstance(results[0], RoomLeaveResponse)
+        assert membership_requests == 1
 
     async def test_classic_operation_child_is_allowed_after_its_owner_finishes(
         self, tempdir
