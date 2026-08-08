@@ -7611,7 +7611,7 @@ class TestRoomLocalRecovery:
                 return response
             return RoomLeaveResponse.from_dict({})
 
-        def fail(*_args):
+        def fail(*_args, **_kwargs):
             raise RuntimeError("store unavailable")
 
         monkeypatch.setattr(client, "_send", send)
@@ -8948,12 +8948,12 @@ class TestRoomLocalRecovery:
         original_save = client.store.save_recovery
         saves = 0
 
-        def fail_second_save(*args):
+        def fail_second_save(*args, **kwargs):
             nonlocal saves
             saves += 1
             if saves == 2:
                 raise RuntimeError("post-decrypt commit failed")
-            original_save(*args)
+            original_save(*args, **kwargs)
 
         monkeypatch.setattr(client.store, "save_recovery", fail_second_save)
         await client.receive_response(
@@ -10023,7 +10023,7 @@ class TestRoomLocalRecovery:
 
         monkeypatch.setattr(client, "_handle_to_device", handle)
 
-        def fail(*_args):
+        def fail(*_args, **_kwargs):
             raise RuntimeError("commit failed")
 
         monkeypatch.setattr(client.store, "save_recovery", fail)
