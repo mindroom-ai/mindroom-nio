@@ -1574,10 +1574,7 @@ async def _collect_slice(
         )
         target_reached = bool(gap.target_token and response.end == gap.target_token)
         bounded_exhausted = bool(
-            gap.membership_bound
-            and gap.target_token
-            and response.end is None
-            and not clear_recovered
+            gap.membership_bound and gap.target_token and response.end is None
         )
         continuity_proven = target_reached or bounded_exhausted
         terminal_causes: set[RecoveryAbandonment] = set()

@@ -609,6 +609,91 @@ class TestRoomLocalRecovery:
         assert client._recovery.abandoned == {}
         await client.close()
 
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_keeps_real_gap_abandoned_by_membership_change(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A successful departure permanently loses a staged real Classic gap."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert client.has_uncommitted_classic_sync_state
+        assert client._recovery.gaps[ROOM_A][0].target_token == "p1"
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_discards_staged_only_abandonment_after_membership_change(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A membership reset must not commit unrelated staged abandonment."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {}
+        await client.close()
+
     async def test_reset_classic_sync_state_rejects_an_inherited_callback_scope(
         self,
         tempdir,
@@ -4045,6 +4130,45 @@ class TestRoomLocalRecovery:
         assert seen == ["$join", "$after", "$held"]
         assert "$prejoin" not in seen
         assert not client._recovery.gaps
+
+    async def test_bounded_exhaustion_after_own_join_recovers_the_new_membership(
+        self, client, aioresponse
+    ):
+        """A bounded exhausted page proves the suffix after an own rejoin."""
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$prejoin", 1),
+                    member_event("$join", 2, "join"),
+                    text_event("$after", 3),
+                    text_event("$held", 4),
+                ],
+                None,
+            ),
+        )
+
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert seen == ["$join", "$after", "$held"]
+        assert "$prejoin" not in seen
+        assert not client._recovery.gaps
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert response.abandoned_rooms == {}
 
     async def test_recent_overlap_and_encrypted_replay(self, client, aioresponse):
         seen = record_events(client)
@@ -7872,7 +7996,7 @@ class TestRoomLocalRecovery:
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
-        assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
         client.store.database.close()
@@ -7998,7 +8122,7 @@ class TestRoomLocalRecovery:
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
-        assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 

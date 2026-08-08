@@ -2031,6 +2031,9 @@ class AsyncClient(Client):
                 (room_id,),
             )
             async with self._recovery_room_state((room_id,)):
+                has_real_gap = any(
+                    gap.target_token for gap in self._recovery.gaps.get(room_id, ())
+                )
                 persist_response_plan(
                     self._recovery,
                     self._recovery_store,
@@ -2041,6 +2044,15 @@ class AsyncClient(Client):
                     ),
                     forgotten_rooms=(room_id,),
                 )
+                if has_real_gap and self._classic_sync_state_staged:
+                    previous = (
+                        self._classic_sync_abandonment_before_staged_response.get(
+                            room_id, frozenset()
+                        )
+                    )
+                    self._classic_sync_abandonment_before_staged_response[room_id] = (
+                        previous | frozenset({RecoveryAbandonment.BASELINE_LOST})
+                    )
                 self._sliding_room_prev_batch.pop(room_id, None)
 
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
