@@ -1964,6 +1964,26 @@ def test_held_event_cap_is_reported_as_a_budget_not_a_loss():
     assert plan.abandoned_rooms == {ROOM: sync_recovery.RecoveryAbandonment.EVENT_LIMIT}
 
 
+def test_existing_gap_held_event_cap_stays_a_budget_stop():
+    """Continuing a real gap must not turn the same ceiling into permanent loss."""
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live-old", 0)]},
+        max_held_events=1,
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$live-new", 1)],
+        user_id="@me:example.org",
+        membership="join",
+    )
+    persist_response_plan(state, None, token=None, plan=plan)
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.EVENT_LIMIT}
+
+
 def test_a_second_loss_cannot_downgrade_an_unsettled_permanent_one():
     """A standing loss keeps the strongest claim made about it.
 

@@ -867,11 +867,12 @@ def plan_room_timeline(
     )
     if (new_gap or existing) and held_count + len(events) > state.max_held_events:
         logger.error("Abandoning recovery with too many held events in %s", room_id)
+        abandons_real_gap = new_gap or any(gap.target_token for gap in existing)
         return _plan_room_reset(
             state,
             room_id,
             events,
-            abandoned=RecoveryAbandonment.EVENT_LIMIT if new_gap else None,
+            abandoned=(RecoveryAbandonment.EVENT_LIMIT if abandons_real_gap else None),
         )
     gap = (
         RecoveryGap(
