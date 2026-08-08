@@ -2,6 +2,72 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.39.0
+
+### Breaking Changes
+
+These only apply when `backfill_limited_timelines=True`.
+
+- Store schema v10 rebuilds `SyncRecoveryAbandonedRooms` to hold one row per
+  room and cause. A store opened through `SqliteQueueDatabase` cannot perform
+  that rebuild safely and raises `LocalProtocolError`; reopen the store once
+  with `SqliteStore` to complete the migration, then resume using the queued
+  store. Rows written before v10 record no cause and are read as
+  `RecoveryAbandonment.UNKNOWN`, because the cause was never captured and no
+  later version can recover it.
+- Custom `MatrixStore` subclasses that persist recovery must declare
+  `supports_recovery_abandonment_reasons = True` in their own class body to be
+  given abandonment causes. Subclasses that do not are still called with the
+  previous `save_recovery()` signature and keep working, but the loss is
+  recorded as `RecoveryAbandonment.UNKNOWN` rather than with its cause.
+
+### Features
+
+- Add `RecoveryAbandonment` and publish `abandoned_rooms` on `SyncResponse` and
+  `SlidingSyncResponse`, mapping each abandoned room to a frozen set of the
+  causes nio gave up for.
+  `unrecovered_room_ids` fused two states an application has to treat
+  differently: a room whose bounded walk is still running will deliver its
+  events on a later response, and a room nio gave up on never will. Telling
+  them apart previously required calling `acknowledge_unrecovered_rooms()` and
+  reading back what it cleared, which forces an application to forget a loss in
+  order to learn that it happened.
+  Giving up is also not by itself proof that the history is gone. `EVENT_LIMIT`,
+  `FETCH_FAILED`, `BASELINE_LOST`, and `CORRUPT_EVENT` say only that nio
+  stopped, and another recovery strategy may still fetch the events;
+  `UNVERIFIABLE` says the walk cannot be made to advance, so those events will
+  never arrive; `UNKNOWN` says nio cannot answer the question. Recording every
+  abandonment as permanent marks rooms incompletable that are merely over
+  budget, and recording none as permanent throws away the one signal that says
+  history is genuinely lost.
+  A room accumulates every cause rather than keeping the latest, so a
+  proven-unreachable gap can never be relabelled as merely over budget by a
+  later abandonment. Causes are persisted and survive a restart alongside the
+  loss they belong to.
+  `unrecovered_room_ids` is unchanged and still names every abandoned room, so
+  existing readers behave identically.
+
+### Bug Fixes
+
+- A sync cancelled before the recovery drain published its fail-closed snapshot
+  from open gap rows only. Abandonment deletes the gap row, so an abandoned room
+  named itself nowhere in that snapshot and a cancelled sync was the one
+  response that reported a permanently lost room as healthy.
+- A targeted gap whose `/messages` walk exhausts history without an `end` token
+  and without reaching its target is no longer treated as recovered. Exhausting
+  history without reaching the target proves nothing about continuity, so the
+  room is reported as abandoned instead of silently clean. Membership-bounded
+  walks still treat bounded exhaustion as proven continuity.
+- A successful `room_leave()` or `room_forget()` now finalizes its recovery
+  reset even when a retained callback raises while draining, so the loss is
+  recorded rather than dropped along with the error.
+- Re-entering an active application-owned Classic Sync operation from a response
+  callback, through `reset_classic_sync_state()` or a membership change, now
+  raises `LocalProtocolError` instead of deadlocking on the operation lock.
+- `recovered_room_ids` and `unrecovered_room_ids` are frozen sets again. Set
+  operations against the abandoned-room mapping's keys had produced mutable
+  `set` objects, which compare equal to a `frozenset` but are unhashable.
+
 ## 0.38.0
 
 ### Breaking Changes
