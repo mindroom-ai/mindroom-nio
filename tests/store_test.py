@@ -136,6 +136,28 @@ def make_v9_abandonment_table(sqlstore, room_ids=()):
         sqlstore._update_version(9)
 
 
+def make_interrupted_abandonment_rebuild(sqlstore):
+    """Leave a populated legacy table beside a valid, empty live table."""
+    table = SyncRecoveryAbandonedRooms._meta.table_name
+    legacy_table = f"{table}_legacy_v10"
+    sqlstore.save_recovery(
+        None,
+        set(),
+        [],
+        [],
+        None,
+        abandoned_room_reasons={
+            TEST_ROOM: RecoveryAbandonment.EVENT_LIMIT,
+        },
+    )
+    with sqlstore.database.bind_ctx(sqlstore.models):
+        sqlstore.database.execute_sql(
+            f'ALTER TABLE "{table}" RENAME TO "{legacy_table}"'
+        )
+        sqlstore.database.create_tables([SyncRecoveryAbandonedRooms])
+    return table, legacy_table
+
+
 class UndeclaredAtomicStore(SqliteStore):
     """A SQLite-backed subclass that has not declared its recovery contract."""
 
@@ -1567,6 +1589,11 @@ class TestClass:
                 "VALUES (?, ?, ?)",
                 (TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value, account.id),
             )
+            before_schema = sqlstore.database.execute_sql(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+        before_version = sqlstore._get_store_version()
         database_path = sqlstore.database_path
         sqlstore.database.close()
         CopyFailingQueueDatabase.copy_attempted = False
@@ -1605,8 +1632,127 @@ class TestClass:
             rows = connection.execute(
                 f'SELECT room_id, reason FROM "{table}"'
             ).fetchall()
+            after_schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            after_version = connection.execute(
+                'SELECT version FROM "storeversion"'
+            ).fetchone()
         assert f"{table}_legacy_v10" not in tables
         assert rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+        assert after_schema == before_schema
+        assert after_version == (before_version,)
+
+    def test_normal_store_recovers_interrupted_rebuild_rows(self, sqlstore):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        sqlstore.database.close()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.EVENT_LIMIT})
+        }
+        with reopened.database.bind_ctx(reopened.models):
+            tables = set(reopened.database.get_tables())
+            rows = reopened.database.execute_sql(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+        assert legacy_table not in tables
+        assert rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+
+    def test_queue_store_refuses_interrupted_rebuild_before_mutation(self, sqlstore):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueDatabase.copy_attempted = False
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        assert not CopyFailingQueueDatabase.copy_attempted
+        database = CopyFailingQueueStore.database_instance
+        assert database is not None
+        assert database.is_stopped()
+        assert database.is_closed()
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            live_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+            legacy_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{legacy_table}"'
+            ).fetchall()
+        assert {table, legacy_table} <= tables
+        assert live_rows == []
+        assert legacy_rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+
+    def test_queue_store_refuses_legacy_only_rebuild_before_creating_live_table(
+        self, sqlstore
+    ):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            legacy_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{legacy_table}"'
+            ).fetchall()
+        assert table not in tables
+        assert legacy_table in tables
+        assert legacy_rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
 
     def test_unknown_stored_reason_string_loads_as_unknown(self, sqlstore):
         table = SyncRecoveryAbandonedRooms._meta.table_name

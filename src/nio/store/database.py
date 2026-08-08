@@ -264,11 +264,52 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryAbandonedRooms])
         self._update_version(9)
 
+    def _refuse_queued_recovery_schema_rebuild(self) -> None:
+        if not self.database.is_stopped():
+            self.database.stop()
+        if not self.database.is_closed():
+            self.database.close()
+        raise LocalProtocolError(
+            "Queued SQLite store cannot safely rebuild the recovery "
+            "abandonment schema; reopen it once with SqliteStore to "
+            "complete the migration."
+        )
+
+    def _preflight_queued_recovery_schema_rebuild(self) -> None:
+        if not isinstance(self.database, SqliteQueueDatabase):
+            return
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        if self.database.table_exists(f"{table}_legacy_v10"):
+            self._refuse_queued_recovery_schema_rebuild()
+
+    def _copy_recovery_abandonment_rows(self, source_table: str) -> None:
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        columns = {
+            row[1]
+            for row in self.database.execute_sql(
+                f'PRAGMA table_info("{source_table}")'
+            ).fetchall()
+        }
+        reason = 'COALESCE("reason", ?)' if "reason" in columns else "?"
+        self.database.execute_sql(
+            f'INSERT OR IGNORE INTO "{table}" '
+            '("room_id", "reason", "account_id") '
+            f'SELECT "room_id", {reason}, "account_id" FROM "{source_table}"',
+            (RecoveryAbandonment.UNKNOWN.value,),
+        )
+
     def _repair_recovery_abandonment_schema(self) -> bool:
         """Replace pre-release v10 shapes with the multi-cause table."""
         table = SyncRecoveryAbandonedRooms._meta.table_name
+        legacy_table = f"{table}_legacy_v10"
+        legacy_exists = self.database.table_exists(legacy_table)
+        if legacy_exists and isinstance(self.database, SqliteQueueDatabase):
+            self._refuse_queued_recovery_schema_rebuild()
         if not self.database.table_exists(table):
             self.database.create_tables([SyncRecoveryAbandonedRooms])
+            if legacy_exists:
+                self._copy_recovery_abandonment_rows(legacy_table)
+                self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
             return True
 
         columns = {
@@ -300,29 +341,18 @@ class MatrixStore:
             and not unique_indexes[0][4]
             and frozenset(unique_columns[0]) == expected
         ):
+            if legacy_exists:
+                self._copy_recovery_abandonment_rows(legacy_table)
+                self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
+                return True
             return False
         if isinstance(self.database, SqliteQueueDatabase):
-            if not self.database.is_stopped():
-                self.database.stop()
-            if not self.database.is_closed():
-                self.database.close()
-            raise LocalProtocolError(
-                "Queued SQLite store cannot safely rebuild the recovery "
-                "abandonment schema; reopen it once with SqliteStore to "
-                "complete the migration."
-            )
+            self._refuse_queued_recovery_schema_rebuild()
 
-        legacy_table = f"{table}_legacy_v10"
         self.database.execute_sql(f'DROP TABLE IF EXISTS "{legacy_table}"')
         self.database.execute_sql(f'ALTER TABLE "{table}" RENAME TO "{legacy_table}"')
         self.database.create_tables([SyncRecoveryAbandonedRooms])
-        reason = 'COALESCE("reason", ?)' if "reason" in columns else "?"
-        self.database.execute_sql(
-            f'INSERT OR IGNORE INTO "{table}" '
-            '("room_id", "reason", "account_id") '
-            f'SELECT "room_id", {reason}, "account_id" FROM "{legacy_table}"',
-            (RecoveryAbandonment.UNKNOWN.value,),
-        )
+        self._copy_recovery_abandonment_rows(legacy_table)
         self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
         return True
 
@@ -386,6 +416,7 @@ class MatrixStore:
         if store_version == 9:
             self.upgrade_to_v10()
 
+        self._preflight_queued_recovery_schema_rebuild()
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
         self._repair_v10_recovery_abandonments()
