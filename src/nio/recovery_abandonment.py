@@ -80,4 +80,4 @@ def normalize_abandonment_reasons(value: object) -> frozenset[RecoveryAbandonmen
             except ValueError:
                 pass
         reasons.add(RecoveryAbandonment.UNKNOWN)
-    return frozenset(reasons)
+    return frozenset(reasons or {RecoveryAbandonment.UNKNOWN})

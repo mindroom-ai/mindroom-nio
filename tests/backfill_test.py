@@ -568,13 +568,13 @@ class TestRoomLocalRecovery:
 
         committed = sync_response("s1", {})
         await client.receive_response(committed)
-        assert committed.abandoned_rooms == {ROOM_A: reason}
+        assert committed.abandoned_rooms == {ROOM_A: frozenset({reason})}
         client.acknowledge_classic_sync("s1")
 
         await client.receive_response(sync_response("s2", {}))
         await client.reset_classic_sync_state()
 
-        assert client._recovery.abandoned == {ROOM_A: reason}
+        assert client._recovery.abandoned == {ROOM_A: frozenset({reason})}
         await client.close()
 
     async def test_reset_classic_sync_state_discards_staged_abandonment(
@@ -5120,7 +5120,9 @@ class TestRoomLocalRecovery:
         # The held token cannot be trusted, so nio has nothing to walk from and
         # can never resume. That is not the same as proving the history gone:
         # the application may still fetch it from the baseline it now has.
-        assert response.abandoned_rooms == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert response.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert not restarted._recovery.gaps
         assert restarted.store
         _, stored, _ = restarted.store.load_sync_recovery()
@@ -7859,7 +7861,9 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in client._recovery.gaps
         assert not any(room_id == ROOM_A for room_id, _ in client._recovery.events)
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert client._sliding_room_prev_batch == {}
         gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
@@ -7884,7 +7888,7 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in restarted._recovery.gaps
         assert restarted._recovery.abandoned == {
-            ROOM_A: RecoveryAbandonment.BASELINE_LOST
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
         }
         await restarted.close()
 
@@ -7928,7 +7932,9 @@ class TestRoomLocalRecovery:
         await getattr(client, operation)(ROOM_A)
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert client.store.load_sync_token() == token_before
         assert client.store.load_sync_recovery() == stored_before
         await client.close()

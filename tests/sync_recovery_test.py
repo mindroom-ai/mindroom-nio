@@ -2231,6 +2231,17 @@ def test_recovery_plan_normalizes_singular_causes_to_frozen_sets():
     )
 
 
+def test_empty_legacy_causes_become_unknown():
+    """A named abandoned room never exposes an empty cause set."""
+    plan = RecoveryPlan(abandoned_rooms={ROOM: []})
+    state = RecoveryState()
+    sync_recovery.load_recovery_state(state, (), (), {ROOM: []})
+
+    expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNKNOWN})}
+    assert plan.abandoned_rooms == expected
+    assert state.abandoned == expected
+
+
 def test_sequential_abandonments_retain_every_cause_until_acknowledged():
     """A later cause must not replace the room's earlier loss."""
     state = RecoveryState()
