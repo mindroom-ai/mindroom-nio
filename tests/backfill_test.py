@@ -805,6 +805,103 @@ class TestRoomLocalRecovery:
         assert done == {membership_reset}
         await client.close()
 
+    @pytest.mark.parametrize("reentry", ["membership", "reset"])
+    async def test_application_owned_membership_reset_rejects_retry_callback_reentry(
+        self, tempdir, monkeypatch, reentry
+    ):
+        """A retry callback cannot wait on the membership reset it interrupted."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                max_limit_exceeded=1,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        attempts = 0
+        callback_errors = []
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return Transport(429 if attempts == 1 else 200)
+
+        async def create_matrix_response(*, response_class, **_kwargs):
+            if response_class is RoomLeaveResponse and attempts == 1:
+                return RoomLeaveError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry",
+                        "retry_after_ms": 1,
+                    }
+                )
+            return RoomLeaveResponse.from_dict({})
+
+        async def reenter(_response):
+            async def nested_operation():
+                if reentry == "membership":
+                    await client.room_forget(ROOM_A)
+                else:
+                    await client.reset_classic_sync_state()
+
+            with pytest.raises(
+                LocalProtocolError, match="active Classic Sync"
+            ) as error:
+                await asyncio.create_task(nested_operation())
+            callback_errors.append(str(error.value))
+
+        client.add_response_callback(reenter, RoomLeaveError)
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+
+        result = await asyncio.wait_for(client.room_leave(ROOM_A), 0.5)
+
+        assert isinstance(result, RoomLeaveResponse)
+        assert attempts == 2
+        assert callback_errors
+        await client.close()
+
+    async def test_classic_operation_child_is_allowed_after_its_owner_finishes(
+        self, tempdir
+    ):
+        """A copied operation context is harmless once its owning lock exits."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+
+        async def reset_after_owner_finishes():
+            child_started.set()
+            await release_child.wait()
+            await client.reset_classic_sync_state()
+
+        async with client._classic_sync_state_operation():
+            child = asyncio.create_task(reset_after_owner_finishes())
+            await child_started.wait()
+
+        release_child.set()
+        await child
+        await client.close()
+
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_reset_classic_sync_state_discards_staged_only_abandonment_after_membership_change(
         self, tempdir, monkeypatch, operation
@@ -8165,6 +8262,59 @@ class TestRoomLocalRecovery:
             ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
         }
         await restarted.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_successful_membership_change_records_loss_after_retained_callback_error(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A callback failure cannot leave a successful departure's gap live."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+
+        async def fail_callback():
+            raise RuntimeError("retained callback failed")
+
+        retained = asyncio.create_task(fail_callback())
+        client._recovery._active_dispatches[(ROOM_A, "$pending", "timeline")] = retained
+        await asyncio.sleep(0)
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        with pytest.raises(RuntimeError, match="retained callback failed"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        assert client._sliding_room_prev_batch == {}
+        gaps, _events, abandoned = client.store.load_sync_recovery()
+        assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_application_owned_membership_change_does_not_write_recovery_store(

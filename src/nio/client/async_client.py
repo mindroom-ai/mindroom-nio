@@ -711,6 +711,10 @@ class AsyncClient(Client):
 
         self._sync_response_lock = asyncio.Lock()
         self._classic_sync_state_operation_lock = asyncio.Lock()
+        self._classic_sync_state_operation_context: ContextVar[object | None] = (
+            ContextVar(f"nio_classic_sync_state_operation_{id(self)}", default=None)
+        )
+        self._active_classic_sync_state_operation: object | None = None
         self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
             f"nio_sync_request_generation_{id(self)}", default=None
         )
@@ -904,6 +908,10 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires token ownership to be disabled."
             )
+        if self._in_active_classic_sync_state_operation():
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset from an active Classic Sync operation."
+            )
         if (
             (callback_scope is not None and callback_scope.active)
             or is_recovery_dispatch_task(self._recovery, caller)
@@ -929,7 +937,7 @@ class AsyncClient(Client):
         self._stop_sync_forever = False
 
         async def reset() -> None:
-            async with self._classic_sync_state_operation_lock:
+            async with self._classic_sync_state_operation():
                 async with self._sync_response_lock:
                     try:
                         await drain_recovery_dispatches(self._recovery)
@@ -1988,6 +1996,10 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Room membership changes cannot run from an event callback."
             )
+        if self._in_active_classic_sync_state_operation():
+            raise LocalProtocolError(
+                "Room membership changes cannot run from an active Classic Sync operation."
+            )
 
         async def reset_after_response() -> _RoomMembershipResponseT:
             response = await send_request()
@@ -2005,7 +2017,7 @@ class AsyncClient(Client):
         ):
 
             async def serialized_reset() -> _RoomMembershipResponseT:
-                async with self._classic_sync_state_operation_lock:
+                async with self._classic_sync_state_operation():
                     return await reset_after_response()
 
             return await serialized_reset()
@@ -2042,34 +2054,38 @@ class AsyncClient(Client):
             return
 
         async with self._sync_response_lock:
-            await drain_recovery_room_dispatches(
-                self._recovery,
-                (room_id,),
-            )
-            async with self._recovery_room_state((room_id,)):
-                has_real_gap = any(
-                    gap.target_token for gap in self._recovery.gaps.get(room_id, ())
-                )
-                persist_response_plan(
+            try:
+                await drain_recovery_room_dispatches(
                     self._recovery,
-                    self._recovery_store,
-                    token=None,
-                    plan=RecoveryPlan(
-                        clear_rooms=frozenset({room_id}),
-                        clear_room_reasons={room_id: RecoveryAbandonment.BASELINE_LOST},
-                    ),
-                    forgotten_rooms=(room_id,),
+                    (room_id,),
                 )
-                if has_real_gap and self._classic_sync_state_staged:
-                    previous = (
-                        self._classic_sync_abandonment_before_staged_response.get(
-                            room_id, frozenset()
+            finally:
+                async with self._recovery_room_state((room_id,)):
+                    has_real_gap = any(
+                        gap.target_token for gap in self._recovery.gaps.get(room_id, ())
+                    )
+                    persist_response_plan(
+                        self._recovery,
+                        self._recovery_store,
+                        token=None,
+                        plan=RecoveryPlan(
+                            clear_rooms=frozenset({room_id}),
+                            clear_room_reasons={
+                                room_id: RecoveryAbandonment.BASELINE_LOST
+                            },
+                        ),
+                        forgotten_rooms=(room_id,),
+                    )
+                    if has_real_gap and self._classic_sync_state_staged:
+                        previous = (
+                            self._classic_sync_abandonment_before_staged_response.get(
+                                room_id, frozenset()
+                            )
                         )
-                    )
-                    self._classic_sync_abandonment_before_staged_response[room_id] = (
-                        previous | frozenset({RecoveryAbandonment.BASELINE_LOST})
-                    )
-                self._sliding_room_prev_batch.pop(room_id, None)
+                        self._classic_sync_abandonment_before_staged_response[
+                            room_id
+                        ] = previous | frozenset({RecoveryAbandonment.BASELINE_LOST})
+                    self._sliding_room_prev_batch.pop(room_id, None)
 
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
         encrypted_rooms: set[str] = set()
@@ -2515,6 +2531,27 @@ class AsyncClient(Client):
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    def _in_active_classic_sync_state_operation(self) -> bool:
+        """Return whether this context belongs to the active Classic operation."""
+        operation = self._classic_sync_state_operation_context.get()
+        return (
+            operation is not None
+            and operation is self._active_classic_sync_state_operation
+        )
+
+    @asynccontextmanager
+    async def _classic_sync_state_operation(self) -> AsyncIterator[None]:
+        """Serialize application-owned Classic state changes and mark their scope."""
+        async with self._classic_sync_state_operation_lock:
+            operation = object()
+            context_token = self._classic_sync_state_operation_context.set(operation)
+            self._active_classic_sync_state_operation = operation
+            try:
+                yield
+            finally:
+                self._active_classic_sync_state_operation = None
+                self._classic_sync_state_operation_context.reset(context_token)
 
     @asynccontextmanager
     async def _sliding_request_lock(
