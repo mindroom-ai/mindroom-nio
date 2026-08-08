@@ -64,6 +64,9 @@ AsyncClient
 .. autoclass:: nio.TimelineEventProvenance
     :members:
 
+.. autoclass:: nio.RecoveryAbandonment
+    :members:
+
 .. autoclass:: nio.TransferMonitor
     :members:
     :undoc-members:

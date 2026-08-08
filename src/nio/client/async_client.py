@@ -109,6 +109,7 @@ from ..exceptions import (
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
+from ..recovery_abandonment import RecoveryAbandonment
 from ..responses import (
     ChangePasswordError,
     ChangePasswordResponse,
@@ -404,7 +405,7 @@ class _SyncGeneration:
 
 
 @dataclass
-class _EventCallbackScope:
+class _CallbackScope:
     active: bool = True
 
 
@@ -686,8 +687,11 @@ class AsyncClient(Client):
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
         self.event_admission_callback: ClientCallback | None = None
-        self._event_callback_scope: ContextVar[_EventCallbackScope | None] = ContextVar(
+        self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
+        )
+        self._response_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
+            f"nio_response_callback_scope_{id(self)}", default=None
         )
 
         self.sharing_session: dict[str, AsyncioEvent] = {}
@@ -709,6 +713,11 @@ class AsyncClient(Client):
         self._closing = False
 
         self._sync_response_lock = asyncio.Lock()
+        self._classic_sync_state_operation_lock = asyncio.Lock()
+        self._classic_sync_state_operation_context: ContextVar[object | None] = (
+            ContextVar(f"nio_classic_sync_state_operation_{id(self)}", default=None)
+        )
+        self._active_classic_sync_state_operation: object | None = None
         self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
             f"nio_sync_request_generation_{id(self)}", default=None
         )
@@ -720,6 +729,9 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = False
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token: str | None = None
+        self._classic_sync_abandonment_before_staged_response: dict[
+            str, frozenset[RecoveryAbandonment]
+        ] = {}
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -830,6 +842,7 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = True
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+        self._classic_sync_abandonment_before_staged_response.clear()
 
     @property
     def has_uncommitted_classic_sync_state(self) -> bool:
@@ -863,6 +876,9 @@ class AsyncClient(Client):
             )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+        self._classic_sync_abandonment_before_staged_response = dict(
+            self._recovery.abandoned
+        )
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -895,6 +911,10 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Classic Sync reset requires token ownership to be disabled."
             )
+        if self._in_active_classic_sync_state_operation():
+            raise LocalProtocolError(
+                "Classic Sync state cannot be reset from an active Classic Sync operation."
+            )
         if (
             (callback_scope is not None and callback_scope.active)
             or is_recovery_dispatch_task(self._recovery, caller)
@@ -920,44 +940,54 @@ class AsyncClient(Client):
         self._stop_sync_forever = False
 
         async def reset() -> None:
-            async with self._sync_response_lock:
-                try:
-                    await drain_recovery_dispatches(self._recovery)
-                finally:
-                    acquired: list[asyncio.Lock] = []
-                    acquired_room_ids: set[str] = set()
+            async with self._classic_sync_state_operation():
+                async with self._sync_response_lock:
                     try:
-                        # Gate interning is synchronous. Re-snapshot after each
-                        # awaited acquisition until no racing room operation
-                        # owns or waits on an unseen gate.
-                        while True:
-                            pending_room_ids = sorted(
-                                set(self._recovery_room_gates) - acquired_room_ids
-                            )
-                            if not pending_room_ids:
-                                break
-                            for room_id in pending_room_ids:
-                                gate = self._recovery_room_gates[room_id]
-                                await gate.acquire()
-                                acquired.append(gate)
-                                acquired_room_ids.add(room_id)
-
-                        self._recovery = RecoveryState(
-                            max_held_events=self.config.backfill_max_events
-                        )
-                        self._sliding_room_prev_batch.clear()
-                        self._pending_sliding_room_account_data.clear()
-                        self._sliding_sync_to_device_since = None
-                        self.loaded_sync_token = ""
-                        self.next_batch = ""
-                        self.rooms.clear()
-                        self.invited_rooms.clear()
-                        self._classic_sync_rebuild_pending = True
-                        self._classic_sync_state_staged = False
-                        self._classic_sync_acknowledgeable_token = None
+                        await drain_recovery_dispatches(self._recovery)
                     finally:
-                        for gate in reversed(acquired):
-                            gate.release()
+                        acquired: list[asyncio.Lock] = []
+                        acquired_room_ids: set[str] = set()
+                        try:
+                            # Gate interning is synchronous. Re-snapshot after each
+                            # awaited acquisition until no racing room operation
+                            # owns or waits on an unseen gate.
+                            while True:
+                                pending_room_ids = sorted(
+                                    set(self._recovery_room_gates) - acquired_room_ids
+                                )
+                                if not pending_room_ids:
+                                    break
+                                for room_id in pending_room_ids:
+                                    gate = self._recovery_room_gates[room_id]
+                                    await gate.acquire()
+                                    acquired.append(gate)
+                                    acquired_room_ids.add(room_id)
+
+                            preserved_abandonment = dict(
+                                self._classic_sync_abandonment_before_staged_response
+                                if self._classic_sync_state_staged
+                                else self._recovery.abandoned
+                            )
+                            self._recovery = RecoveryState(
+                                abandoned=preserved_abandonment,
+                                max_held_events=self.config.backfill_max_events,
+                            )
+                            self._sliding_room_prev_batch.clear()
+                            self._pending_sliding_room_account_data.clear()
+                            self._sliding_sync_to_device_since = None
+                            self.loaded_sync_token = ""
+                            self.next_batch = ""
+                            self.rooms.clear()
+                            self.invited_rooms.clear()
+                            self._classic_sync_rebuild_pending = True
+                            self._classic_sync_state_staged = False
+                            self._classic_sync_acknowledgeable_token = None
+                            self._classic_sync_abandonment_before_staged_response = (
+                                dict(preserved_abandonment)
+                            )
+                        finally:
+                            for gate in reversed(acquired):
+                                gate.release()
 
         await _run_to_completion(reset())
 
@@ -1324,9 +1354,11 @@ class AsyncClient(Client):
         """Stop reporting these rooms as degraded, and return the ones that were.
 
         A room whose gap nio gave up on keeps appearing in
-        ``unrecovered_room_ids`` on every later response, because a loss
-        announced once and then forgotten cannot be told apart from a recovery.
-        Call this once the loss is recorded somewhere the application owns.
+        ``unrecovered_room_ids`` and ``abandoned_rooms`` on every later
+        response, because a loss announced once and then forgotten cannot be
+        told apart from a recovery. Call this once the loss is recorded
+        somewhere the application owns; read ``abandoned_rooms`` to learn what
+        was lost and why, which does not require settling anything.
 
         Returns:
             The subset that was actually degraded, so a caller can log exactly
@@ -1336,21 +1368,25 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Unrecovered rooms require limited-timeline recovery."
             )
-        candidates = frozenset(self._recovery.abandoned & set(room_ids))
+        candidates = frozenset(self._recovery.abandoned.keys() & set(room_ids))
         store = self._recovery_store
         if store and candidates:
             self._require_atomic_recovery_store(store)
             store.clear_recovery_abandonment(candidates)
-        return acknowledge_unrecovered_rooms(self._recovery, candidates)
+        settled = acknowledge_unrecovered_rooms(self._recovery, candidates)
+        for room_id in settled:
+            self._classic_sync_abandonment_before_staged_response.pop(room_id, None)
+        return settled
 
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
     ) -> None:
         if not self.config.backfill_limited_timelines:
             return
-        recovered, unrecovered = take_recovery_outcomes(self._recovery)
+        recovered, unrecovered, abandoned = take_recovery_outcomes(self._recovery)
         response.recovered_room_ids = recovered
         response.unrecovered_room_ids = unrecovered
+        response.abandoned_rooms = abandoned
 
     def _classic_response_real_gap_room_ids(
         self,
@@ -1425,8 +1461,14 @@ class AsyncClient(Client):
             )
         else:
             unrecovered.update(self._sliding_response_real_gap_room_ids(response))
+        # Abandonment deletes the gap row this snapshot is built from, so an
+        # abandoned room names itself nowhere here. Without the sticky set
+        # folded in, a cancelled sync would be the one response that reports a
+        # permanently lost room as healthy.
+        abandoned = dict(self._recovery.abandoned)
         response.recovered_room_ids = frozenset()
-        response.unrecovered_room_ids = frozenset(unrecovered)
+        response.unrecovered_room_ids = frozenset(unrecovered) | frozenset(abandoned)
+        response.abandoned_rooms = abandoned
 
     async def _recovery_room_messages(
         self,
@@ -1493,7 +1535,7 @@ class AsyncClient(Client):
         room: MatrixRoom | None = None,
         *callback_args: object,
     ) -> None:
-        scope = _EventCallbackScope()
+        scope = _CallbackScope()
         token = self._event_callback_scope.set(scope)
         try:
             for callback in callbacks:
@@ -1544,7 +1586,13 @@ class AsyncClient(Client):
 
     async def _on_response(self, response: Response | ErrorResponse):
         for cb in self.response_callbacks:
-            await cb.async_execute(response)
+            scope = _CallbackScope()
+            token = self._response_callback_scope.set(scope)
+            try:
+                await cb.async_execute(response)
+            finally:
+                scope.active = False
+                self._response_callback_scope.reset(token)
 
     async def _handle_sync(
         self,
@@ -1567,6 +1615,10 @@ class AsyncClient(Client):
             and not self._recovery_persistence_enabled
         )
         if application_owned_classic_state:
+            if not self._classic_sync_state_staged:
+                self._classic_sync_abandonment_before_staged_response = dict(
+                    self._recovery.abandoned
+                )
             self._classic_sync_state_staged = True
             self._classic_sync_acknowledgeable_token = None
 
@@ -1781,7 +1833,16 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
-                plans.append(RecoveryPlan(unrecovered_room_ids=unrecoverable_room_ids))
+                # A discontinuity with no usable window token has nothing to
+                # walk from, so nio can never resume it -- but nothing was
+                # established about the history itself.
+                plans.append(
+                    RecoveryPlan(
+                        abandoned_rooms=dict.fromkeys(
+                            unrecoverable_room_ids, RecoveryAbandonment.BASELINE_LOST
+                        )
+                    )
+                )
                 recorded, forgotten = plan_sliding_prev_batches(
                     response,
                     user_id=self.user_id,
@@ -1926,8 +1987,15 @@ class AsyncClient(Client):
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
         recovery_store = self._recovery_store
-        if recovery_store:
-            self._require_atomic_recovery_store(recovery_store)
+        reset_store = recovery_store
+        if (
+            not self.config.backfill_limited_timelines
+            and self.store
+            and self.store.has_real_recovery_gap(room_id)
+        ):
+            reset_store = self.store
+        if reset_store:
+            self._require_atomic_recovery_store(reset_store)
         callback_scope = self._event_callback_scope.get()
         if (
             self.config.backfill_limited_timelines
@@ -1937,42 +2005,110 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Room membership changes cannot run from an event callback."
             )
-        response = await send_request()
-        if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
+        if self._in_active_classic_sync_state_operation():
+            raise LocalProtocolError(
+                "Room membership changes cannot run from an active Classic Sync operation."
+            )
+        response_callback_scope = self._response_callback_scope.get()
+        if (
+            response_callback_scope is not None
+            and response_callback_scope.active
+            and self._active_sync_executor_token is not None
+            and self._sync_executor_context.get() is self._active_sync_executor_token
+        ):
+            raise LocalProtocolError(
+                "Room membership changes cannot run from an active sync response."
+            )
+
+        async def reset_after_response() -> _RoomMembershipResponseT:
+            response = await send_request()
+            if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
+                return response
+
+            if self.config.backfill_limited_timelines:
+                mark_room_reset(self._sync_reset_fence, room_id)
+            await _run_to_completion(self._apply_room_membership_reset(room_id))
             return response
 
-        if self.config.backfill_limited_timelines:
-            mark_room_reset(self._sync_reset_fence, room_id)
-        await _run_to_completion(self._apply_room_membership_reset(room_id))
-        return response
+        if (
+            self.config.backfill_limited_timelines
+            and not self._recovery_persistence_enabled
+        ):
+
+            async def serialized_reset() -> _RoomMembershipResponseT:
+                async with self._classic_sync_state_operation():
+                    return await reset_after_response()
+
+            return await serialized_reset()
+        return await reset_after_response()
 
     async def _apply_room_membership_reset(self, room_id: str) -> None:
         """Clear every room-local recovery artifact after server success."""
         if not self.config.backfill_limited_timelines:
+            # Recovery state is not loaded in this mode, but a prior run may
+            # have left a real gap in the store. The structural cause lets the
+            # store detect and record that loss in the clearing transaction.
+            store = self.store
+            has_real_gap = bool(store and store.has_real_recovery_gap(room_id))
+            if has_real_gap and store and not store.supports_atomic_recovery:
+                # Recheck after the network request. A recovery-disabled client
+                # cannot create this row itself, but failing here is safer than
+                # silently clearing work written by another store owner.
+                self._require_atomic_recovery_store(store)
+            clear_room_reasons = (
+                {room_id: RecoveryAbandonment.BASELINE_LOST} if has_real_gap else {}
+            )
             persist_response_plan(
                 self._recovery,
-                self.store,
+                store,
                 token=None,
-                plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({room_id}),
+                    abandoned_rooms=(
+                        clear_room_reasons
+                        if store and not store.supports_recovery_abandonment_reasons
+                        else {}
+                    ),
+                    clear_room_reasons=clear_room_reasons,
+                ),
                 forgotten_rooms=(room_id,),
             )
             self._sliding_room_prev_batch.pop(room_id, None)
             return
 
         async with self._sync_response_lock:
-            await drain_recovery_room_dispatches(
-                self._recovery,
-                (room_id,),
-            )
-            async with self._recovery_room_state((room_id,)):
-                persist_response_plan(
+            try:
+                await drain_recovery_room_dispatches(
                     self._recovery,
-                    self._recovery_store,
-                    token=None,
-                    plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
-                    forgotten_rooms=(room_id,),
+                    (room_id,),
                 )
-                self._sliding_room_prev_batch.pop(room_id, None)
+            finally:
+                async with self._recovery_room_state((room_id,)):
+                    has_real_gap = any(
+                        gap.target_token for gap in self._recovery.gaps.get(room_id, ())
+                    )
+                    persist_response_plan(
+                        self._recovery,
+                        self._recovery_store,
+                        token=None,
+                        plan=RecoveryPlan(
+                            clear_rooms=frozenset({room_id}),
+                            clear_room_reasons={
+                                room_id: RecoveryAbandonment.BASELINE_LOST
+                            },
+                        ),
+                        forgotten_rooms=(room_id,),
+                    )
+                    if has_real_gap and self._classic_sync_state_staged:
+                        previous = (
+                            self._classic_sync_abandonment_before_staged_response.get(
+                                room_id, frozenset()
+                            )
+                        )
+                        self._classic_sync_abandonment_before_staged_response[
+                            room_id
+                        ] = previous | frozenset({RecoveryAbandonment.BASELINE_LOST})
+                    self._sliding_room_prev_batch.pop(room_id, None)
 
     async def _handle_sliding_sync_rooms(self, response: SlidingSyncResponse) -> None:
         encrypted_rooms: set[str] = set()
@@ -2418,6 +2554,27 @@ class AsyncClient(Client):
 
     def _recovery_room_gate(self, room_id: str) -> asyncio.Lock:
         return self._recovery_room_gates.setdefault(room_id, asyncio.Lock())
+
+    def _in_active_classic_sync_state_operation(self) -> bool:
+        """Return whether this context belongs to the active Classic operation."""
+        operation = self._classic_sync_state_operation_context.get()
+        return (
+            operation is not None
+            and operation is self._active_classic_sync_state_operation
+        )
+
+    @asynccontextmanager
+    async def _classic_sync_state_operation(self) -> AsyncIterator[None]:
+        """Serialize application-owned Classic state changes and mark their scope."""
+        async with self._classic_sync_state_operation_lock:
+            operation = object()
+            context_token = self._classic_sync_state_operation_context.set(operation)
+            self._active_classic_sync_state_operation = operation
+            try:
+                yield
+            finally:
+                self._active_classic_sync_state_operation = None
+                self._classic_sync_state_operation_context.reset(context_token)
 
     @asynccontextmanager
     async def _sliding_request_lock(
@@ -5099,8 +5256,8 @@ class AsyncClient(Client):
             room_id: The room id of the room to leave.
 
         Raises:
-            LocalProtocolError: If called from an event callback context while
-                limited-timeline recovery is enabled.
+            LocalProtocolError: If called from an event callback or active sync
+                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_leave(self.access_token, room_id)
 
@@ -5126,8 +5283,8 @@ class AsyncClient(Client):
             room_id (str): The room id of the room to forget.
 
         Raises:
-            LocalProtocolError: If called from an event callback context while
-                limited-timeline recovery is enabled.
+            LocalProtocolError: If called from an event callback or active sync
+                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_forget(self.access_token, room_id)
 

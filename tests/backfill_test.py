@@ -28,6 +28,7 @@ from nio import (
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
+    RecoveryAbandonment,
     RoomEncryptedImage,
     RoomEncryptionEvent,
     RoomForgetError,
@@ -51,7 +52,7 @@ from nio import (
     UnknownBadEvent,
     UnknownToDeviceEvent,
 )
-from nio.api import MATRIX_API_PATH_V3, Api
+from nio.api import MATRIX_API_PATH_V3, Api, MessageDirection
 from nio.client.sync_recovery import (
     PendingTimelineEvent,
     RecoveryGap,
@@ -538,6 +539,603 @@ class TestRoomLocalRecovery:
         )
         assert seen == ["$later", "$later"]
         assert client.rooms[ROOM_A].name == "Later"
+        await client.close()
+
+    async def test_reset_classic_sync_state_preserves_committed_abandonment(
+        self,
+        tempdir,
+    ):
+        """Replaying one response cannot erase a loss committed before it."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        reason = RecoveryAbandonment.EVENT_LIMIT
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(abandoned_rooms={ROOM_A: reason}),
+        )
+
+        committed = sync_response("s1", {})
+        await client.receive_response(committed)
+        assert committed.abandoned_rooms == {ROOM_A: frozenset({reason})}
+        client.acknowledge_classic_sync("s1")
+
+        await client.receive_response(sync_response("s2", {}))
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {ROOM_A: frozenset({reason})}
+        await client.close()
+
+    async def test_reset_classic_sync_state_discards_staged_abandonment(
+        self,
+        tempdir,
+    ):
+        """A loss created after the committed cursor is replayable state."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_keeps_real_gap_abandoned_by_membership_change(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A successful departure permanently loses a staged real Classic gap."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        assert client.has_uncommitted_classic_sync_state
+        assert client._recovery.gaps[ROOM_A][0].target_token == "p1"
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_waits_for_inflight_membership_reset(
+        self, tempdir, monkeypatch, operation
+    ):
+        """Reset cannot erase a staged gap while a departure is awaiting success."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(response_class, *_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+        reset_waited_for_send = not reset.done()
+
+        release_send.set()
+        await membership_reset
+        await reset
+
+        assert reset_waited_for_send
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_discards_gap_after_rejected_membership_reset(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A failed departure releases reset without recording baseline loss."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(response_class, *_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            error = {"errcode": "M_FORBIDDEN", "error": "rejected"}
+            if response_class is RoomForgetResponse:
+                return RoomForgetError.from_dict(error, ROOM_A)
+            return RoomLeaveError.from_dict(error)
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+        reset_waited_for_response = not reset.done()
+
+        release_send.set()
+        result = await membership_reset
+        await reset
+
+        assert reset_waited_for_response
+        assert isinstance(result, (RoomLeaveError, RoomForgetError))
+        assert client._recovery.abandoned == {}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_application_owned_membership_reset_cancels_pending_transport(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A reset lock must not turn a pending membership request unkillable."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        membership_reset.cancel()
+        done, _ = await asyncio.wait((membership_reset,), timeout=0.05)
+
+        release_send.set()
+        with pytest.raises(asyncio.CancelledError):
+            await membership_reset
+
+        assert done == {membership_reset}
+        await client.close()
+
+    async def test_application_owned_membership_reset_rejects_retry_callback_reentry(
+        self, tempdir, monkeypatch
+    ):
+        """A retry callback cannot wait on the membership reset it interrupted."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                max_limit_exceeded=1,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        attempts = 0
+        callback_errors = []
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return Transport(429 if attempts == 1 else 200)
+
+        async def create_matrix_response(*, response_class, **_kwargs):
+            if response_class is RoomLeaveResponse and attempts == 1:
+                return RoomLeaveError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry",
+                        "retry_after_ms": 1,
+                    }
+                )
+            return RoomLeaveResponse.from_dict({})
+
+        async def reenter(_response):
+            async def nested_operation():
+                await client.room_forget(ROOM_A)
+
+            with pytest.raises(
+                LocalProtocolError, match="active Classic Sync"
+            ) as error:
+                await asyncio.create_task(nested_operation())
+            callback_errors.append(str(error.value))
+
+        client.add_response_callback(reenter, RoomLeaveError)
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+
+        result = await asyncio.wait_for(client.room_leave(ROOM_A), 0.5)
+
+        assert isinstance(result, RoomLeaveResponse)
+        assert attempts == 2
+        assert callback_errors
+        await client.close()
+
+    async def test_reset_classic_sync_state_rejects_active_operation_context(
+        self,
+        tempdir,
+    ):
+        """The reset guard fails promptly without entering its own locked path."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        operation = object()
+        context_token = client._classic_sync_state_operation_context.set(operation)
+        client._active_classic_sync_state_operation = operation
+        try:
+            with pytest.raises(LocalProtocolError, match="active Classic Sync"):
+                await client.reset_classic_sync_state()
+        finally:
+            client._active_classic_sync_state_operation = None
+            client._classic_sync_state_operation_context.reset(context_token)
+            await client.close()
+
+    async def test_messages_retry_callback_rejects_membership_from_sync_executor(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A retry callback cannot make its owning sync await itself."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                max_limit_exceeded=1,
+                store_sync_tokens=False,
+            ),
+        )
+        client.access_token = "token"
+        callback_entered = asyncio.Event()
+        message_attempts = 0
+        leave_attempts = 0
+
+        class Transport:
+            def __init__(self, status):
+                self.status = status
+
+        async def send(_method, path, *_args, **_kwargs):
+            nonlocal leave_attempts, message_attempts
+            if path.endswith("/leave"):
+                leave_attempts += 1
+                return Transport(200)
+            message_attempts += 1
+            return Transport(429 if message_attempts == 1 else 200)
+
+        async def create_matrix_response(*, response_class, data=None, **_kwargs):
+            if response_class is RoomLeaveResponse:
+                return RoomLeaveResponse.from_dict({})
+            if message_attempts == 1:
+                return RoomMessagesError.from_dict(
+                    {
+                        "errcode": "M_LIMIT_EXCEEDED",
+                        "error": "retry",
+                        "retry_after_ms": 1,
+                    },
+                    data[0],
+                )
+            return RoomMessagesResponse.from_dict(
+                {"start": "p1", "end": "s0", "chunk": []},
+                data[0],
+            )
+
+        async def reenter(_response):
+            callback_entered.set()
+            await client.room_leave(ROOM_A)
+
+        monkeypatch.setattr(client, "send", send)
+        monkeypatch.setattr(client, "create_matrix_response", create_matrix_response)
+        client.add_response_callback(reenter, RoomMessagesError)
+
+        executor = object()
+        context_token = client._sync_executor_context.set(executor)
+        client._active_sync_executor_token = executor
+        await client._sync_response_lock.acquire()
+        task = asyncio.create_task(
+            client._recovery_room_messages(
+                ROOM_A,
+                "p1",
+                "s0",
+                MessageDirection.back,
+                10,
+            )
+        )
+        try:
+            await asyncio.wait_for(callback_entered.wait(), 0.5)
+            done, _ = await asyncio.wait((task,), timeout=0.05)
+            assert done == {task}, "429 callback deadlocked on sync-response lock"
+            with pytest.raises(LocalProtocolError, match="active sync"):
+                await task
+            assert leave_attempts == 0
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+            if client._sync_response_lock.locked():
+                client._sync_response_lock.release()
+            if not task.done():
+                await task
+            await client.close()
+
+    async def test_detached_response_callback_membership_runs_after_scope_exits(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """A child the response callback does not await may run afterward."""
+        child: asyncio.Task | None = None
+        release_child = asyncio.Event()
+        membership_requests = 0
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            membership_requests += 1
+            assert response_class is RoomLeaveResponse
+            return RoomLeaveResponse.from_dict({})
+
+        async def spawn_child(_response):
+            nonlocal child
+
+            async def leave_later():
+                await release_child.wait()
+                return await client.room_leave(ROOM_A)
+
+            child = asyncio.create_task(leave_later())
+
+        monkeypatch.setattr(client, "_send", send)
+        client.add_response_callback(spawn_child, RoomMessagesError)
+        response = RoomMessagesError.from_dict(
+            {"errcode": "M_UNKNOWN", "error": "failed"},
+            ROOM_A,
+        )
+
+        executor = object()
+        context_token = client._sync_executor_context.set(executor)
+        client._active_sync_executor_token = executor
+        try:
+            await client.run_response_callbacks([response])
+            assert child is not None
+            release_child.set()
+            result = await asyncio.wait_for(child, 0.5)
+            assert isinstance(result, RoomLeaveResponse)
+            assert membership_requests == 1
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+
+    async def test_response_callback_membership_from_other_executor_is_allowed(
+        self,
+        client,
+        monkeypatch,
+    ):
+        """Only a callback descended from the lock owner can form the cycle."""
+        membership_requests = 0
+        results = []
+
+        async def send(response_class, *_args, **_kwargs):
+            nonlocal membership_requests
+            membership_requests += 1
+            assert response_class is RoomLeaveResponse
+            return RoomLeaveResponse.from_dict({})
+
+        async def leave_room(_response):
+            results.append(await client.room_leave(ROOM_A))
+
+        monkeypatch.setattr(client, "_send", send)
+        client.add_response_callback(leave_room, RoomMessagesError)
+        response = RoomMessagesError.from_dict(
+            {"errcode": "M_UNKNOWN", "error": "failed"},
+            ROOM_A,
+        )
+
+        owner = object()
+        context_token = client._sync_executor_context.set(object())
+        client._active_sync_executor_token = owner
+        try:
+            await client.run_response_callbacks([response])
+        finally:
+            client._active_sync_executor_token = None
+            client._sync_executor_context.reset(context_token)
+
+        assert len(results) == 1
+        assert isinstance(results[0], RoomLeaveResponse)
+        assert membership_requests == 1
+
+    async def test_classic_operation_child_is_allowed_after_its_owner_finishes(
+        self, tempdir
+    ):
+        """A copied operation context is harmless once its owning lock exits."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+
+        async def reset_after_owner_finishes():
+            child_started.set()
+            await release_child.wait()
+            await client.reset_classic_sync_state()
+
+        async with client._classic_sync_state_operation():
+            child = asyncio.create_task(reset_after_owner_finishes())
+            await child_started.wait()
+
+        release_child.set()
+        await child
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_discards_staged_only_abandonment_after_membership_change(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A membership reset must not commit unrelated staged abandonment."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        await getattr(client, operation)(ROOM_A)
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {}
         await client.close()
 
     async def test_reset_classic_sync_state_rejects_an_inherited_callback_scope(
@@ -1137,7 +1735,7 @@ class TestRoomLocalRecovery:
         client.clear_persisted_sync_recovery()
 
         assert client.store.load_sync_token() is None
-        assert client.store.load_sync_recovery() == ([], [], [])
+        assert client.store.load_sync_recovery() == ([], [], {})
         assert client.store.load_sliding_window_tokens() == {}
 
         await client.receive_response(
@@ -3977,6 +4575,45 @@ class TestRoomLocalRecovery:
         assert "$prejoin" not in seen
         assert not client._recovery.gaps
 
+    async def test_bounded_exhaustion_after_own_join_recovers_the_new_membership(
+        self, client, aioresponse
+    ):
+        """A bounded exhausted page proves the suffix after an own rejoin."""
+        seen = record_events(client)
+        client.add_event_callback(
+            lambda _room, event: seen.append(event.event_id), RoomMemberEvent
+        )
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [
+                    text_event("$prejoin", 1),
+                    member_event("$join", 2, "join"),
+                    text_event("$after", 3),
+                    text_event("$held", 4),
+                ],
+                None,
+            ),
+        )
+
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 4)], limited=True, prev_batch="p1"
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert seen == ["$join", "$after", "$held"]
+        assert "$prejoin" not in seen
+        assert not client._recovery.gaps
+        assert response.recovered_room_ids == frozenset({ROOM_A})
+        assert response.unrecovered_room_ids == frozenset()
+        assert response.abandoned_rooms == {}
+
     async def test_recent_overlap_and_encrypted_replay(self, client, aioresponse):
         seen = record_events(client)
         await client.receive_response(
@@ -5048,6 +5685,12 @@ class TestRoomLocalRecovery:
         ]
         assert response.recovered_room_ids == frozenset()
         assert response.unrecovered_room_ids == frozenset({ROOM_A})
+        # The held token cannot be trusted, so nio has nothing to walk from and
+        # can never resume. That is not the same as proving the history gone:
+        # the application may still fetch it from the baseline it now has.
+        assert response.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert not restarted._recovery.gaps
         assert restarted.store
         _, stored, _ = restarted.store.load_sync_recovery()
@@ -7262,7 +7905,7 @@ class TestRoomLocalRecovery:
                 return response
             return RoomLeaveResponse.from_dict({})
 
-        def fail(*_args):
+        def fail(*_args, **_kwargs):
             raise RuntimeError("store unavailable")
 
         monkeypatch.setattr(client, "_send", send)
@@ -7786,7 +8429,9 @@ class TestRoomLocalRecovery:
 
         assert ROOM_A not in client._recovery.gaps
         assert not any(room_id == ROOM_A for room_id, _ in client._recovery.events)
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert client._sliding_room_prev_batch == {}
         gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
@@ -7795,7 +8440,7 @@ class TestRoomLocalRecovery:
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
-        assert abandoned == [ROOM_A]
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
         client.store.database.close()
@@ -7810,8 +8455,63 @@ class TestRoomLocalRecovery:
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
 
         assert ROOM_A not in restarted._recovery.gaps
-        assert restarted._recovery.abandoned == {ROOM_A}
+        assert restarted._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         await restarted.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_successful_membership_change_records_loss_after_retained_callback_error(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A callback failure cannot leave a successful departure's gap live."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                store_sync_tokens=True,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(
+            self._sliding("s1", [text_event("$before", 1)], prev_batch="w1")
+        )
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+
+        async def fail_callback():
+            raise RuntimeError("retained callback failed")
+
+        retained = asyncio.create_task(fail_callback())
+        client._recovery._active_dispatches[(ROOM_A, "$pending", "timeline")] = retained
+        await asyncio.sleep(0)
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        with pytest.raises(RuntimeError, match="retained callback failed"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert ROOM_A not in client._recovery.gaps
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        assert client._sliding_room_prev_batch == {}
+        gaps, _events, abandoned = client.store.load_sync_recovery()
+        assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
+        assert client.store.load_sliding_window_tokens() == {}
+        await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_application_owned_membership_change_does_not_write_recovery_store(
@@ -7853,7 +8553,9 @@ class TestRoomLocalRecovery:
         await getattr(client, operation)(ROOM_A)
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert client.store.load_sync_token() == token_before
         assert client.store.load_sync_recovery() == stored_before
         await client.close()
@@ -7910,13 +8612,14 @@ class TestRoomLocalRecovery:
         monkeypatch.setattr(client, "_send", send)
         await getattr(client, operation)(ROOM_A)
 
-        gaps, events, _ = client.store.load_sync_recovery()
+        gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
         assert [
             event
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 
@@ -8592,12 +9295,12 @@ class TestRoomLocalRecovery:
         original_save = client.store.save_recovery
         saves = 0
 
-        def fail_second_save(*args):
+        def fail_second_save(*args, **kwargs):
             nonlocal saves
             saves += 1
             if saves == 2:
                 raise RuntimeError("post-decrypt commit failed")
-            original_save(*args)
+            original_save(*args, **kwargs)
 
         monkeypatch.setattr(client.store, "save_recovery", fail_second_save)
         await client.receive_response(
@@ -9667,7 +10370,7 @@ class TestRoomLocalRecovery:
 
         monkeypatch.setattr(client, "_handle_to_device", handle)
 
-        def fail(*_args):
+        def fail(*_args, **_kwargs):
             raise RuntimeError("commit failed")
 
         monkeypatch.setattr(client.store, "save_recovery", fail)
