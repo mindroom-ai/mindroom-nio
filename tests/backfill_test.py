@@ -805,9 +805,8 @@ class TestRoomLocalRecovery:
         assert done == {membership_reset}
         await client.close()
 
-    @pytest.mark.parametrize("reentry", ["membership", "reset"])
     async def test_application_owned_membership_reset_rejects_retry_callback_reentry(
-        self, tempdir, monkeypatch, reentry
+        self, tempdir, monkeypatch
     ):
         """A retry callback cannot wait on the membership reset it interrupted."""
         client = AsyncClient(
@@ -848,10 +847,7 @@ class TestRoomLocalRecovery:
 
         async def reenter(_response):
             async def nested_operation():
-                if reentry == "membership":
-                    await client.room_forget(ROOM_A)
-                else:
-                    await client.reset_classic_sync_state()
+                await client.room_forget(ROOM_A)
 
             with pytest.raises(
                 LocalProtocolError, match="active Classic Sync"
@@ -869,6 +865,34 @@ class TestRoomLocalRecovery:
         assert attempts == 2
         assert callback_errors
         await client.close()
+
+    async def test_reset_classic_sync_state_rejects_active_operation_context(
+        self,
+        tempdir,
+    ):
+        """The reset guard fails promptly without entering its own locked path."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        operation = object()
+        context_token = client._classic_sync_state_operation_context.set(operation)
+        client._active_classic_sync_state_operation = operation
+        try:
+            with pytest.raises(LocalProtocolError, match="active Classic Sync"):
+                await client.reset_classic_sync_state()
+        finally:
+            client._active_classic_sync_state_operation = None
+            client._classic_sync_state_operation_context.reset(context_token)
+            await client.close()
 
     async def test_messages_retry_callback_rejects_membership_from_sync_executor(
         self,
