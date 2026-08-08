@@ -408,17 +408,20 @@ class InlineStore:
         self.finished: list[tuple[str, int, str | None, bool]] = []
         self.accepted: list[tuple[str, int, str]] = []
 
-    def save_recovery(self, *args):
+    def save_recovery(
+        self,
+        _token,
+        _clear_rooms,
+        _gaps,
+        _events,
+        _clear_recovered,
+        _window_tokens=None,
+        _forgotten_rooms=(),
+        _abandoned_rooms=None,
+    ):
         self.thread_ids.append(threading.get_ident())
 
-    def finish_recovery(
-        self,
-        room_id,
-        generation,
-        event_id,
-        was_encrypted,
-        abandonment=None,
-    ):
+    def finish_recovery(self, room_id, generation, event_id, was_encrypted):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
 

@@ -1226,7 +1226,7 @@ def persist_response_plan(
     )
     try:
         if store:
-            store.save_recovery(
+            save_args = (
                 token,
                 set(plan.clear_rooms),
                 plan.gaps,
@@ -1235,8 +1235,11 @@ def persist_response_plan(
                 window_tokens,
                 forgotten_rooms,
                 plan.abandoned_rooms,
-                plan.clear_room_reasons,
             )
+            if plan.clear_room_reasons:
+                store.save_recovery(*save_args, plan.clear_room_reasons)
+            else:
+                store.save_recovery(*save_args)
         apply_plan(state, plan)
     except BaseException:
         for room_id in plan.abandoned_rooms:
