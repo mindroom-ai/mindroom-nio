@@ -36,7 +36,10 @@ from ..crypto import (
     TrustState,
 )
 from ..event_provenance import TimelineEventProvenance
-from ..recovery_abandonment import RecoveryAbandonment
+from ..recovery_abandonment import (
+    RecoveryAbandonment,
+    most_conservative_abandonment,
+)
 from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
@@ -696,6 +699,39 @@ class MatrixStore:
             *conditions,
         ).execute()
 
+    @staticmethod
+    def _write_recovery_abandonments(
+        account,
+        abandoned_rooms: Mapping[str, RecoveryAbandonment],
+    ) -> None:
+        """Fold sticky loss reasons before replacing their durable rows."""
+        reasons = dict(abandoned_rooms)
+        room_ids = list(reasons)
+        for index in range(0, len(room_ids), _RECOVERY_WRITE_CHUNK_SIZE):
+            existing = SyncRecoveryAbandonedRooms.select(
+                SyncRecoveryAbandonedRooms.room_id,
+                SyncRecoveryAbandonedRooms.reason,
+            ).where(
+                SyncRecoveryAbandonedRooms.account == account,
+                SyncRecoveryAbandonedRooms.room_id.in_(
+                    room_ids[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+                ),
+            )
+            for row in existing:
+                reasons[row.room_id] = most_conservative_abandonment(
+                    RecoveryAbandonment(row.reason),
+                    reasons[row.room_id],
+                )
+
+        rows = [
+            {"account": account, "room_id": room_id, "reason": reason.value}
+            for room_id, reason in reasons.items()
+        ]
+        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
+            SyncRecoveryAbandonedRooms.replace_many(
+                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            ).execute()
+
     @use_database_atomic
     def save_recovery(
         self,
@@ -707,6 +743,7 @@ class MatrixStore:
         window_tokens: Mapping[str, SlidingWindowToken] | None = None,
         forgotten_rooms: Iterable[str] = (),
         abandoned_rooms: Mapping[str, RecoveryAbandonment] | None = None,
+        clear_room_reasons: Mapping[str, RecoveryAbandonment] | None = None,
     ) -> None:
         account = self._get_account()
         assert account
@@ -719,8 +756,31 @@ class MatrixStore:
         if token:
             SyncTokens.replace(account=account, token=token).execute()
         clear_rooms = list(clear_rooms)
+        clear_room_reasons = dict(clear_room_reasons or {})
+        abandoned_rooms = dict(abandoned_rooms or {})
         for index in range(0, len(clear_rooms), _RECOVERY_WRITE_CHUNK_SIZE):
             room_batch = clear_rooms[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
+            persisted_real_gap_rooms = {
+                row.room_id
+                for row in SyncRecoveryGaps.select(SyncRecoveryGaps.room_id).where(
+                    SyncRecoveryGaps.account == account,
+                    SyncRecoveryGaps.room_id.in_(room_batch),
+                    SyncRecoveryGaps.target_token != "",
+                )
+            }
+            for room_id in persisted_real_gap_rooms:
+                reason = clear_room_reasons.get(room_id)
+                if reason is None:
+                    if room_id in abandoned_rooms:
+                        continue
+                    logger.error(
+                        "Clearing a real gap in %s without naming a cause", room_id
+                    )
+                    reason = RecoveryAbandonment.UNKNOWN
+                abandoned_rooms[room_id] = most_conservative_abandonment(
+                    abandoned_rooms.get(room_id),
+                    reason,
+                )
             self._restore_completed_markers(
                 account,
                 PendingTimelineEvents.room_id.in_(room_batch),
@@ -752,14 +812,7 @@ class MatrixStore:
             SyncRecoveryGaps.replace_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).execute()
-        abandoned = [
-            {"account": account, "room_id": room_id, "reason": reason.value}
-            for room_id, reason in (abandoned_rooms or {}).items()
-        ]
-        for index in range(0, len(abandoned), _RECOVERY_WRITE_CHUNK_SIZE):
-            SyncRecoveryAbandonedRooms.replace_many(
-                abandoned[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).execute()
+        self._write_recovery_abandonments(account, abandoned_rooms)
         self._upsert_pending_events(account, events)
 
     @use_database_atomic
@@ -1126,9 +1179,15 @@ class MatrixStore:
         generation: int,
         event_id: str | None,
         was_encrypted: bool,
+        abandonment: RecoveryAbandonment | None = None,
     ) -> None:
         account = self._get_account()
         assert account
+        if abandonment is not None:
+            self._write_recovery_abandonments(
+                account,
+                {room_id: abandonment},
+            )
         event_filter = (
             PendingTimelineEvents.account == account,
             PendingTimelineEvents.room_id == room_id,

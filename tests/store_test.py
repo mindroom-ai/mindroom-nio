@@ -672,6 +672,81 @@ class TestClass:
             TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE
         }
 
+    def test_clearing_store_only_real_gap_records_structural_cause(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "target", "cursor")],
+            [],
+            None,
+        )
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM},
+            [],
+            [],
+            None,
+            clear_room_reasons={TEST_ROOM: RecoveryAbandonment.BASELINE_LOST},
+        )
+
+        gaps, _, abandoned = sqlstore.load_sync_recovery()
+        assert gaps == []
+        assert abandoned == {TEST_ROOM: RecoveryAbandonment.BASELINE_LOST}
+
+    def test_clearing_store_only_synthetic_gap_records_no_loss(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "", None)],
+            [],
+            None,
+        )
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM},
+            [],
+            [],
+            None,
+            clear_room_reasons={TEST_ROOM: RecoveryAbandonment.BASELINE_LOST},
+        )
+
+        assert sqlstore.load_sync_recovery() == ([], [], {})
+
+    def test_finishing_corrupt_event_records_loss_with_event_mutation(self, sqlstore):
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$corrupt",
+            "{",
+            False,
+            True,
+        )
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "target", None)],
+            [event],
+            None,
+        )
+
+        sqlstore.finish_recovery(
+            TEST_ROOM,
+            1,
+            event.event_id,
+            True,
+            RecoveryAbandonment.CORRUPT_EVENT,
+        )
+
+        gaps, events, abandoned = sqlstore.load_sync_recovery()
+        assert len(gaps) == 1
+        assert [(item.event_id, item.generation) for item in events] == [
+            (event.event_id, 0)
+        ]
+        assert abandoned == {TEST_ROOM: RecoveryAbandonment.CORRUPT_EVENT}
+
     def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
         self,
         sqlstore,
@@ -1327,7 +1402,16 @@ class TestClass:
         gaps = [RecoveryGap(room_id, 1, "target", "cursor") for room_id in room_ids]
         try:
             sqlstore.save_recovery(None, set(), gaps, [], None)
-            sqlstore.save_recovery(None, set(room_ids), [], [], None)
+            sqlstore.save_recovery(
+                None,
+                set(room_ids),
+                [],
+                [],
+                None,
+                clear_room_reasons=dict.fromkeys(
+                    room_ids, RecoveryAbandonment.BASELINE_LOST
+                ),
+            )
             remaining, _, _ = sqlstore.load_sync_recovery()
             assert not {gap.room_id for gap in remaining} & set(room_ids)
         finally:
@@ -1693,6 +1777,11 @@ class TestClass:
             [],
             [],
             retry_gap if clear_mode == "recovered" else None,
+            clear_room_reasons=(
+                {TEST_ROOM: RecoveryAbandonment.BASELINE_LOST}
+                if clear_mode == "room"
+                else None
+            ),
         )
 
         _, events, _ = sqlstore.load_sync_recovery()

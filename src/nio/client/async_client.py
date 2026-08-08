@@ -281,7 +281,6 @@ from .sync_recovery import (
     RecoveryState,
     _LiveCallbackError,
     acknowledge_unrecovered_rooms,
-    cleared_gap_abandonment,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
@@ -722,6 +721,9 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = False
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token: str | None = None
+        self._classic_sync_abandonment_before_staged_response: dict[
+            str, RecoveryAbandonment
+        ] = {}
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None
         )
@@ -832,6 +834,7 @@ class AsyncClient(Client):
         self._classic_sync_rebuild_pending = True
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+        self._classic_sync_abandonment_before_staged_response.clear()
 
     @property
     def has_uncommitted_classic_sync_state(self) -> bool:
@@ -865,6 +868,9 @@ class AsyncClient(Client):
             )
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token = None
+        self._classic_sync_abandonment_before_staged_response = dict(
+            self._recovery.abandoned
+        )
 
     async def reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
@@ -944,8 +950,14 @@ class AsyncClient(Client):
                                 acquired.append(gate)
                                 acquired_room_ids.add(room_id)
 
+                        preserved_abandonment = dict(
+                            self._classic_sync_abandonment_before_staged_response
+                            if self._classic_sync_state_staged
+                            else self._recovery.abandoned
+                        )
                         self._recovery = RecoveryState(
-                            max_held_events=self.config.backfill_max_events
+                            abandoned=preserved_abandonment,
+                            max_held_events=self.config.backfill_max_events,
                         )
                         self._sliding_room_prev_batch.clear()
                         self._pending_sliding_room_account_data.clear()
@@ -957,6 +969,9 @@ class AsyncClient(Client):
                         self._classic_sync_rebuild_pending = True
                         self._classic_sync_state_staged = False
                         self._classic_sync_acknowledgeable_token = None
+                        self._classic_sync_abandonment_before_staged_response = dict(
+                            preserved_abandonment
+                        )
                     finally:
                         for gate in reversed(acquired):
                             gate.release()
@@ -1345,7 +1360,10 @@ class AsyncClient(Client):
         if store and candidates:
             self._require_atomic_recovery_store(store)
             store.clear_recovery_abandonment(candidates)
-        return acknowledge_unrecovered_rooms(self._recovery, candidates)
+        settled = acknowledge_unrecovered_rooms(self._recovery, candidates)
+        for room_id in settled:
+            self._classic_sync_abandonment_before_staged_response.pop(room_id, None)
+        return settled
 
     def _publish_recovery_outcome(
         self, response: SyncResponse | SlidingSyncResponse
@@ -1578,6 +1596,10 @@ class AsyncClient(Client):
             and not self._recovery_persistence_enabled
         )
         if application_owned_classic_state:
+            if not self._classic_sync_state_staged:
+                self._classic_sync_abandonment_before_staged_response = dict(
+                    self._recovery.abandoned
+                )
             self._classic_sync_state_staged = True
             self._classic_sync_acknowledgeable_token = None
 
@@ -1946,8 +1968,11 @@ class AsyncClient(Client):
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
         recovery_store = self._recovery_store
-        if recovery_store:
-            self._require_atomic_recovery_store(recovery_store)
+        reset_store = (
+            recovery_store if self.config.backfill_limited_timelines else self.store
+        )
+        if reset_store:
+            self._require_atomic_recovery_store(reset_store)
         callback_scope = self._event_callback_scope.get()
         if (
             self.config.backfill_limited_timelines
@@ -1969,14 +1994,17 @@ class AsyncClient(Client):
     async def _apply_room_membership_reset(self, room_id: str) -> None:
         """Clear every room-local recovery artifact after server success."""
         if not self.config.backfill_limited_timelines:
-            # No gap can be open here to name a cause for: recovery state is
-            # only ever loaded through ``_recovery_store``, which is ``None``
-            # whenever limited-timeline backfill is off.
+            # Recovery state is not loaded in this mode, but a prior run may
+            # have left a real gap in the store. The structural cause lets the
+            # store detect and record that loss in the clearing transaction.
             persist_response_plan(
                 self._recovery,
                 self.store,
                 token=None,
-                plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({room_id}),
+                    clear_room_reasons={room_id: RecoveryAbandonment.BASELINE_LOST},
+                ),
                 forgotten_rooms=(room_id,),
             )
             self._sliding_room_prev_batch.pop(room_id, None)
@@ -1994,11 +2022,7 @@ class AsyncClient(Client):
                     token=None,
                     plan=RecoveryPlan(
                         clear_rooms=frozenset({room_id}),
-                        abandoned_rooms=cleared_gap_abandonment(
-                            self._recovery,
-                            (room_id,),
-                            RecoveryAbandonment.BASELINE_LOST,
-                        ),
+                        clear_room_reasons={room_id: RecoveryAbandonment.BASELINE_LOST},
                     ),
                     forgotten_rooms=(room_id,),
                 )

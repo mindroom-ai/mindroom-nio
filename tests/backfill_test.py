@@ -541,6 +541,74 @@ class TestRoomLocalRecovery:
         assert client.rooms[ROOM_A].name == "Later"
         await client.close()
 
+    async def test_reset_classic_sync_state_preserves_committed_abandonment(
+        self,
+        tempdir,
+    ):
+        """Replaying one response cannot erase a loss committed before it."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        reason = RecoveryAbandonment.EVENT_LIMIT
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(abandoned_rooms={ROOM_A: reason}),
+        )
+
+        committed = sync_response("s1", {})
+        await client.receive_response(committed)
+        assert committed.abandoned_rooms == {ROOM_A: reason}
+        client.acknowledge_classic_sync("s1")
+
+        await client.receive_response(sync_response("s2", {}))
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {ROOM_A: reason}
+        await client.close()
+
+    async def test_reset_classic_sync_state_discards_staged_abandonment(
+        self,
+        tempdir,
+    ):
+        """A loss created after the committed cursor is replayable state."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await client.receive_response(sync_response("s1", {}))
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+
+        await client.reset_classic_sync_state()
+
+        assert client._recovery.abandoned == {}
+        await client.close()
+
     async def test_reset_classic_sync_state_rejects_an_inherited_callback_scope(
         self,
         tempdir,
@@ -7917,13 +7985,14 @@ class TestRoomLocalRecovery:
         monkeypatch.setattr(client, "_send", send)
         await getattr(client, operation)(ROOM_A)
 
-        gaps, events, _ = client.store.load_sync_recovery()
+        gaps, events, abandoned = client.store.load_sync_recovery()
         assert [gap for gap in gaps if gap.room_id == ROOM_A] == []
         assert [
             event
             for event in events
             if event.room_id == ROOM_A and event.generation > 0
         ] == []
+        assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
         assert client.store.load_sliding_window_tokens() == {}
         await client.close()
 

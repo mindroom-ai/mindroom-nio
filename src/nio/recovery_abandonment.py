@@ -6,11 +6,11 @@ class RecoveryAbandonment(str, Enum):
 
     Abandonment covers situations an application has to treat differently, and
     one that treats them alike gets some of them wrong. ``EVENT_LIMIT``,
-    ``FETCH_FAILED`` and ``BASELINE_LOST`` say only that *nio* stopped: the
-    missing history was never shown to be gone, and a client willing to spend
-    more than nio's bounded walk may still be able to fetch it. ``UNVERIFIABLE``
-    says the walk cannot be made to work at all, so those events will never
-    arrive. ``UNKNOWN`` says nio cannot answer the question.
+    ``FETCH_FAILED``, ``BASELINE_LOST`` and ``CORRUPT_EVENT`` say only that
+    *nio* stopped: the missing history was never shown to be gone, and another
+    recovery strategy may still be able to fetch it. ``UNVERIFIABLE`` says the
+    walk cannot be made to work at all, so those events will never arrive.
+    ``UNKNOWN`` says nio cannot answer the question.
 
     Recording every abandonment as permanent marks rooms incompletable that are
     merely over budget; recording none as permanent throws away the one signal
@@ -32,6 +32,11 @@ class RecoveryAbandonment(str, Enum):
     window token. Nio can never resume *this* walk, but nothing was shown about
     the history itself, and an application may still fetch it from the new
     baseline."""
+
+    CORRUPT_EVENT = "corrupt_event"
+    """A retained event could not be decoded, so nio cannot deliver the exact
+    recovered slice. This names a local data failure; it does not prove that an
+    application or a fresh fetch cannot recover the history another way."""
 
     UNKNOWN = "unknown"
     """Nio cannot say why the walk was given up on. Recorded by rows that
@@ -67,6 +72,17 @@ _RANKS = {
     RecoveryAbandonment.EVENT_LIMIT: 0,
     RecoveryAbandonment.FETCH_FAILED: 1,
     RecoveryAbandonment.BASELINE_LOST: 2,
-    RecoveryAbandonment.UNKNOWN: 3,
-    RecoveryAbandonment.UNVERIFIABLE: 4,
+    RecoveryAbandonment.CORRUPT_EVENT: 3,
+    RecoveryAbandonment.UNKNOWN: 4,
+    RecoveryAbandonment.UNVERIFIABLE: 5,
 }
+
+
+def most_conservative_abandonment(
+    current: RecoveryAbandonment | None,
+    incoming: RecoveryAbandonment,
+) -> RecoveryAbandonment:
+    """Keep whichever reason lets the application assume the least."""
+    if current is None:
+        return incoming
+    return max(current, incoming, key=lambda reason: reason.rank)

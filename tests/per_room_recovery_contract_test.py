@@ -391,6 +391,7 @@ class TestPerRoomRecoveryContract:
         assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
         await client.close()
 
+    @pytest.mark.expects_anonymous_recovery_clear
     async def test_a_clear_that_names_no_cause_is_recorded_as_unknown(
         self,
         tempdir,
@@ -657,6 +658,7 @@ class TestPerRoomRecoveryContract:
     async def test_non_atomic_queue_store_rejects_real_gap_clear_before_mutation(
         self,
         tempdir,
+        caplog,
     ):
         """Deleting a real gap and recording its loss must be one transaction."""
         bootstrap = SqliteStore(OWN_ID, LOGIN["device_id"], tempdir)
@@ -722,6 +724,7 @@ class TestPerRoomRecoveryContract:
                     plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
                 )
 
+            assert "without naming a cause" not in caplog.text
             assert client._recovery.gaps == before_gaps
             assert client._recovery.abandoned == before_abandoned
             assert client._recovery.outcomes == before_outcomes

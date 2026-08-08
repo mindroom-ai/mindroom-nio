@@ -232,7 +232,7 @@ def test_classic_initial_own_join_names_stale_real_gap_as_baseline_lost():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.abandoned_rooms == {
+    assert plan.clear_room_reasons == {
         ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
     }
 
@@ -257,7 +257,7 @@ def test_membership_reset_names_the_real_gap_loss_in_the_plan():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.abandoned_rooms == {
+    assert plan.clear_room_reasons == {
         ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
     }
 
@@ -276,6 +276,9 @@ def test_membership_reset_of_a_synthetic_gap_is_not_a_loss():
 
     assert plan.clear_rooms == frozenset({ROOM})
     assert plan.abandoned_rooms == {}
+    assert plan.clear_room_reasons == {
+        ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
+    }
 
 
 def test_sync_history_counts_toward_held_cap():
@@ -408,7 +411,14 @@ class InlineStore:
     def save_recovery(self, *args):
         self.thread_ids.append(threading.get_ident())
 
-    def finish_recovery(self, room_id, generation, event_id, was_encrypted):
+    def finish_recovery(
+        self,
+        room_id,
+        generation,
+        event_id,
+        was_encrypted,
+        abandonment=None,
+    ):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
 
@@ -666,7 +676,7 @@ async def test_expired_budget_commits_exhausted_page_without_dispatch():
     """
     value = pending("$live", 0)
     state = RecoveryState(
-        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1", membership_bound=True)]},
         events={(ROOM, 1): [value]},
     )
 
@@ -694,6 +704,60 @@ async def test_expired_budget_commits_exhausted_page_without_dispatch():
         "$live",
     ]
     assert state.events[(ROOM, 1)][-1].source_json == value.source_json
+
+
+@pytest.mark.asyncio
+async def test_targeted_unbound_page_without_end_is_sticky_unverifiable():
+    """Exhaustion proves continuity only when membership supplied the bound."""
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
+        events={(ROOM, 1): [pending("$live", 0)]},
+    )
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {"start": "s1", "chunk": [event("$untrusted", 1).source]},
+            ROOM,
+        )
+
+    seen: list[str] = []
+
+    async def dispatch(
+        _room,
+        item,
+        _was_completed,
+        _kind,
+        _provenance,
+        _sync_origin,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        seen.append(item.event_id)
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert seen == ["$live"]
+    assert ROOM not in state.gaps
+    expected = {ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
 
 
 @pytest.mark.asyncio
@@ -823,6 +887,53 @@ async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
     completed = state.completed[ROOM]["$bad"]
     assert completed.was_encrypted
     assert completed.provenance is TimelineEventProvenance.HISTORY
+
+
+@pytest.mark.asyncio
+async def test_corrupt_real_gap_event_is_sticky_abandonment():
+    corrupt = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "$bad",
+        "{",
+        False,
+        True,
+        provenance=TimelineEventProvenance.HISTORY,
+        apply_room_state=False,
+    )
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", None)]},
+        events={(ROOM, 1): [corrupt]},
+    )
+
+    async def unused_fetch(*args):
+        raise AssertionError("closed gap must not fetch")
+
+    async def unused_dispatch(*args):
+        raise AssertionError("corrupt event must not dispatch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=unused_dispatch,
+        store=None,
+    )
+
+    assert ROOM not in state.gaps
+    expected = {ROOM: sync_recovery.RecoveryAbandonment.CORRUPT_EVENT}
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
 
 
 @pytest.mark.asyncio
@@ -1186,7 +1297,13 @@ async def test_close_drains_cleared_dispatch_without_cancelling_it():
         store=None,
     )
     await started.wait()
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+    apply_plan(
+        state,
+        RecoveryPlan(
+            clear_rooms=frozenset({ROOM}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+        ),
+    )
     assert state._active_dispatches
 
     client = AsyncClient("https://example.org")
@@ -1385,7 +1502,15 @@ async def test_clearing_room_drains_active_dispatch_before_reset():
 
     async def reset():
         await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
-        apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+        apply_plan(
+            state,
+            RecoveryPlan(
+                clear_rooms=frozenset({ROOM}),
+                clear_room_reasons={
+                    ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
+                },
+            ),
+        )
 
     task = asyncio.create_task(reset())
     await asyncio.sleep(0)
@@ -1648,7 +1773,10 @@ def test_abandonment_restores_promoted_completed_marker(clear_mode):
     plan = (
         RecoveryPlan(clear_recovered=gap)
         if clear_mode == "recovered"
-        else RecoveryPlan(clear_rooms=frozenset({ROOM}))
+        else RecoveryPlan(
+            clear_rooms=frozenset({ROOM}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+        )
     )
 
     apply_plan(state, plan)
@@ -1860,12 +1988,24 @@ def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
         events={(ROOM, 1): [], (ROOM_B, 1): []},
     )
 
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM, ROOM_B})))
+    apply_plan(
+        state,
+        RecoveryPlan(
+            clear_rooms=frozenset({ROOM, ROOM_B}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.UNKNOWN},
+        ),
+    )
 
+    expected = {ROOM: sync_recovery.RecoveryAbandonment.UNKNOWN}
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
-        {},
+        expected,
+    )
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
     )
 
 
@@ -2020,6 +2160,13 @@ def test_every_reason_is_ranked():
     assert len(set(ranks)) == len(ranks), "a tie would make merges order-dependent"
 
 
+def test_corrupt_recovery_event_has_a_named_abandonment_reason():
+    """A known local loss must not be published as an unknown cause."""
+    assert "corrupt_event" in {
+        reason.value for reason in sync_recovery.RecoveryAbandonment
+    }
+
+
 def test_an_undiagnosed_loss_cannot_be_relabelled_as_recoverable():
     """``UNKNOWN`` outranks every reason that permits an assumption.
 
@@ -2035,6 +2182,7 @@ def test_an_undiagnosed_loss_cannot_be_relabelled_as_recoverable():
         sync_recovery.RecoveryAbandonment.EVENT_LIMIT,
         sync_recovery.RecoveryAbandonment.FETCH_FAILED,
         sync_recovery.RecoveryAbandonment.BASELINE_LOST,
+        sync_recovery.RecoveryAbandonment.CORRUPT_EVENT,
     ):
         state.abandoned = {ROOM: unknown}
         apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: weaker}))

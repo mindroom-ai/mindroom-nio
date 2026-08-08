@@ -23,7 +23,10 @@ from ..events import (
     RoomMemberEvent,
 )
 from ..exceptions import LocalProtocolError
-from ..recovery_abandonment import RecoveryAbandonment
+from ..recovery_abandonment import (
+    RecoveryAbandonment,
+    most_conservative_abandonment,
+)
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
 if TYPE_CHECKING:
@@ -180,6 +183,10 @@ class RecoveryPlan:
     # Explicit real-gap failures and why each one was given up on; synthetic
     # empty-token drains never enter this mapping.
     abandoned_rooms: Mapping[str, RecoveryAbandonment] = field(default_factory=dict)
+    # Why a room is being cleared, used only if that clear destroys a real gap.
+    # Keeping this separate from ``abandoned_rooms`` lets the store make the
+    # decision atomically when the persisted gap is not present in memory.
+    clear_room_reasons: Mapping[str, RecoveryAbandonment] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -238,36 +245,30 @@ def acknowledge_unrecovered_rooms(
     return frozenset(settled)
 
 
-def _most_conservative_abandonment(
-    current: RecoveryAbandonment | None,
-    incoming: RecoveryAbandonment,
-) -> RecoveryAbandonment:
-    """Keep whichever reason lets the application assume the least.
-
-    See :attr:`RecoveryAbandonment.rank` for why the ordering is conservatism
-    rather than certainty.
-    """
-    if current is None:
-        return incoming
-    return max(current, incoming, key=lambda reason: reason.rank)
-
-
-def cleared_gap_abandonment(
+def _materialize_memory_clear_abandonments(
     state: RecoveryState,
-    room_ids: Iterable[str],
-    reason: RecoveryAbandonment,
-) -> dict[str, RecoveryAbandonment]:
-    """Name the rooms whose real gap dies with this clear, and say why.
+    plan: RecoveryPlan,
+) -> RecoveryPlan:
+    """Turn structural clear causes into losses visible in memory.
 
-    Whether a clear drops a real gap is a fact about persisted state, so it is
-    read here; *why* the room is being cleared is only known to the caller and
-    is never inferred from the clear itself.
+    The store performs the same check against persisted gaps in its transaction;
+    this side handles memory-only recovery and supplies immediate response state.
     """
-    return {
-        room_id: reason
-        for room_id in room_ids
-        if any(gap.target_token for gap in state.gaps.get(room_id, ()))
-    }
+    abandoned_rooms = dict(plan.abandoned_rooms)
+    for room_id in plan.clear_rooms:
+        if not any(gap.target_token for gap in state.gaps.get(room_id, ())):
+            continue
+        reason = plan.clear_room_reasons.get(room_id)
+        if reason is None:
+            if room_id in abandoned_rooms:
+                continue
+            logger.error("Clearing a real gap in %s without naming a cause", room_id)
+            reason = RecoveryAbandonment.UNKNOWN
+        abandoned_rooms[room_id] = most_conservative_abandonment(
+            abandoned_rooms.get(room_id),
+            reason,
+        )
+    return replace(plan, abandoned_rooms=abandoned_rooms)
 
 
 def is_recovery_dispatch_task(
@@ -746,6 +747,7 @@ def _plan_room_reset(
     additional_events: Iterable[PendingTimelineEvent] = (),
     *,
     abandoned_rooms: Mapping[str, RecoveryAbandonment] = MappingProxyType({}),
+    clear_reason: RecoveryAbandonment | None = None,
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -760,6 +762,7 @@ def _plan_room_reset(
         return RecoveryPlan(
             clear_rooms=clear,
             abandoned_rooms=abandoned_rooms,
+            clear_room_reasons=({room_id: clear_reason} if clear_reason else {}),
         )
     generation = max((gap.generation for gap in gaps), default=0) + 1
     events = tuple(
@@ -771,6 +774,7 @@ def _plan_room_reset(
         (RecoveryGap(room_id, generation, "", None),),
         events,
         abandoned_rooms=abandoned_rooms,
+        clear_room_reasons=({room_id: clear_reason} if clear_reason else {}),
     )
 
 
@@ -796,11 +800,7 @@ def plan_room_timeline(
         return _plan_room_reset(
             state,
             room_id,
-            abandoned_rooms=cleared_gap_abandonment(
-                state,
-                (room_id,),
-                RecoveryAbandonment.BASELINE_LOST,
-            ),
+            clear_reason=RecoveryAbandonment.BASELINE_LOST,
         )
 
     if live_event_count is not None and not (
@@ -894,7 +894,10 @@ def plan_room_timeline(
             room_id,
             events,
             abandoned_rooms=(
-                {room_id: RecoveryAbandonment.EVENT_LIMIT} if abandons_real_gap else {}
+                {room_id: RecoveryAbandonment.EVENT_LIMIT} if new_gap else {}
+            ),
+            clear_reason=(
+                RecoveryAbandonment.EVENT_LIMIT if abandons_real_gap else None
             ),
         )
     gap = (
@@ -912,14 +915,8 @@ def plan_room_timeline(
         frozenset({room_id}) if clear else frozenset(),
         (gap,) if gap else (),
         tuple(events),
-        abandoned_rooms=(
-            cleared_gap_abandonment(
-                state,
-                (room_id,),
-                RecoveryAbandonment.BASELINE_LOST,
-            )
-            if clear
-            else {}
+        clear_room_reasons=(
+            {room_id: RecoveryAbandonment.BASELINE_LOST} if clear else {}
         ),
     )
 
@@ -929,13 +926,19 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
     abandoned_rooms: dict[str, RecoveryAbandonment] = {}
+    clear_room_reasons: dict[str, RecoveryAbandonment] = {}
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
         for room_id, reason in plan.abandoned_rooms.items():
-            abandoned_rooms[room_id] = _most_conservative_abandonment(
+            abandoned_rooms[room_id] = most_conservative_abandonment(
                 abandoned_rooms.get(room_id),
+                reason,
+            )
+        for room_id, reason in plan.clear_room_reasons.items():
+            clear_room_reasons[room_id] = most_conservative_abandonment(
+                clear_room_reasons.get(room_id),
                 reason,
             )
     return RecoveryPlan(
@@ -943,6 +946,7 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
         tuple(gaps),
         tuple(events),
         abandoned_rooms=abandoned_rooms,
+        clear_room_reasons=clear_room_reasons,
     )
 
 
@@ -1011,11 +1015,7 @@ def plan_sync_response(
         _plan_room_reset(
             state,
             room_id,
-            abandoned_rooms=cleared_gap_abandonment(
-                state,
-                (room_id,),
-                RecoveryAbandonment.BASELINE_LOST,
-            ),
+            clear_reason=RecoveryAbandonment.BASELINE_LOST,
         )
         for room_id in reset_room_ids
     )
@@ -1023,6 +1023,7 @@ def plan_sync_response(
 
 
 def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
+    plan = _materialize_memory_clear_abandonments(state, plan)
     for room_id in plan.abandoned_rooms:
         state.outcomes[room_id] = False
 
@@ -1087,7 +1088,7 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     # Clearing room recovery does not settle a loss. Only the application can
     # do that after recording the missing work somewhere it owns.
     for room_id, reason in plan.abandoned_rooms.items():
-        state.abandoned[room_id] = _most_conservative_abandonment(
+        state.abandoned[room_id] = most_conservative_abandonment(
             state.abandoned.get(room_id),
             reason,
         )
@@ -1198,36 +1199,31 @@ def persist_response_plan(
         for room_id in plan.clear_rooms
         if any(gap.target_token for gap in state.gaps.get(room_id, ()))
     )
-    # Dropping a real gap loses work, so the room has to be named as abandoned.
-    # The cause belongs to whoever cleared the room and is never inferred from
-    # the clear itself: the room being cleared is how abandonment is carried
-    # out, not why it happened. A producer that fails to say why is a defect,
-    # but a durable sync path is the wrong place to raise, so it degrades to
-    # ``UNKNOWN`` -- which claims nothing -- and is caught by the tests instead.
-    abandoned_rooms = dict(plan.abandoned_rooms)
-    for room_id in real_gap_clear_rooms - abandoned_rooms.keys():
-        logger.error("Clearing a real gap in %s without naming a cause", room_id)
-        abandoned_rooms[room_id] = RecoveryAbandonment.UNKNOWN
+    # A structural cause means the store may discover a real gap that is absent
+    # from memory. Reject a non-atomic implementation before validation logs or
+    # any mutation; deleting the gap and recording its loss is one transition.
+    potentially_destructive_clear = bool(
+        real_gap_clear_rooms or plan.clear_room_reasons
+    )
+    if (
+        store
+        and potentially_destructive_clear
+        and not getattr(store, "supports_atomic_recovery", False)
+    ):
+        raise LocalProtocolError(
+            "The configured store does not support atomic recovery writes."
+        )
+    plan = _materialize_memory_clear_abandonments(state, plan)
     # Fold in what is already known before the row is written, not after: the
     # store replaces the room's reason outright, so a plan that claims less
     # than the standing loss would leave a restart reading the weaker one.
     plan = replace(
         plan,
         abandoned_rooms={
-            room_id: _most_conservative_abandonment(
-                state.abandoned.get(room_id), reason
-            )
-            for room_id, reason in abandoned_rooms.items()
+            room_id: most_conservative_abandonment(state.abandoned.get(room_id), reason)
+            for room_id, reason in plan.abandoned_rooms.items()
         },
     )
-    if (
-        store
-        and real_gap_clear_rooms
-        and not getattr(store, "supports_atomic_recovery", False)
-    ):
-        raise LocalProtocolError(
-            "The configured store does not support atomic recovery writes."
-        )
     try:
         if store:
             store.save_recovery(
@@ -1239,6 +1235,7 @@ def persist_response_plan(
                 window_tokens,
                 forgotten_rooms,
                 plan.abandoned_rooms,
+                plan.clear_room_reasons,
             )
         apply_plan(state, plan)
     except BaseException:
@@ -1256,13 +1253,24 @@ def _finish(
     gap: RecoveryGap,
     event: PendingTimelineEvent | None = None,
     was_encrypted: bool = False,
+    abandonment: RecoveryAbandonment | None = None,
 ) -> None:
     if store:
-        store.finish_recovery(
+        finish_args = (
             gap.room_id,
             gap.generation,
             event.event_id if event else None,
             was_encrypted,
+        )
+        if abandonment is None:
+            store.finish_recovery(*finish_args)
+        else:
+            store.finish_recovery(*finish_args, abandonment)
+    if abandonment is not None:
+        state.outcomes[gap.room_id] = False
+        state.abandoned[gap.room_id] = most_conservative_abandonment(
+            state.abandoned.get(gap.room_id),
+            abandonment,
         )
     key = (gap.room_id, gap.generation)
     if event:
@@ -1525,9 +1533,6 @@ async def _collect_slice(
             next_cursor = None
         elif continuity_proven:
             next_cursor = None
-        elif response.end is None and gap.target_token:
-            # Unbound exhaustion closes the walk without proving continuity.
-            next_cursor = None
         elif response.end is None:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
             recovered.clear()
@@ -1581,9 +1586,14 @@ async def _drain_gap(
             event = pending.parse()
         except Exception:
             logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
-            if gap.target_token:
-                state.outcomes[gap.room_id] = False
-            _finish(state, store, gap, pending, pending.was_encrypted)
+            _finish(
+                state,
+                store,
+                gap,
+                pending,
+                pending.was_encrypted,
+                (RecoveryAbandonment.CORRUPT_EVENT if gap.target_token else None),
+            )
             continue
         try:
             key = _dispatch_key(pending)
