@@ -25,7 +25,7 @@ from ..events import (
 from ..exceptions import LocalProtocolError
 from ..recovery_abandonment import (
     RecoveryAbandonment,
-    most_conservative_abandonment,
+    normalize_abandonment_reasons,
 )
 from ..responses import RoomMessagesError, RoomMessagesResponse
 
@@ -34,6 +34,45 @@ if TYPE_CHECKING:
     from ..store.database import MatrixStore
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_abandonment_rooms(
+    rooms: Mapping[str, object],
+) -> dict[str, frozenset[RecoveryAbandonment]]:
+    """Normalize every room's causes at the public recovery boundary."""
+    return {
+        room_id: normalize_abandonment_reasons(reasons)
+        for room_id, reasons in rooms.items()
+    }
+
+
+def _union_abandonment_reasons(
+    current: object | None,
+    incoming: object,
+) -> frozenset[RecoveryAbandonment]:
+    """Add a room's new causes without discarding an earlier cause."""
+    if current is None:
+        return normalize_abandonment_reasons(incoming)
+    return normalize_abandonment_reasons(current) | normalize_abandonment_reasons(
+        incoming
+    )
+
+
+def _legacy_abandonment_rooms(
+    rooms: Mapping[str, frozenset[RecoveryAbandonment]],
+) -> dict[str, RecoveryAbandonment]:
+    """Adapt canonical causes to the currently singular store API.
+
+    Persistent multi-cause encoding is outside this in-memory/public contract.
+    ``UNKNOWN`` avoids incorrectly claiming that one selected cause was the
+    only one when an older store only accepts a scalar reason.
+    """
+    return {
+        room_id: (
+            next(iter(reasons)) if len(reasons) == 1 else RecoveryAbandonment.UNKNOWN
+        )
+        for room_id, reasons in rooms.items()
+    }
 
 
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
@@ -182,11 +221,27 @@ class RecoveryPlan:
     clear_recovered: RecoveryGap | None = None
     # Explicit real-gap failures and why each one was given up on; synthetic
     # empty-token drains never enter this mapping.
-    abandoned_rooms: Mapping[str, RecoveryAbandonment] = field(default_factory=dict)
+    abandoned_rooms: Mapping[str, frozenset[RecoveryAbandonment]] = field(
+        default_factory=dict
+    )
     # Why a room is being cleared, used only if that clear destroys a real gap.
     # Keeping this separate from ``abandoned_rooms`` lets the store make the
     # decision atomically when the persisted gap is not present in memory.
-    clear_room_reasons: Mapping[str, RecoveryAbandonment] = field(default_factory=dict)
+    clear_room_reasons: Mapping[str, frozenset[RecoveryAbandonment]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "abandoned_rooms",
+            _normalize_abandonment_rooms(self.abandoned_rooms),
+        )
+        object.__setattr__(
+            self,
+            "clear_room_reasons",
+            _normalize_abandonment_rooms(self.clear_room_reasons),
+        )
 
 
 @dataclass(frozen=True)
@@ -210,7 +265,7 @@ class RecoveryState:
     # is not drained by a read: a loss that is announced once and then forgotten
     # is indistinguishable from a recovery, so the application would have no way
     # to tell a room with permanently missing work from a healthy one.
-    abandoned: dict[str, RecoveryAbandonment] = field(default_factory=dict)
+    abandoned: dict[str, frozenset[RecoveryAbandonment]] = field(default_factory=dict)
     room_offset: int = 0
     max_held_events: int = 200
     _active_dispatches: dict[_DispatchKey, asyncio.Task[_LiveCallbackError | None]] = (
@@ -222,6 +277,9 @@ class RecoveryState:
     _deferred_dispatch_errors: list[Exception] = field(
         default_factory=list, init=False, repr=False, compare=False
     )
+
+    def __post_init__(self) -> None:
+        self.abandoned = _normalize_abandonment_rooms(self.abandoned)
 
 
 def has_pending_recovery_work(state: RecoveryState) -> bool:
@@ -264,7 +322,7 @@ def _materialize_memory_clear_abandonments(
                 continue
             logger.error("Clearing a real gap in %s without naming a cause", room_id)
             reason = RecoveryAbandonment.UNKNOWN
-        abandoned_rooms[room_id] = most_conservative_abandonment(
+        abandoned_rooms[room_id] = _union_abandonment_reasons(
             abandoned_rooms.get(room_id),
             reason,
         )
@@ -746,8 +804,8 @@ def _plan_room_reset(
     room_id: str,
     additional_events: Iterable[PendingTimelineEvent] = (),
     *,
-    abandoned_rooms: Mapping[str, RecoveryAbandonment] = MappingProxyType({}),
-    clear_reason: RecoveryAbandonment | None = None,
+    abandoned_rooms: Mapping[str, object] = MappingProxyType({}),
+    clear_reason: object | None = None,
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -925,19 +983,19 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
     clear_rooms: set[str] = set()
     gaps: list[RecoveryGap] = []
     events: list[PendingTimelineEvent] = []
-    abandoned_rooms: dict[str, RecoveryAbandonment] = {}
-    clear_room_reasons: dict[str, RecoveryAbandonment] = {}
+    abandoned_rooms: dict[str, frozenset[RecoveryAbandonment]] = {}
+    clear_room_reasons: dict[str, frozenset[RecoveryAbandonment]] = {}
     for plan in plans:
         clear_rooms.update(plan.clear_rooms)
         gaps.extend(plan.gaps)
         events.extend(plan.events)
         for room_id, reason in plan.abandoned_rooms.items():
-            abandoned_rooms[room_id] = most_conservative_abandonment(
+            abandoned_rooms[room_id] = _union_abandonment_reasons(
                 abandoned_rooms.get(room_id),
                 reason,
             )
         for room_id, reason in plan.clear_room_reasons.items():
-            clear_room_reasons[room_id] = most_conservative_abandonment(
+            clear_room_reasons[room_id] = _union_abandonment_reasons(
                 clear_room_reasons.get(room_id),
                 reason,
             )
@@ -1088,7 +1146,7 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     # Clearing room recovery does not settle a loss. Only the application can
     # do that after recording the missing work somewhere it owns.
     for room_id, reason in plan.abandoned_rooms.items():
-        state.abandoned[room_id] = most_conservative_abandonment(
+        state.abandoned[room_id] = _union_abandonment_reasons(
             state.abandoned.get(room_id),
             reason,
         )
@@ -1096,7 +1154,11 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
 
 def take_recovery_outcomes(
     state: RecoveryState,
-) -> tuple[frozenset[str], frozenset[str], dict[str, RecoveryAbandonment]]:
+) -> tuple[
+    frozenset[str],
+    frozenset[str],
+    dict[str, frozenset[RecoveryAbandonment]],
+]:
     """Drain this response's outcomes into recovered, unrecovered, abandoned.
 
     The third result is reported alongside the second as well as folded into
@@ -1114,7 +1176,8 @@ def take_recovery_outcomes(
         for room_id, gaps in state.gaps.items()
         if any(gap.target_token for gap in gaps)
     )
-    abandoned = dict(state.abandoned)
+    abandoned = _normalize_abandonment_rooms(state.abandoned)
+    state.abandoned = abandoned
     # ``frozenset`` operators return ``NotImplemented`` against ``dict_keys``,
     # so the reflected ``dict_keys`` operator answers instead and yields a
     # mutable ``set``. Both fields are published as frozen sets, so the result
@@ -1137,7 +1200,7 @@ def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
     events: Iterable[Any],
-    abandoned: Mapping[str, RecoveryAbandonment] | Iterable[str] | None = None,
+    abandoned: Mapping[str, object] | Iterable[str] | None = None,
 ) -> None:
     state.gaps.clear()
     state.events.clear()
@@ -1145,10 +1208,13 @@ def load_recovery_state(
     state.outcomes.clear()
     state.abandoned.clear()
     if isinstance(abandoned, Mapping):
-        state.abandoned.update(abandoned)
+        state.abandoned.update(_normalize_abandonment_rooms(abandoned))
     else:
         state.abandoned.update(
-            dict.fromkeys(abandoned or (), RecoveryAbandonment.UNKNOWN)
+            {
+                room_id: frozenset({RecoveryAbandonment.UNKNOWN})
+                for room_id in abandoned or ()
+            }
         )
     for row in gaps:
         gap = RecoveryGap(
@@ -1225,7 +1291,7 @@ def persist_response_plan(
     plan = replace(
         plan,
         abandoned_rooms={
-            room_id: most_conservative_abandonment(state.abandoned.get(room_id), reason)
+            room_id: _union_abandonment_reasons(state.abandoned.get(room_id), reason)
             for room_id, reason in plan.abandoned_rooms.items()
         },
     )
@@ -1239,10 +1305,13 @@ def persist_response_plan(
                 plan.clear_recovered,
                 window_tokens,
                 forgotten_rooms,
-                plan.abandoned_rooms,
+                _legacy_abandonment_rooms(plan.abandoned_rooms),
             )
             if plan.clear_room_reasons:
-                store.save_recovery(*save_args, plan.clear_room_reasons)
+                store.save_recovery(
+                    *save_args,
+                    _legacy_abandonment_rooms(plan.clear_room_reasons),
+                )
             else:
                 store.save_recovery(*save_args)
         apply_plan(state, plan)
@@ -1276,7 +1345,7 @@ def _finish(
             store.finish_recovery(*finish_args, abandonment)
     if abandonment is not None:
         state.outcomes[gap.room_id] = False
-        state.abandoned[gap.room_id] = most_conservative_abandonment(
+        state.abandoned[gap.room_id] = _union_abandonment_reasons(
             state.abandoned.get(gap.room_id),
             abandonment,
         )
@@ -1416,7 +1485,7 @@ async def _collect_slice(
     recovered_count = sum(not event.is_live for event in pending)
     while cursor and pages < options.max_pages:
         clear_recovered = False
-        abandoned: RecoveryAbandonment | None = None
+        abandoned: frozenset[RecoveryAbandonment] = frozenset()
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
@@ -1522,30 +1591,23 @@ async def _collect_slice(
             and not clear_recovered
         )
         continuity_proven = target_reached or bounded_exhausted
-        # A cursor the server will not move past is checked before the event
-        # cap. Both can be true of one page, and only one reason is recorded,
-        # so the cap would report a budget stop for a walk nio just watched
-        # fail to advance -- the under-claim the merge order exists to prevent.
+        terminal_causes: set[RecoveryAbandonment] = set()
         if response.end == cursor:
             logger.error("Abandoning unverifiable gap in %s", gap.room_id)
-            recovered.clear()
-            clear_recovered = True
-            abandoned = RecoveryAbandonment.UNVERIFIABLE
-            next_cursor = None
-        elif retained_recovered_count + len(recovered) > options.max_events:
+            terminal_causes.add(RecoveryAbandonment.UNVERIFIABLE)
+        if not continuity_proven and response.end is None:
+            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
+            terminal_causes.add(RecoveryAbandonment.UNVERIFIABLE)
+        if retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
+            terminal_causes.add(RecoveryAbandonment.EVENT_LIMIT)
+        if terminal_causes:
             recovered.clear()
             page_events.clear()
             clear_recovered = True
-            abandoned = RecoveryAbandonment.EVENT_LIMIT
+            abandoned = frozenset(terminal_causes)
             next_cursor = None
         elif continuity_proven:
-            next_cursor = None
-        elif response.end is None:
-            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
-            recovered.clear()
-            clear_recovered = True
-            abandoned = RecoveryAbandonment.UNVERIFIABLE
             next_cursor = None
         else:
             next_cursor = response.end

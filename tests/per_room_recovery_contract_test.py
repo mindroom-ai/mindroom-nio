@@ -417,7 +417,9 @@ class TestPerRoomRecoveryContract:
         )
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         gaps, _events, abandoned = client.store.load_sync_recovery()
         assert gaps == []
         assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
@@ -459,7 +461,9 @@ class TestPerRoomRecoveryContract:
                 plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
             )
 
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.UNKNOWN}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
         assert client.store.load_sync_recovery()[2] == {
             ROOM_A: RecoveryAbandonment.UNKNOWN
         }
@@ -493,7 +497,9 @@ class TestPerRoomRecoveryContract:
         with caplog.at_level(logging.ERROR, logger="nio.client.sync_recovery"):
             await getattr(client, operation)(ROOM_A)
 
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         assert "without naming a cause" not in caplog.text
         await client.close()
 
@@ -1050,16 +1056,11 @@ class TestPerRoomRecoveryContract:
         assert fetch.pages == []
         await client.close()
 
-    async def test_a_weaker_reason_cannot_overwrite_a_stored_loss(
+    async def test_legacy_store_marks_multiple_causes_as_unknown(
         self,
         tempdir,
     ):
-        """What is on disk keeps the strongest claim, not the newest one.
-
-        The row is replaced outright on every write, so a later plan that
-        claims less would leave a restart reading the weaker reason -- and the
-        restart is exactly when the application has nothing else to go on.
-        """
+        """A scalar legacy row never claims one cause was the only cause."""
         client = nio_owned_client(tempdir)
         await client.receive_response(LoginResponse.from_dict(LOGIN))
         assert client.store
@@ -1082,7 +1083,7 @@ class TestPerRoomRecoveryContract:
         )
 
         assert client.store.load_sync_recovery()[2] == {
-            ROOM_A: RecoveryAbandonment.UNVERIFIABLE
+            ROOM_A: RecoveryAbandonment.UNKNOWN
         }
         await client.close()
 
@@ -1131,7 +1132,10 @@ class TestPerRoomRecoveryContract:
             RecordingFetch([messages_error(403)]),
             monkeypatch,
         )
-        assert first.abandoned_rooms == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
+        assert first.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
+        assert isinstance(first.abandoned_rooms[ROOM_A], frozenset)
         assert (
             ROOM_A in first.unrecovered_room_ids
         ), "an abandoned room stays in the union, so existing readers keep working"
@@ -1139,7 +1143,9 @@ class TestPerRoomRecoveryContract:
         client.next_batch = "s1"
         second = sync_response("s2", {})
         await client.receive_response(second)
-        assert second.abandoned_rooms == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
+        assert second.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
 
         assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
 
@@ -1178,7 +1184,9 @@ class TestPerRoomRecoveryContract:
         assert isinstance(
             cancelled.unrecovered_room_ids, frozenset
         ), "a mutable set compares equal to the frozen one this field promises"
-        assert cancelled.abandoned_rooms == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
+        assert cancelled.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
         await client.close()
 
     async def test_abandonment_outlives_a_restart_until_acknowledged(
@@ -1199,7 +1207,9 @@ class TestPerRoomRecoveryContract:
         delivered.install(client)
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
         assert fetch.pages == []
         await client.close()
         assert client.store
@@ -1208,7 +1218,7 @@ class TestPerRoomRecoveryContract:
         restarted = nio_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
         assert restarted._recovery.abandoned == {
-            ROOM_A: RecoveryAbandonment.FETCH_FAILED
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
         }
 
         restarted.next_batch = "s1"
@@ -1219,7 +1229,7 @@ class TestPerRoomRecoveryContract:
         await restarted.receive_response(after_restart)
         assert ROOM_A in after_restart.unrecovered_room_ids
         assert after_restart.abandoned_rooms == {
-            ROOM_A: RecoveryAbandonment.FETCH_FAILED
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
         }, "the reason has to outlive the restart, not just the loss"
 
         assert restarted.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
@@ -1273,7 +1283,7 @@ class TestPerRoomRecoveryContract:
             if recovery_status == 403
             else RecoveryAbandonment.BASELINE_LOST
         )
-        assert client._recovery.abandoned == {ROOM_A: expected}
+        assert client._recovery.abandoned == {ROOM_A: frozenset({expected})}
         assert client.store
         assert client.store.load_sync_recovery()[2] == {ROOM_A: expected}
 
@@ -1303,7 +1313,9 @@ class TestPerRoomRecoveryContract:
         monkeypatch.setattr(store, "clear_recovery_abandonment", fail)
         with pytest.raises(OSError, match="disk failure"):
             client.acknowledge_unrecovered_rooms([ROOM_A])
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
 
         monkeypatch.setattr(store, "clear_recovery_abandonment", original)
         assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})

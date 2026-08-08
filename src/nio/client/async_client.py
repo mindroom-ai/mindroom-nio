@@ -722,7 +722,7 @@ class AsyncClient(Client):
         self._classic_sync_state_staged = False
         self._classic_sync_acknowledgeable_token: str | None = None
         self._classic_sync_abandonment_before_staged_response: dict[
-            str, RecoveryAbandonment
+            str, frozenset[RecoveryAbandonment]
         ] = {}
         self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
             f"nio_current_response_room_ids_{id(self)}", default=None

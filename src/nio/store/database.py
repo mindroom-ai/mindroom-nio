@@ -38,7 +38,7 @@ from ..crypto import (
 from ..event_provenance import TimelineEventProvenance
 from ..recovery_abandonment import (
     RecoveryAbandonment,
-    most_conservative_abandonment,
+    normalize_abandonment_reasons,
 )
 from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
@@ -80,6 +80,17 @@ _RECOVERY_TAG_SIZE = 16
 # SQLite's legacy 999-variable statement limit.
 _RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
+
+
+def _collapse_legacy_abandonment_reasons(
+    current: object,
+    incoming: object,
+) -> RecoveryAbandonment:
+    """Represent a cause union safely in the store's legacy scalar column."""
+    reasons = normalize_abandonment_reasons(current) | normalize_abandonment_reasons(
+        incoming
+    )
+    return next(iter(reasons)) if len(reasons) == 1 else RecoveryAbandonment.UNKNOWN
 
 
 def _recovery_payload_aad(
@@ -732,8 +743,8 @@ class MatrixStore:
                 ),
             )
             for row in existing:
-                reasons[row.room_id] = most_conservative_abandonment(
-                    RecoveryAbandonment(row.reason),
+                reasons[row.room_id] = _collapse_legacy_abandonment_reasons(
+                    row.reason,
                     reasons[row.room_id],
                 )
 
@@ -791,9 +802,11 @@ class MatrixStore:
                         "Clearing a real gap in %s without naming a cause", room_id
                     )
                     reason = RecoveryAbandonment.UNKNOWN
-                abandoned_rooms[room_id] = most_conservative_abandonment(
-                    abandoned_rooms.get(room_id),
-                    reason,
+                previous = abandoned_rooms.get(room_id)
+                abandoned_rooms[room_id] = (
+                    reason
+                    if previous is None
+                    else _collapse_legacy_abandonment_reasons(previous, reason)
                 )
             self._restore_completed_markers(
                 account,

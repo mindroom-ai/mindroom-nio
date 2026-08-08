@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from enum import Enum
 
 
@@ -49,40 +50,34 @@ class RecoveryAbandonment(str, Enum):
     reaching the target. Retrying the same walk cannot help, so the missing
     events are permanently lost."""
 
-    @property
-    def rank(self) -> int:
-        """How little an application may assume recovery is still possible.
 
-        This is deliberately *not* a scale of how much nio claims to know.
-        ``UNKNOWN`` asserts nothing at all, yet outranks four reasons that each
-        assert something, because a reason is only ever replaced by one that
-        permits the application to assume less.
+def normalize_abandonment_reasons(value: object) -> frozenset[RecoveryAbandonment]:
+    """Return canonical abandonment causes for singular or legacy input.
 
-        Abandonment is sticky, so a room can be abandoned again before the
-        application settles the first loss. Merging by recency would let a
-        proven-unreachable gap be relabelled as merely over budget, or an
-        undiagnosed legacy loss be relabelled as a known-recoverable one --
-        the same under-reporting stickiness exists to prevent, moved into the
-        reason.
-        """
-        return _RANKS[self]
+    A singular enum has to be handled before generic iterables because the
+    enum is also a string. Invalid values intentionally become ``UNKNOWN``:
+    retaining that uncertainty is safer than silently dropping a loss.
+    """
+    if isinstance(value, RecoveryAbandonment):
+        return frozenset({value})
+    if isinstance(value, str):
+        try:
+            return frozenset({RecoveryAbandonment(value)})
+        except ValueError:
+            return frozenset({RecoveryAbandonment.UNKNOWN})
+    if not isinstance(value, Iterable):
+        return frozenset({RecoveryAbandonment.UNKNOWN})
 
-
-_RANKS = {
-    RecoveryAbandonment.EVENT_LIMIT: 0,
-    RecoveryAbandonment.FETCH_FAILED: 1,
-    RecoveryAbandonment.BASELINE_LOST: 2,
-    RecoveryAbandonment.CORRUPT_EVENT: 3,
-    RecoveryAbandonment.UNKNOWN: 4,
-    RecoveryAbandonment.UNVERIFIABLE: 5,
-}
-
-
-def most_conservative_abandonment(
-    current: RecoveryAbandonment | None,
-    incoming: RecoveryAbandonment,
-) -> RecoveryAbandonment:
-    """Keep whichever reason lets the application assume the least."""
-    if current is None:
-        return incoming
-    return max(current, incoming, key=lambda reason: reason.rank)
+    reasons: set[RecoveryAbandonment] = set()
+    for item in value:
+        if isinstance(item, RecoveryAbandonment):
+            reasons.add(item)
+            continue
+        if isinstance(item, str):
+            try:
+                reasons.add(RecoveryAbandonment(item))
+                continue
+            except ValueError:
+                pass
+        reasons.add(RecoveryAbandonment.UNKNOWN)
+    return frozenset(reasons)
