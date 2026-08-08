@@ -37,7 +37,7 @@ from nio.client.sync_recovery import (
     record_completed_timeline_event,
     take_recovery_outcomes,
 )
-from nio.responses import RoomMessagesResponse
+from nio.responses import RoomMessagesError, RoomMessagesResponse, SlidingSyncResponse
 
 ROOM = "!room:example.org"
 ROOM_B = "!other:example.org"
@@ -145,6 +145,16 @@ def test_loaded_recovery_keeps_page_chronology_across_live_boundary():
     ]
 
 
+def test_loaded_legacy_abandoned_room_ids_become_unknown():
+    state = RecoveryState()
+
+    sync_recovery.load_recovery_state(state, (), (), [ROOM])
+
+    assert state.abandoned == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNKNOWN})
+    }
+
+
 def test_no_id_keys_are_scoped_to_the_sliding_connection():
     state = RecoveryState()
     bad = Event.parse_event({"type": "broken"})
@@ -215,7 +225,7 @@ def test_received_ancillary_event_stays_after_a_recovered_only_prefix():
     ]
 
 
-def test_classic_initial_own_join_clears_stale_recovery():
+def test_classic_initial_own_join_names_stale_real_gap_as_baseline_lost():
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
         events={(ROOM, 1): [pending("$live-old", 0)]},
@@ -232,10 +242,18 @@ def test_classic_initial_own_join_clears_stale_recovery():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.unrecovered_room_ids == frozenset()
+    assert plan.clear_room_reasons == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.BASELINE_LOST})
+    }
 
 
-def test_membership_reset_leaves_real_gap_loss_for_persistence():
+def test_membership_reset_names_the_real_gap_loss_in_the_plan():
+    """The producer says why, rather than leaving persistence to guess.
+
+    A reset drops the baseline the walk was anchored to, which nio cannot
+    resume -- but it establishes nothing about the history itself, so it must
+    not be reported the same way as a walk proven unable to advance.
+    """
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
     )
@@ -249,7 +267,28 @@ def test_membership_reset_leaves_real_gap_loss_for_persistence():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.unrecovered_room_ids == frozenset()
+    assert plan.clear_room_reasons == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.BASELINE_LOST})
+    }
+
+
+def test_membership_reset_of_a_synthetic_gap_is_not_a_loss():
+    """No real gap means no work was lost, so nothing is abandoned."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "", None)]})
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="leave",
+    )
+
+    assert plan.clear_rooms == frozenset({ROOM})
+    assert plan.abandoned_rooms == {}
+    assert plan.clear_room_reasons == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.BASELINE_LOST})
+    }
 
 
 def test_sync_history_counts_toward_held_cap():
@@ -274,6 +313,7 @@ def test_sync_history_counts_toward_held_cap():
     )
 
     assert second.clear_rooms == frozenset({ROOM})
+    assert second.abandoned_rooms == {}
 
 
 def test_room_reset_preserves_unaccepted_sync_history():
@@ -377,13 +417,28 @@ class InlineStore:
         self.thread_ids: list[int] = []
         self.finished: list[tuple[str, int, str | None, bool]] = []
         self.accepted: list[tuple[str, int, str]] = []
+        self.saved_abandoned_rooms: list[tuple[str, ...]] = []
+        self.actions: list[str] = []
 
-    def save_recovery(self, *args):
+    def save_recovery(
+        self,
+        _token,
+        _clear_rooms,
+        _gaps,
+        _events,
+        _clear_recovered,
+        _window_tokens=None,
+        _forgotten_rooms=(),
+        _abandoned_rooms=None,
+    ):
         self.thread_ids.append(threading.get_ident())
+        self.saved_abandoned_rooms.append(tuple(_abandoned_rooms or ()))
+        self.actions.append("save")
 
     def finish_recovery(self, room_id, generation, event_id, was_encrypted):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
+        self.actions.append("finish")
 
     def accept_recovery_event(self, room_id, generation, event_id):
         self.thread_ids.append(threading.get_ident())
@@ -639,7 +694,7 @@ async def test_expired_budget_commits_exhausted_page_without_dispatch():
     """
     value = pending("$live", 0)
     state = RecoveryState(
-        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1", membership_bound=True)]},
         events={(ROOM, 1): [value]},
     )
 
@@ -667,6 +722,60 @@ async def test_expired_budget_commits_exhausted_page_without_dispatch():
         "$live",
     ]
     assert state.events[(ROOM, 1)][-1].source_json == value.source_json
+
+
+@pytest.mark.asyncio
+async def test_targeted_unbound_page_without_end_is_sticky_unverifiable():
+    """Exhaustion proves continuity only when membership supplied the bound."""
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "p1", "s1")]},
+        events={(ROOM, 1): [pending("$live", 0)]},
+    )
+
+    async def fetch(*_args):
+        return RoomMessagesResponse.from_dict(
+            {"start": "s1", "chunk": [event("$untrusted", 1).source]},
+            ROOM,
+        )
+
+    seen: list[str] = []
+
+    async def dispatch(
+        _room,
+        item,
+        _was_completed,
+        _kind,
+        _provenance,
+        _sync_origin,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        seen.append(item.event_id)
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+
+    assert seen == ["$live"]
+    assert ROOM not in state.gaps
+    expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNVERIFIABLE})}
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
 
 
 @pytest.mark.asyncio
@@ -714,6 +823,45 @@ async def test_unbounded_page_without_end_stays_unverifiable():
     )
     assert seen == ["$live"]
     assert ROOM not in state.gaps
+
+
+@pytest.mark.asyncio
+async def test_unbounded_page_without_end_and_event_cap_retains_both_causes():
+    """An exhausted cursor and a local cap are independent terminal facts."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        ),
+        options=RecoveryOptions(1, 0, 10, 10),
+    )
+
+    assert state.abandoned == {
+        ROOM: frozenset(
+            {
+                sync_recovery.RecoveryAbandonment.EVENT_LIMIT,
+                sync_recovery.RecoveryAbandonment.UNVERIFIABLE,
+            }
+        )
+    }
+
+
+def test_direct_response_construction_normalizes_singular_causes():
+    """Response annotations match their runtime values for direct callers."""
+    response = SlidingSyncResponse(
+        "pos",
+        abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+    )
+
+    assert response.abandoned_rooms == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.BASELINE_LOST})
+    }
 
 
 @pytest.mark.asyncio
@@ -796,6 +944,61 @@ async def test_corrupt_persisted_event_is_discarded_and_acknowledged():
     completed = state.completed[ROOM]["$bad"]
     assert completed.was_encrypted
     assert completed.provenance is TimelineEventProvenance.HISTORY
+
+
+@pytest.mark.asyncio
+async def test_corrupt_real_gap_event_is_sticky_abandonment():
+    corrupt = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "$bad",
+        "{",
+        False,
+        True,
+        provenance=TimelineEventProvenance.HISTORY,
+        apply_room_state=False,
+    )
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", None)]},
+        events={(ROOM, 1): [corrupt]},
+    )
+
+    async def unused_fetch(*args):
+        raise AssertionError("closed gap must not fetch")
+
+    async def unused_dispatch(*args):
+        raise AssertionError("corrupt event must not dispatch")
+
+    store = InlineStore()
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=unused_dispatch,
+        store=store,
+    )
+
+    assert ROOM not in state.gaps
+    assert store.saved_abandoned_rooms == [(ROOM,)]
+    assert store.finished == [
+        (ROOM, 1, "$bad", True),
+        (ROOM, 1, None, False),
+    ]
+    assert store.actions == ["save", "finish", "finish"]
+    expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.CORRUPT_EVENT})}
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
+    assert take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
 
 
 @pytest.mark.asyncio
@@ -1159,7 +1362,13 @@ async def test_close_drains_cleared_dispatch_without_cancelling_it():
         store=None,
     )
     await started.wait()
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+    apply_plan(
+        state,
+        RecoveryPlan(
+            clear_rooms=frozenset({ROOM}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+        ),
+    )
     assert state._active_dispatches
 
     client = AsyncClient("https://example.org")
@@ -1358,7 +1567,15 @@ async def test_clearing_room_drains_active_dispatch_before_reset():
 
     async def reset():
         await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
-        apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM})))
+        apply_plan(
+            state,
+            RecoveryPlan(
+                clear_rooms=frozenset({ROOM}),
+                clear_room_reasons={
+                    ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
+                },
+            ),
+        )
 
     task = asyncio.create_task(reset())
     await asyncio.sleep(0)
@@ -1548,6 +1765,7 @@ async def test_conflicting_overlap_order_keeps_gap_open_without_target():
     assert take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        {},
     )
 
 
@@ -1620,7 +1838,10 @@ def test_abandonment_restores_promoted_completed_marker(clear_mode):
     plan = (
         RecoveryPlan(clear_recovered=gap)
         if clear_mode == "recovered"
-        else RecoveryPlan(clear_rooms=frozenset({ROOM}))
+        else RecoveryPlan(
+            clear_rooms=frozenset({ROOM}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+        )
     )
 
     apply_plan(state, plan)
@@ -1814,10 +2035,12 @@ def test_recovery_outcome_keeps_open_real_gap_unrecovered():
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM, ROOM_B}),
+        {},
     )
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        {},
     )
 
 
@@ -1830,9 +2053,355 @@ def test_clearing_real_gap_is_unrecovered_but_synthetic_gap_is_not():
         events={(ROOM, 1): [], (ROOM_B, 1): []},
     )
 
-    apply_plan(state, RecoveryPlan(clear_rooms=frozenset({ROOM, ROOM_B})))
+    apply_plan(
+        state,
+        RecoveryPlan(
+            clear_rooms=frozenset({ROOM, ROOM_B}),
+            clear_room_reasons={ROOM: sync_recovery.RecoveryAbandonment.UNKNOWN},
+        ),
+    )
 
+    expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNKNOWN})}
     assert sync_recovery.take_recovery_outcomes(state) == (
         frozenset(),
         frozenset({ROOM}),
+        expected,
     )
+    assert sync_recovery.take_recovery_outcomes(state) == (
+        frozenset(),
+        frozenset({ROOM}),
+        expected,
+    )
+
+
+async def _pump_one_page(state: RecoveryState, page, *, options=None) -> list[str]:
+    """Run one recovery pump against a scripted ``/messages`` reply."""
+    seen: list[str] = []
+
+    async def fetch(*_args):
+        return page
+
+    async def dispatch(
+        _room,
+        value,
+        _was_completed,
+        _kind,
+        _provenance,
+        _sync_origin,
+        _apply_room_state,
+        admission_accepted,
+        mark_admission_accepted,
+    ):
+        accept_admission(admission_accepted, mark_admission_accepted)
+        seen.append(value.event_id)
+        return value
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=options or RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=fetch,
+        dispatch_event=dispatch,
+        store=None,
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_room_event_cap_is_reported_as_a_budget_not_a_loss():
+    """Running out of nio's event budget is not evidence the history is gone.
+
+    The cap is a bound nio sets on itself, exactly like an application-side
+    page limit. An application told only that the room was abandoned would
+    mark it permanently incompletable for what is really a spending decision,
+    so the reason has to say which of the two happened.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "more",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        ),
+        options=RecoveryOptions(1, 0, 10, 10),
+    )
+
+    assert state.abandoned == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.EVENT_LIMIT})
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_refused_backfill_is_reported_apart_from_a_broken_walk():
+    """A server that says no is a different finding from a walk that cannot work.
+
+    Nothing about a refusal shows the events are unreachable: a later session
+    with different permissions may fetch them. Folding it in with the
+    unverifiable walks would overstate what nio actually established.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+    refusal = RoomMessagesError.from_dict(
+        {"errcode": "M_FORBIDDEN", "error": "not allowed"},
+        ROOM,
+    )
+    refusal.transport_response = SimpleNamespace(status=403)
+
+    await _pump_one_page(state, refusal)
+
+    assert state.abandoned == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.FETCH_FAILED})
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_walk_that_cannot_advance_is_reported_as_permanent():
+    """A cursor the server will not move past is the one genuinely lost case.
+
+    Retrying cannot help, so this is the reason an application may treat as
+    permanent -- and the only one. Reporting it the same way as a budget stop
+    would throw the distinction away in the other direction.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {"start": "cursor", "end": "cursor", "chunk": []},
+            ROOM,
+        ),
+    )
+
+    assert state.abandoned == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNVERIFIABLE})
+    }
+
+
+def test_held_event_cap_is_reported_as_a_budget_not_a_loss():
+    """The other cost ceiling has to answer the same way as the first.
+
+    Dropping a room because too many of its events are held is the same
+    spending decision as the per-gap cap, reached from the ingress side.
+    """
+    state = RecoveryState(max_held_events=0)
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$live", 1)],
+        user_id="@me:example.org",
+        membership="join",
+        cursor_token="since",
+        target_token="p1",
+    )
+
+    assert plan.abandoned_rooms == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.EVENT_LIMIT})
+    }
+
+
+def test_existing_gap_held_event_cap_stays_a_budget_stop():
+    """Continuing a real gap must not turn the same ceiling into permanent loss."""
+    state = RecoveryState(
+        gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
+        events={(ROOM, 1): [pending("$live-old", 0)]},
+        max_held_events=1,
+    )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[event("$live-new", 1)],
+        user_id="@me:example.org",
+        membership="join",
+    )
+    persist_response_plan(state, None, token=None, plan=plan)
+
+    assert state.abandoned == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.EVENT_LIMIT})
+    }
+
+
+def test_recovery_plan_normalizes_singular_causes_to_frozen_sets():
+    """Public plans never expose the legacy singular cause representation."""
+    plan = RecoveryPlan(
+        abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST},
+        clear_room_reasons={ROOM_B: sync_recovery.RecoveryAbandonment.CORRUPT_EVENT},
+    )
+
+    assert plan.abandoned_rooms == {
+        ROOM: frozenset({sync_recovery.RecoveryAbandonment.BASELINE_LOST})
+    }
+    assert plan.clear_room_reasons == {
+        ROOM_B: frozenset({sync_recovery.RecoveryAbandonment.CORRUPT_EVENT})
+    }
+    assert sync_recovery.normalize_abandonment_reasons(object()) == frozenset(
+        {sync_recovery.RecoveryAbandonment.UNKNOWN}
+    )
+
+
+def test_empty_legacy_causes_become_unknown():
+    """A named abandoned room never exposes an empty cause set."""
+    plan = RecoveryPlan(abandoned_rooms={ROOM: []})
+    state = RecoveryState()
+    sync_recovery.load_recovery_state(state, (), (), {ROOM: []})
+
+    expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.UNKNOWN})}
+    assert plan.abandoned_rooms == expected
+    assert state.abandoned == expected
+
+
+def test_sequential_abandonments_retain_every_cause_until_acknowledged():
+    """A later cause must not replace the room's earlier loss."""
+    state = RecoveryState()
+
+    apply_plan(
+        state,
+        RecoveryPlan(
+            abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST}
+        ),
+    )
+    apply_plan(
+        state,
+        RecoveryPlan(
+            abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.CORRUPT_EVENT}
+        ),
+    )
+
+    assert state.abandoned == {
+        ROOM: frozenset(
+            {
+                sync_recovery.RecoveryAbandonment.BASELINE_LOST,
+                sync_recovery.RecoveryAbandonment.CORRUPT_EVENT,
+            }
+        )
+    }
+    assert sync_recovery.acknowledge_unrecovered_rooms(state, [ROOM]) == frozenset(
+        {ROOM}
+    )
+    assert state.abandoned == {}
+
+
+def test_merged_plans_union_causes_for_one_room():
+    """Combining independently planned work cannot discard either cause."""
+    plan = sync_recovery.merge_recovery_plans(
+        (
+            RecoveryPlan(
+                abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST}
+            ),
+            RecoveryPlan(
+                abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.CORRUPT_EVENT}
+            ),
+        )
+    )
+
+    assert plan.abandoned_rooms == {
+        ROOM: frozenset(
+            {
+                sync_recovery.RecoveryAbandonment.BASELINE_LOST,
+                sync_recovery.RecoveryAbandonment.CORRUPT_EVENT,
+            }
+        )
+    }
+
+
+def test_corrupt_recovery_event_has_a_named_abandonment_reason():
+    """A known local loss must not be published as an unknown cause."""
+    assert "corrupt_event" in {
+        reason.value for reason in sync_recovery.RecoveryAbandonment
+    }
+
+
+def test_an_undiagnosed_loss_keeps_later_named_causes():
+    """Unknown legacy data is retained beside every later named cause."""
+    state = RecoveryState()
+    unknown = sync_recovery.RecoveryAbandonment.UNKNOWN
+
+    for later in (
+        sync_recovery.RecoveryAbandonment.EVENT_LIMIT,
+        sync_recovery.RecoveryAbandonment.FETCH_FAILED,
+        sync_recovery.RecoveryAbandonment.BASELINE_LOST,
+        sync_recovery.RecoveryAbandonment.CORRUPT_EVENT,
+    ):
+        state.abandoned = {ROOM: unknown}
+        apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: later}))
+        assert state.abandoned == {ROOM: frozenset({unknown, later})}, later
+
+    state.abandoned = {ROOM: unknown}
+    apply_plan(
+        state,
+        RecoveryPlan(
+            abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+        ),
+    )
+    assert state.abandoned == {
+        ROOM: frozenset({unknown, sync_recovery.RecoveryAbandonment.UNVERIFIABLE})
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_cursor_and_event_cap_on_one_page_retain_both_causes():
+    """One terminal page records every cause it establishes."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "cursor",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        ),
+        options=RecoveryOptions(1, 0, 10, 10),
+    )
+
+    assert state.abandoned == {
+        ROOM: frozenset(
+            {
+                sync_recovery.RecoveryAbandonment.EVENT_LIMIT,
+                sync_recovery.RecoveryAbandonment.UNVERIFIABLE,
+            }
+        )
+    }
+
+
+def test_published_recovery_outcomes_stay_frozen():
+    """``frozenset`` operators return ``NotImplemented`` against ``dict_keys``.
+
+    The reflected ``dict_keys`` operator answers instead and yields a mutable
+    ``set``, which compares equal to the frozen set every assertion here uses.
+    The published fields are declared frozen, so the type is checked directly.
+    """
+    state = RecoveryState()
+    state.outcomes = {ROOM: True, ROOM_B: False}
+    state.abandoned = {ROOM_B: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+
+    recovered, unrecovered, _abandoned = take_recovery_outcomes(state)
+
+    assert isinstance(recovered, frozenset)
+    assert isinstance(unrecovered, frozenset)
+
+
+def test_a_second_loss_is_added_until_the_room_is_settled():
+    """Acknowledgement is the only operation that removes a room's full set."""
+    state = RecoveryState()
+    unverifiable = sync_recovery.RecoveryAbandonment.UNVERIFIABLE
+    budget = sync_recovery.RecoveryAbandonment.EVENT_LIMIT
+
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: unverifiable}))
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: budget}))
+
+    assert state.abandoned == {ROOM: frozenset({unverifiable, budget})}
+
+    assert sync_recovery.acknowledge_unrecovered_rooms(state, [ROOM]) == frozenset(
+        {ROOM}
+    )
+    apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: budget}))
+
+    assert state.abandoned == {ROOM: frozenset({budget})}

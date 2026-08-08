@@ -19,6 +19,25 @@ BOB_DEVICE = "@bob:example.org"
 BOB_DEVICE_ID = "JLAFKJWSRS"
 
 
+@pytest.fixture(autouse=True)
+def fail_on_anonymous_recovery_clear(request, caplog):
+    """Make every production-path test enforce explicit clear causes."""
+    yield
+    if request.node.get_closest_marker("expects_anonymous_recovery_clear"):
+        return
+    records = [
+        *caplog.get_records("setup"),
+        *caplog.get_records("call"),
+    ]
+    anonymous = [
+        record
+        for record in records
+        if "Clearing a real gap" in record.getMessage()
+        and "without naming a cause" in record.getMessage()
+    ]
+    assert not anonymous, "a recovery producer cleared a real gap anonymously"
+
+
 @pytest.fixture
 def tempdir(tmp_path):
     return str(tmp_path)

@@ -37,6 +37,10 @@ from .events import (
 )
 from .events.presence import PresenceEvent
 from .http import TransportResponse
+from .recovery_abandonment import (
+    RecoveryAbandonment,
+    normalize_abandonment_reasons,
+)
 from .schemas import Schemas, validate_json
 
 logger = logging.getLogger(__name__)
@@ -2076,10 +2080,23 @@ class SyncResponse(Response):
     ``recovered_room_ids`` contains rooms whose limited-timeline gaps nio
     closed while handling this response after dispatching every recovered
     event. ``unrecovered_room_ids`` contains rooms with a gap still open or
-    abandoned. Both fields are populated only when limited-timeline backfill
-    is enabled. They can include rooms absent from ``rooms`` when earlier
-    recovery completes while handling this response. ``timeline.limited``
-    remains the unmodified server value.
+    abandoned.
+
+    ``abandoned_rooms`` names the rooms in that second set nio gave up on,
+    mapped to frozen sets of :class:`~nio.RecoveryAbandonment` causes. The
+    two are distinguished because a room whose walk is still running will
+    deliver its events on a later response and an abandoned one will not, and
+    because giving up is not by itself proof that the history is gone: see
+    :class:`~nio.RecoveryAbandonment` for which reasons make that claim. An
+    abandoned room keeps being reported on every response until
+    :meth:`~nio.AsyncClient.acknowledge_unrecovered_rooms` settles it, and it
+    is always named in ``unrecovered_room_ids`` too, so a caller that only
+    cares about degradation can keep reading the union.
+
+    All three fields are populated only when limited-timeline backfill is
+    enabled. They can include rooms absent from ``rooms`` when earlier recovery
+    completes while handling this response. ``timeline.limited`` remains the
+    unmodified server value.
     """
 
     next_batch: str = field()
@@ -2091,6 +2108,15 @@ class SyncResponse(Response):
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
     recovered_room_ids: frozenset[str] = frozenset()
     unrecovered_room_ids: frozenset[str] = frozenset()
+    abandoned_rooms: dict[str, frozenset[RecoveryAbandonment]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        self.abandoned_rooms = {
+            room_id: normalize_abandonment_reasons(reasons)
+            for room_id, reasons in self.abandoned_rooms.items()
+        }
 
     def __str__(self) -> str:
         result = []
@@ -2340,6 +2366,14 @@ class SlidingSyncResponse(Response):
             earlier recovery completes while handling this response.
         unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window gap
             still open or abandoned.
+        abandoned_rooms (Dict[str, FrozenSet[RecoveryAbandonment]]): The rooms in
+            ``unrecovered_room_ids`` nio gave up on, mapped to every cause. A room
+            still being walked will deliver its events on a later response and
+            an abandoned one will not, and giving up is not by itself proof
+            that the history is gone: see :class:`~nio.RecoveryAbandonment` for
+            which reasons make that claim. An abandoned room is reported on
+            every response until
+            :meth:`~nio.AsyncClient.acknowledge_unrecovered_rooms` settles it.
 
     Recovery outcomes are populated only when limited-timeline backfill is
     enabled. The room's ``limited`` field remains the unmodified server value.
@@ -2359,6 +2393,15 @@ class SlidingSyncResponse(Response):
     room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
     recovered_room_ids: frozenset[str] = frozenset()
     unrecovered_room_ids: frozenset[str] = frozenset()
+    abandoned_rooms: dict[str, frozenset[RecoveryAbandonment]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        self.abandoned_rooms = {
+            room_id: normalize_abandonment_reasons(reasons)
+            for room_id, reasons in self.abandoned_rooms.items()
+        }
 
     @staticmethod
     def _parse_list(

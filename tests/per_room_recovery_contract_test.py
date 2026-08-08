@@ -11,6 +11,7 @@ error is raised anywhere for the loss.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,10 @@ from nio import (
     DeviceOneTimeKeyCount,
     LocalProtocolError,
     LoginResponse,
+    RecoveryAbandonment,
+    RoomForgetResponse,
     RoomInfo,
+    RoomLeaveResponse,
     RoomMessageText,
     Rooms,
     SyncResponse,
@@ -162,6 +166,42 @@ class UndeclaredAtomicStore(SqliteStore):
 
     def _create_database(self):
         return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
+class LegacyRecoveryStore(UndeclaredAtomicStore):
+    """A non-atomic custom store implementing the released eight-argument API."""
+
+    def save_recovery(
+        self,
+        token,
+        clear_rooms,
+        gaps,
+        events,
+        clear_recovered,
+        window_tokens=None,
+        forgotten_rooms=(),
+        abandoned_rooms=(),
+    ):
+        self.last_legacy_abandoned_rooms = tuple(abandoned_rooms)
+        return super().save_recovery(
+            token,
+            clear_rooms,
+            gaps,
+            events,
+            clear_recovered,
+            window_tokens,
+            forgotten_rooms,
+            abandoned_rooms,
+        )
+
+    def finish_recovery(self, room_id, generation, event_id, was_encrypted):
+        return super().finish_recovery(room_id, generation, event_id, was_encrypted)
+
+
+class LegacyAtomicRecoveryStore(LegacyRecoveryStore):
+    """An atomic custom store still using the released save signature."""
+
+    supports_atomic_recovery = True
 
 
 class QueueStore(SqliteStore):
@@ -308,7 +348,9 @@ class TestPerRoomRecoveryContract:
         writes: list[tuple[str | None, tuple[RecoveryGap, ...]]] = []
         original_save = client.store.save_recovery
 
-        def record_save(token, clear_rooms, gaps, events, clear_recovered, *args):
+        def record_save(
+            token, clear_rooms, gaps, events, clear_recovered, *args, **kwargs
+        ):
             writes.append((token, tuple(gaps)))
             return original_save(
                 token,
@@ -317,6 +359,7 @@ class TestPerRoomRecoveryContract:
                 events,
                 clear_recovered,
                 *args,
+                **kwargs,
             )
 
         monkeypatch.setattr(client.store, "save_recovery", record_save)
@@ -374,14 +417,97 @@ class TestPerRoomRecoveryContract:
             client._recovery,
             client.store,
             token=None,
-            plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+            plan=RecoveryPlan(
+                clear_rooms=frozenset({ROOM_A}),
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.BASELINE_LOST},
+            ),
         )
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
         gaps, _events, abandoned = client.store.load_sync_recovery()
         assert gaps == []
-        assert abandoned == [ROOM_A]
+        assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})}
+        await client.close()
+
+    @pytest.mark.expects_anonymous_recovery_clear
+    async def test_a_clear_that_names_no_cause_is_recorded_as_unknown(
+        self,
+        tempdir,
+        caplog,
+    ):
+        """Persistence records the loss but refuses to invent the cause.
+
+        Whether a clear drops a real gap is a fact about persisted state, so
+        persistence reads it; *why* is known only to whoever cleared the room.
+        A producer that fails to say is a defect -- but a durable sync path is
+        the wrong place to raise, so the loss is still recorded, under a reason
+        that claims nothing, and the defect is surfaced in the log.
+
+        No production path reaches this: every real-gap-clearing site names its
+        cause, which is what
+        ``test_no_production_path_clears_a_real_gap_anonymously`` pins.
+        """
+        client = nio_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+        with caplog.at_level(logging.ERROR, logger="nio.client.sync_recovery"):
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+            )
+
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
+        assert client.store.load_sync_recovery()[2] == {
+            ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
+        assert "without naming a cause" in caplog.text
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_no_production_path_clears_a_real_gap_anonymously(
+        self,
+        tempdir,
+        monkeypatch,
+        caplog,
+        operation,
+    ):
+        """The ``UNKNOWN`` fallback is a backstop, not a live code path."""
+        client = nio_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        with caplog.at_level(logging.ERROR, logger="nio.client.sync_recovery"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        assert "without naming a cause" not in caplog.text
         await client.close()
 
     async def test_unresolved_gap_does_not_block_the_global_cursor(
@@ -470,7 +596,7 @@ class TestPerRoomRecoveryContract:
             assert client._recovery.events == {}
             assert client._recovery.outcomes == {}
             assert client.store.load_sync_token() is None
-            assert client.store.load_sync_recovery() == ([], [], [])
+            assert client.store.load_sync_recovery() == ([], [], {})
         finally:
             await client.close()
             if client.store:
@@ -508,8 +634,231 @@ class TestPerRoomRecoveryContract:
 
             assert not network_called
             assert client._recovery.gaps == {}
-            assert client._recovery.abandoned == set()
-            assert client.store.load_sync_recovery() == ([], [], [])
+            assert client._recovery.abandoned == {}
+            assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
+    )
+    @pytest.mark.parametrize("synthetic_gap", [False, True])
+    @pytest.mark.parametrize(
+        "store_class",
+        [LegacyRecoveryStore, LegacyAtomicRecoveryStore],
+    )
+    async def test_legacy_store_allows_disabled_reset_without_a_real_gap(
+        self,
+        tempdir,
+        response,
+        synthetic_gap,
+        store_class,
+    ):
+        """Ordinary leave/forget stays available when no real gap is at risk."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=store_class),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return response
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            assert not client.config.backfill_limited_timelines
+            if synthetic_gap:
+                gap = RecoveryGap(ROOM_A, 1, "", None)
+                client.store.save_recovery(None, set(), [gap], [], None)
+
+            result = await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert result is response
+            assert network_called
+            assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
+    )
+    async def test_non_atomic_store_rejects_disabled_reset_with_a_persisted_gap(
+        self,
+        tempdir,
+        response,
+    ):
+        """A store-only real gap still requires atomic loss recording."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyRecoveryStore),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return response
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            gap = RecoveryGap(ROOM_A, 1, "target", "cursor")
+            client.store.save_recovery(None, set(), [gap], [], None)
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert not network_called
+            gaps, _, abandoned = client.store.load_sync_recovery()
+            assert [(item.room_id, item.target_token) for item in gaps] == [
+                (ROOM_A, "target")
+            ]
+            assert abandoned == {}
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
+    )
+    async def test_legacy_atomic_store_receives_released_call_shapes_after_reset(
+        self,
+        tempdir,
+        response,
+    ):
+        """Server success is followed by eight-argument save compatibility."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyAtomicRecoveryStore),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return response
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            client.store.save_recovery(
+                None,
+                set(),
+                [RecoveryGap(ROOM_A, 1, "target", "cursor")],
+                [],
+                None,
+            )
+
+            result = await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert result is response
+            assert network_called
+            assert client.store.last_legacy_abandoned_rooms == (ROOM_A,)
+            gaps, _, abandoned = client.store.load_sync_recovery()
+            assert gaps == []
+            assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})}
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_legacy_atomic_store_ignores_gap_free_structural_candidate(
+        self,
+        tempdir,
+    ):
+        """A structural reason is not itself an actual abandoned room."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyAtomicRecoveryStore),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({ROOM_A}),
+                    clear_room_reasons={
+                        ROOM_A: RecoveryAbandonment.BASELINE_LOST,
+                    },
+                ),
+            )
+
+            assert client._recovery.abandoned == {}
+            assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_legacy_atomic_store_receives_materialized_real_gap_abandonment(
+        self,
+        tempdir,
+    ):
+        """A real in-memory gap still becomes an eighth-argument room ID."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyAtomicRecoveryStore),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),),
+                ),
+            )
+
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({ROOM_A}),
+                    clear_room_reasons={
+                        ROOM_A: RecoveryAbandonment.BASELINE_LOST,
+                    },
+                ),
+            )
+
+            assert client._recovery.abandoned == {
+                ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+            }
+            assert client.store.load_sync_recovery()[2] == {
+                ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})
+            }
         finally:
             await client.close()
             if client.store:
@@ -539,23 +888,27 @@ class TestPerRoomRecoveryContract:
             await client.receive_response(LoginResponse.from_dict(LOGIN))
             assert isinstance(client.store, QueueStore)
             store = client.store
-            room_ids = frozenset(
-                f"!abandoned-{index}:example.org" for index in range(81)
-            )
+            room_ids = {
+                f"!abandoned-{index}:example.org": RecoveryAbandonment.UNVERIFIABLE
+                for index in range(81)
+            }
             store.save_recovery(
                 None,
                 set(),
                 [],
                 [],
                 None,
-                abandoned_rooms=room_ids,
+                abandoned_room_reasons=room_ids,
             )
             store.database.stop()
-            client._recovery.abandoned.update(room_ids)
+            room_reasons = {
+                room_id: frozenset({reason}) for room_id, reason in room_ids.items()
+            }
+            client._recovery.abandoned.update(room_reasons)
             before_memory = client._recovery.abandoned.copy()
             before_rows = store.load_sync_recovery()[2]
             assert len(before_rows) == 81
-            assert set(before_rows) == room_ids
+            assert before_rows == room_reasons
             store.database.start()
 
             with pytest.raises(LocalProtocolError, match="atomic recovery"):
@@ -576,6 +929,7 @@ class TestPerRoomRecoveryContract:
     async def test_non_atomic_queue_store_rejects_real_gap_clear_before_mutation(
         self,
         tempdir,
+        caplog,
     ):
         """Deleting a real gap and recording its loss must be one transaction."""
         bootstrap = SqliteStore(OWN_ID, LOGIN["device_id"], tempdir)
@@ -623,7 +977,7 @@ class TestPerRoomRecoveryContract:
                     abandoned,
                 )
 
-            expected_rows = ([(ROOM_A, 1, "target", "cursor", False)], [], [])
+            expected_rows = ([(ROOM_A, 1, "target", "cursor", False)], [], {})
             assert persisted_recovery() == expected_rows
             before_gaps = {
                 room_id: list(room_gaps)
@@ -641,6 +995,7 @@ class TestPerRoomRecoveryContract:
                     plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
                 )
 
+            assert "without naming a cause" not in caplog.text
             assert client._recovery.gaps == before_gaps
             assert client._recovery.abandoned == before_abandoned
             assert client._recovery.outcomes == before_outcomes
@@ -841,6 +1196,191 @@ class TestPerRoomRecoveryContract:
         assert fetch.pages == []
         await client.close()
 
+    async def test_builtin_store_preserves_multiple_causes(
+        self,
+        tempdir,
+    ):
+        """An opted-in store persists every independently discovered cause."""
+        client = nio_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
+            ),
+        )
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+
+        assert client.store.load_sync_recovery()[2] == {
+            ROOM_A: frozenset(
+                {
+                    RecoveryAbandonment.EVENT_LIMIT,
+                    RecoveryAbandonment.UNVERIFIABLE,
+                }
+            )
+        }
+        await client.close()
+
+    async def test_abandonment_is_named_apart_from_a_walk_still_running(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """A permanent loss is nameable without having to settle it first.
+
+        ``unrecovered_room_ids`` fuses two states an application must treat
+        differently: a room whose walk is still running will deliver its events
+        on some later pump, while an abandoned room never will. With only the
+        union published, the sole way to tell them apart is to call
+        ``acknowledge_unrecovered_rooms`` and read back what it cleared -- which
+        forgets the loss in order to learn of it, and so inverts the store-first
+        ordering every other durable transition here keeps.
+        """
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        walking = RecordingFetch([messages_error(429)])
+        open_gap = await open_a_stuck_gap(client, walking, monkeypatch)
+
+        assert client._recovery.gaps[ROOM_A], "the walk must still be pending"
+        assert ROOM_A in open_gap.unrecovered_room_ids
+        assert (
+            open_gap.abandoned_rooms == {}
+        ), "a retryable walk is degraded, not given up on"
+        await client.close()
+
+    async def test_abandonment_is_republished_with_its_reason_until_settled(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """The published reason is as sticky as the union it is drawn from.
+
+        Reporting the loss once and then dropping it would be the exact defect
+        stickiness exists to prevent, moved to a narrower field an application
+        is more likely to read on its own.
+        """
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        first = await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(403)]),
+            monkeypatch,
+        )
+        assert first.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
+        assert isinstance(first.abandoned_rooms[ROOM_A], frozenset)
+        assert (
+            ROOM_A in first.unrecovered_room_ids
+        ), "an abandoned room stays in the union, so existing readers keep working"
+
+        client.next_batch = "s1"
+        second = sync_response("s2", {})
+        await client.receive_response(second)
+        assert second.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
+
+        assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
+
+        client.next_batch = "s2"
+        settled = sync_response("s3", {})
+        await client.receive_response(settled)
+        assert settled.abandoned_rooms == {}
+        assert settled.unrecovered_room_ids == frozenset()
+        await client.close()
+
+    async def test_published_abandonment_is_a_snapshot(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """Settling current state must not rewrite an earlier response."""
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        response = await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(403)]),
+            monkeypatch,
+        )
+        expected = {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED}),
+        }
+        assert response.abandoned_rooms == expected
+
+        persist_response_plan(
+            client._recovery,
+            None,
+            token=None,
+            plan=RecoveryPlan(
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.EVENT_LIMIT}
+            ),
+        )
+        current = {
+            ROOM_A: frozenset(
+                {
+                    RecoveryAbandonment.EVENT_LIMIT,
+                    RecoveryAbandonment.FETCH_FAILED,
+                }
+            ),
+        }
+        assert client._recovery.abandoned == current
+        assert response.abandoned_rooms == expected
+
+        response.abandoned_rooms[ROOM_B] = frozenset({RecoveryAbandonment.UNKNOWN})
+        assert client._recovery.abandoned == current
+        del response.abandoned_rooms[ROOM_B]
+
+        assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
+
+        assert client._recovery.abandoned == {}
+        assert response.abandoned_rooms == expected
+        await client.close()
+
+    async def test_a_cancelled_sync_still_names_an_abandoned_room(
+        self,
+        tempdir,
+        monkeypatch,
+    ):
+        """The fail-closed snapshot cannot be the one response that forgets.
+
+        ``_publish_waiting_sync_cancellation`` builds its degraded set from open
+        gap rows, and an abandoned room no longer has one -- the row is deleted
+        when the walk is given up on. Without the sticky set folded in, a
+        cancellation would publish a permanently lost room as healthy.
+        """
+        client = application_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        await open_a_stuck_gap(
+            client,
+            RecordingFetch([messages_error(403)]),
+            monkeypatch,
+        )
+        assert not client._recovery.gaps.get(ROOM_A)
+
+        cancelled = sync_response("s2", {})
+        client._publish_waiting_sync_cancellation(cancelled, "s1")
+
+        assert cancelled.unrecovered_room_ids == frozenset({ROOM_A})
+        assert isinstance(
+            cancelled.unrecovered_room_ids, frozenset
+        ), "a mutable set compares equal to the frozen one this field promises"
+        assert cancelled.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
+        await client.close()
+
     async def test_abandonment_outlives_a_restart_until_acknowledged(
         self,
         tempdir,
@@ -859,7 +1399,9 @@ class TestPerRoomRecoveryContract:
         delivered.install(client)
         fetch = RecordingFetch([messages_error(403)])
         await open_a_stuck_gap(client, fetch, monkeypatch)
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
         assert fetch.pages == []
         await client.close()
         assert client.store
@@ -867,7 +1409,9 @@ class TestPerRoomRecoveryContract:
 
         restarted = nio_owned_client(tempdir)
         await restarted.receive_response(LoginResponse.from_dict(LOGIN))
-        assert restarted._recovery.abandoned == {ROOM_A}
+        assert restarted._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
 
         restarted.next_batch = "s1"
         after_restart = sync_response(
@@ -876,6 +1420,9 @@ class TestPerRoomRecoveryContract:
         )
         await restarted.receive_response(after_restart)
         assert ROOM_A in after_restart.unrecovered_room_ids
+        assert after_restart.abandoned_rooms == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }, "the reason has to outlive the restart, not just the loss"
 
         assert restarted.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
         assert restarted.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset()
@@ -894,7 +1441,7 @@ class TestPerRoomRecoveryContract:
         reopened = nio_owned_client(tempdir)
         await reopened.receive_response(LoginResponse.from_dict(LOGIN))
         assert (
-            reopened._recovery.abandoned == set()
+            reopened._recovery.abandoned == {}
         ), "acknowledgement must be durable too, or the loss returns on restart"
         await reopened.close()
 
@@ -919,9 +1466,18 @@ class TestPerRoomRecoveryContract:
         )
         await client.receive_response(reset)
 
-        assert client._recovery.abandoned == {ROOM_A}
+        # 403 is refused outright; 429 leaves the walk open until the leave
+        # drops the gap it was walking. Neither shows the history is gone: a
+        # rate-limited walk that loses its baseline was never proven unable to
+        # advance, and reporting it as such would be the over-claim in reverse.
+        expected = (
+            RecoveryAbandonment.FETCH_FAILED
+            if recovery_status == 403
+            else RecoveryAbandonment.BASELINE_LOST
+        )
+        assert client._recovery.abandoned == {ROOM_A: frozenset({expected})}
         assert client.store
-        assert client.store.load_sync_recovery()[2] == [ROOM_A]
+        assert client.store.load_sync_recovery()[2] == {ROOM_A: frozenset({expected})}
 
         later = sync_response("s3", {})
         await client.receive_response(later)
@@ -949,12 +1505,14 @@ class TestPerRoomRecoveryContract:
         monkeypatch.setattr(store, "clear_recovery_abandonment", fail)
         with pytest.raises(OSError, match="disk failure"):
             client.acknowledge_unrecovered_rooms([ROOM_A])
-        assert client._recovery.abandoned == {ROOM_A}
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.FETCH_FAILED})
+        }
 
         monkeypatch.setattr(store, "clear_recovery_abandonment", original)
         assert client.acknowledge_unrecovered_rooms([ROOM_A]) == frozenset({ROOM_A})
-        assert client._recovery.abandoned == set()
-        assert store.load_sync_recovery()[2] == []
+        assert client._recovery.abandoned == {}
+        assert store.load_sync_recovery()[2] == {}
         await client.close()
 
     @pytest.mark.parametrize("last_page", ["empty", "final_events"])

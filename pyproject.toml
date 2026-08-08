@@ -130,6 +130,9 @@ fixture-parentheses = false
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "expects_anonymous_recovery_clear: exercises the UNKNOWN clear-cause backstop",
+]
 
 [dependency-groups]
 dev = [

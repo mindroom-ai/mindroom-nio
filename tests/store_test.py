@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 from helpers import faker
 from peewee import SqliteDatabase
+from playhouse.sqliteq import SqliteQueueDatabase
 
-from nio import TimelineEventProvenance
+from nio import RecoveryAbandonment, TimelineEventProvenance
 from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
 from nio.crypto import (
     InboundGroupSession,
@@ -19,7 +20,7 @@ from nio.crypto import (
     OutgoingKeyRequest,
     TrustState,
 )
-from nio.exceptions import OlmTrustError
+from nio.exceptions import LocalProtocolError, OlmTrustError
 from nio.sliding_sync_tokens import SlidingWindowToken
 from nio.store import (
     DefaultStore,
@@ -111,11 +112,82 @@ def seed_v5_recovery_state(sqlstore):
     sqlstore._update_version(5)
 
 
+def make_v9_abandonment_table(sqlstore, room_ids=()):
+    """Replace the current table with the released reasonless v9 shape."""
+    table = SyncRecoveryAbandonedRooms._meta.table_name
+    account = sqlstore._get_account()
+    assert account
+    with sqlstore.database.bind_ctx(sqlstore.models):
+        sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+        sqlstore.database.execute_sql(
+            f'CREATE TABLE "{table}" ('
+            '"id" INTEGER NOT NULL PRIMARY KEY, '
+            '"room_id" TEXT NOT NULL, '
+            '"account_id" INTEGER NOT NULL, '
+            'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+            "ON DELETE CASCADE, "
+            'UNIQUE ("account_id", "room_id"))'
+        )
+        for room_id in room_ids:
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" ("room_id", "account_id") VALUES (?, ?)',
+                (room_id, account.id),
+            )
+        sqlstore._update_version(9)
+
+
+def make_interrupted_abandonment_rebuild(sqlstore):
+    """Leave a populated legacy table beside a valid, empty live table."""
+    table = SyncRecoveryAbandonedRooms._meta.table_name
+    legacy_table = f"{table}_legacy_v10"
+    sqlstore.save_recovery(
+        None,
+        set(),
+        [],
+        [],
+        None,
+        abandoned_room_reasons={
+            TEST_ROOM: RecoveryAbandonment.EVENT_LIMIT,
+        },
+    )
+    with sqlstore.database.bind_ctx(sqlstore.models):
+        sqlstore.database.execute_sql(
+            f'ALTER TABLE "{table}" RENAME TO "{legacy_table}"'
+        )
+        sqlstore.database.create_tables([SyncRecoveryAbandonedRooms])
+    return table, legacy_table
+
+
 class UndeclaredAtomicStore(SqliteStore):
     """A SQLite-backed subclass that has not declared its recovery contract."""
 
     def _create_database(self):
         return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
+class CopyFailingQueueDatabase(SqliteQueueDatabase):
+    """Expose whether a queued migration reached its destructive copy step."""
+
+    copy_attempted = False
+
+    def execute_sql(self, sql, *args, **kwargs):
+        if "_legacy_v10" in sql and sql.startswith("INSERT OR IGNORE INTO"):
+            type(self).copy_attempted = True
+            raise RuntimeError("copy failed")
+        return super().execute_sql(sql, *args, **kwargs)
+
+
+class CopyFailingQueueStore(SqliteStore):
+    database_instance = None
+
+    def _create_database(self):
+        database = CopyFailingQueueDatabase(
+            self.database_path,
+            pragmas={"foreign_keys": 1, "journal_mode": "wal"},
+            autostart=True,
+        )
+        type(self).database_instance = database
+        return database
 
 
 class TestClass:
@@ -137,6 +209,13 @@ class TestClass:
         assert SqliteStore.supports_atomic_recovery is True
         assert SqliteMemoryStore.supports_atomic_recovery is True
         assert UndeclaredAtomicStore.supports_atomic_recovery is False
+
+    def test_detailed_abandonment_capability_requires_each_subclass_to_opt_in(self):
+        assert MatrixStore.supports_recovery_abandonment_reasons is False
+        assert DefaultStore.supports_recovery_abandonment_reasons is True
+        assert SqliteStore.supports_recovery_abandonment_reasons is True
+        assert SqliteMemoryStore.supports_recovery_abandonment_reasons is True
+        assert UndeclaredAtomicStore.supports_recovery_abandonment_reasons is False
 
     @property
     def example_devices(self):
@@ -585,7 +664,7 @@ class TestClass:
     def test_store_versioning(self, store):
         version = store._get_store_version()
 
-        assert version == 9
+        assert version == 10
 
     def test_sync_recovery_roundtrip_is_atomic(self, sqlstore, monkeypatch):
         sqlstore.save_sync_token("s1")
@@ -617,7 +696,7 @@ class TestClass:
                 None,
             )
         assert sqlstore.load_sync_token() == "s1"
-        assert sqlstore.load_sync_recovery() == ([], [], [])
+        assert sqlstore.load_sync_recovery() == ([], [], {})
 
         monkeypatch.setattr(sqlstore, "_upsert_pending_events", original)
         sqlstore.save_recovery("s2", set(), [gap], [event], None)
@@ -663,12 +742,172 @@ class TestClass:
             [],
             [],
             None,
-            abandoned_rooms={TEST_ROOM},
+            abandoned_room_reasons={TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE},
         )
 
         sqlstore.save_recovery(None, {TEST_ROOM}, [], [], None)
 
-        assert sqlstore.load_sync_recovery()[2] == [TEST_ROOM]
+        assert sqlstore.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.UNVERIFIABLE})
+        }
+
+    def test_multiple_abandonment_causes_survive_repeated_writes_and_reopen(
+        self, sqlstore
+    ):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_room_reasons={
+                TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE,
+            },
+        )
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_room_reasons={
+                TEST_ROOM: RecoveryAbandonment.EVENT_LIMIT,
+            },
+        )
+
+        expected = {
+            TEST_ROOM: frozenset(
+                {
+                    RecoveryAbandonment.EVENT_LIMIT,
+                    RecoveryAbandonment.UNVERIFIABLE,
+                }
+            )
+        }
+        assert sqlstore.load_sync_recovery()[2] == expected
+        sqlstore.database.close()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+        assert reopened.load_sync_recovery()[2] == expected
+
+    def test_acknowledgement_deletes_every_cause_row(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_room_reasons={
+                TEST_ROOM: frozenset(
+                    {
+                        RecoveryAbandonment.EVENT_LIMIT,
+                        RecoveryAbandonment.UNVERIFIABLE,
+                    }
+                )
+            },
+        )
+
+        sqlstore.clear_recovery_abandonment([TEST_ROOM])
+
+        assert sqlstore.load_sync_recovery()[2] == {}
+
+    def test_legacy_room_iterable_is_persisted_as_unknown(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            None,
+            (),
+            [TEST_ROOM],
+        )
+
+        assert sqlstore.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
+
+    def test_clearing_store_only_real_gap_records_structural_cause(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "target", "cursor")],
+            [],
+            None,
+        )
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM},
+            [],
+            [],
+            None,
+            clear_room_reasons={TEST_ROOM: RecoveryAbandonment.BASELINE_LOST},
+        )
+
+        gaps, _, abandoned = sqlstore.load_sync_recovery()
+        assert gaps == []
+        assert abandoned == {TEST_ROOM: frozenset({RecoveryAbandonment.BASELINE_LOST})}
+
+    def test_clearing_store_only_synthetic_gap_records_no_loss(self, sqlstore):
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "", None)],
+            [],
+            None,
+        )
+
+        sqlstore.save_recovery(
+            None,
+            {TEST_ROOM},
+            [],
+            [],
+            None,
+            clear_room_reasons={TEST_ROOM: RecoveryAbandonment.BASELINE_LOST},
+        )
+
+        assert sqlstore.load_sync_recovery() == ([], [], {})
+
+    def test_finishing_corrupt_event_records_loss_with_event_mutation(self, sqlstore):
+        event = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "$corrupt",
+            "{",
+            False,
+            True,
+        )
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [RecoveryGap(TEST_ROOM, 1, "target", None)],
+            [event],
+            None,
+        )
+
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_room_reasons={
+                TEST_ROOM: RecoveryAbandonment.CORRUPT_EVENT,
+            },
+        )
+        sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, True)
+
+        gaps, events, abandoned = sqlstore.load_sync_recovery()
+        assert len(gaps) == 1
+        assert [(item.event_id, item.generation) for item in events] == [
+            (event.event_id, 0)
+        ]
+        assert abandoned == {TEST_ROOM: frozenset({RecoveryAbandonment.CORRUPT_EVENT})}
 
     def test_clear_sync_recovery_removes_cursor_rows_gaps_and_windows(
         self,
@@ -698,7 +937,7 @@ class TestClass:
                 pending("$completed", 2),
             ],
             None,
-            abandoned_rooms={TEST_ROOM},
+            abandoned_rooms={TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE},
         )
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$accepted")
         sqlstore.finish_recovery(TEST_ROOM, 1, "$completed", False)
@@ -714,7 +953,7 @@ class TestClass:
             sqlstore.store_path,
         )
         assert reopened.load_sync_token() is None
-        assert reopened.load_sync_recovery() == ([], [], [])
+        assert reopened.load_sync_recovery() == ([], [], {})
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_clear_sync_recovery_is_atomic(
@@ -738,7 +977,7 @@ class TestClass:
             [gap],
             [event],
             None,
-            abandoned_rooms={TEST_ROOM},
+            abandoned_room_reasons={TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE},
         )
         sqlstore.finish_recovery(TEST_ROOM, 1, event.event_id, False)
         sqlstore.save_sliding_window_tokens(
@@ -762,7 +1001,7 @@ class TestClass:
         assert [(item.event_id, item.generation) for item in events] == [
             ("$completed", 0)
         ]
-        assert abandoned == [TEST_ROOM]
+        assert abandoned == {TEST_ROOM: frozenset({RecoveryAbandonment.UNVERIFIABLE})}
         assert sqlstore.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
         }
@@ -824,7 +1063,7 @@ class TestClass:
         later sync iteration with the same ValueError."""
         sqlstore.accept_recovery_event(TEST_ROOM, 1, "$vanished")
 
-        assert sqlstore.load_sync_recovery() == ([], [], [])
+        assert sqlstore.load_sync_recovery() == ([], [], {})
 
     def test_accept_recovery_event_survives_generation_divergence(self, sqlstore):
         """The store can hold an event under a different generation than
@@ -953,7 +1192,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         with reopened.database.bind_ctx(reopened.models):
             assert PendingTimelineEvents.table_exists()
             assert SyncRecoveryGaps.table_exists()
@@ -981,7 +1220,7 @@ class TestClass:
             sqlstore.device_id,
             sqlstore.store_path,
         )
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         with reopened.database.bind_ctx(reopened.models):
             assert SlidingWindowTokens.table_exists()
         assert reopened.load_sliding_window_tokens() == {}
@@ -1014,7 +1253,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         assert reopened.load_sliding_window_tokens() == {}
 
     def test_v5_store_adds_durable_admission_phase(self, sqlstore):
@@ -1062,7 +1301,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         assert reopened.load_sync_token() == "s1"
         assert reopened.load_sliding_window_tokens() == {
             TEST_ROOM: SlidingWindowToken("w1", "$join")
@@ -1119,14 +1358,14 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         gaps, events, abandoned = reopened.load_sync_recovery()
         assert len(gaps) == 1
         assert not gaps[0].membership_bound
         assert [(item.room_id, item.generation, item.event_id) for item in events] == [
             (TEST_ROOM, 1, "$pending")
         ]
-        assert abandoned == []
+        assert abandoned == {}
         with reopened.database.bind_ctx(reopened.models):
             columns = {
                 row[1]
@@ -1160,7 +1399,7 @@ class TestClass:
             sqlstore.store_path,
         )
 
-        assert reopened._get_store_version() == 9
+        assert reopened._get_store_version() == 10
         gaps, events, abandoned = reopened.load_sync_recovery()
         assert [
             (
@@ -1175,9 +1414,360 @@ class TestClass:
         assert [(item.room_id, item.generation, item.event_id) for item in events] == [
             (TEST_ROOM, 1, "$pending")
         ]
-        assert abandoned == []
+        assert abandoned == {}
         with reopened.database.bind_ctx(reopened.models):
             assert SyncRecoveryAbandonedRooms.table_exists()
+
+    def test_v9_store_reads_a_reasonless_loss_as_unknown(self, sqlstore):
+        """A row written before the reason existed says so, and nothing more.
+
+        The cause was never captured and no later version can recover it, so
+        the migration is the one place a guess becomes permanent: stamping a
+        cause here would be indistinguishable from a real finding forever.
+        ``UNKNOWN`` claims nothing, and outranks every recoverable reason, so
+        the loss can neither be downgraded nor mistaken for a diagnosis.
+        """
+        sqlstore.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_rooms={TEST_ROOM: RecoveryAbandonment.EVENT_LIMIT},
+        )
+        make_v9_abandonment_table(sqlstore, [TEST_ROOM])
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened._get_store_version() == 10
+        assert reopened.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
+
+    def test_v9_store_marks_an_ambiguous_terminal_gap_as_unknown(self, sqlstore):
+        """A pre-v10 terminal real gap cannot be assumed to have continuity.
+
+        V9 could persist an unbound exhausted walk with no cursor and no
+        abandonment row, then crash before draining it. Nothing in that state
+        distinguishes proven continuity from an unverified stop, so the
+        migration must preserve the ambiguity instead of later reporting the
+        room as recovered.
+        """
+        gap = RecoveryGap(TEST_ROOM, 1, "target", None)
+        sqlstore.save_recovery(None, set(), [gap], [], None)
+        make_v9_abandonment_table(sqlstore)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        gaps, _, abandoned = reopened.load_sync_recovery()
+        assert [
+            (item.room_id, item.target_token, item.cursor_token) for item in gaps
+        ] == [(TEST_ROOM, "target", None)]
+        assert abandoned == {TEST_ROOM: frozenset({RecoveryAbandonment.UNKNOWN})}
+
+    def test_v9_store_marks_bounded_terminal_gap_as_unknown(self, sqlstore):
+        """Every pre-v10 terminal real gap lacks durable loss classification."""
+        gap = RecoveryGap(TEST_ROOM, 1, "target", None, membership_bound=True)
+        sqlstore.save_recovery(None, set(), [gap], [], None)
+        make_v9_abandonment_table(sqlstore)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        gaps, _, abandoned = reopened.load_sync_recovery()
+        assert [(item.room_id, item.membership_bound) for item in gaps] == [
+            (TEST_ROOM, True)
+        ]
+        assert abandoned == {TEST_ROOM: frozenset({RecoveryAbandonment.UNKNOWN})}
+
+    def test_candidate_v10_unique_by_room_table_is_rebuilt_on_open(self, sqlstore):
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        account = sqlstore._get_account()
+        assert account
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+            sqlstore.database.execute_sql(
+                f'CREATE TABLE "{table}" ('
+                '"id" INTEGER NOT NULL PRIMARY KEY, '
+                '"room_id" TEXT NOT NULL, '
+                '"reason" TEXT NOT NULL, '
+                '"account_id" INTEGER NOT NULL, '
+                'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+                "ON DELETE CASCADE, "
+                'UNIQUE ("room_id", "account_id"), '
+                'UNIQUE ("account_id", "room_id", "reason"))'
+            )
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" ("room_id", "reason", "account_id") '
+                "VALUES (?, ?, ?)",
+                (TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value, account.id),
+            )
+        sqlstore.database.close()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.EVENT_LIMIT})
+        }
+        with reopened.database.bind_ctx(reopened.models):
+            unique_indexes = [
+                row[1]
+                for row in reopened.database.execute_sql(
+                    f'PRAGMA index_list("{table}")'
+                ).fetchall()
+                if row[2]
+            ]
+            unique_columns = {
+                tuple(
+                    column[2]
+                    for column in reopened.database.execute_sql(
+                        f'PRAGMA index_info("{index}")'
+                    ).fetchall()
+                )
+                for index in unique_indexes
+            }
+        assert frozenset({"account_id", "room_id", "reason"}) in {
+            frozenset(columns) for columns in unique_columns
+        }
+        assert not any(
+            frozenset(columns) <= frozenset({"account_id", "room_id"})
+            for columns in unique_columns
+        )
+
+        reopened.save_recovery(
+            None,
+            set(),
+            [],
+            [],
+            None,
+            abandoned_room_reasons={
+                TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE,
+            },
+        )
+        assert reopened.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset(
+                {
+                    RecoveryAbandonment.EVENT_LIMIT,
+                    RecoveryAbandonment.UNVERIFIABLE,
+                }
+            )
+        }
+
+    def test_queue_store_refuses_old_shape_before_destructive_migration(self, sqlstore):
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        account = sqlstore._get_account()
+        assert account
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+            sqlstore.database.execute_sql(
+                f'CREATE TABLE "{table}" ('
+                '"id" INTEGER NOT NULL PRIMARY KEY, '
+                '"room_id" TEXT NOT NULL, '
+                '"reason" TEXT NOT NULL, '
+                '"account_id" INTEGER NOT NULL, '
+                'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+                "ON DELETE CASCADE, "
+                'UNIQUE ("account_id", "room_id"))'
+            )
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" ("room_id", "reason", "account_id") '
+                "VALUES (?, ?, ?)",
+                (TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value, account.id),
+            )
+            before_schema = sqlstore.database.execute_sql(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+        before_version = sqlstore._get_store_version()
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueDatabase.copy_attempted = False
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        assert not CopyFailingQueueDatabase.copy_attempted
+        database = CopyFailingQueueStore.database_instance
+        assert database is not None
+        assert database.is_stopped()
+        assert database.is_closed()
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            rows = connection.execute(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+            after_schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            after_version = connection.execute(
+                'SELECT version FROM "storeversion"'
+            ).fetchone()
+        assert f"{table}_legacy_v10" not in tables
+        assert rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+        assert after_schema == before_schema
+        assert after_version == (before_version,)
+
+    def test_normal_store_recovers_interrupted_rebuild_rows(self, sqlstore):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        sqlstore.database.close()
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        assert reopened.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.EVENT_LIMIT})
+        }
+        with reopened.database.bind_ctx(reopened.models):
+            tables = set(reopened.database.get_tables())
+            rows = reopened.database.execute_sql(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+        assert legacy_table not in tables
+        assert rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+
+    def test_queue_store_refuses_interrupted_rebuild_before_mutation(self, sqlstore):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueDatabase.copy_attempted = False
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        assert not CopyFailingQueueDatabase.copy_attempted
+        database = CopyFailingQueueStore.database_instance
+        assert database is not None
+        assert database.is_stopped()
+        assert database.is_closed()
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            live_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+            legacy_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{legacy_table}"'
+            ).fetchall()
+        assert {table, legacy_table} <= tables
+        assert live_rows == []
+        assert legacy_rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+
+    def test_queue_store_refuses_legacy_only_rebuild_before_creating_live_table(
+        self, sqlstore
+    ):
+        table, legacy_table = make_interrupted_abandonment_rebuild(sqlstore)
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            legacy_rows = connection.execute(
+                f'SELECT room_id, reason FROM "{legacy_table}"'
+            ).fetchall()
+        assert table not in tables
+        assert legacy_table in tables
+        assert legacy_rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
+
+    def test_unknown_stored_reason_string_loads_as_unknown(self, sqlstore):
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        account = sqlstore._get_account()
+        assert account
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" ("room_id", "reason", "account_id") '
+                "VALUES (?, ?, ?)",
+                (TEST_ROOM, "future_reason", account.id),
+            )
+
+        assert sqlstore.load_sync_recovery()[2] == {
+            TEST_ROOM: frozenset({RecoveryAbandonment.UNKNOWN})
+        }
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)
@@ -1292,7 +1882,16 @@ class TestClass:
         gaps = [RecoveryGap(room_id, 1, "target", "cursor") for room_id in room_ids]
         try:
             sqlstore.save_recovery(None, set(), gaps, [], None)
-            sqlstore.save_recovery(None, set(room_ids), [], [], None)
+            sqlstore.save_recovery(
+                None,
+                set(room_ids),
+                [],
+                [],
+                None,
+                clear_room_reasons=dict.fromkeys(
+                    room_ids, RecoveryAbandonment.BASELINE_LOST
+                ),
+            )
             remaining, _, _ = sqlstore.load_sync_recovery()
             assert not {gap.room_id for gap in remaining} & set(room_ids)
         finally:
@@ -1658,6 +2257,11 @@ class TestClass:
             [],
             [],
             retry_gap if clear_mode == "recovered" else None,
+            clear_room_reasons=(
+                {TEST_ROOM: RecoveryAbandonment.BASELINE_LOST}
+                if clear_mode == "room"
+                else None
+            ),
         )
 
         _, events, _ = sqlstore.load_sync_recovery()
