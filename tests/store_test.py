@@ -1181,13 +1181,14 @@ class TestClass:
         with reopened.database.bind_ctx(reopened.models):
             assert SyncRecoveryAbandonedRooms.table_exists()
 
-    def test_v9_store_reads_a_reasonless_loss_as_permanent(self, sqlstore):
-        """A row written before the reason existed still has to claim a loss.
+    def test_v9_store_reads_a_reasonless_loss_as_unknown(self, sqlstore):
+        """A row written before the reason existed says so, and nothing more.
 
-        The cause was never recorded, so nio cannot say the history is merely
-        over budget. Guessing the weaker reason would tell the application it
-        may still fetch history that may in fact be unreachable, which is the
-        under-reporting this table exists to prevent.
+        The cause was never captured and no later version can recover it, so
+        the migration is the one place a guess becomes permanent: stamping a
+        cause here would be indistinguishable from a real finding forever.
+        ``UNKNOWN`` claims nothing, and outranks every recoverable reason, so
+        the loss can neither be downgraded nor mistaken for a diagnosis.
         """
         sqlstore.save_recovery(
             None,
@@ -1210,7 +1211,7 @@ class TestClass:
 
         assert reopened._get_store_version() == 10
         assert reopened.load_sync_recovery()[2] == {
-            TEST_ROOM: RecoveryAbandonment.UNVERIFIABLE
+            TEST_ROOM: RecoveryAbandonment.UNKNOWN
         }
 
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):

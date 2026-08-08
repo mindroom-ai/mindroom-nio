@@ -235,10 +235,34 @@ def test_classic_initial_own_join_clears_stale_recovery():
     assert plan.abandoned_rooms == {}
 
 
-def test_membership_reset_leaves_real_gap_loss_for_persistence():
+def test_membership_reset_names_the_real_gap_loss_in_the_plan():
+    """The producer says why, rather than leaving persistence to guess.
+
+    A reset drops the baseline the walk was anchored to, which nio cannot
+    resume -- but it establishes nothing about the history itself, so it must
+    not be reported the same way as a walk proven unable to advance.
+    """
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
     )
+
+    plan = plan_room_timeline(
+        state,
+        room_id=ROOM,
+        timeline_events=[],
+        user_id="@me:example.org",
+        membership="leave",
+    )
+
+    assert plan.clear_rooms == frozenset({ROOM})
+    assert plan.abandoned_rooms == {
+        ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
+    }
+
+
+def test_membership_reset_of_a_synthetic_gap_is_not_a_loss():
+    """No real gap means no work was lost, so nothing is abandoned."""
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "", None)]})
 
     plan = plan_room_timeline(
         state,
@@ -1983,6 +2007,89 @@ def test_existing_gap_held_event_cap_stays_a_budget_stop():
     persist_response_plan(state, None, token=None, plan=plan)
 
     assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.EVENT_LIMIT}
+
+
+def test_every_reason_is_ranked():
+    """A member with no rank would raise the first time it was merged."""
+    for reason in sync_recovery.RecoveryAbandonment:
+        assert isinstance(reason.rank, int)
+
+    ranks = [reason.rank for reason in sync_recovery.RecoveryAbandonment]
+    assert len(set(ranks)) == len(ranks), "a tie would make merges order-dependent"
+
+
+def test_an_undiagnosed_loss_cannot_be_relabelled_as_recoverable():
+    """``UNKNOWN`` outranks every reason that permits an assumption.
+
+    A legacy row records that a room lost history and nothing about why. If a
+    later budget stop could overwrite it, an application would be told the
+    history is merely over budget and may still be fetched -- a claim nio never
+    made about that room and cannot make now, because the cause is gone.
+    """
+    state = RecoveryState()
+    unknown = sync_recovery.RecoveryAbandonment.UNKNOWN
+
+    for weaker in (
+        sync_recovery.RecoveryAbandonment.EVENT_LIMIT,
+        sync_recovery.RecoveryAbandonment.FETCH_FAILED,
+        sync_recovery.RecoveryAbandonment.BASELINE_LOST,
+    ):
+        state.abandoned = {ROOM: unknown}
+        apply_plan(state, RecoveryPlan(abandoned_rooms={ROOM: weaker}))
+        assert state.abandoned == {ROOM: unknown}, weaker
+
+    # Proof still beats an admission of ignorance.
+    state.abandoned = {ROOM: unknown}
+    apply_plan(
+        state,
+        RecoveryPlan(
+            abandoned_rooms={ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+        ),
+    )
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_cursor_outranks_the_event_cap_on_one_page():
+    """One page can hit both, and only one reason is recorded.
+
+    Checking the cap first would report a budget stop for a walk nio had just
+    watched fail to advance -- an under-claim the merge order never sees,
+    because the losing reason is never produced.
+    """
+    state = RecoveryState(gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]})
+
+    await _pump_one_page(
+        state,
+        RoomMessagesResponse.from_dict(
+            {
+                "start": "cursor",
+                "end": "cursor",
+                "chunk": [event("$overflow", 2).source],
+            },
+            ROOM,
+        ),
+        options=RecoveryOptions(1, 0, 10, 10),
+    )
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+
+
+def test_published_recovery_outcomes_stay_frozen():
+    """``frozenset`` operators return ``NotImplemented`` against ``dict_keys``.
+
+    The reflected ``dict_keys`` operator answers instead and yields a mutable
+    ``set``, which compares equal to the frozen set every assertion here uses.
+    The published fields are declared frozen, so the type is checked directly.
+    """
+    state = RecoveryState()
+    state.outcomes = {ROOM: True, ROOM_B: False}
+    state.abandoned = {ROOM_B: sync_recovery.RecoveryAbandonment.UNVERIFIABLE}
+
+    recovered, unrecovered, _abandoned = take_recovery_outcomes(state)
+
+    assert isinstance(recovered, frozenset)
+    assert isinstance(unrecovered, frozenset)
 
 
 def test_a_second_loss_cannot_downgrade_an_unsettled_permanent_one():

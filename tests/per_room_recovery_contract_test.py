@@ -11,6 +11,7 @@ error is raised anywhere for the loss.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,9 @@ from nio import (
     LocalProtocolError,
     LoginResponse,
     RecoveryAbandonment,
+    RoomForgetResponse,
     RoomInfo,
+    RoomLeaveResponse,
     RoomMessageText,
     Rooms,
     SyncResponse,
@@ -375,14 +378,90 @@ class TestPerRoomRecoveryContract:
             client._recovery,
             client.store,
             token=None,
-            plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+            plan=RecoveryPlan(
+                clear_rooms=frozenset({ROOM_A}),
+                abandoned_rooms={ROOM_A: RecoveryAbandonment.BASELINE_LOST},
+            ),
         )
 
         assert ROOM_A not in client._recovery.gaps
-        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
+        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
         gaps, _events, abandoned = client.store.load_sync_recovery()
         assert gaps == []
-        assert abandoned == {ROOM_A: RecoveryAbandonment.UNVERIFIABLE}
+        assert abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        await client.close()
+
+    async def test_a_clear_that_names_no_cause_is_recorded_as_unknown(
+        self,
+        tempdir,
+        caplog,
+    ):
+        """Persistence records the loss but refuses to invent the cause.
+
+        Whether a clear drops a real gap is a fact about persisted state, so
+        persistence reads it; *why* is known only to whoever cleared the room.
+        A producer that fails to say is a defect -- but a durable sync path is
+        the wrong place to raise, so the loss is still recorded, under a reason
+        that claims nothing, and the defect is surfaced in the log.
+
+        No production path reaches this: every real-gap-clearing site names its
+        cause, which is what
+        ``test_no_production_path_clears_a_real_gap_anonymously`` pins.
+        """
+        client = nio_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        assert client.store
+
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+        with caplog.at_level(logging.ERROR, logger="nio.client.sync_recovery"):
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(clear_rooms=frozenset({ROOM_A})),
+            )
+
+        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.UNKNOWN}
+        assert client.store.load_sync_recovery()[2] == {
+            ROOM_A: RecoveryAbandonment.UNKNOWN
+        }
+        assert "without naming a cause" in caplog.text
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_no_production_path_clears_a_real_gap_anonymously(
+        self,
+        tempdir,
+        monkeypatch,
+        caplog,
+        operation,
+    ):
+        """The ``UNKNOWN`` fallback is a backstop, not a live code path."""
+        client = nio_owned_client(tempdir)
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        persist_response_plan(
+            client._recovery,
+            client.store,
+            token=None,
+            plan=RecoveryPlan(gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),)),
+        )
+
+        async def send(response_class, *_args, **_kwargs):
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        with caplog.at_level(logging.ERROR, logger="nio.client.sync_recovery"):
+            await getattr(client, operation)(ROOM_A)
+
+        assert client._recovery.abandoned == {ROOM_A: RecoveryAbandonment.BASELINE_LOST}
+        assert "without naming a cause" not in caplog.text
         await client.close()
 
     async def test_unresolved_gap_does_not_block_the_global_cursor(
@@ -968,6 +1047,9 @@ class TestPerRoomRecoveryContract:
         client._publish_waiting_sync_cancellation(cancelled, "s1")
 
         assert cancelled.unrecovered_room_ids == frozenset({ROOM_A})
+        assert isinstance(
+            cancelled.unrecovered_room_ids, frozenset
+        ), "a mutable set compares equal to the frozen one this field promises"
         assert cancelled.abandoned_rooms == {ROOM_A: RecoveryAbandonment.FETCH_FAILED}
         await client.close()
 
@@ -1055,11 +1137,13 @@ class TestPerRoomRecoveryContract:
         await client.receive_response(reset)
 
         # 403 is refused outright; 429 leaves the walk open until the leave
-        # drops the gap it was walking.
+        # drops the gap it was walking. Neither shows the history is gone: a
+        # rate-limited walk that loses its baseline was never proven unable to
+        # advance, and reporting it as such would be the over-claim in reverse.
         expected = (
             RecoveryAbandonment.FETCH_FAILED
             if recovery_status == 403
-            else RecoveryAbandonment.UNVERIFIABLE
+            else RecoveryAbandonment.BASELINE_LOST
         )
         assert client._recovery.abandoned == {ROOM_A: expected}
         assert client.store

@@ -267,10 +267,11 @@ class MatrixStore:
             ).fetchall()
         }
         if "reason" not in columns:
-            # Rows written before the reason existed record a loss of unknown
-            # cause. Claiming the least would tell the application it may still
-            # fetch history that nio may have proven unreachable.
-            default = RecoveryAbandonment.UNVERIFIABLE.value
+            # Rows written before the reason existed record a loss whose cause
+            # was never captured, and no later version can recover it. Stamping
+            # a cause here would make that guess indistinguishable from a real
+            # finding forever, so they say so instead.
+            default = RecoveryAbandonment.UNKNOWN.value
             self.database.execute_sql(
                 f'ALTER TABLE "{table}" '
                 f"ADD COLUMN reason TEXT NOT NULL DEFAULT '{default}'"

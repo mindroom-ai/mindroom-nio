@@ -240,10 +240,10 @@ class SyncRecoveryAbandonedRooms(Model):
     """
 
     room_id = TextField()
-    # Why the walk was given up on. Defaults to the strongest claim, because a
-    # row that predates the column records a loss of unknown cause, and
-    # under-claiming one is the failure this table exists to prevent.
-    reason = TextField(default=RecoveryAbandonment.UNVERIFIABLE.value)
+    # Why the walk was given up on. A row that reaches the store without one
+    # records a loss whose cause nio never captured, and saying so is honest
+    # where guessing a cause would be indistinguishable from a real finding.
+    reason = TextField(default=RecoveryAbandonment.UNKNOWN.value)
     account = ForeignKeyField(
         model=Accounts,
         on_delete="CASCADE",

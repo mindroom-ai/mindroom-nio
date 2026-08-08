@@ -281,6 +281,7 @@ from .sync_recovery import (
     RecoveryState,
     _LiveCallbackError,
     acknowledge_unrecovered_rooms,
+    cleared_gap_abandonment,
     drain_recovery_dispatches,
     drain_recovery_room_dispatches,
     has_pending_recovery_work,
@@ -1435,7 +1436,7 @@ class AsyncClient(Client):
         # permanently lost room as healthy.
         abandoned = dict(self._recovery.abandoned)
         response.recovered_room_ids = frozenset()
-        response.unrecovered_room_ids = frozenset(unrecovered) | abandoned.keys()
+        response.unrecovered_room_ids = frozenset(unrecovered) | frozenset(abandoned)
         response.abandoned_rooms = abandoned
 
     async def _recovery_room_messages(
@@ -1791,12 +1792,13 @@ class AsyncClient(Client):
                     )
                     for room_id in planned_room_ids - response.rooms.keys()
                 )
-                # A discontinuity with no usable baseline has nothing to walk
-                # from, so continuity can never be proven for it.
+                # A discontinuity with no usable window token has nothing to
+                # walk from, so nio can never resume it -- but nothing was
+                # established about the history itself.
                 plans.append(
                     RecoveryPlan(
                         abandoned_rooms=dict.fromkeys(
-                            unrecoverable_room_ids, RecoveryAbandonment.UNVERIFIABLE
+                            unrecoverable_room_ids, RecoveryAbandonment.BASELINE_LOST
                         )
                     )
                 )
@@ -1967,6 +1969,9 @@ class AsyncClient(Client):
     async def _apply_room_membership_reset(self, room_id: str) -> None:
         """Clear every room-local recovery artifact after server success."""
         if not self.config.backfill_limited_timelines:
+            # No gap can be open here to name a cause for: recovery state is
+            # only ever loaded through ``_recovery_store``, which is ``None``
+            # whenever limited-timeline backfill is off.
             persist_response_plan(
                 self._recovery,
                 self.store,
@@ -1987,7 +1992,14 @@ class AsyncClient(Client):
                     self._recovery,
                     self._recovery_store,
                     token=None,
-                    plan=RecoveryPlan(clear_rooms=frozenset({room_id})),
+                    plan=RecoveryPlan(
+                        clear_rooms=frozenset({room_id}),
+                        abandoned_rooms=cleared_gap_abandonment(
+                            self._recovery,
+                            (room_id,),
+                            RecoveryAbandonment.BASELINE_LOST,
+                        ),
+                    ),
                     forgotten_rooms=(room_id,),
                 )
                 self._sliding_room_prev_batch.pop(room_id, None)

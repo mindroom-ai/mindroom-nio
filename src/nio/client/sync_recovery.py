@@ -9,6 +9,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..api import MessageDirection
@@ -237,24 +238,36 @@ def acknowledge_unrecovered_rooms(
     return frozenset(settled)
 
 
-# Weakest claim first. A room can be abandoned again before the application
-# settles the first loss, and reporting whichever reason came last would let a
-# proven-unreachable gap be relabelled as merely over budget -- the same
-# under-reporting that stickiness exists to prevent, moved into the reason.
-_ABANDONMENT_PRECEDENCE = (
-    RecoveryAbandonment.EVENT_LIMIT,
-    RecoveryAbandonment.FETCH_FAILED,
-    RecoveryAbandonment.UNVERIFIABLE,
-)
-
-
-def _strongest_abandonment(
+def _most_conservative_abandonment(
     current: RecoveryAbandonment | None,
     incoming: RecoveryAbandonment,
 ) -> RecoveryAbandonment:
+    """Keep whichever reason lets the application assume the least.
+
+    See :attr:`RecoveryAbandonment.rank` for why the ordering is conservatism
+    rather than certainty.
+    """
     if current is None:
         return incoming
-    return max(current, incoming, key=_ABANDONMENT_PRECEDENCE.index)
+    return max(current, incoming, key=lambda reason: reason.rank)
+
+
+def cleared_gap_abandonment(
+    state: RecoveryState,
+    room_ids: Iterable[str],
+    reason: RecoveryAbandonment,
+) -> dict[str, RecoveryAbandonment]:
+    """Name the rooms whose real gap dies with this clear, and say why.
+
+    Whether a clear drops a real gap is a fact about persisted state, so it is
+    read here; *why* the room is being cleared is only known to the caller and
+    is never inferred from the clear itself.
+    """
+    return {
+        room_id: reason
+        for room_id in room_ids
+        if any(gap.target_token for gap in state.gaps.get(room_id, ()))
+    }
 
 
 def is_recovery_dispatch_task(
@@ -732,7 +745,7 @@ def _plan_room_reset(
     room_id: str,
     additional_events: Iterable[PendingTimelineEvent] = (),
     *,
-    abandoned: RecoveryAbandonment | None = None,
+    abandoned_rooms: Mapping[str, RecoveryAbandonment] = MappingProxyType({}),
 ) -> RecoveryPlan:
     gaps = state.gaps.get(room_id, ())
     live = [
@@ -742,7 +755,7 @@ def _plan_room_reset(
         if event.is_live
     ] + list(additional_events)
     clear = frozenset({room_id})
-    abandoned_rooms = {room_id: abandoned} if abandoned else {}
+    abandoned_rooms = dict(abandoned_rooms)
     if not live:
         return RecoveryPlan(
             clear_rooms=clear,
@@ -780,7 +793,15 @@ def plan_room_timeline(
     account_data_events: Sequence[AccountDataEvent | BadEventType] = (),
 ) -> RecoveryPlan:
     if membership in {"leave", "ban", "invite"}:
-        return _plan_room_reset(state, room_id)
+        return _plan_room_reset(
+            state,
+            room_id,
+            abandoned_rooms=cleared_gap_abandonment(
+                state,
+                (room_id,),
+                RecoveryAbandonment.BASELINE_LOST,
+            ),
+        )
 
     if live_event_count is not None and not (
         0 <= live_event_count <= len(timeline_events)
@@ -872,7 +893,9 @@ def plan_room_timeline(
             state,
             room_id,
             events,
-            abandoned=(RecoveryAbandonment.EVENT_LIMIT if abandons_real_gap else None),
+            abandoned_rooms=(
+                {room_id: RecoveryAbandonment.EVENT_LIMIT} if abandons_real_gap else {}
+            ),
         )
     gap = (
         RecoveryGap(
@@ -902,7 +925,7 @@ def merge_recovery_plans(plans: Iterable[RecoveryPlan]) -> RecoveryPlan:
         gaps.extend(plan.gaps)
         events.extend(plan.events)
         for room_id, reason in plan.abandoned_rooms.items():
-            abandoned_rooms[room_id] = _strongest_abandonment(
+            abandoned_rooms[room_id] = _most_conservative_abandonment(
                 abandoned_rooms.get(room_id),
                 reason,
             )
@@ -975,7 +998,18 @@ def plan_sync_response(
         )
         for room_id, room_info in joined_rooms.items()
     ]
-    plans.extend(_plan_room_reset(state, room_id) for room_id in reset_room_ids)
+    plans.extend(
+        _plan_room_reset(
+            state,
+            room_id,
+            abandoned_rooms=cleared_gap_abandonment(
+                state,
+                (room_id,),
+                RecoveryAbandonment.BASELINE_LOST,
+            ),
+        )
+        for room_id in reset_room_ids
+    )
     return merge_recovery_plans(plans)
 
 
@@ -1044,7 +1078,7 @@ def apply_plan(state: RecoveryState, plan: RecoveryPlan) -> None:
     # Clearing room recovery does not settle a loss. Only the application can
     # do that after recording the missing work somewhere it owns.
     for room_id, reason in plan.abandoned_rooms.items():
-        state.abandoned[room_id] = _strongest_abandonment(
+        state.abandoned[room_id] = _most_conservative_abandonment(
             state.abandoned.get(room_id),
             reason,
         )
@@ -1071,15 +1105,20 @@ def take_recovery_outcomes(
         if any(gap.target_token for gap in gaps)
     )
     abandoned = dict(state.abandoned)
+    # ``frozenset`` operators return ``NotImplemented`` against ``dict_keys``,
+    # so the reflected ``dict_keys`` operator answers instead and yields a
+    # mutable ``set``. Both fields are published as frozen sets, so the result
+    # is re-frozen rather than relying on the operand types.
+    abandoned_ids = frozenset(abandoned)
     recovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if complete)
         - pending
-        - abandoned.keys()
+        - abandoned_ids
     )
     unrecovered = (
         frozenset(room_id for room_id, complete in outcomes.items() if not complete)
         | pending
-        | abandoned.keys()
+        | abandoned_ids
     )
     return recovered, unrecovered, abandoned
 
@@ -1150,20 +1189,25 @@ def persist_response_plan(
         for room_id in plan.clear_rooms
         if any(gap.target_token for gap in state.gaps.get(room_id, ()))
     )
-    # A real gap dropped with the room it belonged to leaves no baseline to
-    # walk from, so its history can never be proven contiguous again. A plan
-    # that already said why it gave up keeps its own reason: the room being
-    # cleared is how abandonment is carried out, not why it happened.
+    # Dropping a real gap loses work, so the room has to be named as abandoned.
+    # The cause belongs to whoever cleared the room and is never inferred from
+    # the clear itself: the room being cleared is how abandonment is carried
+    # out, not why it happened. A producer that fails to say why is a defect,
+    # but a durable sync path is the wrong place to raise, so it degrades to
+    # ``UNKNOWN`` -- which claims nothing -- and is caught by the tests instead.
     abandoned_rooms = dict(plan.abandoned_rooms)
-    for room_id in real_gap_clear_rooms:
-        abandoned_rooms.setdefault(room_id, RecoveryAbandonment.UNVERIFIABLE)
+    for room_id in real_gap_clear_rooms - abandoned_rooms.keys():
+        logger.error("Clearing a real gap in %s without naming a cause", room_id)
+        abandoned_rooms[room_id] = RecoveryAbandonment.UNKNOWN
     # Fold in what is already known before the row is written, not after: the
     # store replaces the room's reason outright, so a plan that claims less
     # than the standing loss would leave a restart reading the weaker one.
     plan = replace(
         plan,
         abandoned_rooms={
-            room_id: _strongest_abandonment(state.abandoned.get(room_id), reason)
+            room_id: _most_conservative_abandonment(
+                state.abandoned.get(room_id), reason
+            )
             for room_id, reason in abandoned_rooms.items()
         },
     )
@@ -1453,18 +1497,22 @@ async def _collect_slice(
             and not clear_recovered
         )
         continuity_proven = target_reached or bounded_exhausted
-        if retained_recovered_count + len(recovered) > options.max_events:
+        # A cursor the server will not move past is checked before the event
+        # cap. Both can be true of one page, and only one reason is recorded,
+        # so the cap would report a budget stop for a walk nio just watched
+        # fail to advance -- the under-claim the merge order exists to prevent.
+        if response.end == cursor:
+            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
+            recovered.clear()
+            clear_recovered = True
+            abandoned = RecoveryAbandonment.UNVERIFIABLE
+            next_cursor = None
+        elif retained_recovered_count + len(recovered) > options.max_events:
             logger.error("Abandoning recovery at the room event cap in %s", gap.room_id)
             recovered.clear()
             page_events.clear()
             clear_recovered = True
             abandoned = RecoveryAbandonment.EVENT_LIMIT
-            next_cursor = None
-        elif response.end == cursor:
-            logger.error("Abandoning unverifiable gap in %s", gap.room_id)
-            recovered.clear()
-            clear_recovered = True
-            abandoned = RecoveryAbandonment.UNVERIFIABLE
             next_cursor = None
         elif continuity_proven:
             next_cursor = None
