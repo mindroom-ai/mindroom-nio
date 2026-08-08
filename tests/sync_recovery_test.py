@@ -274,6 +274,7 @@ def test_sync_history_counts_toward_held_cap():
     )
 
     assert second.clear_rooms == frozenset({ROOM})
+    assert second.abandoned_rooms == {}
 
 
 def test_room_reset_preserves_unaccepted_sync_history():
