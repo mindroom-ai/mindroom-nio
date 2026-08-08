@@ -82,17 +82,6 @@ _RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
 
 
-def _collapse_legacy_abandonment_reasons(
-    current: object,
-    incoming: object,
-) -> RecoveryAbandonment:
-    """Represent a cause union safely in the store's legacy scalar column."""
-    reasons = normalize_abandonment_reasons(current) | normalize_abandonment_reasons(
-        incoming
-    )
-    return next(iter(reasons)) if len(reasons) == 1 else RecoveryAbandonment.UNKNOWN
-
-
 def _recovery_payload_aad(
     account_id: int,
     room_id: str,
@@ -141,6 +130,7 @@ class MatrixStore:
     """Storage class for matrix state."""
 
     supports_atomic_recovery: ClassVar[bool] = False
+    supports_recovery_abandonment_reasons: ClassVar[bool] = False
     models = [
         Accounts,
         OlmSessions,
@@ -170,6 +160,8 @@ class MatrixStore:
         super().__init_subclass__(**kwargs)
         if "supports_atomic_recovery" not in cls.__dict__:
             cls.supports_atomic_recovery = False
+        if "supports_recovery_abandonment_reasons" not in cls.__dict__:
+            cls.supports_recovery_abandonment_reasons = False
 
     def _create_database(self):
         return SqliteDatabase(
@@ -271,40 +263,84 @@ class MatrixStore:
             self.database.create_tables([SyncRecoveryAbandonedRooms])
         self._update_version(9)
 
-    @use_database_atomic
-    def upgrade_to_v10(self):
+    def _repair_recovery_abandonment_schema(self) -> bool:
+        """Replace pre-release v10 shapes with the multi-cause table."""
         table = SyncRecoveryAbandonedRooms._meta.table_name
-        gaps_table = SyncRecoveryGaps._meta.table_name
+        if not self.database.table_exists(table):
+            self.database.create_tables([SyncRecoveryAbandonedRooms])
+            return True
+
         columns = {
             row[1]
             for row in self.database.execute_sql(
                 f'PRAGMA table_info("{table}")'
             ).fetchall()
         }
-        if "reason" not in columns:
-            # Rows written before the reason existed record a loss whose cause
-            # was never captured, and no later version can recover it. Stamping
-            # a cause here would make that guess indistinguishable from a real
-            # finding forever, so they say so instead.
-            default = RecoveryAbandonment.UNKNOWN.value
-            self.database.execute_sql(
-                f'ALTER TABLE "{table}" '
-                f"ADD COLUMN reason TEXT NOT NULL DEFAULT '{default}'"
+        unique_indexes = [
+            row[1]
+            for row in self.database.execute_sql(
+                f'PRAGMA index_list("{table}")'
+            ).fetchall()
+            if row[2]
+        ]
+        unique_columns = {
+            tuple(
+                column[2]
+                for column in self.database.execute_sql(
+                    f'PRAGMA index_info("{index}")'
+                ).fetchall()
             )
-        # V9 could persist an unbound exhausted real gap with no cursor and no
-        # abandonment row, then crash before draining it. A membership-bounded
-        # terminal gap already proved continuity; an unbounded one carries no
-        # durable proof, so preserve its ambiguity rather than letting startup
-        # later report the room as recovered.
+            for index in unique_indexes
+        }
+        expected = ("account_id", "room_id", "reason")
+        legacy = ("account_id", "room_id")
+        if (
+            "reason" in columns
+            and expected in unique_columns
+            and legacy not in unique_columns
+        ):
+            return False
+
+        legacy_table = f"{table}_legacy_v10"
+        self.database.execute_sql(f'DROP TABLE IF EXISTS "{legacy_table}"')
+        self.database.execute_sql(f'ALTER TABLE "{table}" RENAME TO "{legacy_table}"')
+        self.database.create_tables([SyncRecoveryAbandonedRooms])
+        reason = 'COALESCE("reason", ?)' if "reason" in columns else "?"
         self.database.execute_sql(
             f'INSERT OR IGNORE INTO "{table}" '
             '("room_id", "reason", "account_id") '
-            f'SELECT "room_id", ?, "account_id" FROM "{gaps_table}" '
-            'WHERE "target_token" != ? AND "cursor_token" IS NULL '
-            'AND "membership_bound" = 0',
+            f'SELECT "room_id", {reason}, "account_id" FROM "{legacy_table}"',
+            (RecoveryAbandonment.UNKNOWN.value,),
+        )
+        self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
+        return True
+
+    def _seed_terminal_recovery_abandonments(self) -> None:
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        gaps_table = SyncRecoveryGaps._meta.table_name
+        self.database.execute_sql(
+            f'INSERT OR IGNORE INTO "{table}" '
+            '("room_id", "reason", "account_id") '
+            f'SELECT DISTINCT gaps."room_id", ?, gaps."account_id" '
+            f'FROM "{gaps_table}" AS gaps '
+            'WHERE gaps."target_token" != ? '
+            'AND gaps."cursor_token" IS NULL '
+            f'AND NOT EXISTS (SELECT 1 FROM "{table}" AS abandoned '
+            'WHERE abandoned."account_id" = gaps."account_id" '
+            'AND abandoned."room_id" = gaps."room_id")',
             (RecoveryAbandonment.UNKNOWN.value, ""),
         )
+
+    @use_database_atomic
+    def upgrade_to_v10(self):
+        self._repair_recovery_abandonment_schema()
+        self._seed_terminal_recovery_abandonments()
         self._update_version(10)
+
+    @use_database_atomic
+    def _repair_v10_recovery_abandonments(self) -> None:
+        if self._repair_recovery_abandonment_schema():
+            self._seed_terminal_recovery_abandonments()
 
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
@@ -341,6 +377,7 @@ class MatrixStore:
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
+        self._repair_v10_recovery_abandonments()
 
     def _get_store_version(self):
         with self.database.bind_ctx([StoreVersion]):
@@ -727,35 +764,18 @@ class MatrixStore:
     @staticmethod
     def _write_recovery_abandonments(
         account,
-        abandoned_rooms: Mapping[str, RecoveryAbandonment],
+        abandoned_rooms: Mapping[str, object],
     ) -> None:
-        """Fold sticky loss reasons before replacing their durable rows."""
-        reasons = dict(abandoned_rooms)
-        room_ids = list(reasons)
-        for index in range(0, len(room_ids), _RECOVERY_WRITE_CHUNK_SIZE):
-            existing = SyncRecoveryAbandonedRooms.select(
-                SyncRecoveryAbandonedRooms.room_id,
-                SyncRecoveryAbandonedRooms.reason,
-            ).where(
-                SyncRecoveryAbandonedRooms.account == account,
-                SyncRecoveryAbandonedRooms.room_id.in_(
-                    room_ids[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-                ),
-            )
-            for row in existing:
-                reasons[row.room_id] = _collapse_legacy_abandonment_reasons(
-                    row.reason,
-                    reasons[row.room_id],
-                )
-
+        """Append every normalized cause without erasing standing causes."""
         rows = [
             {"account": account, "room_id": room_id, "reason": reason.value}
-            for room_id, reason in reasons.items()
+            for room_id, value in abandoned_rooms.items()
+            for reason in normalize_abandonment_reasons(value)
         ]
         for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
-            SyncRecoveryAbandonedRooms.replace_many(
+            SyncRecoveryAbandonedRooms.insert_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).execute()
+            ).on_conflict_ignore().execute()
 
     @use_database_atomic
     def save_recovery(
@@ -767,8 +787,10 @@ class MatrixStore:
         clear_recovered: RecoveryGap | None,
         window_tokens: Mapping[str, SlidingWindowToken] | None = None,
         forgotten_rooms: Iterable[str] = (),
-        abandoned_rooms: Mapping[str, RecoveryAbandonment] | None = None,
-        clear_room_reasons: Mapping[str, RecoveryAbandonment] | None = None,
+        abandoned_rooms: Iterable[str] = (),
+        *,
+        abandoned_room_reasons: Mapping[str, object] | None = None,
+        clear_room_reasons: Mapping[str, object] | None = None,
     ) -> None:
         account = self._get_account()
         assert account
@@ -781,8 +803,21 @@ class MatrixStore:
         if token:
             SyncTokens.replace(account=account, token=token).execute()
         clear_rooms = list(clear_rooms)
-        clear_room_reasons = dict(clear_room_reasons or {})
-        abandoned_rooms = dict(abandoned_rooms or {})
+        clear_room_reasons = {
+            room_id: normalize_abandonment_reasons(reasons)
+            for room_id, reasons in (clear_room_reasons or {}).items()
+        }
+        detailed_abandonments = {
+            room_id: normalize_abandonment_reasons(reasons)
+            for room_id, reasons in (abandoned_room_reasons or {}).items()
+        }
+        for room_id in abandoned_rooms:
+            if room_id in clear_room_reasons:
+                continue
+            detailed_abandonments.setdefault(
+                room_id,
+                frozenset({RecoveryAbandonment.UNKNOWN}),
+            )
         for index in range(0, len(clear_rooms), _RECOVERY_WRITE_CHUNK_SIZE):
             room_batch = clear_rooms[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             persisted_real_gap_rooms = {
@@ -794,19 +829,16 @@ class MatrixStore:
                 )
             }
             for room_id in persisted_real_gap_rooms:
-                reason = clear_room_reasons.get(room_id)
-                if reason is None:
-                    if room_id in abandoned_rooms:
+                reasons = clear_room_reasons.get(room_id)
+                if reasons is None:
+                    if room_id in detailed_abandonments:
                         continue
                     logger.error(
                         "Clearing a real gap in %s without naming a cause", room_id
                     )
-                    reason = RecoveryAbandonment.UNKNOWN
-                previous = abandoned_rooms.get(room_id)
-                abandoned_rooms[room_id] = (
-                    reason
-                    if previous is None
-                    else _collapse_legacy_abandonment_reasons(previous, reason)
+                    reasons = frozenset({RecoveryAbandonment.UNKNOWN})
+                detailed_abandonments[room_id] = (
+                    detailed_abandonments.get(room_id, frozenset()) | reasons
                 )
             self._restore_completed_markers(
                 account,
@@ -839,7 +871,7 @@ class MatrixStore:
             SyncRecoveryGaps.replace_many(
                 rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
             ).execute()
-        self._write_recovery_abandonments(account, abandoned_rooms)
+        self._write_recovery_abandonments(account, detailed_abandonments)
         self._upsert_pending_events(account, events)
 
     @use_database_atomic
@@ -1036,7 +1068,7 @@ class MatrixStore:
     ) -> tuple[
         list[SyncRecoveryGaps],
         list[PendingTimelineEvent],
-        dict[str, RecoveryAbandonment],
+        dict[str, frozenset[RecoveryAbandonment]],
     ]:
         """Load room obligations, their ordered pending callbacks, and lost rooms."""
         from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
@@ -1045,11 +1077,20 @@ class MatrixStore:
         if not account:
             return [], [], {}
 
-        abandoned = {
-            row.room_id: RecoveryAbandonment(row.reason)
-            for row in SyncRecoveryAbandonedRooms.select()
+        abandoned_sets: dict[str, set[RecoveryAbandonment]] = {}
+        for row in (
+            SyncRecoveryAbandonedRooms.select()
             .where(SyncRecoveryAbandonedRooms.account == account)
-            .order_by(SyncRecoveryAbandonedRooms.room_id)
+            .order_by(
+                SyncRecoveryAbandonedRooms.room_id,
+                SyncRecoveryAbandonedRooms.reason,
+            )
+        ):
+            abandoned_sets.setdefault(row.room_id, set()).update(
+                normalize_abandonment_reasons(row.reason)
+            )
+        abandoned = {
+            room_id: frozenset(reasons) for room_id, reasons in abandoned_sets.items()
         }
         gaps = list(
             SyncRecoveryGaps.select()
@@ -1222,15 +1263,9 @@ class MatrixStore:
         generation: int,
         event_id: str | None,
         was_encrypted: bool,
-        abandonment: RecoveryAbandonment | None = None,
     ) -> None:
         account = self._get_account()
         assert account
-        if abandonment is not None:
-            self._write_recovery_abandonments(
-                account,
-                {room_id: abandonment},
-            )
         event_filter = (
             PendingTimelineEvents.account == account,
             PendingTimelineEvents.room_id == room_id,
@@ -1438,6 +1473,7 @@ class DefaultStore(MatrixStore):
     """
 
     supports_atomic_recovery: ClassVar[bool] = True
+    supports_recovery_abandonment_reasons: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
@@ -1577,6 +1613,7 @@ class SqliteStore(MatrixStore):
     """
 
     supports_atomic_recovery: ClassVar[bool] = True
+    supports_recovery_abandonment_reasons: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
     def _get_device(self, device):
@@ -1828,6 +1865,7 @@ class SqliteMemoryStore(SqliteStore):
     """
 
     supports_atomic_recovery: ClassVar[bool] = True
+    supports_recovery_abandonment_reasons: ClassVar[bool] = True
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

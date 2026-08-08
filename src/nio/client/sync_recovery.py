@@ -58,23 +58,6 @@ def _union_abandonment_reasons(
     )
 
 
-def _legacy_abandonment_rooms(
-    rooms: Mapping[str, frozenset[RecoveryAbandonment]],
-) -> dict[str, RecoveryAbandonment]:
-    """Adapt canonical causes to the currently singular store API.
-
-    Persistent multi-cause encoding is outside this in-memory/public contract.
-    ``UNKNOWN`` avoids incorrectly claiming that one selected cause was the
-    only one when an older store only accepts a scalar reason.
-    """
-    return {
-        room_id: (
-            next(iter(reasons)) if len(reasons) == 1 else RecoveryAbandonment.UNKNOWN
-        )
-        for room_id, reasons in rooms.items()
-    }
-
-
 FetchMessages = Callable[[str, str, str | None, MessageDirection, int], Awaitable]
 PendingEventKind = Literal["timeline", "ephemeral", "account_data"]
 _DispatchResult = Event | BadEventType | EphemeralEvent | AccountDataEvent | None
@@ -1285,9 +1268,8 @@ def persist_response_plan(
             "The configured store does not support atomic recovery writes."
         )
     plan = _materialize_memory_clear_abandonments(state, plan)
-    # Fold in what is already known before the row is written, not after: the
-    # store replaces the room's reason outright, so a plan that claims less
-    # than the standing loss would leave a restart reading the weaker one.
+    # Fold in what is already known before the row is written so every store
+    # boundary receives the complete standing cause set for the room.
     plan = replace(
         plan,
         abandoned_rooms={
@@ -1305,12 +1287,13 @@ def persist_response_plan(
                 plan.clear_recovered,
                 window_tokens,
                 forgotten_rooms,
-                _legacy_abandonment_rooms(plan.abandoned_rooms),
+                tuple(dict.fromkeys((*plan.abandoned_rooms, *plan.clear_room_reasons))),
             )
-            if plan.clear_room_reasons:
+            if getattr(store, "supports_recovery_abandonment_reasons", False):
                 store.save_recovery(
                     *save_args,
-                    _legacy_abandonment_rooms(plan.clear_room_reasons),
+                    abandoned_room_reasons=plan.abandoned_rooms,
+                    clear_room_reasons=plan.clear_room_reasons,
                 )
             else:
                 store.save_recovery(*save_args)
@@ -1333,16 +1316,22 @@ def _finish(
     abandonment: RecoveryAbandonment | None = None,
 ) -> None:
     if store:
+        if abandonment is not None:
+            persist_response_plan(
+                state,
+                store,
+                token=None,
+                plan=RecoveryPlan(
+                    abandoned_rooms={gap.room_id: abandonment},
+                ),
+            )
         finish_args = (
             gap.room_id,
             gap.generation,
             event.event_id if event else None,
             was_encrypted,
         )
-        if abandonment is None:
-            store.finish_recovery(*finish_args)
-        else:
-            store.finish_recovery(*finish_args, abandonment)
+        store.finish_recovery(*finish_args)
     if abandonment is not None:
         state.outcomes[gap.room_id] = False
         state.abandoned[gap.room_id] = _union_abandonment_reasons(

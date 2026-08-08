@@ -417,6 +417,8 @@ class InlineStore:
         self.thread_ids: list[int] = []
         self.finished: list[tuple[str, int, str | None, bool]] = []
         self.accepted: list[tuple[str, int, str]] = []
+        self.saved_abandoned_rooms: list[tuple[str, ...]] = []
+        self.actions: list[str] = []
 
     def save_recovery(
         self,
@@ -430,10 +432,13 @@ class InlineStore:
         _abandoned_rooms=None,
     ):
         self.thread_ids.append(threading.get_ident())
+        self.saved_abandoned_rooms.append(tuple(_abandoned_rooms or ()))
+        self.actions.append("save")
 
     def finish_recovery(self, room_id, generation, event_id, was_encrypted):
         self.thread_ids.append(threading.get_ident())
         self.finished.append((room_id, generation, event_id, was_encrypted))
+        self.actions.append("finish")
 
     def accept_recovery_event(self, room_id, generation, event_id):
         self.thread_ids.append(threading.get_ident())
@@ -965,16 +970,24 @@ async def test_corrupt_real_gap_event_is_sticky_abandonment():
     async def unused_dispatch(*args):
         raise AssertionError("corrupt event must not dispatch")
 
+    store = InlineStore()
+
     await pump_recovery(
         state,
         user_id="@me:example.org",
         options=RecoveryOptions(1, 10, 10, 10),
         fetch_messages=unused_fetch,
         dispatch_event=unused_dispatch,
-        store=None,
+        store=store,
     )
 
     assert ROOM not in state.gaps
+    assert store.saved_abandoned_rooms == [(ROOM,)]
+    assert store.finished == [
+        (ROOM, 1, "$bad", True),
+        (ROOM, 1, None, False),
+    ]
+    assert store.actions == ["save", "finish", "finish"]
     expected = {ROOM: frozenset({sync_recovery.RecoveryAbandonment.CORRUPT_EVENT})}
     assert take_recovery_outcomes(state) == (
         frozenset(),

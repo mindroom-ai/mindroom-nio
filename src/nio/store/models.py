@@ -251,7 +251,7 @@ class SyncRecoveryAbandonedRooms(Model):
     )
 
     class Meta:
-        constraints = [SQL("UNIQUE(account_id,room_id)")]
+        constraints = [SQL("UNIQUE(account_id,room_id,reason)")]
 
 
 class PendingTimelineEvents(Model):
