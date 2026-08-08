@@ -168,6 +168,38 @@ class UndeclaredAtomicStore(SqliteStore):
         return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
 
 
+class LegacyRecoveryStore(UndeclaredAtomicStore):
+    """A non-atomic custom store implementing the released eight-argument API."""
+
+    def save_recovery(
+        self,
+        token,
+        clear_rooms,
+        gaps,
+        events,
+        clear_recovered,
+        window_tokens=None,
+        forgotten_rooms=(),
+        abandoned_rooms=(),
+    ):
+        return super().save_recovery(
+            token,
+            clear_rooms,
+            gaps,
+            events,
+            clear_recovered,
+            window_tokens,
+            forgotten_rooms,
+            abandoned_rooms,
+        )
+
+
+class LegacyAtomicRecoveryStore(LegacyRecoveryStore):
+    """An atomic custom store still using the released save signature."""
+
+    supports_atomic_recovery = True
+
+
 class QueueStore(SqliteStore):
     """A real-file queued store whose multi-statement writes are not atomic."""
 
@@ -591,6 +623,99 @@ class TestPerRoomRecoveryContract:
             assert client._recovery.gaps == {}
             assert client._recovery.abandoned == {}
             assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
+    )
+    @pytest.mark.parametrize("synthetic_gap", [False, True])
+    @pytest.mark.parametrize(
+        "store_class",
+        [LegacyRecoveryStore, LegacyAtomicRecoveryStore],
+    )
+    async def test_legacy_store_allows_disabled_reset_without_a_real_gap(
+        self,
+        tempdir,
+        response,
+        synthetic_gap,
+        store_class,
+    ):
+        """Ordinary leave/forget stays available when no real gap is at risk."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=store_class),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return response
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            assert not client.config.backfill_limited_timelines
+            if synthetic_gap:
+                gap = RecoveryGap(ROOM_A, 1, "", None)
+                client.store.save_recovery(None, set(), [gap], [], None)
+
+            result = await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert result is response
+            assert network_called
+            assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
+    )
+    async def test_non_atomic_store_rejects_disabled_reset_with_a_persisted_gap(
+        self,
+        tempdir,
+        response,
+    ):
+        """A store-only real gap still requires atomic loss recording."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyRecoveryStore),
+        )
+        network_called = False
+
+        async def send_request():
+            nonlocal network_called
+            network_called = True
+            return response
+
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            gap = RecoveryGap(ROOM_A, 1, "target", "cursor")
+            client.store.save_recovery(None, set(), [gap], [], None)
+
+            with pytest.raises(LocalProtocolError, match="atomic recovery"):
+                await client._run_room_membership_reset(ROOM_A, send_request)
+
+            assert not network_called
+            gaps, _, abandoned = client.store.load_sync_recovery()
+            assert [(item.room_id, item.target_token) for item in gaps] == [
+                (ROOM_A, "target")
+            ]
+            assert abandoned == {}
         finally:
             await client.close()
             if client.store:

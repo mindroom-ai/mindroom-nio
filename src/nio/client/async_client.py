@@ -1968,9 +1968,13 @@ class AsyncClient(Client):
     ) -> _RoomMembershipResponseT:
         """Run the network request first, then atomically apply a success."""
         recovery_store = self._recovery_store
-        reset_store = (
-            recovery_store if self.config.backfill_limited_timelines else self.store
-        )
+        reset_store = recovery_store
+        if (
+            not self.config.backfill_limited_timelines
+            and self.store
+            and self.store.has_real_recovery_gap(room_id)
+        ):
+            reset_store = self.store
         if reset_store:
             self._require_atomic_recovery_store(reset_store)
         callback_scope = self._event_callback_scope.get()
@@ -1997,13 +2001,24 @@ class AsyncClient(Client):
             # Recovery state is not loaded in this mode, but a prior run may
             # have left a real gap in the store. The structural cause lets the
             # store detect and record that loss in the clearing transaction.
+            store = self.store
+            has_real_gap = bool(store and store.has_real_recovery_gap(room_id))
+            if has_real_gap and store and not store.supports_atomic_recovery:
+                # Recheck after the network request. A recovery-disabled client
+                # cannot create this row itself, but failing here is safer than
+                # silently clearing work written by another store owner.
+                self._require_atomic_recovery_store(store)
             persist_response_plan(
                 self._recovery,
-                self.store,
+                store,
                 token=None,
                 plan=RecoveryPlan(
                     clear_rooms=frozenset({room_id}),
-                    clear_room_reasons={room_id: RecoveryAbandonment.BASELINE_LOST},
+                    clear_room_reasons=(
+                        {room_id: RecoveryAbandonment.BASELINE_LOST}
+                        if has_real_gap
+                        else {}
+                    ),
                 ),
                 forgotten_rooms=(room_id,),
             )

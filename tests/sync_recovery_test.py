@@ -145,6 +145,14 @@ def test_loaded_recovery_keeps_page_chronology_across_live_boundary():
     ]
 
 
+def test_loaded_legacy_abandoned_room_ids_become_unknown():
+    state = RecoveryState()
+
+    sync_recovery.load_recovery_state(state, (), (), [ROOM])
+
+    assert state.abandoned == {ROOM: sync_recovery.RecoveryAbandonment.UNKNOWN}
+
+
 def test_no_id_keys_are_scoped_to_the_sliding_connection():
     state = RecoveryState()
     bad = Event.parse_event({"type": "broken"})

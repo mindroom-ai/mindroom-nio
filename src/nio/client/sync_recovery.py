@@ -1137,14 +1137,19 @@ def load_recovery_state(
     state: RecoveryState,
     gaps: Iterable[Any],
     events: Iterable[Any],
-    abandoned: Mapping[str, RecoveryAbandonment] | None = None,
+    abandoned: Mapping[str, RecoveryAbandonment] | Iterable[str] | None = None,
 ) -> None:
     state.gaps.clear()
     state.events.clear()
     state.completed.clear()
     state.outcomes.clear()
     state.abandoned.clear()
-    state.abandoned.update(abandoned or {})
+    if isinstance(abandoned, Mapping):
+        state.abandoned.update(abandoned)
+    else:
+        state.abandoned.update(
+            dict.fromkeys(abandoned or (), RecoveryAbandonment.UNKNOWN)
+        )
     for row in gaps:
         gap = RecoveryGap(
             row.room_id,

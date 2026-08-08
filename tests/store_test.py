@@ -1289,6 +1289,55 @@ class TestClass:
             TEST_ROOM: RecoveryAbandonment.UNKNOWN
         }
 
+    def test_v9_store_marks_an_ambiguous_terminal_gap_as_unknown(self, sqlstore):
+        """A pre-v10 terminal real gap cannot be assumed to have continuity.
+
+        V9 could persist an unbound exhausted walk with no cursor and no
+        abandonment row, then crash before draining it. Nothing in that state
+        distinguishes proven continuity from an unverified stop, so the
+        migration must preserve the ambiguity instead of later reporting the
+        room as recovered.
+        """
+        gap = RecoveryGap(TEST_ROOM, 1, "target", None)
+        sqlstore.save_recovery(None, set(), [gap], [], None)
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(f'ALTER TABLE "{table}" DROP COLUMN reason')
+            sqlstore._update_version(9)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        gaps, _, abandoned = reopened.load_sync_recovery()
+        assert [
+            (item.room_id, item.target_token, item.cursor_token) for item in gaps
+        ] == [(TEST_ROOM, "target", None)]
+        assert abandoned == {TEST_ROOM: RecoveryAbandonment.UNKNOWN}
+
+    def test_v9_store_keeps_bounded_terminal_continuity_recovered(self, sqlstore):
+        """Membership-bounded exhaustion already proved the terminal walk."""
+        gap = RecoveryGap(TEST_ROOM, 1, "target", None, membership_bound=True)
+        sqlstore.save_recovery(None, set(), [gap], [], None)
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.execute_sql(f'ALTER TABLE "{table}" DROP COLUMN reason')
+            sqlstore._update_version(9)
+
+        reopened = SqliteStore(
+            sqlstore.user_id,
+            sqlstore.device_id,
+            sqlstore.store_path,
+        )
+
+        gaps, _, abandoned = reopened.load_sync_recovery()
+        assert [(item.room_id, item.membership_bound) for item in gaps] == [
+            (TEST_ROOM, True)
+        ]
+        assert abandoned == {}
+
     def test_v7_recovery_upgrade_rollback_preserves_state(self, sqlstore, monkeypatch):
         seed_v5_recovery_state(sqlstore)
         sqlstore.upgrade_to_v6()

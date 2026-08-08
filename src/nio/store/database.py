@@ -263,6 +263,7 @@ class MatrixStore:
     @use_database_atomic
     def upgrade_to_v10(self):
         table = SyncRecoveryAbandonedRooms._meta.table_name
+        gaps_table = SyncRecoveryGaps._meta.table_name
         columns = {
             row[1]
             for row in self.database.execute_sql(
@@ -279,6 +280,19 @@ class MatrixStore:
                 f'ALTER TABLE "{table}" '
                 f"ADD COLUMN reason TEXT NOT NULL DEFAULT '{default}'"
             )
+        # V9 could persist an unbound exhausted real gap with no cursor and no
+        # abandonment row, then crash before draining it. A membership-bounded
+        # terminal gap already proved continuity; an unbounded one carries no
+        # durable proof, so preserve its ambiguity rather than letting startup
+        # later report the room as recovered.
+        self.database.execute_sql(
+            f'INSERT OR IGNORE INTO "{table}" '
+            '("room_id", "reason", "account_id") '
+            f'SELECT "room_id", ?, "account_id" FROM "{gaps_table}" '
+            'WHERE "target_token" != ? AND "cursor_token" IS NULL '
+            'AND "membership_bound" = 0',
+            (RecoveryAbandonment.UNKNOWN.value, ""),
+        )
         self._update_version(10)
 
     def __post_init__(self):
@@ -1068,6 +1082,22 @@ class MatrixStore:
                 )
             )
         return gaps, events, abandoned
+
+    @use_database
+    def has_real_recovery_gap(self, room_id: str) -> bool:
+        """Return whether this room has persisted, non-synthetic recovery work."""
+        account = self._get_account()
+        if not account:
+            return False
+        return (
+            SyncRecoveryGaps.select()
+            .where(
+                SyncRecoveryGaps.account == account,
+                SyncRecoveryGaps.room_id == room_id,
+                SyncRecoveryGaps.target_token != "",
+            )
+            .exists()
+        )
 
     @use_database_atomic
     def accept_recovery_event(

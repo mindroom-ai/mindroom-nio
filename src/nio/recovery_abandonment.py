@@ -54,7 +54,7 @@ class RecoveryAbandonment(str, Enum):
         """How little an application may assume recovery is still possible.
 
         This is deliberately *not* a scale of how much nio claims to know.
-        ``UNKNOWN`` asserts nothing at all, yet outranks three reasons that each
+        ``UNKNOWN`` asserts nothing at all, yet outranks four reasons that each
         assert something, because a reason is only ever replaced by one that
         permits the application to assume less.
 
