@@ -215,7 +215,7 @@ def test_received_ancillary_event_stays_after_a_recovered_only_prefix():
     ]
 
 
-def test_classic_initial_own_join_clears_stale_recovery():
+def test_classic_initial_own_join_names_stale_real_gap_as_baseline_lost():
     state = RecoveryState(
         gaps={ROOM: [RecoveryGap(ROOM, 1, "target", "cursor")]},
         events={(ROOM, 1): [pending("$live-old", 0)]},
@@ -232,7 +232,9 @@ def test_classic_initial_own_join_clears_stale_recovery():
     )
 
     assert plan.clear_rooms == frozenset({ROOM})
-    assert plan.abandoned_rooms == {}
+    assert plan.abandoned_rooms == {
+        ROOM: sync_recovery.RecoveryAbandonment.BASELINE_LOST
+    }
 
 
 def test_membership_reset_names_the_real_gap_loss_in_the_plan():

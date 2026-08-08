@@ -912,6 +912,15 @@ def plan_room_timeline(
         frozenset({room_id}) if clear else frozenset(),
         (gap,) if gap else (),
         tuple(events),
+        abandoned_rooms=(
+            cleared_gap_abandonment(
+                state,
+                (room_id,),
+                RecoveryAbandonment.BASELINE_LOST,
+            )
+            if clear
+            else {}
+        ),
     )
 
 
