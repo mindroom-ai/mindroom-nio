@@ -1287,7 +1287,7 @@ def persist_response_plan(
                 plan.clear_recovered,
                 window_tokens,
                 forgotten_rooms,
-                tuple(dict.fromkeys((*plan.abandoned_rooms, *plan.clear_room_reasons))),
+                tuple(plan.abandoned_rooms),
             )
             if getattr(store, "supports_recovery_abandonment_reasons", False):
                 store.save_recovery(

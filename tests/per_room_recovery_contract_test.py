@@ -737,6 +737,7 @@ class TestPerRoomRecoveryContract:
         "response",
         [RoomLeaveResponse(), RoomForgetResponse(ROOM_A)],
     )
+    @pytest.mark.expects_anonymous_recovery_clear
     async def test_legacy_atomic_store_receives_released_call_shapes_after_reset(
         self,
         tempdir,
@@ -775,6 +776,88 @@ class TestPerRoomRecoveryContract:
             gaps, _, abandoned = client.store.load_sync_recovery()
             assert gaps == []
             assert abandoned == {ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})}
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_legacy_atomic_store_ignores_gap_free_structural_candidate(
+        self,
+        tempdir,
+    ):
+        """A structural reason is not itself an actual abandoned room."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyAtomicRecoveryStore),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({ROOM_A}),
+                    clear_room_reasons={
+                        ROOM_A: RecoveryAbandonment.BASELINE_LOST,
+                    },
+                ),
+            )
+
+            assert client._recovery.abandoned == {}
+            assert client.store.load_sync_recovery() == ([], [], {})
+        finally:
+            await client.close()
+            if client.store:
+                client.store.database.close()
+
+    async def test_legacy_atomic_store_receives_materialized_real_gap_abandonment(
+        self,
+        tempdir,
+    ):
+        """A real in-memory gap still becomes an eighth-argument room ID."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=LegacyAtomicRecoveryStore),
+        )
+        try:
+            await client.receive_response(LoginResponse.from_dict(LOGIN))
+            assert client.store
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    gaps=(RecoveryGap(ROOM_A, 1, "target", "cursor"),),
+                ),
+            )
+
+            persist_response_plan(
+                client._recovery,
+                client.store,
+                token=None,
+                plan=RecoveryPlan(
+                    clear_rooms=frozenset({ROOM_A}),
+                    clear_room_reasons={
+                        ROOM_A: RecoveryAbandonment.BASELINE_LOST,
+                    },
+                ),
+            )
+
+            assert client._recovery.abandoned == {
+                ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+            }
+            assert client.store.load_sync_recovery()[2] == {
+                ROOM_A: frozenset({RecoveryAbandonment.UNKNOWN})
+            }
         finally:
             await client.close()
             if client.store:
