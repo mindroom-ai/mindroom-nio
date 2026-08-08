@@ -710,6 +710,7 @@ class AsyncClient(Client):
         self._closing = False
 
         self._sync_response_lock = asyncio.Lock()
+        self._classic_sync_state_operation_lock = asyncio.Lock()
         self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
             f"nio_sync_request_generation_{id(self)}", default=None
         )
@@ -928,53 +929,54 @@ class AsyncClient(Client):
         self._stop_sync_forever = False
 
         async def reset() -> None:
-            async with self._sync_response_lock:
-                try:
-                    await drain_recovery_dispatches(self._recovery)
-                finally:
-                    acquired: list[asyncio.Lock] = []
-                    acquired_room_ids: set[str] = set()
+            async with self._classic_sync_state_operation_lock:
+                async with self._sync_response_lock:
                     try:
-                        # Gate interning is synchronous. Re-snapshot after each
-                        # awaited acquisition until no racing room operation
-                        # owns or waits on an unseen gate.
-                        while True:
-                            pending_room_ids = sorted(
-                                set(self._recovery_room_gates) - acquired_room_ids
-                            )
-                            if not pending_room_ids:
-                                break
-                            for room_id in pending_room_ids:
-                                gate = self._recovery_room_gates[room_id]
-                                await gate.acquire()
-                                acquired.append(gate)
-                                acquired_room_ids.add(room_id)
-
-                        preserved_abandonment = dict(
-                            self._classic_sync_abandonment_before_staged_response
-                            if self._classic_sync_state_staged
-                            else self._recovery.abandoned
-                        )
-                        self._recovery = RecoveryState(
-                            abandoned=preserved_abandonment,
-                            max_held_events=self.config.backfill_max_events,
-                        )
-                        self._sliding_room_prev_batch.clear()
-                        self._pending_sliding_room_account_data.clear()
-                        self._sliding_sync_to_device_since = None
-                        self.loaded_sync_token = ""
-                        self.next_batch = ""
-                        self.rooms.clear()
-                        self.invited_rooms.clear()
-                        self._classic_sync_rebuild_pending = True
-                        self._classic_sync_state_staged = False
-                        self._classic_sync_acknowledgeable_token = None
-                        self._classic_sync_abandonment_before_staged_response = dict(
-                            preserved_abandonment
-                        )
+                        await drain_recovery_dispatches(self._recovery)
                     finally:
-                        for gate in reversed(acquired):
-                            gate.release()
+                        acquired: list[asyncio.Lock] = []
+                        acquired_room_ids: set[str] = set()
+                        try:
+                            # Gate interning is synchronous. Re-snapshot after each
+                            # awaited acquisition until no racing room operation
+                            # owns or waits on an unseen gate.
+                            while True:
+                                pending_room_ids = sorted(
+                                    set(self._recovery_room_gates) - acquired_room_ids
+                                )
+                                if not pending_room_ids:
+                                    break
+                                for room_id in pending_room_ids:
+                                    gate = self._recovery_room_gates[room_id]
+                                    await gate.acquire()
+                                    acquired.append(gate)
+                                    acquired_room_ids.add(room_id)
+
+                            preserved_abandonment = dict(
+                                self._classic_sync_abandonment_before_staged_response
+                                if self._classic_sync_state_staged
+                                else self._recovery.abandoned
+                            )
+                            self._recovery = RecoveryState(
+                                abandoned=preserved_abandonment,
+                                max_held_events=self.config.backfill_max_events,
+                            )
+                            self._sliding_room_prev_batch.clear()
+                            self._pending_sliding_room_account_data.clear()
+                            self._sliding_sync_to_device_since = None
+                            self.loaded_sync_token = ""
+                            self.next_batch = ""
+                            self.rooms.clear()
+                            self.invited_rooms.clear()
+                            self._classic_sync_rebuild_pending = True
+                            self._classic_sync_state_staged = False
+                            self._classic_sync_acknowledgeable_token = None
+                            self._classic_sync_abandonment_before_staged_response = (
+                                dict(preserved_abandonment)
+                            )
+                        finally:
+                            for gate in reversed(acquired):
+                                gate.release()
 
         await _run_to_completion(reset())
 
@@ -1986,14 +1988,28 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Room membership changes cannot run from an event callback."
             )
-        response = await send_request()
-        if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
+
+        async def reset_after_response() -> _RoomMembershipResponseT:
+            response = await send_request()
+            if not isinstance(response, (RoomLeaveResponse, RoomForgetResponse)):
+                return response
+
+            if self.config.backfill_limited_timelines:
+                mark_room_reset(self._sync_reset_fence, room_id)
+            await _run_to_completion(self._apply_room_membership_reset(room_id))
             return response
 
-        if self.config.backfill_limited_timelines:
-            mark_room_reset(self._sync_reset_fence, room_id)
-        await _run_to_completion(self._apply_room_membership_reset(room_id))
-        return response
+        if (
+            self.config.backfill_limited_timelines
+            and not self._recovery_persistence_enabled
+        ):
+
+            async def serialized_reset() -> _RoomMembershipResponseT:
+                async with self._classic_sync_state_operation_lock:
+                    return await reset_after_response()
+
+            return await serialized_reset()
+        return await reset_after_response()
 
     async def _apply_room_membership_reset(self, room_id: str) -> None:
         """Clear every room-local recovery artifact after server success."""

@@ -656,6 +656,156 @@ class TestRoomLocalRecovery:
         await client.close()
 
     @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_waits_for_inflight_membership_reset(
+        self, tempdir, monkeypatch, operation
+    ):
+        """Reset cannot erase a staged gap while a departure is awaiting success."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(response_class, *_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            if response_class is RoomForgetResponse:
+                return RoomForgetResponse.from_dict({}, ROOM_A)
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+        reset_waited_for_send = not reset.done()
+
+        release_send.set()
+        await membership_reset
+        await reset
+
+        assert reset_waited_for_send
+        assert client._recovery.abandoned == {
+            ROOM_A: frozenset({RecoveryAbandonment.BASELINE_LOST})
+        }
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_reset_classic_sync_state_discards_gap_after_rejected_membership_reset(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A failed departure releases reset without recording baseline loss."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_max_pages=0,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        client.next_batch = "s0"
+        await client.receive_response(
+            sync_response(
+                "s1",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 2)], limited=True, prev_batch="p1"
+                    )
+                },
+            )
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(response_class, *_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            error = {"errcode": "M_FORBIDDEN", "error": "rejected"}
+            if response_class is RoomForgetResponse:
+                return RoomForgetError.from_dict(error, ROOM_A)
+            return RoomLeaveError.from_dict(error)
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        reset = asyncio.create_task(client.reset_classic_sync_state())
+        await asyncio.sleep(0)
+        reset_waited_for_response = not reset.done()
+
+        release_send.set()
+        result = await membership_reset
+        await reset
+
+        assert reset_waited_for_response
+        assert isinstance(result, (RoomLeaveError, RoomForgetError))
+        assert client._recovery.abandoned == {}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
+    async def test_application_owned_membership_reset_cancels_pending_transport(
+        self, tempdir, monkeypatch, operation
+    ):
+        """A reset lock must not turn a pending membership request unkillable."""
+        client = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(
+                backfill_limited_timelines=True,
+                backfill_persist_recovery=False,
+                store_sync_tokens=False,
+            ),
+        )
+        await client.receive_response(LoginResponse.from_dict(LOGIN))
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return RoomLeaveResponse.from_dict({})
+
+        monkeypatch.setattr(client, "_send", send)
+        membership_reset = asyncio.create_task(getattr(client, operation)(ROOM_A))
+        await send_started.wait()
+        membership_reset.cancel()
+        done, _ = await asyncio.wait((membership_reset,), timeout=0.05)
+
+        release_send.set()
+        with pytest.raises(asyncio.CancelledError):
+            await membership_reset
+
+        assert done == {membership_reset}
+        await client.close()
+
+    @pytest.mark.parametrize("operation", ["room_leave", "room_forget"])
     async def test_reset_classic_sync_state_discards_staged_only_abandonment_after_membership_change(
         self, tempdir, monkeypatch, operation
     ):
