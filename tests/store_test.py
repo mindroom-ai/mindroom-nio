@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from helpers import faker
 from peewee import SqliteDatabase
+from playhouse.sqliteq import SqliteQueueDatabase
 
 from nio import RecoveryAbandonment, TimelineEventProvenance
 from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
@@ -19,7 +20,7 @@ from nio.crypto import (
     OutgoingKeyRequest,
     TrustState,
 )
-from nio.exceptions import OlmTrustError
+from nio.exceptions import LocalProtocolError, OlmTrustError
 from nio.sliding_sync_tokens import SlidingWindowToken
 from nio.store import (
     DefaultStore,
@@ -140,6 +141,31 @@ class UndeclaredAtomicStore(SqliteStore):
 
     def _create_database(self):
         return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
+class CopyFailingQueueDatabase(SqliteQueueDatabase):
+    """Expose whether a queued migration reached its destructive copy step."""
+
+    copy_attempted = False
+
+    def execute_sql(self, sql, *args, **kwargs):
+        if "_legacy_v10" in sql and sql.startswith("INSERT OR IGNORE INTO"):
+            type(self).copy_attempted = True
+            raise RuntimeError("copy failed")
+        return super().execute_sql(sql, *args, **kwargs)
+
+
+class CopyFailingQueueStore(SqliteStore):
+    database_instance = None
+
+    def _create_database(self):
+        database = CopyFailingQueueDatabase(
+            self.database_path,
+            pragmas={"foreign_keys": 1, "journal_mode": "wal"},
+            autostart=True,
+        )
+        type(self).database_instance = database
+        return database
 
 
 class TestClass:
@@ -1457,7 +1483,7 @@ class TestClass:
                 '"account_id" INTEGER NOT NULL, '
                 'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
                 "ON DELETE CASCADE, "
-                'UNIQUE ("account_id", "room_id"), '
+                'UNIQUE ("room_id", "account_id"), '
                 'UNIQUE ("account_id", "room_id", "reason"))'
             )
             sqlstore.database.execute_sql(
@@ -1493,8 +1519,13 @@ class TestClass:
                 )
                 for index in unique_indexes
             }
-        assert ("account_id", "room_id", "reason") in unique_columns
-        assert ("account_id", "room_id") not in unique_columns
+        assert frozenset({"account_id", "room_id", "reason"}) in {
+            frozenset(columns) for columns in unique_columns
+        }
+        assert not any(
+            frozenset(columns) <= frozenset({"account_id", "room_id"})
+            for columns in unique_columns
+        )
 
         reopened.save_recovery(
             None,
@@ -1514,6 +1545,68 @@ class TestClass:
                 }
             )
         }
+
+    def test_queue_store_refuses_old_shape_before_destructive_migration(self, sqlstore):
+        table = SyncRecoveryAbandonedRooms._meta.table_name
+        account = sqlstore._get_account()
+        assert account
+        with sqlstore.database.bind_ctx(sqlstore.models):
+            sqlstore.database.drop_tables([SyncRecoveryAbandonedRooms])
+            sqlstore.database.execute_sql(
+                f'CREATE TABLE "{table}" ('
+                '"id" INTEGER NOT NULL PRIMARY KEY, '
+                '"room_id" TEXT NOT NULL, '
+                '"reason" TEXT NOT NULL, '
+                '"account_id" INTEGER NOT NULL, '
+                'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+                "ON DELETE CASCADE, "
+                'UNIQUE ("account_id", "room_id"))'
+            )
+            sqlstore.database.execute_sql(
+                f'INSERT INTO "{table}" ("room_id", "reason", "account_id") '
+                "VALUES (?, ?, ?)",
+                (TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value, account.id),
+            )
+        database_path = sqlstore.database_path
+        sqlstore.database.close()
+        CopyFailingQueueDatabase.copy_attempted = False
+        CopyFailingQueueStore.database_instance = None
+
+        try:
+            with pytest.raises(
+                LocalProtocolError,
+                match="reopen it once with SqliteStore",
+            ):
+                CopyFailingQueueStore(
+                    sqlstore.user_id,
+                    sqlstore.device_id,
+                    sqlstore.store_path,
+                )
+        finally:
+            database = CopyFailingQueueStore.database_instance
+            if database is not None:
+                if not database.is_stopped():
+                    database.stop()
+                if not database.is_closed():
+                    database.close()
+
+        assert not CopyFailingQueueDatabase.copy_attempted
+        database = CopyFailingQueueStore.database_instance
+        assert database is not None
+        assert database.is_stopped()
+        assert database.is_closed()
+        with sqlite3.connect(database_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            rows = connection.execute(
+                f'SELECT room_id, reason FROM "{table}"'
+            ).fetchall()
+        assert f"{table}_legacy_v10" not in tables
+        assert rows == [(TEST_ROOM, RecoveryAbandonment.EVENT_LIMIT.value)]
 
     def test_unknown_stored_reason_string_loads_as_unknown(self, sqlstore):
         table = SyncRecoveryAbandonedRooms._meta.table_name

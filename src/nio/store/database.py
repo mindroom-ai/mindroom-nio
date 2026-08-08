@@ -36,6 +36,7 @@ from ..crypto import (
     TrustState,
 )
 from ..event_provenance import TimelineEventProvenance
+from ..exceptions import LocalProtocolError
 from ..recovery_abandonment import (
     RecoveryAbandonment,
     normalize_abandonment_reasons,
@@ -277,29 +278,39 @@ class MatrixStore:
             ).fetchall()
         }
         unique_indexes = [
-            row[1]
+            row
             for row in self.database.execute_sql(
                 f'PRAGMA index_list("{table}")'
             ).fetchall()
             if row[2]
         ]
-        unique_columns = {
+        unique_columns = [
             tuple(
                 column[2]
                 for column in self.database.execute_sql(
-                    f'PRAGMA index_info("{index}")'
+                    f'PRAGMA index_info("{index[1]}")'
                 ).fetchall()
             )
             for index in unique_indexes
-        }
-        expected = ("account_id", "room_id", "reason")
-        legacy = ("account_id", "room_id")
+        ]
+        expected = frozenset({"account_id", "room_id", "reason"})
         if (
             "reason" in columns
-            and expected in unique_columns
-            and legacy not in unique_columns
+            and len(unique_indexes) == 1
+            and not unique_indexes[0][4]
+            and frozenset(unique_columns[0]) == expected
         ):
             return False
+        if isinstance(self.database, SqliteQueueDatabase):
+            if not self.database.is_stopped():
+                self.database.stop()
+            if not self.database.is_closed():
+                self.database.close()
+            raise LocalProtocolError(
+                "Queued SQLite store cannot safely rebuild the recovery "
+                "abandonment schema; reopen it once with SqliteStore to "
+                "complete the migration."
+            )
 
         legacy_table = f"{table}_legacy_v10"
         self.database.execute_sql(f'DROP TABLE IF EXISTS "{legacy_table}"')
