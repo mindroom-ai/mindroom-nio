@@ -53,7 +53,8 @@ SLIDING_SOURCE = SlidingSourceConfig(
 )
 OWN_USER_ID = "@alice:example.org"
 CRASH_EXIT_CODE = 86
-LIST_FRAMES_SQL = (
+FRAME_CLASSIFICATION_LIMIT = 257
+CLASSIFY_FRAMES_SQL = (
     "SELECT * FROM NioIngestFrame WHERE account_id = ? "
     "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?"
 )
@@ -951,32 +952,116 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
         bootstrap.close()
 
 
+UUID_ALIAS_SPELLINGS = (
+    "hex",
+    "upper_canonical",
+    "upper_hex",
+    "braced_canonical",
+    "braced_hex",
+    "braced_upper_canonical",
+    "braced_upper_hex",
+    "urn_uuid_canonical",
+    "urn_uuid_hex",
+    "urn_uuid_upper_canonical",
+    "urn_uuid_upper_hex",
+    "urn_uuid_braced_canonical",
+    "urn_uuid_braced_hex",
+    "urn_uuid_braced_upper_canonical",
+    "urn_uuid_braced_upper_hex",
+    "uuid_canonical",
+    "uuid_hex",
+    "uuid_upper_canonical",
+    "uuid_upper_hex",
+    "urn_canonical",
+    "urn_hex",
+    "urn_upper_canonical",
+    "urn_upper_hex",
+    "partial_hyphens",
+    "arbitrary_hyphens",
+    "repeated_braces",
+    "embedded_prefixes",
+)
+
+
+def _uuid_alias(value: UUID, spelling: str) -> str:
+    canonical = str(value)
+    hex_value = value.hex
+    aliases = {
+        "hex": hex_value,
+        "upper_canonical": canonical.upper(),
+        "upper_hex": hex_value.upper(),
+        "braced_canonical": f"{{{canonical}}}",
+        "braced_hex": f"{{{hex_value}}}",
+        "braced_upper_canonical": f"{{{canonical.upper()}}}",
+        "braced_upper_hex": f"{{{hex_value.upper()}}}",
+        "urn_uuid_canonical": f"urn:uuid:{canonical}",
+        "urn_uuid_hex": f"urn:uuid:{hex_value}",
+        "urn_uuid_upper_canonical": f"urn:uuid:{canonical.upper()}",
+        "urn_uuid_upper_hex": f"urn:uuid:{hex_value.upper()}",
+        "urn_uuid_braced_canonical": f"urn:uuid:{{{canonical}}}",
+        "urn_uuid_braced_hex": f"urn:uuid:{{{hex_value}}}",
+        "urn_uuid_braced_upper_canonical": f"urn:uuid:{{{canonical.upper()}}}",
+        "urn_uuid_braced_upper_hex": f"urn:uuid:{{{hex_value.upper()}}}",
+        "uuid_canonical": f"uuid:{canonical}",
+        "uuid_hex": f"uuid:{hex_value}",
+        "uuid_upper_canonical": f"uuid:{canonical.upper()}",
+        "uuid_upper_hex": f"uuid:{hex_value.upper()}",
+        "urn_canonical": f"urn:{canonical}",
+        "urn_hex": f"urn:{hex_value}",
+        "urn_upper_canonical": f"urn:{canonical.upper()}",
+        "urn_upper_hex": f"urn:{hex_value.upper()}",
+        "partial_hyphens": canonical.replace("-", "", 1),
+        "arbitrary_hyphens": "-".join(
+            hex_value[index : index + 4] for index in range(0, 32, 4)
+        ),
+        "repeated_braces": f"{{{{{canonical}}}}}",
+        "embedded_prefixes": (
+            f"{hex_value[:8]}urn:{hex_value[8:16]}uuid:{hex_value[16:]}"
+        ),
+    }
+    return aliases[spelling]
+
+
+def _mutate_frame_id(
+    database_path: Path,
+    frame_id: UUID,
+    alias: str,
+    mutation: str,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        if mutation == "rename":
+            connection.execute(
+                "UPDATE NioIngestFrame SET frame_id = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (alias, ACCOUNT_ID, str(frame_id)),
+            )
+            return
+        connection.execute(
+            "INSERT INTO NioIngestFrame ("
+            "account_id, frame_id, source_epoch, request_id, staged_revision, "
+            "payload_ciphertext, payload_sha256) "
+            "SELECT account_id, ?, source_epoch, request_id, staged_revision, "
+            "payload_ciphertext, payload_sha256 FROM NioIngestFrame "
+            "WHERE account_id = ? AND frame_id = ?",
+            (alias, ACCOUNT_ID, str(frame_id)),
+        )
+
+
+@pytest.mark.parametrize("spelling", UUID_ALIAS_SPELLINGS)
 @pytest.mark.parametrize("mutation", ("rename", "copy"))
 @pytest.mark.parametrize("reader", ("load", "list"))
-def test_noncanonical_frame_id_alias_fails_stopped_for_every_read_path(
+def test_every_python_uuid_alias_fails_stopped_for_every_frame_read(
     tmp_path: Path,
+    spelling: str,
     mutation: str,
     reader: str,
 ) -> None:
     stage = _stage_one(tmp_path)
     frame_id = stage.proposal.frame.frame_id
-    with sqlite3.connect(stage.database_path) as connection:
-        if mutation == "rename":
-            connection.execute(
-                "UPDATE NioIngestFrame SET frame_id = ? "
-                "WHERE account_id = ? AND frame_id = ?",
-                (frame_id.hex, ACCOUNT_ID, str(frame_id)),
-            )
-        else:
-            connection.execute(
-                "INSERT INTO NioIngestFrame ("
-                "account_id, frame_id, source_epoch, request_id, staged_revision, "
-                "payload_ciphertext, payload_sha256) "
-                "SELECT account_id, ?, source_epoch, request_id, staged_revision, "
-                "payload_ciphertext, payload_sha256 FROM NioIngestFrame "
-                "WHERE account_id = ? AND frame_id = ?",
-                (frame_id.hex, ACCOUNT_ID, str(frame_id)),
-            )
+    alias = _uuid_alias(frame_id, spelling)
+    assert alias != str(frame_id)
+    assert UUID(alias) == frame_id
+    _mutate_frame_id(stage.database_path, frame_id, alias, mutation)
 
     reopened = _open(tmp_path)
     try:
@@ -985,6 +1070,54 @@ def test_noncanonical_frame_id_alias_fails_stopped_for_every_read_path(
                 reopened._journal.load_frame(frame_id)
             else:
                 reopened._journal.list_frames(256)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("reader", ("load", "list"))
+def test_invalid_raw_frame_id_fails_stopped_for_every_frame_read(
+    tmp_path: Path,
+    reader: str,
+) -> None:
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    _mutate_frame_id(stage.database_path, frame_id, "not-a-uuid", "rename")
+
+    reopened = _open(tmp_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="frame_id"):
+            if reader == "load":
+                reopened._journal.load_frame(frame_id)
+            else:
+                reopened._journal.list_frames(256)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("mutation", ("rename", "copy"))
+def test_collision_probe_uses_account_frame_identity_classification(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    _mutate_frame_id(
+        stage.database_path,
+        frame_id,
+        f"uuid:{frame_id.hex}",
+        mutation,
+    )
+    statements: list[str] = []
+    reopened = _open(tmp_path, statements=statements)
+    try:
+        statements.clear()
+        with pytest.raises(JournalIntegrityError, match="frame_id"):
+            _stage(
+                reopened._journal,
+                expected_revision=stage.committed.revision,
+                proposal=stage.proposal,
+            )
+        assert _business_dml(statements) == []
     finally:
         reopened.close()
 
@@ -1217,8 +1350,8 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
         selected = [sql for sql in statements if "FROM NioIngestFrame" in sql]
         assert [_normalized_sql(sql) for sql in selected] == [
             _normalized_sql(
-                LIST_FRAMES_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
-                    "?", "256", 1
+                CLASSIFY_FRAMES_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", str(FRAME_CLASSIFICATION_LIMIT), 1
                 )
             )
         ]
@@ -1229,8 +1362,8 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
                 reopened._journal.list_frames(invalid_limit)
         with sqlite3.connect(tmp_path / "journal.db") as connection:
             plan = connection.execute(
-                f"EXPLAIN QUERY PLAN {LIST_FRAMES_SQL}",
-                (ACCOUNT_ID, 256),
+                f"EXPLAIN QUERY PLAN {CLASSIFY_FRAMES_SQL}",
+                (ACCOUNT_ID, FRAME_CLASSIFICATION_LIMIT),
             ).fetchall()
         assert any("NioIngestFrame_drain" in row[3] for row in plan)
     finally:

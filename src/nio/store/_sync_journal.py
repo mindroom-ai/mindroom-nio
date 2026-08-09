@@ -291,12 +291,11 @@ class SqliteIngestionJournal(JournalRows):
                 frame,
             )
 
-            rows = self._frame_rows_for_identity(frame.frame_id)
+            rows = dict(self._classify_frame_rows())
             self._transition_hook("frame_collision_probe")
-            if len(rows) > 1:
-                raise JournalIntegrityError("frame_id has multiple textual identities")
-            if rows:
-                stored = self._decode_frame_row(frame.frame_id, rows[0], owner)
+            row = rows.get(frame.frame_id)
+            if row is not None:
+                stored = self._decode_frame_row(frame.frame_id, row, owner)
                 if stored.response != frame.response or frame.staged_revision not in (
                     0,
                     stored.staged_revision,
