@@ -25,13 +25,9 @@ from nio.ingest import (
     TransportKind,
     canonical_batch_payload,
 )
-from nio.ingest.membership import MembershipBaseline
 from nio.ingest.serialization import (
     _batch_from_payload,
-    _canonical_membership_baseline_payload,
     _canonical_room_snapshot_payload,
-    _membership_baseline_from_payload,
-    _membership_baseline_sha256,
     _origin_from_dict,
     _room_snapshot_from_payload,
     batch_from_records,
@@ -55,26 +51,6 @@ GOLDEN_EVENT_PAYLOAD = (
     b'"source_json":"eyJib2R5IjoiY2Fmw6kifQ==","clear_json":null}]}'
 )
 GOLDEN_EVENT_SHA256 = "9ad8f6afc7fc80f6642aa08446d4217d42fc0fb318d4658ba9a8b6d4d8751748"
-GOLDEN_SYSTEM_EVENT_ID = "3bc7e4ef-92f1-5ef3-8e86-f1e5f7708846"
-GOLDEN_SYSTEM_EVENT_PAYLOAD = (
-    b'{"schema_version":1,"account_id":"@alice:\xe4\xbe\x8b.org","device_id":"DEVICE",'
-    b'"consumer":{"journal_generation":"11111111-1111-1111-1111-111111111111",'
-    b'"consumer_generation":"22222222-2222-2222-2222-222222222222"},'
-    b'"stream_id":"44444444-4444-4444-4444-444444444444","sequence":7,'
-    b'"created_revision":11,"records":[{"record_type":"event",'
-    b'"record_id":"3bc7e4ef-92f1-5ef3-8e86-f1e5f7708846",'
-    b'"kind":"room_lifecycle","origin":{"origin_type":"system",'
-    b'"kind":"membership_change",'
-    b'"operation_id":"33333333-3333-3333-3333-333333333333"},'
-    b'"room_id":"!room:example.org","membership_epoch":1,"room_sequence":5,'
-    b'"event_id":null,"provenance":null,'
-    b'"source_json":"eyJtZW1iZXJzaGlwIjoibGVhdmUifQ==","clear_json":null}]}'
-)
-GOLDEN_SYSTEM_EVENT_SHA256 = (
-    "aab2b88a8de7b8a85f464b50bc1b48d10f004fd1500f6f2f9476e9cf6ce537f1"
-)
-GOLDEN_SYSTEM_BATCH_ID = UUID("a46c2db4-eb09-5144-9d42-814d81eb8b4f")
-
 GOLDEN_ROOM_SNAPSHOT_PAYLOAD = (
     b'{"room_id":"!room:example.org","membership_epoch":3,'
     b'"own_user_id":"@me:example.org","own_membership":"join","encrypted":true,'
@@ -83,13 +59,6 @@ GOLDEN_ROOM_SNAPSHOT_PAYLOAD = (
     b'"power_levels_json":"eyJ1c2VycyI6e319","members":['
     b'{"user_id":"@me:example.org","membership":"join","display_name":"Me",'
     b'"avatar_url":null,"power_level":100}]}'
-)
-GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD = (
-    b'{"room_id":"!room:example.org","source_epoch":4,"membership_epoch":7,'
-    b'"prev_batch":"old-prev","membership_event_id":"$member"}'
-)
-GOLDEN_MEMBERSHIP_BASELINE_SHA256 = (
-    "b062a60936591f6faf40441955d46e7269892d4d7f57aafa6b6e817a525ab198"
 )
 
 
@@ -104,51 +73,6 @@ def event_record(source_json: bytes = b'{"body":"caf\xc3\xa9"}') -> EventRecord:
         "$event",
         TimelineEventProvenance.LIVE,
         source_json,
-        None,
-    )
-
-
-def system_lifecycle_record() -> EventRecord:
-    return EventRecord(
-        GOLDEN_SYSTEM_EVENT_ID,
-        RecordKind.ROOM_LIFECYCLE,
-        SystemOrigin(SystemOriginKind.MEMBERSHIP_CHANGE, OPERATION_ID),
-        "!room:example.org",
-        1,
-        5,
-        None,
-        None,
-        b'{"membership":"leave"}',
-        None,
-    )
-
-
-def hydration_state_record() -> EventRecord:
-    return EventRecord(
-        "a000241c-2af1-5da0-86c6-790f821c4c9d",
-        RecordKind.STATE,
-        SystemOrigin(SystemOriginKind.ROOM_HYDRATION, OPERATION_ID),
-        "!room:example.org",
-        1,
-        5,
-        "$state",
-        None,
-        b'{"type":"m.room.name"}',
-        None,
-    )
-
-
-def room_readiness_record() -> EventRecord:
-    return EventRecord(
-        "0f791901-db7c-58ce-97a2-47c054dc3a6d",
-        RecordKind.ROOM_READINESS,
-        SystemOrigin(SystemOriginKind.ROOM_HYDRATION, OPERATION_ID),
-        "!room:example.org",
-        1,
-        6,
-        None,
-        None,
-        b'{"status":"ready"}',
         None,
     )
 
@@ -240,106 +164,6 @@ def test_canonical_payload_pins_field_order_utf8_and_digest() -> None:
     )
 
 
-def test_system_event_canonical_payload_and_identity_are_golden() -> None:
-    batch = make_batch(system_lifecycle_record())
-
-    assert canonical_batch_payload(batch) == GOLDEN_SYSTEM_EVENT_PAYLOAD
-    assert batch.ref.sha256.hex() == GOLDEN_SYSTEM_EVENT_SHA256
-    assert batch.ref.batch_id == GOLDEN_SYSTEM_BATCH_ID
-    assert _batch_from_payload(GOLDEN_SYSTEM_EVENT_PAYLOAD) == batch
-
-
-@pytest.mark.parametrize(
-    "record_factory",
-    (system_lifecycle_record, hydration_state_record, room_readiness_record),
-)
-def test_every_allowed_system_event_pair_round_trips_canonically(
-    record_factory,
-) -> None:
-    batch = make_batch(record_factory())
-
-    assert _batch_from_payload(canonical_batch_payload(batch)) == batch
-
-
-def test_no_event_system_identity_binds_every_frozen_input() -> None:
-    record = system_lifecycle_record()
-    mutations = (
-        dataclasses.replace(record, record_id="stale"),
-        dataclasses.replace(record, record_id="é"),
-        dataclasses.replace(record, room_id="!other:example.org"),
-        dataclasses.replace(record, membership_epoch=2),
-        dataclasses.replace(
-            record,
-            origin=SystemOrigin(
-                SystemOriginKind.MEMBERSHIP_CHANGE,
-                UUID("99999999-9999-9999-9999-999999999999"),
-            ),
-        ),
-        dataclasses.replace(record, source_json=b'{"membership":"join"}'),
-        dataclasses.replace(
-            record,
-            kind=RecordKind.ROOM_READINESS,
-            origin=SystemOrigin(SystemOriginKind.ROOM_HYDRATION, OPERATION_ID),
-        ),
-    )
-
-    for mutated in mutations:
-        with pytest.raises(BatchIntegrityError, match="record_id"):
-            make_batch(mutated)
-    with pytest.raises(BatchIntegrityError, match="record_id"):
-        batch_from_records(
-            account_id="@alice:例.org",
-            device_id="DEVICE",
-            consumer=BINDING,
-            stream_id=UUID("99999999-9999-9999-9999-999999999999"),
-            sequence=7,
-            created_revision=11,
-            records=(record,),
-        )
-
-    same_identity = dataclasses.replace(
-        record,
-        provenance=TimelineEventProvenance.HISTORY,
-        clear_json=b'{"decrypted":true}',
-    )
-    assert make_batch(same_identity).records == (same_identity,)
-
-
-def test_hydration_state_identity_is_keyed_only_to_matrix_event_identity() -> None:
-    record = hydration_state_record()
-
-    assert make_batch(record).records == (record,)
-    for mutated in (
-        dataclasses.replace(record, record_id="stale"),
-        dataclasses.replace(record, room_id="!other:example.org"),
-        dataclasses.replace(record, event_id="$other"),
-    ):
-        with pytest.raises(BatchIntegrityError, match="record_id"):
-            make_batch(mutated)
-    with pytest.raises(BatchIntegrityError, match="record_id"):
-        batch_from_records(
-            account_id="@alice:例.org",
-            device_id="DEVICE",
-            consumer=BINDING,
-            stream_id=UUID("99999999-9999-9999-9999-999999999999"),
-            sequence=7,
-            created_revision=11,
-            records=(record,),
-        )
-
-    same_matrix_event = dataclasses.replace(
-        record,
-        origin=SystemOrigin(
-            SystemOriginKind.ROOM_HYDRATION,
-            UUID("99999999-9999-9999-9999-999999999999"),
-        ),
-        membership_epoch=2,
-        room_sequence=6,
-        source_json=b'{"type":"m.room.name","content":{"name":"Room"}}',
-    )
-    assert make_batch(same_matrix_event).records == (same_matrix_event,)
-
-
 @pytest.mark.parametrize(
     "origin",
     (
@@ -386,14 +210,6 @@ def test_origin_decode_requires_exact_ordered_fields(
 ) -> None:
     with pytest.raises(ValueError, match="origin.*fields"):
         _origin_from_dict(origin)
-
-
-@pytest.mark.parametrize("removed", (b"consumer_reset", b"source_rebind"))
-def test_decode_rejects_removed_system_origin_kinds(removed: bytes) -> None:
-    payload = GOLDEN_SYSTEM_EVENT_PAYLOAD.replace(b"membership_change", removed)
-
-    with pytest.raises(ValueError):
-        _batch_from_payload(payload)
 
 
 def test_changing_one_record_byte_changes_digest_and_batch_id() -> None:
@@ -638,40 +454,3 @@ def test_room_snapshot_canonical_round_trip_includes_own_identity() -> None:
 
     assert payload == GOLDEN_ROOM_SNAPSHOT_PAYLOAD
     assert _room_snapshot_from_payload(payload) == snapshot
-
-
-def test_membership_baseline_has_one_strict_canonical_payload_and_digest() -> None:
-    baseline = MembershipBaseline(
-        "!room:example.org",
-        4,
-        7,
-        "old-prev",
-        "$member",
-    )
-
-    assert _canonical_membership_baseline_payload(baseline) == (
-        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD
-    )
-    assert _membership_baseline_sha256(baseline).hex() == (
-        GOLDEN_MEMBERSHIP_BASELINE_SHA256
-    )
-    assert (
-        _membership_baseline_from_payload(GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD)
-        == baseline
-    )
-    for malformed in (
-        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
-            b'"room_id":"!room:example.org","source_epoch":4',
-            b'"source_epoch":4,"room_id":"!room:example.org"',
-        ),
-        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
-            b',"membership_event_id":"$member"',
-            b"",
-        ),
-        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
-            b'"membership_event_id":"$member"',
-            b'"membership_event_id":"$member","extra":true',
-        ),
-    ):
-        with pytest.raises(ValueError, match="canonical"):
-            _membership_baseline_from_payload(malformed)

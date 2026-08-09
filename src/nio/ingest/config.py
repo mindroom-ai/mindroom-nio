@@ -1,10 +1,6 @@
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
-from .model import ConsumerBinding, TransportKind
-
-MAX_RECORDS_PER_BATCH = 256
-MAX_BYTES_PER_BATCH = 2 * 1024 * 1024
-MAX_RECORD_BYTES = 1024 * 1024
+from .model import TransportKind
 
 
 def _require_exact(value: object, expected: type, field_name: str) -> None:
@@ -70,42 +66,18 @@ def source_transport(source: object) -> TransportKind:
 @dataclass(frozen=True, slots=True)
 class IngestionConfig:
     source: SourceConfig
-    consumer: ConsumerBinding
     max_staged_frames: int = 2
-    max_unacknowledged_batches: int = 8
-    max_records_per_batch: int = MAX_RECORDS_PER_BATCH
-    max_bytes_per_batch: int = MAX_BYTES_PER_BATCH
-    max_record_bytes: int = MAX_RECORD_BYTES
-    max_crypto_inputs_per_commit: int = 32
-    max_crypto_input_bytes_per_commit: int = 1024 * 1024
     sqlite_busy_timeout_ms: int = 2_000
-    sqlite_write_retry_limit: int = 2
-    max_concurrent_recovery_rooms: int = 8
-    max_concurrent_room_hydrations: int = 8
-    max_recovery_events_per_room: int = 10_000
-    max_held_events_per_room: int = 10_000
-    max_held_bytes_per_room: int = 32 * 1024 * 1024
 
     def __post_init__(self) -> None:
         source_transport(self.source)
-        _require_exact(self.consumer, ConsumerBinding, "consumer")
-
-        for config_field in fields(self):
-            if not config_field.name.startswith("max_") and config_field.name not in {
-                "sqlite_busy_timeout_ms",
-                "sqlite_write_retry_limit",
-            }:
-                continue
-            value = getattr(self, config_field.name)
-            _require_exact(value, int, config_field.name)
-            if value <= 0:
-                raise ValueError(f"{config_field.name} must be positive")
-
-        ceilings = {
-            "max_records_per_batch": MAX_RECORDS_PER_BATCH,
-            "max_bytes_per_batch": MAX_BYTES_PER_BATCH,
-            "max_record_bytes": MAX_RECORD_BYTES,
-        }
-        for field_name, ceiling in ceilings.items():
-            if getattr(self, field_name) > ceiling:
-                raise ValueError(f"{field_name} exceeds immutable ceiling {ceiling}")
+        _require_exact(self.max_staged_frames, int, "max_staged_frames")
+        _require_exact(
+            self.sqlite_busy_timeout_ms,
+            int,
+            "sqlite_busy_timeout_ms",
+        )
+        if not 1 <= self.max_staged_frames <= 256:
+            raise ValueError("max_staged_frames must be between 1 and 256")
+        if self.sqlite_busy_timeout_ms <= 0:
+            raise ValueError("sqlite_busy_timeout_ms must be positive")

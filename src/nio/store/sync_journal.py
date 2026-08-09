@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import threading
 from contextlib import contextmanager
@@ -10,8 +9,6 @@ from uuid import UUID
 
 from ..exceptions import LocalProtocolError
 from ..ingest.config import SourceConfig, source_transport
-from ..ingest.model import ConsumerBootstrap
-from ..ingest.state import ConsumerAttachStatus
 from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
 if TYPE_CHECKING:
@@ -117,14 +114,6 @@ class StoreBootstrap:
     def stream_id(self) -> UUID:
         return self._journal.stream_id
 
-    @property
-    def binding_operation_id(self) -> UUID:
-        return self._journal.binding_operation_id
-
-    @property
-    def next_batch_sequence(self) -> int:
-        return self._journal.next_batch_sequence
-
     def open_matrix_store(
         self,
         store_class: type[MatrixStore],
@@ -138,16 +127,6 @@ class StoreBootstrap:
             store_class,
             self._journal.pickle_key if pickle_key is None else pickle_key,
         )
-
-    async def attach_consumer(self, consumer: ConsumerBootstrap) -> None:
-        while (  # noqa: ASYNC110 - durable chunks intentionally yield cooperatively.
-            self._journal.attach_consumer_step(consumer)
-            is ConsumerAttachStatus.ATTACHING
-        ):
-            await asyncio.sleep(0)  # noqa: ASYNC115
-
-    def assert_http_enabled(self) -> None:
-        self._journal._require_attached()
 
     def close(self) -> None:
         self._journal._writer_lock.assert_process_owner()

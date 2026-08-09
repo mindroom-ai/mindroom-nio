@@ -41,14 +41,12 @@ class RecordKind(StrEnum):
     PRESENCE = "presence"
     TO_DEVICE = "to_device"
     ROOM_LIFECYCLE = "room_lifecycle"
-    ROOM_READINESS = "room_readiness"
     DECRYPTION_UPDATE = "decryption_update"
 
 
 class SystemOriginKind(StrEnum):
     FRESH_START = "fresh_start"
     MEMBERSHIP_CHANGE = "membership_change"
-    ROOM_HYDRATION = "room_hydration"
     STORE_VALIDATION = "store_validation"
 
 
@@ -121,7 +119,7 @@ class SystemOrigin:
 class EventRecord:
     record_id: str
     kind: RecordKind
-    origin: RecordOrigin | SystemOrigin
+    origin: RecordOrigin
     room_id: str | None
     membership_epoch: int | None
     room_sequence: int | None
@@ -133,8 +131,8 @@ class EventRecord:
     def __post_init__(self) -> None:
         _require_exact(self.record_id, str, "record_id")
         _require_exact(self.kind, RecordKind, "kind")
-        if type(self.origin) not in (RecordOrigin, SystemOrigin):
-            raise TypeError("EventRecord origin must be RecordOrigin or SystemOrigin")
+        if type(self.origin) is not RecordOrigin:
+            raise TypeError("EventRecord origin must be a RecordOrigin")
         _require_optional_exact(self.room_id, str, "room_id")
         _require_optional_exact(self.membership_epoch, int, "membership_epoch")
         _require_optional_exact(self.room_sequence, int, "room_sequence")
@@ -146,32 +144,6 @@ class EventRecord:
         )
         _require_exact(self.source_json, bytes, "source_json")
         _require_optional_exact(self.clear_json, bytes, "clear_json")
-
-        if type(self.origin) is SystemOrigin:
-            allowed_pair = (
-                (self.kind is RecordKind.ROOM_LIFECYCLE)
-                and (self.origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE)
-            ) or (
-                self.kind in (RecordKind.STATE, RecordKind.ROOM_READINESS)
-                and self.origin.kind is SystemOriginKind.ROOM_HYDRATION
-            )
-            if not allowed_pair:
-                raise ValueError("EventRecord SystemOrigin kind pair is not allowed")
-            if not self.room_id:
-                raise ValueError("system EventRecord room_id must be nonempty")
-            if self.membership_epoch is None or self.membership_epoch < 0:
-                raise ValueError(
-                    "system EventRecord membership_epoch must be nonnegative"
-                )
-            if self.room_sequence is None or self.room_sequence < 0:
-                raise ValueError("system EventRecord room_sequence must be nonnegative")
-            if self.kind is RecordKind.STATE:
-                if not self.event_id:
-                    raise ValueError(
-                        "hydration state EventRecord event_id must be nonempty"
-                    )
-            elif self.event_id is not None:
-                raise ValueError("local system EventRecord event_id must be None")
 
 
 @dataclass(frozen=True, slots=True)

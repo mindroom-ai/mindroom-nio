@@ -1,67 +1,23 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
+import base64
+import json
 import sqlite3
-from dataclasses import replace
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from ..exceptions import LocalProtocolError
 from ..ingest._json import load_internal_json
 from ..ingest.errors import JournalIntegrityError
-from ..ingest.model import (
-    EventRecord,
-    LossRecord,
-    RecordOrigin,
-    RoomHydrationStatus,
-    SyncBatch,
-    SystemOrigin,
-    TransportKind,
-)
+from ..ingest.model import TransportKind
 from ..ingest.ports import NetworkRequest, StagedSourceResponse
-from ..ingest.serialization import (
-    _batch_from_payload,
-    _canonical_json,
-    _decoded_bytes,
-    _encoded_bytes,
-    _load_json_object,
-    _loss_id,
-    _membership_baseline_from_dict,
-    _membership_baseline_to_dict,
-    _record_from_dict,
-    _record_from_exact_dict,
-    _record_to_dict,
-    _recovery_gap_from_dict,
-    _recovery_gap_to_dict,
-    _room_snapshot_from_dict,
-    _room_snapshot_to_dict,
-    _system_event_record_id,
-    _validate_batch,
-    canonical_batch_payload,
-)
-from ..ingest.state import (
-    LaneRecord,
-    LaneRecordKey,
-    LaneRecordSection,
-    LaneStatus,
-    OwnerView,
-    ReadyRecord,
-    ReleasePhase,
-    RoomAggregate,
-    RoomLane,
-    RoomState,
-    SourceState,
-    StagedFrame,
-)
-from ._sync_journal_effects import NetworkEffectRows
+from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_preflight import _validate_source_cursor
 
-_FRAME_FIELDS = (
-    "request",
-    "response_body",
-    "source_sha256",
-    "staged_revision",
-)
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+_NORMALIZATION_VERSION = 1
 _NETWORK_REQUEST_FIELDS = (
     "stream_id",
     "transport",
@@ -74,55 +30,41 @@ _NETWORK_REQUEST_FIELDS = (
     "timeout_ms",
     "request_cursor_json",
 )
-_READY_FIELDS = (
-    "item_id",
-    "item_kind",
-    "ready_order",
-    "source_frame_id",
-    "room_id",
-    "membership_epoch",
-    "room_sequence",
-    "canonical_bytes",
-    "record",
-    "created_revision",
+_FRAME_FIELDS = (
+    "normalization_version",
+    "request",
+    "response_body",
+    "source_sha256",
 )
-_ROOM_STATE_FIELDS = (
-    "room_id",
-    "current_membership_epoch",
-    "next_room_sequence",
-    "hydration_status",
-    "snapshot",
-    "membership_baseline",
-    "updated_revision",
-)
-_ROOM_LANE_FIELDS = (
-    "room_id",
-    "membership_epoch",
-    "lane_status",
-    "held_record_count",
-    "held_canonical_bytes",
-    "release_phase",
-    "ready_order",
-    "next_held_ordinal",
-    "successor_membership_epoch",
-    "recovery_gap",
-    "pending_lifecycle",
-    "updated_revision",
-)
-_LANE_RECORD_FIELDS = (
-    "room_id",
-    "membership_epoch",
-    "section",
-    "page_ordinal",
-    "record_ordinal",
-    "item_id",
-    "item_kind",
-    "source_frame_id",
-    "source_effect_id",
-    "canonical_bytes",
-    "record",
-    "created_revision",
-)
+
+
+def _canonical_internal(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _encoded_bytes(value: bytes | None) -> str | None:
+    return base64.b64encode(value).decode("ascii") if value is not None else None
+
+
+def _decoded_bytes(
+    value: object,
+    field_name: str,
+    *,
+    optional: bool = False,
+) -> bytes | None:
+    if value is None and optional:
+        return None
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a base64 string")
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError as error:
+        raise ValueError(f"{field_name} must be valid base64") from error
 
 
 def _network_request_to_dict(request: NetworkRequest) -> dict[str, object]:
@@ -143,12 +85,9 @@ def _network_request_to_dict(request: NetworkRequest) -> dict[str, object]:
 
 
 def _network_request_from_dict(value: object) -> NetworkRequest:
-    if type(value) is not dict:
-        raise ValueError("network request must be an object")
-    request = value
-    if tuple(request) != _NETWORK_REQUEST_FIELDS:
+    if type(value) is not dict or tuple(value) != _NETWORK_REQUEST_FIELDS:
         raise ValueError("network request fields are not canonical")
-    query = request["query"]
+    query = value["query"]
     if type(query) is not list:
         raise ValueError("network request query must be an array")
     pairs: list[tuple[str, str]] = []
@@ -159,640 +98,182 @@ def _network_request_from_dict(value: object) -> NetworkRequest:
         if type(key) is not str or type(item) is not str:
             raise ValueError("network request query entries are invalid")
         pairs.append((key, item))
-    body = _decoded_bytes(request["body"], "request body", optional=True)
-    cursor = _decoded_bytes(request["request_cursor_json"], "request cursor")
-    if cursor is None:
-        raise ValueError("request cursor must be bytes")
-    if any(
-        type(request[name]) is not int
-        for name in ("source_epoch", "request_id", "timeout_ms")
-    ):
-        raise ValueError("network request integer fields are invalid")
+    for name in ("source_epoch", "request_id", "timeout_ms"):
+        if type(value[name]) is not int:
+            raise ValueError("network request integer fields are invalid")
     for name in ("stream_id", "transport", "method", "path"):
-        if type(request[name]) is not str:
+        if type(value[name]) is not str:
             raise ValueError("network request string fields are invalid")
-    parsed = NetworkRequest(
-        UUID(request["stream_id"]),
-        TransportKind(request["transport"]),
-        request["source_epoch"],
-        request["request_id"],
-        request["method"],
-        request["path"],
-        tuple(pairs),
-        body,
-        request["timeout_ms"],
-        cursor,
-    )
-    if request != _network_request_to_dict(parsed):
-        raise ValueError("network request is not canonical")
-    return parsed
-
-
-def _frame_response_from_envelope(value: object) -> tuple[StagedSourceResponse, int]:
-    if type(value) is not dict:
-        raise ValueError("frame authenticated envelope must be an object")
-    envelope = value
-    if tuple(envelope) != _FRAME_FIELDS:
-        raise ValueError("frame authenticated envelope is invalid")
-    revision = envelope["staged_revision"]
-    if type(revision) is not int or revision < 0:
-        raise ValueError("frame staged revision is invalid")
-    body = _decoded_bytes(envelope["response_body"], "response body")
-    digest = _decoded_bytes(envelope["source_sha256"], "source digest")
-    if body is None or digest is None:
-        raise ValueError("frame response fields are invalid")
-    response = StagedSourceResponse(
-        _network_request_from_dict(envelope["request"]), body, digest
-    )
-    canonical = {
-        "request": _network_request_to_dict(response.request),
-        "response_body": _encoded_bytes(response.response_body),
-        "source_sha256": _encoded_bytes(response.source_sha256),
-        "staged_revision": revision,
-    }
-    if envelope != canonical:
-        raise ValueError("frame authenticated envelope is not canonical")
-    return response, revision
-
-
-class JournalRows(NetworkEffectRows):
-    def _open_payload(self, domain, primary_key, row, prefix):
-        return self._codec.decrypt(
-            domain,
-            primary_key,
-            bytes(row[f"{prefix}_ciphertext"]),
-            bytes(row[f"{prefix}_sha256"]),
-        )
-
-    @staticmethod
-    def _revalidate_insert(cursor, load, expected, message):
-        if cursor.rowcount == 0 and load() != expected:
-            raise JournalIntegrityError(message)
-
-    @staticmethod
-    def _validate_record_transport(
-        record: EventRecord | LossRecord,
-        transport_kind: TransportKind,
-    ) -> None:
-        origin = record.origin
-        if type(origin) is RecordOrigin and origin.transport is not transport_kind:
-            raise JournalIntegrityError(
-                "record origin transport does not match immutable journal transport"
-            )
-
-    def _validate_room_lane_transport(
-        self,
-        lane: RoomLane,
-        transport_kind: TransportKind,
-    ) -> None:
-        try:
-            replace(lane)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-        if (
-            lane.recovery_gap is not None
-            and lane.recovery_gap.origin.transport is not transport_kind
-        ):
-            raise JournalIntegrityError(
-                "recovery gap transport does not match immutable journal transport"
-            )
-        if lane.pending_lifecycle is not None:
-            self._validate_record_transport(
-                lane.pending_lifecycle,
-                transport_kind,
-            )
-            self._validated_record_id(lane.pending_lifecycle)
-
-    @classmethod
-    def _validate_lane_record_transport(
-        cls,
-        lane_record: LaneRecord,
-        transport_kind: TransportKind,
-    ) -> None:
-        try:
-            replace(lane_record)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-        cls._validate_record_transport(lane_record.record, transport_kind)
-
-    @staticmethod
-    def _room_state_payload(state: RoomState, revision: int) -> bytes:
-        return _canonical_json(
-            {
-                "room_id": state.room_id,
-                "current_membership_epoch": state.current_membership_epoch,
-                "next_room_sequence": state.next_room_sequence,
-                "hydration_status": state.hydration_status.value,
-                "snapshot": (
-                    _room_snapshot_to_dict(state.snapshot)
-                    if state.snapshot is not None
-                    else None
-                ),
-                "membership_baseline": (
-                    _membership_baseline_to_dict(state.membership_baseline)
-                    if state.membership_baseline is not None
-                    else None
-                ),
-                "updated_revision": revision,
-            }
-        )
-
-    @staticmethod
-    def _room_lane_payload(lane: RoomLane, revision: int) -> bytes:
-        return _canonical_json(
-            {
-                "room_id": lane.room_id,
-                "membership_epoch": lane.membership_epoch,
-                "lane_status": lane.lane_status.value,
-                "held_record_count": lane.held_record_count,
-                "held_canonical_bytes": lane.held_canonical_bytes,
-                "release_phase": lane.release_phase.value,
-                "ready_order": lane.ready_order,
-                "next_held_ordinal": lane.next_held_ordinal,
-                "successor_membership_epoch": lane.successor_membership_epoch,
-                "recovery_gap": (
-                    _recovery_gap_to_dict(lane.recovery_gap)
-                    if lane.recovery_gap is not None
-                    else None
-                ),
-                "pending_lifecycle": (
-                    _record_to_dict(lane.pending_lifecycle)
-                    if lane.pending_lifecycle is not None
-                    else None
-                ),
-                "updated_revision": revision,
-            }
-        )
-
-    def _write_room_state(self, state: RoomState, revision: int) -> None:
-        payload = self._room_state_payload(state, revision)
-        ciphertext, digest = self._codec.seal(
-            "NioIngestRoomState", (state.room_id,), payload
-        )
-        self._transition_execute(
-            "room_state",
-            """INSERT INTO NioIngestRoomState (
-                account_id, room_id, current_membership_epoch,
-                next_room_sequence, hydration_status, state_ciphertext,
-                state_sha256, updated_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, room_id) DO UPDATE SET
-                current_membership_epoch = excluded.current_membership_epoch,
-                next_room_sequence = excluded.next_room_sequence,
-                hydration_status = excluded.hydration_status, state_ciphertext = excluded.state_ciphertext,
-                state_sha256 = excluded.state_sha256, updated_revision = excluded.updated_revision""",
-            (
-                self.account_id,
-                state.room_id,
-                state.current_membership_epoch,
-                state.next_room_sequence,
-                state.hydration_status.value,
-                ciphertext,
-                digest,
-                revision,
-            ),
-        )
-
-    def _write_room_lane(
-        self,
-        lane: RoomLane,
-        revision: int,
-        transport_kind: TransportKind,
-    ) -> None:
-        self._validate_room_lane_transport(lane, transport_kind)
-        payload = self._room_lane_payload(lane, revision)
-        ciphertext, digest = self._codec.seal(
-            "NioIngestRoomLane",
-            (lane.room_id, lane.membership_epoch),
-            payload,
-        )
-        self._transition_execute(
-            "room_lane",
-            """INSERT INTO NioIngestRoomLane (
-                account_id, room_id, membership_epoch, lane_status,
-                held_record_count, held_canonical_bytes, release_phase,
-                ready_order, next_held_ordinal, successor_membership_epoch,
-                lane_state_ciphertext, lane_state_sha256,
-                updated_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, room_id, membership_epoch) DO UPDATE SET
-                lane_status = excluded.lane_status, held_record_count = excluded.held_record_count,
-                held_canonical_bytes = excluded.held_canonical_bytes, release_phase = excluded.release_phase,
-                ready_order = excluded.ready_order, next_held_ordinal = excluded.next_held_ordinal,
-                successor_membership_epoch = excluded.successor_membership_epoch,
-                lane_state_ciphertext = excluded.lane_state_ciphertext,
-                lane_state_sha256 = excluded.lane_state_sha256,
-                updated_revision = excluded.updated_revision""",
-            (
-                self.account_id,
-                lane.room_id,
-                lane.membership_epoch,
-                lane.lane_status.value,
-                lane.held_record_count,
-                lane.held_canonical_bytes,
-                lane.release_phase.value,
-                lane.ready_order,
-                lane.next_held_ordinal,
-                lane.successor_membership_epoch,
-                ciphertext,
-                digest,
-                revision,
-            ),
-        )
-
-    def _validated_record_id(self, record: EventRecord | LossRecord) -> str:
-        if isinstance(record, EventRecord):
-            if type(record.origin) is SystemOrigin:
-                try:
-                    expected_id = _system_event_record_id(self.stream_id, record)
-                except (TypeError, ValueError) as error:
-                    raise JournalIntegrityError(
-                        "system EventRecord is invalid"
-                    ) from error
-                if record.record_id != expected_id:
-                    raise JournalIntegrityError(
-                        "record_id does not match system event contents"
-                    )
-            return record.record_id
-        if record.loss_id != _loss_id(self.stream_id, record):
-            raise JournalIntegrityError("loss_id does not match loss contents")
-        return record.loss_id
-
-    def _validate_ready_record(self, ready: ReadyRecord) -> str:
-        try:
-            replace(ready)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-        return self._validated_record_id(ready.record)
-
-    @staticmethod
-    def _validate_batch_integrity(batch: SyncBatch) -> None:
-        try:
-            _validate_batch(batch)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-
-    def _write_ready(self, ready: ReadyRecord, revision: int) -> None:
-        item_id = self._validate_ready_record(ready)
-        item_kind = "event" if type(ready.record) is EventRecord else "loss"
-        record_payload = _canonical_json(_record_to_dict(ready.record))
-        canonical_bytes = len(record_payload)
-        room_sequence = (
-            ready.record.room_sequence if type(ready.record) is EventRecord else None
-        )
-        payload = _canonical_json(
-            {
-                "item_id": item_id,
-                "item_kind": item_kind,
-                "ready_order": ready.ready_order,
-                "source_frame_id": (
-                    str(ready.source_frame_id) if ready.source_frame_id else None
-                ),
-                "room_id": ready.record.room_id,
-                "membership_epoch": ready.record.membership_epoch,
-                "room_sequence": room_sequence,
-                "canonical_bytes": canonical_bytes,
-                "record": _record_to_dict(ready.record),
-                "created_revision": revision,
-            }
-        )
-        ciphertext, digest = self._codec.seal(
-            "NioIngestReadyRecord", (item_id,), payload
-        )
-        if ready.canonical_bytes not in (0, canonical_bytes):
-            raise JournalIntegrityError(
-                "ready canonical_bytes does not match canonical payload"
-            )
-        cursor = self._transition_execute(
-            "ready_record",
-            """INSERT INTO NioIngestReadyRecord (
-                account_id, ready_order, item_id, item_kind, source_frame_id, room_id,
-                membership_epoch, room_sequence, payload_ciphertext,
-                payload_sha256, canonical_bytes, created_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, item_id) DO NOTHING""",
-            (
-                self.account_id,
-                ready.ready_order,
-                item_id,
-                item_kind,
-                str(ready.source_frame_id) if ready.source_frame_id else None,
-                ready.record.room_id,
-                ready.record.membership_epoch,
-                room_sequence,
-                ciphertext,
-                digest,
-                canonical_bytes,
-                revision,
-            ),
-        )
-
-        def load_ready():
-            row = self.connection.execute(
-                "SELECT * FROM NioIngestReadyRecord "
-                "WHERE account_id = ? AND item_id = ?",
-                (self.account_id, item_id),
-            ).fetchone()
-            return self._decode_ready_row(row) if row is not None else None
-
-        self._revalidate_insert(
+    cursor = _decoded_bytes(value["request_cursor_json"], "request cursor")
+    assert cursor is not None
+    try:
+        request = NetworkRequest(
+            UUID(value["stream_id"]),
+            TransportKind(value["transport"]),
+            value["source_epoch"],
+            value["request_id"],
+            value["method"],
+            value["path"],
+            tuple(pairs),
+            _decoded_bytes(value["body"], "request body", optional=True),
+            value["timeout_ms"],
             cursor,
-            load_ready,
-            replace(ready, canonical_bytes=canonical_bytes, created_revision=revision),
-            "ready item_id or ready_order collides with different contents",
         )
+    except (TypeError, ValueError) as error:
+        raise ValueError("network request is invalid") from error
+    if value != _network_request_to_dict(request):
+        raise ValueError("network request is not canonical")
+    return request
 
-    @staticmethod
-    def _lane_record_primary_key(
-        key: LaneRecordKey,
-    ) -> tuple[str | int, ...]:
-        return (
-            key.room_id,
-            key.membership_epoch,
-            key.section.value,
-            key.page_ordinal,
-            key.record_ordinal,
-        )
 
-    def _lane_record_payload(
-        self,
-        lane_record: LaneRecord,
-        item_id: str,
-        item_kind: str,
-        revision: int,
-    ) -> bytes:
-        key = lane_record.key
-        return _canonical_json(
-            {
-                "room_id": key.room_id,
-                "membership_epoch": key.membership_epoch,
-                "section": key.section.value,
-                "page_ordinal": key.page_ordinal,
-                "record_ordinal": key.record_ordinal,
-                "item_id": item_id,
-                "item_kind": item_kind,
-                "source_frame_id": (
-                    str(lane_record.source_frame_id)
-                    if lane_record.source_frame_id is not None
-                    else None
-                ),
-                "source_effect_id": (
-                    str(lane_record.source_effect_id)
-                    if lane_record.source_effect_id is not None
-                    else None
-                ),
-                "canonical_bytes": lane_record.canonical_bytes,
-                "record": _record_to_dict(lane_record.record),
-                "created_revision": revision,
-            }
-        )
+def _frame_envelope(frame: StagedFrame) -> dict[str, object]:
+    return {
+        "normalization_version": _NORMALIZATION_VERSION,
+        "request": _network_request_to_dict(frame.response.request),
+        "response_body": _encoded_bytes(frame.response.response_body),
+        "source_sha256": _encoded_bytes(frame.response.source_sha256),
+    }
 
-    def _write_lane_record(
-        self,
-        lane_record: LaneRecord,
-        revision: int,
-    ) -> None:
-        item_id = self._validated_record_id(lane_record.record)
-        item_kind = "event" if type(lane_record.record) is EventRecord else "loss"
-        record_payload = _canonical_json(_record_to_dict(lane_record.record))
-        if lane_record.canonical_bytes != len(record_payload):
-            raise JournalIntegrityError(
-                "lane record canonical_bytes does not match canonical payload"
-            )
-        payload = self._lane_record_payload(
-            lane_record,
-            item_id,
-            item_kind,
-            revision,
-        )
-        primary_key = self._lane_record_primary_key(lane_record.key)
-        ciphertext, digest = self._codec.seal(
-            "NioIngestLaneRecord",
-            primary_key,
-            payload,
-        )
-        cursor = self._transition_execute(
-            "lane_record_insert",
-            """INSERT INTO NioIngestLaneRecord (
-                account_id, room_id, membership_epoch, section,
-                page_ordinal, record_ordinal, item_id, item_kind,
-                source_frame_id, source_effect_id, payload_ciphertext,
-                payload_sha256, canonical_bytes, created_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT DO NOTHING""",
-            (
-                self.account_id,
-                lane_record.key.room_id,
-                lane_record.key.membership_epoch,
-                lane_record.key.section.value,
-                lane_record.key.page_ordinal,
-                lane_record.key.record_ordinal,
-                item_id,
-                item_kind,
-                (
-                    str(lane_record.source_frame_id)
-                    if lane_record.source_frame_id is not None
-                    else None
-                ),
-                (
-                    str(lane_record.source_effect_id)
-                    if lane_record.source_effect_id is not None
-                    else None
-                ),
-                ciphertext,
-                digest,
-                lane_record.canonical_bytes,
-                revision,
-            ),
-        )
-        if cursor.rowcount == 0:
-            by_key = self.load_lane_record(lane_record.key)
-            by_item = self._load_lane_record_by_item_id(item_id)
-            if by_key != lane_record or by_item != lane_record:
-                raise JournalIntegrityError(
-                    "lane record key or item identity collides with different contents"
-                )
 
-    def _decode_lane_record_row(
-        self,
-        row: sqlite3.Row,
-        transport_kind: TransportKind,
-    ) -> LaneRecord:
-        try:
-            key = LaneRecordKey(
-                row["room_id"],
-                row["membership_epoch"],
-                LaneRecordSection(row["section"]),
-                row["page_ordinal"],
-                row["record_ordinal"],
-            )
-            payload = self._open_payload(
-                "NioIngestLaneRecord",
-                self._lane_record_primary_key(key),
-                row,
-                "payload",
-            )
-            envelope = _load_json_object(payload)
-            if tuple(envelope) != _LANE_RECORD_FIELDS:
-                raise ValueError("lane record envelope fields are not canonical")
-            source_frame_value = envelope["source_frame_id"]
-            source_effect_value = envelope["source_effect_id"]
-            source_frame_id = (
-                UUID(source_frame_value) if source_frame_value is not None else None
-            )
-            source_effect_id = (
-                UUID(source_effect_value) if source_effect_value is not None else None
-            )
-            record = _record_from_exact_dict(envelope["record"])
-            lane_record = LaneRecord(
-                LaneRecordKey(
-                    envelope["room_id"],
-                    envelope["membership_epoch"],
-                    LaneRecordSection(envelope["section"]),
-                    envelope["page_ordinal"],
-                    envelope["record_ordinal"],
-                ),
-                record,
-                source_frame_id,
-                source_effect_id,
-                envelope["canonical_bytes"],
-            )
-            created_revision = envelope["created_revision"]
-            if type(created_revision) is not int or created_revision < 0:
-                raise ValueError("lane record created_revision is invalid")
-        except (AttributeError, TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "lane record authenticated envelope is invalid"
-            ) from error
+def _frame_response_from_envelope(value: object) -> StagedSourceResponse:
+    if type(value) is not dict or tuple(value) != _FRAME_FIELDS:
+        raise ValueError("frame authenticated envelope is invalid")
+    if type(value["normalization_version"]) is not int or (
+        value["normalization_version"] != _NORMALIZATION_VERSION
+    ):
+        raise ValueError("frame normalization version is invalid")
+    body = _decoded_bytes(value["response_body"], "response body")
+    digest = _decoded_bytes(value["source_sha256"], "source digest")
+    assert body is not None
+    assert digest is not None
+    response = StagedSourceResponse(
+        _network_request_from_dict(value["request"]),
+        body,
+        digest,
+    )
+    return response
 
-        item_id = self._validated_record_id(record)
-        item_kind = "event" if type(record) is EventRecord else "loss"
-        record_payload = _canonical_json(_record_to_dict(record))
-        if lane_record.canonical_bytes != len(record_payload):
-            raise JournalIntegrityError(
-                "lane record canonical_bytes does not match canonical payload"
-            )
-        if payload != self._lane_record_payload(
-            lane_record,
-            item_id,
-            item_kind,
-            created_revision,
-        ):
-            raise JournalIntegrityError(
-                "lane record authenticated envelope is not canonical"
-            )
-        authenticated = (
-            lane_record.key.room_id,
-            lane_record.key.membership_epoch,
-            lane_record.key.section.value,
-            lane_record.key.page_ordinal,
-            lane_record.key.record_ordinal,
-            item_id,
-            item_kind,
-            str(source_frame_id) if source_frame_id is not None else None,
-            str(source_effect_id) if source_effect_id is not None else None,
-            lane_record.canonical_bytes,
-            created_revision,
-        )
-        columns = tuple(
-            row[name]
-            for name in (
-                "room_id",
-                "membership_epoch",
-                "section",
-                "page_ordinal",
-                "record_ordinal",
-                "item_id",
-                "item_kind",
-                "source_frame_id",
-                "source_effect_id",
-                "canonical_bytes",
-                "created_revision",
-            )
-        )
-        if authenticated != columns:
-            raise JournalIntegrityError(
-                "lane record columns do not match authenticated payload"
-            )
-        self._validate_lane_record_transport(lane_record, transport_kind)
-        return lane_record
 
-    def load_lane_record(self, key: LaneRecordKey) -> LaneRecord | None:
-        owner = self._require_attached()
-        if type(key) is not LaneRecordKey:
-            raise TypeError("key must be LaneRecordKey")
-        row = self.connection.execute(
-            "SELECT * FROM NioIngestLaneRecord WHERE account_id = ? "
-            "AND room_id = ? AND membership_epoch = ? AND section = ? "
-            "AND page_ordinal = ? AND record_ordinal = ?",
-            (self.account_id, *self._lane_record_primary_key(key)),
-        ).fetchone()
-        return (
-            self._decode_lane_record_row(row, owner.transport_kind)
-            if row is not None
-            else None
-        )
+def _source_header(source: SourceState) -> bytes:
+    return _canonical_internal(
+        [
+            source.transport_kind.value,
+            source.source_epoch,
+            source.next_request_id,
+            source.active,
+        ]
+    )
 
-    def _load_lane_record_by_item_id(self, item_id: str) -> LaneRecord | None:
-        owner = self._require_attached()
-        row = self.connection.execute(
-            "SELECT * FROM NioIngestLaneRecord " "WHERE account_id = ? AND item_id = ?",
-            (self.account_id, item_id),
-        ).fetchone()
-        return (
-            self._decode_lane_record_row(row, owner.transport_kind)
-            if row is not None
-            else None
-        )
 
-    def list_lane_records(
-        self,
-        room_id: str,
-        membership_epoch: int,
-        section: LaneRecordSection | None = None,
-    ) -> tuple[LaneRecord, ...]:
-        owner = self._require_attached()
-        if type(room_id) is not str or not room_id:
-            raise TypeError("room_id must be a nonempty str")
-        if type(membership_epoch) is not int or membership_epoch < 0:
-            raise TypeError("membership_epoch must be a nonnegative int")
-        if section is not None and type(section) is not LaneRecordSection:
-            raise TypeError("section must be LaneRecordSection or None")
-        parameters: tuple[object, ...] = (
-            self.account_id,
-            room_id,
-            membership_epoch,
-        )
-        section_clause = ""
-        if section is not None:
-            section_clause = " AND section = ?"
-            parameters += (section.value,)
-        rows = self.connection.execute(
-            "SELECT * FROM NioIngestLaneRecord WHERE account_id = ? "
-            "AND room_id = ? AND membership_epoch = ?"
-            f"{section_clause} ORDER BY CASE section "
-            "WHEN 'loss' THEN 0 WHEN 'recovered' THEN 1 WHEN 'held' THEN 2 END, "
-            "page_ordinal, record_ordinal, item_id",
-            parameters,
+def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
+    request = frame.response.request
+    return _canonical_internal(
+        [request.source_epoch, request.request_id, staged_revision]
+    )
+
+
+class JournalRows:
+    account_id: str
+    device_id: str
+
+    def _meta(self) -> sqlite3.Row:
+        self._assert_open()  # type: ignore[attr-defined]
+        rows = self._connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM NioIngestMeta"
         ).fetchall()
-        return tuple(
-            self._decode_lane_record_row(row, owner.transport_kind) for row in rows
-        )
+        if len(rows) != 1:
+            raise JournalIntegrityError(
+                "ingestion-v1 marker row cardinality is not one"
+            )
+        return rows[0]
 
-    def _write_source(self, source: SourceState) -> None:
-        ciphertext, digest = self._codec.seal(
-            "NioIngestSourceState", (self.account_id,), source.cursor_json
+    def load_owner(self) -> OwnerView:
+        row = self._meta()
+        try:
+            owner = OwnerView(
+                row["account_id"],
+                row["device_id"],
+                row["schema_version"],
+                UUID(row["stream_id"]),
+                TransportKind(row["transport_kind"]),
+                row["revision"],
+                UUID(row["writer_epoch"]),
+                row["next_source_epoch"],
+            )
+            if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
+                raise ValueError("created_at_ns is invalid")
+        except (AttributeError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("ingestion owner row is invalid") from error
+        if owner.account_id != self.account_id or owner.device_id != self.device_id:
+            raise JournalIntegrityError("ingestion owner identity changed")
+        return owner
+
+    def _decode_source_row(
+        self,
+        row: Mapping[str, object],
+        owner: OwnerView,
+    ) -> SourceState:
+        try:
+            active = row["active"]
+            if type(active) is not int or active not in (0, 1):
+                raise ValueError("source active column is invalid")
+            clear = SourceState(
+                row["source_epoch"],
+                owner.transport_kind,
+                b"",
+                row["next_request_id"],
+                bool(active),
+            )
+            cursor_json = self._codec.decrypt(  # type: ignore[attr-defined]
+                "NioIngestSourceState",
+                (self.account_id,),
+                bytes(row["cursor_ciphertext"]),
+                bytes(row["cursor_sha256"]),
+                header=_source_header(clear),
+            )
+            source = SourceState(
+                clear.source_epoch,
+                clear.transport_kind,
+                cursor_json,
+                clear.next_request_id,
+                clear.active,
+            )
+            _validate_source_cursor(source.transport_kind, source.cursor_json)
+            if row["account_id"] != self.account_id:
+                raise ValueError("source account_id changed")
+            return source
+        except JournalIntegrityError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("persisted source state is invalid") from error
+
+    def load_source(self) -> SourceState:
+        owner = self.load_owner()
+        rows = self._connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM NioIngestSourceState"
+        ).fetchall()
+        if len(rows) != 1:
+            raise JournalIntegrityError("ingestion source row cardinality is not one")
+        return self._decode_source_row(rows[0], owner)
+
+    def _write_source(self, source: SourceState) -> sqlite3.Cursor:
+        _validate_source_cursor(source.transport_kind, source.cursor_json)
+        ciphertext, digest = self._codec.seal(  # type: ignore[attr-defined]
+            "NioIngestSourceState",
+            (self.account_id,),
+            source.cursor_json,
+            header=_source_header(source),
         )
-        self._transition_execute(
-            "source_state",
-            """INSERT INTO NioIngestSourceState (
-                account_id, source_epoch, cursor_ciphertext, cursor_sha256,
-                next_request_id, active
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id) DO UPDATE SET
-                source_epoch = excluded.source_epoch,
-                cursor_ciphertext = excluded.cursor_ciphertext, cursor_sha256 = excluded.cursor_sha256,
-                next_request_id = excluded.next_request_id, active = excluded.active""",
+        return self._connection.execute(  # type: ignore[attr-defined]
+            "INSERT INTO NioIngestSourceState ("
+            "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
+            "next_request_id, active) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(account_id) DO UPDATE SET "
+            "source_epoch = excluded.source_epoch, "
+            "cursor_ciphertext = excluded.cursor_ciphertext, "
+            "cursor_sha256 = excluded.cursor_sha256, "
+            "next_request_id = excluded.next_request_id, "
+            "active = excluded.active",
             (
                 self.account_id,
                 source.source_epoch,
@@ -803,132 +284,75 @@ class JournalRows(NetworkEffectRows):
             ),
         )
 
-    def load_source(self) -> SourceState:
-        owner = self.load_owner()
-        row = self.connection.execute(
-            "SELECT * FROM NioIngestSourceState WHERE account_id = ?",
-            (self.account_id,),
-        ).fetchone()
-        if row is None:
-            raise JournalIntegrityError("ingestion source row is missing")
-        cursor = self._open_payload(
-            "NioIngestSourceState", (self.account_id,), row, "cursor"
-        )
-        try:
-            _validate_source_cursor(owner.transport_kind, cursor)
-        except LocalProtocolError as error:
-            raise JournalIntegrityError(str(error)) from error
-        return SourceState(
-            row["source_epoch"],
-            owner.transport_kind,
-            cursor,
-            row["next_request_id"],
-            bool(row["active"]),
-        )
-
-    def _write_frame(self, frame: StagedFrame, revision: int, owner: OwnerView) -> None:
-        payload = _canonical_json(
-            {
-                "request": _network_request_to_dict(frame.response.request),
-                "response_body": _encoded_bytes(frame.response.response_body),
-                "source_sha256": _encoded_bytes(frame.response.source_sha256),
-                "staged_revision": revision,
-            }
-        )
-        ciphertext, digest = self._codec.seal(
-            "NioIngestFrame", (frame.frame_id,), payload
-        )
-        cursor = self._transition_execute(
-            "frame",
-            """INSERT INTO NioIngestFrame (
-                account_id, frame_id, source_epoch, request_id,
-                payload_ciphertext, payload_sha256, staged_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, frame_id) DO NOTHING""",
-            (
-                self.account_id,
-                str(frame.frame_id),
-                frame.response.request.source_epoch,
-                frame.response.request.request_id,
-                ciphertext,
-                digest,
-                revision,
-            ),
-        )
-        self._revalidate_insert(
-            cursor,
-            lambda: self._load_frame_with_owner(frame.frame_id, owner),
-            replace(frame, staged_revision=revision),
-            "frame_id collides with different authenticated contents",
-        )
-
     def _decode_frame_row(
         self,
         frame_id: UUID,
-        row: sqlite3.Row,
+        row: Mapping[str, object],
         owner: OwnerView,
     ) -> StagedFrame:
-        payload = self._open_payload("NioIngestFrame", (frame_id,), row, "payload")
         try:
-            response, revision = _frame_response_from_envelope(
-                load_internal_json(payload, "frame authenticated envelope")
-            )
-            if payload != _canonical_json(
-                {
-                    "request": _network_request_to_dict(response.request),
-                    "response_body": _encoded_bytes(response.response_body),
-                    "source_sha256": _encoded_bytes(response.source_sha256),
-                    "staged_revision": revision,
-                }
+            stored_id = UUID(row["frame_id"])
+            if stored_id != frame_id or row["account_id"] != self.account_id:
+                raise ValueError("selected frame identity changed")
+            source_epoch = row["source_epoch"]
+            request_id = row["request_id"]
+            staged_revision = row["staged_revision"]
+            if any(
+                type(value) is not int
+                for value in (source_epoch, request_id, staged_revision)
             ):
-                raise ValueError("frame authenticated envelope is not canonical")
-            frame = StagedFrame(frame_id, response, revision)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "frame authenticated envelope is invalid"
-            ) from error
-        request = response.request
-        if (
-            request.stream_id != owner.stream_id
-            or request.transport is not owner.transport_kind
-        ):
-            raise JournalIntegrityError("frame request does not match journal owner")
-        if (
-            request.source_epoch,
-            request.request_id,
-            revision,
-        ) != (
-            row["source_epoch"],
-            row["request_id"],
-            row["staged_revision"],
-        ):
-            raise JournalIntegrityError(
-                "frame columns do not match authenticated metadata"
+                raise ValueError("frame ordering columns are invalid")
+            header = _canonical_internal([source_epoch, request_id, staged_revision])
+            payload = self._codec.decrypt(  # type: ignore[attr-defined]
+                "NioIngestFrame",
+                (frame_id,),
+                bytes(row["payload_ciphertext"]),
+                bytes(row["payload_sha256"]),
+                header=header,
             )
-        return frame
+            envelope = load_internal_json(payload, "frame authenticated envelope")
+            response = _frame_response_from_envelope(envelope)
+            frame = StagedFrame(frame_id, response, staged_revision)
+            if payload != _canonical_internal(_frame_envelope(frame)):
+                raise ValueError("frame authenticated envelope is not canonical")
+            request = response.request
+            if (
+                request.stream_id != owner.stream_id
+                or request.transport is not owner.transport_kind
+            ):
+                raise ValueError("frame request does not match journal owner")
+            if (request.source_epoch, request.request_id) != (
+                source_epoch,
+                request_id,
+            ):
+                raise ValueError("frame columns do not match authenticated metadata")
+            return frame
+        except JournalIntegrityError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("persisted staged frame is invalid") from error
 
     def _load_frame_with_owner(
         self,
         frame_id: UUID,
         owner: OwnerView,
     ) -> StagedFrame | None:
-        row = self.connection.execute(
+        row = self._connection.execute(  # type: ignore[attr-defined]
             "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
             (self.account_id, str(frame_id)),
         ).fetchone()
         return self._decode_frame_row(frame_id, row, owner) if row is not None else None
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
-        owner = self._require_attached()
         if type(frame_id) is not UUID:
             raise TypeError("frame_id must be UUID")
-        return self._load_frame_with_owner(frame_id, owner)
+        return self._load_frame_with_owner(frame_id, self.load_owner())
 
     def list_frames(self, limit: int) -> tuple[StagedFrame, ...]:
-        owner = self._require_attached()
         if type(limit) is not int or not 1 <= limit <= 256:
             raise ValueError("frame limit must be an integer from 1 through 256")
-        rows = self.connection.execute(
+        owner = self.load_owner()
+        rows = self._connection.execute(  # type: ignore[attr-defined]
             "SELECT * FROM NioIngestFrame WHERE account_id = ? "
             "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
             (self.account_id, limit),
@@ -938,441 +362,35 @@ class JournalRows(NetworkEffectRows):
                 self._decode_frame_row(UUID(row["frame_id"]), row, owner)
                 for row in rows
             )
-        except (TypeError, ValueError) as error:
+        except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("selected frame identity is invalid") from error
 
-    def _write_batch(
+    def _write_frame(
         self,
-        batch: SyncBatch,
-        revision: int,
-        owner: OwnerView,
-    ) -> None:
-        self._validate_batch_integrity(batch)
-        if (
-            batch.account_id != self.account_id
-            or batch.device_id != self.device_id
-            or batch.consumer != owner.binding
-            or batch.ref.stream_id != owner.stream_id
-        ):
-            raise JournalIntegrityError("batch owner identity does not match journal")
-        if batch.created_revision != revision:
-            raise JournalIntegrityError(
-                "batch created_revision does not match commit revision"
-            )
-        payload = canonical_batch_payload(batch)
-        digest = hashlib.sha256(payload).digest()
-        if not hmac.compare_digest(digest, batch.ref.sha256):
-            raise JournalIntegrityError("batch payload digest does not match reference")
-        ciphertext = self._codec.encrypt(
-            "NioIngestBatch",
-            (batch.ref.sequence,),
+        frame: StagedFrame,
+        staged_revision: int,
+    ) -> sqlite3.Cursor:
+        stored = StagedFrame(frame.frame_id, frame.response, staged_revision)
+        payload = _canonical_internal(_frame_envelope(stored))
+        ciphertext, digest = self._codec.seal(  # type: ignore[attr-defined]
+            "NioIngestFrame",
+            (stored.frame_id,),
             payload,
-            digest,
+            header=_frame_header(stored, staged_revision),
         )
-        self._transition_execute(
-            "batch",
-            """INSERT INTO NioIngestBatch (
-                account_id, sequence, batch_id, payload_ciphertext,
-                payload_sha256, created_revision
-            ) VALUES (?, ?, ?, ?, ?, ?)""",
+        request = stored.response.request
+        return self._connection.execute(  # type: ignore[attr-defined]
+            "INSERT INTO NioIngestFrame ("
+            "account_id, frame_id, source_epoch, request_id, "
+            "payload_ciphertext, payload_sha256, staged_revision"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 self.account_id,
-                batch.ref.sequence,
-                str(batch.ref.batch_id),
+                str(stored.frame_id),
+                request.source_epoch,
+                request.request_id,
                 ciphertext,
                 digest,
-                revision,
+                staged_revision,
             ),
         )
-
-    def _write_batch_items(self, batch: SyncBatch) -> None:
-        values = []
-        parameters: list[object] = []
-        for ordinal, record in enumerate(batch.records):
-            item_id = self._validated_record_id(record)
-            item_kind = "event" if type(record) is EventRecord else "loss"
-            values.append("(?, ?, ?, ?, ?)")
-            parameters.extend(
-                (self.account_id, item_id, item_kind, batch.ref.sequence, ordinal)
-            )
-        cursor = self._transition_execute(
-            "batch_items",
-            "INSERT INTO NioIngestBatchItem "
-            "(account_id, item_id, item_kind, sequence, record_ordinal) VALUES "
-            + ",".join(values),
-            tuple(parameters),
-        )
-        if cursor.rowcount != len(batch.records):
-            raise JournalIntegrityError("batch item index insert is incomplete")
-
-    def _validate_batch_items(self, batch: SyncBatch) -> None:
-        rows = self.connection.execute(
-            "SELECT item_id, item_kind, record_ordinal "
-            "FROM NioIngestBatchItem WHERE account_id = ? AND sequence = ? "
-            "ORDER BY record_ordinal",
-            (self.account_id, batch.ref.sequence),
-        ).fetchall()
-        actual = tuple(
-            (row["item_id"], row["item_kind"], row["record_ordinal"]) for row in rows
-        )
-        expected = tuple(
-            (
-                self._validated_record_id(record),
-                "event" if type(record) is EventRecord else "loss",
-                ordinal,
-            )
-            for ordinal, record in enumerate(batch.records)
-        )
-        if actual != expected:
-            raise JournalIntegrityError(
-                "batch item index does not match authenticated batch payload"
-            )
-
-    def _validate_batch_has_no_source_owner(self, batch: SyncBatch) -> None:
-        item_ids = tuple(self._validated_record_id(record) for record in batch.records)
-        placeholders = ",".join("?" for _ in item_ids)
-        duplicate = self.connection.execute(
-            "SELECT item_id FROM NioIngestReadyRecord WHERE account_id = ? "
-            f"AND item_id IN ({placeholders}) UNION ALL "
-            "SELECT item_id FROM NioIngestLaneRecord WHERE account_id = ? "
-            f"AND item_id IN ({placeholders}) LIMIT 1",
-            (self.account_id, *item_ids, self.account_id, *item_ids),
-        ).fetchone()
-        if duplicate is not None:
-            raise JournalIntegrityError(
-                "batch item has a duplicate ready or lane durable owner"
-            )
-
-    def _decode_batch(self, row: sqlite3.Row) -> SyncBatch:
-        digest = bytes(row["payload_sha256"])
-        payload = self._open_payload(
-            "NioIngestBatch", (row["sequence"],), row, "payload"
-        )
-        try:
-            batch = _batch_from_payload(payload)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-        self._validate_batch_integrity(batch)
-        if (
-            batch.ref.sequence != row["sequence"]
-            or str(batch.ref.batch_id) != row["batch_id"]
-            or not hmac.compare_digest(batch.ref.sha256, digest)
-        ):
-            raise JournalIntegrityError("batch identity does not match stored row")
-        if batch.created_revision != row["created_revision"]:
-            raise JournalIntegrityError(
-                "batch created_revision does not match stored row"
-            )
-        owner = self._require_attached()
-        if (
-            batch.account_id != owner.account_id
-            or batch.device_id != owner.device_id
-            or batch.consumer != owner.binding
-            or batch.ref.stream_id != owner.stream_id
-        ):
-            raise JournalIntegrityError("batch owner does not match journal owner")
-        self._validate_batch_items(batch)
-        self._validate_batch_has_no_source_owner(batch)
-        return batch
-
-    def _decode_ready_row(self, row: sqlite3.Row) -> ReadyRecord:
-        payload = self._open_payload(
-            "NioIngestReadyRecord", (row["item_id"],), row, "payload"
-        )
-        envelope = _load_json_object(payload)
-        if tuple(envelope) != _READY_FIELDS:
-            raise JournalIntegrityError("ready authenticated envelope is invalid")
-        ready_order = envelope["ready_order"]
-        created_revision = envelope["created_revision"]
-        source_frame_value = envelope["source_frame_id"]
-        if type(ready_order) is not int or type(created_revision) is not int:
-            raise JournalIntegrityError("ready authenticated metadata is invalid")
-        try:
-            source_frame_id = (
-                UUID(source_frame_value) if source_frame_value is not None else None
-            )
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError("ready source_frame_id is invalid") from error
-        try:
-            record = _record_from_dict(envelope["record"])
-            record_payload = _canonical_json(_record_to_dict(record))
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "ready authenticated record is invalid"
-            ) from error
-        if envelope["canonical_bytes"] != len(record_payload):
-            raise JournalIntegrityError(
-                "ready canonical_bytes does not match canonical payload"
-            )
-        actual_id = self._validated_record_id(record)
-        item_kind = "event" if type(record) is EventRecord else "loss"
-        if actual_id != envelope["item_id"]:
-            raise JournalIntegrityError("ready record identity does not match row")
-        expected_sequence = (
-            record.room_sequence if isinstance(record, EventRecord) else None
-        )
-        authenticated = (
-            envelope["item_id"],
-            envelope["item_kind"],
-            record.room_id,
-            record.membership_epoch,
-            expected_sequence,
-            ready_order,
-            str(source_frame_id) if source_frame_id is not None else None,
-            envelope["canonical_bytes"],
-            created_revision,
-        )
-        columns = tuple(
-            row[name]
-            for name in (
-                "item_id",
-                "item_kind",
-                "room_id",
-                "membership_epoch",
-                "room_sequence",
-                "ready_order",
-                "source_frame_id",
-                "canonical_bytes",
-                "created_revision",
-            )
-        )
-        if envelope["item_kind"] != item_kind or authenticated != columns:
-            raise JournalIntegrityError(
-                "ready record columns do not match authenticated payload"
-            )
-        try:
-            ready = ReadyRecord(
-                ready_order,
-                record,
-                source_frame_id,
-                envelope["canonical_bytes"],
-                created_revision,
-            )
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-        self._validate_ready_record(ready)
-        return ready
-
-    def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]:
-        self._require_attached()
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("limit must be positive")
-        rows = self.connection.execute(
-            """SELECT ready_order, item_id, item_kind, source_frame_id, room_id,
-                   membership_epoch, room_sequence, payload_ciphertext,
-                   payload_sha256, canonical_bytes, created_revision
-            FROM NioIngestReadyRecord
-            WHERE account_id = ?
-            ORDER BY ready_order, item_id
-            LIMIT ?""",
-            (self.account_id, limit),
-        ).fetchall()
-        return tuple(self._decode_ready_row(row) for row in rows)
-
-    def _decode_room_state(self, row: sqlite3.Row) -> RoomState:
-        try:
-            payload = self._open_payload(
-                "NioIngestRoomState", (row["room_id"],), row, "state"
-            )
-            envelope = _load_json_object(payload)
-            if tuple(envelope) != _ROOM_STATE_FIELDS:
-                raise ValueError("room state envelope fields are not canonical")
-            snapshot_value = envelope["snapshot"]
-            baseline_value = envelope["membership_baseline"]
-            state = RoomState(
-                room_id=envelope["room_id"],
-                current_membership_epoch=envelope["current_membership_epoch"],
-                next_room_sequence=envelope["next_room_sequence"],
-                hydration_status=RoomHydrationStatus(envelope["hydration_status"]),
-                snapshot=(
-                    _room_snapshot_from_dict(snapshot_value)
-                    if snapshot_value is not None
-                    else None
-                ),
-                membership_baseline=(
-                    _membership_baseline_from_dict(baseline_value)
-                    if baseline_value is not None
-                    else None
-                ),
-                updated_revision=envelope["updated_revision"],
-            )
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "room state authenticated envelope is invalid"
-            ) from error
-        if payload != self._room_state_payload(state, state.updated_revision):
-            raise JournalIntegrityError(
-                "room state authenticated envelope is not canonical"
-            )
-        authenticated = (
-            state.room_id,
-            state.current_membership_epoch,
-            state.next_room_sequence,
-            state.hydration_status.value,
-            state.updated_revision,
-        )
-        columns = tuple(
-            row[name]
-            for name in (
-                "room_id",
-                "current_membership_epoch",
-                "next_room_sequence",
-                "hydration_status",
-                "updated_revision",
-            )
-        )
-        if authenticated != columns:
-            raise JournalIntegrityError(
-                "room state columns do not match authenticated payload"
-            )
-        return state
-
-    def _decode_room_lane(
-        self,
-        row: sqlite3.Row,
-        transport_kind: TransportKind,
-    ) -> RoomLane:
-        try:
-            payload = self._open_payload(
-                "NioIngestRoomLane",
-                (row["room_id"], row["membership_epoch"]),
-                row,
-                "lane_state",
-            )
-            envelope = _load_json_object(payload)
-            if tuple(envelope) != _ROOM_LANE_FIELDS:
-                raise ValueError("room lane envelope fields are not canonical")
-            gap_value = envelope["recovery_gap"]
-            lifecycle_value = envelope["pending_lifecycle"]
-            lifecycle = (
-                _record_from_exact_dict(lifecycle_value)
-                if lifecycle_value is not None
-                else None
-            )
-            if lifecycle is not None and type(lifecycle) is not EventRecord:
-                raise ValueError("lifecycle barrier is not an EventRecord")
-            lane = RoomLane(
-                room_id=envelope["room_id"],
-                membership_epoch=envelope["membership_epoch"],
-                lane_status=LaneStatus(envelope["lane_status"]),
-                held_record_count=envelope["held_record_count"],
-                held_canonical_bytes=envelope["held_canonical_bytes"],
-                release_phase=ReleasePhase(envelope["release_phase"]),
-                ready_order=envelope["ready_order"],
-                next_held_ordinal=envelope["next_held_ordinal"],
-                successor_membership_epoch=envelope["successor_membership_epoch"],
-                recovery_gap=(
-                    _recovery_gap_from_dict(gap_value)
-                    if gap_value is not None
-                    else None
-                ),
-                pending_lifecycle=lifecycle,
-                updated_revision=envelope["updated_revision"],
-            )
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "room lane authenticated envelope is invalid"
-            ) from error
-        if payload != self._room_lane_payload(lane, lane.updated_revision):
-            raise JournalIntegrityError(
-                "room lane authenticated envelope is not canonical"
-            )
-        authenticated = (
-            lane.room_id,
-            lane.membership_epoch,
-            lane.lane_status.value,
-            lane.held_record_count,
-            lane.held_canonical_bytes,
-            lane.release_phase.value,
-            lane.ready_order,
-            lane.next_held_ordinal,
-            lane.successor_membership_epoch,
-            lane.updated_revision,
-        )
-        columns = tuple(
-            row[name]
-            for name in (
-                "room_id",
-                "membership_epoch",
-                "lane_status",
-                "held_record_count",
-                "held_canonical_bytes",
-                "release_phase",
-                "ready_order",
-                "next_held_ordinal",
-                "successor_membership_epoch",
-                "updated_revision",
-            )
-        )
-        if authenticated != columns:
-            raise JournalIntegrityError(
-                "room lane columns do not match authenticated payload"
-            )
-        self._validate_room_lane_transport(lane, transport_kind)
-        return lane
-
-    @staticmethod
-    def _validate_room_aggregate(state: RoomState, lanes: tuple[RoomLane, ...]) -> None:
-        if not lanes:
-            raise JournalIntegrityError("room state has no membership lane")
-        try:
-            RoomAggregate(state, lanes[-1], lanes[:-1])
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(str(error)) from error
-
-    def _load_room_aggregates(
-        self,
-        room_ids: frozenset[str],
-    ) -> dict[str, RoomAggregate]:
-        owner = self._require_attached()
-        if not room_ids:
-            return {}
-        ordered_ids = tuple(sorted(room_ids))
-        placeholders = ",".join("?" for _ in ordered_ids)
-        state_rows = self.connection.execute(
-            "SELECT * FROM NioIngestRoomState "
-            f"WHERE account_id = ? AND room_id IN ({placeholders}) "
-            "ORDER BY room_id",
-            (self.account_id, *ordered_ids),
-        ).fetchall()
-        lane_rows = self.connection.execute(
-            "SELECT * FROM NioIngestRoomLane "
-            f"WHERE account_id = ? AND room_id IN ({placeholders}) "
-            "ORDER BY room_id, membership_epoch",
-            (self.account_id, *ordered_ids),
-        ).fetchall()
-        states = {row["room_id"]: self._decode_room_state(row) for row in state_rows}
-        lanes_by_room: dict[str, list[RoomLane]] = {}
-        for row in lane_rows:
-            lanes_by_room.setdefault(row["room_id"], []).append(
-                self._decode_room_lane(row, owner.transport_kind)
-            )
-        if set(lanes_by_room) - set(states):
-            raise JournalIntegrityError("membership lane exists without room state")
-
-        aggregates: dict[str, RoomAggregate] = {}
-        for room_id, state in states.items():
-            lanes = tuple(lanes_by_room.get(room_id, ()))
-            self._validate_room_aggregate(state, lanes)
-            aggregates[room_id] = RoomAggregate(state, lanes[-1], lanes[:-1])
-        return aggregates
-
-    def load_rooms(
-        self,
-        room_ids: frozenset[str],
-    ) -> dict[str, RoomAggregate]:
-        if type(room_ids) is not frozenset or any(
-            type(room_id) is not str for room_id in room_ids
-        ):
-            raise TypeError("room_ids must be a frozenset of str")
-        owner = self._require_attached()
-        aggregates = self._load_room_aggregates(room_ids)
-        stored_effects = self._load_network_effect_rows_for_rooms(room_ids, owner)
-        self._validate_network_effect_graph(
-            aggregates,
-            {
-                stored.effect.request.effect_id: stored.effect
-                for stored in stored_effects
-            },
-        )
-        return aggregates

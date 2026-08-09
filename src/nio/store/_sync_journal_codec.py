@@ -49,11 +49,14 @@ class EncryptedRowCodec:
         table: str,
         primary_key: tuple[str | int | UUID, ...],
         digest: bytes,
+        header: bytes,
     ) -> bytes:
         if type(table) is not str or not table:
             raise TypeError("table must be a nonempty str")
         if type(digest) is not bytes or len(digest) != hashlib.sha256().digest_size:
             raise TypeError("digest must be a SHA-256 bytes value")
+        if type(header) is not bytes:
+            raise TypeError("header must be bytes")
         fields = (
             str(SCHEMA_VERSION).encode(),
             table.encode(),
@@ -61,6 +64,7 @@ class EncryptedRowCodec:
             str(self.stream_id).encode(),
             self._primary_key_payload(primary_key),
             digest,
+            header,
         )
         return _AAD_DOMAIN + b"".join(_length_frame(value) for value in fields)
 
@@ -69,9 +73,10 @@ class EncryptedRowCodec:
         table: str,
         primary_key: tuple[str | int | UUID, ...],
         payload: bytes,
+        header: bytes = b"",
     ) -> tuple[bytes, bytes]:
         digest = hashlib.sha256(payload).digest()
-        return self.encrypt(table, primary_key, payload, digest), digest
+        return self.encrypt(table, primary_key, payload, digest, header), digest
 
     def encrypt(
         self,
@@ -79,6 +84,7 @@ class EncryptedRowCodec:
         primary_key: tuple[str | int | UUID, ...],
         payload: bytes,
         digest: bytes | None = None,
+        header: bytes = b"",
     ) -> bytes:
         if type(payload) is not bytes:
             raise TypeError("payload must be bytes")
@@ -88,7 +94,7 @@ class EncryptedRowCodec:
             raise JournalIntegrityError("payload digest does not match plaintext")
         nonce = os.urandom(_NONCE_SIZE)
         cipher = AES.new(self._key, AES.MODE_GCM, nonce=nonce, mac_len=_TAG_SIZE)
-        cipher.update(self._aad(table, primary_key, digest))
+        cipher.update(self._aad(table, primary_key, digest, header))
         encrypted, tag = cipher.encrypt_and_digest(payload)
         return bytes((SCHEMA_VERSION,)) + nonce + tag + encrypted
 
@@ -98,6 +104,7 @@ class EncryptedRowCodec:
         primary_key: tuple[str | int | UUID, ...],
         ciphertext: bytes,
         digest: bytes,
+        header: bytes = b"",
     ) -> bytes:
         if (
             type(ciphertext) is not bytes
@@ -113,7 +120,7 @@ class EncryptedRowCodec:
             mac_len=_TAG_SIZE,
         )
         try:
-            cipher.update(self._aad(table, primary_key, digest))
+            cipher.update(self._aad(table, primary_key, digest, header))
             payload = cipher.decrypt_and_verify(
                 ciphertext[tag_end:], ciphertext[nonce_end:tag_end]
             )
