@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 
-**Status:** Approved in conversation; awaiting review of this written specification
+**Status:** Approved for autonomous execution
 
 **Scope:** Architecture and delivery reset for the durable Matrix ingestion rewrite
 
@@ -394,7 +394,7 @@ Task 5 remains blocked unless each deletion needed by the final budget is either
 
 The named partial-symbol inventory remains contingency and is not required for the +5,997 conditional scenario.
 
-Bas Nijholt is the human approval owner unless he delegates that role by name in the pull request. At every task or every 500 added production lines, whichever occurs first, Codex stops, reports directly to that person, reforecasts, and waits for explicit approval before proceeding:
+Bas Nijholt is the human approval owner. On 2026-08-09 he delegated uninterrupted execution of this plan to Codex. At every task or every 500 added production lines, whichever occurs first, Codex reports directly, reforecasts, and continues without waiting while every hard constraint still passes:
 
 1. production additions, deletions, and net by repository;
 2. cumulative net versus the fixed bases;
@@ -411,6 +411,8 @@ Work stops before the next task if:
 - a required deletion has no named replacement and consumer inventory;
 - a deferred invariant has no owner before activation; or
 - performance exceeds its approved budget.
+
+When a stop condition is reached, Codex must first reduce scope, delete superseded implementation, or redesign the next checkpoint to restore compliance, then continue. It requests another decision only when no compliant in-scope path remains.
 
 The status may also be recorded in the ledger, but the ledger never substitutes for a direct report and human decision.
 
