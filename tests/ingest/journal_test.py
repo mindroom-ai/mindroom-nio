@@ -3,6 +3,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 import warnings
 from pathlib import Path
 from uuid import UUID
@@ -55,9 +56,11 @@ from nio.ingest.serialization import (
     canonical_batch_payload,
 )
 from nio.exceptions import LocalProtocolError
-from nio.store import SqliteStore
+from nio.crypto import OlmAccount
+from nio.store import DefaultStore, MatrixStore, SqliteStore
 from nio.store._sync_journal import SqliteIngestionJournal
 from nio.store._sync_journal_codec import EncryptedRowCodec
+from nio.store.database import use_database
 from nio.store.sync_journal import (
     open_ingestion_store,
 )
@@ -810,6 +813,155 @@ def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
     replacement.close()
 
 
+def test_every_decorated_database_entrypoint_checks_ownership_first() -> None:
+    class RevokedStoreProbe:
+        models = ()
+
+        def _database_operation(self):
+            raise LocalProtocolError("ownership lease is revoked")
+
+        @property
+        def database(self):
+            raise AssertionError("database was accessed before the ownership lease")
+
+    probe = RevokedStoreProbe()
+    decorated = []
+    for store_class in (MatrixStore, DefaultStore, SqliteStore):
+        for method in vars(store_class).values():
+            if (
+                callable(method)
+                and hasattr(method, "__wrapped__")
+                and not isinstance(method, (staticmethod, classmethod))
+                and method.__name__ != "__repr__"
+            ):
+                decorated.append(method)
+                with pytest.raises(LocalProtocolError, match="ownership lease"):
+                    method(probe)
+
+    assert decorated
+
+
+@pytest.mark.parametrize("operation", ("load", "save", "upgrade"))
+def test_retained_store_is_revoked_before_a_replacement_owner_opens(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    stale_store = bootstrap.open_matrix_store(SqliteStore)
+    stale_store.save_account(OlmAccount())
+    bootstrap.close()
+
+    replacement = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    current_store = replacement.open_matrix_store(SqliteStore)
+    try:
+        operations = {
+            "load": stale_store.load_account,
+            "save": lambda: stale_store.save_account(OlmAccount()),
+            "upgrade": stale_store.upgrade_to_v2,
+        }
+        with pytest.raises(LocalProtocolError, match="ownership lease"):
+            operations[operation]()
+        assert stale_store.database.is_closed()
+
+        assert current_store.load_account() is not None
+        current_store.save_account(OlmAccount())
+    finally:
+        replacement.close()
+
+
+def test_store_lease_remains_revoked_when_database_close_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    real_close = store.database.close
+
+    def fail_close() -> None:
+        raise RuntimeError("injected database close failure")
+
+    monkeypatch.setattr(store.database, "close", fail_close)
+    with pytest.raises(RuntimeError, match="injected database close failure"):
+        bootstrap.close()
+
+    with pytest.raises(LocalProtocolError, match="ownership lease"):
+        store.load_account()
+    with pytest.raises(LocalProtocolError, match="writer lock"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name="journal.db",
+        )
+
+    monkeypatch.setattr(store.database, "close", real_close)
+    bootstrap.close()
+
+
+def test_bootstrap_close_waits_for_an_inflight_store_operation(
+    tmp_path: Path,
+) -> None:
+    operation_entered = threading.Event()
+    allow_operation = threading.Event()
+
+    class PausingStore(SqliteStore):
+        @use_database
+        def pausing_load_account(self):
+            operation_entered.set()
+            assert allow_operation.wait(timeout=5)
+            return self._get_account()
+
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(PausingStore)
+    store.save_account(OlmAccount())
+    outcomes: list[object] = []
+
+    def load_account() -> None:
+        try:
+            outcomes.append(store.pausing_load_account())
+        except BaseException as error:
+            outcomes.append(error)
+
+    operation = threading.Thread(target=load_account)
+    operation.start()
+    assert operation_entered.wait(timeout=5)
+    release = threading.Timer(0.1, allow_operation.set)
+    release.start()
+    started = time.monotonic()
+    try:
+        bootstrap.close()
+    finally:
+        allow_operation.set()
+        operation.join(timeout=5)
+        release.join(timeout=5)
+
+    assert len(outcomes) == 1
+    assert not isinstance(outcomes[0], BaseException)
+    assert time.monotonic() - started >= 0.09
+    with pytest.raises(LocalProtocolError, match="ownership lease"):
+        store.load_account()
+
+
 def test_direct_bootstrap_authority_is_consumed_and_registered_once(
     tmp_path: Path,
 ) -> None:
@@ -1038,6 +1190,46 @@ def test_inherited_child_cannot_attach_or_open_e2ee_store(tmp_path: Path) -> Non
         assert all("acquiring process" in outcome for outcome in outcomes)
         assert bootstrap._journal.load_owner().revision == 0
         assert "accounts" not in _table_names(tmp_path / "journal.db")
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_inherited_child_cannot_read_or_write_an_open_e2ee_store(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    store.save_account(OlmAccount())
+
+    def inherited_operations() -> tuple[str, ...]:
+        outcomes = (
+            _operation_outcome(store.load_account),
+            _operation_outcome(lambda: store.save_account(OlmAccount())),
+            _operation_outcome(bootstrap.close),
+        )
+        store.database.close()
+        return outcomes
+
+    try:
+        outcomes = _fork_outcomes(inherited_operations)
+        assert len(outcomes) == 3
+        assert all("acquiring process" in outcome for outcome in outcomes)
+
+        assert store.load_account() is not None
+        store.save_account(OlmAccount())
+        with pytest.raises(LocalProtocolError, match="writer lock"):
+            open_ingestion_store(
+                tmp_path,
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                database_name="journal.db",
+            )
     finally:
         bootstrap.close()
 

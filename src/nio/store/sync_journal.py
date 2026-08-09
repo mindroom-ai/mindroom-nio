@@ -17,6 +17,30 @@ if TYPE_CHECKING:
     from .database import MatrixStore
 
 
+class _StoreOwnershipLease:
+    def __init__(self) -> None:
+        self._owner_pid = os.getpid()
+        self._active = True
+        self._lock = threading.RLock()
+
+    def _assert_process_owner(self) -> None:
+        if os.getpid() != self._owner_pid:
+            raise LocalProtocolError("ownership lease belongs to acquiring process")
+
+    @contextmanager
+    def operation(self) -> Iterator[None]:
+        self._assert_process_owner()
+        with self._lock:
+            if not self._active:
+                raise LocalProtocolError("store ownership lease is revoked")
+            yield
+
+    def revoke(self) -> None:
+        self._assert_process_owner()
+        with self._lock:
+            self._active = False
+
+
 class StoreBootstrap:
     """Single-owner preflight handle retaining the ingestion writer lock."""
 
@@ -26,17 +50,19 @@ class StoreBootstrap:
         self._store_lock = threading.RLock()
 
     @contextmanager
-    def _claim_store(self, store: MatrixStore) -> Iterator[None]:
+    def _claim_store(self, store: MatrixStore) -> Iterator[_StoreOwnershipLease]:
         self._journal._assert_file_owner()
         with self._store_lock:
             if self._store is not None:
                 raise LocalProtocolError(
                     "StoreBootstrap can open MatrixStore only once"
                 )
+            lease = _StoreOwnershipLease()
             self._store = store
             try:
-                yield
+                yield lease
             except BaseException:
+                lease.revoke()
                 self._store = None
                 raise
 
@@ -84,8 +110,10 @@ class StoreBootstrap:
     def close(self) -> None:
         self._journal._writer_lock.assert_process_owner()
         with self._store_lock:
-            if self._store is not None and not self._store.database.is_closed():
-                self._store.database.close()
+            if self._store is not None:
+                self._store._revoke_ingestion_lease()
+                if not self._store.database.is_closed():
+                    self._store.database.close()
             self._journal.close()
 
 

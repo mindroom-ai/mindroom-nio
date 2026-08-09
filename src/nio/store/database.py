@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -77,7 +78,7 @@ if TYPE_CHECKING:
         PendingTimelineEvent,
         RecoveryGap,
     )
-    from .sync_journal import StoreBootstrap
+    from .sync_journal import StoreBootstrap, _StoreOwnershipLease
 
 
 _RECOVERY_PAYLOAD_VERSION = 1
@@ -119,33 +120,29 @@ def _recovery_payload_aad(
 
 
 def use_database(fn):
-    """
-    Ensure that the correct database context is used for the wrapped function.
-    """
+    """Ensure that the correct database context is used."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self.database.bind_ctx(self.models):
-            return fn(self, *args, **kwargs)
+        with self._database_operation():
+            with self.database.bind_ctx(self.models):
+                return fn(self, *args, **kwargs)
 
     return inner
 
 
 def use_database_atomic(fn):
-    """
-    Ensure that the correct database context is used for the wrapped function.
-
-    This also ensures that the database transaction will be atomic.
-    """
+    """Bind the correct database and make non-queue writes atomic."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self.database.bind_ctx(self.models):
-            if isinstance(self.database, SqliteQueueDatabase):
-                return fn(self, *args, **kwargs)
-            else:
-                with self.database.atomic():
+        with self._database_operation():
+            with self.database.bind_ctx(self.models):
+                if isinstance(self.database, SqliteQueueDatabase):
                     return fn(self, *args, **kwargs)
+                else:
+                    with self.database.atomic():
+                        return fn(self, *args, **kwargs)
 
     return inner
 
@@ -182,6 +179,9 @@ class MatrixStore:
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
     _ingestion_bootstrap: StoreBootstrap | None = field(default=None, repr=False)
+    _ingestion_lease: _StoreOwnershipLease | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -199,6 +199,15 @@ class MatrixStore:
             },
         )
 
+    def _database_operation(self):
+        lease = self._ingestion_lease
+        return lease.operation() if lease is not None else nullcontext()
+
+    def _revoke_ingestion_lease(self) -> None:
+        assert self._ingestion_lease is not None
+        self._ingestion_lease.revoke()
+
+    @use_database
     def upgrade_to_v2(self):
         with self.database.bind_ctx([DeviceKeys_v1]):
             self.database.drop_tables(
@@ -213,17 +222,20 @@ class MatrixStore:
             self.database.create_tables([DeviceKeys, DeviceTrustState])
         self._update_version(2)
 
+    @use_database
     def upgrade_to_v3(self):
         with self.database.bind_ctx(self.models):
             self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
 
+    @use_database
     def upgrade_to_v5(self):
         with self.database.bind_ctx(self.models):
             self.database.drop_tables([SlidingWindowTokens], safe=True)
             self.database.create_tables([SlidingWindowTokens])
         self._update_version(5)
 
+    @use_database
     def upgrade_to_v6(self):
         with self.database.bind_ctx(self.models):
             table = PendingTimelineEvents._meta.table_name
@@ -420,7 +432,8 @@ class MatrixStore:
             return
         if bootstrap is not None:
             self._ingestion_bootstrap = None
-            with bootstrap._claim_store(self):
+            with bootstrap._claim_store(self) as lease:
+                self._ingestion_lease = lease
                 if not database_has_ingestion_marker(self.database_path):
                     raise LocalProtocolError(
                         "StoreBootstrap marker disappeared before store open"
