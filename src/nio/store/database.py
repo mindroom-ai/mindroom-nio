@@ -1644,8 +1644,8 @@ class DefaultStore(MatrixStore):
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
-    def __post_init__(self):
-        super().__post_init__()
+    def __post_init__(self, _ingestion_bootstrap=None):
+        super().__post_init__(_ingestion_bootstrap)
 
         trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
         self.trust_db = KeyStore(os.path.join(self.store_path, trust_file_path))
