@@ -968,6 +968,15 @@ Tests, fixtures, generated locks, and this document are excluded. These are plan
 
 At each checkpoint, replace estimates for completed work with actual `git diff --stat`/language-aware production counts and reforecast the remaining rows. Crossing +6,000 projected net or a 50% row overrun triggers review before more implementation.
 
+Task 3 plus Task 4 actuals at commit `4f1b850` are +2,163 production lines
+relative to the Task 2 head, compared with the 400–700 forecast. The Task 4
+slice after its Task 3 prerequisite checkpoint is +1,321/−57 (+1,264 net).
+This exceeds the 50% row threshold and triggered an independent architecture/size
+review. The review approved the pure adapter seams and attributed the overrun to
+load-bearing request authentication, persisted dialect negotiation/range state,
+membership proof, and first-class parity; do not compress these correctness
+contracts merely to meet the estimate. Reforecast again at Task 6 and Task 7.
+
 ---
 
 ## Delivery and Branch Strategy
@@ -1116,6 +1125,33 @@ Commit: `feat(ingest): normalize classic sync frames`
 - [ ] Test Sliding E2EE extension output is byte-equivalent to Classic device-list/key-count control input for the crypto worker.
 - [ ] Test that the connection-specific `pos` never becomes a cross-restart continuity proof.
 - [ ] Keep transport-specific membership extraction in this adapter and shared membership-epoch rules in `membership.py`.
+
+Resolved implementation contract at `4f1b850`:
+
+- The exact persisted `SlidingCursor` contains independent `pos` and to-device
+  `since`, a coordinator-seeded connection UUID, its logical connection name, the
+  reserved range end and immutable page size, negotiated range-ack mode, and the
+  range-complete flag. A reset retains to-device/range configuration, clears `pos`
+  and completion, returns ack mode to unknown, and explicitly marks room history
+  uncertain.
+- Requests always carry deterministic MSC3575 `txn_id` evidence. A new connection
+  negotiates `TXN_ECHO` when the server echoes it and `RESPONSE_BOUND` when native
+  Synapse omits it. Once echo mode is observed, omission fails closed; stale valid
+  echoes may map payload/`pos`/to-device evidence but cannot expand or newly complete
+  all-room coverage.
+- Reserved range completion overscans one index: completion requires
+  `range_end >= reported_count`, which is harmless for inclusive servers and avoids
+  archived conduwuit's exclusive-end bug. Configured room extensions are scoped to
+  the reserved all-room list, exact wildcard input is normalized to that list, and
+  to-device uses an authenticated positive internal limit.
+- Missing top-level room membership is derived from the latest exact own-member
+  evidence in state plus only the `num_live` timeline suffix. Explicit and derived
+  sections must agree. Initial/expanded rooms without exact proof remain unsafe.
+- `all_rooms_coverage_complete` proves only that the reserved room-ID range was
+  acknowledged. It never proves authoritative room state or crypto readiness.
+  Task 8 must keep any initial/expanded Sliding room with incomplete required-state
+  proof (including quiet initial Tuwunel responses and archived conduwuit member
+  wildcard failure) `PENDING` until authenticated full-state hydration succeeds.
 
 Run red, then green:
 
@@ -1284,7 +1320,7 @@ Commit: `feat(ingest): make crypto work replay safe`
 - [ ] Test a changed consumer/journal generation fails before HTTP, batch delivery, or ack. There is no position-preserving rebind API; only a matching database-pair restore or Task 13's explicit destructive reset against a different journal generation can recover.
 - [ ] Test terminal auth/protocol/store/crypto failures drain already-durable batches and then raise through `next_batch()`/`wait_closed()`; transient failures retry without invoking a response callback.
 - [ ] Test `wait_ready()` completes only after the first source frame is durably staged and reduced, including a genuinely empty frame, and raises the terminal session failure instead of hanging.
-- [ ] Test `wait_baseline_hydrated()` independently: Classic full-state, paged Sliding all-room coverage, fallback room-state requests, retryable pending state, and terminal unavailable state. No outbound crypto request for a pending/unavailable room reaches the worker.
+- [ ] Test `wait_baseline_hydrated()` independently: Classic full-state, paged Sliding all-room coverage, fallback room-state requests, retryable pending state, and terminal unavailable state. Sliding `all_rooms_coverage_complete` is only room-ID coverage: an initial/expanded room with incomplete required-state proof remains `PENDING` and must complete authenticated full-state hydration before becoming `READY`, including quiet initial Tuwunel responses and archived conduwuit wildcard failure. No outbound crypto request for a pending/unavailable room reaches the worker.
 - [ ] Expose immutable, non-authoritative observability for records and canonical bytes per batch; record/byte fill ratios; raw-frame, recovery-page, reducer, materialization, crypto-group, and acknowledgement commit counts; staged-frame/ready-lane/unacknowledged-batch depths; oldest unacknowledged-batch age; and commit-latency p50/p95/max by transaction class. Metrics are updated only after the measured transition resolves, never execute a callback, and never add a correctness transaction.
 - [ ] With a fake monotonic clock and recording journal/crypto fakes, prove counters increment once per committed unit rather than once per record, gauges fall after drain, oldest-batch age survives ordinary polling, and failed/rolled-back transitions are labeled separately rather than counted as commits.
 - [ ] Instrument a one-room commit in a 10,000-room synthetic directory and assert only that key is loaded, allocated, and replaced; all unrelated snapshot identities remain unchanged. Iterating an explicit directory snapshot while later commits occur must remain stable, while no commit copies all rooms.
