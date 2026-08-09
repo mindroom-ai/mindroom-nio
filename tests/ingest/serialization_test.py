@@ -179,6 +179,13 @@ def test_sync_batch_recomputes_integrity_on_dataclass_replace() -> None:
         dataclasses.replace(batch, ref=dataclasses.replace(batch.ref, sha256=b""))
 
 
+def test_batch_ref_digest_requires_exact_immutable_bytes() -> None:
+    batch = make_batch(event_record())
+
+    with pytest.raises(TypeError, match="sha256.*bytes"):
+        dataclasses.replace(batch.ref, sha256=bytearray(batch.ref.sha256))  # type: ignore[arg-type]
+
+
 def test_sync_batch_rejects_zero_records_on_construction_and_decode() -> None:
     with pytest.raises(ValueError, match="at least one record"):
         SyncBatch(
@@ -214,6 +221,10 @@ def test_sync_batch_records_are_tuple_only() -> None:
             1,
             [event_record()],  # type: ignore[arg-type]
         )
+
+    batch = make_batch(event_record())
+    with pytest.raises(TypeError, match="records.*EventRecord or LossRecord"):
+        dataclasses.replace(batch, records=(object(),))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -327,6 +338,50 @@ def test_system_loss_rejects_kind_or_operation_inconsistent_with_loss_id() -> No
     ):
         with pytest.raises(BatchIntegrityError, match="loss_id"):
             make_batch(dataclasses.replace(valid_loss, origin=inconsistent_origin))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'"kind":"timeline"', b'"kind":"unknown"'),
+        (b'"provenance":"live"', b'"provenance":"unknown"'),
+        (b'"transport":"classic"', b'"transport":"unknown"'),
+    ],
+)
+def test_decode_rejects_unknown_event_enum_strings(old: bytes, new: bytes) -> None:
+    with pytest.raises(ValueError):
+        _batch_from_payload(GOLDEN_EVENT_PAYLOAD.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'"kind":"fresh_start"', b'"kind":"unknown"'),
+        (b'"reason":"baseline_lost"', b'"reason":"unknown"'),
+    ],
+)
+def test_decode_rejects_unknown_loss_enum_strings(old: bytes, new: bytes) -> None:
+    origin = SystemOrigin(SystemOriginKind.FRESH_START, OPERATION_ID)
+    boundary = LossBoundary(None, None, None, None)
+    loss = LossRecord(
+        loss_id(
+            origin,
+            "!system:example.org",
+            0,
+            LossReason.BASELINE_LOST,
+            boundary,
+        ),
+        origin,
+        "!system:example.org",
+        0,
+        LossReason.BASELINE_LOST,
+        boundary,
+        b"{}",
+    )
+    payload = canonical_batch_payload(make_batch(loss))
+
+    with pytest.raises(ValueError):
+        _batch_from_payload(payload.replace(old, new))
 
 
 def test_room_snapshot_canonical_round_trip_includes_own_identity() -> None:

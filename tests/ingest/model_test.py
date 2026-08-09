@@ -28,6 +28,15 @@ CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 OPERATION_ID = UUID("33333333-3333-3333-3333-333333333333")
 
 
+class ForeignWireValue(StrEnum):
+    CLASSIC = "classic"
+    FRESH_START = "fresh_start"
+    TIMELINE = "timeline"
+    LIVE = "live"
+    FETCH_FAILED = "fetch_failed"
+    JOIN = "join"
+
+
 def test_wire_enums_have_stable_string_values() -> None:
     assert issubclass(TransportKind, StrEnum)
     assert {member.name: member.value for member in TransportKind} == {
@@ -159,6 +168,153 @@ def test_collection_fields_require_tuples() -> None:
             None,
             [],  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.parametrize(
+    "make_value",
+    [
+        lambda: ConsumerBootstrap(
+            OPERATION_ID,
+            ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+            1,
+            (),
+            bytearray(b"digest"),  # type: ignore[arg-type]
+        ),
+        lambda: EventRecord(
+            "$event",
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            1,
+            "$event",
+            TimelineEventProvenance.LIVE,
+            bytearray(b"{}"),  # type: ignore[arg-type]
+            None,
+        ),
+        lambda: EventRecord(
+            "$event",
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            1,
+            "$event",
+            TimelineEventProvenance.LIVE,
+            b"{}",
+            memoryview(b"{}"),  # type: ignore[arg-type]
+        ),
+        lambda: RoomSnapshot(
+            "!room:example.org",
+            1,
+            "@me:example.org",
+            "join",
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bytearray(b"{}"),  # type: ignore[arg-type]
+            (),
+        ),
+        lambda: LossRecord(
+            "loss-id",
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            LossReason.FETCH_FAILED,
+            LossBoundary(None, None, None, None),
+            bytearray(b"{}"),  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_public_bytes_fields_require_exact_immutable_bytes(make_value) -> None:
+    with pytest.raises(TypeError, match="bytes"):
+        make_value()
+
+
+def test_collection_fields_validate_every_nested_element() -> None:
+    with pytest.raises(TypeError, match="baseline_room_ids.*str"):
+        ConsumerBootstrap(
+            OPERATION_ID,
+            ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+            1,
+            (object(),),  # type: ignore[arg-type]
+            b"digest",
+        )
+
+    with pytest.raises(TypeError, match="members.*RoomMemberSnapshot"):
+        RoomSnapshot(
+            "!room:example.org",
+            1,
+            "@me:example.org",
+            "join",
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            (object(),),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "make_value",
+    [
+        lambda: RecordOrigin(ForeignWireValue.CLASSIC, 1, 2, 3),  # type: ignore[arg-type]
+        lambda: SystemOrigin(ForeignWireValue.FRESH_START, OPERATION_ID),  # type: ignore[arg-type]
+        lambda: EventRecord(
+            "$event",
+            ForeignWireValue.TIMELINE,  # type: ignore[arg-type]
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            1,
+            "$event",
+            TimelineEventProvenance.LIVE,
+            b"{}",
+            None,
+        ),
+        lambda: EventRecord(
+            "$event",
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            1,
+            "$event",
+            ForeignWireValue.LIVE,  # type: ignore[arg-type]
+            b"{}",
+            None,
+        ),
+        lambda: LossRecord(
+            "loss-id",
+            RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+            "!room:example.org",
+            1,
+            ForeignWireValue.FETCH_FAILED,  # type: ignore[arg-type]
+            LossBoundary(None, None, None, None),
+            b"{}",
+        ),
+        lambda: RoomMemberSnapshot(
+            "@alice:example.org",
+            ForeignWireValue.JOIN,  # type: ignore[arg-type]
+            "Alice",
+            None,
+            0,
+        ),
+    ],
+)
+def test_direct_construction_rejects_foreign_str_enum_values(make_value) -> None:
+    with pytest.raises(TypeError, match="must be"):
+        make_value()
 
 
 def test_event_record_rejects_system_origin() -> None:
