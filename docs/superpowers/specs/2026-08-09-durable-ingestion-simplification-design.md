@@ -425,10 +425,10 @@ This architecture is too large for one implementation plan. It is delivered as s
 3. **Crypto replay safety:** Task 7 and the shared E2EE/receipt transaction.
 4. **Coordinator and lifecycle:** Tasks 8-9 and their effects/commands.
 5. **MindRoom bot activation:** admission, minimal directory, crypto reach-through removal, provisioning, and canary.
-6. **Desktop migration:** separately approved after bot activation.
+6. **Desktop migration:** separately scoped after bot activation; it remains disabled for v2 accounts until implemented, but proceeds under the standing execution delegation once its written plan, line envelope, review, and hard constraints are complete.
 7. **Observation and deletion:** only after the relevant old path has passed its observation gate.
 
-Each subproject receives its own design/plan and line envelope before implementation. Approval of this architecture authorizes writing the Task 4.5 simplification implementation plan only; it does not pre-approve all later code.
+Each subproject receives its own design/plan and line envelope before implementation. After approving this architecture, Bas Nijholt explicitly delegated uninterrupted implementation of the whole plan to Codex: later subprojects still require their written plan, independent review, direct size/performance report, and passing hard constraints, but they do not pause for another approval. Codex continues automatically and asks for a decision only when no compliant in-scope redesign, deletion, or scope reduction can clear a hard stop.
 
 ## Acceptance Criteria for This Replan
 
@@ -441,4 +441,4 @@ The replan succeeds when:
 - every removed correctness guarantee has the named future owner above;
 - no deferred guarantee is needed by an enabled runtime path;
 - the written and measured budget gate is enforced directly with the human approval owner; and
-- Task 5 remains blocked until the simplified checkpoint's actual size, forecast, tests, and performance are approved.
+- Task 5 remains blocked until the simplified checkpoint's actual size, forecast, tests, and performance are reported and every approved hard constraint passes.
