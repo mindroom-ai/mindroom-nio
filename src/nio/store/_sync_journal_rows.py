@@ -12,28 +12,37 @@ from ..ingest.model import (
     EventRecord,
     LossReason,
     LossRecord,
-    RecordKind,
+    RecordOrigin,
     RoomHydrationStatus,
     SyncBatch,
+    TransportKind,
 )
 from ..ingest.serialization import (
     _batch_from_payload,
     _boundary_from_dict,
     _boundary_to_dict,
     _canonical_json,
-    _canonical_room_snapshot_payload,
     _decoded_bytes,
     _encoded_bytes,
     _load_json_object,
     _loss_id,
+    _membership_baseline_from_dict,
+    _membership_baseline_to_dict,
     _origin_from_dict,
     _origin_to_dict,
     _record_from_dict,
+    _record_from_exact_dict,
     _record_to_dict,
-    _room_snapshot_from_payload,
+    _recovery_gap_from_dict,
+    _recovery_gap_to_dict,
+    _room_snapshot_from_dict,
+    _room_snapshot_to_dict,
     canonical_batch_payload,
 )
 from ..ingest.state import (
+    LaneRecord,
+    LaneRecordKey,
+    LaneRecordSection,
     LaneStatus,
     OwnerView,
     ReadyRecord,
@@ -48,6 +57,43 @@ from ._sync_journal_preflight import _validate_source_cursor
 
 _FRAME_FIELDS = {"source_epoch", "request_id", "payload", "staged_revision"}
 _READY_FIELDS = {"ready_order", "record", "source_frame_id", "created_revision"}
+_ROOM_STATE_FIELDS = (
+    "room_id",
+    "current_membership_epoch",
+    "next_room_sequence",
+    "hydration_status",
+    "snapshot",
+    "membership_baseline",
+    "updated_revision",
+)
+_ROOM_LANE_FIELDS = (
+    "room_id",
+    "membership_epoch",
+    "lane_status",
+    "held_record_count",
+    "held_canonical_bytes",
+    "release_phase",
+    "ready_order",
+    "next_held_ordinal",
+    "successor_membership_epoch",
+    "recovery_gap",
+    "pending_lifecycle",
+    "updated_revision",
+)
+_LANE_RECORD_FIELDS = (
+    "room_id",
+    "membership_epoch",
+    "section",
+    "page_ordinal",
+    "record_ordinal",
+    "item_id",
+    "item_kind",
+    "source_frame_id",
+    "source_effect_id",
+    "canonical_bytes",
+    "record",
+    "created_revision",
+)
 
 
 class JournalRows:
@@ -64,14 +110,106 @@ class JournalRows:
         if cursor.rowcount == 0 and load() != expected:
             raise JournalIntegrityError(message)
 
-    def _write_room_state(self, state: RoomState, revision: int) -> None:
-        if state.snapshot is None:
-            ciphertext = digest = None
-        else:
-            payload = _canonical_room_snapshot_payload(state.snapshot)
-            ciphertext, digest = self._codec.seal(
-                "NioIngestRoomState", (state.room_id,), payload
+    @staticmethod
+    def _validate_record_transport(
+        record: EventRecord | LossRecord,
+        transport_kind: TransportKind,
+    ) -> None:
+        origin = record.origin
+        if type(origin) is RecordOrigin and origin.transport is not transport_kind:
+            raise JournalIntegrityError(
+                "record origin transport does not match immutable journal transport"
             )
+
+    @classmethod
+    def _validate_room_lane_transport(
+        cls,
+        lane: RoomLane,
+        transport_kind: TransportKind,
+    ) -> None:
+        try:
+            replace(lane)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+        if (
+            lane.recovery_gap is not None
+            and lane.recovery_gap.origin.transport is not transport_kind
+        ):
+            raise JournalIntegrityError(
+                "recovery gap transport does not match immutable journal transport"
+            )
+        if lane.pending_lifecycle is not None:
+            cls._validate_record_transport(
+                lane.pending_lifecycle,
+                transport_kind,
+            )
+
+    @classmethod
+    def _validate_lane_record_transport(
+        cls,
+        lane_record: LaneRecord,
+        transport_kind: TransportKind,
+    ) -> None:
+        try:
+            replace(lane_record)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+        cls._validate_record_transport(lane_record.record, transport_kind)
+
+    @staticmethod
+    def _room_state_payload(state: RoomState, revision: int) -> bytes:
+        return _canonical_json(
+            {
+                "room_id": state.room_id,
+                "current_membership_epoch": state.current_membership_epoch,
+                "next_room_sequence": state.next_room_sequence,
+                "hydration_status": state.hydration_status.value,
+                "snapshot": (
+                    _room_snapshot_to_dict(state.snapshot)
+                    if state.snapshot is not None
+                    else None
+                ),
+                "membership_baseline": (
+                    _membership_baseline_to_dict(state.membership_baseline)
+                    if state.membership_baseline is not None
+                    else None
+                ),
+                "updated_revision": revision,
+            }
+        )
+
+    @staticmethod
+    def _room_lane_payload(lane: RoomLane, revision: int) -> bytes:
+        return _canonical_json(
+            {
+                "room_id": lane.room_id,
+                "membership_epoch": lane.membership_epoch,
+                "lane_status": lane.lane_status.value,
+                "held_record_count": lane.held_record_count,
+                "held_canonical_bytes": lane.held_canonical_bytes,
+                "release_phase": lane.release_phase.value,
+                "ready_order": lane.ready_order,
+                "next_held_ordinal": lane.next_held_ordinal,
+                "successor_membership_epoch": lane.successor_membership_epoch,
+                "recovery_gap": (
+                    _recovery_gap_to_dict(lane.recovery_gap)
+                    if lane.recovery_gap is not None
+                    else None
+                ),
+                "pending_lifecycle": (
+                    _record_to_dict(lane.pending_lifecycle)
+                    if lane.pending_lifecycle is not None
+                    else None
+                ),
+                "updated_revision": revision,
+            }
+        )
+
+    def _write_room_state(self, state: RoomState, revision: int) -> None:
+        payload = self._room_state_payload(state, revision)
+        ciphertext, digest = self._codec.seal(
+            "NioIngestRoomState", (state.room_id,), payload
+        )
         self._transition_execute(
             "room_state",
             """INSERT INTO NioIngestRoomState (
@@ -97,34 +235,29 @@ class JournalRows:
         )
 
     def _write_room_lane(self, lane: RoomLane, revision: int) -> None:
-        if lane.pending_lifecycle is None:
-            ciphertext = digest = None
-        else:
-            payload = _canonical_json(_record_to_dict(lane.pending_lifecycle))
-            ciphertext, digest = self._codec.seal(
-                "NioIngestRoomLane.lifecycle",
-                (lane.room_id, lane.membership_epoch),
-                payload,
-            )
+        payload = self._room_lane_payload(lane, revision)
+        ciphertext, digest = self._codec.seal(
+            "NioIngestRoomLane",
+            (lane.room_id, lane.membership_epoch),
+            payload,
+        )
         self._transition_execute(
             "room_lane",
             """INSERT INTO NioIngestRoomLane (
                 account_id, room_id, membership_epoch, lane_status,
                 held_record_count, held_canonical_bytes, release_phase,
-                release_loss_id, ready_order, next_held_ordinal,
-                next_recovery_page, successor_membership_epoch,
-                pending_lifecycle_ciphertext, pending_lifecycle_sha256,
+                ready_order, next_held_ordinal, successor_membership_epoch,
+                lane_state_ciphertext, lane_state_sha256,
                 updated_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id, room_id, membership_epoch) DO UPDATE SET
                 lane_status = excluded.lane_status, held_record_count = excluded.held_record_count,
                 held_canonical_bytes = excluded.held_canonical_bytes, release_phase = excluded.release_phase,
-                release_loss_id = excluded.release_loss_id,
                 ready_order = excluded.ready_order, next_held_ordinal = excluded.next_held_ordinal,
-                next_recovery_page = excluded.next_recovery_page,
                 successor_membership_epoch = excluded.successor_membership_epoch,
-                pending_lifecycle_ciphertext = excluded.pending_lifecycle_ciphertext,
-                pending_lifecycle_sha256 = excluded.pending_lifecycle_sha256, updated_revision = excluded.updated_revision""",
+                lane_state_ciphertext = excluded.lane_state_ciphertext,
+                lane_state_sha256 = excluded.lane_state_sha256,
+                updated_revision = excluded.updated_revision""",
             (
                 self.account_id,
                 lane.room_id,
@@ -133,10 +266,8 @@ class JournalRows:
                 lane.held_record_count,
                 lane.held_canonical_bytes,
                 lane.release_phase.value,
-                lane.release_loss_id,
                 lane.ready_order,
                 lane.next_held_ordinal,
-                lane.next_recovery_page,
                 lane.successor_membership_epoch,
                 ciphertext,
                 digest,
@@ -262,6 +393,294 @@ class JournalRows:
             replace(ready, canonical_bytes=canonical_bytes, created_revision=revision),
             "ready record_id or ready_order collides with different contents",
         )
+
+    @staticmethod
+    def _lane_record_primary_key(
+        key: LaneRecordKey,
+    ) -> tuple[str | int, ...]:
+        return (
+            key.room_id,
+            key.membership_epoch,
+            key.section.value,
+            key.page_ordinal,
+            key.record_ordinal,
+        )
+
+    def _lane_record_payload(
+        self,
+        lane_record: LaneRecord,
+        item_id: str,
+        item_kind: str,
+        revision: int,
+    ) -> bytes:
+        key = lane_record.key
+        return _canonical_json(
+            {
+                "room_id": key.room_id,
+                "membership_epoch": key.membership_epoch,
+                "section": key.section.value,
+                "page_ordinal": key.page_ordinal,
+                "record_ordinal": key.record_ordinal,
+                "item_id": item_id,
+                "item_kind": item_kind,
+                "source_frame_id": (
+                    str(lane_record.source_frame_id)
+                    if lane_record.source_frame_id is not None
+                    else None
+                ),
+                "source_effect_id": (
+                    str(lane_record.source_effect_id)
+                    if lane_record.source_effect_id is not None
+                    else None
+                ),
+                "canonical_bytes": lane_record.canonical_bytes,
+                "record": _record_to_dict(lane_record.record),
+                "created_revision": revision,
+            }
+        )
+
+    def _write_lane_record(
+        self,
+        lane_record: LaneRecord,
+        revision: int,
+    ) -> None:
+        item_id = self._validated_record_id(lane_record.record)
+        item_kind = "event" if type(lane_record.record) is EventRecord else "loss"
+        record_payload = _canonical_json(_record_to_dict(lane_record.record))
+        if lane_record.canonical_bytes != len(record_payload):
+            raise JournalIntegrityError(
+                "lane record canonical_bytes does not match canonical payload"
+            )
+        payload = self._lane_record_payload(
+            lane_record,
+            item_id,
+            item_kind,
+            revision,
+        )
+        primary_key = self._lane_record_primary_key(lane_record.key)
+        ciphertext, digest = self._codec.seal(
+            "NioIngestLaneRecord",
+            primary_key,
+            payload,
+        )
+        cursor = self._transition_execute(
+            "lane_record_insert",
+            """INSERT INTO NioIngestLaneRecord (
+                account_id, room_id, membership_epoch, section,
+                page_ordinal, record_ordinal, item_id, item_kind,
+                source_frame_id, source_effect_id, payload_ciphertext,
+                payload_sha256, canonical_bytes, created_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING""",
+            (
+                self.account_id,
+                lane_record.key.room_id,
+                lane_record.key.membership_epoch,
+                lane_record.key.section.value,
+                lane_record.key.page_ordinal,
+                lane_record.key.record_ordinal,
+                item_id,
+                item_kind,
+                (
+                    str(lane_record.source_frame_id)
+                    if lane_record.source_frame_id is not None
+                    else None
+                ),
+                (
+                    str(lane_record.source_effect_id)
+                    if lane_record.source_effect_id is not None
+                    else None
+                ),
+                ciphertext,
+                digest,
+                lane_record.canonical_bytes,
+                revision,
+            ),
+        )
+        if cursor.rowcount == 0:
+            by_key = self.load_lane_record(lane_record.key)
+            by_item = self._load_lane_record_by_item_id(item_id)
+            if by_key != lane_record or by_item != lane_record:
+                raise JournalIntegrityError(
+                    "lane record key or item identity collides with different contents"
+                )
+
+    def _decode_lane_record_row(
+        self,
+        row: sqlite3.Row,
+        transport_kind: TransportKind,
+    ) -> LaneRecord:
+        try:
+            key = LaneRecordKey(
+                row["room_id"],
+                row["membership_epoch"],
+                LaneRecordSection(row["section"]),
+                row["page_ordinal"],
+                row["record_ordinal"],
+            )
+            payload = self._open_payload(
+                "NioIngestLaneRecord",
+                self._lane_record_primary_key(key),
+                row,
+                "payload",
+            )
+            envelope = _load_json_object(payload)
+            if tuple(envelope) != _LANE_RECORD_FIELDS:
+                raise ValueError("lane record envelope fields are not canonical")
+            source_frame_value = envelope["source_frame_id"]
+            source_effect_value = envelope["source_effect_id"]
+            source_frame_id = (
+                UUID(source_frame_value) if source_frame_value is not None else None
+            )
+            source_effect_id = (
+                UUID(source_effect_value) if source_effect_value is not None else None
+            )
+            record = _record_from_exact_dict(envelope["record"])
+            lane_record = LaneRecord(
+                LaneRecordKey(
+                    envelope["room_id"],
+                    envelope["membership_epoch"],
+                    LaneRecordSection(envelope["section"]),
+                    envelope["page_ordinal"],
+                    envelope["record_ordinal"],
+                ),
+                record,
+                source_frame_id,
+                source_effect_id,
+                envelope["canonical_bytes"],
+            )
+            created_revision = envelope["created_revision"]
+            if type(created_revision) is not int or created_revision < 0:
+                raise ValueError("lane record created_revision is invalid")
+        except (AttributeError, TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "lane record authenticated envelope is invalid"
+            ) from error
+
+        item_id = self._validated_record_id(record)
+        item_kind = "event" if type(record) is EventRecord else "loss"
+        record_payload = _canonical_json(_record_to_dict(record))
+        if lane_record.canonical_bytes != len(record_payload):
+            raise JournalIntegrityError(
+                "lane record canonical_bytes does not match canonical payload"
+            )
+        if payload != self._lane_record_payload(
+            lane_record,
+            item_id,
+            item_kind,
+            created_revision,
+        ):
+            raise JournalIntegrityError(
+                "lane record authenticated envelope is not canonical"
+            )
+        authenticated = (
+            lane_record.key.room_id,
+            lane_record.key.membership_epoch,
+            lane_record.key.section.value,
+            lane_record.key.page_ordinal,
+            lane_record.key.record_ordinal,
+            item_id,
+            item_kind,
+            str(source_frame_id) if source_frame_id is not None else None,
+            str(source_effect_id) if source_effect_id is not None else None,
+            lane_record.canonical_bytes,
+            created_revision,
+        )
+        columns = tuple(
+            row[name]
+            for name in (
+                "room_id",
+                "membership_epoch",
+                "section",
+                "page_ordinal",
+                "record_ordinal",
+                "item_id",
+                "item_kind",
+                "source_frame_id",
+                "source_effect_id",
+                "canonical_bytes",
+                "created_revision",
+            )
+        )
+        if authenticated != columns:
+            raise JournalIntegrityError(
+                "lane record columns do not match authenticated payload"
+            )
+        self._validate_lane_record_transport(lane_record, transport_kind)
+        return lane_record
+
+    def load_lane_record(self, key: LaneRecordKey) -> LaneRecord | None:
+        owner = self._require_attached()
+        if type(key) is not LaneRecordKey:
+            raise TypeError("key must be LaneRecordKey")
+        row = self.connection.execute(
+            "SELECT * FROM NioIngestLaneRecord WHERE account_id = ? "
+            "AND room_id = ? AND membership_epoch = ? AND section = ? "
+            "AND page_ordinal = ? AND record_ordinal = ?",
+            (self.account_id, *self._lane_record_primary_key(key)),
+        ).fetchone()
+        return (
+            self._decode_lane_record_row(row, owner.transport_kind)
+            if row is not None
+            else None
+        )
+
+    def _load_lane_record_by_item_id(self, item_id: str) -> LaneRecord | None:
+        owner = self._require_attached()
+        row = self.connection.execute(
+            "SELECT * FROM NioIngestLaneRecord " "WHERE account_id = ? AND item_id = ?",
+            (self.account_id, item_id),
+        ).fetchone()
+        return (
+            self._decode_lane_record_row(row, owner.transport_kind)
+            if row is not None
+            else None
+        )
+
+    def list_lane_records(
+        self,
+        room_id: str,
+        membership_epoch: int,
+        section: LaneRecordSection | None = None,
+    ) -> tuple[LaneRecord, ...]:
+        owner = self._require_attached()
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        if type(membership_epoch) is not int or membership_epoch < 0:
+            raise TypeError("membership_epoch must be a nonnegative int")
+        if section is not None and type(section) is not LaneRecordSection:
+            raise TypeError("section must be LaneRecordSection or None")
+        parameters: tuple[object, ...] = (
+            self.account_id,
+            room_id,
+            membership_epoch,
+        )
+        section_clause = ""
+        if section is not None:
+            section_clause = " AND section = ?"
+            parameters += (section.value,)
+        rows = self.connection.execute(
+            "SELECT * FROM NioIngestLaneRecord WHERE account_id = ? "
+            "AND room_id = ? AND membership_epoch = ?"
+            f"{section_clause} ORDER BY CASE section "
+            "WHEN 'loss' THEN 0 WHEN 'recovered' THEN 1 WHEN 'held' THEN 2 END, "
+            "page_ordinal, record_ordinal, item_id",
+            parameters,
+        ).fetchall()
+        return tuple(
+            self._decode_lane_record_row(row, owner.transport_kind) for row in rows
+        )
+
+    def _delete_lane_record(self, key: LaneRecordKey) -> None:
+        cursor = self._transition_execute(
+            "lane_record_delete",
+            "DELETE FROM NioIngestLaneRecord WHERE account_id = ? "
+            "AND room_id = ? AND membership_epoch = ? AND section = ? "
+            "AND page_ordinal = ? AND record_ordinal = ?",
+            (self.account_id, *self._lane_record_primary_key(key)),
+        )
+        if cursor.rowcount != 1:
+            raise JournalIntegrityError("lane record delete target is missing")
 
     def _write_source(self, source: SourceState) -> None:
         ciphertext, digest = self._codec.seal(
@@ -524,108 +943,161 @@ class JournalRows:
         return tuple(self._decode_ready_row(row) for row in rows)
 
     def _decode_room_state(self, row: sqlite3.Row) -> RoomState:
-        ciphertext = row["state_ciphertext"]
-        digest_value = row["state_sha256"]
-        if (ciphertext is None) != (digest_value is None):
-            raise JournalIntegrityError("partial encrypted room state")
-        snapshot = None
-        if ciphertext is not None:
+        try:
             payload = self._open_payload(
                 "NioIngestRoomState", (row["room_id"],), row, "state"
             )
-            snapshot = _room_snapshot_from_payload(payload)
-        return RoomState(
-            row["room_id"],
-            row["current_membership_epoch"],
-            row["next_room_sequence"],
-            RoomHydrationStatus(row["hydration_status"]),
-            snapshot,
-            row["updated_revision"],
+            envelope = _load_json_object(payload)
+            if tuple(envelope) != _ROOM_STATE_FIELDS:
+                raise ValueError("room state envelope fields are not canonical")
+            snapshot_value = envelope["snapshot"]
+            baseline_value = envelope["membership_baseline"]
+            state = RoomState(
+                room_id=envelope["room_id"],
+                current_membership_epoch=envelope["current_membership_epoch"],
+                next_room_sequence=envelope["next_room_sequence"],
+                hydration_status=RoomHydrationStatus(envelope["hydration_status"]),
+                snapshot=(
+                    _room_snapshot_from_dict(snapshot_value)
+                    if snapshot_value is not None
+                    else None
+                ),
+                membership_baseline=(
+                    _membership_baseline_from_dict(baseline_value)
+                    if baseline_value is not None
+                    else None
+                ),
+                updated_revision=envelope["updated_revision"],
+            )
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "room state authenticated envelope is invalid"
+            ) from error
+        if payload != self._room_state_payload(state, state.updated_revision):
+            raise JournalIntegrityError(
+                "room state authenticated envelope is not canonical"
+            )
+        authenticated = (
+            state.room_id,
+            state.current_membership_epoch,
+            state.next_room_sequence,
+            state.hydration_status.value,
+            state.updated_revision,
         )
+        columns = tuple(
+            row[name]
+            for name in (
+                "room_id",
+                "current_membership_epoch",
+                "next_room_sequence",
+                "hydration_status",
+                "updated_revision",
+            )
+        )
+        if authenticated != columns:
+            raise JournalIntegrityError(
+                "room state columns do not match authenticated payload"
+            )
+        return state
 
-    def _decode_room_lane(self, row: sqlite3.Row) -> RoomLane:
-        ciphertext = row["pending_lifecycle_ciphertext"]
-        digest_value = row["pending_lifecycle_sha256"]
-        if (ciphertext is None) != (digest_value is None):
-            raise JournalIntegrityError("partial encrypted lifecycle barrier")
-        lifecycle = None
-        if ciphertext is not None:
+    def _decode_room_lane(
+        self,
+        row: sqlite3.Row,
+        transport_kind: TransportKind,
+    ) -> RoomLane:
+        try:
             payload = self._open_payload(
-                "NioIngestRoomLane.lifecycle",
+                "NioIngestRoomLane",
                 (row["room_id"], row["membership_epoch"]),
                 row,
-                "pending_lifecycle",
+                "lane_state",
             )
-            decoded = _record_from_dict(_load_json_object(payload))
-            if not isinstance(decoded, EventRecord):
-                raise JournalIntegrityError("lifecycle barrier is not an event record")
-            lifecycle = decoded
-        return RoomLane(
-            room_id=row["room_id"],
-            membership_epoch=row["membership_epoch"],
-            lane_status=LaneStatus(row["lane_status"]),
-            held_record_count=row["held_record_count"],
-            held_canonical_bytes=row["held_canonical_bytes"],
-            release_phase=ReleasePhase(row["release_phase"]),
-            release_loss_id=row["release_loss_id"],
-            ready_order=row["ready_order"],
-            next_held_ordinal=row["next_held_ordinal"],
-            next_recovery_page=row["next_recovery_page"],
-            successor_membership_epoch=row["successor_membership_epoch"],
-            pending_lifecycle=lifecycle,
-            updated_revision=row["updated_revision"],
+            envelope = _load_json_object(payload)
+            if tuple(envelope) != _ROOM_LANE_FIELDS:
+                raise ValueError("room lane envelope fields are not canonical")
+            gap_value = envelope["recovery_gap"]
+            lifecycle_value = envelope["pending_lifecycle"]
+            lifecycle = (
+                _record_from_exact_dict(lifecycle_value)
+                if lifecycle_value is not None
+                else None
+            )
+            if lifecycle is not None and type(lifecycle) is not EventRecord:
+                raise ValueError("lifecycle barrier is not an EventRecord")
+            lane = RoomLane(
+                room_id=envelope["room_id"],
+                membership_epoch=envelope["membership_epoch"],
+                lane_status=LaneStatus(envelope["lane_status"]),
+                held_record_count=envelope["held_record_count"],
+                held_canonical_bytes=envelope["held_canonical_bytes"],
+                release_phase=ReleasePhase(envelope["release_phase"]),
+                ready_order=envelope["ready_order"],
+                next_held_ordinal=envelope["next_held_ordinal"],
+                successor_membership_epoch=envelope["successor_membership_epoch"],
+                recovery_gap=(
+                    _recovery_gap_from_dict(gap_value)
+                    if gap_value is not None
+                    else None
+                ),
+                pending_lifecycle=lifecycle,
+                updated_revision=envelope["updated_revision"],
+            )
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "room lane authenticated envelope is invalid"
+            ) from error
+        if payload != self._room_lane_payload(lane, lane.updated_revision):
+            raise JournalIntegrityError(
+                "room lane authenticated envelope is not canonical"
+            )
+        authenticated = (
+            lane.room_id,
+            lane.membership_epoch,
+            lane.lane_status.value,
+            lane.held_record_count,
+            lane.held_canonical_bytes,
+            lane.release_phase.value,
+            lane.ready_order,
+            lane.next_held_ordinal,
+            lane.successor_membership_epoch,
+            lane.updated_revision,
         )
+        columns = tuple(
+            row[name]
+            for name in (
+                "room_id",
+                "membership_epoch",
+                "lane_status",
+                "held_record_count",
+                "held_canonical_bytes",
+                "release_phase",
+                "ready_order",
+                "next_held_ordinal",
+                "successor_membership_epoch",
+                "updated_revision",
+            )
+        )
+        if authenticated != columns:
+            raise JournalIntegrityError(
+                "room lane columns do not match authenticated payload"
+            )
+        self._validate_room_lane_transport(lane, transport_kind)
+        return lane
 
     @staticmethod
     def _validate_room_aggregate(state: RoomState, lanes: tuple[RoomLane, ...]) -> None:
         if not lanes:
             raise JournalIntegrityError("room state has no membership lane")
-        ordered = tuple(sorted(lanes, key=lambda lane: lane.membership_epoch))
-        if ordered != lanes:
-            raise JournalIntegrityError("room membership lanes are not ordered")
-        if any(
-            right.membership_epoch != left.membership_epoch + 1
-            for left, right in zip(ordered, ordered[1:], strict=False)
-        ):
-            raise JournalIntegrityError("room membership lane chain is not gap-free")
-        active = tuple(
-            lane for lane in ordered if lane.lane_status is LaneStatus.ACTIVE
-        )
-        if len(active) != 1:
-            raise JournalIntegrityError("room must have exactly one active lane")
-        if active[0].membership_epoch != state.current_membership_epoch:
-            raise JournalIntegrityError(
-                "active lane does not match current membership epoch"
-            )
-        if active[0] is not ordered[-1]:
-            raise JournalIntegrityError("active lane must be the final epoch")
-
-        for lane, successor in zip(ordered, ordered[1:], strict=False):
-            lifecycle = lane.pending_lifecycle
-            if lane.lane_status is not LaneStatus.RETIRING:
-                raise JournalIntegrityError("predecessor lane must be retiring")
-            if lane.successor_membership_epoch != successor.membership_epoch:
-                raise JournalIntegrityError("retiring lane successor is not gap-free")
-            if (
-                lifecycle is None
-                or lifecycle.kind is not RecordKind.ROOM_LIFECYCLE
-                or lifecycle.room_id != state.room_id
-                or lifecycle.membership_epoch != successor.membership_epoch
-            ):
-                raise JournalIntegrityError(
-                    "retiring lane lifecycle barrier is invalid"
-                )
-        if (
-            active[0].successor_membership_epoch is not None
-            or active[0].pending_lifecycle is not None
-        ):
-            raise JournalIntegrityError("active lane cannot have a successor barrier")
+        try:
+            RoomAggregate(state, lanes[-1], lanes[:-1])
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
 
     def load_rooms(
         self,
         room_ids: frozenset[str],
     ) -> dict[str, RoomAggregate]:
-        self._require_attached()
+        owner = self._require_attached()
         if type(room_ids) is not frozenset or any(
             type(room_id) is not str for room_id in room_ids
         ):
@@ -650,7 +1122,7 @@ class JournalRows:
         lanes_by_room: dict[str, list[RoomLane]] = {}
         for row in lane_rows:
             lanes_by_room.setdefault(row["room_id"], []).append(
-                self._decode_room_lane(row)
+                self._decode_room_lane(row, owner.transport_kind)
             )
         if set(lanes_by_room) - set(states):
             raise JournalIntegrityError("membership lane exists without room state")

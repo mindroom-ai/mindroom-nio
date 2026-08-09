@@ -39,6 +39,19 @@ TXN_ACK = SlidingRangeAckMode.TXN_ECHO
 RESPONSE_ACK = SlidingRangeAckMode.RESPONSE_BOUND
 
 
+def _baseline(
+    prev_batch: str,
+    membership_event_id: str,
+) -> MembershipBaseline:
+    return MembershipBaseline(
+        "!room:example.org",
+        4,
+        1,
+        prev_batch,
+        membership_event_id,
+    )
+
+
 @pytest.fixture
 def sliding_source() -> SlidingSource:
     return SlidingSource(
@@ -2014,19 +2027,19 @@ def test_explicit_room_membership_must_agree_with_exact_own_evidence(
             id="first-current-membership",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"required_state": [_own_member("$m1")]},
             MembershipProof(MembershipProofKind.CONTINUES, "$m1"),
             id="exact-held-membership",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$old"),
+            _baseline("w1", "$old"),
             {"timeline": [_own_member("$new")], "num_live": 1},
             MembershipProof(MembershipProofKind.CHANGED, "$new"),
             id="live-own-join",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {
                 "required_state": [
                     _own_member(
@@ -2040,7 +2053,7 @@ def test_explicit_room_membership_must_agree_with_exact_own_evidence(
             id="linked-join-rotation",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {
                 "required_state": [
                     _own_member(
@@ -2054,43 +2067,43 @@ def test_explicit_room_membership_must_agree_with_exact_own_evidence(
             id="wrong-predecessor",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"required_state": [_own_member("$m2")]},
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="unlinked-required-state-rejoin",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"required_state": [{"state_key": OWN_USER_ID, "type": "m.room.member"}]},
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="unparsed-own-state",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {},
             MembershipProof(MembershipProofKind.CONTINUES, "$m1"),
             id="ordinary-delta",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"initial": True},
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="initial-without-proof",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"expanded_timeline": True},
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="expanded-without-proof",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             {"membership": "invite"},
             MembershipProof(MembershipProofKind.DEPARTED, None),
             id="invite",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$old"),
+            _baseline("w1", "$old"),
             {
                 "required_state": [_own_member("$current")],
                 "timeline": [_own_member("$historical"), {"type": "m.room.message"}],
@@ -2133,7 +2146,7 @@ def test_sliding_adapter_ports_legacy_membership_proof_cases(
 def test_expanded_timeline_is_a_distinct_recoverable_discontinuity(
     sliding_source: SlidingSource,
 ) -> None:
-    baseline = MembershipBaseline("old-prev", "$m1")
+    baseline = _baseline("old-prev", "$m1")
     cursor = SlidingCursor(
         "p0", "td0", CONNECTION, CONNECTION_NAME, 1, 2, TXN_ACK, False
     )

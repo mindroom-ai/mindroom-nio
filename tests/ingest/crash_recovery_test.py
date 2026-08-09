@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import multiprocessing
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 from uuid import UUID
@@ -26,10 +27,18 @@ from nio.ingest import (
     TransportKind,
 )
 from nio.ingest.config import ClassicSourceConfig
-from nio.ingest.serialization import _loss_id, batch_from_records
+from nio.ingest.serialization import (
+    _canonical_json,
+    _loss_id,
+    _record_to_dict,
+    batch_from_records,
+)
 from nio.ingest.state import (
     AckOutcome,
     JournalTransition,
+    LaneRecord,
+    LaneRecordKey,
+    LaneRecordSection,
     LaneStatus,
     ReadyRecord,
     RoomLane,
@@ -376,6 +385,132 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
         assert reopened._journal.load_frame(FRAME_ID) is None
         assert reopened._journal.oldest_unacknowledged() is None
         assert reopened._journal.load_loss(loss.loss_id) is None
+    finally:
+        reopened.close()
+
+
+def _held_lane_record(record_id: str, ordinal: int) -> LaneRecord:
+    event = _event(record_id, ordinal + 10)
+    return LaneRecord(
+        LaneRecordKey(
+            event.room_id,
+            event.membership_epoch,
+            LaneRecordSection.HELD,
+            0,
+            ordinal,
+        ),
+        event,
+        FRAME_ID,
+        None,
+        len(_canonical_json(_record_to_dict(event))),
+    )
+
+
+def _kill_during_carrier_transition(
+    store_path: Path,
+    consumer: ConsumerBootstrap,
+    transition: JournalTransition,
+    kill_after: int,
+) -> None:
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    asyncio.run(bootstrap.attach_consumer(consumer))
+    bootstrap._journal.set_transition_statement_hook(_exit_at_statement(kill_after))
+    bootstrap._journal.commit(
+        expected_revision=2,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=transition,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_after", range(1, 6))
+async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
+    tmp_path: Path,
+    kill_after: int,
+) -> None:
+    store_path = tmp_path / f"carrier-kill-{kill_after}"
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    room_id = "!room:example.org"
+    existing = _held_lane_record("carrier-existing", 0)
+    original_state = RoomState(
+        room_id,
+        1,
+        1,
+        RoomHydrationStatus.READY,
+        _snapshot(room_id),
+    )
+    original_lane = RoomLane(
+        room_id,
+        1,
+        LaneStatus.ACTIVE,
+        held_record_count=1,
+        held_canonical_bytes=existing.canonical_bytes,
+        next_held_ordinal=1,
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            room_states=(original_state,),
+            room_lanes=(original_lane,),
+            lane_record_inserts=(existing,),
+        ),
+    )
+    inserted = _held_lane_record("carrier-inserted", 1)
+    transition = JournalTransition(
+        room_states=(replace(original_state, next_room_sequence=2),),
+        room_lanes=(
+            replace(
+                original_lane,
+                held_canonical_bytes=inserted.canonical_bytes,
+                next_held_ordinal=2,
+            ),
+        ),
+        lane_record_inserts=(inserted,),
+        lane_record_deletes=(existing.key,),
+    )
+    bootstrap.close()
+
+    _assert_process_crashed(
+        _kill_during_carrier_transition,
+        store_path,
+        consumer,
+        transition,
+        kill_after,
+    )
+
+    reopened = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        await reopened.attach_consumer(consumer)
+        assert reopened._journal.load_owner().revision == 2
+        aggregate = reopened._journal.load_rooms(frozenset({room_id}))[room_id]
+        assert aggregate.state == original_state
+        assert aggregate.active_lane == original_lane
+        assert reopened._journal.load_lane_record(existing.key) == existing
+        assert reopened._journal.load_lane_record(inserted.key) is None
     finally:
         reopened.close()
 

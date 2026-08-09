@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from enum import StrEnum
 from uuid import UUID
 
@@ -22,10 +22,25 @@ from nio.ingest import (
     TimelineEventProvenance,
     TransportKind,
 )
+from nio.ingest.membership import MembershipBaseline
+from nio.ingest.recovery import RecoveryGap
+from nio.ingest.state import (
+    LaneRecord,
+    LaneRecordKey,
+    LaneRecordSection,
+    LaneStatus,
+    ReleasePhase,
+    RoomAggregate,
+    RoomLane,
+    RoomState,
+)
 
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 OPERATION_ID = UUID("33333333-3333-3333-3333-333333333333")
+GAP_ID = UUID("44444444-4444-4444-4444-444444444444")
+EFFECT_ID = UUID("55555555-5555-5555-5555-555555555555")
+FRAME_ID = UUID("66666666-6666-6666-6666-666666666666")
 
 
 class ForeignWireValue(StrEnum):
@@ -263,6 +278,487 @@ def test_collection_fields_validate_every_nested_element() -> None:
             None,
             (object(),),  # type: ignore[arg-type]
         )
+
+
+def _membership_baseline() -> MembershipBaseline:
+    return MembershipBaseline(
+        "!room:example.org",
+        3,
+        7,
+        "old-prev",
+        "$member",
+    )
+
+
+def _recovery_gap() -> RecoveryGap:
+    return RecoveryGap(
+        GAP_ID,
+        "!room:example.org",
+        4,
+        7,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 2),
+        "$member",
+        "old-prev",
+        "new-prev",
+        "cursor-1",
+        ("old-prev", "cursor-1"),
+        1,
+        8,
+        EFFECT_ID,
+    )
+
+
+def _lane_event(
+    *,
+    room_id: str = "!room:example.org",
+    provenance: TimelineEventProvenance = TimelineEventProvenance.LIVE,
+) -> EventRecord:
+    return EventRecord(
+        "$event",
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 3),
+        room_id,
+        7,
+        1,
+        "$event",
+        provenance,
+        b"{}",
+        None,
+    )
+
+
+def _lane_loss() -> LossRecord:
+    return LossRecord(
+        "loss-id",
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 3),
+        "!room:example.org",
+        7,
+        LossReason.FETCH_FAILED,
+        LossBoundary(None, None, "old-prev", "new-prev"),
+        b"{}",
+    )
+
+
+def test_recovery_carriers_are_frozen_slotted_and_exact() -> None:
+    baseline = _membership_baseline()
+    gap = _recovery_gap()
+
+    assert not hasattr(baseline, "__dict__")
+    assert not hasattr(gap, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        baseline.prev_batch = "changed"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        gap.cursor_token = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="source_epoch"):
+        MembershipBaseline(
+            baseline.room_id,
+            True,  # type: ignore[arg-type]
+            baseline.membership_epoch,
+            baseline.prev_batch,
+            baseline.membership_event_id,
+        )
+    with pytest.raises(TypeError, match="seen_cursor_tokens"):
+        RecoveryGap(
+            gap.gap_id,
+            gap.room_id,
+            gap.opening_source_epoch,
+            gap.membership_epoch,
+            gap.origin,
+            gap.membership_event_id,
+            gap.start_token,
+            gap.target_token,
+            gap.cursor_token,
+            list(gap.seen_cursor_tokens),  # type: ignore[arg-type]
+            gap.pages_committed,
+            gap.recovered_record_count,
+            gap.in_flight_effect_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"start_token": ""}, "start_token"),
+        ({"seen_cursor_tokens": ()}, "seen_cursor_tokens"),
+        (
+            {"seen_cursor_tokens": ("old-prev", "cursor-1", "cursor-1")},
+            "unique",
+        ),
+        ({"seen_cursor_tokens": ("wrong", "cursor-1")}, "start_token"),
+        ({"seen_cursor_tokens": ("old-prev", "wrong")}, "cursor_token"),
+        ({"pages_committed": -1}, "nonnegative"),
+        ({"pages_committed": 2}, "cursor history"),
+        (
+            {"origin": RecordOrigin(TransportKind.CLASSIC, 5, 9, 2)},
+            "opening_source_epoch",
+        ),
+    ),
+)
+def test_recovery_gap_rejects_ambiguous_cursor_or_counter_state(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    from dataclasses import replace
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        replace(_recovery_gap(), **changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"opening_source_epoch": True},
+        {"membership_epoch": True},
+        {"pages_committed": True},
+        {"recovered_record_count": True},
+    ),
+)
+def test_recovery_gap_rejects_bool_counters(changes: dict[str, object]) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(TypeError):
+        replace(_recovery_gap(), **changes)
+
+
+def test_recovery_gap_distinguishes_wrong_cursor_types_from_empty_tokens() -> None:
+    from dataclasses import replace
+
+    with pytest.raises(TypeError, match="seen_cursor_tokens"):
+        replace(_recovery_gap(), seen_cursor_tokens=("old-prev", 1))
+    with pytest.raises(ValueError, match="seen_cursor_tokens"):
+        replace(_recovery_gap(), seen_cursor_tokens=("old-prev", ""))
+
+
+def _model_snapshot() -> RoomSnapshot:
+    return RoomSnapshot(
+        "!room:example.org",
+        7,
+        "@me:example.org",
+        "join",
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (),
+    )
+
+
+def test_room_state_requires_consistent_hydration_and_nonnegative_counters() -> None:
+    with pytest.raises(ValueError, match="READY.*snapshot"):
+        RoomState(
+            "!room:example.org",
+            7,
+            1,
+            RoomHydrationStatus.READY,
+            None,
+            _membership_baseline(),
+        )
+    with pytest.raises(ValueError, match="UNAVAILABLE.*snapshot"):
+        RoomState(
+            "!room:example.org",
+            7,
+            1,
+            RoomHydrationStatus.UNAVAILABLE,
+            _model_snapshot(),
+            None,
+        )
+    with pytest.raises(ValueError, match="membership baseline room/epoch"):
+        RoomState(
+            "!other:example.org",
+            7,
+            1,
+            RoomHydrationStatus.PENDING,
+            None,
+            _membership_baseline(),
+        )
+    for field_name in (
+        "current_membership_epoch",
+        "next_room_sequence",
+        "updated_revision",
+    ):
+        values = {
+            "room_id": "!room:example.org",
+            "current_membership_epoch": 7,
+            "next_room_sequence": 1,
+            "hydration_status": RoomHydrationStatus.READY,
+            "snapshot": _model_snapshot(),
+            "membership_baseline": _membership_baseline(),
+            "updated_revision": 0,
+        }
+        values[field_name] = -1
+        with pytest.raises(ValueError, match="nonnegative"):
+            RoomState(**values)
+
+
+def test_room_lane_requires_gap_containment_phase_and_nonnegative_counters() -> None:
+    with pytest.raises(ValueError, match="recovery gap room/epoch"):
+        RoomLane(
+            "!room:example.org",
+            8,
+            LaneStatus.ACTIVE,
+            release_phase=ReleasePhase.RECOVERING,
+            recovery_gap=_recovery_gap(),
+        )
+    with pytest.raises(ValueError, match="RECOVERING.*recovery gap"):
+        RoomLane(
+            "!room:example.org",
+            7,
+            LaneStatus.ACTIVE,
+            release_phase=ReleasePhase.RECOVERING,
+        )
+    with pytest.raises(ValueError, match="recovery gap.*RECOVERING"):
+        RoomLane(
+            "!room:example.org",
+            7,
+            LaneStatus.ACTIVE,
+            recovery_gap=_recovery_gap(),
+        )
+    for field_name in (
+        "membership_epoch",
+        "held_record_count",
+        "held_canonical_bytes",
+        "ready_order",
+        "next_held_ordinal",
+        "successor_membership_epoch",
+        "updated_revision",
+    ):
+        values = {
+            "room_id": "!room:example.org",
+            "membership_epoch": 7,
+            "lane_status": LaneStatus.ACTIVE,
+            "held_record_count": 0,
+            "held_canonical_bytes": 0,
+            "release_phase": ReleasePhase.IDLE,
+            "ready_order": None,
+            "next_held_ordinal": 0,
+            "successor_membership_epoch": None,
+            "recovery_gap": None,
+            "pending_lifecycle": None,
+            "updated_revision": 0,
+        }
+        values[field_name] = -1
+        with pytest.raises(ValueError, match="nonnegative"):
+            RoomLane(**values)
+
+
+@pytest.mark.parametrize(
+    ("release_phase", "ready_order", "recovery_gap"),
+    (
+        (ReleasePhase.IDLE, None, None),
+        (ReleasePhase.RECOVERING, None, _recovery_gap()),
+        (ReleasePhase.RELEASING_RECOVERED, 0, None),
+        (ReleasePhase.RELEASING_TERMINAL, 0, None),
+    ),
+)
+def test_room_lane_ready_head_exactly_matches_release_phase(
+    release_phase: ReleasePhase,
+    ready_order: int | None,
+    recovery_gap: RecoveryGap | None,
+) -> None:
+    lane = RoomLane(
+        "!room:example.org",
+        7,
+        LaneStatus.ACTIVE,
+        release_phase=release_phase,
+        ready_order=ready_order,
+        recovery_gap=recovery_gap,
+    )
+
+    assert lane.ready_order == ready_order
+    invalid_ready_order = 0 if ready_order is None else None
+    with pytest.raises(ValueError, match="ready_order"):
+        replace(lane, ready_order=invalid_ready_order)
+
+
+def test_room_lane_owns_exact_local_topology_and_held_counters() -> None:
+    lifecycle = replace(
+        _lane_event(),
+        kind=RecordKind.ROOM_LIFECYCLE,
+        membership_epoch=7,
+    )
+    retiring = RoomLane(
+        "!room:example.org",
+        6,
+        LaneStatus.RETIRING,
+        successor_membership_epoch=7,
+        pending_lifecycle=lifecycle,
+    )
+
+    assert retiring.pending_lifecycle == lifecycle
+    invalid_topologies = (
+        {"lane_status": LaneStatus.ACTIVE},
+        {"successor_membership_epoch": None},
+        {"pending_lifecycle": None},
+        {"pending_lifecycle": replace(lifecycle, kind=RecordKind.TIMELINE)},
+        {"pending_lifecycle": replace(lifecycle, room_id="!other:example.org")},
+        {"pending_lifecycle": replace(lifecycle, membership_epoch=8)},
+        {
+            "release_phase": ReleasePhase.RECOVERING,
+            "recovery_gap": replace(_recovery_gap(), membership_epoch=6),
+        },
+    )
+    for changes in invalid_topologies:
+        with pytest.raises(ValueError, match="active|retiring|lifecycle|gap"):
+            replace(retiring, **changes)
+
+    for changes in (
+        {"held_record_count": 1, "held_canonical_bytes": 0},
+        {"held_record_count": 0, "held_canonical_bytes": 1},
+        {
+            "held_record_count": 2,
+            "held_canonical_bytes": 10,
+            "next_held_ordinal": 1,
+        },
+    ):
+        with pytest.raises(ValueError, match="held"):
+            RoomLane(
+                "!room:example.org",
+                7,
+                LaneStatus.ACTIVE,
+                **changes,
+            )
+
+
+def test_room_carriers_reject_empty_room_ids() -> None:
+    with pytest.raises(ValueError, match="room_id"):
+        RoomState(
+            "",
+            0,
+            0,
+            RoomHydrationStatus.PENDING,
+            None,
+        )
+    with pytest.raises(ValueError, match="room_id"):
+        RoomLane("", 0, LaneStatus.ACTIVE)
+
+
+def test_room_aggregate_constructor_enforces_the_full_epoch_chain() -> None:
+    state = RoomState(
+        "!room:example.org",
+        7,
+        1,
+        RoomHydrationStatus.READY,
+        _model_snapshot(),
+        _membership_baseline(),
+    )
+    active = RoomLane(
+        "!room:example.org",
+        7,
+        LaneStatus.ACTIVE,
+        release_phase=ReleasePhase.RECOVERING,
+        recovery_gap=_recovery_gap(),
+    )
+    aggregate = RoomAggregate(state, active, ())
+
+    assert aggregate.active_lane == active
+    with pytest.raises(ValueError, match="baseline"):
+        RoomAggregate(replace(state, membership_baseline=None), active, ())
+    with pytest.raises(ValueError, match="start token"):
+        RoomAggregate(
+            state,
+            replace(
+                active,
+                recovery_gap=replace(
+                    _recovery_gap(),
+                    start_token="other",
+                    seen_cursor_tokens=("other", "cursor-1"),
+                ),
+            ),
+            (),
+        )
+    retiring = RoomLane(
+        "!room:example.org",
+        6,
+        LaneStatus.RETIRING,
+        successor_membership_epoch=7,
+        pending_lifecycle=replace(
+            _lane_event(),
+            kind=RecordKind.ROOM_LIFECYCLE,
+            membership_epoch=7,
+        ),
+    )
+    assert RoomAggregate(state, active, (retiring,)).retiring_lanes == (retiring,)
+    wrong_chain = replace(
+        retiring,
+        successor_membership_epoch=8,
+        pending_lifecycle=replace(retiring.pending_lifecycle, membership_epoch=8),
+    )
+    with pytest.raises(ValueError, match="successor"):
+        RoomAggregate(state, active, (wrong_chain,))
+
+
+def test_lane_record_section_controls_record_and_source_identity() -> None:
+    event = _lane_event()
+    recovered_event = _lane_event(provenance=TimelineEventProvenance.RECOVERED)
+    loss = _lane_loss()
+
+    held = LaneRecord(
+        LaneRecordKey("!room:example.org", 7, LaneRecordSection.HELD, 0, 1),
+        event,
+        FRAME_ID,
+        None,
+        10,
+    )
+    recovered = LaneRecord(
+        LaneRecordKey("!room:example.org", 7, LaneRecordSection.RECOVERED, 1, 1),
+        recovered_event,
+        None,
+        EFFECT_ID,
+        10,
+    )
+    terminal = LaneRecord(
+        LaneRecordKey("!room:example.org", 7, LaneRecordSection.LOSS, 0, 0),
+        loss,
+        None,
+        EFFECT_ID,
+        10,
+    )
+
+    assert (held.record, recovered.record, terminal.record) == (
+        event,
+        recovered_event,
+        loss,
+    )
+    with pytest.raises(ValueError, match="LOSS.*LossRecord"):
+        LaneRecord(terminal.key, event, None, None, 10)
+    with pytest.raises(ValueError, match="RECOVERED.*EventRecord"):
+        LaneRecord(recovered.key, loss, None, EFFECT_ID, 10)
+    with pytest.raises(ValueError, match="HELD.*source_frame_id"):
+        LaneRecord(held.key, event, None, None, 10)
+    with pytest.raises(ValueError, match="RECOVERED.*source_effect_id"):
+        LaneRecord(recovered.key, recovered_event, None, None, 10)
+    with pytest.raises(ValueError, match="RECOVERED.*provenance"):
+        LaneRecord(recovered.key, event, None, EFFECT_ID, 10)
+    with pytest.raises(ValueError, match="HELD.*provenance"):
+        LaneRecord(held.key, recovered_event, FRAME_ID, None, 10)
+    with pytest.raises(ValueError, match="source identity"):
+        LaneRecord(terminal.key, loss, FRAME_ID, EFFECT_ID, 10)
+    with pytest.raises(ValueError, match="exactly one source pointer"):
+        LaneRecord(terminal.key, loss, None, None, 10)
+    system_loss = replace(
+        loss,
+        origin=SystemOrigin(SystemOriginKind.STORE_VALIDATION, OPERATION_ID),
+    )
+    assert LaneRecord(terminal.key, system_loss, None, None, 10).record == system_loss
+    with pytest.raises(ValueError, match="system-derived.*source pointer"):
+        LaneRecord(terminal.key, system_loss, FRAME_ID, None, 10)
+    with pytest.raises(ValueError, match="room/epoch"):
+        LaneRecord(
+            held.key,
+            _lane_event(room_id="!other:example.org"),
+            FRAME_ID,
+            None,
+            10,
+        )
+    with pytest.raises(ValueError, match="canonical_bytes"):
+        LaneRecord(held.key, event, FRAME_ID, None, 0)
+    with pytest.raises(ValueError, match="item identity"):
+        LaneRecord(held.key, replace(event, record_id=""), FRAME_ID, None, 10)
 
 
 @pytest.mark.parametrize(

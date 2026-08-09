@@ -14,13 +14,21 @@ def _require_optional_string(value: object, field_name: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class MembershipBaseline:
+    room_id: str
+    source_epoch: int
+    membership_epoch: int
     prev_batch: str
     membership_event_id: str
 
     def __post_init__(self) -> None:
-        _require_exact(self.prev_batch, str, "prev_batch")
-        _require_exact(self.membership_event_id, str, "membership_event_id")
-        if not self.prev_batch or not self.membership_event_id:
+        for name in ("room_id", "prev_batch", "membership_event_id"):
+            _require_exact(getattr(self, name), str, name)
+        for name in ("source_epoch", "membership_epoch"):
+            value = getattr(self, name)
+            _require_exact(value, int, name)
+            if value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if not self.room_id or not self.prev_batch or not self.membership_event_id:
             raise ValueError("membership baseline values must not be empty")
 
 
@@ -150,17 +158,41 @@ def advance_membership_baseline(
     baseline: MembershipBaseline | None,
     proof: MembershipProof,
     *,
+    room_id: str,
+    source_epoch: int,
+    membership_epoch: int,
     current_prev_batch: str | None,
 ) -> MembershipBaseline | None:
     if baseline is not None and type(baseline) is not MembershipBaseline:
         raise TypeError("baseline must be MembershipBaseline or None")
     _require_exact(proof, MembershipProof, "proof")
+    _require_exact(room_id, str, "room_id")
+    _require_exact(source_epoch, int, "source_epoch")
+    _require_exact(membership_epoch, int, "membership_epoch")
     _require_optional_string(current_prev_batch, "current_prev_batch")
+    if not room_id:
+        raise ValueError("room_id must not be empty")
+    if source_epoch < 0 or membership_epoch < 0:
+        raise ValueError("source_epoch and membership_epoch must be nonnegative")
     if proof.kind in {MembershipProofKind.DEPARTED, MembershipProofKind.UNSAFE}:
         return None
     assert proof.membership_event_id is not None
     if current_prev_batch:
-        return MembershipBaseline(current_prev_batch, proof.membership_event_id)
+        return MembershipBaseline(
+            room_id,
+            source_epoch,
+            membership_epoch,
+            current_prev_batch,
+            proof.membership_event_id,
+        )
     if proof.kind is MembershipProofKind.CONTINUES and baseline is not None:
-        return MembershipBaseline(baseline.prev_batch, proof.membership_event_id)
+        if baseline.room_id != room_id or baseline.membership_epoch != membership_epoch:
+            raise ValueError("baseline room/epoch does not match durable context")
+        return MembershipBaseline(
+            baseline.room_id,
+            baseline.source_epoch,
+            baseline.membership_epoch,
+            baseline.prev_batch,
+            proof.membership_event_id,
+        )
     return None

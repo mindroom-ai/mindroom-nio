@@ -40,9 +40,14 @@ from nio.ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
 )
+from nio.ingest.membership import MembershipBaseline
+from nio.ingest.recovery import RecoveryGap
 from nio.ingest.state import (
     AckOutcome,
     JournalTransition,
+    LaneRecord,
+    LaneRecordKey,
+    LaneRecordSection,
     LaneStatus,
     ReleasePhase,
     ReadyRecord,
@@ -116,6 +121,12 @@ def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() ->
             return {}
 
         def load_ready_heads(self, limit):
+            return ()
+
+        def load_lane_record(self, key):
+            return None
+
+        def list_lane_records(self, room_id, membership_epoch, section=None):
             return ()
 
         def load_frame(self, frame_id):
@@ -2198,6 +2209,46 @@ def _snapshot(room_id: str, membership_epoch: int) -> RoomSnapshot:
     )
 
 
+def _baseline(
+    room_id: str,
+    membership_epoch: int,
+    *,
+    membership_event_id: str = "$member",
+    prev_batch: str = "old-prev",
+) -> MembershipBaseline:
+    return MembershipBaseline(
+        room_id,
+        1,
+        membership_epoch,
+        prev_batch,
+        membership_event_id,
+    )
+
+
+def _gap(
+    room_id: str,
+    membership_epoch: int,
+    *,
+    membership_event_id: str = "$member",
+    start_token: str = "old-prev",
+) -> RecoveryGap:
+    return RecoveryGap(
+        UUID("44444444-4444-4444-4444-444444444444"),
+        room_id,
+        4,
+        membership_epoch,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 2),
+        membership_event_id,
+        start_token,
+        "new-prev",
+        "cursor-1",
+        (start_token, "cursor-1"),
+        1,
+        8,
+        UUID("55555555-5555-5555-5555-555555555555"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
     tmp_path: Path,
@@ -2219,6 +2270,7 @@ async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
         next_room_sequence=8,
         hydration_status=RoomHydrationStatus.READY,
         snapshot=_snapshot(room_id, 3),
+        membership_baseline=_baseline(room_id, 3),
     )
     lanes = (
         RoomLane(
@@ -2239,7 +2291,8 @@ async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
             room_id=room_id,
             membership_epoch=3,
             lane_status=LaneStatus.ACTIVE,
-            release_phase=ReleasePhase.IDLE,
+            release_phase=ReleasePhase.RECOVERING,
+            recovery_gap=_gap(room_id, 3),
         ),
     )
     try:
@@ -2267,6 +2320,1278 @@ async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
         assert aggregate.retiring_lanes == lanes[:2]
     finally:
         reopened.close()
+
+
+def _lane_event(
+    record_id: str,
+    room_id: str,
+    membership_epoch: int,
+    room_sequence: int,
+    provenance: TimelineEventProvenance,
+) -> EventRecord:
+    return EventRecord(
+        record_id,
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, room_sequence),
+        room_id,
+        membership_epoch,
+        room_sequence,
+        f"${record_id}",
+        provenance,
+        f'{{"record":"{record_id}"}}'.encode(),
+        None,
+    )
+
+
+def _lane_record(
+    key: LaneRecordKey,
+    record: EventRecord | LossRecord,
+    *,
+    source_frame_id: UUID | None = None,
+    source_effect_id: UUID | None = None,
+    canonical_bytes: int | None = None,
+) -> LaneRecord:
+    return LaneRecord(
+        key,
+        record,
+        source_frame_id,
+        source_effect_id,
+        (
+            len(_canonical_json(_record_to_dict(record)))
+            if canonical_bytes is None
+            else canonical_bytes
+        ),
+    )
+
+
+def _terminal_loss(stream_id: UUID, room_id: str, membership_epoch: int) -> LossRecord:
+    incomplete = LossRecord(
+        "",
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 4),
+        room_id,
+        membership_epoch,
+        LossReason.FETCH_FAILED,
+        LossBoundary("$prior", 1_700_000_000_000, "old-prev", "new-prev"),
+        b'{"errcode":"M_FORBIDDEN"}',
+    )
+    return replace(incomplete, loss_id=_loss_id(stream_id, incomplete))
+
+
+def _room_carrier_transition(
+    room_id: str,
+    membership_epoch: int,
+    *,
+    lane_records: tuple[LaneRecord, ...] = (),
+) -> JournalTransition:
+    held_records = tuple(
+        record
+        for record in lane_records
+        if record.key.section is LaneRecordSection.HELD
+    )
+    return JournalTransition(
+        room_states=(
+            RoomState(
+                room_id,
+                membership_epoch,
+                8,
+                RoomHydrationStatus.READY,
+                _snapshot(room_id, membership_epoch),
+                _baseline(room_id, membership_epoch),
+            ),
+        ),
+        room_lanes=(
+            RoomLane(
+                room_id,
+                membership_epoch,
+                LaneStatus.ACTIVE,
+                held_record_count=len(held_records),
+                held_canonical_bytes=sum(
+                    record.canonical_bytes for record in held_records
+                ),
+                release_phase=ReleasePhase.RECOVERING,
+                next_held_ordinal=len(held_records),
+                recovery_gap=_gap(room_id, membership_epoch),
+            ),
+        ),
+        lane_record_inserts=lane_records,
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_room_carriers_are_always_authenticated_after_attach(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    room_id = "!baseline:example.org"
+    try:
+        await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap, (room_id,)))
+        state_row = bootstrap._journal.connection.execute(
+            "SELECT state_ciphertext, state_sha256 FROM NioIngestRoomState "
+            "WHERE account_id = ? AND room_id = ?",
+            (ACCOUNT_ID, room_id),
+        ).fetchone()
+        lane_row = bootstrap._journal.connection.execute(
+            "SELECT lane_state_ciphertext, lane_state_sha256 "
+            "FROM NioIngestRoomLane WHERE account_id = ? AND room_id = ?",
+            (ACCOUNT_ID, room_id),
+        ).fetchone()
+
+        assert all(value is not None for value in state_row)
+        assert all(value is not None for value in lane_row)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_records_round_trip_list_in_section_order_and_delete_after_restart(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    room_id = "!room:example.org"
+    epoch = 3
+    effect_id = UUID("55555555-5555-5555-5555-555555555555")
+    frame_id = UUID("66666666-6666-6666-6666-666666666666")
+    loss = _terminal_loss(bootstrap.stream_id, room_id, epoch)
+    recovered = _lane_event(
+        "recovered", room_id, epoch, 6, TimelineEventProvenance.RECOVERED
+    )
+    held = _lane_event("held", room_id, epoch, 7, TimelineEventProvenance.LIVE)
+    records = (
+        _lane_record(
+            LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, 0),
+            held,
+            source_frame_id=frame_id,
+        ),
+        _lane_record(
+            LaneRecordKey(room_id, epoch, LaneRecordSection.RECOVERED, 1, 0),
+            recovered,
+            source_effect_id=effect_id,
+        ),
+        _lane_record(
+            LaneRecordKey(room_id, epoch, LaneRecordSection.LOSS, 0, 0),
+            loss,
+            source_effect_id=effect_id,
+        ),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            room_id,
+            epoch,
+            lane_records=records,
+        ),
+    )
+    bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        await reopened.attach_consumer(consumer)
+        expected = (records[2], records[1], records[0])
+        assert reopened._journal.list_lane_records(room_id, epoch) == expected
+        assert (
+            tuple(reopened._journal.load_lane_record(record.key) for record in expected)
+            == expected
+        )
+        assert reopened._journal.list_lane_records(
+            room_id,
+            epoch,
+            LaneRecordSection.RECOVERED,
+        ) == (records[1],)
+
+        reopened._journal.commit(
+            expected_revision=2,
+            writer_epoch=reopened._journal.writer_epoch,
+            transition=JournalTransition(
+                lane_record_deletes=(records[1].key,),
+            ),
+        )
+        assert reopened._journal.load_lane_record(records[1].key) is None
+        assert reopened._journal.list_lane_records(room_id, epoch) == (
+            records[2],
+            records[0],
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_active_gap_accepts_linked_membership_event_rotation(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    transition = _room_carrier_transition(room_id, 3)
+    rotated_gap = _gap(room_id, 3, membership_event_id="$linked-rotation")
+    transition = replace(
+        transition,
+        room_lanes=(replace(transition.room_lanes[0], recovery_gap=rotated_gap),),
+    )
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=transition,
+        )
+        aggregate = bootstrap._journal.load_rooms(frozenset({room_id}))[room_id]
+        assert aggregate.state.membership_baseline == _baseline(room_id, 3)
+        assert aggregate.active_lane.recovery_gap == rotated_gap
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_held_lane_record_deltas_reconcile_exact_counters_and_never_rewind(
+    tmp_path: Path,
+) -> None:
+    bootstrap, room_id, epoch, existing = await _journal_with_carriers(tmp_path)
+    inserted = _lane_record(
+        LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, 1),
+        _lane_event("next-held", room_id, epoch, 8, TimelineEventProvenance.LIVE),
+        source_frame_id=UUID("77777777-7777-7777-7777-777777777777"),
+    )
+    lane = bootstrap._journal.load_rooms(frozenset({room_id}))[room_id].active_lane
+    try:
+        with_insert = replace(
+            lane,
+            held_record_count=2,
+            held_canonical_bytes=(existing.canonical_bytes + inserted.canonical_bytes),
+            next_held_ordinal=2,
+        )
+        bootstrap._journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                room_lanes=(with_insert,),
+                lane_record_inserts=(inserted,),
+            ),
+        )
+        after_delete = replace(
+            with_insert,
+            held_record_count=1,
+            held_canonical_bytes=inserted.canonical_bytes,
+        )
+        bootstrap._journal.commit(
+            expected_revision=3,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                room_lanes=(after_delete,),
+                lane_record_deletes=(existing.key,),
+            ),
+        )
+
+        aggregate = bootstrap._journal.load_rooms(frozenset({room_id}))[room_id]
+        assert aggregate.active_lane == after_delete
+        assert aggregate.active_lane.next_held_ordinal == 2
+        assert bootstrap._journal.list_lane_records(room_id, epoch) == (inserted,)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_lane_update",
+        "wrong_count",
+        "wrong_bytes",
+        "ordinal_gap",
+        "counter_without_delta",
+        "delete_wrong_count",
+    ),
+)
+async def test_held_lane_record_deltas_reject_counter_or_ordinal_drift_before_cas(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    bootstrap, room_id, epoch, existing = await _journal_with_carriers(tmp_path)
+    lane = bootstrap._journal.load_rooms(frozenset({room_id}))[room_id].active_lane
+    ordinal = 2 if case == "ordinal_gap" else 1
+    inserted = _lane_record(
+        LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, ordinal),
+        _lane_event("candidate", room_id, epoch, 8, TimelineEventProvenance.LIVE),
+        source_frame_id=UUID("77777777-7777-7777-7777-777777777777"),
+    )
+    expected_lane = replace(
+        lane,
+        held_record_count=2,
+        held_canonical_bytes=existing.canonical_bytes + inserted.canonical_bytes,
+        next_held_ordinal=2,
+    )
+    inserts = (inserted,)
+    deletes: tuple[LaneRecordKey, ...] = ()
+    lanes = (expected_lane,)
+    if case == "missing_lane_update":
+        lanes = ()
+    elif case == "wrong_count":
+        lanes = (replace(expected_lane, held_record_count=1),)
+    elif case == "wrong_bytes":
+        lanes = (replace(expected_lane, held_canonical_bytes=existing.canonical_bytes),)
+    elif case == "ordinal_gap":
+        lanes = (replace(expected_lane, next_held_ordinal=3),)
+    elif case == "counter_without_delta":
+        inserts = ()
+        lanes = (replace(lane, next_held_ordinal=2),)
+    elif case == "delete_wrong_count":
+        inserts = ()
+        deletes = (existing.key,)
+        lanes = (lane,)
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="HELD lane"):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    room_lanes=lanes,
+                    lane_record_inserts=inserts,
+                    lane_record_deletes=deletes,
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part", ("ciphertext", "digest", "metadata"))
+async def test_lane_record_delete_authenticates_target_before_meta_cas(
+    tmp_path: Path,
+    part: str,
+) -> None:
+    bootstrap, _, _, existing = await _journal_with_carriers(tmp_path)
+    if part == "metadata":
+        statement = (
+            "UPDATE NioIngestLaneRecord SET canonical_bytes = 999 "
+            "WHERE account_id = ? AND item_id = ?"
+        )
+        parameters: tuple[object, ...] = (ACCOUNT_ID, existing.record.record_id)
+    else:
+        column = "payload_ciphertext" if part == "ciphertext" else "payload_sha256"
+        value = bootstrap._journal.connection.execute(
+            f"SELECT {column} FROM NioIngestLaneRecord "
+            "WHERE account_id = ? AND item_id = ?",
+            (ACCOUNT_ID, existing.record.record_id),
+        ).fetchone()[0]
+        changed = bytes(value[:-1]) + bytes((value[-1] ^ 1,))
+        statement = (
+            f"UPDATE NioIngestLaneRecord SET {column} = ? "
+            "WHERE account_id = ? AND item_id = ?"
+        )
+        parameters = (changed, ACCOUNT_ID, existing.record.record_id)
+    bootstrap._journal.connection.execute(statement, parameters)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    lane_record_deletes=(existing.key,),
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT count(*) FROM NioIngestLaneRecord "
+                "WHERE account_id = ? AND item_id = ?",
+                (ACCOUNT_ID, existing.record.record_id),
+            ).fetchone()[0]
+            == 1
+        )
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_commit_revalidates_room_lane_ready_head_before_meta_cas(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    lane = RoomLane(room_id, 1, LaneStatus.ACTIVE)
+    object.__setattr__(lane, "ready_order", 0)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="ready_order"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    room_states=(
+                        RoomState(
+                            room_id,
+                            1,
+                            1,
+                            RoomHydrationStatus.READY,
+                            _snapshot(room_id, 1),
+                        ),
+                    ),
+                    room_lanes=(lane,),
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("active_gap_without_baseline", "baseline"),
+        ("gap_token_mismatch", "start token"),
+    ),
+)
+async def test_room_aggregate_rejects_cross_carrier_counterexamples_before_write(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    state = RoomState(
+        room_id,
+        1,
+        1,
+        RoomHydrationStatus.READY,
+        _snapshot(room_id, 1),
+        _baseline(room_id, 1),
+    )
+    lanes = (
+        RoomLane(
+            room_id,
+            1,
+            LaneStatus.ACTIVE,
+            release_phase=ReleasePhase.RECOVERING,
+            recovery_gap=_gap(room_id, 1),
+        ),
+    )
+    if case == "active_gap_without_baseline":
+        state = replace(state, membership_baseline=None)
+    else:
+        lanes = (replace(lanes[0], recovery_gap=_gap(room_id, 1, start_token="other")),)
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match=message):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(room_states=(state,), room_lanes=lanes),
+            )
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_transport", tuple(TransportKind))
+@pytest.mark.parametrize("carrier", ("gap", "lifecycle", "lane_record"))
+async def test_room_carriers_reject_foreign_transport_before_meta_cas(
+    tmp_path: Path,
+    owner_transport: TransportKind,
+    carrier: str,
+) -> None:
+    source = (
+        CLASSIC_SOURCE
+        if owner_transport is TransportKind.CLASSIC
+        else _sliding_source_config()
+    )
+    foreign = (
+        TransportKind.SLIDING
+        if owner_transport is TransportKind.CLASSIC
+        else TransportKind.CLASSIC
+    )
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=source,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    if carrier == "gap":
+        gap = replace(
+            _gap(room_id, 1),
+            origin=RecordOrigin(foreign, 4, 9, 2),
+        )
+        transition = JournalTransition(
+            room_states=(
+                RoomState(
+                    room_id,
+                    1,
+                    1,
+                    RoomHydrationStatus.READY,
+                    _snapshot(room_id, 1),
+                    _baseline(room_id, 1),
+                ),
+            ),
+            room_lanes=(
+                RoomLane(
+                    room_id,
+                    1,
+                    LaneStatus.ACTIVE,
+                    release_phase=ReleasePhase.RECOVERING,
+                    recovery_gap=gap,
+                ),
+            ),
+        )
+    elif carrier == "lifecycle":
+        lifecycle = replace(
+            _lifecycle(room_id, 2, 0),
+            origin=RecordOrigin(foreign, 1, 1, 0),
+        )
+        transition = JournalTransition(
+            room_states=(
+                RoomState(
+                    room_id,
+                    2,
+                    1,
+                    RoomHydrationStatus.READY,
+                    _snapshot(room_id, 2),
+                    _baseline(room_id, 2),
+                ),
+            ),
+            room_lanes=(
+                RoomLane(
+                    room_id,
+                    1,
+                    LaneStatus.RETIRING,
+                    successor_membership_epoch=2,
+                    pending_lifecycle=lifecycle,
+                ),
+                RoomLane(room_id, 2, LaneStatus.ACTIVE),
+            ),
+        )
+    else:
+        event = replace(
+            _lane_event("foreign", room_id, 1, 1, TimelineEventProvenance.LIVE),
+            origin=RecordOrigin(foreign, 4, 9, 1),
+        )
+        lane_record = _lane_record(
+            LaneRecordKey(room_id, 1, LaneRecordSection.HELD, 0, 0),
+            event,
+            source_frame_id=UUID("66666666-6666-6666-6666-666666666666"),
+        )
+        transition = JournalTransition(
+            room_states=(
+                RoomState(
+                    room_id,
+                    1,
+                    1,
+                    RoomHydrationStatus.READY,
+                    _snapshot(room_id, 1),
+                ),
+            ),
+            room_lanes=(RoomLane(room_id, 1, LaneStatus.ACTIVE),),
+            lane_record_inserts=(lane_record,),
+        )
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="transport"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ("gap", "lifecycle", "lane_record"))
+async def test_authenticated_room_carriers_reject_foreign_transport_after_restart(
+    tmp_path: Path,
+    carrier: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    room_id = "!room:example.org"
+    foreign_origin = RecordOrigin(TransportKind.SLIDING, 4, 9, 2)
+    lane_record = None
+    if carrier == "gap":
+        transition = _room_carrier_transition(room_id, 1)
+        lane = replace(
+            transition.room_lanes[0],
+            recovery_gap=replace(
+                transition.room_lanes[0].recovery_gap,
+                origin=foreign_origin,
+            ),
+        )
+    elif carrier == "lifecycle":
+        lifecycle = _lifecycle(room_id, 2, 0)
+        transition = JournalTransition(
+            room_states=(
+                RoomState(
+                    room_id,
+                    2,
+                    1,
+                    RoomHydrationStatus.READY,
+                    _snapshot(room_id, 2),
+                    _baseline(room_id, 2),
+                ),
+            ),
+            room_lanes=(
+                RoomLane(
+                    room_id,
+                    1,
+                    LaneStatus.RETIRING,
+                    successor_membership_epoch=2,
+                    pending_lifecycle=lifecycle,
+                ),
+                RoomLane(room_id, 2, LaneStatus.ACTIVE),
+            ),
+        )
+        lane = replace(
+            transition.room_lanes[0],
+            pending_lifecycle=replace(lifecycle, origin=foreign_origin),
+        )
+    else:
+        event = _lane_event(
+            "transport-forge",
+            room_id,
+            1,
+            1,
+            TimelineEventProvenance.LIVE,
+        )
+        lane_record = _lane_record(
+            LaneRecordKey(room_id, 1, LaneRecordSection.HELD, 0, 0),
+            event,
+            source_frame_id=UUID("66666666-6666-6666-6666-666666666666"),
+        )
+        transition = JournalTransition(
+            room_states=(
+                RoomState(
+                    room_id,
+                    1,
+                    1,
+                    RoomHydrationStatus.READY,
+                    _snapshot(room_id, 1),
+                ),
+            ),
+            room_lanes=(
+                RoomLane(
+                    room_id,
+                    1,
+                    LaneStatus.ACTIVE,
+                    held_record_count=1,
+                    held_canonical_bytes=lane_record.canonical_bytes,
+                    next_held_ordinal=1,
+                ),
+            ),
+            lane_record_inserts=(lane_record,),
+        )
+        lane = transition.room_lanes[0]
+
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=transition,
+    )
+    if carrier == "lane_record":
+        assert lane_record is not None
+        forged_record = replace(
+            lane_record,
+            record=replace(lane_record.record, origin=foreign_origin),
+        )
+        payload = bootstrap._journal._lane_record_payload(
+            forged_record,
+            forged_record.record.record_id,
+            "event",
+            2,
+        )
+        ciphertext, digest = bootstrap._journal._codec.seal(
+            "NioIngestLaneRecord",
+            bootstrap._journal._lane_record_primary_key(forged_record.key),
+            payload,
+        )
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestLaneRecord SET payload_ciphertext = ?, "
+            "payload_sha256 = ? WHERE account_id = ? AND item_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, forged_record.record.record_id),
+        )
+    else:
+        payload = bootstrap._journal._room_lane_payload(lane, 2)
+        ciphertext, digest = bootstrap._journal._codec.seal(
+            "NioIngestRoomLane",
+            (lane.room_id, lane.membership_epoch),
+            payload,
+        )
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestRoomLane SET lane_state_ciphertext = ?, "
+            "lane_state_sha256 = ? WHERE account_id = ? AND room_id = ? "
+            "AND membership_epoch = ?",
+            (
+                ciphertext,
+                digest,
+                ACCOUNT_ID,
+                lane.room_id,
+                lane.membership_epoch,
+            ),
+        )
+    bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        await reopened.attach_consumer(consumer)
+        with pytest.raises(JournalIntegrityError, match="transport"):
+            if lane_record is None:
+                reopened._journal.load_rooms(frozenset({room_id}))
+            else:
+                reopened._journal.load_lane_record(lane_record.key)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_record_decode_wraps_authenticated_uuid_shape_errors(
+    tmp_path: Path,
+) -> None:
+    bootstrap, _, _, lane_record = await _journal_with_carriers(tmp_path)
+    payload = bootstrap._journal._lane_record_payload(
+        lane_record,
+        lane_record.record.record_id,
+        "event",
+        2,
+    )
+    envelope = json.loads(payload)
+    envelope["source_frame_id"] = 7
+    forged_payload = _canonical_json(envelope)
+    ciphertext, digest = bootstrap._journal._codec.seal(
+        "NioIngestLaneRecord",
+        bootstrap._journal._lane_record_primary_key(lane_record.key),
+        forged_payload,
+    )
+    bootstrap._journal.connection.execute(
+        "UPDATE NioIngestLaneRecord SET payload_ciphertext = ?, "
+        "payload_sha256 = ? WHERE account_id = ? AND item_id = ?",
+        (ciphertext, digest, ACCOUNT_ID, lane_record.record.record_id),
+    )
+    try:
+        with pytest.raises(JournalIntegrityError, match="authenticated envelope"):
+            bootstrap._journal.load_lane_record(lane_record.key)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_record_decode_rejects_transport_loss_without_source_owner(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    loss = _terminal_loss(bootstrap.stream_id, room_id, 1)
+    lane_record = _lane_record(
+        LaneRecordKey(room_id, 1, LaneRecordSection.LOSS, 0, 0),
+        loss,
+        source_effect_id=UUID("55555555-5555-5555-5555-555555555555"),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            room_id,
+            1,
+            lane_records=(lane_record,),
+        ),
+    )
+    payload = bootstrap._journal._lane_record_payload(
+        lane_record,
+        loss.loss_id,
+        "loss",
+        2,
+    )
+    envelope = json.loads(payload)
+    envelope["source_effect_id"] = None
+    forged_payload = _canonical_json(envelope)
+    ciphertext, digest = bootstrap._journal._codec.seal(
+        "NioIngestLaneRecord",
+        bootstrap._journal._lane_record_primary_key(lane_record.key),
+        forged_payload,
+    )
+    bootstrap._journal.connection.execute(
+        "UPDATE NioIngestLaneRecord SET source_effect_id = NULL, "
+        "payload_ciphertext = ?, payload_sha256 = ? "
+        "WHERE account_id = ? AND item_id = ?",
+        (ciphertext, digest, ACCOUNT_ID, loss.loss_id),
+    )
+    try:
+        with pytest.raises(JournalIntegrityError, match="authenticated envelope"):
+            bootstrap._journal.load_lane_record(lane_record.key)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_record_insert_revalidates_key_item_identity_and_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    epoch = 3
+    frame_id = UUID("66666666-6666-6666-6666-666666666666")
+    event = _lane_event("held", room_id, epoch, 7, TimelineEventProvenance.LIVE)
+    existing = _lane_record(
+        LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, 0),
+        event,
+        source_frame_id=frame_id,
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            room_id,
+            epoch,
+            lane_records=(existing,),
+        ),
+    )
+    bootstrap._journal.commit(
+        expected_revision=2,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(lane_record_inserts=(existing,)),
+    )
+
+    changed_event = _lane_event(
+        "changed", room_id, epoch, 8, TimelineEventProvenance.LIVE
+    )
+    collisions = (
+        _lane_record(existing.key, changed_event, source_frame_id=frame_id),
+        _lane_record(
+            replace(existing.key, record_ordinal=1),
+            event,
+            source_frame_id=frame_id,
+        ),
+        _lane_record(
+            replace(existing.key, record_ordinal=2),
+            _lane_event("wrong-size", room_id, epoch, 9, TimelineEventProvenance.LIVE),
+            source_frame_id=frame_id,
+            canonical_bytes=existing.canonical_bytes,
+        ),
+    )
+    try:
+        for collision in collisions:
+            with pytest.raises(JournalIntegrityError, match="lane record"):
+                bootstrap._journal.commit(
+                    expected_revision=3,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=JournalTransition(
+                        lane_record_inserts=(collision,),
+                    ),
+                )
+            assert bootstrap._journal.load_owner().revision == 3
+            assert bootstrap._journal.load_lane_record(existing.key) == existing
+
+        with pytest.raises(JournalIntegrityError, match="lane record.*missing"):
+            bootstrap._journal.commit(
+                expected_revision=3,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    lane_record_deletes=(replace(existing.key, record_ordinal=99),),
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 3
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_room",
+        "missing_epoch",
+        "duplicate_insert",
+        "duplicate_item",
+        "duplicate_delete",
+        "insert_delete_overlap",
+    ),
+)
+async def test_lane_record_transition_rejects_invalid_key_sets_before_write(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    epoch = 3
+    frame_id = UUID("66666666-6666-6666-6666-666666666666")
+    existing = _lane_record(
+        LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, 0),
+        _lane_event("existing", room_id, epoch, 7, TimelineEventProvenance.LIVE),
+        source_frame_id=frame_id,
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            room_id,
+            epoch,
+            lane_records=(existing,),
+        ),
+    )
+    candidate_room = "!missing:example.org" if case == "missing_room" else room_id
+    candidate_epoch = 4 if case == "missing_epoch" else epoch
+    candidate = _lane_record(
+        LaneRecordKey(
+            candidate_room,
+            candidate_epoch,
+            LaneRecordSection.HELD,
+            0,
+            1,
+        ),
+        _lane_event(
+            "candidate",
+            candidate_room,
+            candidate_epoch,
+            8,
+            TimelineEventProvenance.LIVE,
+        ),
+        source_frame_id=frame_id,
+    )
+    if case in {"missing_room", "missing_epoch"}:
+        transition = JournalTransition(lane_record_inserts=(candidate,))
+    elif case == "duplicate_insert":
+        transition = JournalTransition(lane_record_inserts=(candidate, candidate))
+    elif case == "duplicate_item":
+        transition = JournalTransition(
+            lane_record_inserts=(
+                candidate,
+                replace(candidate, key=replace(candidate.key, record_ordinal=2)),
+            ),
+        )
+    elif case == "duplicate_delete":
+        transition = JournalTransition(
+            lane_record_deletes=(existing.key, existing.key),
+        )
+    else:
+        transition = JournalTransition(
+            lane_record_inserts=(candidate,),
+            lane_record_deletes=(candidate.key,),
+        )
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="lane record"):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+async def _journal_with_carriers(tmp_path: Path):
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    epoch = 3
+    event = _lane_event("held", room_id, epoch, 7, TimelineEventProvenance.LIVE)
+    lane_record = _lane_record(
+        LaneRecordKey(room_id, epoch, LaneRecordSection.HELD, 0, 0),
+        event,
+        source_frame_id=UUID("66666666-6666-6666-6666-666666666666"),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            room_id,
+            epoch,
+            lane_records=(lane_record,),
+        ),
+    )
+    return bootstrap, room_id, epoch, lane_record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ("room_state", "room_lane", "lane_record"))
+@pytest.mark.parametrize("part", ("ciphertext", "sha256"))
+async def test_carrier_payload_or_digest_tamper_fails_before_any_revision_mutation(
+    tmp_path: Path,
+    target: str,
+    part: str,
+) -> None:
+    bootstrap, room_id, epoch, lane_record = await _journal_with_carriers(tmp_path)
+    locations = {
+        "room_state": (
+            "NioIngestRoomState",
+            "state",
+            "room_id = ?",
+            (room_id,),
+        ),
+        "room_lane": (
+            "NioIngestRoomLane",
+            "lane_state",
+            "room_id = ? AND membership_epoch = ?",
+            (room_id, epoch),
+        ),
+        "lane_record": (
+            "NioIngestLaneRecord",
+            "payload",
+            "room_id = ? AND membership_epoch = ? AND section = ? "
+            "AND page_ordinal = ? AND record_ordinal = ?",
+            (
+                lane_record.key.room_id,
+                lane_record.key.membership_epoch,
+                lane_record.key.section.value,
+                lane_record.key.page_ordinal,
+                lane_record.key.record_ordinal,
+            ),
+        ),
+    }
+    table, prefix, where, parameters = locations[target]
+    column = f"{prefix}_{part}"
+    row = bootstrap._journal.connection.execute(
+        f'SELECT "{column}" FROM "{table}" WHERE account_id = ? AND {where}',
+        (ACCOUNT_ID, *parameters),
+    ).fetchone()
+    value = bytes(row[0])
+    changed = value[:-1] + bytes((value[-1] ^ 1,))
+    bootstrap._journal.connection.execute(
+        f'UPDATE "{table}" SET "{column}" = ? WHERE account_id = ? AND {where}',
+        (changed, ACCOUNT_ID, *parameters),
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError):
+            if target == "lane_record":
+                bootstrap._journal.load_lane_record(lane_record.key)
+            else:
+                bootstrap._journal.load_rooms(frozenset({room_id}))
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "column", "forged"),
+    (
+        ("room_state", "room_id", "!forged:example.org"),
+        ("room_state", "current_membership_epoch", 4),
+        ("room_state", "next_room_sequence", 9),
+        ("room_state", "hydration_status", "unavailable"),
+        ("room_state", "updated_revision", 99),
+        ("room_lane", "room_id", "!forged:example.org"),
+        ("room_lane", "membership_epoch", 4),
+        ("room_lane", "lane_status", "retiring"),
+        ("room_lane", "held_record_count", 2),
+        ("room_lane", "held_canonical_bytes", 1),
+        ("room_lane", "release_phase", "releasing_recovered"),
+        ("room_lane", "ready_order", 42),
+        ("room_lane", "next_held_ordinal", 2),
+        ("room_lane", "successor_membership_epoch", 4),
+        ("room_lane", "updated_revision", 99),
+        ("lane_record", "room_id", "!forged:example.org"),
+        ("lane_record", "membership_epoch", 4),
+        ("lane_record", "section", "recovered"),
+        ("lane_record", "page_ordinal", 2),
+        ("lane_record", "record_ordinal", 1),
+        ("lane_record", "item_id", "$forged"),
+        ("lane_record", "item_kind", "loss"),
+        (
+            "lane_record",
+            "source_frame_id",
+            "77777777-7777-7777-7777-777777777777",
+        ),
+        (
+            "lane_record",
+            "source_effect_id",
+            "88888888-8888-8888-8888-888888888888",
+        ),
+        ("lane_record", "canonical_bytes", 999),
+        ("lane_record", "created_revision", 99),
+    ),
+)
+async def test_carrier_plaintext_metadata_must_match_authenticated_envelope(
+    tmp_path: Path,
+    target: str,
+    column: str,
+    forged: object,
+) -> None:
+    bootstrap, room_id, epoch, lane_record = await _journal_with_carriers(tmp_path)
+    locations = {
+        "room_state": ("NioIngestRoomState", "room_id = ?", (room_id,)),
+        "room_lane": (
+            "NioIngestRoomLane",
+            "room_id = ? AND membership_epoch = ?",
+            (room_id, epoch),
+        ),
+        "lane_record": (
+            "NioIngestLaneRecord",
+            "room_id = ? AND membership_epoch = ? AND section = ? "
+            "AND page_ordinal = ? AND record_ordinal = ?",
+            (
+                lane_record.key.room_id,
+                lane_record.key.membership_epoch,
+                lane_record.key.section.value,
+                lane_record.key.page_ordinal,
+                lane_record.key.record_ordinal,
+            ),
+        ),
+    }
+    table, where, parameters = locations[target]
+    bootstrap._journal.connection.execute("PRAGMA ignore_check_constraints = ON")
+    bootstrap._journal.connection.execute(
+        f'UPDATE "{table}" SET "{column}" = ? WHERE account_id = ? AND {where}',
+        (forged, ACCOUNT_ID, *parameters),
+    )
+    bootstrap._journal.connection.execute("PRAGMA ignore_check_constraints = OFF")
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="authenticat"):
+            if target == "lane_record":
+                lookup_room = forged if column == "room_id" else lane_record.key.room_id
+                lookup_epoch = (
+                    forged
+                    if column == "membership_epoch"
+                    else lane_record.key.membership_epoch
+                )
+                assert type(lookup_room) is str
+                assert type(lookup_epoch) is int
+                bootstrap._journal.list_lane_records(lookup_room, lookup_epoch)
+            else:
+                lookup_room = forged if column == "room_id" else room_id
+                assert type(lookup_room) is str
+                bootstrap._journal.load_rooms(frozenset({room_id, lookup_room}))
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
 
 
 @pytest.mark.asyncio

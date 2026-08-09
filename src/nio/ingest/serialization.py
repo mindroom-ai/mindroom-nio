@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid5
 
 from .errors import BatchIntegrityError
+from .membership import MembershipBaseline
 from .model import (
     BatchRef,
     ConsumerBinding,
@@ -23,8 +24,48 @@ from .model import (
     TimelineEventProvenance,
     TransportKind,
 )
+from .recovery import RecoveryGap
 
 SCHEMA_VERSION = 1
+
+_MEMBERSHIP_BASELINE_FIELDS = (
+    "room_id",
+    "source_epoch",
+    "membership_epoch",
+    "prev_batch",
+    "membership_event_id",
+)
+_RECOVERY_GAP_FIELDS = (
+    "gap_id",
+    "room_id",
+    "opening_source_epoch",
+    "membership_epoch",
+    "origin",
+    "membership_event_id",
+    "start_token",
+    "target_token",
+    "cursor_token",
+    "seen_cursor_tokens",
+    "pages_committed",
+    "recovered_record_count",
+    "in_flight_effect_id",
+)
+_ROOM_SNAPSHOT_FIELDS = (
+    "room_id",
+    "membership_epoch",
+    "own_user_id",
+    "own_membership",
+    "encrypted",
+    "name",
+    "canonical_alias",
+    "topic",
+    "avatar_url",
+    "join_rule",
+    "room_version",
+    "guest_access",
+    "power_levels_json",
+    "members",
+)
 
 
 def _canonical_json(value: dict[str, Any]) -> bytes:
@@ -178,6 +219,115 @@ def _record_from_dict(value: object) -> EventRecord | LossRecord:
             _required_decoded_bytes(record.get("detail_json"), "detail_json"),
         )
     raise ValueError("record_type must be 'event' or 'loss'")
+
+
+def _record_from_exact_dict(value: object) -> EventRecord | LossRecord:
+    payload = _dict(value, "record")
+    record = _record_from_dict(payload)
+    canonical = _record_to_dict(record)
+    if tuple(payload) != tuple(canonical) or payload != canonical:
+        raise ValueError("record fields are not canonical")
+    return record
+
+
+def _membership_baseline_to_dict(
+    baseline: MembershipBaseline,
+) -> dict[str, object]:
+    if type(baseline) is not MembershipBaseline:
+        raise TypeError("baseline must be MembershipBaseline")
+    return {
+        "room_id": baseline.room_id,
+        "source_epoch": baseline.source_epoch,
+        "membership_epoch": baseline.membership_epoch,
+        "prev_batch": baseline.prev_batch,
+        "membership_event_id": baseline.membership_event_id,
+    }
+
+
+def _membership_baseline_from_dict(value: object) -> MembershipBaseline:
+    baseline = _dict(value, "membership_baseline")
+    if tuple(baseline) != _MEMBERSHIP_BASELINE_FIELDS:
+        raise ValueError("membership baseline fields are not canonical")
+    return MembershipBaseline(
+        _string(baseline["room_id"], "room_id"),
+        _integer(baseline["source_epoch"], "source_epoch"),
+        _integer(baseline["membership_epoch"], "membership_epoch"),
+        _string(baseline["prev_batch"], "prev_batch"),
+        _string(baseline["membership_event_id"], "membership_event_id"),
+    )
+
+
+def _canonical_membership_baseline_payload(
+    baseline: MembershipBaseline,
+) -> bytes:
+    return _canonical_json(_membership_baseline_to_dict(baseline))
+
+
+def _membership_baseline_sha256(baseline: MembershipBaseline) -> bytes:
+    return hashlib.sha256(_canonical_membership_baseline_payload(baseline)).digest()
+
+
+def _membership_baseline_from_payload(payload: bytes) -> MembershipBaseline:
+    baseline = _membership_baseline_from_dict(_load_json_object(payload))
+    if payload != _canonical_membership_baseline_payload(baseline):
+        raise ValueError("membership baseline payload is not canonical")
+    return baseline
+
+
+def _recovery_gap_to_dict(gap: RecoveryGap) -> dict[str, object]:
+    if type(gap) is not RecoveryGap:
+        raise TypeError("gap must be RecoveryGap")
+    return {
+        "gap_id": str(gap.gap_id),
+        "room_id": gap.room_id,
+        "opening_source_epoch": gap.opening_source_epoch,
+        "membership_epoch": gap.membership_epoch,
+        "origin": _origin_to_dict(gap.origin),
+        "membership_event_id": gap.membership_event_id,
+        "start_token": gap.start_token,
+        "target_token": gap.target_token,
+        "cursor_token": gap.cursor_token,
+        "seen_cursor_tokens": list(gap.seen_cursor_tokens),
+        "pages_committed": gap.pages_committed,
+        "recovered_record_count": gap.recovered_record_count,
+        "in_flight_effect_id": (
+            str(gap.in_flight_effect_id)
+            if gap.in_flight_effect_id is not None
+            else None
+        ),
+    }
+
+
+def _recovery_gap_from_dict(value: object) -> RecoveryGap:
+    gap = _dict(value, "recovery_gap")
+    if tuple(gap) != _RECOVERY_GAP_FIELDS:
+        raise ValueError("recovery gap fields are not canonical")
+    origin = _origin_from_dict(gap["origin"])
+    if type(origin) is not RecordOrigin:
+        raise ValueError("recovery gap origin must be a RecordOrigin")
+    seen_value = gap["seen_cursor_tokens"]
+    if not isinstance(seen_value, list):
+        raise ValueError("seen_cursor_tokens must be an array")
+    effect_value = gap["in_flight_effect_id"]
+    return RecoveryGap(
+        UUID(_string(gap["gap_id"], "gap_id")),
+        _string(gap["room_id"], "room_id"),
+        _integer(gap["opening_source_epoch"], "opening_source_epoch"),
+        _integer(gap["membership_epoch"], "membership_epoch"),
+        origin,
+        _string(gap["membership_event_id"], "membership_event_id"),
+        _string(gap["start_token"], "start_token"),
+        _string(gap["target_token"], "target_token"),
+        _string(gap["cursor_token"], "cursor_token"),
+        tuple(_string(token, "seen_cursor_token") for token in seen_value),
+        _integer(gap["pages_committed"], "pages_committed"),
+        _integer(gap["recovered_record_count"], "recovered_record_count"),
+        (
+            UUID(_string(effect_value, "in_flight_effect_id"))
+            if effect_value is not None
+            else None
+        ),
+    )
 
 
 def _batch_dict(
@@ -378,7 +528,16 @@ def _canonical_room_snapshot_payload(snapshot: RoomSnapshot) -> bytes:
 
 
 def _room_snapshot_from_payload(payload: bytes) -> RoomSnapshot:
-    root = _load_json_object(payload)
+    snapshot = _room_snapshot_from_dict(_load_json_object(payload))
+    if payload != _canonical_room_snapshot_payload(snapshot):
+        raise ValueError("room snapshot payload is not canonical")
+    return snapshot
+
+
+def _room_snapshot_from_dict(value: object) -> RoomSnapshot:
+    root = _dict(value, "room_snapshot")
+    if tuple(root) != _ROOM_SNAPSHOT_FIELDS:
+        raise ValueError("room snapshot fields are not canonical")
     members_value = root.get("members")
     if not isinstance(members_value, list):
         raise ValueError("members must be an array")

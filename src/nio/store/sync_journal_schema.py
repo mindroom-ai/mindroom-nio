@@ -23,7 +23,8 @@ SCHEMA_SQL = (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id), room_id TEXT NOT NULL,
         current_membership_epoch INTEGER NOT NULL, next_room_sequence INTEGER NOT NULL,
         hydration_status TEXT NOT NULL CHECK (hydration_status IN ('pending', 'ready', 'unavailable')),
-        state_ciphertext BLOB, state_sha256 BLOB, updated_revision INTEGER NOT NULL,
+        state_ciphertext BLOB NOT NULL, state_sha256 BLOB NOT NULL,
+        updated_revision INTEGER NOT NULL,
         PRIMARY KEY (account_id, room_id)
     )""",
     """CREATE TABLE NioIngestRoomLane (
@@ -34,10 +35,20 @@ SCHEMA_SQL = (
         release_phase TEXT NOT NULL CHECK (release_phase IN (
             'idle', 'recovering', 'releasing_recovered', 'releasing_terminal'
         )),
-        release_loss_id TEXT, ready_order INTEGER, next_held_ordinal INTEGER NOT NULL,
-        next_recovery_page INTEGER NOT NULL, successor_membership_epoch INTEGER,
-        pending_lifecycle_ciphertext BLOB, pending_lifecycle_sha256 BLOB,
+        ready_order INTEGER, next_held_ordinal INTEGER NOT NULL,
+        successor_membership_epoch INTEGER,
+        lane_state_ciphertext BLOB NOT NULL, lane_state_sha256 BLOB NOT NULL,
         updated_revision INTEGER NOT NULL,
+        CHECK (held_record_count >= 0 AND held_canonical_bytes >= 0),
+        CHECK (next_held_ordinal >= held_record_count),
+        CHECK ((held_record_count = 0) = (held_canonical_bytes = 0)),
+        CHECK ((release_phase IN (
+            'releasing_recovered', 'releasing_terminal'
+        )) = (ready_order IS NOT NULL)),
+        CHECK (ready_order IS NULL OR ready_order >= 0),
+        CHECK ((lane_status = 'retiring') = (
+            successor_membership_epoch IS NOT NULL
+        )),
         PRIMARY KEY (account_id, room_id, membership_epoch)
     )""",
     "CREATE INDEX NioIngestRoomLane_ready ON NioIngestRoomLane(account_id, ready_order)",
@@ -53,13 +64,27 @@ SCHEMA_SQL = (
     """CREATE TABLE NioIngestLaneRecord (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
         room_id TEXT NOT NULL, membership_epoch INTEGER NOT NULL,
-        section TEXT NOT NULL CHECK (section IN ('recovered', 'held')),
+        section TEXT NOT NULL CHECK (section IN ('loss', 'recovered', 'held')),
         page_ordinal INTEGER NOT NULL, record_ordinal INTEGER NOT NULL,
-        record_id TEXT NOT NULL, payload_ciphertext BLOB NOT NULL,
+        item_id TEXT NOT NULL,
+        item_kind TEXT NOT NULL CHECK (item_kind IN ('event', 'loss')),
+        source_frame_id TEXT, source_effect_id TEXT,
+        payload_ciphertext BLOB NOT NULL,
         payload_sha256 BLOB NOT NULL, canonical_bytes INTEGER NOT NULL,
         created_revision INTEGER NOT NULL,
+        CHECK ((section = 'loss') = (item_kind = 'loss')),
+        CHECK (length(item_id) > 0),
+        CHECK (canonical_bytes > 0),
+        CHECK (section != 'held' OR page_ordinal = 0),
+        CHECK (source_frame_id IS NULL OR source_effect_id IS NULL),
+        CHECK (section != 'held' OR (
+            source_frame_id IS NOT NULL AND source_effect_id IS NULL
+        )),
+        CHECK (section != 'recovered' OR (
+            source_effect_id IS NOT NULL AND source_frame_id IS NULL
+        )),
         PRIMARY KEY (account_id, room_id, membership_epoch, section, page_ordinal, record_ordinal),
-        UNIQUE (account_id, record_id)
+        UNIQUE (account_id, item_id)
     )""",
     """CREATE TABLE NioIngestFrame (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id), frame_id TEXT NOT NULL,

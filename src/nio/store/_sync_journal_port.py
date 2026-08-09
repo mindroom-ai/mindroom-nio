@@ -8,6 +8,9 @@ from ..ingest.state import (
     AckOutcome,
     CommitResult,
     JournalTransition,
+    LaneRecord,
+    LaneRecordKey,
+    LaneRecordSection,
     OwnerView,
     ReadyRecord,
     RoomAggregate,
@@ -30,6 +33,15 @@ class IngestionJournal(Protocol):
     ) -> dict[str, RoomAggregate]: ...
 
     def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]: ...
+
+    def load_lane_record(self, key: LaneRecordKey) -> LaneRecord | None: ...
+
+    def list_lane_records(
+        self,
+        room_id: str,
+        membership_epoch: int,
+        section: LaneRecordSection | None = None,
+    ) -> tuple[LaneRecord, ...]: ...
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None: ...
 

@@ -12,6 +12,25 @@ from nio.ingest.membership import (
     prove_membership,
 )
 
+ROOM_ID = "!room:example.org"
+
+
+def _baseline(
+    prev_batch: str,
+    membership_event_id: str,
+    *,
+    room_id: str = ROOM_ID,
+    source_epoch: int = 1,
+    membership_epoch: int = 1,
+) -> MembershipBaseline:
+    return MembershipBaseline(
+        room_id,
+        source_epoch,
+        membership_epoch,
+        prev_batch,
+        membership_event_id,
+    )
+
 
 def observation(
     *,
@@ -39,7 +58,7 @@ def observation(
 
 
 def test_membership_values_are_frozen_slotted_and_exact() -> None:
-    baseline = MembershipBaseline("w1", "$member")
+    baseline = _baseline("w1", "$member")
     evidence = observation(event_membership="join", event_id="$member")
     proof = MembershipProof(MembershipProofKind.CONTINUES, "$member")
 
@@ -78,13 +97,13 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="current-membership-establishes-first-baseline",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(event_membership="join", event_id="$m1"),
             MembershipProof(MembershipProofKind.CONTINUES, "$m1"),
             id="exact-membership-event-continues",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$old"),
+            _baseline("w1", "$old"),
             observation(
                 event_membership="join",
                 event_id="$new",
@@ -94,7 +113,7 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="live-own-join-proves-new-membership-but-breaks-continuity",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 event_membership="join",
                 event_id="$m1",
@@ -104,7 +123,7 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="live-redelivery-of-the-baseline-still-breaks-continuity",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 event_membership="join",
                 event_id="$m2",
@@ -116,7 +135,7 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="live-linked-rotation-still-breaks-continuity",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 event_membership="join",
                 event_id="$m2",
@@ -127,7 +146,7 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="linked-join-to-join-rotation-continues",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 event_membership="join",
                 event_id="$m2",
@@ -138,7 +157,7 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="rotation-replacing-another-event-is-unsafe",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 event_membership="join",
                 event_id="$m2",
@@ -149,31 +168,31 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="rotation-from-non-join-is-unsafe",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(event_membership="join", event_id="$m2"),
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="unlinked-required-state-join-cannot-date-a-rejoin",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(is_unparsed=True),
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="unparsed-own-membership-stub-is-unsafe",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(),
             MembershipProof(MembershipProofKind.CONTINUES, "$m1"),
             id="ordinary-delta-without-membership-change-continues",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(is_initial=True),
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="initial-window-without-membership-proof-is-unsafe",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(is_expanded_timeline=True),
             MembershipProof(MembershipProofKind.UNSAFE, None),
             id="expanded-window-without-membership-proof-is-unsafe",
@@ -185,19 +204,19 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="no-membership-event-and-no-baseline-is-unsafe",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(room_membership="invite"),
             MembershipProof(MembershipProofKind.DEPARTED, None),
             id="invite-crosses-membership-epoch",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(room_membership="invite", is_unparsed=True),
             MembershipProof(MembershipProofKind.DEPARTED, None),
             id="authoritative-room-departure-outranks-an-unparsed-stub",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(
                 room_membership="leave",
                 event_membership="join",
@@ -207,13 +226,13 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             id="authoritative-room-departure-outranks-a-contradictory-join",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(room_membership="knock"),
             MembershipProof(MembershipProofKind.DEPARTED, None),
             id="knock-crosses-membership-epoch",
         ),
         pytest.param(
-            MembershipBaseline("w1", "$m1"),
+            _baseline("w1", "$m1"),
             observation(room_membership="ban"),
             MembershipProof(MembershipProofKind.DEPARTED, None),
             id="ban-crosses-membership-epoch",
@@ -229,7 +248,7 @@ def test_membership_epoch_proof_rules(
 
 
 def test_recovery_uses_old_window_only_for_proven_continuity() -> None:
-    baseline = MembershipBaseline("old-prev", "$m1")
+    baseline = _baseline("old-prev", "$m1")
 
     assert (
         membership_recovery_cursor(
@@ -258,22 +277,36 @@ def test_recovery_uses_old_window_only_for_proven_continuity() -> None:
 
 
 def test_baseline_advance_forgets_departures_and_rebinds_join_transitions() -> None:
-    baseline = MembershipBaseline("old-prev", "$m1")
+    baseline = _baseline("old-prev", "$m1")
 
     assert advance_membership_baseline(
         baseline,
         MembershipProof(MembershipProofKind.CONTINUES, "$m2"),
+        room_id=ROOM_ID,
+        source_epoch=9,
+        membership_epoch=1,
         current_prev_batch=None,
-    ) == MembershipBaseline("old-prev", "$m2")
+    ) == _baseline("old-prev", "$m2")
     assert advance_membership_baseline(
         baseline,
         MembershipProof(MembershipProofKind.CHANGED, "$m2"),
+        room_id=ROOM_ID,
+        source_epoch=9,
+        membership_epoch=2,
         current_prev_batch="new-prev",
-    ) == MembershipBaseline("new-prev", "$m2")
+    ) == _baseline(
+        "new-prev",
+        "$m2",
+        source_epoch=9,
+        membership_epoch=2,
+    )
     assert (
         advance_membership_baseline(
             baseline,
             MembershipProof(MembershipProofKind.CHANGED, "$m2"),
+            room_id=ROOM_ID,
+            source_epoch=9,
+            membership_epoch=2,
             current_prev_batch=None,
         )
         is None
@@ -283,6 +316,9 @@ def test_baseline_advance_forgets_departures_and_rebinds_join_transitions() -> N
             advance_membership_baseline(
                 baseline,
                 MembershipProof(kind, None),
+                room_id=ROOM_ID,
+                source_epoch=9,
+                membership_epoch=2,
                 current_prev_batch="new-prev",
             )
             is None

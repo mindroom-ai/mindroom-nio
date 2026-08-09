@@ -25,9 +25,13 @@ from nio.ingest import (
     TransportKind,
     canonical_batch_payload,
 )
+from nio.ingest.membership import MembershipBaseline
 from nio.ingest.serialization import (
     _batch_from_payload,
+    _canonical_membership_baseline_payload,
     _canonical_room_snapshot_payload,
+    _membership_baseline_from_payload,
+    _membership_baseline_sha256,
     _room_snapshot_from_payload,
     batch_from_records,
 )
@@ -59,6 +63,13 @@ GOLDEN_ROOM_SNAPSHOT_PAYLOAD = (
     b'"power_levels_json":"eyJ1c2VycyI6e319","members":['
     b'{"user_id":"@me:example.org","membership":"join","display_name":"Me",'
     b'"avatar_url":null,"power_level":100}]}'
+)
+GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD = (
+    b'{"room_id":"!room:example.org","source_epoch":4,"membership_epoch":7,'
+    b'"prev_batch":"old-prev","membership_event_id":"$member"}'
+)
+GOLDEN_MEMBERSHIP_BASELINE_SHA256 = (
+    "b062a60936591f6faf40441955d46e7269892d4d7f57aafa6b6e817a525ab198"
 )
 
 
@@ -406,3 +417,40 @@ def test_room_snapshot_canonical_round_trip_includes_own_identity() -> None:
 
     assert payload == GOLDEN_ROOM_SNAPSHOT_PAYLOAD
     assert _room_snapshot_from_payload(payload) == snapshot
+
+
+def test_membership_baseline_has_one_strict_canonical_payload_and_digest() -> None:
+    baseline = MembershipBaseline(
+        "!room:example.org",
+        4,
+        7,
+        "old-prev",
+        "$member",
+    )
+
+    assert _canonical_membership_baseline_payload(baseline) == (
+        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD
+    )
+    assert _membership_baseline_sha256(baseline).hex() == (
+        GOLDEN_MEMBERSHIP_BASELINE_SHA256
+    )
+    assert (
+        _membership_baseline_from_payload(GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD)
+        == baseline
+    )
+    for malformed in (
+        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
+            b'"room_id":"!room:example.org","source_epoch":4',
+            b'"source_epoch":4,"room_id":"!room:example.org"',
+        ),
+        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
+            b',"membership_event_id":"$member"',
+            b"",
+        ),
+        GOLDEN_MEMBERSHIP_BASELINE_PAYLOAD.replace(
+            b'"membership_event_id":"$member"',
+            b'"membership_event_id":"$member","extra":true',
+        ),
+    ):
+        with pytest.raises(ValueError, match="canonical"):
+            _membership_baseline_from_payload(malformed)
