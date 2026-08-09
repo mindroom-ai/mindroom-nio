@@ -294,6 +294,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
         database_name="journal.db",
     )
     try:
+        await reopened.attach_consumer(_consumer(reopened))
         assert reopened.journal.load_owner().revision == 1
         assert reopened.journal.load_owner().next_ready_order == 0
         assert reopened.journal.load_owner().next_batch_sequence == 1
@@ -361,6 +362,7 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
         database_name="journal.db",
     )
     try:
+        await reopened.attach_consumer(consumer)
         owner = reopened.journal.load_owner()
         assert owner.last_acked_sequence == 1
         assert owner.revision == 3

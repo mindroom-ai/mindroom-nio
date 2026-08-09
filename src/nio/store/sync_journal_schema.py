@@ -9,6 +9,7 @@ CREATE TABLE NioIngestMeta (
     binding_operation_id TEXT NOT NULL,
     journal_generation TEXT,
     consumer_generation TEXT,
+    consumer_first_sequence INTEGER,
     baseline_rooms_sha256 BLOB,
     consumer_attached_revision INTEGER,
     revision INTEGER NOT NULL,

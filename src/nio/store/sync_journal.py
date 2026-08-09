@@ -34,6 +34,7 @@ from ..ingest.model import (
     RoomHydrationStatus,
     SystemOrigin,
     SystemOriginKind,
+    SyncBatch,
     TransportKind,
 )
 from ..ingest.serialization import (
@@ -65,7 +66,12 @@ from ..ingest.state import (
     SourceState,
     StagedFrame,
 )
-from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
+from .sync_journal_schema import (
+    INGESTION_TABLES,
+    META_TABLE_SQL,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -192,9 +198,26 @@ class EncryptedRowCodec:
 class IngestionJournal(Protocol):
     """Durable compare-and-swap journal used by the ingestion owner."""
 
-    def oldest_unacknowledged(self): ...
+    def load_owner(self) -> OwnerView: ...
 
-    def acknowledge(self, ref): ...
+    def load_rooms(
+        self,
+        room_ids: frozenset[str],
+    ) -> dict[str, RoomAggregate]: ...
+
+    def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]: ...
+
+    def commit(
+        self,
+        *,
+        expected_revision: int,
+        writer_epoch: UUID,
+        transition: JournalTransition,
+    ) -> CommitResult: ...
+
+    def oldest_unacknowledged(self) -> SyncBatch | None: ...
+
+    def acknowledge(self, ref: BatchRef) -> AckOutcome: ...
 
 
 class _WriterLock:
@@ -290,6 +313,9 @@ class SqliteIngestionJournal:
         self._statement_observer = statement_observer
         self._transition_statement_hook = transition_statement_hook
         self._closed = False
+        stat = os.stat(database_path)
+        self._file_identity = (stat.st_dev, stat.st_ino)
+        self._consumer_validated = False
         self._codec = EncryptedRowCodec(pickle_key, account_id, self.stream_id)
         self._ack_lock = threading.Lock()
 
@@ -393,12 +419,13 @@ class SqliteIngestionJournal:
                 INSERT INTO NioIngestMeta (
                     account_id, device_id, schema_version, stream_id,
                     binding_operation_id, journal_generation,
-                    consumer_generation, baseline_rooms_sha256,
+                    consumer_generation, consumer_first_sequence,
+                    baseline_rooms_sha256,
                     consumer_attached_revision, revision, writer_epoch,
                     next_source_epoch, next_ready_order, next_batch_sequence,
                     last_acked_sequence, last_acked_batch_id,
                     last_acked_sha256, created_at_ns
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, 0, 1,
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, 1, 0, 1,
                           0, NULL, NULL, ?)
                 """,
                 (
@@ -444,6 +471,15 @@ class SqliteIngestionJournal:
             raise LocalProtocolError(
                 f"unsupported ingestion schema_version {row['schema_version']}"
             )
+        tables = {
+            table["name"]
+            for table in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name GLOB 'NioIngest*'"
+            ).fetchall()
+        }
+        if tables != INGESTION_TABLES:
+            raise LocalProtocolError("ingestion-v1 schema is incomplete or unexpected")
 
         old_epoch = row["writer_epoch"]
         writer_epoch = uuid4()
@@ -466,6 +502,16 @@ class SqliteIngestionJournal:
     def _assert_open(self) -> None:
         if self._closed or not self._writer_lock.active:
             raise LocalProtocolError("ingestion journal is closed")
+        try:
+            stat = os.stat(self.database_path)
+        except FileNotFoundError as error:
+            raise LocalProtocolError(
+                "ingestion database file identity is no longer present"
+            ) from error
+        if (stat.st_dev, stat.st_ino) != self._file_identity:
+            raise LocalProtocolError(
+                "ingestion database file identity changed after lock acquisition"
+            )
 
     def set_transition_statement_hook(
         self,
@@ -499,7 +545,16 @@ class SqliteIngestionJournal:
         row = self._meta()
         journal_generation = row["journal_generation"]
         consumer_generation = row["consumer_generation"]
-        if (journal_generation is None) != (consumer_generation is None):
+        binding_values = (
+            journal_generation,
+            consumer_generation,
+            row["consumer_first_sequence"],
+            row["baseline_rooms_sha256"],
+            row["consumer_attached_revision"],
+        )
+        if any(value is None for value in binding_values) and any(
+            value is not None for value in binding_values
+        ):
             raise JournalIntegrityError("partial consumer binding in ingestion meta")
         binding = (
             ConsumerBinding(UUID(journal_generation), UUID(consumer_generation))
@@ -513,6 +568,7 @@ class SqliteIngestionJournal:
             stream_id=UUID(row["stream_id"]),
             binding_operation_id=UUID(row["binding_operation_id"]),
             binding=binding,
+            consumer_first_sequence=row["consumer_first_sequence"],
             baseline_rooms_sha256=(
                 bytes(row["baseline_rooms_sha256"])
                 if row["baseline_rooms_sha256"] is not None
@@ -531,6 +587,10 @@ class SqliteIngestionJournal:
         owner = self.load_owner()
         if owner.binding is None:
             raise LocalProtocolError("ingestion consumer is not attached")
+        if not self._consumer_validated:
+            raise LocalProtocolError(
+                "ingestion consumer is not validated for this owner lifetime"
+            )
         return owner
 
     @property
@@ -576,22 +636,32 @@ class SqliteIngestionJournal:
         owner = self.load_owner()
         if consumer.binding_operation_id != owner.binding_operation_id:
             raise LocalProtocolError("binding_operation_id does not match journal")
-        if consumer.first_sequence != owner.next_batch_sequence:
-            raise LocalProtocolError("first_sequence does not match journal")
         if owner.binding is not None:
-            if (
-                owner.binding != consumer.binding
-                or owner.baseline_rooms_sha256 is None
-                or not hmac.compare_digest(
-                    owner.baseline_rooms_sha256,
-                    consumer.baseline_sha256,
-                )
-            ):
+            if owner.binding != consumer.binding:
                 raise LocalProtocolError(
                     "consumer binding does not match attached owner"
                 )
-            self._validate_attached_baseline(consumer)
+            if owner.consumer_first_sequence != consumer.first_sequence:
+                raise LocalProtocolError(
+                    "first_sequence does not match attached owner"
+                )
+            assert owner.baseline_rooms_sha256 is not None
+            if not hmac.compare_digest(
+                owner.baseline_rooms_sha256,
+                consumer.baseline_sha256,
+            ):
+                raise LocalProtocolError(
+                    "consumer baseline does not match attached owner"
+                )
+            self._consumer_validated = True
+            try:
+                self._validate_attached_baseline(consumer)
+            except BaseException:
+                self._consumer_validated = False
+                raise
             return
+        if consumer.first_sequence != owner.next_batch_sequence:
+            raise LocalProtocolError("first_sequence does not match journal")
 
         new_revision = owner.revision + 1
         origin = SystemOrigin(
@@ -647,7 +717,8 @@ class SqliteIngestionJournal:
                 """
                 UPDATE NioIngestMeta
                 SET journal_generation = ?, consumer_generation = ?,
-                    baseline_rooms_sha256 = ?, consumer_attached_revision = ?,
+                    consumer_first_sequence = ?, baseline_rooms_sha256 = ?,
+                    consumer_attached_revision = ?,
                     revision = ?, next_ready_order = ?
                 WHERE account_id = ? AND revision = ? AND writer_epoch = ?
                   AND journal_generation IS NULL AND consumer_generation IS NULL
@@ -655,6 +726,7 @@ class SqliteIngestionJournal:
                 (
                     str(consumer.binding.journal_generation),
                     str(consumer.binding.consumer_generation),
+                    consumer.first_sequence,
                     consumer.baseline_sha256,
                     new_revision,
                     new_revision,
@@ -672,6 +744,7 @@ class SqliteIngestionJournal:
                 self._write_loss(loss, new_revision)
                 self._write_ready(ready, new_revision)
             self.connection.execute("COMMIT")
+            self._consumer_validated = True
         except BaseException:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
@@ -801,7 +874,7 @@ class SqliteIngestionJournal:
         record_payload = _canonical_json(_record_to_dict(loss))
         loss_digest = hashlib.sha256(record_payload).digest()
         primary_key = (loss.loss_id,)
-        self._transition_execute(
+        cursor = self._transition_execute(
             "loss",
             """
             INSERT INTO NioIngestLoss (
@@ -843,16 +916,30 @@ class SqliteIngestionJournal:
                 revision,
             ),
         )
+        if cursor.rowcount == 0:
+            existing = self.load_loss(loss.loss_id)
+            if existing != loss:
+                raise JournalIntegrityError(
+                    "loss_id collides with different authenticated contents"
+                )
+
+    def _validated_record_id(self, record: EventRecord | LossRecord) -> str:
+        if isinstance(record, EventRecord):
+            return record.record_id
+        if record.loss_id != _loss_id(self.stream_id, record):
+            raise JournalIntegrityError("loss_id does not match loss contents")
+        return record.loss_id
 
     def _write_ready(self, ready: ReadyRecord, revision: int) -> None:
         payload = _canonical_json(_record_to_dict(ready.record))
         digest = hashlib.sha256(payload).digest()
-        record_id = (
-            ready.record.record_id
-            if isinstance(ready.record, EventRecord)
-            else ready.record.loss_id
-        )
-        self._transition_execute(
+        record_id = self._validated_record_id(ready.record)
+        canonical_bytes = len(payload)
+        if ready.canonical_bytes not in (0, canonical_bytes):
+            raise JournalIntegrityError(
+                "ready canonical_bytes does not match canonical payload"
+            )
+        cursor = self._transition_execute(
             "ready_record",
             """
             INSERT INTO NioIngestReadyRecord (
@@ -881,10 +968,30 @@ class SqliteIngestionJournal:
                     digest,
                 ),
                 digest,
-                ready.canonical_bytes or len(payload),
+                canonical_bytes,
                 revision,
             ),
         )
+        if cursor.rowcount == 0:
+            row = self.connection.execute(
+                "SELECT ready_order, record_id, source_frame_id, room_id, "
+                "membership_epoch, room_sequence, payload_ciphertext, "
+                "payload_sha256, canonical_bytes, created_revision "
+                "FROM NioIngestReadyRecord "
+                "WHERE account_id = ? AND record_id = ?",
+                (self.account_id, record_id),
+            ).fetchone()
+            existing = self._decode_ready_row(row) if row is not None else None
+            if (
+                existing is None
+                or existing.ready_order != ready.ready_order
+                or existing.record != ready.record
+                or existing.source_frame_id != ready.source_frame_id
+                or existing.canonical_bytes != canonical_bytes
+            ):
+                raise JournalIntegrityError(
+                    "ready record_id or ready_order collides with different contents"
+                )
 
     def _write_source(self, source: SourceState) -> None:
         digest = hashlib.sha256(source.cursor_json).digest()
@@ -950,19 +1057,14 @@ class SqliteIngestionJournal:
             frame.payload,
             digest,
         )
-        self._transition_execute(
+        cursor = self._transition_execute(
             "frame",
             """
             INSERT INTO NioIngestFrame (
                 account_id, frame_id, source_epoch, request_id,
                 payload_ciphertext, payload_sha256, staged_revision
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, frame_id) DO UPDATE SET
-                source_epoch = excluded.source_epoch,
-                request_id = excluded.request_id,
-                payload_ciphertext = excluded.payload_ciphertext,
-                payload_sha256 = excluded.payload_sha256,
-                staged_revision = excluded.staged_revision
+            ON CONFLICT(account_id, frame_id) DO NOTHING
             """,
             (
                 self.account_id,
@@ -974,6 +1076,17 @@ class SqliteIngestionJournal:
                 revision,
             ),
         )
+        if cursor.rowcount == 0:
+            existing = self.load_frame(frame.frame_id)
+            if (
+                existing is None
+                or existing.source_epoch != frame.source_epoch
+                or existing.request_id != frame.request_id
+                or existing.payload != frame.payload
+            ):
+                raise JournalIntegrityError(
+                    "frame_id collides with different authenticated contents"
+                )
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         self._require_attached()
@@ -997,7 +1110,12 @@ class SqliteIngestionJournal:
             row["staged_revision"],
         )
 
-    def _write_batch(self, batch, revision: int, owner: OwnerView) -> None:
+    def _write_batch(
+        self,
+        batch: SyncBatch,
+        revision: int,
+        owner: OwnerView,
+    ) -> None:
         if (
             batch.account_id != self.account_id
             or batch.device_id != self.device_id
@@ -1005,6 +1123,10 @@ class SqliteIngestionJournal:
             or batch.ref.stream_id != owner.stream_id
         ):
             raise JournalIntegrityError("batch owner identity does not match journal")
+        if batch.created_revision != revision:
+            raise JournalIntegrityError(
+                "batch created_revision does not match commit revision"
+            )
         payload = canonical_batch_payload(batch)
         digest = hashlib.sha256(payload).digest()
         if not hmac.compare_digest(digest, batch.ref.sha256):
@@ -1033,7 +1155,7 @@ class SqliteIngestionJournal:
             ),
         )
 
-    def _decode_batch(self, row: sqlite3.Row):
+    def _decode_batch(self, row: sqlite3.Row) -> SyncBatch:
         digest = bytes(row["payload_sha256"])
         payload = self._codec.decrypt(
             "NioIngestBatch",
@@ -1048,7 +1170,58 @@ class SqliteIngestionJournal:
             or not hmac.compare_digest(batch.ref.sha256, digest)
         ):
             raise JournalIntegrityError("batch identity does not match stored row")
+        if batch.created_revision != row["created_revision"]:
+            raise JournalIntegrityError(
+                "batch created_revision does not match stored row"
+            )
+        owner = self._require_attached()
+        if (
+            batch.account_id != owner.account_id
+            or batch.device_id != owner.device_id
+            or batch.consumer != owner.binding
+            or batch.ref.stream_id != owner.stream_id
+        ):
+            raise JournalIntegrityError("batch owner does not match journal owner")
         return batch
+
+    def _decode_ready_row(self, row: sqlite3.Row) -> ReadyRecord:
+        digest = bytes(row["payload_sha256"])
+        payload = self._codec.decrypt(
+            "NioIngestReadyRecord",
+            (row["record_id"],),
+            bytes(row["payload_ciphertext"]),
+            digest,
+        )
+        record = _record_from_dict(_load_json_object(payload))
+        if row["canonical_bytes"] != len(payload):
+            raise JournalIntegrityError(
+                "ready canonical_bytes does not match canonical payload"
+            )
+        actual_id = self._validated_record_id(record)
+        if actual_id != row["record_id"]:
+            raise JournalIntegrityError("ready record identity does not match row")
+        expected_sequence = (
+            record.room_sequence if isinstance(record, EventRecord) else None
+        )
+        if (
+            record.room_id != row["room_id"]
+            or record.membership_epoch != row["membership_epoch"]
+            or expected_sequence != row["room_sequence"]
+        ):
+            raise JournalIntegrityError(
+                "ready record columns do not match authenticated payload"
+            )
+        return ReadyRecord(
+            row["ready_order"],
+            record,
+            (
+                UUID(row["source_frame_id"])
+                if row["source_frame_id"] is not None
+                else None
+            ),
+            row["canonical_bytes"],
+            row["created_revision"],
+        )
 
     def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]:
         self._require_attached()
@@ -1056,7 +1229,8 @@ class SqliteIngestionJournal:
             raise ValueError("limit must be positive")
         rows = self.connection.execute(
             """
-            SELECT ready_order, record_id, source_frame_id, payload_ciphertext,
+            SELECT ready_order, record_id, source_frame_id, room_id,
+                   membership_epoch, room_sequence, payload_ciphertext,
                    payload_sha256, canonical_bytes, created_revision
             FROM NioIngestReadyRecord
             WHERE account_id = ?
@@ -1065,35 +1239,7 @@ class SqliteIngestionJournal:
             """,
             (self.account_id, limit),
         ).fetchall()
-        ready: list[ReadyRecord] = []
-        for row in rows:
-            digest = bytes(row["payload_sha256"])
-            payload = self._codec.decrypt(
-                "NioIngestReadyRecord",
-                (row["record_id"],),
-                bytes(row["payload_ciphertext"]),
-                digest,
-            )
-            record = _record_from_dict(_load_json_object(payload))
-            actual_id = (
-                record.record_id if isinstance(record, EventRecord) else record.loss_id
-            )
-            if actual_id != row["record_id"]:
-                raise JournalIntegrityError("ready record identity does not match row")
-            ready.append(
-                ReadyRecord(
-                    row["ready_order"],
-                    record,
-                    (
-                        UUID(row["source_frame_id"])
-                        if row["source_frame_id"] is not None
-                        else None
-                    ),
-                    row["canonical_bytes"],
-                    row["created_revision"],
-                )
-            )
-        return tuple(ready)
+        return tuple(self._decode_ready_row(row) for row in rows)
 
     def _decode_room_state(self, row: sqlite3.Row) -> RoomState:
         ciphertext = row["state_ciphertext"]
@@ -1280,6 +1426,8 @@ class SqliteIngestionJournal:
         loss_digest = hashlib.sha256(_canonical_json(_record_to_dict(loss))).digest()
         if not hmac.compare_digest(loss_digest, bytes(row["loss_sha256"])):
             raise JournalIntegrityError("whole loss digest mismatch")
+        if loss.loss_id != _loss_id(self.stream_id, loss):
+            raise JournalIntegrityError("loss_id does not match loss contents")
         return loss
 
     def commit(
@@ -1394,7 +1542,7 @@ class SqliteIngestionJournal:
             raise
         return CommitResult(new_revision)
 
-    def oldest_unacknowledged(self):
+    def oldest_unacknowledged(self) -> SyncBatch | None:
         self._require_attached()
         row = self.connection.execute(
             "SELECT * FROM NioIngestBatch "
@@ -1405,7 +1553,7 @@ class SqliteIngestionJournal:
         return self._decode_batch(row) if row is not None else None
 
     @staticmethod
-    def _reference_matches(batch, ref: BatchRef) -> bool:
+    def _reference_matches(batch: SyncBatch, ref: BatchRef) -> bool:
         return (
             batch.ref.stream_id == ref.stream_id
             and batch.ref.sequence == ref.sequence
@@ -1437,6 +1585,18 @@ class SqliteIngestionJournal:
                         "latest acknowledged batch row is not retained"
                     )
                 batch = self._decode_batch(row)
+                frontier = self._meta()
+                if (
+                    frontier["last_acked_batch_id"] != str(batch.ref.batch_id)
+                    or frontier["last_acked_sha256"] is None
+                    or not hmac.compare_digest(
+                        bytes(frontier["last_acked_sha256"]),
+                        batch.ref.sha256,
+                    )
+                ):
+                    raise JournalIntegrityError(
+                        "acknowledgement frontier does not match retained payload"
+                    )
                 if not self._reference_matches(batch, ref):
                     raise JournalConflictError(
                         "acknowledgement reference does not match payload"

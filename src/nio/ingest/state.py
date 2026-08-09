@@ -38,6 +38,7 @@ class OwnerView:
     stream_id: UUID
     binding_operation_id: UUID
     binding: ConsumerBinding | None
+    consumer_first_sequence: int | None
     baseline_rooms_sha256: bytes | None
     consumer_attached_revision: int | None
     revision: int

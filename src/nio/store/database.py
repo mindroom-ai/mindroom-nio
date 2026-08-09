@@ -535,6 +535,19 @@ class MatrixStore:
             with self.database.bind_ctx([StoreVersion, *e2ee_models]):
                 if not present_e2ee:
                     with self.database.atomic():
+                        cursor = self.database.execute_sql(
+                            "UPDATE NioIngestMeta "
+                            "SET writer_epoch = writer_epoch "
+                            "WHERE account_id = ? AND writer_epoch = ?",
+                            (
+                                self.user_id,
+                                str(bootstrap.journal.writer_epoch),
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise LocalProtocolError(
+                                "ingestion writer_epoch changed during E2EE setup"
+                            )
                         self.database.create_tables([StoreVersion, *e2ee_models])
                         StoreVersion.create(version=self.store_version)
                 else:
