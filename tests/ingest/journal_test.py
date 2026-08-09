@@ -3,6 +3,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import warnings
 from pathlib import Path
 from uuid import UUID
 
@@ -235,7 +236,9 @@ def _table_names(database_path: Path) -> set[str]:
 
 def _fork_outcomes(operation) -> tuple[str, ...]:
     read_fd, write_fd = os.pipe()
-    child_pid = os.fork()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="This process .* multi-threaded")
+        child_pid = os.fork()
     if child_pid == 0:
         os.close(read_fd)
         try:
