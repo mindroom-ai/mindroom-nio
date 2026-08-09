@@ -291,11 +291,14 @@ class SqliteIngestionJournal(JournalRows):
                 frame,
             )
 
-            rows = dict(self._classify_frame_rows())
+            frame_ids = self._classify_frame_ids()
             self._transition_hook("frame_collision_probe")
-            row = rows.get(frame.frame_id)
-            if row is not None:
-                stored = self._decode_frame_row(frame.frame_id, row, owner)
+            if frame.frame_id in frame_ids:
+                stored = self._decode_frame_row(
+                    frame.frame_id,
+                    self._frame_row(frame.frame_id),
+                    owner,
+                )
                 if stored.response != frame.response or frame.staged_revision not in (
                     0,
                     stored.staged_revision,

@@ -54,7 +54,13 @@ SLIDING_SOURCE = SlidingSourceConfig(
 OWN_USER_ID = "@alice:example.org"
 CRASH_EXIT_CODE = 86
 FRAME_CLASSIFICATION_LIMIT = 257
-CLASSIFY_FRAMES_SQL = (
+LARGE_CIPHERTEXT_PLACEHOLDER_BYTES = 64 * 1024
+CLASSIFY_FRAME_IDS_SQL = (
+    "SELECT frame_id FROM NioIngestFrame WHERE account_id = ? "
+    "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?"
+)
+LOAD_FRAME_SQL = "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?"
+LIST_FRAMES_SQL = (
     "SELECT * FROM NioIngestFrame WHERE account_id = ? "
     "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?"
 )
@@ -942,6 +948,19 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
 
         assert repeated == result
         assert _business_dml(statements) == []
+        frame_selects = [sql for sql in statements if "FROM NioIngestFrame" in sql]
+        assert [_normalized_sql(sql) for sql in frame_selects] == [
+            _normalized_sql(
+                CLASSIFY_FRAME_IDS_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", str(FRAME_CLASSIFICATION_LIMIT), 1
+                )
+            ),
+            _normalized_sql(
+                LOAD_FRAME_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", f"'{proposal.frame.frame_id}'", 1
+                )
+            ),
+        ]
         assert journal.load_owner().revision == result.revision
         assert journal.load_source() == proposal.successor_source
         assert journal.load_frame(proposal.frame.frame_id) == replace(
@@ -1118,6 +1137,76 @@ def test_collision_probe_uses_account_frame_identity_classification(
                 proposal=stage.proposal,
             )
         assert _business_dml(statements) == []
+    finally:
+        reopened.close()
+
+
+def test_load_frame_classifies_ids_then_fetches_only_the_exact_payload(
+    tmp_path: Path,
+) -> None:
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    statements: list[str] = []
+    reopened = _open(tmp_path, statements=statements)
+    try:
+        statements.clear()
+        assert reopened._journal.load_frame(frame_id) == replace(
+            stage.proposal.frame,
+            staged_revision=stage.committed.revision,
+        )
+        frame_selects = [sql for sql in statements if "FROM NioIngestFrame" in sql]
+        assert [_normalized_sql(sql) for sql in frame_selects] == [
+            _normalized_sql(
+                CLASSIFY_FRAME_IDS_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", str(FRAME_CLASSIFICATION_LIMIT), 1
+                )
+            ),
+            _normalized_sql(
+                LOAD_FRAME_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", f"'{frame_id}'", 1
+                )
+            ),
+        ]
+    finally:
+        reopened.close()
+
+
+def test_missing_load_classifies_256_large_rows_without_fetching_payloads(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    bootstrap.close()
+    database_path = tmp_path / "journal.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executemany(
+            "INSERT INTO NioIngestFrame ("
+            "account_id, frame_id, source_epoch, request_id, staged_revision, "
+            "payload_ciphertext, payload_sha256) "
+            "VALUES (?, ?, 0, ?, 1, zeroblob(?), zeroblob(32))",
+            (
+                (
+                    ACCOUNT_ID,
+                    str(UUID(int=index + 1)),
+                    index,
+                    LARGE_CIPHERTEXT_PLACEHOLDER_BYTES,
+                )
+                for index in range(256)
+            ),
+        )
+
+    statements: list[str] = []
+    reopened = _open(tmp_path, statements=statements)
+    try:
+        statements.clear()
+        assert reopened._journal.load_frame(UUID(int=0)) is None
+        frame_selects = [sql for sql in statements if "FROM NioIngestFrame" in sql]
+        assert [_normalized_sql(sql) for sql in frame_selects] == [
+            _normalized_sql(
+                CLASSIFY_FRAME_IDS_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", str(FRAME_CLASSIFICATION_LIMIT), 1
+                )
+            )
+        ]
     finally:
         reopened.close()
 
@@ -1350,10 +1439,15 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
         selected = [sql for sql in statements if "FROM NioIngestFrame" in sql]
         assert [_normalized_sql(sql) for sql in selected] == [
             _normalized_sql(
-                CLASSIFY_FRAMES_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                CLASSIFY_FRAME_IDS_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
                     "?", str(FRAME_CLASSIFICATION_LIMIT), 1
                 )
-            )
+            ),
+            _normalized_sql(
+                LIST_FRAMES_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
+                    "?", "256", 1
+                )
+            ),
         ]
         for limit in range(1, 257):
             assert reopened._journal.list_frames(limit) == expected[:limit]
@@ -1362,10 +1456,12 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
                 reopened._journal.list_frames(invalid_limit)
         with sqlite3.connect(tmp_path / "journal.db") as connection:
             plan = connection.execute(
-                f"EXPLAIN QUERY PLAN {CLASSIFY_FRAMES_SQL}",
+                f"EXPLAIN QUERY PLAN {CLASSIFY_FRAME_IDS_SQL}",
                 (ACCOUNT_ID, FRAME_CLASSIFICATION_LIMIT),
             ).fetchall()
-        assert any("NioIngestFrame_drain" in row[3] for row in plan)
+        assert any(
+            "USING COVERING INDEX NioIngestFrame_drain" in row[3] for row in plan
+        )
     finally:
         reopened.close()
 

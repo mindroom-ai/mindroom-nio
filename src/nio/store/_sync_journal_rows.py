@@ -349,31 +349,41 @@ class JournalRows:
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise JournalIntegrityError("persisted staged frame is invalid") from error
 
-    def _classify_frame_rows(self) -> tuple[tuple[UUID, sqlite3.Row], ...]:
+    def _classify_frame_ids(self) -> frozenset[UUID]:
         rows = self._connection.execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+            "SELECT frame_id FROM NioIngestFrame WHERE account_id = ? "
             "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
             (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
         ).fetchall()
         if len(rows) > _MAX_STAGED_FRAMES:
             raise JournalIntegrityError("staged frame count exceeds the 256 frame cap")
 
-        classified = tuple((self._parse_frame_id(row), row) for row in rows)
-        identities = [stored_id for ((_, stored_id), _) in classified]
+        classified = tuple(self._parse_frame_id(row) for row in rows)
+        identities = [stored_id for _, stored_id in classified]
         if len(identities) != len(set(identities)):
             raise JournalIntegrityError("frame_id has multiple textual identities")
-        for (raw_frame_id, stored_id), _ in classified:
+        for raw_frame_id, stored_id in classified:
             if raw_frame_id != str(stored_id):
                 raise JournalIntegrityError("persisted frame_id is not canonical")
-        return tuple((stored_id, row) for ((_, stored_id), row) in classified)
+        return frozenset(identities)
+
+    def _frame_row(self, frame_id: UUID) -> sqlite3.Row:
+        row = self._connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (self.account_id, str(frame_id)),
+        ).fetchone()
+        if row is None:
+            raise JournalIntegrityError("classified frame_id row is missing")
+        return row
 
     def _load_frame_with_owner(
         self,
         frame_id: UUID,
         owner: OwnerView,
     ) -> StagedFrame | None:
-        row = dict(self._classify_frame_rows()).get(frame_id)
-        return self._decode_frame_row(frame_id, row, owner) if row is not None else None
+        if frame_id not in self._classify_frame_ids():
+            return None
+        return self._decode_frame_row(frame_id, self._frame_row(frame_id), owner)
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         if type(frame_id) is not UUID:
@@ -384,9 +394,15 @@ class JournalRows:
         if type(limit) is not int or not 1 <= limit <= 256:
             raise ValueError("frame limit must be an integer from 1 through 256")
         owner = self.load_owner()
+        self._classify_frame_ids()
+        rows = self._connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+            "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
+            (self.account_id, limit),
+        ).fetchall()
         return tuple(
-            self._decode_frame_row(frame_id, row, owner)
-            for frame_id, row in self._classify_frame_rows()[:limit]
+            self._decode_frame_row(self._parse_frame_id(row)[1], row, owner)
+            for row in rows
         )
 
     def _write_frame(
