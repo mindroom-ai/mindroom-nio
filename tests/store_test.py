@@ -165,6 +165,14 @@ class UndeclaredAtomicStore(SqliteStore):
         return SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
 
 
+class ExternalStyleStore(SqliteStore):
+    """Match the traditional public no-argument post-init hook."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.external_post_init_ran = True
+
+
 class CopyFailingQueueDatabase(SqliteQueueDatabase):
     """Expose whether a queued migration reached its destructive copy step."""
 
@@ -202,6 +210,13 @@ class TestClass:
     def test_writable_store_uses_pytest_tmp_path(self, tmp_path):
         store = self.ephemeral_store
         assert Path(store.database_path).parent == tmp_path
+
+    def test_external_store_subclass_keeps_no_argument_post_init_hook(self):
+        store = ExternalStyleStore("@external:example.org", "DEVICE", self.store_path)
+        try:
+            assert store.external_post_init_ran is True
+        finally:
+            store.database.close()
 
     def test_atomic_recovery_capability_requires_each_subclass_to_opt_in(self):
         assert MatrixStore.supports_atomic_recovery is False

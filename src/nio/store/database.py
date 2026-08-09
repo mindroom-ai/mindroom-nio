@@ -16,7 +16,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from dataclasses import InitVar, asdict, dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -180,7 +180,9 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
-    _ingestion_bootstrap: InitVar[StoreBootstrap | None] = None
+    _ingestion_bootstrap: StoreBootstrap | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -408,16 +410,20 @@ class MatrixStore:
         if self._repair_recovery_abandonment_schema():
             self._seed_terminal_recovery_abandonments()
 
-    def __post_init__(self, _ingestion_bootstrap: StoreBootstrap | None) -> None:
+    def __post_init__(self) -> None:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
-        if _ingestion_bootstrap is not None:
-            with _ingestion_bootstrap._claim_store(self):
-                if not database_has_ingestion_marker(self.database_path):
-                    raise LocalProtocolError(
-                        "StoreBootstrap marker disappeared before store open"
-                    )
-                self._post_init_ingestion_store(_ingestion_bootstrap)
+        bootstrap = self._ingestion_bootstrap
+        if bootstrap is not None:
+            try:
+                with bootstrap._claim_store(self):
+                    if not database_has_ingestion_marker(self.database_path):
+                        raise LocalProtocolError(
+                            "StoreBootstrap marker disappeared before store open"
+                        )
+                    self._post_init_ingestion_store(bootstrap)
+            finally:
+                self._ingestion_bootstrap = None
             return
 
         with StableFileLock(Path(self.database_path)):
@@ -1647,8 +1653,8 @@ class DefaultStore(MatrixStore):
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
-    def __post_init__(self, _ingestion_bootstrap=None):
-        super().__post_init__(_ingestion_bootstrap)
+    def __post_init__(self):
+        super().__post_init__()
 
         trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
         self.trust_db = KeyStore(os.path.join(self.store_path, trust_file_path))
