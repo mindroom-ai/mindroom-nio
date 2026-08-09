@@ -32,9 +32,9 @@ from ..ingest.model import (
     LossRecord,
     RecordKind,
     RoomHydrationStatus,
+    SyncBatch,
     SystemOrigin,
     SystemOriginKind,
-    SyncBatch,
     TransportKind,
 )
 from ..ingest.serialization import (
@@ -642,9 +642,7 @@ class SqliteIngestionJournal:
                     "consumer binding does not match attached owner"
                 )
             if owner.consumer_first_sequence != consumer.first_sequence:
-                raise LocalProtocolError(
-                    "first_sequence does not match attached owner"
-                )
+                raise LocalProtocolError("first_sequence does not match attached owner")
             assert owner.baseline_rooms_sha256 is not None
             if not hmac.compare_digest(
                 owner.baseline_rooms_sha256,
@@ -757,14 +755,33 @@ class SqliteIngestionJournal:
         aggregates = self.load_rooms(frozenset(room_ids))
         if set(aggregates) != set(room_ids):
             raise JournalIntegrityError("attached baseline room plan is incomplete")
-        placeholders = self.connection.execute(
-            "SELECT room_id FROM NioIngestLoss "
-            f"WHERE account_id = ? AND room_id IN ({','.join('?' for _ in room_ids)}) "
-            "AND reason = ? AND membership_epoch = 0",
-            (self.account_id, *room_ids, LossReason.BASELINE_LOST.value),
-        ).fetchall()
-        if {row["room_id"] for row in placeholders} != set(room_ids):
-            raise JournalIntegrityError("attached baseline loss plan is incomplete")
+        origin = SystemOrigin(
+            SystemOriginKind.FRESH_START,
+            consumer.binding_operation_id,
+        )
+        boundary = LossBoundary(None, None, None, None)
+        detail = b'{"cause":"fresh_start","scope":"consumer_baseline"}'
+        for room_id in room_ids:
+            incomplete = LossRecord(
+                "",
+                origin,
+                room_id,
+                0,
+                LossReason.BASELINE_LOST,
+                boundary,
+                detail,
+            )
+            expected = LossRecord(
+                _loss_id(self.stream_id, incomplete),
+                origin,
+                room_id,
+                0,
+                LossReason.BASELINE_LOST,
+                boundary,
+                detail,
+            )
+            if self.load_loss(expected.loss_id) != expected:
+                raise JournalIntegrityError("attached baseline loss plan is incomplete")
 
     def _write_room_state(self, state: RoomState, revision: int) -> None:
         if state.snapshot is None:
@@ -1690,6 +1707,7 @@ class StoreBootstrap:
     def __init__(self, journal: SqliteIngestionJournal) -> None:
         self._journal = journal
         self._store_opened = False
+        self._store: MatrixStore | None = None
 
     @property
     def journal(self) -> SqliteIngestionJournal:
@@ -1732,6 +1750,7 @@ class StoreBootstrap:
             self.journal.pickle_key if pickle_key is None else pickle_key,
         )
         self._store_opened = True
+        self._store = store
         return store
 
     async def attach_consumer(self, consumer: ConsumerBootstrap) -> None:
@@ -1741,7 +1760,11 @@ class StoreBootstrap:
         self.journal._require_attached()
 
     def close(self) -> None:
-        self._journal.close()
+        try:
+            if self._store is not None and not self._store.database.is_closed():
+                self._store.database.close()
+        finally:
+            self._journal.close()
 
 
 def open_ingestion_store(

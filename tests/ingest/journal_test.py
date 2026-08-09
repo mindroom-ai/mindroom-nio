@@ -449,6 +449,29 @@ def test_e2ee_bootstrap_creation_is_writer_epoch_fenced(
     assert fence_index < first_create
 
 
+def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+
+    bootstrap.close()
+
+    assert store.database.is_closed()
+    replacement = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    replacement.close()
+
+
 def test_queue_database_is_refused_before_ingestion_schema_creation(
     tmp_path: Path,
 ) -> None:
@@ -595,6 +618,40 @@ async def test_attach_consumer_rejects_digest_operation_sequence_and_retry_drift
                     consumer_generation=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
                 )
             )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_attach_retry_authenticates_durable_baseline_losses(
+    tmp_path: Path,
+) -> None:
+    room_ids = ("!alpha:example.org",)
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, room_ids)
+    await bootstrap.attach_consumer(consumer)
+    row = bootstrap.journal.connection.execute(
+        "SELECT loss_id, detail_ciphertext FROM NioIngestLoss WHERE account_id = ?",
+        (ACCOUNT_ID,),
+    ).fetchone()
+    tampered = bytearray(row["detail_ciphertext"])
+    tampered[-1] ^= 1
+    bootstrap.journal.connection.execute(
+        "UPDATE NioIngestLoss SET detail_ciphertext = ? "
+        "WHERE account_id = ? AND loss_id = ?",
+        (bytes(tampered), ACCOUNT_ID, row["loss_id"]),
+    )
+    try:
+        with pytest.raises(JournalIntegrityError, match="authentication"):
+            await bootstrap.attach_consumer(consumer)
+        with pytest.raises(LocalProtocolError, match="not validated"):
+            bootstrap.assert_http_enabled()
     finally:
         bootstrap.close()
 
