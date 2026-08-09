@@ -12,11 +12,9 @@ authors = [
 ]
 license = { file = "LICENSE.md" }
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -54,7 +52,7 @@ Source = "https://github.com/mindroom-ai/mindroom-nio"
 Documentation = "https://matrix-nio.readthedocs.io/en/latest/"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 
 fix = true
 show-fixes = true
