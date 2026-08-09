@@ -391,20 +391,12 @@ def sliding_membership_observation(
 class SlidingSource:
     stream_id: UUID
     config: SlidingSourceConfig
-    bootstrap_range_size: int
     own_user_id: str
 
     def __post_init__(self) -> None:
         _require_exact(self.stream_id, UUID, "stream_id")
         _require_exact(self.config, SlidingSourceConfig, "config")
-        _require_exact(
-            self.bootstrap_range_size,
-            int,
-            "bootstrap_range_size",
-        )
         _require_exact(self.own_user_id, str, "own_user_id")
-        if self.bootstrap_range_size <= 0:
-            raise ValueError("bootstrap_range_size must be positive")
         if not self.own_user_id:
             raise ValueError("own_user_id must not be empty")
 
@@ -415,8 +407,8 @@ class SlidingSource:
             None,
             connection_instance,
             self.config.connection_name,
-            self.bootstrap_range_size - 1,
-            self.bootstrap_range_size,
+            self.config.all_rooms_page_size - 1,
+            self.config.all_rooms_page_size,
             SlidingRangeAckMode.UNKNOWN,
             False,
         )

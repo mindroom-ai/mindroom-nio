@@ -25,6 +25,7 @@ from nio.ingest import (
     RoomSnapshot,
     TransportKind,
 )
+from nio.ingest.config import ClassicSourceConfig
 from nio.ingest.serialization import _loss_id, batch_from_records
 from nio.ingest.state import (
     AckOutcome,
@@ -44,6 +45,7 @@ DEVICE_ID = "DEVICE"
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 FRAME_ID = UUID("55555555-5555-5555-5555-555555555555")
+CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 
 
 CRASH_EXIT_CODE = 86
@@ -78,6 +80,7 @@ def _assert_process_crashed(
 def _kill_during_schema(store_path: Path, kill_after: int) -> None:
     open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -85,7 +88,7 @@ def _kill_during_schema(store_path: Path, kill_after: int) -> None:
     )
 
 
-@pytest.mark.parametrize("kill_after", range(1, len(SCHEMA_SQL) + 3))
+@pytest.mark.parametrize("kill_after", range(1, len(SCHEMA_SQL) + 4))
 def test_fresh_schema_creation_is_atomic_at_every_statement(
     tmp_path: Path,
     kill_after: int,
@@ -105,12 +108,20 @@ def test_fresh_schema_creation_is_atomic_at_every_statement(
 
     reopened = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
     )
     try:
         assert reopened.schema_version == 1
+        assert reopened._journal.load_source() == SourceState(
+            0,
+            TransportKind.CLASSIC,
+            b'{"next_batch":null}',
+            1,
+            True,
+        )
     finally:
         reopened.close()
 
@@ -143,6 +154,7 @@ def _kill_during_attach(
 ) -> None:
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -161,6 +173,7 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
     store_path = tmp_path / f"attach-kill-{kill_after}"
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -172,6 +185,7 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
 
     reopened = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -295,6 +309,7 @@ def _kill_during_transition(
 ) -> None:
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -318,6 +333,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
     store_path = tmp_path / f"kill-{kill_after}"
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -337,6 +353,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
 
     reopened = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -347,7 +364,13 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
         assert reopened._journal.load_owner().revision == 1
         assert reopened._journal.load_owner().next_ready_order == 0
         assert reopened._journal.load_owner().next_batch_sequence == 1
-        assert reopened._journal.load_source() is None
+        assert reopened._journal.load_source() == SourceState(
+            0,
+            TransportKind.CLASSIC,
+            b'{"next_batch":null}',
+            1,
+            True,
+        )
         assert reopened._journal.load_rooms(frozenset({"!room:example.org"})) == {}
         assert reopened._journal.load_ready_heads(limit=10) == ()
         assert reopened._journal.load_frame(FRAME_ID) is None
@@ -365,6 +388,7 @@ def _kill_during_acknowledgement(
 ) -> None:
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -384,6 +408,7 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
     store_path = tmp_path / f"ack-kill-{kill_after}"
     bootstrap = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -420,6 +445,7 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
 
     reopened = open_ingestion_store(
         store_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",

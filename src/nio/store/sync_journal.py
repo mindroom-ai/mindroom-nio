@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from ..exceptions import LocalProtocolError
+from ..ingest.config import SourceConfig, source_transport
 from ..ingest.model import ConsumerBootstrap
 from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
@@ -157,6 +158,7 @@ def open_ingestion_store(
     *,
     account_id: str,
     device_id: str,
+    source: SourceConfig,
     pickle_key: str = "",
     database_name: str = "",
     sqlite_busy_timeout_ms: int = 2_000,
@@ -164,11 +166,13 @@ def open_ingestion_store(
     transition_statement_hook: Callable[[str], None] | None = None,
     schema_statement_hook: Callable[[str], None] | None = None,
 ) -> StoreBootstrap:
+    source_transport(source)
     database_name = database_name or f"{account_id}_{device_id}.db"
     journal = _SqliteIngestionJournal.open(
         Path(store_path) / database_name,
         account_id=account_id,
         device_id=device_id,
+        source=source,
         pickle_key=pickle_key,
         sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
         statement_observer=statement_observer,

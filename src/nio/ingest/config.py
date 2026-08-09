@@ -1,6 +1,6 @@
 from dataclasses import dataclass, fields
 
-from .model import ConsumerBinding
+from .model import ConsumerBinding, TransportKind
 
 MAX_RECORDS_PER_BATCH = 256
 MAX_BYTES_PER_BATCH = 2 * 1024 * 1024
@@ -16,16 +16,10 @@ def _require_exact(value: object, expected: type, field_name: str) -> None:
 class ClassicSourceConfig:
     timeout_ms: int
     filter_json: bytes
-    full_state_on_cold_start: bool = True
 
     def __post_init__(self) -> None:
         _require_exact(self.timeout_ms, int, "timeout_ms")
         _require_exact(self.filter_json, bytes, "filter_json")
-        _require_exact(
-            self.full_state_on_cold_start,
-            bool,
-            "full_state_on_cold_start",
-        )
         if self.timeout_ms < 0:
             raise ValueError("timeout_ms must be nonnegative")
 
@@ -37,6 +31,7 @@ class SlidingSourceConfig:
     lists_json: bytes
     room_subscriptions_json: bytes
     extensions_json: bytes
+    all_rooms_page_size: int = 100
 
     def __post_init__(self) -> None:
         _require_exact(self.timeout_ms, int, "timeout_ms")
@@ -48,15 +43,33 @@ class SlidingSourceConfig:
             "room_subscriptions_json",
         )
         _require_exact(self.extensions_json, bytes, "extensions_json")
+        _require_exact(
+            self.all_rooms_page_size,
+            int,
+            "all_rooms_page_size",
+        )
         if self.timeout_ms < 0:
             raise ValueError("timeout_ms must be nonnegative")
         if not self.connection_name:
             raise ValueError("connection_name must not be empty")
+        if self.all_rooms_page_size <= 0:
+            raise ValueError("all_rooms_page_size must be positive")
+
+
+SourceConfig = ClassicSourceConfig | SlidingSourceConfig
+
+
+def source_transport(source: object) -> TransportKind:
+    if type(source) is ClassicSourceConfig:
+        return TransportKind.CLASSIC
+    if type(source) is SlidingSourceConfig:
+        return TransportKind.SLIDING
+    raise TypeError("source must be ClassicSourceConfig or SlidingSourceConfig")
 
 
 @dataclass(frozen=True, slots=True)
 class IngestionConfig:
-    source: ClassicSourceConfig | SlidingSourceConfig
+    source: SourceConfig
     consumer: ConsumerBinding
     max_staged_frames: int = 2
     max_unacknowledged_batches: int = 8
@@ -69,21 +82,18 @@ class IngestionConfig:
     sqlite_write_retry_limit: int = 2
     max_concurrent_recovery_rooms: int = 8
     max_concurrent_room_hydrations: int = 8
-    sliding_bootstrap_range_size: int = 100
     max_recovery_events_per_room: int = 10_000
     max_held_events_per_room: int = 10_000
     max_held_bytes_per_room: int = 32 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        if type(self.source) not in (ClassicSourceConfig, SlidingSourceConfig):
-            raise TypeError("source must be ClassicSourceConfig or SlidingSourceConfig")
+        source_transport(self.source)
         _require_exact(self.consumer, ConsumerBinding, "consumer")
 
         for config_field in fields(self):
             if not config_field.name.startswith("max_") and config_field.name not in {
                 "sqlite_busy_timeout_ms",
                 "sqlite_write_retry_limit",
-                "sliding_bootstrap_range_size",
             }:
                 continue
             value = getattr(self, config_field.name)

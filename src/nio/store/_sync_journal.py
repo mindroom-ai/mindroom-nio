@@ -14,6 +14,7 @@ from uuid import UUID
 from peewee import SqliteDatabase
 
 from ..exceptions import LocalProtocolError
+from ..ingest.config import SourceConfig, source_transport
 from ..ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
@@ -29,6 +30,7 @@ from ..ingest.model import (
     SyncBatch,
     SystemOrigin,
     SystemOriginKind,
+    TransportKind,
 )
 from ..ingest.serialization import (
     _canonical_json,
@@ -49,6 +51,7 @@ from ._sync_journal_codec import EncryptedRowCodec
 from ._sync_journal_preflight import (
     FileIdentity,
     StableFileLock,
+    _validate_source_cursor,
     immediate_transaction,
     open_journal_database,
 )
@@ -95,6 +98,7 @@ class SqliteIngestionJournal(JournalRows):
         *,
         account_id: str,
         device_id: str,
+        source: SourceConfig,
         pickle_key: str = "",
         sqlite_busy_timeout_ms: int = 2_000,
         statement_observer: Callable[[str], None] | None = None,
@@ -107,6 +111,7 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("device_id must be a nonempty str")
         if type(pickle_key) is not str:
             raise TypeError("pickle_key must be str")
+        source_transport(source)
         if type(sqlite_busy_timeout_ms) is not int or sqlite_busy_timeout_ms <= 0:
             raise ValueError("sqlite_busy_timeout_ms must be positive")
 
@@ -114,6 +119,8 @@ class SqliteIngestionJournal(JournalRows):
             database,
             account_id=account_id,
             device_id=device_id,
+            pickle_key=pickle_key,
+            source=source,
             sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
             statement_observer=statement_observer,
             schema_statement_hook=schema_statement_hook,
@@ -202,6 +209,7 @@ class SqliteIngestionJournal(JournalRows):
             device_id=row["device_id"],
             schema_version=row["schema_version"],
             stream_id=UUID(row["stream_id"]),
+            transport_kind=TransportKind(row["transport_kind"]),
             binding_operation_id=UUID(row["binding_operation_id"]),
             binding=binding,
             consumer_first_sequence=row["consumer_first_sequence"],
@@ -395,6 +403,18 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("transition must be JournalTransition")
         if owner.revision != expected_revision or writer_epoch != self.writer_epoch:
             raise JournalConflictError("journal revision or writer_epoch is stale")
+        if transition.source_state is not None:
+            if transition.source_state.transport_kind is not owner.transport_kind:
+                raise JournalIntegrityError(
+                    "source transport does not match immutable journal transport"
+                )
+            try:
+                _validate_source_cursor(
+                    owner.transport_kind,
+                    transition.source_state.cursor_json,
+                )
+            except LocalProtocolError as error:
+                raise JournalIntegrityError(str(error)) from error
 
         ready_orders = tuple(
             sorted(ready.ready_order for ready in transition.ready_records)

@@ -2,7 +2,9 @@ SCHEMA_VERSION = 1
 
 META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     account_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, schema_version INTEGER NOT NULL,
-    stream_id TEXT NOT NULL, binding_operation_id TEXT NOT NULL, journal_generation TEXT,
+    stream_id TEXT NOT NULL,
+    transport_kind TEXT NOT NULL CHECK (transport_kind IN ('classic', 'sliding')),
+    binding_operation_id TEXT NOT NULL, journal_generation TEXT,
     consumer_generation TEXT, consumer_first_sequence INTEGER, baseline_rooms_sha256 BLOB,
     consumer_attached_revision INTEGER, revision INTEGER NOT NULL, writer_epoch TEXT NOT NULL,
     next_source_epoch INTEGER NOT NULL,
@@ -14,7 +16,6 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
 SCHEMA_SQL = (
     """CREATE TABLE NioIngestSourceState (
         account_id TEXT PRIMARY KEY REFERENCES NioIngestMeta(account_id), source_epoch INTEGER NOT NULL,
-        transport_kind TEXT NOT NULL CHECK (transport_kind IN ('classic', 'sliding')),
         cursor_ciphertext BLOB NOT NULL, cursor_sha256 BLOB NOT NULL,
         next_request_id INTEGER NOT NULL, active INTEGER NOT NULL CHECK (active IN (0, 1))
     )""",

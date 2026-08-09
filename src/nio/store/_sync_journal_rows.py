@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import replace
 from uuid import UUID
 
+from ..exceptions import LocalProtocolError
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import (
     EventRecord,
@@ -14,7 +15,6 @@ from ..ingest.model import (
     RecordKind,
     RoomHydrationStatus,
     SyncBatch,
-    TransportKind,
 )
 from ..ingest.serialization import (
     _batch_from_payload,
@@ -44,6 +44,7 @@ from ..ingest.state import (
     SourceState,
     StagedFrame,
 )
+from ._sync_journal_preflight import _validate_source_cursor
 
 _FRAME_FIELDS = {"source_epoch", "request_id", "payload", "staged_revision"}
 _READY_FIELDS = {"ready_order", "record", "source_frame_id", "created_revision"}
@@ -269,17 +270,16 @@ class JournalRows:
         self._transition_execute(
             "source_state",
             """INSERT INTO NioIngestSourceState (
-                account_id, source_epoch, transport_kind, cursor_ciphertext,
-                cursor_sha256, next_request_id, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                account_id, source_epoch, cursor_ciphertext, cursor_sha256,
+                next_request_id, active
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id) DO UPDATE SET
-                source_epoch = excluded.source_epoch, transport_kind = excluded.transport_kind,
+                source_epoch = excluded.source_epoch,
                 cursor_ciphertext = excluded.cursor_ciphertext, cursor_sha256 = excluded.cursor_sha256,
                 next_request_id = excluded.next_request_id, active = excluded.active""",
             (
                 self.account_id,
                 source.source_epoch,
-                source.transport_kind.value,
                 ciphertext,
                 digest,
                 source.next_request_id,
@@ -287,20 +287,24 @@ class JournalRows:
             ),
         )
 
-    def load_source(self) -> SourceState | None:
-        self._require_attached()
+    def load_source(self) -> SourceState:
+        owner = self.load_owner()
         row = self.connection.execute(
             "SELECT * FROM NioIngestSourceState WHERE account_id = ?",
             (self.account_id,),
         ).fetchone()
         if row is None:
-            return None
+            raise JournalIntegrityError("ingestion source row is missing")
         cursor = self._open_payload(
             "NioIngestSourceState", (self.account_id,), row, "cursor"
         )
+        try:
+            _validate_source_cursor(owner.transport_kind, cursor)
+        except LocalProtocolError as error:
+            raise JournalIntegrityError(str(error)) from error
         return SourceState(
             row["source_epoch"],
-            TransportKind(row["transport_kind"]),
+            owner.transport_kind,
             cursor,
             row["next_request_id"],
             bool(row["active"]),

@@ -59,8 +59,8 @@ def sliding_source() -> SlidingSource:
                 b'"to_device":{"enabled":false,"limit":9},'
                 b'"typing":{"enabled":false,"lists":[],"rooms":[]}}'
             ),
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
 
@@ -211,7 +211,7 @@ def test_source_constructs_initial_cursor_without_creating_an_identity(
     )
     assert isinstance(sliding_source, SyncSource)
     with pytest.raises(ValueError, match="positive"):
-        replace(sliding_source, bootstrap_range_size=0)
+        replace(sliding_source.config, all_rooms_page_size=0)
 
 
 def test_reset_is_coordinator_seeded_and_preserves_only_independent_state() -> None:
@@ -380,8 +380,8 @@ def test_to_device_limit_is_an_internal_non_weakenable_constant(
             json.dumps(
                 {"to_device": {"enabled": False, "limit": configured_limit}}
             ).encode(),
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
     request = source.plan_request(_state(source.initial_cursor(CONNECTION)), 7)
@@ -465,8 +465,8 @@ def test_room_extension_scope_cannot_exclude_the_reserved_list(
             b"{}",
             b"{}",
             json.dumps({"typing": extension}).encode(),
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
     request = source.plan_request(
@@ -507,8 +507,8 @@ def test_exact_wildcard_is_normalized_for_all_tuwunel_room_extensions() -> None:
                     for name in ("account_data", "typing", "receipts")
                 }
             ),
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
     request = source.plan_request(_state(source.initial_cursor(CONNECTION)), 7)
@@ -535,8 +535,8 @@ def test_non_exact_wildcard_extension_scope_is_rejected() -> None:
             b"{}",
             b"{}",
             b'{"typing":{"lists":["*","foreground"]}}',
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
 
@@ -926,8 +926,7 @@ def test_missing_after_echo_negotiation_or_non_string_echo_is_malformed(
 def test_synapse_missing_echo_negotiates_response_bound_and_expands() -> None:
     source = SlidingSource(
         STREAM_ID,
-        SlidingSourceConfig(30_000, CONNECTION_NAME, b"{}", b"{}", b"{}"),
-        bootstrap_range_size=2,
+        SlidingSourceConfig(30_000, CONNECTION_NAME, b"{}", b"{}", b"{}", 2),
         own_user_id=OWN_USER_ID,
     )
     cursor = source.initial_cursor(CONNECTION)
@@ -1195,8 +1194,8 @@ def test_restart_replays_with_durable_payload_and_page_size(
             b'{"different":{"timeline_limit":7}}',
             b"{}",
             b'{"custom":{"after_restart":true}}',
+            all_rooms_page_size=7,
         ),
-        bootstrap_range_size=7,
         own_user_id=OWN_USER_ID,
     )
 
@@ -1287,8 +1286,14 @@ def test_request_planning_rejects_invalid_or_noncanonical_cursor_bytes(
 def test_reserved_name_collision_is_rejected_without_silent_override() -> None:
     source = SlidingSource(
         STREAM_ID,
-        SlidingSourceConfig(0, "worker", b'{"__nio_all_rooms_v1":{}}', b"{}", b"{}"),
-        bootstrap_range_size=2,
+        SlidingSourceConfig(
+            0,
+            "worker",
+            b'{"__nio_all_rooms_v1":{}}',
+            b"{}",
+            b"{}",
+            2,
+        ),
         own_user_id=OWN_USER_ID,
     )
 
@@ -1323,8 +1328,8 @@ def test_reserved_list_slot_is_kept_within_wire_limit(
             json.dumps({f"list-{index}": {} for index in range(caller_count)}).encode(),
             b"{}",
             b"{}",
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
     state = _state(source.initial_cursor(CONNECTION))
@@ -1359,8 +1364,8 @@ def test_room_subscription_wire_limit_is_validated(
                 }
             ).encode(),
             b"{}",
+            all_rooms_page_size=2,
         ),
-        bootstrap_range_size=2,
         own_user_id=OWN_USER_ID,
     )
     state = _state(source.initial_cursor(CONNECTION))

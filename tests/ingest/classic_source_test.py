@@ -105,6 +105,23 @@ def test_initial_request_has_full_state_and_no_since(
     assert state.cursor_json == b'{"next_batch":null}'
 
 
+def test_cold_durable_request_without_full_state_is_rejected(
+    classic_source: ClassicSource,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor(None)),
+        request_id=9,
+    )
+    assert request is not None
+    missing_full_state = replace(request, query=request.query[1:])
+
+    with pytest.raises(ValueError, match="classic sync request"):
+        classic_source.normalize(
+            missing_full_state,
+            _network_result(missing_full_state, b'{"next_batch":"s1"}'),
+        )
+
+
 def test_continuation_request_retains_prior_cursor_without_full_state(
     classic_source: ClassicSource,
 ) -> None:
@@ -1004,7 +1021,6 @@ def test_restart_normalizes_a_durable_request_using_its_original_config() -> Non
         ClassicSourceConfig(
             timeout_ms=1_000,
             filter_json=b'{"room":{"timeline":{"limit":5}}}',
-            full_state_on_cold_start=True,
         ),
     )
     request = original_source.plan_request(
@@ -1017,7 +1033,6 @@ def test_restart_normalizes_a_durable_request_using_its_original_config() -> Non
         ClassicSourceConfig(
             timeout_ms=45_000,
             filter_json=b'{"room":{"timeline":{"limit":100}}}',
-            full_state_on_cold_start=False,
         ),
     )
 

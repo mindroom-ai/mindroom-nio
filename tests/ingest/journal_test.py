@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import json
 import os
 import sqlite3
 import threading
 import time
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -32,6 +34,7 @@ from nio.ingest.config import (
     IngestionConfig,
     SlidingSourceConfig,
 )
+from nio.ingest.classic import ClassicSource
 from nio.ingest.errors import (
     FreshIngestionRequired,
     JournalConflictError,
@@ -72,6 +75,19 @@ STREAM_ID = UUID("33333333-3333-3333-3333-333333333333")
 
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
+
+CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+
+
+def _sliding_source_config(*, all_rooms_page_size: int = 100) -> SlidingSourceConfig:
+    return SlidingSourceConfig(
+        timeout_ms=30_000,
+        connection_name="worker",
+        lists_json=b"{}",
+        room_subscriptions_json=b"{}",
+        extensions_json=b"{}",
+        all_rooms_page_size=all_rooms_page_size,
+    )
 
 
 def test_store_public_surface_exposes_only_ingestion_bootstrap() -> None:
@@ -147,12 +163,17 @@ def test_source_configs_are_frozen_and_validate_exact_wire_values() -> None:
         extensions_json=b"{}",
     )
 
-    assert classic.full_state_on_cold_start is True
+    assert not hasattr(classic, "full_state_on_cold_start")
     assert sliding.connection_name == "main"
+    assert sliding.all_rooms_page_size == 100
     with pytest.raises(TypeError, match="timeout_ms"):
         ClassicSourceConfig(timeout_ms=True, filter_json=b"{}")
     with pytest.raises(TypeError, match="filter_json"):
         ClassicSourceConfig(timeout_ms=1, filter_json="{}")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="all_rooms_page_size"):
+        replace(sliding, all_rooms_page_size=True)
+    with pytest.raises(ValueError, match="all_rooms_page_size"):
+        replace(sliding, all_rooms_page_size=0)
     with pytest.raises(TypeError, match="consumer"):
         IngestionConfig(source=classic, consumer=object())  # type: ignore[arg-type]
 
@@ -175,7 +196,6 @@ def test_ingestion_config_accepts_every_resource_bound_at_one() -> None:
         sqlite_write_retry_limit=1,
         max_concurrent_recovery_rooms=1,
         max_concurrent_room_hydrations=1,
-        sliding_bootstrap_range_size=1,
         max_recovery_events_per_room=1,
         max_held_events_per_room=1,
         max_held_bytes_per_room=1,
@@ -194,6 +214,12 @@ def test_ingestion_config_accepts_every_resource_bound_at_one() -> None:
             consumer=consumer,
             max_record_bytes=1024 * 1024 + 1,
         )
+    with pytest.raises(TypeError, match="sliding_bootstrap_range_size"):
+        IngestionConfig(
+            source=source,
+            consumer=consumer,
+            sliding_bootstrap_range_size=1,  # type: ignore[call-arg]
+        )
 
 
 @pytest.mark.parametrize(
@@ -210,7 +236,6 @@ def test_ingestion_config_accepts_every_resource_bound_at_one() -> None:
         "sqlite_write_retry_limit",
         "max_concurrent_recovery_rooms",
         "max_concurrent_room_hydrations",
-        "sliding_bootstrap_range_size",
         "max_recovery_events_per_room",
         "max_held_events_per_room",
         "max_held_bytes_per_room",
@@ -267,6 +292,278 @@ def _operation_outcome(operation) -> str:
     return "accepted"
 
 
+def test_open_requires_an_exact_source_config_before_touching_the_store(
+    tmp_path: Path,
+) -> None:
+    class DerivedClassicSourceConfig(ClassicSourceConfig):
+        pass
+
+    for source in (
+        object(),
+        DerivedClassicSourceConfig(timeout_ms=0, filter_json=b"{}"),
+    ):
+        with pytest.raises(
+            TypeError,
+            match="source must be ClassicSourceConfig or SlidingSourceConfig",
+        ):
+            open_ingestion_store(
+                tmp_path,
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                source=source,  # type: ignore[arg-type]
+                database_name="journal.db",
+            )
+
+    assert not (tmp_path / "journal.db").exists()
+    assert not (tmp_path / "journal.db.ingest.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("source_factory", "transport", "page_size"),
+    (
+        (lambda: CLASSIC_SOURCE, TransportKind.CLASSIC, None),
+        (
+            lambda: _sliding_source_config(all_rooms_page_size=1),
+            TransportKind.SLIDING,
+            1,
+        ),
+        (lambda: _sliding_source_config(), TransportKind.SLIDING, 100),
+    ),
+)
+def test_fresh_open_freezes_transport_and_inserts_one_cold_source_before_attach(
+    tmp_path: Path,
+    source_factory,
+    transport: TransportKind,
+    page_size: int | None,
+) -> None:
+    source_config = source_factory()
+    database_name = f"{transport.value}-{page_size}.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=source_config,
+        database_name=database_name,
+    )
+    try:
+        owner = bootstrap._journal.load_owner()
+        source_state = bootstrap._journal.load_source()
+
+        assert owner.transport_kind is transport
+        assert source_state is not None
+        assert source_state.source_epoch == 0
+        assert source_state.transport_kind is transport
+        assert source_state.next_request_id == 1
+        assert source_state.active is True
+        with sqlite3.connect(tmp_path / database_name) as connection:
+            assert connection.execute(
+                "SELECT transport_kind FROM NioIngestMeta"
+            ).fetchall() == [(transport.value,)]
+            assert connection.execute(
+                "SELECT COUNT(*) FROM NioIngestSourceState"
+            ).fetchone() == (1,)
+            source_columns = {
+                row[1]
+                for row in connection.execute(
+                    'PRAGMA table_info("NioIngestSourceState")'
+                )
+            }
+        assert "transport_kind" not in source_columns
+
+        if transport is TransportKind.CLASSIC:
+            assert source_state.cursor_json == b'{"next_batch":null}'
+            request = ClassicSource(bootstrap.stream_id, source_config).plan_request(
+                source_state,
+                request_id=1,
+            )
+            assert request is not None
+            assert request.query[0] == ("full_state", "true")
+        else:
+            cursor = json.loads(source_state.cursor_json)
+            assert cursor == {
+                "all_rooms_coverage_complete": False,
+                "all_rooms_page_size": page_size,
+                "all_rooms_range_ack_mode": "unknown",
+                "all_rooms_range_end": page_size - 1,
+                "connection_instance": cursor["connection_instance"],
+                "connection_name": source_config.connection_name,
+                "pos": None,
+                "to_device_since": None,
+            }
+            UUID(cursor["connection_instance"])
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("source_pair_factory",),
+    (
+        (
+            lambda: (
+                ClassicSourceConfig(timeout_ms=1, filter_json=b'{"a":1}'),
+                ClassicSourceConfig(timeout_ms=90_000, filter_json=b'{"b":2}'),
+            ),
+        ),
+        (
+            lambda: (
+                SlidingSourceConfig(1, "first", b"{}", b"{}", b"{}", 1),
+                SlidingSourceConfig(
+                    90_000,
+                    "changed",
+                    b'{"caller":{}}',
+                    b'{"!room:example.org":{}}',
+                    b'{"custom":{"enabled":true}}',
+                    99,
+                ),
+            ),
+        ),
+    ),
+)
+def test_same_transport_reopen_keeps_the_exact_durable_source_across_config_drift(
+    tmp_path: Path,
+    source_pair_factory,
+) -> None:
+    created_source, reopened_source = source_pair_factory()
+    database_path = tmp_path / "journal.db"
+    first = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=created_source,
+        pickle_key="secret",
+        database_name=database_path.name,
+    )
+    durable_source = first._journal.load_source()
+    first.close()
+    with sqlite3.connect(database_path) as connection:
+        encrypted_before = connection.execute(
+            "SELECT * FROM NioIngestSourceState"
+        ).fetchone()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=reopened_source,
+        pickle_key="secret",
+        database_name=database_path.name,
+    )
+    try:
+        assert reopened._journal.load_source() == durable_source
+        with sqlite3.connect(database_path) as connection:
+            encrypted_after = connection.execute(
+                "SELECT * FROM NioIngestSourceState"
+            ).fetchone()
+        assert encrypted_after == encrypted_before
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("source_pair_factory",),
+    (
+        (lambda: (CLASSIC_SOURCE, _sliding_source_config()),),
+        (lambda: (_sliding_source_config(), CLASSIC_SOURCE),),
+    ),
+)
+def test_cross_transport_reopen_fails_before_any_database_write(
+    tmp_path: Path,
+    source_pair_factory,
+) -> None:
+    created_source, wrong_source = source_pair_factory()
+    database_path = tmp_path / "journal.db"
+    first = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=created_source,
+        database_name=database_path.name,
+    )
+    first.close()
+    with sqlite3.connect(database_path) as connection:
+        before = connection.execute(
+            "SELECT writer_epoch, transport_kind FROM NioIngestMeta"
+        ).fetchone()
+
+    statements: list[str] = []
+    with pytest.raises(LocalProtocolError, match="transport"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            source=wrong_source,
+            database_name=database_path.name,
+            statement_observer=statements.append,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        after = connection.execute(
+            "SELECT writer_epoch, transport_kind FROM NioIngestMeta"
+        ).fetchone()
+    assert after == before
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+    exact = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=created_source,
+        database_name=database_path.name,
+    )
+    exact.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_factory", "wrong_transport"),
+    (
+        (lambda: CLASSIC_SOURCE, TransportKind.SLIDING),
+        (lambda: _sliding_source_config(), TransportKind.CLASSIC),
+    ),
+)
+async def test_source_transition_cannot_replace_frozen_transport_before_write(
+    tmp_path: Path,
+    source_factory,
+    wrong_transport: TransportKind,
+) -> None:
+    source_config = source_factory()
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        source=source_config,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    original_source = bootstrap._journal.load_source()
+    assert original_source is not None
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="transport"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    source_state=replace(
+                        original_source,
+                        transport_kind=wrong_transport,
+                    )
+                ),
+            )
+
+        assert bootstrap._journal.load_owner().revision == 1
+        assert bootstrap._journal.load_source() == original_source
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
 def test_fresh_open_creates_independent_v1_schema_with_marker_first(
     tmp_path: Path,
 ) -> None:
@@ -274,6 +571,7 @@ def test_fresh_open_creates_independent_v1_schema_with_marker_first(
 
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -302,6 +600,7 @@ def test_opening_v1_journal_never_reads_or_alters_legacy_sync_tables(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -322,6 +621,7 @@ def test_opening_v1_journal_never_reads_or_alters_legacy_sync_tables(
     statements: list[str] = []
     reopened = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -340,6 +640,7 @@ def test_opening_v1_journal_never_reads_or_alters_legacy_sync_tables(
 def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> None:
     first = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -348,6 +649,7 @@ def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> N
         with pytest.raises(LocalProtocolError, match="writer lock"):
             open_ingestion_store(
                 tmp_path,
+                source=CLASSIC_SOURCE,
                 account_id=ACCOUNT_ID,
                 device_id=DEVICE_ID,
                 database_name="journal.db",
@@ -358,6 +660,7 @@ def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> N
     with pytest.raises(LocalProtocolError, match="account_id"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id="@mallory:example.org",
             device_id=DEVICE_ID,
             database_name="journal.db",
@@ -365,6 +668,7 @@ def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> N
     with pytest.raises(LocalProtocolError, match="device_id"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id="OTHER",
             database_name="journal.db",
@@ -378,6 +682,7 @@ def test_sqlite_backup_opens_at_a_distinct_path_with_a_new_sidecar(
     restored_path = tmp_path / "restored.db"
     source = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=source_path.name,
@@ -396,6 +701,7 @@ def test_sqlite_backup_opens_at_a_distinct_path_with_a_new_sidecar(
 
     restored = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=restored_path.name,
@@ -412,6 +718,7 @@ def test_sqlite_backup_opens_at_a_distinct_path_with_a_new_sidecar(
 def test_schema_version_is_validated_independently(tmp_path: Path) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -423,6 +730,7 @@ def test_schema_version_is_validated_independently(tmp_path: Path) -> None:
     with pytest.raises(LocalProtocolError, match="schema_version"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name="journal.db",
@@ -433,6 +741,7 @@ def test_existing_v1_schema_is_validated_without_repair(tmp_path: Path) -> None:
     database_path = tmp_path / "journal.db"
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=database_path.name,
@@ -444,6 +753,7 @@ def test_existing_v1_schema_is_validated_without_repair(tmp_path: Path) -> None:
     with pytest.raises(LocalProtocolError, match="topology"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name=database_path.name,
@@ -483,6 +793,7 @@ def _rewrite_table_sql(
         "foreign_key",
         "primary_key",
         "check_constraint",
+        "transport_check",
         "view",
     ),
 )
@@ -493,6 +804,7 @@ def test_existing_v1_open_rejects_every_topology_drift_before_epoch_write(
     database_path = tmp_path / f"{mutation}.db"
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=database_path.name,
@@ -531,6 +843,13 @@ def test_existing_v1_open_rejects_every_topology_drift_before_epoch_write(
                 "active INTEGER NOT NULL CHECK (active IN (0, 1))",
                 "active INTEGER NOT NULL",
             )
+        elif mutation == "transport_check":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestMeta",
+                "transport_kind TEXT NOT NULL CHECK (transport_kind IN ('classic', 'sliding'))",
+                "transport_kind TEXT NOT NULL",
+            )
         else:
             connection.execute(
                 "CREATE VIEW NioIngestUnexpectedView AS "
@@ -540,6 +859,7 @@ def test_existing_v1_open_rejects_every_topology_drift_before_epoch_write(
     with pytest.raises(LocalProtocolError, match="topology"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name=database_path.name,
@@ -561,6 +881,7 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
     database_path = tmp_path / "journal.db"
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=database_path.name,
@@ -570,7 +891,7 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "INSERT INTO NioIngestMeta SELECT ?, device_id, schema_version, "
-            "stream_id, binding_operation_id, journal_generation, "
+            "stream_id, transport_kind, binding_operation_id, journal_generation, "
             "consumer_generation, consumer_first_sequence, baseline_rooms_sha256, "
             "consumer_attached_revision, revision, writer_epoch, "
             "next_source_epoch, next_ready_order, "
@@ -583,6 +904,7 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
     with pytest.raises(LocalProtocolError, match="marker row"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name=database_path.name,
@@ -594,12 +916,80 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
         ).fetchall() == [(writer_epoch,)]
 
 
+def test_existing_v1_open_rejects_a_missing_source_before_epoch_write(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=database_path.name,
+    )
+    writer_epoch = str(bootstrap._journal.writer_epoch)
+    bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM NioIngestSourceState")
+
+    with pytest.raises(LocalProtocolError, match="source row cardinality"):
+        open_ingestion_store(
+            tmp_path,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name=database_path.name,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT writer_epoch FROM NioIngestMeta"
+        ).fetchone() == (writer_epoch,)
+
+
+def test_existing_v1_open_authenticates_source_before_epoch_write(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name=database_path.name,
+    )
+    writer_epoch = str(bootstrap._journal.writer_epoch)
+    bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE NioIngestSourceState SET cursor_sha256 = ?",
+            (bytes(32),),
+        )
+
+    with pytest.raises(JournalIntegrityError, match="authentication"):
+        open_ingestion_store(
+            tmp_path,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            pickle_key="secret",
+            database_name=database_path.name,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT writer_epoch FROM NioIngestMeta"
+        ).fetchone() == (writer_epoch,)
+
+
 def test_unexpected_trigger_is_rejected_before_it_can_mutate_legacy_state(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "journal.db"
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=database_path.name,
@@ -618,6 +1008,7 @@ def test_unexpected_trigger_is_rejected_before_it_can_mutate_legacy_state(
     try:
         reopened = open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name=database_path.name,
@@ -663,6 +1054,7 @@ def test_nonempty_unmarked_database_is_refused_without_sql_write(
     with pytest.raises(FreshIngestionRequired):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name="legacy.db",
@@ -679,6 +1071,7 @@ def test_v1_marker_blocks_legacy_store_but_bootstrap_opens_only_e2ee_tables(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -737,6 +1130,7 @@ def test_concurrent_v1_and_legacy_initialization_cannot_interleave(
         try:
             bootstrap = open_ingestion_store(
                 tmp_path,
+                source=CLASSIC_SOURCE,
                 account_id=ACCOUNT_ID,
                 device_id=DEVICE_ID,
                 database_name="journal.db",
@@ -791,6 +1185,7 @@ def test_e2ee_bootstrap_creation_is_writer_epoch_fenced(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -834,6 +1229,7 @@ def test_nested_e2ee_calls_share_one_outer_writer_epoch_fence(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -863,6 +1259,7 @@ def test_e2ee_operation_rejects_an_ambient_transaction_before_sql(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -887,6 +1284,7 @@ def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -898,6 +1296,7 @@ def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
     assert store.database.is_closed()
     replacement = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -940,6 +1339,7 @@ def test_retained_store_is_revoked_before_a_replacement_owner_opens(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -950,6 +1350,7 @@ def test_retained_store_is_revoked_before_a_replacement_owner_opens(
 
     replacement = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -977,6 +1378,7 @@ def test_store_lease_remains_revoked_when_database_close_fails(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -996,6 +1398,7 @@ def test_store_lease_remains_revoked_when_database_close_fails(
     with pytest.raises(LocalProtocolError, match="writer lock"):
         open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name="journal.db",
@@ -1020,6 +1423,7 @@ def test_bootstrap_close_waits_for_an_inflight_store_operation(
 
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1059,6 +1463,7 @@ def test_direct_bootstrap_authority_is_consumed_and_registered_once(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1099,6 +1504,7 @@ def test_concurrent_direct_bootstrap_claims_admit_exactly_one_store(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1176,6 +1582,7 @@ def test_concurrent_direct_bootstrap_claims_admit_exactly_one_store(
 def test_failed_direct_bootstrap_claim_rolls_back_for_retry(tmp_path: Path) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1214,6 +1621,7 @@ def test_inherited_child_cannot_use_or_release_parent_ownership(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1237,6 +1645,7 @@ def test_inherited_child_cannot_use_or_release_parent_ownership(
         try:
             second = open_ingestion_store(
                 tmp_path,
+                source=CLASSIC_SOURCE,
                 account_id=ACCOUNT_ID,
                 device_id=DEVICE_ID,
                 database_name="journal.db",
@@ -1254,6 +1663,7 @@ def test_inherited_child_cannot_use_or_release_parent_ownership(
 def test_inherited_child_cannot_attach_or_open_e2ee_store(tmp_path: Path) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1292,6 +1702,7 @@ def test_inherited_child_cannot_read_or_write_an_open_e2ee_store(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1318,6 +1729,7 @@ def test_inherited_child_cannot_read_or_write_an_open_e2ee_store(
         with pytest.raises(LocalProtocolError, match="writer lock"):
             open_ingestion_store(
                 tmp_path,
+                source=CLASSIC_SOURCE,
                 account_id=ACCOUNT_ID,
                 device_id=DEVICE_ID,
                 database_name="journal.db",
@@ -1339,6 +1751,7 @@ def test_queue_database_is_refused_before_ingestion_schema_creation(
             database,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
+            source=CLASSIC_SOURCE,
         )
 
     assert "NioIngestMeta" not in _table_names(database_path)
@@ -1369,6 +1782,7 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -1431,6 +1845,7 @@ async def test_attach_consumer_rejects_digest_operation_sequence_and_retry_drift
     room_ids = ("!alpha:example.org",)
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1483,6 +1898,7 @@ async def test_exact_attach_retry_authenticates_durable_baseline_losses(
     room_ids = ("!alpha:example.org",)
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -1516,6 +1932,7 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1541,6 +1958,7 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
 
     reopened = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1571,6 +1989,7 @@ def test_bootstrap_rejects_database_path_replaced_after_lock_acquisition(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1601,6 +2020,7 @@ def test_current_owner_fails_closed_when_retained_lock_path_is_replaced(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1620,6 +2040,7 @@ def test_lock_path_replacement_takeover_fences_every_stale_handle_before_sql(
     database_path = tmp_path / "journal.db"
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name=database_path.name,
@@ -1632,6 +2053,7 @@ def test_lock_path_replacement_takeover_fences_every_stale_handle_before_sql(
     try:
         second = open_ingestion_store(
             tmp_path,
+            source=CLASSIC_SOURCE,
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             database_name=database_path.name,
@@ -1662,6 +2084,7 @@ def test_stale_e2ee_writer_epoch_is_cas_fenced_before_store_sql(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1781,6 +2204,7 @@ async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -1829,6 +2253,7 @@ async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
 
     reopened = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -1850,6 +2275,7 @@ async def test_one_room_transition_never_scans_or_rewrites_other_rooms(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
@@ -1915,11 +2341,13 @@ async def test_wrong_revision_or_writer_epoch_refuses_transition_without_write(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",
     )
     await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    cold_source = bootstrap._journal.load_source()
     transition = JournalTransition(
         source_state=SourceState(1, TransportKind.CLASSIC, b'"cursor"', 2, True)
     )
@@ -1937,7 +2365,7 @@ async def test_wrong_revision_or_writer_epoch_refuses_transition_without_write(
                 transition=transition,
             )
         assert bootstrap._journal.load_owner().revision == 1
-        assert bootstrap._journal.load_source() is None
+        assert bootstrap._journal.load_source() == cold_source
     finally:
         bootstrap.close()
 
@@ -1948,6 +2376,7 @@ async def test_loss_round_trips_after_its_source_frame_is_compacted(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2035,6 +2464,7 @@ async def test_deterministic_loss_and_ready_ids_fail_closed_on_payload_drift(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2150,6 +2580,7 @@ async def test_ready_canonical_byte_accounting_is_derived_and_revalidated(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2190,6 +2621,7 @@ async def test_frame_id_is_insert_or_exact_revalidate_never_overwritten(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2242,6 +2674,7 @@ async def test_frame_read_authenticates_every_returned_metadata_field(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2287,6 +2720,7 @@ async def test_ready_read_authenticates_every_returned_metadata_field(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2334,6 +2768,7 @@ async def test_batch_commit_and_read_validate_full_owner_and_row_identity(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2418,6 +2853,7 @@ async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         pickle_key="secret",
@@ -2487,6 +2923,7 @@ async def test_latest_ack_retry_revalidates_persisted_frontier_and_payload(
 ) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
+        source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         database_name="journal.db",

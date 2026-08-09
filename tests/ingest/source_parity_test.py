@@ -135,8 +135,7 @@ def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> No
 
     sliding = SlidingSource(
         STREAM_ID,
-        SlidingSourceConfig(30_000, "worker", b"{}", b"{}", b"{}"),
-        bootstrap_range_size=2,
+        SlidingSourceConfig(30_000, "worker", b"{}", b"{}", b"{}", 2),
         own_user_id=OWN_USER_ID,
     )
     sliding_cursor = SlidingCursor(

@@ -36,6 +36,7 @@ class OwnerView:
     device_id: str
     schema_version: int
     stream_id: UUID
+    transport_kind: TransportKind
     binding_operation_id: UUID
     binding: ConsumerBinding | None
     consumer_first_sequence: int | None

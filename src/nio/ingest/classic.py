@@ -143,7 +143,7 @@ class ClassicSource:
         query: list[tuple[str, str]] = []
         if cursor.next_batch is not None:
             query.append(("since", cursor.next_batch))
-        elif self.config.full_state_on_cold_start:
+        else:
             query.append(("full_state", "true"))
         if self.config.timeout_ms:
             query.append(("timeout", str(self.config.timeout_ms)))
@@ -168,7 +168,7 @@ class ClassicSource:
         expected: list[tuple[str, str]] = []
         if cursor.next_batch is not None:
             expected.append(("since", cursor.next_batch))
-        elif request.query[0] == ("full_state", "true"):
+        else:
             expected.append(("full_state", "true"))
         if request.timeout_ms:
             expected.append(("timeout", str(request.timeout_ms)))

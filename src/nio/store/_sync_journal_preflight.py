@@ -15,7 +15,26 @@ from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..exceptions import LocalProtocolError
+from ..ingest.config import (
+    ClassicSourceConfig,
+    SlidingSourceConfig,
+    SourceConfig,
+    source_transport,
+)
 from ..ingest.errors import FreshIngestionRequired
+from ..ingest.model import TransportKind
+from ..ingest.sliding import (
+    SlidingCursor,
+    SlidingRangeAckMode,
+    _sliding_cursor_from_json,
+    canonical_sliding_cursor,
+)
+from ..ingest.source import (
+    ClassicCursor,
+    _classic_cursor_from_json,
+    canonical_classic_cursor,
+)
+from ._sync_journal_codec import EncryptedRowCodec
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
@@ -187,13 +206,64 @@ def validate_schema_topology(connection: sqlite3.Connection) -> None:
         raise LocalProtocolError("ingestion-v1 schema topology is invalid") from error
 
 
+def _validate_source_cursor(
+    transport_kind: TransportKind,
+    cursor_json: bytes,
+) -> None:
+    try:
+        if transport_kind is TransportKind.CLASSIC:
+            classic_cursor = _classic_cursor_from_json(cursor_json)
+            canonical = canonical_classic_cursor(classic_cursor)
+        else:
+            sliding_cursor = _sliding_cursor_from_json(cursor_json)
+            canonical = canonical_sliding_cursor(sliding_cursor)
+    except (TypeError, ValueError) as error:
+        raise LocalProtocolError(
+            f"persisted {transport_kind.value} source cursor is invalid"
+        ) from error
+    if canonical != cursor_json:
+        raise LocalProtocolError(
+            f"persisted {transport_kind.value} source cursor is not canonical"
+        )
+
+
+def _cold_source_cursor(source: SourceConfig) -> bytes:
+    if type(source) is ClassicSourceConfig:
+        return canonical_classic_cursor(ClassicCursor(None))
+    if type(source) is not SlidingSourceConfig:
+        source_transport(source)
+        raise AssertionError("unreachable")
+    return canonical_sliding_cursor(
+        SlidingCursor(
+            pos=None,
+            to_device_since=None,
+            connection_instance=uuid4(),
+            connection_name=source.connection_name,
+            all_rooms_range_end=source.all_rooms_page_size - 1,
+            all_rooms_page_size=source.all_rooms_page_size,
+            all_rooms_range_ack_mode=SlidingRangeAckMode.UNKNOWN,
+            all_rooms_coverage_complete=False,
+        )
+    )
+
+
 def _create_fresh(
     connection: sqlite3.Connection,
     account_id: str,
     device_id: str,
+    pickle_key: str,
+    source: SourceConfig,
     writer_epoch: UUID,
     statement_hook: Callable[[str], None] | None,
 ) -> None:
+    transport_kind = source_transport(source)
+    stream_id = uuid4()
+    cursor_json = _cold_source_cursor(source)
+    cursor_ciphertext, cursor_sha256 = EncryptedRowCodec(
+        pickle_key,
+        account_id,
+        stream_id,
+    ).seal("NioIngestSourceState", (account_id,), cursor_json)
     with immediate_transaction(connection):
         connection.execute(META_TABLE_SQL)
         if statement_hook is not None:
@@ -201,19 +271,20 @@ def _create_fresh(
         connection.execute(
             """INSERT INTO NioIngestMeta (
                 account_id, device_id, schema_version, stream_id,
-                binding_operation_id, journal_generation,
+                transport_kind, binding_operation_id, journal_generation,
                 consumer_generation, consumer_first_sequence,
                 baseline_rooms_sha256, consumer_attached_revision, revision,
                 writer_epoch, next_source_epoch, next_ready_order,
                 next_batch_sequence, last_acked_sequence, last_acked_batch_id,
                 last_acked_sha256, created_at_ns
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?,
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?,
                       1, 0, 1, 0, NULL, NULL, ?)""",
             (
                 account_id,
                 device_id,
                 SCHEMA_VERSION,
-                str(uuid4()),
+                str(stream_id),
+                transport_kind.value,
                 str(uuid4()),
                 str(writer_epoch),
                 time.time_ns(),
@@ -225,16 +296,28 @@ def _create_fresh(
             connection.execute(statement.strip())
             if statement_hook is not None:
                 statement_hook(f"schema_{index}")
+        connection.execute(
+            """INSERT INTO NioIngestSourceState (
+                account_id, source_epoch, cursor_ciphertext, cursor_sha256,
+                next_request_id, active
+            ) VALUES (?, 0, ?, ?, 1, 1)""",
+            (account_id, cursor_ciphertext, cursor_sha256),
+        )
+        if statement_hook is not None:
+            statement_hook("insert_source")
 
 
 def _open_existing(
     connection: sqlite3.Connection,
     account_id: str,
     device_id: str,
+    pickle_key: str,
+    source: SourceConfig,
 ) -> UUID:
     validate_schema_topology(connection)
     rows = connection.execute(
-        "SELECT account_id, device_id, schema_version, writer_epoch "
+        "SELECT account_id, device_id, schema_version, stream_id, "
+        "transport_kind, writer_epoch "
         "FROM NioIngestMeta"
     ).fetchall()
     if len(rows) != 1:
@@ -246,6 +329,34 @@ def _open_existing(
         raise LocalProtocolError("ingestion device_id does not match")
     if row["schema_version"] != SCHEMA_VERSION:
         raise LocalProtocolError(f"unsupported schema_version {row['schema_version']}")
+    try:
+        transport_kind = TransportKind(row["transport_kind"])
+    except ValueError as error:
+        raise LocalProtocolError("ingestion transport_kind is invalid") from error
+    if source_transport(source) is not transport_kind:
+        raise LocalProtocolError("ingestion transport kind does not match source")
+
+    source_rows = connection.execute("SELECT * FROM NioIngestSourceState").fetchall()
+    if len(source_rows) != 1:
+        raise LocalProtocolError("ingestion source row cardinality is not one")
+    source_row = source_rows[0]
+    if source_row["account_id"] != account_id:
+        raise LocalProtocolError("ingestion source account_id does not match")
+    try:
+        stream_id = UUID(row["stream_id"])
+    except (TypeError, ValueError) as error:
+        raise LocalProtocolError("ingestion stream_id is invalid") from error
+    cursor_json = EncryptedRowCodec(
+        pickle_key,
+        account_id,
+        stream_id,
+    ).decrypt(
+        "NioIngestSourceState",
+        (account_id,),
+        bytes(source_row["cursor_ciphertext"]),
+        bytes(source_row["cursor_sha256"]),
+    )
+    _validate_source_cursor(transport_kind, cursor_json)
     old_epoch = row["writer_epoch"]
     writer_epoch = uuid4()
     with immediate_transaction(connection):
@@ -273,10 +384,13 @@ def open_journal_database(
     *,
     account_id: str,
     device_id: str,
+    pickle_key: str,
+    source: SourceConfig,
     sqlite_busy_timeout_ms: int,
     statement_observer: Callable[[str], None] | None,
     schema_statement_hook: Callable[[str], None] | None,
 ) -> OpenedJournalDatabase:
+    source_transport(source)
     path = database_path(database)
     path.parent.mkdir(parents=True, exist_ok=True)
     writer_lock = StableFileLock(path)
@@ -298,13 +412,21 @@ def open_journal_database(
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
         if marker_exists:
-            writer_epoch = _open_existing(connection, account_id, device_id)
+            writer_epoch = _open_existing(
+                connection,
+                account_id,
+                device_id,
+                pickle_key,
+                source,
+            )
         else:
             writer_epoch = uuid4()
             _create_fresh(
                 connection,
                 account_id,
                 device_id,
+                pickle_key,
+                source,
                 writer_epoch,
                 schema_statement_hook,
             )
