@@ -373,7 +373,7 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalConflictError("consumer attach compare-and-swap failed")
             for state, lane, loss, ready in planned:
                 self._write_room_state(state, new_revision)
-                self._write_room_lane(lane, new_revision)
+                self._write_room_lane(lane, new_revision, owner.transport_kind)
                 self._write_loss(loss, new_revision)
                 self._write_ready(ready, new_revision)
         self._consumer_validated = True
@@ -480,6 +480,10 @@ class SqliteIngestionJournal(JournalRows):
                 lane_record,
                 owner.transport_kind,
             )
+        for ready in transition.ready_records:
+            self._validate_ready_record(ready)
+        for batch in transition.batches:
+            self._validate_batch_integrity(batch)
 
         ready_orders = tuple(
             sorted(ready.ready_order for ready in transition.ready_records)
@@ -626,7 +630,7 @@ class SqliteIngestionJournal(JournalRows):
             for state in transition.room_states:
                 self._write_room_state(state, new_revision)
             for lane in transition.room_lanes:
-                self._write_room_lane(lane, new_revision)
+                self._write_room_lane(lane, new_revision, owner.transport_kind)
             for lane_record in transition.lane_record_inserts:
                 self._write_lane_record(lane_record, new_revision)
             for key in transition.lane_record_deletes:

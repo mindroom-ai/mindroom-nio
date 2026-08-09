@@ -66,6 +66,18 @@ _ROOM_SNAPSHOT_FIELDS = (
     "power_levels_json",
     "members",
 )
+_TRANSPORT_ORIGIN_FIELDS = (
+    "origin_type",
+    "transport",
+    "source_epoch",
+    "request_id",
+    "frame_index",
+)
+_SYSTEM_ORIGIN_FIELDS = (
+    "origin_type",
+    "kind",
+    "operation_id",
+)
 
 
 def _canonical_json(value: dict[str, Any]) -> bytes:
@@ -116,6 +128,8 @@ def _origin_from_dict(value: object) -> RecordOrigin | SystemOrigin:
     origin = _dict(value, "origin")
     origin_type = origin.get("origin_type")
     if origin_type == "transport":
+        if tuple(origin) != _TRANSPORT_ORIGIN_FIELDS:
+            raise ValueError("transport origin fields are not canonical")
         return RecordOrigin(
             TransportKind(_string(origin.get("transport"), "transport")),
             _integer(origin.get("source_epoch"), "source_epoch"),
@@ -123,6 +137,8 @@ def _origin_from_dict(value: object) -> RecordOrigin | SystemOrigin:
             _integer(origin.get("frame_index"), "frame_index"),
         )
     if origin_type == "system":
+        if tuple(origin) != _SYSTEM_ORIGIN_FIELDS:
+            raise ValueError("system origin fields are not canonical")
         return SystemOrigin(
             SystemOriginKind(_string(origin.get("kind"), "kind")),
             UUID(_string(origin.get("operation_id"), "operation_id")),
@@ -195,7 +211,7 @@ def _record_from_dict(value: object) -> EventRecord | LossRecord:
         return EventRecord(
             _string(record.get("record_id"), "record_id"),
             RecordKind(_string(record.get("kind"), "kind")),
-            origin,  # type: ignore[arg-type]
+            origin,
             _optional_string(record.get("room_id"), "room_id"),
             _optional_integer(record.get("membership_epoch"), "membership_epoch"),
             _optional_integer(record.get("room_sequence"), "room_sequence"),
@@ -432,7 +448,16 @@ def _validate_batch(batch: SyncBatch) -> None:
         raise ValueError("SyncBatch requires at least one record")
 
     for record in batch.records:
-        if isinstance(record, LossRecord):
+        if type(record) is EventRecord and type(record.origin) is SystemOrigin:
+            expected_record_id = _system_event_record_id(
+                batch.ref.stream_id,
+                record,
+            )
+            if record.record_id != expected_record_id:
+                raise BatchIntegrityError(
+                    "record_id does not match system event contents"
+                )
+        elif isinstance(record, LossRecord):
             expected_loss_id = _loss_id(batch.ref.stream_id, record)
             if not hmac.compare_digest(record.loss_id, expected_loss_id):
                 raise BatchIntegrityError("loss_id does not match loss contents")
@@ -446,6 +471,26 @@ def _validate_batch(batch: SyncBatch) -> None:
     )
     if batch.ref.batch_id != expected_batch_id:
         raise BatchIntegrityError("batch_id does not match canonical payload")
+
+
+def _system_event_record_id(stream_id: UUID, record: EventRecord) -> str:
+    if type(stream_id) is not UUID:
+        raise TypeError("stream_id must be UUID")
+    if type(record) is not EventRecord or type(record.origin) is not SystemOrigin:
+        raise TypeError("record must be a SystemOrigin EventRecord")
+    record.__post_init__()
+    assert record.room_id is not None
+    if record.kind is RecordKind.STATE:
+        assert record.event_id is not None
+        identity = f"{record.kind.value}:{record.room_id}:{record.event_id}"
+    else:
+        assert record.membership_epoch is not None
+        source_digest = hashlib.sha256(record.source_json).hexdigest()
+        identity = (
+            f"{record.kind.value}:{record.room_id}:{record.membership_epoch}:"
+            f"{record.origin.kind.value}:{record.origin.operation_id}:{source_digest}"
+        )
+    return str(uuid5(stream_id, identity))
 
 
 def _loss_id(stream_id: UUID, record: LossRecord) -> str:

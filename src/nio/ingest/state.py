@@ -415,6 +415,13 @@ class ReadyRecord:
     canonical_bytes: int = 0
     created_revision: int = field(default=0, compare=False)
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.record.origin) is SystemOrigin
+            and self.source_frame_id is not None
+        ):
+            raise ValueError("SystemOrigin ReadyRecord source_frame_id must be None")
+
 
 @dataclass(frozen=True, slots=True)
 class StagedFrame:

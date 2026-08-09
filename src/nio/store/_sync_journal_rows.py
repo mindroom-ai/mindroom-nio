@@ -15,6 +15,7 @@ from ..ingest.model import (
     RecordOrigin,
     RoomHydrationStatus,
     SyncBatch,
+    SystemOrigin,
     TransportKind,
 )
 from ..ingest.serialization import (
@@ -37,6 +38,8 @@ from ..ingest.serialization import (
     _recovery_gap_to_dict,
     _room_snapshot_from_dict,
     _room_snapshot_to_dict,
+    _system_event_record_id,
+    _validate_batch,
     canonical_batch_payload,
 )
 from ..ingest.state import (
@@ -121,9 +124,8 @@ class JournalRows:
                 "record origin transport does not match immutable journal transport"
             )
 
-    @classmethod
     def _validate_room_lane_transport(
-        cls,
+        self,
         lane: RoomLane,
         transport_kind: TransportKind,
     ) -> None:
@@ -139,10 +141,11 @@ class JournalRows:
                 "recovery gap transport does not match immutable journal transport"
             )
         if lane.pending_lifecycle is not None:
-            cls._validate_record_transport(
+            self._validate_record_transport(
                 lane.pending_lifecycle,
                 transport_kind,
             )
+            self._validated_record_id(lane.pending_lifecycle)
 
     @classmethod
     def _validate_lane_record_transport(
@@ -234,7 +237,13 @@ class JournalRows:
             ),
         )
 
-    def _write_room_lane(self, lane: RoomLane, revision: int) -> None:
+    def _write_room_lane(
+        self,
+        lane: RoomLane,
+        revision: int,
+        transport_kind: TransportKind,
+    ) -> None:
+        self._validate_room_lane_transport(lane, transport_kind)
         payload = self._room_lane_payload(lane, revision)
         ciphertext, digest = self._codec.seal(
             "NioIngestRoomLane",
@@ -326,13 +335,38 @@ class JournalRows:
 
     def _validated_record_id(self, record: EventRecord | LossRecord) -> str:
         if isinstance(record, EventRecord):
+            if type(record.origin) is SystemOrigin:
+                try:
+                    expected_id = _system_event_record_id(self.stream_id, record)
+                except (TypeError, ValueError) as error:
+                    raise JournalIntegrityError(
+                        "system EventRecord is invalid"
+                    ) from error
+                if record.record_id != expected_id:
+                    raise JournalIntegrityError(
+                        "record_id does not match system event contents"
+                    )
             return record.record_id
         if record.loss_id != _loss_id(self.stream_id, record):
             raise JournalIntegrityError("loss_id does not match loss contents")
         return record.loss_id
 
+    def _validate_ready_record(self, ready: ReadyRecord) -> str:
+        try:
+            replace(ready)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+        return self._validated_record_id(ready.record)
+
+    @staticmethod
+    def _validate_batch_integrity(batch: SyncBatch) -> None:
+        try:
+            _validate_batch(batch)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+
     def _write_ready(self, ready: ReadyRecord, revision: int) -> None:
-        record_id = self._validated_record_id(ready.record)
+        record_id = self._validate_ready_record(ready)
         record_payload = _canonical_json(_record_to_dict(ready.record))
         payload = _canonical_json(
             {
@@ -802,6 +836,7 @@ class JournalRows:
         revision: int,
         owner: OwnerView,
     ) -> None:
+        self._validate_batch_integrity(batch)
         if (
             batch.account_id != self.account_id
             or batch.device_id != self.device_id
@@ -844,7 +879,11 @@ class JournalRows:
         payload = self._open_payload(
             "NioIngestBatch", (row["sequence"],), row, "payload"
         )
-        batch = _batch_from_payload(payload)
+        try:
+            batch = _batch_from_payload(payload)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+        self._validate_batch_integrity(batch)
         if (
             batch.ref.sequence != row["sequence"]
             or str(batch.ref.batch_id) != row["batch_id"]
@@ -883,8 +922,13 @@ class JournalRows:
             )
         except (TypeError, ValueError) as error:
             raise JournalIntegrityError("ready source_frame_id is invalid") from error
-        record = _record_from_dict(envelope["record"])
-        record_payload = _canonical_json(_record_to_dict(record))
+        try:
+            record = _record_from_dict(envelope["record"])
+            record_payload = _canonical_json(_record_to_dict(record))
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "ready authenticated record is invalid"
+            ) from error
         if row["canonical_bytes"] != len(record_payload):
             raise JournalIntegrityError(
                 "ready canonical_bytes does not match canonical payload"
@@ -918,13 +962,18 @@ class JournalRows:
             raise JournalIntegrityError(
                 "ready record columns do not match authenticated payload"
             )
-        return ReadyRecord(
-            ready_order,
-            record,
-            source_frame_id,
-            row["canonical_bytes"],
-            created_revision,
-        )
+        try:
+            ready = ReadyRecord(
+                ready_order,
+                record,
+                source_frame_id,
+                row["canonical_bytes"],
+                created_revision,
+            )
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(str(error)) from error
+        self._validate_ready_record(ready)
+        return ready
 
     def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]:
         self._require_attached()

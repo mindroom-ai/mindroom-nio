@@ -8,7 +8,7 @@ import time
 import warnings
 from dataclasses import replace
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pytest
 from peewee import SqliteDatabase
@@ -76,6 +76,8 @@ from nio.store.sync_journal import (
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 STREAM_ID = UUID("33333333-3333-3333-3333-333333333333")
+SYSTEM_OPERATION_ID = UUID("44444444-4444-4444-4444-444444444444")
+STALE_SYSTEM_RECORD_ID = "99999999-9999-5999-8999-999999999999"
 
 
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
@@ -3991,6 +3993,436 @@ def _batch_event(sequence: int) -> EventRecord:
         f'{{"sequence":{sequence}}}'.encode(),
         None,
     )
+
+
+def _journal_system_event(
+    stream_id: UUID,
+    kind: RecordKind,
+    *,
+    room_id: str = "!room:example.org",
+    membership_epoch: int = 1,
+    room_sequence: int = 1,
+) -> EventRecord:
+    if kind is RecordKind.STATE:
+        origin_kind = SystemOriginKind.ROOM_HYDRATION
+        event_id = "$hydrated"
+        source_json = b'{"type":"m.room.name"}'
+        identity = f"{kind.value}:{room_id}:{event_id}"
+    elif kind is RecordKind.ROOM_LIFECYCLE:
+        origin_kind = SystemOriginKind.MEMBERSHIP_CHANGE
+        event_id = None
+        source_json = b'{"membership":"leave"}'
+        identity = (
+            f"{kind.value}:{room_id}:{membership_epoch}:{origin_kind.value}:"
+            f"{SYSTEM_OPERATION_ID}:{hashlib.sha256(source_json).hexdigest()}"
+        )
+    else:
+        assert kind is RecordKind.ROOM_READINESS
+        origin_kind = SystemOriginKind.ROOM_HYDRATION
+        event_id = None
+        source_json = b'{"status":"ready"}'
+        identity = (
+            f"{kind.value}:{room_id}:{membership_epoch}:{origin_kind.value}:"
+            f"{SYSTEM_OPERATION_ID}:{hashlib.sha256(source_json).hexdigest()}"
+        )
+    return EventRecord(
+        str(uuid5(stream_id, identity)),
+        kind,
+        SystemOrigin(origin_kind, SYSTEM_OPERATION_ID),
+        room_id,
+        membership_epoch,
+        room_sequence,
+        event_id,
+        None,
+        source_json,
+        None,
+    )
+
+
+def _journal_system_loss(stream_id: UUID) -> LossRecord:
+    incomplete = LossRecord(
+        "",
+        SystemOrigin(SystemOriginKind.STORE_VALIDATION, SYSTEM_OPERATION_ID),
+        "!room:example.org",
+        1,
+        LossReason.CORRUPT_STORED_RECORD,
+        LossBoundary(None, None, None, None),
+        b'{"table":"ready"}',
+    )
+    return replace(incomplete, loss_id=_loss_id(stream_id, incomplete))
+
+
+def _system_lifecycle_transition(lifecycle: EventRecord) -> JournalTransition:
+    room_id = lifecycle.room_id
+    assert room_id is not None
+    return JournalTransition(
+        room_states=(
+            RoomState(
+                room_id,
+                2,
+                2,
+                RoomHydrationStatus.READY,
+                _snapshot(room_id, 2),
+            ),
+        ),
+        room_lanes=(
+            RoomLane(
+                room_id,
+                1,
+                LaneStatus.RETIRING,
+                successor_membership_epoch=2,
+                pending_lifecycle=lifecycle,
+            ),
+            RoomLane(room_id, 2, LaneStatus.ACTIVE),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ("ready", "lifecycle", "batch"))
+async def test_system_event_identity_rejects_before_journal_dml(
+    tmp_path: Path,
+    carrier: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    if carrier == "ready":
+        valid = _journal_system_event(
+            bootstrap.stream_id,
+            RecordKind.ROOM_READINESS,
+        )
+        transition = JournalTransition(
+            ready_records=(
+                ReadyRecord(0, replace(valid, record_id=STALE_SYSTEM_RECORD_ID)),
+            ),
+        )
+    elif carrier == "lifecycle":
+        valid = _journal_system_event(
+            bootstrap.stream_id,
+            RecordKind.ROOM_LIFECYCLE,
+            membership_epoch=2,
+        )
+        transition = _system_lifecycle_transition(
+            replace(valid, record_id=STALE_SYSTEM_RECORD_ID)
+        )
+    else:
+        valid = _journal_system_event(bootstrap.stream_id, RecordKind.STATE)
+        batch = batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer=consumer.binding,
+            stream_id=bootstrap.stream_id,
+            sequence=1,
+            created_revision=2,
+            records=(valid,),
+        )
+        object.__setattr__(valid, "record_id", STALE_SYSTEM_RECORD_ID)
+        payload = canonical_batch_payload(batch)
+        digest = hashlib.sha256(payload).digest()
+        object.__setattr__(batch.ref, "sha256", digest)
+        object.__setattr__(
+            batch.ref,
+            "batch_id",
+            uuid5(bootstrap.stream_id, f"1:{digest.hex()}"),
+        )
+        transition = JournalTransition(batches=(batch,))
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="record_id"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ("ready", "lifecycle", "batch"))
+async def test_authenticated_system_event_identity_is_revalidated_on_read(
+    tmp_path: Path,
+    carrier: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    codec = EncryptedRowCodec("secret", ACCOUNT_ID, bootstrap.stream_id)
+    try:
+        if carrier == "ready":
+            valid = _journal_system_event(
+                bootstrap.stream_id,
+                RecordKind.ROOM_READINESS,
+            )
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    ready_records=(ReadyRecord(0, valid),),
+                ),
+            )
+            forged = replace(valid, record_id=STALE_SYSTEM_RECORD_ID)
+            payload = _canonical_json(
+                {
+                    "ready_order": 0,
+                    "record": _record_to_dict(forged),
+                    "source_frame_id": None,
+                    "created_revision": 2,
+                }
+            )
+            ciphertext, digest = codec.seal(
+                "NioIngestReadyRecord",
+                (forged.record_id,),
+                payload,
+            )
+            bootstrap._journal.connection.execute(
+                "UPDATE NioIngestReadyRecord SET record_id = ?, "
+                "payload_ciphertext = ?, payload_sha256 = ? "
+                "WHERE account_id = ? AND record_id = ?",
+                (
+                    forged.record_id,
+                    ciphertext,
+                    digest,
+                    ACCOUNT_ID,
+                    valid.record_id,
+                ),
+            )
+            load = lambda: bootstrap._journal.load_ready_heads(limit=1)
+        elif carrier == "lifecycle":
+            valid = _journal_system_event(
+                bootstrap.stream_id,
+                RecordKind.ROOM_LIFECYCLE,
+                membership_epoch=2,
+            )
+            transition = _system_lifecycle_transition(valid)
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+            forged = replace(valid, record_id=STALE_SYSTEM_RECORD_ID)
+            lane = replace(
+                transition.room_lanes[0],
+                pending_lifecycle=forged,
+                updated_revision=2,
+            )
+            payload = bootstrap._journal._room_lane_payload(lane, 2)
+            ciphertext, digest = codec.seal(
+                "NioIngestRoomLane",
+                (lane.room_id, lane.membership_epoch),
+                payload,
+            )
+            bootstrap._journal.connection.execute(
+                "UPDATE NioIngestRoomLane SET lane_state_ciphertext = ?, "
+                "lane_state_sha256 = ? WHERE account_id = ? AND room_id = ? "
+                "AND membership_epoch = ?",
+                (
+                    ciphertext,
+                    digest,
+                    ACCOUNT_ID,
+                    lane.room_id,
+                    lane.membership_epoch,
+                ),
+            )
+            load = lambda: bootstrap._journal.load_rooms(frozenset({lane.room_id}))
+        else:
+            valid = _journal_system_event(bootstrap.stream_id, RecordKind.STATE)
+            batch = batch_from_records(
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                consumer=consumer.binding,
+                stream_id=bootstrap.stream_id,
+                sequence=1,
+                created_revision=2,
+                records=(valid,),
+            )
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(batches=(batch,)),
+            )
+            payload = canonical_batch_payload(batch).replace(
+                valid.record_id.encode(),
+                STALE_SYSTEM_RECORD_ID.encode(),
+            )
+            assert len(payload) == len(canonical_batch_payload(batch))
+            digest = hashlib.sha256(payload).digest()
+            batch_id = uuid5(
+                bootstrap.stream_id,
+                f"1:{digest.hex()}",
+            )
+            ciphertext = codec.encrypt(
+                "NioIngestBatch",
+                (1,),
+                payload,
+                digest,
+            )
+            bootstrap._journal.connection.execute(
+                "UPDATE NioIngestBatch SET batch_id = ?, payload_ciphertext = ?, "
+                "payload_sha256 = ? WHERE account_id = ? AND sequence = 1",
+                (str(batch_id), ciphertext, digest, ACCOUNT_ID),
+            )
+            load = bootstrap._journal.oldest_unacknowledged
+
+        with pytest.raises(JournalIntegrityError, match="record_id"):
+            load()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_ready_wraps_strict_system_origin_decode_errors(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    record = _journal_system_event(
+        bootstrap.stream_id,
+        RecordKind.ROOM_READINESS,
+    )
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                ready_records=(ReadyRecord(0, record),),
+            ),
+        )
+        record_payload = _record_to_dict(record)
+        origin_payload = record_payload["origin"]
+        assert isinstance(origin_payload, dict)
+        origin_payload["extra"] = True
+        payload = _canonical_json(
+            {
+                "ready_order": 0,
+                "record": record_payload,
+                "source_frame_id": None,
+                "created_revision": 2,
+            }
+        )
+        ciphertext, digest = EncryptedRowCodec(
+            "secret",
+            ACCOUNT_ID,
+            bootstrap.stream_id,
+        ).seal("NioIngestReadyRecord", (record.record_id,), payload)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestReadyRecord SET payload_ciphertext = ?, "
+            "payload_sha256 = ? WHERE account_id = ? AND record_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, record.record_id),
+        )
+
+        with pytest.raises(JournalIntegrityError, match="ready"):
+            bootstrap._journal.load_ready_heads(limit=1)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_family", ("event", "loss"))
+async def test_system_ready_lineage_rejects_source_frame_on_write_and_read(
+    tmp_path: Path,
+    record_family: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    record: EventRecord | LossRecord
+    if record_family == "event":
+        record = _journal_system_event(
+            bootstrap.stream_id,
+            RecordKind.ROOM_READINESS,
+        )
+    else:
+        record = _journal_system_loss(bootstrap.stream_id)
+    item_id = record.record_id if type(record) is EventRecord else record.loss_id
+    ready = ReadyRecord(0, record)
+    source_frame_id = UUID("55555555-5555-5555-5555-555555555555")
+    object.__setattr__(ready, "source_frame_id", source_frame_id)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="source_frame_id"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(ready_records=(ready,)),
+            )
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+
+        object.__setattr__(ready, "source_frame_id", None)
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(ready_records=(ready,)),
+        )
+        payload = _canonical_json(
+            {
+                "ready_order": 0,
+                "record": _record_to_dict(record),
+                "source_frame_id": str(source_frame_id),
+                "created_revision": 2,
+            }
+        )
+        ciphertext, digest = EncryptedRowCodec(
+            "secret",
+            ACCOUNT_ID,
+            bootstrap.stream_id,
+        ).seal("NioIngestReadyRecord", (item_id,), payload)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestReadyRecord SET source_frame_id = ?, "
+            "payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND record_id = ?",
+            (
+                str(source_frame_id),
+                ciphertext,
+                digest,
+                ACCOUNT_ID,
+                item_id,
+            ),
+        )
+        with pytest.raises(JournalIntegrityError, match="source_frame_id"):
+            bootstrap._journal.load_ready_heads(limit=1)
+    finally:
+        bootstrap.close()
 
 
 @pytest.mark.asyncio

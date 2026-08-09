@@ -29,6 +29,7 @@ from nio.ingest.state import (
     LaneRecordKey,
     LaneRecordSection,
     LaneStatus,
+    ReadyRecord,
     ReleasePhase,
     RoomAggregate,
     RoomLane,
@@ -67,13 +68,13 @@ def test_wire_enums_have_stable_string_values() -> None:
         "PRESENCE": "presence",
         "TO_DEVICE": "to_device",
         "ROOM_LIFECYCLE": "room_lifecycle",
+        "ROOM_READINESS": "room_readiness",
         "DECRYPTION_UPDATE": "decryption_update",
     }
     assert {member.name: member.value for member in SystemOriginKind} == {
         "FRESH_START": "fresh_start",
-        "CONSUMER_RESET": "consumer_reset",
         "MEMBERSHIP_CHANGE": "membership_change",
-        "SOURCE_REBIND": "source_rebind",
+        "ROOM_HYDRATION": "room_hydration",
         "STORE_VALIDATION": "store_validation",
     }
     assert {member.name: member.value for member in LossReason} == {
@@ -762,6 +763,37 @@ def test_lane_record_section_controls_record_and_source_identity() -> None:
 
 
 @pytest.mark.parametrize(
+    "record",
+    (
+        EventRecord(
+            "system-ready",
+            RecordKind.ROOM_READINESS,
+            SystemOrigin(SystemOriginKind.ROOM_HYDRATION, OPERATION_ID),
+            "!room:example.org",
+            7,
+            3,
+            None,
+            None,
+            b"{}",
+            None,
+        ),
+        replace(
+            _lane_loss(),
+            origin=SystemOrigin(SystemOriginKind.STORE_VALIDATION, OPERATION_ID),
+        ),
+    ),
+)
+def test_system_origin_ready_records_cannot_claim_a_source_frame(
+    record: EventRecord | LossRecord,
+) -> None:
+    with pytest.raises(ValueError, match="SystemOrigin.*source_frame_id"):
+        ReadyRecord(0, record, FRAME_ID)
+
+    assert ReadyRecord(0, record).source_frame_id is None
+    assert ReadyRecord(0, _lane_event()).source_frame_id is None
+
+
+@pytest.mark.parametrize(
     "make_value",
     [
         lambda: RecordOrigin(ForeignWireValue.CLASSIC, 1, 2, 3),  # type: ignore[arg-type]
@@ -813,17 +845,145 @@ def test_direct_construction_rejects_foreign_str_enum_values(make_value) -> None
         make_value()
 
 
-def test_event_record_rejects_system_origin() -> None:
-    with pytest.raises(TypeError, match="EventRecord origin must be a RecordOrigin"):
+@pytest.mark.parametrize(
+    ("kind_value", "origin_kind_value", "event_id"),
+    (
+        ("room_lifecycle", "membership_change", None),
+        ("state", "room_hydration", "$state"),
+        ("room_readiness", "room_hydration", None),
+    ),
+)
+def test_event_record_accepts_only_scoped_system_origin_pairs(
+    kind_value: str,
+    origin_kind_value: str,
+    event_id: str | None,
+) -> None:
+    kind = RecordKind(kind_value)
+    origin_kind = SystemOriginKind(origin_kind_value)
+    system_record = EventRecord(
+        "system-record",
+        kind,
+        SystemOrigin(origin_kind, OPERATION_ID),
+        "!room:example.org",
+        7,
+        3,
+        event_id,
+        TimelineEventProvenance.HISTORY,
+        b"{}",
+        b"{}",
+    )
+    transport_record = replace(
+        system_record,
+        origin=RecordOrigin(TransportKind.CLASSIC, 1, 2, 3),
+    )
+
+    assert system_record.origin == SystemOrigin(origin_kind, OPERATION_ID)
+    assert transport_record.origin == RecordOrigin(TransportKind.CLASSIC, 1, 2, 3)
+    if kind is RecordKind.ROOM_LIFECYCLE:
+        observed_lifecycle = replace(transport_record, event_id="$event")
+        assert observed_lifecycle.event_id == "$event"
+
+
+def test_event_record_system_origin_whitelist_is_exhaustive() -> None:
+    allowed = {
+        (RecordKind.ROOM_LIFECYCLE, SystemOriginKind.MEMBERSHIP_CHANGE),
+        (RecordKind.STATE, SystemOriginKind.ROOM_HYDRATION),
+        (RecordKind.ROOM_READINESS, SystemOriginKind.ROOM_HYDRATION),
+    }
+    for kind in RecordKind:
+        for origin_kind in SystemOriginKind:
+            event_id = "$state" if kind is RecordKind.STATE else None
+            arguments = (
+                "system-record",
+                kind,
+                SystemOrigin(origin_kind, OPERATION_ID),
+                "!room:example.org",
+                7,
+                3,
+                event_id,
+                None,
+                b"{}",
+                None,
+            )
+            if (kind, origin_kind) in allowed:
+                assert EventRecord(*arguments).kind is kind
+            else:
+                with pytest.raises(ValueError, match="SystemOrigin"):
+                    EventRecord(*arguments)
+
+
+@pytest.mark.parametrize(
+    ("kind_value", "origin_kind_value", "event_id"),
+    (
+        ("room_lifecycle", "membership_change", None),
+        ("state", "room_hydration", "$state"),
+        ("room_readiness", "room_hydration", None),
+    ),
+)
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"room_id": None},
+        {"room_id": ""},
+        {"membership_epoch": None},
+        {"membership_epoch": -1},
+        {"room_sequence": None},
+        {"room_sequence": -1},
+    ),
+)
+def test_system_event_records_require_room_epoch_and_sequence_scope(
+    kind_value: str,
+    origin_kind_value: str,
+    event_id: str | None,
+    changes: dict[str, object],
+) -> None:
+    record = EventRecord(
+        "system-record",
+        RecordKind(kind_value),
+        SystemOrigin(SystemOriginKind(origin_kind_value), OPERATION_ID),
+        "!room:example.org",
+        7,
+        3,
+        event_id,
+        None,
+        b"{}",
+        None,
+    )
+
+    with pytest.raises(ValueError, match="room_id|membership_epoch|room_sequence"):
+        replace(record, **changes)
+
+
+@pytest.mark.parametrize(
+    ("kind_value", "event_id"),
+    (
+        ("state", None),
+        ("state", ""),
+        ("room_lifecycle", "$event"),
+        ("room_readiness", "$event"),
+    ),
+)
+def test_system_event_record_event_id_rules_are_exact(
+    kind_value: str,
+    event_id: str | None,
+) -> None:
+    kind = RecordKind(kind_value)
+    origin_kind = (
+        SystemOriginKind.MEMBERSHIP_CHANGE
+        if kind is RecordKind.ROOM_LIFECYCLE
+        else SystemOriginKind.ROOM_HYDRATION
+    )
+
+    with pytest.raises(ValueError, match="event_id"):
         EventRecord(
-            "$event",
-            RecordKind.TIMELINE,
-            SystemOrigin(SystemOriginKind.FRESH_START, OPERATION_ID),  # type: ignore[arg-type]
+            "system-record",
+            kind,
+            SystemOrigin(origin_kind, OPERATION_ID),
             "!room:example.org",
-            1,
-            1,
-            "$event",
-            TimelineEventProvenance.LIVE,
+            7,
+            3,
+            event_id,
+            None,
             b"{}",
             None,
         )
