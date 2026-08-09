@@ -1,11 +1,12 @@
 import json
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
 from .model import RecordOrigin, TransportKind
-from .ports import NetworkFailureKind, NetworkRequest
+from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
+from .state import SourceState
 
 MATRIX_CANONICAL_INTEGER_MAX = (1 << 53) - 1
 
@@ -34,7 +35,7 @@ def _object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _load_json(data: bytes, field_name: str) -> Any:
+def load_json(data: bytes, field_name: str) -> Any:
     if type(data) is not bytes:
         raise TypeError(f"{field_name} must be bytes")
     try:
@@ -50,7 +51,7 @@ def _load_json(data: bytes, field_name: str) -> Any:
         raise ValueError(f"{field_name} must contain valid UTF-8 JSON") from error
 
 
-def _canonical_json(value: Any) -> bytes:
+def canonical_json(value: Any) -> bytes:
     try:
         return json.dumps(
             value,
@@ -75,11 +76,11 @@ class ClassicCursor:
 def canonical_classic_cursor(cursor: ClassicCursor) -> bytes:
     if type(cursor) is not ClassicCursor:
         raise TypeError("cursor must be ClassicCursor")
-    return _canonical_json({"next_batch": cursor.next_batch})
+    return canonical_json({"next_batch": cursor.next_batch})
 
 
 def _classic_cursor_from_json(data: bytes) -> ClassicCursor:
-    value = _load_json(data, "classic cursor")
+    value = load_json(data, "classic cursor")
     if type(value) is not dict or set(value) != {"next_batch"}:
         raise ValueError("classic cursor must contain only next_batch")
     next_batch = value["next_batch"]
@@ -100,6 +101,21 @@ class SourceResultKind(StrEnum):
     RETRYABLE_ERROR = "retryable_error"
     TERMINAL_ERROR = "terminal_error"
     RESET_REQUIRED = "reset_required"
+
+
+@runtime_checkable
+class SyncSource(Protocol):
+    def plan_request(
+        self,
+        state: SourceState,
+        request_id: int,
+    ) -> NetworkRequest | None: ...
+
+    def normalize(
+        self,
+        request: NetworkRequest,
+        result: NetworkResult,
+    ) -> "SourceResult": ...
 
 
 def _is_retryable_http_status(status_code: int) -> bool:
@@ -288,9 +304,7 @@ class SourceResult:
             ) and self.retry_after_ms is None
         else:
             valid = (
-                self.status_code is not None
-                and 400 <= self.status_code < 500
-                and not _is_retryable_http_status(self.status_code)
+                self.status_code == 400
                 and self.network_failure is None
                 and self.request.transport is TransportKind.SLIDING
                 and self.error_code == "M_UNKNOWN_POS"
@@ -298,3 +312,125 @@ class SourceResult:
             )
         if not valid:
             raise ValueError("source result contradicts its error classification")
+
+
+def canonical_json_or_raw(data: bytes) -> bytes:
+    try:
+        return canonical_json(load_json(data, "response body"))
+    except (TypeError, ValueError):
+        return data
+
+
+def validate_network_result_identity(
+    request: NetworkRequest,
+    result: NetworkResult,
+) -> None:
+    _require_exact(request, NetworkRequest, "request")
+    _require_exact(result, NetworkResult, "result")
+    if (
+        result.stream_id != request.stream_id
+        or result.transport is not request.transport
+        or result.source_epoch != request.source_epoch
+        or result.request_id != request.request_id
+    ):
+        raise ValueError("network result does not match its request")
+
+
+def normalize_source_error(
+    request: NetworkRequest,
+    result: NetworkResult,
+) -> SourceResult | None:
+    """Normalize transport/non-200 failures shared by every sync source."""
+    validate_network_result_identity(request, result)
+    if result.failure is not None:
+        kind = (
+            SourceResultKind.RETRYABLE_ERROR
+            if result.failure
+            in {NetworkFailureKind.TIMEOUT, NetworkFailureKind.CONNECTION}
+            else SourceResultKind.TERMINAL_ERROR
+        )
+        return SourceResult(
+            kind=kind,
+            request=request,
+            frame=None,
+            status_code=None,
+            network_failure=result.failure,
+            error_code=None,
+            retry_after_ms=None,
+            response_body=result.body,
+            detail=f"network {result.failure.value}",
+        )
+
+    assert result.status_code is not None
+    if result.status_code == 200:
+        return None
+
+    parsed: Any = None
+    try:
+        parsed = load_json(result.body, "response body")
+        response_body = canonical_json(parsed)
+    except (TypeError, ValueError):
+        response_body = result.body
+
+    error_code = None
+    body_retry_after = None
+    if type(parsed) is dict:
+        value = parsed.get("errcode")
+        if type(value) is str:
+            error_code = value
+        retry_value = parsed.get("retry_after_ms")
+        if type(retry_value) is int and retry_value >= 0:
+            body_retry_after = retry_value
+
+    reset_required = (
+        request.transport is TransportKind.SLIDING
+        and result.status_code == 400
+        and error_code == "M_UNKNOWN_POS"
+    )
+    retryable = _is_retryable_http_status(result.status_code)
+    retry_after_ms = None
+    if retryable:
+        retry_after_ms = (
+            result.retry_after_ms
+            if result.retry_after_ms is not None
+            else body_retry_after
+        )
+    return SourceResult(
+        kind=(
+            SourceResultKind.RESET_REQUIRED
+            if reset_required
+            else (
+                SourceResultKind.RETRYABLE_ERROR
+                if retryable
+                else SourceResultKind.TERMINAL_ERROR
+            )
+        ),
+        request=request,
+        frame=None,
+        status_code=result.status_code,
+        network_failure=None,
+        error_code=error_code,
+        retry_after_ms=retry_after_ms,
+        response_body=response_body,
+        detail=(
+            "source reset required" if reset_required else f"HTTP {result.status_code}"
+        ),
+    )
+
+
+def malformed_success_result(
+    request: NetworkRequest,
+    body: bytes,
+    error: TypeError | ValueError,
+) -> SourceResult:
+    return SourceResult(
+        kind=SourceResultKind.TERMINAL_ERROR,
+        request=request,
+        frame=None,
+        status_code=200,
+        network_failure=None,
+        error_code=None,
+        retry_after_ms=None,
+        response_body=canonical_json_or_raw(body),
+        detail=str(error),
+    )

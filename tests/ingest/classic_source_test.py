@@ -23,11 +23,13 @@ from nio.ingest.source import (
     RoomSection,
     SourceResult,
     SourceResultKind,
+    SyncSource,
     canonical_classic_cursor,
 )
 from nio.ingest.state import SourceState
 
 STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
+OTHER_STREAM_ID = UUID("234c90aa-7625-4aa8-acd5-ef6005af3250")
 
 
 @pytest.fixture
@@ -71,6 +73,12 @@ def test_classic_cursor_is_frozen_slotted_and_canonical() -> None:
         cursor.next_batch = "s1"  # type: ignore[misc]
 
 
+def test_classic_source_satisfies_the_structural_sync_source_protocol(
+    classic_source: ClassicSource,
+) -> None:
+    assert isinstance(classic_source, SyncSource)
+
+
 def test_initial_request_has_full_state_and_no_since(
     classic_source: ClassicSource,
 ) -> None:
@@ -79,6 +87,7 @@ def test_initial_request_has_full_state_and_no_since(
     request = classic_source.plan_request(state, request_id=9)
 
     assert request == NetworkRequest(
+        stream_id=STREAM_ID,
         transport=TransportKind.CLASSIC,
         source_epoch=4,
         request_id=9,
@@ -104,6 +113,7 @@ def test_continuation_request_retains_prior_cursor_without_full_state(
     request = classic_source.plan_request(state, request_id=9)
 
     assert request == NetworkRequest(
+        stream_id=STREAM_ID,
         transport=TransportKind.CLASSIC,
         source_epoch=4,
         request_id=9,
@@ -168,6 +178,7 @@ def test_request_planning_rejects_noncanonical_durable_cursor_bytes(
 
 def _network_result(request: NetworkRequest, body: bytes) -> NetworkResult:
     return NetworkResult(
+        stream_id=request.stream_id,
         transport=request.transport,
         source_epoch=request.source_epoch,
         request_id=request.request_id,
@@ -401,6 +412,36 @@ def test_semantically_identical_object_order_produces_identical_frame_bytes(
     assert first.frame.source_json == second.frame.source_json
 
 
+def test_same_body_under_distinct_request_ids_has_exact_distinct_frame_ids(
+    classic_source: ClassicSource,
+    classic_sync_body: bytes,
+) -> None:
+    request_nine = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior"), request_id=9),
+        request_id=9,
+    )
+    request_ten = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior"), request_id=10),
+        request_id=10,
+    )
+    assert request_nine is not None
+    assert request_ten is not None
+
+    frame_nine = classic_source.normalize(
+        request_nine,
+        _network_result(request_nine, classic_sync_body),
+    ).frame
+    frame_ten = classic_source.normalize(
+        request_ten,
+        _network_result(request_ten, classic_sync_body),
+    ).frame
+
+    assert frame_nine is not None
+    assert frame_ten is not None
+    assert frame_nine.frame_id == UUID("8c49ed56-b163-579c-aa98-6a24fee3cbcc")
+    assert frame_ten.frame_id == UUID("4f19ea14-734e-5f01-b358-52aeb84c973f")
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [
@@ -420,13 +461,14 @@ def test_transport_failures_have_an_explicit_classification(
     )
     assert request is not None
     network_result = NetworkResult(
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        None,
-        b"",
-        failure,
-        None,
+        stream_id=request.stream_id,
+        transport=request.transport,
+        source_epoch=request.source_epoch,
+        request_id=request.request_id,
+        status_code=None,
+        body=b"",
+        failure=failure,
+        retry_after_ms=None,
     )
 
     result = classic_source.normalize(request, network_result)
@@ -467,13 +509,14 @@ def test_http_statuses_are_classified_without_becoming_empty_frames(
     assert request is not None
     body = b'{"retry_after_ms":250,"error":"later","errcode":"M_TEST"}'
     network_result = NetworkResult(
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        status_code,
-        body,
-        None,
-        None,
+        stream_id=request.stream_id,
+        transport=request.transport,
+        source_epoch=request.source_epoch,
+        request_id=request.request_id,
+        status_code=status_code,
+        body=body,
+        failure=None,
+        retry_after_ms=None,
     )
 
     result = classic_source.normalize(request, network_result)
@@ -499,19 +542,45 @@ def test_retry_after_header_takes_precedence_over_error_body(
     )
     assert request is not None
     network_result = NetworkResult(
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        429,
-        b'{"errcode":"M_LIMIT_EXCEEDED","error":"slow","retry_after_ms":250}',
-        None,
-        900,
+        stream_id=request.stream_id,
+        transport=request.transport,
+        source_epoch=request.source_epoch,
+        request_id=request.request_id,
+        status_code=429,
+        body=b'{"errcode":"M_LIMIT_EXCEEDED","error":"slow","retry_after_ms":250}',
+        failure=None,
+        retry_after_ms=900,
     )
 
     result = classic_source.normalize(request, network_result)
 
     assert result.kind is SourceResultKind.RETRYABLE_ERROR
     assert result.retry_after_ms == 900
+
+
+def test_zero_retry_after_header_takes_precedence_over_error_body(
+    classic_source: ClassicSource,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior")),
+        request_id=9,
+    )
+    assert request is not None
+    network_result = NetworkResult(
+        stream_id=request.stream_id,
+        transport=request.transport,
+        source_epoch=request.source_epoch,
+        request_id=request.request_id,
+        status_code=429,
+        body=b'{"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":250}',
+        failure=None,
+        retry_after_ms=0,
+    )
+
+    result = classic_source.normalize(request, network_result)
+
+    assert result.kind is SourceResultKind.RETRYABLE_ERROR
+    assert result.retry_after_ms == 0
 
 
 def test_non_json_retryable_http_body_is_retained_exactly(
@@ -527,13 +596,14 @@ def test_non_json_retryable_http_body_is_retained_exactly(
     result = classic_source.normalize(
         request,
         NetworkResult(
-            request.transport,
-            request.source_epoch,
-            request.request_id,
-            503,
-            body,
-            None,
-            None,
+            stream_id=request.stream_id,
+            transport=request.transport,
+            source_epoch=request.source_epoch,
+            request_id=request.request_id,
+            status_code=503,
+            body=body,
+            failure=None,
+            retry_after_ms=None,
         ),
     )
 
@@ -629,13 +699,14 @@ def test_deeply_nested_http_error_body_is_classified_and_retained(
     assert request is not None
     body = (b"[" * 50_000) + b"0" + (b"]" * 50_000)
     network_result = NetworkResult(
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        503,
-        body,
-        None,
-        None,
+        stream_id=request.stream_id,
+        transport=request.transport,
+        source_epoch=request.source_epoch,
+        request_id=request.request_id,
+        status_code=503,
+        body=body,
+        failure=None,
+        retry_after_ms=None,
     )
 
     result = classic_source.normalize(request, network_result)
@@ -730,19 +801,21 @@ def test_reset_required_rejects_the_wrong_transport_or_error_code(
 def test_transport_failure_cannot_smuggle_an_http_body() -> None:
     with pytest.raises(ValueError, match="body must be empty"):
         NetworkResult(
-            TransportKind.CLASSIC,
-            1,
-            1,
-            None,
-            b"diagnostic body",
-            NetworkFailureKind.TIMEOUT,
-            None,
+            stream_id=STREAM_ID,
+            transport=TransportKind.CLASSIC,
+            source_epoch=1,
+            request_id=1,
+            status_code=None,
+            body=b"diagnostic body",
+            failure=NetworkFailureKind.TIMEOUT,
+            retry_after_ms=None,
         )
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("stream_id", OTHER_STREAM_ID),
         ("transport", TransportKind.SLIDING),
         ("source_epoch", 5),
         ("request_id", 10),
@@ -762,6 +835,47 @@ def test_network_result_cannot_be_cross_wired_to_another_request(
 
     with pytest.raises(ValueError, match="does not match"):
         classic_source.normalize(request, result)
+
+
+def test_network_result_from_same_numbered_request_on_another_stream_is_rejected(
+    classic_source: ClassicSource,
+) -> None:
+    other_source = ClassicSource(
+        OTHER_STREAM_ID,
+        ClassicSourceConfig(
+            timeout_ms=30_000,
+            filter_json=b'{"room":{"timeline":{"limit":5}}}',
+        ),
+    )
+    state = _source_state(ClassicCursor("s-prior"), request_id=9)
+    request = classic_source.plan_request(state, request_id=9)
+    other_request = other_source.plan_request(state, request_id=9)
+    assert request is not None
+    assert other_request is not None
+    other_result = _network_result(other_request, b'{"next_batch":"foreign"}')
+
+    with pytest.raises(ValueError, match="does not match"):
+        classic_source.normalize(request, other_result)
+
+
+def test_request_from_same_numbered_request_on_another_stream_is_rejected(
+    classic_source: ClassicSource,
+) -> None:
+    other_source = ClassicSource(
+        OTHER_STREAM_ID,
+        ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}"),
+    )
+    other_request = other_source.plan_request(
+        _source_state(ClassicCursor("s-prior"), request_id=9),
+        request_id=9,
+    )
+    assert other_request is not None
+
+    with pytest.raises(ValueError, match="stream"):
+        classic_source.normalize(
+            other_request,
+            _network_result(other_request, b'{"next_batch":"foreign"}'),
+        )
 
 
 @pytest.mark.parametrize(
@@ -823,13 +937,14 @@ def test_corrupt_request_cursor_is_an_integrity_error_before_http_classification
         request_cursor_json=b'{"next_batch": "s-prior"}',
     )
     result = NetworkResult(
-        corrupt_request.transport,
-        corrupt_request.source_epoch,
-        corrupt_request.request_id,
-        503,
-        b"unavailable",
-        None,
-        None,
+        stream_id=corrupt_request.stream_id,
+        transport=corrupt_request.transport,
+        source_epoch=corrupt_request.source_epoch,
+        request_id=corrupt_request.request_id,
+        status_code=503,
+        body=b"unavailable",
+        failure=None,
+        retry_after_ms=None,
     )
 
     with pytest.raises(ValueError, match="canonical classic cursor"):
@@ -920,13 +1035,14 @@ def test_source_types_reject_foreign_string_enums() -> None:
 
     with pytest.raises(TypeError):
         NetworkResult(
-            ForeignTransport.CLASSIC,  # type: ignore[arg-type]
-            1,
-            1,
-            200,
-            b"{}",
-            None,
-            None,
+            stream_id=STREAM_ID,
+            transport=ForeignTransport.CLASSIC,  # type: ignore[arg-type]
+            source_epoch=1,
+            request_id=1,
+            status_code=200,
+            body=b"{}",
+            failure=None,
+            retry_after_ms=None,
         )
 
 
@@ -1018,6 +1134,32 @@ def test_transport_source_result_rejects_even_zero_retry_delay(
 
 @pytest.mark.parametrize("status", [408, 429, 503])
 def test_reset_required_rejects_retryable_http_statuses(
+    classic_source: ClassicSource,
+    status: int,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior")),
+        request_id=9,
+    )
+    assert request is not None
+    request = replace(request, transport=TransportKind.SLIDING)
+
+    with pytest.raises(ValueError, match="classification"):
+        SourceResult(
+            kind=SourceResultKind.RESET_REQUIRED,
+            request=request,
+            frame=None,
+            status_code=status,
+            network_failure=None,
+            error_code="M_UNKNOWN_POS",
+            retry_after_ms=None,
+            response_body=b'{"errcode":"M_UNKNOWN_POS"}',
+            detail="source reset required",
+        )
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_reset_required_rejects_non_400_unknown_position_statuses(
     classic_source: ClassicSource,
     status: int,
 ) -> None:

@@ -5,7 +5,7 @@ from uuid import UUID, uuid5
 
 from .config import ClassicSourceConfig
 from .model import RecordOrigin, TransportKind
-from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
+from .ports import NetworkRequest, NetworkResult
 from .source import (
     ClassicCursor,
     RoomSection,
@@ -13,10 +13,13 @@ from .source import (
     SourceResult,
     SourceResultKind,
     SyncFrame,
-    _canonical_json,
     _classic_cursor_from_json,
-    _load_json,
     canonical_classic_cursor,
+    canonical_json,
+    load_json,
+    malformed_success_result,
+    normalize_source_error,
+    validate_network_result_identity,
 )
 from .state import SourceState
 
@@ -54,6 +57,7 @@ class ClassicSource:
             return None
 
         return NetworkRequest(
+            stream_id=self.stream_id,
             transport=TransportKind.CLASSIC,
             source_epoch=state.source_epoch,
             request_id=request_id,
@@ -71,43 +75,14 @@ class ClassicSource:
         result: NetworkResult,
     ) -> SourceResult:
         self._validate_result_identity(request, result)
-        if result.failure is not None:
-            kind = (
-                SourceResultKind.RETRYABLE_ERROR
-                if result.failure
-                in {NetworkFailureKind.TIMEOUT, NetworkFailureKind.CONNECTION}
-                else SourceResultKind.TERMINAL_ERROR
-            )
-            return SourceResult(
-                kind=kind,
-                request=request,
-                frame=None,
-                status_code=None,
-                network_failure=result.failure,
-                error_code=None,
-                retry_after_ms=None,
-                response_body=result.body,
-                detail=f"network {result.failure.value}",
-            )
-
-        assert result.status_code is not None
-        if result.status_code != 200:
-            return self._http_error(request, result)
+        error_result = normalize_source_error(request, result)
+        if error_result is not None:
+            return error_result
 
         try:
             frame = self._normalize_frame(request, result.body)
         except (TypeError, ValueError) as error:
-            return SourceResult(
-                kind=SourceResultKind.TERMINAL_ERROR,
-                request=request,
-                frame=None,
-                status_code=200,
-                network_failure=None,
-                error_code=None,
-                retry_after_ms=None,
-                response_body=self._canonical_body_or_raw(result.body),
-                detail=str(error),
-            )
+            return malformed_success_result(request, result.body, error)
         return SourceResult(
             kind=SourceResultKind.FRAME,
             request=request,
@@ -131,6 +106,8 @@ class ClassicSource:
             raise TypeError("result must be NetworkResult")
         if request.transport is not TransportKind.CLASSIC:
             raise ValueError("ClassicSource can normalize only classic requests")
+        if request.stream_id != self.stream_id:
+            raise ValueError("classic request stream does not match source stream")
         cursor = _classic_cursor_from_json(request.request_cursor_json)
         if canonical_classic_cursor(cursor) != request.request_cursor_json:
             raise ValueError("request_cursor_json must be a canonical classic cursor")
@@ -141,12 +118,7 @@ class ClassicSource:
         ):
             raise ValueError("request is not the planned classic sync request")
         self._validate_request_query(request, cursor)
-        if (
-            result.transport is not request.transport
-            or result.source_epoch != request.source_epoch
-            or result.request_id != request.request_id
-        ):
-            raise ValueError("network result does not match its request")
+        validate_network_result_identity(request, result)
 
     def _request_query(
         self,
@@ -154,7 +126,7 @@ class ClassicSource:
     ) -> tuple[tuple[str, str], ...]:
         if type(cursor) is not ClassicCursor:
             raise TypeError("cursor must be ClassicCursor")
-        filter_value = _load_json(self.config.filter_json, "filter_json")
+        filter_value = load_json(self.config.filter_json, "filter_json")
         if type(filter_value) is not dict:
             raise ValueError("filter_json must contain a JSON object")
         query: list[tuple[str, str]] = []
@@ -164,7 +136,7 @@ class ClassicSource:
             query.append(("full_state", "true"))
         if self.config.timeout_ms:
             query.append(("timeout", str(self.config.timeout_ms)))
-        query.append(("filter", _canonical_json(filter_value).decode("utf-8")))
+        query.append(("filter", canonical_json(filter_value).decode("utf-8")))
         return tuple(query)
 
     @staticmethod
@@ -178,7 +150,7 @@ class ClassicSource:
             filter_json = request.query[-1][1].encode("utf-8")
         except UnicodeEncodeError as error:
             raise ValueError("request filter must be canonical UTF-8 JSON") from error
-        filter_value = _load_json(filter_json, "request filter")
+        filter_value = load_json(filter_json, "request filter")
         if type(filter_value) is not dict:
             raise ValueError("request filter must contain a JSON object")
 
@@ -189,69 +161,15 @@ class ClassicSource:
             expected.append(("full_state", "true"))
         if request.timeout_ms:
             expected.append(("timeout", str(request.timeout_ms)))
-        expected.append(("filter", _canonical_json(filter_value).decode("utf-8")))
+        expected.append(("filter", canonical_json(filter_value).decode("utf-8")))
         if request.query != tuple(expected):
             raise ValueError("request is not the planned classic sync request")
 
-    @staticmethod
-    def _canonical_body_or_raw(body: bytes) -> bytes:
-        try:
-            return _canonical_json(_load_json(body, "response body"))
-        except (TypeError, ValueError):
-            return body
-
-    def _http_error(
-        self,
-        request: NetworkRequest,
-        result: NetworkResult,
-    ) -> SourceResult:
-        assert result.status_code is not None
-        parsed: Any = None
-        try:
-            parsed = _load_json(result.body, "response body")
-            response_body = _canonical_json(parsed)
-        except (TypeError, ValueError):
-            response_body = result.body
-
-        error_code = None
-        body_retry_after = None
-        if type(parsed) is dict:
-            value = parsed.get("errcode")
-            if type(value) is str:
-                error_code = value
-            retry_value = parsed.get("retry_after_ms")
-            if type(retry_value) is int and retry_value >= 0:
-                body_retry_after = retry_value
-
-        retryable = result.status_code in {408, 429} or result.status_code >= 500
-        retry_after_ms = None
-        if retryable:
-            retry_after_ms = (
-                result.retry_after_ms
-                if result.retry_after_ms is not None
-                else body_retry_after
-            )
-        return SourceResult(
-            kind=(
-                SourceResultKind.RETRYABLE_ERROR
-                if retryable
-                else SourceResultKind.TERMINAL_ERROR
-            ),
-            request=request,
-            frame=None,
-            status_code=result.status_code,
-            network_failure=None,
-            error_code=error_code,
-            retry_after_ms=retry_after_ms,
-            response_body=response_body,
-            detail=f"HTTP {result.status_code}",
-        )
-
     def _normalize_frame(self, request: NetworkRequest, body: bytes) -> SyncFrame:
-        root = _load_json(body, "sync response")
+        root = load_json(body, "sync response")
         root = self._object(root, "sync response")
         next_batch = self._string(root.get("next_batch"), "next_batch")
-        source_json = _canonical_json(root)
+        source_json = canonical_json(root)
         request_cursor = _classic_cursor_from_json(request.request_cursor_json)
         request_cursor_json = canonical_classic_cursor(request_cursor)
 
@@ -309,19 +227,19 @@ class ClassicSource:
                     "ephemeral",
                 )
                 ephemeral.extend(
-                    _canonical_json({"room_id": room_id, "event": event})
+                    canonical_json({"room_id": room_id, "event": event})
                     for event in ephemeral_events
                 )
                 segments.append(
                     RoomSegment(
                         room_id=room_id,
                         section=section,
-                        state_json=tuple(_canonical_json(event) for event in state),
+                        state_json=tuple(canonical_json(event) for event in state),
                         timeline_json=tuple(
-                            _canonical_json(event) for event in timeline
+                            canonical_json(event) for event in timeline
                         ),
                         room_account_data_json=tuple(
-                            _canonical_json(event) for event in account_data
+                            canonical_json(event) for event in account_data
                         ),
                         timeline_limited=limited,
                         timeline_prev_batch=prev_batch,
@@ -382,26 +300,26 @@ class ClassicSource:
             ),
             source_json=source_json,
             to_device_json=tuple(
-                _canonical_json(event)
+                canonical_json(event)
                 for event in self._event_container(
                     root.get("to_device", {}),
                     "to_device",
                 )
             ),
-            device_list_delta_json=_canonical_json({"changed": changed, "left": left}),
-            one_time_key_counts_json=_canonical_json(key_counts),
-            unused_fallback_key_types_json=_canonical_json(fallback),
+            device_list_delta_json=canonical_json({"changed": changed, "left": left}),
+            one_time_key_counts_json=canonical_json(key_counts),
+            unused_fallback_key_types_json=canonical_json(fallback),
             room_segments=tuple(segments),
             ephemeral_json=tuple(ephemeral),
             global_account_data_json=tuple(
-                _canonical_json(event)
+                canonical_json(event)
                 for event in self._event_container(
                     root.get("account_data", {}),
                     "account_data",
                 )
             ),
             presence_json=tuple(
-                _canonical_json(event)
+                canonical_json(event)
                 for event in self._event_container(
                     root.get("presence", {}),
                     "presence",

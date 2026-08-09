@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from uuid import UUID
 
 from .model import TransportKind
 
@@ -11,6 +12,7 @@ def _require_exact(value: object, expected: type, field_name: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class NetworkRequest:
+    stream_id: UUID
     transport: TransportKind
     source_epoch: int
     request_id: int
@@ -22,6 +24,7 @@ class NetworkRequest:
     request_cursor_json: bytes
 
     def __post_init__(self) -> None:
+        _require_exact(self.stream_id, UUID, "stream_id")
         _require_exact(self.transport, TransportKind, "transport")
         _require_exact(self.source_epoch, int, "source_epoch")
         _require_exact(self.request_id, int, "request_id")
@@ -57,6 +60,7 @@ class NetworkFailureKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class NetworkResult:
+    stream_id: UUID
     transport: TransportKind
     source_epoch: int
     request_id: int
@@ -66,6 +70,7 @@ class NetworkResult:
     retry_after_ms: int | None
 
     def __post_init__(self) -> None:
+        _require_exact(self.stream_id, UUID, "stream_id")
         _require_exact(self.transport, TransportKind, "transport")
         _require_exact(self.source_epoch, int, "source_epoch")
         _require_exact(self.request_id, int, "request_id")
