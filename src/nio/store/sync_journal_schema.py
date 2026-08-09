@@ -4,13 +4,76 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     account_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, schema_version INTEGER NOT NULL,
     stream_id TEXT NOT NULL,
     transport_kind TEXT NOT NULL CHECK (transport_kind IN ('classic', 'sliding')),
-    binding_operation_id TEXT NOT NULL, journal_generation TEXT,
+    binding_operation_id TEXT NOT NULL,
+    consumer_attach_status TEXT NOT NULL CHECK (consumer_attach_status IN ('unbound', 'attaching', 'attached')),
+    consumer_attach_next_room_ordinal INTEGER NOT NULL CHECK (consumer_attach_next_room_ordinal >= 0),
+    journal_generation TEXT,
     consumer_generation TEXT, consumer_first_sequence INTEGER, baseline_rooms_sha256 BLOB,
     consumer_attached_revision INTEGER, revision INTEGER NOT NULL, writer_epoch TEXT NOT NULL,
     next_source_epoch INTEGER NOT NULL,
     next_ready_order INTEGER NOT NULL, next_batch_sequence INTEGER NOT NULL,
     last_acked_sequence INTEGER NOT NULL, last_acked_batch_id TEXT,
-    last_acked_sha256 BLOB, created_at_ns INTEGER NOT NULL
+    last_acked_sha256 BLOB, created_at_ns INTEGER NOT NULL,
+    CHECK (
+        (consumer_attach_status = 'unbound'
+            AND consumer_attach_next_room_ordinal = 0
+            AND revision = 0
+            AND journal_generation IS NULL
+            AND consumer_generation IS NULL
+            AND consumer_first_sequence IS NULL
+            AND baseline_rooms_sha256 IS NULL
+            AND consumer_attached_revision IS NULL
+            AND next_ready_order = 0
+            AND next_batch_sequence = 1
+            AND typeof(last_acked_sequence) = 'integer'
+            AND last_acked_sequence = 0
+            AND last_acked_batch_id IS NULL
+            AND last_acked_sha256 IS NULL)
+        OR
+        (consumer_attach_status = 'attaching'
+            AND journal_generation IS NOT NULL
+            AND consumer_generation IS NOT NULL
+            AND consumer_first_sequence IS NOT NULL
+            AND consumer_first_sequence > 0
+            AND baseline_rooms_sha256 IS NOT NULL
+            AND typeof(baseline_rooms_sha256) = 'blob'
+            AND length(baseline_rooms_sha256) = 32
+            AND consumer_attached_revision IS NULL
+            AND revision >= 1
+            AND consumer_attach_next_room_ordinal > 0
+            AND consumer_attach_next_room_ordinal = next_ready_order
+            AND next_batch_sequence = consumer_first_sequence
+            AND typeof(last_acked_sequence) = 'integer'
+            AND last_acked_sequence = consumer_first_sequence - 1
+            AND last_acked_batch_id IS NULL
+            AND last_acked_sha256 IS NULL)
+        OR
+        (consumer_attach_status = 'attached'
+            AND journal_generation IS NOT NULL
+            AND consumer_generation IS NOT NULL
+            AND consumer_first_sequence IS NOT NULL
+            AND consumer_first_sequence > 0
+            AND baseline_rooms_sha256 IS NOT NULL
+            AND typeof(baseline_rooms_sha256) = 'blob'
+            AND length(baseline_rooms_sha256) = 32
+            AND consumer_attached_revision IS NOT NULL
+            AND consumer_attached_revision >= 1
+            AND consumer_attached_revision <= revision
+            AND consumer_attach_next_room_ordinal <= next_ready_order
+            AND next_batch_sequence >= consumer_first_sequence
+            AND typeof(last_acked_sequence) = 'integer'
+            AND last_acked_sequence >= consumer_first_sequence - 1
+            AND last_acked_sequence < next_batch_sequence
+            AND (
+                (last_acked_sequence = consumer_first_sequence - 1
+                    AND last_acked_batch_id IS NULL
+                    AND last_acked_sha256 IS NULL)
+                OR
+                (last_acked_sequence >= consumer_first_sequence
+                    AND typeof(last_acked_batch_id) = 'text'
+                    AND typeof(last_acked_sha256) = 'blob'
+                    AND length(last_acked_sha256) = 32)))
+    )
 )""".strip()
 
 SCHEMA_SQL = (

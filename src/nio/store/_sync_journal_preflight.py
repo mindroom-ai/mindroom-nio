@@ -271,13 +271,14 @@ def _create_fresh(
         connection.execute(
             """INSERT INTO NioIngestMeta (
                 account_id, device_id, schema_version, stream_id,
-                transport_kind, binding_operation_id, journal_generation,
+                transport_kind, binding_operation_id, consumer_attach_status,
+                consumer_attach_next_room_ordinal, journal_generation,
                 consumer_generation, consumer_first_sequence,
                 baseline_rooms_sha256, consumer_attached_revision, revision,
                 writer_epoch, next_source_epoch, next_ready_order,
                 next_batch_sequence, last_acked_sequence, last_acked_batch_id,
                 last_acked_sha256, created_at_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?,
+            ) VALUES (?, ?, ?, ?, ?, ?, 'unbound', 0, NULL, NULL, NULL, NULL, NULL, 0, ?,
                       1, 0, 1, 0, NULL, NULL, ?)""",
             (
                 account_id,

@@ -15,6 +15,7 @@ from peewee import SqliteDatabase
 
 from nio.event_provenance import TimelineEventProvenance
 from nio.ingest import (
+    BatchRef,
     ConsumerBinding,
     ConsumerBootstrap,
     EventRecord,
@@ -44,6 +45,7 @@ from nio.ingest.membership import MembershipBaseline
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.state import (
     AckOutcome,
+    ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
     LaneRecordKey,
@@ -807,6 +809,9 @@ def _rewrite_table_sql(
         "primary_key",
         "check_constraint",
         "transport_check",
+        "attach_status_check",
+        "attach_ordinal_check",
+        "attach_digest_type_check",
         "view",
     ),
 )
@@ -863,6 +868,30 @@ def test_existing_v1_open_rejects_every_topology_drift_before_epoch_write(
                 "transport_kind TEXT NOT NULL CHECK (transport_kind IN ('classic', 'sliding'))",
                 "transport_kind TEXT NOT NULL",
             )
+        elif mutation == "attach_status_check":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestMeta",
+                "consumer_attach_status TEXT NOT NULL CHECK "
+                "(consumer_attach_status IN ('unbound', 'attaching', 'attached'))",
+                "consumer_attach_status TEXT NOT NULL",
+            )
+        elif mutation == "attach_ordinal_check":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestMeta",
+                "consumer_attach_next_room_ordinal INTEGER NOT NULL CHECK "
+                "(consumer_attach_next_room_ordinal >= 0)",
+                "consumer_attach_next_room_ordinal INTEGER NOT NULL",
+            )
+        elif mutation == "attach_digest_type_check":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestMeta",
+                "AND typeof(baseline_rooms_sha256) = 'blob'\n"
+                "            AND length(baseline_rooms_sha256) = 32",
+                "AND length(baseline_rooms_sha256) = 32",
+            )
         else:
             connection.execute(
                 "CREATE VIEW NioIngestUnexpectedView AS "
@@ -904,7 +933,9 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "INSERT INTO NioIngestMeta SELECT ?, device_id, schema_version, "
-            "stream_id, transport_kind, binding_operation_id, journal_generation, "
+            "stream_id, transport_kind, binding_operation_id, "
+            "consumer_attach_status, consumer_attach_next_room_ordinal, "
+            "journal_generation, "
             "consumer_generation, consumer_first_sequence, baseline_rooms_sha256, "
             "consumer_attached_revision, revision, writer_epoch, "
             "next_source_epoch, next_ready_order, "
@@ -1789,6 +1820,933 @@ def _consumer_bootstrap(
     )
 
 
+def _baseline_room_ids(count: int) -> tuple[str, ...]:
+    return tuple(f"!baseline-{ordinal:05d}:example.org" for ordinal in range(count))
+
+
+def _attach_room_chunks(labels: list[str]) -> list[int]:
+    chunks: list[int] = []
+    for label in labels:
+        if label == "meta_attach":
+            chunks.append(0)
+        elif label == "room_state":
+            chunks[-1] += 1
+    return chunks
+
+
+def test_fresh_owner_is_durably_unbound_at_ordinal_zero(tmp_path: Path) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.UNBOUND
+        assert owner.consumer_attach_next_room_ordinal == 0
+        assert owner.binding is None
+        assert owner.consumer_first_sequence is None
+        assert owner.baseline_rooms_sha256 is None
+        assert owner.consumer_attached_revision is None
+        assert owner.revision == 0
+        assert owner.next_ready_order == 0
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("assignments", "parameters"),
+    (
+        ("consumer_attach_status = 'unknown'", ()),
+        ("consumer_attach_next_room_ordinal = -1", ()),
+        ("consumer_attach_next_room_ordinal = 1", ()),
+        ("revision = 1", ()),
+        ("next_batch_sequence = 2", ()),
+        ("last_acked_sequence = 1", ()),
+        ("last_acked_batch_id = 'not-null'", ()),
+        ("last_acked_sha256 = X'00'", ()),
+        (
+            "journal_generation = ?",
+            (str(JOURNAL_GENERATION),),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_sequence = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_batch_id = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_sha256 = ?",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32, b"y" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_sequence = -1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_sequence = 1, "
+            "last_acked_batch_id = ?, last_acked_sha256 = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                b"y" * 32,
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_batch_id = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, next_batch_sequence = 2, last_acked_sequence = 1, "
+            "last_acked_batch_id = ?, last_acked_sha256 = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                "y" * 32,
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), "x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 0, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 0, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "next_batch_sequence = 0",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "next_batch_sequence = 2",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 0, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, next_batch_sequence = 0",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 2, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+    ),
+)
+def test_meta_attach_checks_reject_invalid_state_matrix(
+    tmp_path: Path,
+    assignments: str,
+    parameters: tuple[object, ...],
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            bootstrap._journal.connection.execute(
+                f"UPDATE NioIngestMeta SET {assignments} WHERE account_id = ?",
+                (*parameters, ACCOUNT_ID),
+            )
+        assert (
+            bootstrap._journal.load_owner().consumer_attach_status
+            is ConsumerAttachStatus.UNBOUND
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    (
+        "journal_generation",
+        "consumer_generation",
+        "consumer_first_sequence",
+        "baseline_rooms_sha256",
+    ),
+)
+def test_attaching_schema_requires_every_frozen_binding_field(
+    tmp_path: Path,
+    missing_column: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            bootstrap._journal.connection.execute(
+                "UPDATE NioIngestMeta SET consumer_attach_status = 'attaching', "
+                "journal_generation = ?, consumer_generation = ?, "
+                "consumer_first_sequence = 1, baseline_rooms_sha256 = ?, "
+                "revision = 1, consumer_attach_next_room_ordinal = 1, "
+                f"next_ready_order = 1, {missing_column} = NULL WHERE account_id = ?",
+                (
+                    str(JOURNAL_GENERATION),
+                    str(CONSUMER_GENERATION),
+                    b"x" * 32,
+                    ACCOUNT_ID,
+                ),
+            )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("assignments", "parameters"),
+    (
+        ("consumer_attach_status = 'unknown'", ()),
+        ("consumer_attach_next_room_ordinal = -1", ()),
+        ("consumer_attach_next_room_ordinal = 1", ()),
+        ("revision = 1", ()),
+        ("next_batch_sequence = 2", ()),
+        ("last_acked_sequence = 1", ()),
+        ("last_acked_batch_id = 'not-null'", ()),
+        ("last_acked_sha256 = X'00'", ()),
+        (
+            "journal_generation = ?",
+            (str(JOURNAL_GENERATION),),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), "x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 31),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 0, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 0, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "next_batch_sequence = 0",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "next_batch_sequence = 2",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_sequence = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_batch_id = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 1, "
+            "last_acked_sha256 = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                b"y" * 32,
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 0, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, next_batch_sequence = 0",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_sequence = -1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_sequence = 1, "
+            "last_acked_batch_id = ?, last_acked_sha256 = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                b"y" * 32,
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, last_acked_batch_id = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 1, "
+            "revision = 1, next_batch_sequence = 2, last_acked_sequence = 1, "
+            "last_acked_batch_id = ?, last_acked_sha256 = ?",
+            (
+                str(JOURNAL_GENERATION),
+                str(CONSUMER_GENERATION),
+                b"x" * 32,
+                str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                "y" * 32,
+            ),
+        ),
+        (
+            "consumer_attach_status = 'attached', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, consumer_attached_revision = 2, "
+            "revision = 1",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+        (
+            "consumer_attach_status = 'attaching', journal_generation = ?, "
+            "consumer_generation = ?, consumer_first_sequence = 1, "
+            "baseline_rooms_sha256 = ?, revision = 1, "
+            "consumer_attach_next_room_ordinal = 1, next_ready_order = 0",
+            (str(JOURNAL_GENERATION), str(CONSUMER_GENERATION), b"x" * 32),
+        ),
+    ),
+)
+def test_load_owner_rejects_forged_attach_state_even_without_sql_checks(
+    tmp_path: Path,
+    assignments: str,
+    parameters: tuple[object, ...],
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        bootstrap._journal.connection.execute("PRAGMA ignore_check_constraints = ON")
+        bootstrap._journal.connection.execute(
+            f"UPDATE NioIngestMeta SET {assignments} WHERE account_id = ?",
+            (*parameters, ACCOUNT_ID),
+        )
+        with pytest.raises(JournalIntegrityError, match="consumer attach"):
+            bootstrap._journal.load_owner()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("last_sequence", "last_batch_id", "last_digest", "sql_rejects"),
+    (
+        (1, None, b"y" * 32, True),
+        (1, str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")), None, True),
+        (1, str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")), b"y" * 31, True),
+        (1, str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")), "y" * 32, True),
+        (1, "not-a-uuid", b"y" * 32, False),
+        (1.5, str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")), b"y" * 32, True),
+    ),
+)
+def test_attached_ack_identity_schema_and_decoder_are_exact(
+    tmp_path: Path,
+    last_sequence: object,
+    last_batch_id: object,
+    last_digest: object,
+    sql_rejects: bool,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    statement = (
+        "UPDATE NioIngestMeta SET consumer_attach_status = 'attached', "
+        "journal_generation = ?, consumer_generation = ?, "
+        "consumer_first_sequence = 1, baseline_rooms_sha256 = ?, "
+        "consumer_attached_revision = 1, revision = 1, next_batch_sequence = 2, "
+        "last_acked_sequence = ?, last_acked_batch_id = ?, last_acked_sha256 = ? "
+        "WHERE account_id = ?"
+    )
+    parameters = (
+        str(JOURNAL_GENERATION),
+        str(CONSUMER_GENERATION),
+        b"x" * 32,
+        last_sequence,
+        last_batch_id,
+        last_digest,
+        ACCOUNT_ID,
+    )
+    try:
+        if sql_rejects:
+            with pytest.raises(sqlite3.IntegrityError):
+                bootstrap._journal.connection.execute(statement, parameters)
+            bootstrap._journal.connection.execute(
+                "PRAGMA ignore_check_constraints = ON"
+            )
+        bootstrap._journal.connection.execute(statement, parameters)
+        with pytest.raises(JournalIntegrityError, match="consumer attach"):
+            bootstrap._journal.load_owner()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("room_count", "expected_chunks", "expected_yields"),
+    (
+        (0, [0], []),
+        (1, [1], []),
+        (256, [256], []),
+        (257, [256, 1], [(ConsumerAttachStatus.ATTACHING, 256, 1)]),
+    ),
+)
+async def test_attach_consumer_uses_bounded_transactions_and_yields_only_between_chunks(
+    tmp_path: Path,
+    room_count: int,
+    expected_chunks: list[int],
+    expected_yields: list[tuple[ConsumerAttachStatus, int, int]],
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    room_ids = _baseline_room_ids(room_count)
+    consumer = _consumer_bootstrap(bootstrap, room_ids)
+    labels: list[str] = []
+    yielded_states: list[tuple[ConsumerAttachStatus, int, int]] = []
+    bootstrap._journal.set_transition_statement_hook(labels.append)
+
+    def observe_yield() -> None:
+        owner = bootstrap._journal.load_owner()
+        yielded_states.append(
+            (
+                owner.consumer_attach_status,
+                owner.consumer_attach_next_room_ordinal,
+                owner.revision,
+            )
+        )
+
+    try:
+        observer = asyncio.get_running_loop().call_soon(observe_yield)
+        await bootstrap.attach_consumer(consumer)
+        observer.cancel()
+
+        owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == room_count
+        assert owner.next_ready_order == room_count
+        assert owner.revision == len(expected_chunks)
+        assert owner.consumer_attached_revision == len(expected_chunks)
+        assert _attach_room_chunks(labels) == expected_chunks
+        assert yielded_states == expected_yields
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT COUNT(*) FROM NioIngestReadyRecord"
+            ).fetchone()[0]
+            == room_count
+        )
+    finally:
+        observer.cancel()
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_consumer_10000_rooms_has_exact_transaction_and_order_bound(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    room_ids = _baseline_room_ids(10_000)
+    consumer = _consumer_bootstrap(bootstrap, room_ids)
+    labels: list[str] = []
+    bootstrap._journal.set_transition_statement_hook(labels.append)
+    try:
+        await bootstrap.attach_consumer(consumer)
+
+        expected_chunks = [256] * 39 + [16]
+        owner = bootstrap._journal.load_owner()
+        assert _attach_room_chunks(labels) == expected_chunks
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == 10_000
+        assert owner.next_ready_order == 10_000
+        assert owner.revision == 40
+        assert owner.consumer_attached_revision == 40
+        for table in (
+            "NioIngestRoomState",
+            "NioIngestRoomLane",
+            "NioIngestReadyRecord",
+            "NioIngestLoss",
+        ):
+            assert (
+                bootstrap._journal.connection.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0]
+                == 10_000
+            )
+        ready_orders = bootstrap._journal.connection.execute(
+            "SELECT ready_order FROM NioIngestReadyRecord ORDER BY ready_order"
+        ).fetchall()
+        assert [row[0] for row in ready_orders] == list(range(10_000))
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attach_resumes_from_committed_chunk_boundary(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, _baseline_room_ids(257))
+    task = asyncio.create_task(bootstrap.attach_consumer(consumer))
+    try:
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHING
+        assert owner.consumer_attach_next_room_ordinal == 256
+        assert owner.next_ready_order == 256
+        assert owner.revision == 1
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT COUNT(*) FROM NioIngestRoomState"
+            ).fetchone()[0]
+            == 256
+        )
+
+        await bootstrap.attach_consumer(consumer)
+        owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == 257
+        assert owner.next_ready_order == 257
+        assert owner.revision == 2
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_reopened_attach_resumes_exact_committed_prefix(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, _baseline_room_ids(257))
+    assert (
+        bootstrap._journal.attach_consumer_step(consumer)
+        is ConsumerAttachStatus.ATTACHING
+    )
+    bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    labels: list[str] = []
+    reopened._journal.set_transition_statement_hook(labels.append)
+    try:
+        await reopened.attach_consumer(consumer)
+        owner = reopened._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == 257
+        assert owner.next_ready_order == 257
+        assert owner.revision == 2
+        assert _attach_room_chunks(labels) == [1]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_attaching_prefix_keeps_all_attached_operations_closed(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, _baseline_room_ids(257))
+    source = bootstrap._journal.load_source()
+    try:
+        status = bootstrap._journal.attach_consumer_step(consumer)
+        assert status is ConsumerAttachStatus.ATTACHING
+        assert bootstrap._journal.load_source() == source
+
+        ref = BatchRef(
+            bootstrap.stream_id,
+            1,
+            UUID("aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa"),
+            b"x" * 32,
+        )
+        operations = (
+            bootstrap.assert_http_enabled,
+            lambda: bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(),
+            ),
+            bootstrap._journal.oldest_unacknowledged,
+            lambda: bootstrap._journal.acknowledge(ref),
+            lambda: bootstrap._journal.load_rooms(frozenset()),
+            lambda: bootstrap._journal.load_ready_heads(limit=1),
+            lambda: bootstrap._journal.load_loss("missing"),
+            lambda: bootstrap._journal.load_frame(
+                UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            ),
+            lambda: bootstrap._journal.load_lane_record(
+                LaneRecordKey("!missing:example.org", 0, LaneRecordSection.HELD, 0, 0)
+            ),
+            lambda: bootstrap._journal.list_lane_records("!missing:example.org", 0),
+        )
+        for operation in operations:
+            with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+                operation()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("room_ids", "message"),
+    (
+        (("!b:example.org", "!a:example.org"), "sorted"),
+        (("!a:example.org", "!a:example.org"), "duplicates"),
+        (("",), "nonempty"),
+    ),
+)
+async def test_attach_consumer_rejects_noncanonical_room_tuple_before_dml(
+    tmp_path: Path,
+    room_ids: tuple[str, ...],
+    message: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, room_ids)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(LocalProtocolError, match=message):
+            await bootstrap.attach_consumer(consumer)
+        owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.UNBOUND
+        assert owner.revision == 0
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "operation",
+        "journal_generation",
+        "consumer_generation",
+        "first_sequence",
+        "rooms",
+        "digest",
+    ),
+)
+async def test_attaching_retry_rejects_every_frozen_tuple_drift_before_dml(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, _baseline_room_ids(257))
+    try:
+        assert (
+            bootstrap._journal.attach_consumer_step(consumer)
+            is ConsumerAttachStatus.ATTACHING
+        )
+        before = bootstrap._journal.load_owner()
+        if drift == "operation":
+            candidate = replace(
+                consumer,
+                binding_operation_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            )
+        elif drift == "journal_generation":
+            candidate = replace(
+                consumer,
+                binding=replace(
+                    consumer.binding,
+                    journal_generation=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                ),
+            )
+        elif drift == "consumer_generation":
+            candidate = replace(
+                consumer,
+                binding=replace(
+                    consumer.binding,
+                    consumer_generation=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                ),
+            )
+        elif drift == "first_sequence":
+            candidate = replace(consumer, first_sequence=2)
+        elif drift == "rooms":
+            changed_rooms = (*consumer.baseline_room_ids[:-1], "!zzzzz:example.org")
+            candidate = _consumer_bootstrap(bootstrap, changed_rooms)
+        else:
+            candidate = replace(consumer, baseline_sha256=b"x" * 32)
+
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        with pytest.raises(LocalProtocolError):
+            await bootstrap.attach_consumer(candidate)
+        assert bootstrap._journal.load_owner() == before
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ("attaching", "attached"))
+async def test_attach_retry_requires_exact_ordinal_relation_to_supplied_tuple(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    if status == "attaching":
+        original = _consumer_bootstrap(bootstrap, _baseline_room_ids(257))
+        assert (
+            bootstrap._journal.attach_consumer_step(original)
+            is ConsumerAttachStatus.ATTACHING
+        )
+        candidate = _consumer_bootstrap(bootstrap, _baseline_room_ids(256))
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestMeta SET baseline_rooms_sha256 = ? "
+            "WHERE account_id = ?",
+            (candidate.baseline_sha256, ACCOUNT_ID),
+        )
+    else:
+        candidate = _consumer_bootstrap(bootstrap, _baseline_room_ids(1))
+        await bootstrap.attach_consumer(candidate)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestMeta SET consumer_attach_next_room_ordinal = 0 "
+            "WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
+    bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    statements: list[str] = []
+    reopened._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(LocalProtocolError, match="ordinal"):
+            await reopened.attach_consumer(candidate)
+        with pytest.raises(LocalProtocolError, match="not attached|not validated"):
+            reopened.assert_http_enabled()
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        reopened.close()
+
+
 @pytest.mark.asyncio
 async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
     tmp_path: Path,
@@ -1813,6 +2771,8 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
         bootstrap.assert_http_enabled()
 
         owner = bootstrap._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == len(room_ids)
         assert owner.binding == consumer.binding
         assert owner.baseline_rooms_sha256 == consumer.baseline_sha256
         assert owner.consumer_attached_revision == 1
@@ -1844,9 +2804,26 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
             )
 
         revision = owner.revision
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
         await bootstrap.attach_consumer(consumer)
+        bootstrap._journal.connection.set_trace_callback(None)
         assert bootstrap._journal.load_owner().revision == revision
         assert bootstrap._journal.load_ready_heads(limit=10) == ready
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+        assert not any(
+            table in statement
+            for table in (
+                "NioIngestRoomState",
+                "NioIngestRoomLane",
+                "NioIngestLoss",
+                "NioIngestReadyRecord",
+            )
+            for statement in statements
+        )
     finally:
         bootstrap.close()
 
@@ -1905,7 +2882,7 @@ async def test_attach_consumer_rejects_digest_operation_sequence_and_retry_drift
 
 
 @pytest.mark.asyncio
-async def test_exact_attach_retry_authenticates_durable_baseline_losses(
+async def test_exact_attach_retry_is_metadata_only_even_if_baseline_loss_is_corrupt(
     tmp_path: Path,
 ) -> None:
     room_ids = ("!alpha:example.org",)
@@ -1930,13 +2907,34 @@ async def test_exact_attach_retry_authenticates_durable_baseline_losses(
         "WHERE account_id = ? AND loss_id = ?",
         (bytes(tampered), ACCOUNT_ID, row["loss_id"]),
     )
+    bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    statements: list[str] = []
+    reopened._journal.connection.set_trace_callback(statements.append)
     try:
+        await reopened.attach_consumer(consumer)
+        reopened._journal.connection.set_trace_callback(None)
+        reopened.assert_http_enabled()
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+        assert not any(
+            "NioIngestLoss" in statement or "NioIngestReadyRecord" in statement
+            for statement in statements
+        )
         with pytest.raises(JournalIntegrityError, match="authentication"):
-            await bootstrap.attach_consumer(consumer)
-        with pytest.raises(LocalProtocolError, match="not validated"):
-            bootstrap.assert_http_enabled()
+            reopened._journal.load_loss(row["loss_id"])
     finally:
-        bootstrap.close()
+        reopened.close()
 
 
 @pytest.mark.asyncio
@@ -1967,6 +2965,8 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
         transition=JournalTransition(batches=(batch,)),
     )
     assert bootstrap.next_batch_sequence == consumer.first_sequence + 1
+    assert bootstrap._journal.acknowledge(batch.ref) is AckOutcome.ACKNOWLEDGED
+    assert bootstrap._journal.load_owner().consumer_first_sequence == 1
     bootstrap.close()
 
     reopened = open_ingestion_store(
@@ -1982,7 +2982,11 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
         with pytest.raises(LocalProtocolError, match="not validated"):
             reopened._journal.oldest_unacknowledged()
         await reopened.attach_consumer(consumer)
-        assert reopened._journal.load_owner().revision == 2
+        owner = reopened._journal.load_owner()
+        assert owner.revision == 3
+        assert owner.consumer_attached_revision == 1
+        assert owner.consumer_first_sequence == consumer.first_sequence
+        assert owner.next_batch_sequence == consumer.first_sequence + 1
 
         changed_sequence = ConsumerBootstrap(
             consumer.binding_operation_id,

@@ -40,6 +40,7 @@ from ..ingest.serialization import (
 from ..ingest.state import (
     AckOutcome,
     CommitResult,
+    ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
     LaneRecordSection,
@@ -61,6 +62,9 @@ from ._sync_journal_rows import JournalRows
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+_ATTACH_ROOM_CHUNK_SIZE = 256
 
 
 class SqliteIngestionJournal(JournalRows):
@@ -190,22 +194,108 @@ class SqliteIngestionJournal(JournalRows):
         row = self._meta()
         journal_generation = row["journal_generation"]
         consumer_generation = row["consumer_generation"]
-        binding_values = (
+        consumer_first_sequence = row["consumer_first_sequence"]
+        baseline_value = row["baseline_rooms_sha256"]
+        attached_revision = row["consumer_attached_revision"]
+        last_acked_sequence = row["last_acked_sequence"]
+        last_acked_batch_id = row["last_acked_batch_id"]
+        last_acked_sha256 = row["last_acked_sha256"]
+        required_binding_values = (
             journal_generation,
             consumer_generation,
-            row["consumer_first_sequence"],
-            row["baseline_rooms_sha256"],
-            row["consumer_attached_revision"],
+            consumer_first_sequence,
+            baseline_value,
         )
-        if any(value is None for value in binding_values) and any(
-            value is not None for value in binding_values
-        ):
-            raise JournalIntegrityError("partial consumer binding in ingestion meta")
-        binding = (
-            ConsumerBinding(UUID(journal_generation), UUID(consumer_generation))
-            if journal_generation is not None
-            else None
-        )
+        try:
+            attach_status = ConsumerAttachStatus(row["consumer_attach_status"])
+            attach_ordinal = row["consumer_attach_next_room_ordinal"]
+            revision = row["revision"]
+            next_ready_order = row["next_ready_order"]
+            next_batch_sequence = row["next_batch_sequence"]
+            if any(
+                type(value) is not int or value < 0
+                for value in (
+                    attach_ordinal,
+                    revision,
+                    next_ready_order,
+                    next_batch_sequence,
+                    last_acked_sequence,
+                )
+            ):
+                raise ValueError("attach counters must be nonnegative integers")
+
+            if attach_status is ConsumerAttachStatus.UNBOUND:
+                if (
+                    attach_ordinal != 0
+                    or revision != 0
+                    or next_ready_order != 0
+                    or next_batch_sequence != 1
+                    or last_acked_sequence != 0
+                    or any(value is not None for value in required_binding_values)
+                    or attached_revision is not None
+                    or last_acked_batch_id is not None
+                    or last_acked_sha256 is not None
+                ):
+                    raise ValueError("UNBOUND attach metadata is inconsistent")
+                binding = None
+                baseline_digest = None
+            else:
+                if any(value is None for value in required_binding_values):
+                    raise ValueError("bound attach metadata is incomplete")
+                if (
+                    type(consumer_first_sequence) is not int
+                    or consumer_first_sequence <= 0
+                ):
+                    raise ValueError("consumer first sequence is invalid")
+                if type(baseline_value) is not bytes or len(baseline_value) != 32:
+                    raise ValueError("baseline digest is invalid")
+                binding = ConsumerBinding(
+                    UUID(journal_generation),
+                    UUID(consumer_generation),
+                )
+                baseline_digest = baseline_value
+                if attach_status is ConsumerAttachStatus.ATTACHING:
+                    if (
+                        attached_revision is not None
+                        or revision < 1
+                        or attach_ordinal <= 0
+                        or attach_ordinal != next_ready_order
+                        or next_batch_sequence != consumer_first_sequence
+                        or last_acked_sequence != consumer_first_sequence - 1
+                        or last_acked_batch_id is not None
+                        or last_acked_sha256 is not None
+                    ):
+                        raise ValueError("ATTACHING metadata is inconsistent")
+                else:
+                    if (
+                        type(attached_revision) is not int
+                        or attached_revision <= 0
+                        or attached_revision > revision
+                        or attach_ordinal > next_ready_order
+                        or next_batch_sequence < consumer_first_sequence
+                        or last_acked_sequence < consumer_first_sequence - 1
+                        or last_acked_sequence >= next_batch_sequence
+                    ):
+                        raise ValueError("ATTACHED metadata is inconsistent")
+                    if last_acked_sequence == consumer_first_sequence - 1:
+                        if (
+                            last_acked_batch_id is not None
+                            or last_acked_sha256 is not None
+                        ):
+                            raise ValueError("unacknowledged frontier has an identity")
+                    else:
+                        if (
+                            type(last_acked_batch_id) is not str
+                            or type(last_acked_sha256) is not bytes
+                            or len(last_acked_sha256) != 32
+                        ):
+                            raise ValueError("acknowledgement identity is invalid")
+                        UUID(last_acked_batch_id)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "consumer attach metadata is invalid"
+            ) from error
+
         return OwnerView(
             account_id=row["account_id"],
             device_id=row["device_id"],
@@ -213,24 +303,22 @@ class SqliteIngestionJournal(JournalRows):
             stream_id=UUID(row["stream_id"]),
             transport_kind=TransportKind(row["transport_kind"]),
             binding_operation_id=UUID(row["binding_operation_id"]),
+            consumer_attach_status=attach_status,
+            consumer_attach_next_room_ordinal=attach_ordinal,
             binding=binding,
-            consumer_first_sequence=row["consumer_first_sequence"],
-            baseline_rooms_sha256=(
-                bytes(row["baseline_rooms_sha256"])
-                if row["baseline_rooms_sha256"] is not None
-                else None
-            ),
-            consumer_attached_revision=row["consumer_attached_revision"],
-            revision=row["revision"],
+            consumer_first_sequence=consumer_first_sequence,
+            baseline_rooms_sha256=baseline_digest,
+            consumer_attached_revision=attached_revision,
+            revision=revision,
             writer_epoch=UUID(row["writer_epoch"]),
-            next_ready_order=row["next_ready_order"],
-            next_batch_sequence=row["next_batch_sequence"],
-            last_acked_sequence=row["last_acked_sequence"],
+            next_ready_order=next_ready_order,
+            next_batch_sequence=next_batch_sequence,
+            last_acked_sequence=last_acked_sequence,
         )
 
     def _require_attached(self) -> OwnerView:
         owner = self.load_owner()
-        if owner.binding is None:
+        if owner.consumer_attach_status is not ConsumerAttachStatus.ATTACHED:
             raise LocalProtocolError("ingestion consumer is not attached")
         if not self._consumer_validated:
             raise LocalProtocolError(
@@ -260,10 +348,12 @@ class SqliteIngestionJournal(JournalRows):
             type(room_id) is not str for room_id in room_ids
         ):
             raise TypeError("baseline_room_ids must be a tuple of str")
-        if room_ids != tuple(sorted(set(room_ids))):
-            raise LocalProtocolError(
-                "baseline_room_ids must be sorted and contain no duplicates"
-            )
+        if any(not room_id for room_id in room_ids):
+            raise LocalProtocolError("baseline_room_ids must contain nonempty IDs")
+        if room_ids != tuple(sorted(room_ids)):
+            raise LocalProtocolError("baseline_room_ids must be sorted")
+        if len(set(room_ids)) != len(room_ids):
+            raise LocalProtocolError("baseline_room_ids must contain no duplicates")
         return json.dumps(
             list(room_ids),
             separators=(",", ":"),
@@ -273,6 +363,7 @@ class SqliteIngestionJournal(JournalRows):
     def _baseline_plan(
         self,
         consumer: ConsumerBootstrap,
+        room_ids: tuple[str, ...],
         first_ready_order: int,
     ) -> tuple[tuple[RoomState, RoomLane, LossRecord, ReadyRecord], ...]:
         origin = SystemOrigin(
@@ -281,8 +372,9 @@ class SqliteIngestionJournal(JournalRows):
         )
         boundary = LossBoundary(None, None, None, None)
         detail = b'{"cause":"fresh_start","scope":"consumer_baseline"}'
+        stream_id = self.stream_id
         planned = []
-        for offset, room_id in enumerate(consumer.baseline_room_ids):
+        for offset, room_id in enumerate(room_ids):
             loss = LossRecord(
                 "",
                 origin,
@@ -292,7 +384,7 @@ class SqliteIngestionJournal(JournalRows):
                 boundary,
                 detail,
             )
-            loss = replace(loss, loss_id=_loss_id(self.stream_id, loss))
+            loss = replace(loss, loss_id=_loss_id(stream_id, loss))
             planned.append(
                 (
                     RoomState(room_id, 0, 0, RoomHydrationStatus.PENDING, None),
@@ -307,7 +399,10 @@ class SqliteIngestionJournal(JournalRows):
             )
         return tuple(planned)
 
-    def attach_consumer(self, consumer: ConsumerBootstrap) -> None:
+    def attach_consumer_step(
+        self,
+        consumer: ConsumerBootstrap,
+    ) -> ConsumerAttachStatus:
         if type(consumer) is not ConsumerBootstrap:
             raise TypeError("consumer must be ConsumerBootstrap")
         baseline_payload = self._canonical_baseline(consumer.baseline_room_ids)
@@ -318,7 +413,12 @@ class SqliteIngestionJournal(JournalRows):
         owner = self.load_owner()
         if consumer.binding_operation_id != owner.binding_operation_id:
             raise LocalProtocolError("binding_operation_id does not match journal")
-        if owner.binding is not None:
+        if owner.consumer_attach_status is ConsumerAttachStatus.UNBOUND:
+            if consumer.first_sequence != owner.next_batch_sequence:
+                raise LocalProtocolError("first_sequence does not match journal")
+            start_ordinal = 0
+        else:
+            assert owner.binding is not None
             if owner.binding != consumer.binding:
                 raise LocalProtocolError(
                     "consumer binding does not match attached owner"
@@ -333,40 +433,94 @@ class SqliteIngestionJournal(JournalRows):
                 raise LocalProtocolError(
                     "consumer baseline does not match attached owner"
                 )
+            start_ordinal = owner.consumer_attach_next_room_ordinal
+            room_count = len(consumer.baseline_room_ids)
+            if owner.consumer_attach_status is ConsumerAttachStatus.ATTACHING:
+                if start_ordinal >= room_count:
+                    raise LocalProtocolError(
+                        "ATTACHING consumer ordinal must precede baseline length"
+                    )
+            elif start_ordinal != room_count:
+                raise LocalProtocolError(
+                    "ATTACHED consumer ordinal must equal baseline length"
+                )
+
+        if owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED:
             self._consumer_validated = True
-            try:
-                self._validate_attached_baseline(consumer)
-            except BaseException:
-                self._consumer_validated = False
-                raise
-            return
-        if consumer.first_sequence != owner.next_batch_sequence:
-            raise LocalProtocolError("first_sequence does not match journal")
+            return ConsumerAttachStatus.ATTACHED
 
         new_revision = owner.revision + 1
-        planned = self._baseline_plan(consumer, owner.next_ready_order)
+        end_ordinal = min(
+            start_ordinal + _ATTACH_ROOM_CHUNK_SIZE,
+            len(consumer.baseline_room_ids),
+        )
+        final = end_ordinal == len(consumer.baseline_room_ids)
+        new_status = (
+            ConsumerAttachStatus.ATTACHED if final else ConsumerAttachStatus.ATTACHING
+        )
+        planned = self._baseline_plan(
+            consumer,
+            consumer.baseline_room_ids[start_ordinal:end_ordinal],
+            owner.next_ready_order,
+        )
+        new_ready_order = owner.next_ready_order + len(planned)
+        attached_revision = new_revision if final else None
+
+        if owner.consumer_attach_status is ConsumerAttachStatus.UNBOUND:
+            comparison = """consumer_attach_status = 'unbound'
+                  AND consumer_attach_next_room_ordinal = 0
+                  AND journal_generation IS NULL
+                  AND consumer_generation IS NULL
+                  AND consumer_first_sequence IS NULL
+                  AND baseline_rooms_sha256 IS NULL
+                  AND consumer_attached_revision IS NULL"""
+            comparison_parameters: tuple[object, ...] = ()
+        else:
+            comparison = """consumer_attach_status = 'attaching'
+                  AND consumer_attach_next_room_ordinal = ?
+                  AND journal_generation = ? AND consumer_generation = ?
+                  AND consumer_first_sequence = ?
+                  AND baseline_rooms_sha256 = ?
+                  AND consumer_attached_revision IS NULL
+                  AND next_ready_order = ?
+                  AND next_batch_sequence = ?"""
+            comparison_parameters = (
+                start_ordinal,
+                str(consumer.binding.journal_generation),
+                str(consumer.binding.consumer_generation),
+                consumer.first_sequence,
+                consumer.baseline_sha256,
+                owner.next_ready_order,
+                consumer.first_sequence,
+            )
 
         with immediate_transaction(self.connection):
             cursor = self._transition_execute(
                 "meta_attach",
-                """UPDATE NioIngestMeta
-                SET journal_generation = ?, consumer_generation = ?,
+                f"""UPDATE NioIngestMeta
+                SET consumer_attach_status = ?,
+                    consumer_attach_next_room_ordinal = ?,
+                    journal_generation = ?, consumer_generation = ?,
                     consumer_first_sequence = ?, baseline_rooms_sha256 = ?,
                     consumer_attached_revision = ?,
                     revision = ?, next_ready_order = ?
                 WHERE account_id = ? AND revision = ? AND writer_epoch = ?
-                  AND journal_generation IS NULL AND consumer_generation IS NULL""",
+                  AND binding_operation_id = ? AND {comparison}""",
                 (
+                    new_status.value,
+                    end_ordinal,
                     str(consumer.binding.journal_generation),
                     str(consumer.binding.consumer_generation),
                     consumer.first_sequence,
                     consumer.baseline_sha256,
+                    attached_revision,
                     new_revision,
-                    new_revision,
-                    owner.next_ready_order + len(planned),
+                    new_ready_order,
                     self.account_id,
                     owner.revision,
                     str(self.writer_epoch),
+                    str(consumer.binding_operation_id),
+                    *comparison_parameters,
                 ),
             )
             if cursor.rowcount != 1:
@@ -376,18 +530,9 @@ class SqliteIngestionJournal(JournalRows):
                 self._write_room_lane(lane, new_revision, owner.transport_kind)
                 self._write_loss(loss, new_revision)
                 self._write_ready(ready, new_revision)
-        self._consumer_validated = True
-
-    def _validate_attached_baseline(self, consumer: ConsumerBootstrap) -> None:
-        room_ids = consumer.baseline_room_ids
-        if not room_ids:
-            return
-        aggregates = self.load_rooms(frozenset(room_ids))
-        if set(aggregates) != set(room_ids):
-            raise JournalIntegrityError("attached baseline room plan is incomplete")
-        for _, _, expected, _ in self._baseline_plan(consumer, 0):
-            if self.load_loss(expected.loss_id) != expected:
-                raise JournalIntegrityError("attached baseline loss plan is incomplete")
+        if final:
+            self._consumer_validated = True
+        return new_status
 
     @staticmethod
     def _validate_held_lane_reconciliation(

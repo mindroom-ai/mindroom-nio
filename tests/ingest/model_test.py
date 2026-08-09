@@ -4,6 +4,7 @@ from uuid import UUID
 
 import pytest
 
+import nio.ingest.state as ingest_state
 from nio import TimelineEventProvenance as TopLevelTimelineEventProvenance
 from nio.ingest import (
     ConsumerBinding,
@@ -94,6 +95,13 @@ def test_wire_enums_have_stable_string_values() -> None:
         "PENDING": "pending",
         "READY": "ready",
         "UNAVAILABLE": "unavailable",
+    }
+    attach_status = getattr(ingest_state, "ConsumerAttachStatus", None)
+    assert attach_status is not None
+    assert {member.name: member.value for member in attach_status} == {
+        "UNBOUND": "unbound",
+        "ATTACHING": "attaching",
+        "ATTACHED": "attached",
     }
     assert TimelineEventProvenance is TopLevelTimelineEventProvenance
 

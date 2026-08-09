@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from nio.event_provenance import TimelineEventProvenance
+from nio.exceptions import LocalProtocolError
 from nio.ingest import (
     BatchRef,
     ConsumerBinding,
@@ -35,6 +36,7 @@ from nio.ingest.serialization import (
 )
 from nio.ingest.state import (
     AckOutcome,
+    ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
     LaneRecordKey,
@@ -156,6 +158,17 @@ def _one_room_consumer(bootstrap) -> ConsumerBootstrap:
     )
 
 
+def _many_room_consumer(bootstrap, count: int) -> ConsumerBootstrap:
+    room_ids = tuple(f"!baseline-{ordinal:05d}:example.org" for ordinal in range(count))
+    return ConsumerBootstrap(
+        bootstrap.binding_operation_id,
+        ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+        bootstrap.next_batch_sequence,
+        room_ids,
+        hashlib.sha256(_canonical_json(list(room_ids))).digest(),
+    )
+
+
 def _kill_during_attach(
     store_path: Path,
     consumer: ConsumerBootstrap,
@@ -202,6 +215,8 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
     )
     try:
         owner = reopened._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.UNBOUND
+        assert owner.consumer_attach_next_room_ordinal == 0
         assert owner.binding is None
         assert owner.revision == 0
         for table in (
@@ -215,6 +230,77 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
                     f'SELECT COUNT(*) FROM "{table}"'
                 ).fetchone()[0]
                 == 0
+            )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_after", range(1026, 1031))
+async def test_final_attach_chunk_rolls_back_and_resumes_exact_prefix_after_kill(
+    tmp_path: Path,
+    kill_after: int,
+) -> None:
+    store_path = tmp_path / f"attach-final-kill-{kill_after}"
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _many_room_consumer(bootstrap, 257)
+    bootstrap.close()
+    _assert_process_crashed(_kill_during_attach, store_path, consumer, kill_after)
+
+    reopened = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        owner = reopened._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHING
+        assert owner.consumer_attach_next_room_ordinal == 256
+        assert owner.next_ready_order == 256
+        assert owner.revision == 1
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            reopened.assert_http_enabled()
+        for table in (
+            "NioIngestRoomState",
+            "NioIngestRoomLane",
+            "NioIngestReadyRecord",
+            "NioIngestLoss",
+        ):
+            assert (
+                reopened._journal.connection.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0]
+                == 256
+            )
+
+        await reopened.attach_consumer(consumer)
+        owner = reopened._journal.load_owner()
+        assert owner.consumer_attach_status is ConsumerAttachStatus.ATTACHED
+        assert owner.consumer_attach_next_room_ordinal == 257
+        assert owner.next_ready_order == 257
+        assert owner.consumer_attached_revision == 2
+        assert owner.revision == 2
+        for table in (
+            "NioIngestRoomState",
+            "NioIngestRoomLane",
+            "NioIngestReadyRecord",
+            "NioIngestLoss",
+        ):
+            assert (
+                reopened._journal.connection.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0]
+                == 257
             )
     finally:
         reopened.close()

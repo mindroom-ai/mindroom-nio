@@ -35,6 +35,12 @@ class AckOutcome(StrEnum):
     ALREADY_ACKNOWLEDGED = "already_acknowledged"
 
 
+class ConsumerAttachStatus(StrEnum):
+    UNBOUND = "unbound"
+    ATTACHING = "attaching"
+    ATTACHED = "attached"
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerView:
     account_id: str
@@ -43,6 +49,8 @@ class OwnerView:
     stream_id: UUID
     transport_kind: TransportKind
     binding_operation_id: UUID
+    consumer_attach_status: ConsumerAttachStatus
+    consumer_attach_next_room_ordinal: int
     binding: ConsumerBinding | None
     consumer_first_sequence: int | None
     baseline_rooms_sha256: bytes | None

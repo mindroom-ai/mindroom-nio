@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from uuid import UUID
 from ..exceptions import LocalProtocolError
 from ..ingest.config import SourceConfig, source_transport
 from ..ingest.model import ConsumerBootstrap
+from ..ingest.state import ConsumerAttachStatus
 from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
 if TYPE_CHECKING:
@@ -138,7 +140,11 @@ class StoreBootstrap:
         )
 
     async def attach_consumer(self, consumer: ConsumerBootstrap) -> None:
-        self._journal.attach_consumer(consumer)
+        while (  # noqa: ASYNC110 - durable chunks intentionally yield cooperatively.
+            self._journal.attach_consumer_step(consumer)
+            is ConsumerAttachStatus.ATTACHING
+        ):
+            await asyncio.sleep(0)  # noqa: ASYNC115
 
     def assert_http_enabled(self) -> None:
         self._journal._require_attached()
