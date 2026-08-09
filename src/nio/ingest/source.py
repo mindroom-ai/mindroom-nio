@@ -12,6 +12,7 @@ from ._json import (
 from ._json import (
     load_json as load_json,
 )
+from .membership import MembershipObservation
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
 from .state import SourceState
@@ -151,6 +152,7 @@ class RoomSegment:
     initial: bool
     expanded_timeline: bool
     live_event_count: int
+    membership_observation: MembershipObservation
 
     @property
     def history_discontinuity(self) -> bool:
@@ -175,10 +177,35 @@ class RoomSegment:
         _require_exact(self.initial, bool, "initial")
         _require_exact(self.expanded_timeline, bool, "expanded_timeline")
         _require_exact(self.live_event_count, int, "live_event_count")
+        _require_exact(
+            self.membership_observation,
+            MembershipObservation,
+            "membership_observation",
+        )
         if not self.room_id:
             raise ValueError("room_id must not be empty")
         if not 0 <= self.live_event_count <= len(self.timeline_json):
             raise ValueError("live_event_count must index the timeline suffix")
+        observation = self.membership_observation
+        if observation.is_initial is not self.initial:
+            raise ValueError("membership observation initial flag must match segment")
+        if observation.is_expanded_timeline is not self.expanded_timeline:
+            raise ValueError("membership observation expanded flag must match segment")
+        expected_room_membership = {
+            RoomSection.INVITE: "invite",
+            RoomSection.KNOCK: "knock",
+            RoomSection.JOIN: "join",
+            RoomSection.LEAVE: "leave",
+            RoomSection.UNCHANGED: None,
+        }[self.section]
+        if observation.room_membership != expected_room_membership:
+            raise ValueError(
+                "membership observation room membership must match section"
+            )
+        if observation.is_live and not self.live_event_count:
+            raise ValueError(
+                "live membership observation requires live timeline events"
+            )
         if self.section is RoomSection.UNCHANGED and (
             self.state_json
             or self.timeline_json
@@ -190,6 +217,17 @@ class RoomSegment:
             or self.live_event_count
         ):
             raise ValueError("unchanged room segments must be account-data-only")
+        if self.section is RoomSection.UNCHANGED and (
+            observation.event_membership is not None
+            or observation.event_id is not None
+            or observation.previous_membership is not None
+            or observation.replaces_state is not None
+            or observation.is_live
+            or observation.is_initial
+            or observation.is_expanded_timeline
+            or observation.is_unparsed
+        ):
+            raise ValueError("unchanged room membership observation must be neutral")
 
 
 @dataclass(frozen=True, slots=True)

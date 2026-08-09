@@ -5,7 +5,12 @@ from typing import Any
 from uuid import UUID, uuid5
 
 from .config import SlidingSourceConfig
-from .membership import MembershipObservation
+from .membership import (
+    MembershipObservation,
+    _latest_own_membership,
+    _membership_observation,
+    _OwnMembershipEvidence,
+)
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkRequest, NetworkResult
 from .source import (
@@ -246,58 +251,6 @@ def _section_for_membership(membership: Any) -> RoomSection:
         raise ValueError(f"unknown room membership: {membership}") from error
 
 
-@dataclass(frozen=True, slots=True)
-class _OwnMembershipEvidence:
-    membership: str | None
-    event_id: str | None
-    previous_membership: str | None
-    replaces_state: str | None
-    is_live: bool
-    is_unparsed: bool
-
-
-def _latest_own_membership(
-    state_events: list[dict[str, Any]],
-    timeline_events: list[dict[str, Any]],
-    live_event_count: int,
-    own_user_id: str,
-) -> _OwnMembershipEvidence | None:
-    candidates: list[tuple[dict[str, Any], bool]] = [
-        (event, False) for event in state_events
-    ]
-    live_timeline = timeline_events[-live_event_count:] if live_event_count else ()
-    candidates.extend((event, True) for event in live_timeline)
-    for event, is_live in reversed(candidates):
-        if (
-            event.get("type") != "m.room.member"
-            or event.get("state_key") != own_user_id
-        ):
-            continue
-        if "content" not in event:
-            return _OwnMembershipEvidence(None, None, None, None, is_live, True)
-        content = _object(event["content"], "own membership event content")
-        membership = content.get("membership")
-        if membership is not None and type(membership) is not str:
-            raise ValueError("own membership event membership must be a string")
-        event_id = event.get("event_id")
-        if event_id is not None and type(event_id) is not str:
-            raise ValueError("own membership event event_id must be a string")
-        unsigned = _object(event.get("unsigned", {}), "own membership event unsigned")
-        prev_content = _object(
-            unsigned.get("prev_content", {}),
-            "own membership event unsigned.prev_content",
-        )
-        return _OwnMembershipEvidence(
-            membership,
-            event_id,
-            prev_content.get("membership"),
-            unsigned.get("replaces_state"),
-            is_live,
-            membership is None,
-        )
-    return None
-
-
 def _room_section(
     membership: Any,
     has_stripped_state: bool,
@@ -320,42 +273,6 @@ def _room_section(
     return explicit
 
 
-def _membership_observation(
-    segment: RoomSegment,
-    own_membership: _OwnMembershipEvidence | None,
-) -> MembershipObservation:
-    room_membership = {
-        RoomSection.INVITE: "invite",
-        RoomSection.KNOCK: "knock",
-        RoomSection.JOIN: "join",
-        RoomSection.LEAVE: "leave",
-        RoomSection.UNCHANGED: None,
-    }[segment.section]
-    if own_membership is None:
-        return MembershipObservation(
-            room_membership=room_membership,
-            event_membership=None,
-            event_id=None,
-            previous_membership=None,
-            replaces_state=None,
-            is_live=False,
-            is_initial=segment.initial,
-            is_expanded_timeline=segment.expanded_timeline,
-            is_unparsed=False,
-        )
-    return MembershipObservation(
-        room_membership=room_membership,
-        event_membership=own_membership.membership,
-        event_id=own_membership.event_id,
-        previous_membership=own_membership.previous_membership,
-        replaces_state=own_membership.replaces_state,
-        is_live=own_membership.is_live,
-        is_initial=segment.initial,
-        is_expanded_timeline=segment.expanded_timeline,
-        is_unparsed=own_membership.is_unparsed,
-    )
-
-
 def sliding_membership_observation(
     segment: RoomSegment,
     own_user_id: str,
@@ -365,26 +282,7 @@ def sliding_membership_observation(
     if not own_user_id:
         raise ValueError("own_user_id must not be empty")
 
-    state_events = [
-        _object(load_json(event, "room state event"), "room state event")
-        for event in segment.state_json
-    ]
-    timeline_events = [
-        _object(
-            load_json(event, "room timeline event"),
-            "room timeline event",
-        )
-        for event in segment.timeline_json
-    ]
-    return _membership_observation(
-        segment,
-        _latest_own_membership(
-            state_events,
-            timeline_events,
-            segment.live_event_count,
-            own_user_id,
-        ),
-    )
+    return segment.membership_observation
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,8 +744,18 @@ class SlidingSource:
                 initial=initial,
                 expanded_timeline=expanded,
                 live_event_count=live_event_count,
+                membership_observation=_membership_observation(
+                    {
+                        RoomSection.INVITE: "invite",
+                        RoomSection.KNOCK: "knock",
+                        RoomSection.JOIN: "join",
+                        RoomSection.LEAVE: "leave",
+                    }[section],
+                    own_membership,
+                    is_initial=initial,
+                    is_expanded_timeline=expanded,
+                ),
             )
-            _membership_observation(segment, own_membership)
             by_section[section].append(segment)
             seen_room_ids.add(room_id)
 
@@ -868,6 +776,9 @@ class SlidingSource:
                     initial=False,
                     expanded_timeline=False,
                     live_event_count=0,
+                    membership_observation=MembershipObservation(
+                        None, None, None, None, None, False, False, False, False
+                    ),
                 )
             )
         room_segments = tuple(

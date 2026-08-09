@@ -11,6 +11,7 @@ import pytest
 
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig
+from nio.ingest.membership import MembershipObservation
 from nio.ingest.model import TransportKind
 from nio.ingest.ports import (
     NetworkFailureKind,
@@ -30,6 +31,7 @@ from nio.ingest.state import SourceState
 
 STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
 OTHER_STREAM_ID = UUID("234c90aa-7625-4aa8-acd5-ef6005af3250")
+OWN_USER_ID = "@me:example.org"
 
 
 @pytest.fixture
@@ -40,6 +42,7 @@ def classic_source() -> ClassicSource:
             timeout_ms=30_000,
             filter_json=b'{"room": {"timeline": {"limit": 20}}}',
         ),
+        OWN_USER_ID,
     )
 
 
@@ -77,6 +80,109 @@ def test_classic_source_satisfies_the_structural_sync_source_protocol(
     classic_source: ClassicSource,
 ) -> None:
     assert isinstance(classic_source, SyncSource)
+
+
+@pytest.mark.parametrize(
+    ("own_user_id", "error"),
+    [
+        pytest.param(1, TypeError, id="foreign-type"),
+        pytest.param("", ValueError, id="empty"),
+    ],
+)
+def test_classic_source_requires_an_exact_nonempty_own_user_id(
+    own_user_id: object,
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error, match="own_user_id"):
+        ClassicSource(
+            STREAM_ID,
+            ClassicSourceConfig(30_000, b"{}"),
+            own_user_id,  # type: ignore[arg-type]
+        )
+
+
+def test_classic_normalizes_only_its_own_member_evidence() -> None:
+    source = ClassicSource(
+        STREAM_ID,
+        ClassicSourceConfig(30_000, b"{}"),
+        OWN_USER_ID,
+    )
+    request = source.plan_request(_source_state(ClassicCursor("s0")), 9)
+    assert request is not None
+    body = {
+        "next_batch": "s1",
+        "rooms": {
+            "join": {
+                "!room:example.org": {
+                    "state": {
+                        "events": [
+                            {
+                                "type": "m.room.member",
+                                "state_key": "@other:example.org",
+                                "event_id": "$other",
+                                "content": {"membership": "leave"},
+                            },
+                            {
+                                "type": "m.room.member",
+                                "state_key": OWN_USER_ID,
+                                "event_id": "$own",
+                                "content": {"membership": "join"},
+                            },
+                        ]
+                    },
+                    "timeline": {"events": []},
+                }
+            }
+        },
+    }
+
+    normalized = source.normalize(
+        request, _network_result(request, json.dumps(body).encode())
+    )
+
+    assert normalized.frame is not None
+    assert normalized.frame.room_segments[
+        0
+    ].membership_observation == MembershipObservation(
+        "join", "join", "$own", None, None, False, False, False, False
+    )
+
+
+def test_classic_rejects_parseable_own_membership_that_contradicts_section() -> None:
+    source = ClassicSource(
+        STREAM_ID,
+        ClassicSourceConfig(30_000, b"{}"),
+        OWN_USER_ID,
+    )
+    request = source.plan_request(_source_state(ClassicCursor("s0")), 9)
+    assert request is not None
+    body = {
+        "next_batch": "s1",
+        "rooms": {
+            "join": {
+                "!room:example.org": {
+                    "state": {
+                        "events": [
+                            {
+                                "type": "m.room.member",
+                                "state_key": OWN_USER_ID,
+                                "content": {"membership": "leave"},
+                            }
+                        ]
+                    },
+                    "timeline": {"events": []},
+                }
+            }
+        },
+    }
+
+    normalized = source.normalize(
+        request, _network_result(request, json.dumps(body).encode())
+    )
+
+    assert normalized.kind is SourceResultKind.TERMINAL_ERROR
+    assert normalized.detail is not None
+    assert "contradicts" in normalized.detail
 
 
 def test_initial_request_has_full_state_and_no_since(
@@ -910,6 +1016,7 @@ def test_network_result_from_same_numbered_request_on_another_stream_is_rejected
             timeout_ms=30_000,
             filter_json=b'{"room":{"timeline":{"limit":5}}}',
         ),
+        OWN_USER_ID,
     )
     state = _source_state(ClassicCursor("s-prior"), request_id=9)
     request = classic_source.plan_request(state, request_id=9)
@@ -928,6 +1035,7 @@ def test_request_from_same_numbered_request_on_another_stream_is_rejected(
     other_source = ClassicSource(
         OTHER_STREAM_ID,
         ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}"),
+        OWN_USER_ID,
     )
     other_request = other_source.plan_request(
         _source_state(ClassicCursor("s-prior"), request_id=9),
@@ -1022,6 +1130,7 @@ def test_restart_normalizes_a_durable_request_using_its_original_config() -> Non
             timeout_ms=1_000,
             filter_json=b'{"room":{"timeline":{"limit":5}}}',
         ),
+        OWN_USER_ID,
     )
     request = original_source.plan_request(
         _source_state(ClassicCursor(None)),
@@ -1034,6 +1143,7 @@ def test_restart_normalizes_a_durable_request_using_its_original_config() -> Non
             timeout_ms=45_000,
             filter_json=b'{"room":{"timeline":{"limit":100}}}',
         ),
+        OWN_USER_ID,
     )
 
     normalized = restarted_source.normalize(
@@ -1085,6 +1195,9 @@ def test_frozen_source_values_reject_mutable_nested_inputs(
             False,
             False,
             0,
+            MembershipObservation(
+                "join", None, None, None, None, False, False, False, False
+            ),
         )
 
     mismatched_request = replace(request, request_id=request.request_id + 1)
@@ -1278,6 +1391,9 @@ def test_classic_adapter_is_synchronous_and_owns_no_runtime_resources(
             True,
             False,
             0,
+            MembershipObservation(
+                "join", None, None, None, None, False, True, False, False
+            ),
         ),
     ):
         assert not hasattr(value, "__dict__")

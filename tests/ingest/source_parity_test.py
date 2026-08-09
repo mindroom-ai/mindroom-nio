@@ -1,6 +1,8 @@
 import json
 from uuid import UUID
 
+import pytest
+
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
 from nio.ingest.model import RecordKind, TransportKind
@@ -62,6 +64,215 @@ def _shape(frame: SyncFrame) -> tuple[tuple[RecordKind, str | None, bytes], ...]
     return tuple(records)
 
 
+def _membership_observation_pair(
+    *,
+    classic_section: str,
+    sliding_membership: str,
+    state: list[dict[str, object]],
+    timeline: list[dict[str, object]] | None = None,
+    live: bool = False,
+    initial: bool = False,
+) -> tuple[object, object]:
+    classic = ClassicSource(STREAM_ID, ClassicSourceConfig(30_000, b"{}"), OWN_USER_ID)
+    classic_cursor = ClassicCursor(None if initial else "s0")
+    classic_request = classic.plan_request(
+        SourceState(
+            2,
+            TransportKind.CLASSIC,
+            canonical_classic_cursor(classic_cursor),
+            4,
+            True,
+        ),
+        4,
+    )
+    assert classic_request is not None
+    state_key = {"invite": "invite_state", "knock": "knock_state"}.get(
+        classic_section, "state"
+    )
+    timeline = timeline or []
+    classic_body = {
+        "next_batch": "s1",
+        "rooms": {
+            classic_section: {
+                ROOM_ID: {
+                    state_key: {"events": state},
+                    "timeline": {"events": timeline},
+                }
+            }
+        },
+    }
+    classic_result = classic.normalize(
+        classic_request, _result(classic_request, classic_body)
+    )
+    assert classic_result.frame is not None
+
+    sliding = SlidingSource(
+        STREAM_ID,
+        SlidingSourceConfig(30_000, "worker", b"{}", b"{}", b"{}", 2),
+        OWN_USER_ID,
+    )
+    sliding_cursor = SlidingCursor(
+        None if initial else "p0",
+        "td0",
+        CONNECTION,
+        "worker",
+        1,
+        2,
+        SlidingRangeAckMode.UNKNOWN if initial else SlidingRangeAckMode.TXN_ECHO,
+        False,
+    )
+    sliding_request = sliding.plan_request(
+        SourceState(
+            2,
+            TransportKind.SLIDING,
+            canonical_sliding_cursor(sliding_cursor),
+            4,
+            True,
+        ),
+        4,
+    )
+    assert sliding_request is not None
+    assert sliding_request.body is not None
+    room: dict[str, object] = {
+        "membership": sliding_membership,
+        "timeline": timeline,
+        "num_live": len(timeline) if live else 0,
+    }
+    if sliding_membership in {"invite", "knock"}:
+        room["stripped_state"] = state
+    else:
+        room["required_state"] = state
+    sliding_body = {
+        "pos": "p1",
+        "txn_id": json.loads(sliding_request.body)["txn_id"],
+        "lists": {RESERVED_LIST: {"count": 1}},
+        "rooms": {ROOM_ID: room},
+    }
+    sliding_result = sliding.normalize(
+        sliding_request, _result(sliding_request, sliding_body)
+    )
+    assert sliding_result.frame is not None
+    return (
+        classic_result.frame.room_segments[0].membership_observation,
+        sliding_result.frame.room_segments[0].membership_observation,
+    )
+
+
+def _own_member(
+    membership: str,
+    event_id: str,
+    *,
+    previous_membership: str | None = None,
+    replaces_state: str | None = None,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "type": "m.room.member",
+        "state_key": OWN_USER_ID,
+        "event_id": event_id,
+        "content": {"membership": membership},
+    }
+    if previous_membership is not None or replaces_state is not None:
+        event["unsigned"] = {
+            "prev_content": {"membership": previous_membership},
+            "replaces_state": replaces_state,
+        }
+    return event
+
+
+@pytest.mark.parametrize(
+    ("classic_section", "sliding_membership", "state", "timeline", "live"),
+    [
+        pytest.param(
+            "join",
+            "join",
+            [_own_member("join", "$same")],
+            [_own_member("join", "$same")],
+            True,
+            id="same-id-live-join",
+        ),
+        pytest.param(
+            "join",
+            "join",
+            [
+                _own_member(
+                    "join", "$new", previous_membership="join", replaces_state="$old"
+                )
+            ],
+            None,
+            False,
+            id="linked-non-live-join",
+        ),
+        pytest.param(
+            "invite",
+            "invite",
+            [_own_member("invite", "$invite")],
+            None,
+            False,
+            id="invite",
+        ),
+        pytest.param(
+            "knock", "knock", [_own_member("knock", "$knock")], None, False, id="knock"
+        ),
+        pytest.param(
+            "leave", "leave", [_own_member("leave", "$leave")], None, False, id="leave"
+        ),
+        pytest.param(
+            "leave", "ban", [_own_member("ban", "$ban")], None, False, id="ban"
+        ),
+        pytest.param(
+            "join",
+            "join",
+            [{"type": "m.room.member", "state_key": OWN_USER_ID}],
+            None,
+            False,
+            id="malformed-own-member",
+        ),
+    ],
+)
+def test_classic_and_sliding_preserve_equal_membership_observations(
+    classic_section: str,
+    sliding_membership: str,
+    state: list[dict[str, object]],
+    timeline: list[dict[str, object]] | None,
+    live: bool,
+) -> None:
+    classic_observation, sliding_observation = _membership_observation_pair(
+        classic_section=classic_section,
+        sliding_membership=sliding_membership,
+        state=state,
+        timeline=timeline,
+        live=live,
+    )
+
+    assert classic_observation == sliding_observation
+    observation = classic_observation
+    assert observation.room_membership == classic_section
+    assert observation.is_live is live
+    if "content" not in state[-1]:
+        assert observation.is_unparsed is True
+        assert observation.event_membership is None
+        assert observation.event_id is None
+    else:
+        event = (timeline or state)[-1] if live else state[-1]
+        content = event["content"]
+        assert type(content) is dict
+        assert observation.is_unparsed is False
+        assert observation.event_membership == content["membership"]
+        assert observation.event_id == event["event_id"]
+
+
+def test_classic_and_sliding_preserve_initial_incomplete_observations() -> None:
+    classic_observation, sliding_observation = _membership_observation_pair(
+        classic_section="join",
+        sliding_membership="join",
+        state=[],
+        initial=True,
+    )
+
+    assert classic_observation == sliding_observation
+    assert classic_observation.is_initial is True
+
+
 def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> None:
     state_event = {
         "content": {"membership": "join"},
@@ -94,6 +305,7 @@ def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> No
     classic = ClassicSource(
         STREAM_ID,
         ClassicSourceConfig(30_000, b"{}"),
+        own_user_id=OWN_USER_ID,
     )
     classic_state = SourceState(
         2,
@@ -221,3 +433,4 @@ def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> No
         classic_room.expanded_timeline,
         classic_room.live_event_count,
     )
+    assert sliding_room.membership_observation == classic_room.membership_observation

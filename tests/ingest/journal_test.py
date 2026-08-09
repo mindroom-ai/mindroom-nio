@@ -414,7 +414,9 @@ def test_fresh_open_freezes_transport_and_inserts_one_cold_source_before_attach(
 
         if transport is TransportKind.CLASSIC:
             assert source_state.cursor_json == b'{"next_batch":null}'
-            request = ClassicSource(bootstrap.stream_id, source_config).plan_request(
+            request = ClassicSource(
+                bootstrap.stream_id, source_config, "@own:example.org"
+            ).plan_request(
                 source_state,
                 request_id=1,
             )

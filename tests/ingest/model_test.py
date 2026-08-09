@@ -23,9 +23,10 @@ from nio.ingest import (
     TimelineEventProvenance,
     TransportKind,
 )
-from nio.ingest.membership import MembershipBaseline
+from nio.ingest.membership import MembershipBaseline, MembershipObservation
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.serialization import _loss_id, batch_from_records
+from nio.ingest.source import RoomSection, RoomSegment
 from nio.ingest.state import (
     LaneRecord,
     LaneRecordKey,
@@ -164,6 +165,47 @@ def test_wire_dataclasses_are_frozen_and_slotted() -> None:
         assert not hasattr(value, "__dict__")
         with pytest.raises(FrozenInstanceError):
             setattr(value, fields(value)[0].name, "mutable")
+
+
+def test_room_segment_carries_an_exact_membership_observation() -> None:
+    observation = MembershipObservation(
+        "join", None, None, None, None, False, False, False, False
+    )
+    segment = RoomSegment(
+        "!room:example.org",
+        RoomSection.JOIN,
+        (),
+        (),
+        (),
+        False,
+        None,
+        False,
+        False,
+        0,
+        observation,
+    )
+
+    assert tuple(field.name for field in fields(RoomSegment)) == (
+        "room_id",
+        "section",
+        "state_json",
+        "timeline_json",
+        "room_account_data_json",
+        "timeline_limited",
+        "timeline_prev_batch",
+        "initial",
+        "expanded_timeline",
+        "live_event_count",
+        "membership_observation",
+    )
+    with pytest.raises(
+        TypeError, match="membership_observation must be MembershipObservation"
+    ):
+        replace(segment, membership_observation=object())  # type: ignore[arg-type]
+
+    conflicting = replace(observation, is_initial=True)
+    with pytest.raises(ValueError, match="membership observation initial flag"):
+        replace(segment, membership_observation=conflicting)
 
 
 def test_collection_fields_require_tuples() -> None:

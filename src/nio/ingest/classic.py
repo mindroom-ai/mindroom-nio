@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from uuid import UUID, uuid5
 
 from .config import ClassicSourceConfig
+from .membership import _latest_own_membership, _membership_observation
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkRequest, NetworkResult
 from .source import (
@@ -39,12 +40,17 @@ _CLASSIC_ROOM_SECTIONS = (
 class ClassicSource:
     stream_id: UUID
     config: ClassicSourceConfig
+    own_user_id: str
 
     def __post_init__(self) -> None:
         if type(self.stream_id) is not UUID:
             raise TypeError("stream_id must be UUID")
         if type(self.config) is not ClassicSourceConfig:
             raise TypeError("config must be ClassicSourceConfig")
+        if type(self.own_user_id) is not str:
+            raise TypeError("own_user_id must be str")
+        if not self.own_user_id:
+            raise ValueError("own_user_id must not be empty")
 
     def plan_request(
         self,
@@ -249,6 +255,30 @@ class ClassicSource:
                     canonical_json({"room_id": room_id, "event": event})
                     for event in ephemeral_events
                 )
+                own_membership = _latest_own_membership(
+                    state,
+                    timeline,
+                    0 if initial else len(timeline),
+                    self.own_user_id,
+                )
+                room_membership = {
+                    RoomSection.INVITE: "invite",
+                    RoomSection.KNOCK: "knock",
+                    RoomSection.JOIN: "join",
+                    RoomSection.LEAVE: "leave",
+                }[section]
+                if (
+                    own_membership is not None
+                    and not own_membership.is_unparsed
+                    and own_membership.membership != room_membership
+                    and not (
+                        room_membership == "leave"
+                        and own_membership.membership == "ban"
+                    )
+                ):
+                    raise ValueError(
+                        "room section contradicts exact own membership evidence"
+                    )
                 segments.append(
                     RoomSegment(
                         room_id=room_id,
@@ -265,6 +295,12 @@ class ClassicSource:
                         initial=initial,
                         expanded_timeline=False,
                         live_event_count=0 if initial else len(timeline),
+                        membership_observation=_membership_observation(
+                            room_membership,
+                            own_membership,
+                            is_initial=initial,
+                            is_expanded_timeline=False,
+                        ),
                     )
                 )
 

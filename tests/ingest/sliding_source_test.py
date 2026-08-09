@@ -9,6 +9,7 @@ import pytest
 from nio.ingest.config import SlidingSourceConfig
 from nio.ingest.membership import (
     MembershipBaseline,
+    MembershipObservation,
     MembershipProof,
     MembershipProofKind,
     membership_recovery_cursor,
@@ -1560,6 +1561,9 @@ def test_rooms_and_extensions_normalize_without_losing_order_or_duplicates(
     assert unchanged.initial is False
     assert unchanged.expanded_timeline is False
     assert unchanged.history_discontinuity is False
+    assert unchanged.membership_observation == MembershipObservation(
+        None, None, None, None, None, False, False, False, False
+    )
     with pytest.raises(ValueError, match="account-data-only"):
         replace(
             unchanged,
@@ -1810,6 +1814,33 @@ def test_membership_extraction_marks_live_own_join_and_unparsed_stub(
     assert live_observation.replaces_state == "$old"
     assert live_observation.is_live is True
     assert stub_observation.is_unparsed is True
+
+
+def test_membership_observation_is_stored_not_reparsed_from_segment_bytes(
+    sliding_source: SlidingSource,
+) -> None:
+    cursor = SlidingCursor(
+        "p0", "td0", CONNECTION, CONNECTION_NAME, 1, 2, TXN_ACK, False
+    )
+    request = sliding_source.plan_request(_state(cursor), 7)
+    assert request is not None
+    body = _success_body(request, pos="p1", count=1, to_device_since="td1")
+    body["rooms"] = {
+        "!room:example.org": {
+            "membership": "join",
+            "required_state": [_own_member("$own")],
+        }
+    }
+
+    normalized = sliding_source.normalize(request, _result(request, body))
+
+    assert normalized.frame is not None
+    segment = normalized.frame.room_segments[0]
+    corrupted = replace(segment, state_json=(b"not json",))
+    assert (
+        sliding_membership_observation(corrupted, OWN_USER_ID)
+        is segment.membership_observation
+    )
 
 
 def _own_member(
@@ -2183,6 +2214,40 @@ def test_expanded_timeline_is_a_distinct_recoverable_discontinuity(
             current_prev_batch=segment.timeline_prev_batch,
         )
         == "old-prev"
+    )
+
+
+def test_expanded_incomplete_room_stores_unsafe_membership_evidence(
+    sliding_source: SlidingSource,
+) -> None:
+    cursor = SlidingCursor(
+        "p0", "td0", CONNECTION, CONNECTION_NAME, 1, 2, TXN_ACK, False
+    )
+    request = sliding_source.plan_request(_state(cursor), 7)
+    assert request is not None
+    body = _success_body(
+        request,
+        pos="p1",
+        count=1,
+        to_device_since="td1",
+    )
+    body["rooms"] = {
+        "!room:example.org": {
+            "membership": "join",
+            "expanded_timeline": True,
+        }
+    }
+
+    normalized = sliding_source.normalize(request, _result(request, body))
+
+    assert normalized.frame is not None
+    observation = normalized.frame.room_segments[0].membership_observation
+    assert observation.is_expanded_timeline is True
+    assert prove_membership(
+        _baseline("old-prev", "$member"), observation
+    ) == MembershipProof(
+        MembershipProofKind.UNSAFE,
+        None,
     )
 
 
