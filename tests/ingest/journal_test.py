@@ -41,6 +41,10 @@ from nio.ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
 )
+from nio.ingest.effects import (
+    MembershipOperationRef,
+    MembershipOperationResolution,
+)
 from nio.ingest.membership import MembershipBaseline
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.state import (
@@ -146,6 +150,15 @@ def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() ->
 
         def list_schedulable_network_effects(self, limit):
             return ()
+
+        def claim_membership_operation(self, effect_id):
+            return None
+
+        def uncertain_membership_operations(self, limit, *, after_effect_id=None):
+            return ()
+
+        def resolve_membership_operation(self, ref, resolution):
+            return None
 
         def commit(self, *, expected_revision, writer_epoch, transition):
             return None
@@ -1838,18 +1851,38 @@ def test_inherited_child_cannot_use_or_release_parent_ownership(
         database_name="journal.db",
     )
     store = bootstrap.open_matrix_store(SqliteStore)
+    ref = MembershipOperationRef(
+        UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        "!room:example.org",
+        0,
+        1,
+        b"x" * 32,
+    )
 
     def inherited_operations() -> tuple[str, ...]:
-        return (
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        outcomes = (
             _operation_outcome(bootstrap._journal._assert_open),
+            _operation_outcome(
+                lambda: bootstrap._journal.claim_membership_operation(ref.effect_id)
+            ),
+            _operation_outcome(
+                lambda: bootstrap._journal.resolve_membership_operation(
+                    ref,
+                    MembershipOperationResolution.SUPERSEDE,
+                )
+            ),
             _operation_outcome(bootstrap.close),
             _operation_outcome(bootstrap._journal._writer_lock.close),
         )
+        return (*outcomes, json.dumps(statements))
 
     try:
         outcomes = _fork_outcomes(inherited_operations)
-        assert len(outcomes) == 3
-        assert all("acquiring process" in outcome for outcome in outcomes)
+        assert len(outcomes) == 6
+        assert all("acquiring process" in outcome for outcome in outcomes[:-1])
+        assert outcomes[-1] == "[]"
         assert not store.database.is_closed()
         assert bootstrap._journal.load_owner().revision == 0
         second = None
@@ -2712,6 +2745,8 @@ async def test_attaching_prefix_keeps_all_attached_operations_closed(
         status = bootstrap._journal.attach_consumer_step(consumer)
         assert status is ConsumerAttachStatus.ATTACHING
         assert bootstrap._journal.load_source() == source
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
 
         ref = BatchRef(
             bootstrap.stream_id,
@@ -2742,10 +2777,26 @@ async def test_attaching_prefix_keeps_all_attached_operations_closed(
             ),
             lambda: bootstrap._journal.list_network_effects(1),
             lambda: bootstrap._journal.list_schedulable_network_effects(1),
+            lambda: bootstrap._journal.claim_membership_operation(
+                UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+            ),
+            lambda: bootstrap._journal.uncertain_membership_operations(1),
+            lambda: bootstrap._journal.resolve_membership_operation(
+                MembershipOperationRef(
+                    UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+                    "!missing:example.org",
+                    0,
+                    1,
+                    b"x" * 32,
+                ),
+                MembershipOperationResolution.SUPERSEDE,
+            ),
         )
         for operation in operations:
             with pytest.raises(LocalProtocolError, match="consumer is not attached"):
                 operation()
+        bootstrap._journal.connection.set_trace_callback(None)
+        assert "BEGIN IMMEDIATE" not in statements
     finally:
         bootstrap.close()
 

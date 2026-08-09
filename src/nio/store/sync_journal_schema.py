@@ -247,6 +247,10 @@ SCHEMA_SQL = (
         NioIngestNetworkEffect(account_id, created_revision, effect_id)
         WHERE effect_kind != 'membership'
         OR membership_delivery_state = 'ready'""",
+    """CREATE INDEX NioIngestNetworkEffect_uncertain ON
+        NioIngestNetworkEffect(account_id, effect_id)
+        WHERE effect_kind = 'membership'
+        AND membership_delivery_state = 'dispatched_unconfirmed'""",
     """CREATE TABLE NioIngestCryptoEffect (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
         effect_id TEXT NOT NULL, effect_kind TEXT NOT NULL,

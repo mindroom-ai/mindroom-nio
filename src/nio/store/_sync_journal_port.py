@@ -3,7 +3,14 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from ..ingest.effects import PersistedNetworkEffect
+from ..ingest.effects import (
+    MembershipOperationRef,
+    MembershipOperationResolution,
+    MembershipOperationResolutionOutcome,
+    MembershipOperationStatus,
+    MembershipRequest,
+    PersistedNetworkEffect,
+)
 from ..ingest.model import BatchRef, SyncBatch
 from ..ingest.state import (
     AckOutcome,
@@ -60,6 +67,24 @@ class IngestionJournal(Protocol):
         self,
         limit: int,
     ) -> tuple[PersistedNetworkEffect, ...]: ...
+
+    def claim_membership_operation(
+        self,
+        effect_id: UUID,
+    ) -> tuple[MembershipRequest, MembershipOperationRef]: ...
+
+    def uncertain_membership_operations(
+        self,
+        limit: int,
+        *,
+        after_effect_id: UUID | None = None,
+    ) -> tuple[MembershipOperationStatus, ...]: ...
+
+    def resolve_membership_operation(
+        self,
+        ref: MembershipOperationRef,
+        resolution: MembershipOperationResolution,
+    ) -> MembershipOperationResolutionOutcome: ...
 
     def commit(
         self,

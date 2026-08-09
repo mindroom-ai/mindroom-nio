@@ -526,6 +526,11 @@ def test_network_effect_schema_enforces_exact_union_state_and_indexes(
                 True,
                 ("account_id", "created_revision", "effect_id"),
             ),
+            "NioIngestNetworkEffect_uncertain": (
+                False,
+                True,
+                ("account_id", "effect_id"),
+            ),
         }
         actual_indexes = {}
         for _, name, unique, _, partial in connection.execute(

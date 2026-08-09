@@ -29,6 +29,9 @@ from nio.ingest.config import ClassicSourceConfig
 from nio.ingest.effects import (
     MembershipAction,
     MembershipDeliveryState,
+    MembershipOperationRef,
+    MembershipOperationResolution,
+    MembershipOperationResolutionOutcome,
     MembershipRequest,
     PersistedNetworkEffect,
     RecoveryRequest,
@@ -932,3 +935,138 @@ async def test_network_effect_graph_rolls_back_at_every_persisted_statement(
             reopened._journal.load_rooms(frozenset({"!baseline:example.org"}))
         finally:
             reopened.close()
+
+
+def _interrupt_membership_operation(
+    store_path: Path,
+    consumer: ConsumerBootstrap,
+    operation: str,
+    ref: MembershipOperationRef | None,
+    statement_ordinal: int,
+) -> None:
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    asyncio.run(bootstrap.attach_consumer(consumer))
+    journal = bootstrap._journal
+    journal.set_transition_statement_hook(_exit_at_statement(statement_ordinal))
+    effect_id = _membership_effect(bootstrap.stream_id).request.effect_id
+    if operation == "claim":
+        journal.claim_membership_operation(effect_id)
+    else:
+        assert ref is not None
+        resolution = (
+            MembershipOperationResolution.RETRY
+            if operation == "retry"
+            else MembershipOperationResolution.SUPERSEDE
+        )
+        journal.resolve_membership_operation(ref, resolution)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("claim", "retry", "supersede"))
+async def test_membership_operation_rolls_back_at_every_persisted_statement(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    store_path = tmp_path / f"membership-{operation}"
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _one_room_consumer(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    journal = bootstrap._journal
+    membership = _membership_effect(bootstrap.stream_id)
+    journal.commit(
+        expected_revision=1,
+        writer_epoch=journal.writer_epoch,
+        transition=JournalTransition(network_effect_inserts=(membership,)),
+    )
+    ref = None
+    if operation != "claim":
+        _, ref = journal.claim_membership_operation(membership.request.effect_id)
+    expected_revision = journal.load_owner().revision
+    expected_rows = _network_effect_graph_rows(journal)
+    expected_effects = journal.list_network_effects(256)
+    bootstrap.close()
+
+    for statement_ordinal in (1, 2):
+        _assert_process_crashed(
+            _interrupt_membership_operation,
+            store_path,
+            consumer,
+            operation,
+            ref,
+            statement_ordinal,
+        )
+        reopened = open_ingestion_store(
+            store_path,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            pickle_key="secret",
+            database_name="journal.db",
+        )
+        try:
+            await reopened.attach_consumer(consumer)
+            assert reopened._journal.load_owner().revision == expected_revision
+            assert _network_effect_graph_rows(reopened._journal) == expected_rows
+            assert reopened._journal.list_network_effects(256) == expected_effects
+        finally:
+            reopened.close()
+
+    completed = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        await completed.attach_consumer(consumer)
+        if operation == "claim":
+            request, completed_ref = completed._journal.claim_membership_operation(
+                membership.request.effect_id
+            )
+            assert request == membership.request
+            assert completed_ref.attempt_ordinal == 1
+            assert completed._journal.uncertain_membership_operations(256)[0].ref == (
+                completed_ref
+            )
+        elif operation == "retry":
+            assert ref is not None
+            assert (
+                completed._journal.resolve_membership_operation(
+                    ref,
+                    MembershipOperationResolution.RETRY,
+                )
+                is MembershipOperationResolutionOutcome.READY
+            )
+            retried = completed._journal.load_network_effect(ref.effect_id)
+            assert retried is not None
+            assert retried.membership_delivery_state is MembershipDeliveryState.READY
+            assert retried.prior_delivery_uncertain is True
+        else:
+            assert ref is not None
+            assert (
+                completed._journal.resolve_membership_operation(
+                    ref,
+                    MembershipOperationResolution.SUPERSEDE,
+                )
+                is MembershipOperationResolutionOutcome.SUPERSEDED
+            )
+            assert completed._journal.load_network_effect(ref.effect_id) is None
+        assert completed._journal.load_owner().revision == expected_revision + 1
+    finally:
+        completed.close()

@@ -11,6 +11,10 @@ from ..ingest._json import load_internal_json
 from ..ingest.effects import (
     MembershipAction,
     MembershipDeliveryState,
+    MembershipOperationRef,
+    MembershipOperationResolution,
+    MembershipOperationResolutionOutcome,
+    MembershipOperationStatus,
     MembershipRequest,
     NetworkEffectKind,
     NetworkEffectRequest,
@@ -18,7 +22,7 @@ from ..ingest.effects import (
     RecoveryRequest,
     RoomHydrationRequest,
 )
-from ..ingest.errors import JournalIntegrityError
+from ..ingest.errors import JournalConflictError, JournalIntegrityError
 from ..ingest.model import RoomHydrationStatus, TransportKind
 from ..ingest.serialization import (
     _canonical_json,
@@ -26,6 +30,7 @@ from ..ingest.serialization import (
     _encoded_bytes,
 )
 from ..ingest.state import OwnerView, RoomAggregate
+from ._sync_journal_preflight import immediate_transaction
 
 _NETWORK_EFFECT_COMMON_FIELDS = (
     "effect_id",
@@ -603,6 +608,253 @@ class NetworkEffectRows:
         limit: int,
     ) -> tuple[PersistedNetworkEffect, ...]:
         return self._list_network_effects(limit, schedulable_only=True)
+
+    @staticmethod
+    def _membership_operation_ref(
+        stored: _StoredNetworkEffect,
+    ) -> MembershipOperationRef:
+        request = stored.effect.request
+        if type(request) is not MembershipRequest:
+            raise JournalIntegrityError("network effect is not a membership operation")
+        return MembershipOperationRef(
+            request.effect_id,
+            request.room_id,
+            request.membership_epoch,
+            stored.effect.attempt_ordinal,
+            stored.request_sha256,
+        )
+
+    def _load_live_membership_operation(
+        self,
+        effect_id: UUID,
+        owner: OwnerView,
+    ) -> _StoredNetworkEffect | None:
+        stored = self._load_network_effect_row(effect_id, owner)
+        if stored is None:
+            return None
+        request = stored.effect.request
+        if type(request) is not MembershipRequest:
+            raise JournalIntegrityError("network effect is not a membership operation")
+        aggregates = self._load_room_aggregates(frozenset((request.room_id,)))
+        room_effects = self._load_network_effect_rows_for_rooms(
+            frozenset((request.room_id,)),
+            owner,
+        )
+        effects_by_id = {
+            value.effect.request.effect_id: value.effect for value in room_effects
+        }
+        self._validate_network_effect_graph(aggregates, effects_by_id)
+        exact = next(
+            (
+                value
+                for value in room_effects
+                if value.effect.request.effect_id == effect_id
+            ),
+            None,
+        )
+        if exact != stored:
+            raise JournalIntegrityError(
+                "membership operation target changed during authenticated load"
+            )
+        return stored
+
+    def _membership_operation_owner(self) -> OwnerView:
+        owner = self._require_attached()
+        if owner.writer_epoch != self.writer_epoch:
+            raise JournalConflictError("journal writer_epoch is stale")
+        return owner
+
+    def _advance_membership_operation_revision(
+        self,
+        owner: OwnerView,
+        revision: int,
+        label: str,
+    ) -> None:
+        cursor = self._transition_execute(
+            label,
+            "UPDATE NioIngestMeta SET revision = ? "
+            "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+            (
+                revision,
+                self.account_id,
+                owner.revision,
+                str(self.writer_epoch),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise JournalConflictError("membership operation revision is stale")
+
+    def claim_membership_operation(
+        self,
+        effect_id: UUID,
+    ) -> tuple[MembershipRequest, MembershipOperationRef]:
+        if type(effect_id) is not UUID:
+            raise TypeError("effect_id must be UUID")
+        self._membership_operation_owner()
+        with immediate_transaction(self.connection):
+            owner = self._membership_operation_owner()
+            stored = self._load_live_membership_operation(effect_id, owner)
+            if stored is None:
+                raise JournalIntegrityError("membership operation does not exist")
+            effect = stored.effect
+            request = effect.request
+            assert type(request) is MembershipRequest
+            if effect.membership_delivery_state is not MembershipDeliveryState.READY:
+                raise JournalIntegrityError("membership operation is not READY")
+            proposed = PersistedNetworkEffect(
+                request,
+                effect.attempt_ordinal + 1,
+                MembershipDeliveryState.DISPATCHED_UNCONFIRMED,
+                effect.prior_delivery_uncertain,
+            )
+            revision = owner.revision + 1
+            prepared = self._prepare_network_effect_state_updates(
+                ((stored, proposed),),
+                revision,
+            )
+            self._advance_membership_operation_revision(
+                owner,
+                revision,
+                "membership_claim_meta",
+            )
+            self._update_network_effects(prepared, revision)
+            return request, self._membership_operation_ref(
+                _StoredNetworkEffect(
+                    proposed,
+                    stored.created_revision,
+                    revision,
+                    stored.request_sha256,
+                    prepared[0].state_sha256,
+                )
+            )
+
+    def uncertain_membership_operations(
+        self,
+        limit: int,
+        *,
+        after_effect_id: UUID | None = None,
+    ) -> tuple[MembershipOperationStatus, ...]:
+        owner = self._require_attached()
+        self._validate_network_effect_list_limit(limit)
+        if after_effect_id is not None and type(after_effect_id) is not UUID:
+            raise TypeError("after_effect_id must be UUID or None")
+        after_clause = " AND effect_id > ?" if after_effect_id is not None else ""
+        parameters: tuple[object, ...] = (
+            (self.account_id, str(after_effect_id), limit)
+            if after_effect_id is not None
+            else (self.account_id, limit)
+        )
+        rows = self.connection.execute(
+            "SELECT * FROM NioIngestNetworkEffect WHERE account_id = ? "
+            "AND effect_kind = 'membership' "
+            "AND membership_delivery_state = 'dispatched_unconfirmed'"
+            f"{after_clause} ORDER BY effect_id LIMIT ?",
+            parameters,
+        ).fetchall()
+        stored_effects = tuple(
+            self._decode_network_effect_row(row, owner) for row in rows
+        )
+        self._validate_loaded_network_effects(stored_effects)
+        return tuple(
+            MembershipOperationStatus(
+                self._membership_operation_ref(stored),
+                stored.effect.request.action,
+                MembershipDeliveryState.DISPATCHED_UNCONFIRMED,
+                cast(bool, stored.effect.prior_delivery_uncertain),
+            )
+            for stored in stored_effects
+            if type(stored.effect.request) is MembershipRequest
+        )
+
+    @staticmethod
+    def _validate_membership_operation_ref(
+        stored: _StoredNetworkEffect,
+        ref: MembershipOperationRef,
+    ) -> None:
+        request = stored.effect.request
+        if type(request) is not MembershipRequest:
+            raise JournalIntegrityError("network effect is not a membership operation")
+        if (
+            request.effect_id != ref.effect_id
+            or request.room_id != ref.room_id
+            or request.membership_epoch != ref.membership_epoch
+            or stored.effect.attempt_ordinal != ref.attempt_ordinal
+            or stored.request_sha256 != ref.request_sha256
+        ):
+            raise JournalIntegrityError("membership operation reference is stale")
+
+    def resolve_membership_operation(
+        self,
+        ref: MembershipOperationRef,
+        resolution: MembershipOperationResolution,
+    ) -> MembershipOperationResolutionOutcome:
+        if type(ref) is not MembershipOperationRef:
+            raise TypeError("ref must be MembershipOperationRef")
+        try:
+            ref = replace(ref)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "membership operation reference is invalid"
+            ) from error
+        if type(resolution) is not MembershipOperationResolution:
+            raise TypeError("resolution must be MembershipOperationResolution")
+        self._membership_operation_owner()
+        with immediate_transaction(self.connection):
+            owner = self._membership_operation_owner()
+            stored = self._load_live_membership_operation(ref.effect_id, owner)
+            if stored is None:
+                if resolution is MembershipOperationResolution.SUPERSEDE:
+                    return MembershipOperationResolutionOutcome.ABSENT
+                raise JournalIntegrityError("membership operation does not exist")
+            self._validate_membership_operation_ref(stored, ref)
+            effect = stored.effect
+            if resolution is MembershipOperationResolution.RETRY:
+                if (
+                    effect.membership_delivery_state is MembershipDeliveryState.READY
+                    and effect.prior_delivery_uncertain is True
+                ):
+                    return MembershipOperationResolutionOutcome.READY
+                if (
+                    effect.membership_delivery_state
+                    is not MembershipDeliveryState.DISPATCHED_UNCONFIRMED
+                ):
+                    raise JournalIntegrityError(
+                        "membership operation is not DISPATCHED_UNCONFIRMED"
+                    )
+                proposed = PersistedNetworkEffect(
+                    effect.request,
+                    effect.attempt_ordinal,
+                    MembershipDeliveryState.READY,
+                    True,
+                )
+                revision = owner.revision + 1
+                prepared = self._prepare_network_effect_state_updates(
+                    ((stored, proposed),),
+                    revision,
+                )
+                self._advance_membership_operation_revision(
+                    owner,
+                    revision,
+                    "membership_retry_meta",
+                )
+                self._update_network_effects(prepared, revision)
+                return MembershipOperationResolutionOutcome.READY
+
+            if (
+                effect.membership_delivery_state
+                is not MembershipDeliveryState.DISPATCHED_UNCONFIRMED
+            ):
+                raise JournalIntegrityError(
+                    "membership operation is not DISPATCHED_UNCONFIRMED"
+                )
+            revision = owner.revision + 1
+            self._advance_membership_operation_revision(
+                owner,
+                revision,
+                "membership_supersede_meta",
+            )
+            self._delete_network_effects((stored,))
+            return MembershipOperationResolutionOutcome.SUPERSEDED
 
     def _network_effect_insert_values(
         self,
