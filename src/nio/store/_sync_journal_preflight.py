@@ -56,9 +56,7 @@ class StableFileLock:
 
     def assert_process_owner(self) -> None:
         if os.getpid() != self.owner_pid:
-            raise LocalProtocolError(
-                "ingestion ownership belongs to the acquiring process"
-            )
+            raise LocalProtocolError("ownership belongs to the acquiring process")
 
     def assert_identity(self) -> None:
         self.assert_process_owner()

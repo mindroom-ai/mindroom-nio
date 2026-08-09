@@ -82,13 +82,11 @@ class StoreBootstrap:
         self._journal._require_attached()
 
     def close(self) -> None:
-        self._journal._assert_process_owner()
+        self._journal._writer_lock.assert_process_owner()
         with self._store_lock:
-            try:
-                if self._store is not None and not self._store.database.is_closed():
-                    self._store.database.close()
-            finally:
-                self._journal.close()
+            if self._store is not None and not self._store.database.is_closed():
+                self._store.database.close()
+            self._journal.close()
 
 
 def open_ingestion_store(

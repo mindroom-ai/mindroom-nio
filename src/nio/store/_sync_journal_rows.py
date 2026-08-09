@@ -82,8 +82,7 @@ class JournalRows:
                 current_membership_epoch = excluded.current_membership_epoch,
                 next_room_sequence = excluded.next_room_sequence,
                 hydration_status = excluded.hydration_status, state_ciphertext = excluded.state_ciphertext,
-                state_sha256 = excluded.state_sha256, updated_revision = excluded.updated_revision
-            """,
+                state_sha256 = excluded.state_sha256, updated_revision = excluded.updated_revision""",
             (
                 self.account_id,
                 state.room_id,
@@ -124,8 +123,7 @@ class JournalRows:
                 next_recovery_page = excluded.next_recovery_page,
                 successor_membership_epoch = excluded.successor_membership_epoch,
                 pending_lifecycle_ciphertext = excluded.pending_lifecycle_ciphertext,
-                pending_lifecycle_sha256 = excluded.pending_lifecycle_sha256, updated_revision = excluded.updated_revision
-            """,
+                pending_lifecycle_sha256 = excluded.pending_lifecycle_sha256, updated_revision = excluded.updated_revision""",
             (
                 self.account_id,
                 lane.room_id,
@@ -277,8 +275,7 @@ class JournalRows:
             ON CONFLICT(account_id) DO UPDATE SET
                 source_epoch = excluded.source_epoch, transport_kind = excluded.transport_kind,
                 cursor_ciphertext = excluded.cursor_ciphertext, cursor_sha256 = excluded.cursor_sha256,
-                next_request_id = excluded.next_request_id, active = excluded.active
-            """,
+                next_request_id = excluded.next_request_id, active = excluded.active""",
             (
                 self.account_id,
                 source.source_epoch,

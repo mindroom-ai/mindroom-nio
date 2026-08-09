@@ -131,7 +131,7 @@ class SqliteIngestionJournal(JournalRows):
         )
 
     def _assert_file_owner(self) -> None:
-        self._assert_process_owner()
+        self._writer_lock.assert_process_owner()
         if self._closed:
             raise LocalProtocolError("ingestion journal is closed")
         self._writer_lock.assert_identity()
@@ -156,9 +156,6 @@ class SqliteIngestionJournal(JournalRows):
             self._writer_lock.identity
         ):
             raise LocalProtocolError("persisted ingestion lock file identity changed")
-
-    def _assert_process_owner(self) -> None:
-        self._writer_lock.assert_process_owner()
 
     def set_transition_statement_hook(
         self,
@@ -576,13 +573,11 @@ class SqliteIngestionJournal(JournalRows):
             with immediate_transaction(self.connection):
                 cursor = self._transition_execute(
                     "ack_meta",
-                    """
-                    UPDATE NioIngestMeta
+                    """UPDATE NioIngestMeta
                     SET revision = ?, last_acked_sequence = ?,
                         last_acked_batch_id = ?, last_acked_sha256 = ?
                     WHERE account_id = ? AND revision = ? AND writer_epoch = ?
-                      AND last_acked_sequence = ?
-                    """,
+                      AND last_acked_sequence = ?""",
                     (
                         new_revision,
                         ref.sequence,
@@ -624,7 +619,7 @@ class SqliteIngestionJournal(JournalRows):
             self._ack_lock.release()
 
     def close(self) -> None:
-        self._assert_process_owner()
+        self._writer_lock.assert_process_owner()
         if self._closed:
             return
         self.connection.close()

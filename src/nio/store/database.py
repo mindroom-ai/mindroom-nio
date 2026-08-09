@@ -181,9 +181,7 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
-    _ingestion_bootstrap: StoreBootstrap | None = field(
-        default=None, repr=False, compare=False
-    )
+    _ingestion_bootstrap: StoreBootstrap | None = field(default=None, repr=False)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -421,15 +419,13 @@ class MatrixStore:
             self._post_init_legacy_store()
             return
         if bootstrap is not None:
-            try:
-                with bootstrap._claim_store(self):
-                    if not database_has_ingestion_marker(self.database_path):
-                        raise LocalProtocolError(
-                            "StoreBootstrap marker disappeared before store open"
-                        )
-                    self._post_init_ingestion_store(bootstrap)
-            finally:
-                self._ingestion_bootstrap = None
+            self._ingestion_bootstrap = None
+            with bootstrap._claim_store(self):
+                if not database_has_ingestion_marker(self.database_path):
+                    raise LocalProtocolError(
+                        "StoreBootstrap marker disappeared before store open"
+                    )
+                self._post_init_ingestion_store(bootstrap)
             return
 
         with StableFileLock(Path(self.database_path)):
