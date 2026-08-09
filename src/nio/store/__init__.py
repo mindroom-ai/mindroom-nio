@@ -46,3 +46,10 @@ if package_installed("vodozemac"):
         use_database,
         use_database_atomic,
     )
+    from .sync_journal import (
+        EncryptedRowCodec,
+        IngestionJournal,
+        SqliteIngestionJournal,
+        StoreBootstrap,
+        open_ingestion_store,
+    )

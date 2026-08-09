@@ -1,0 +1,915 @@
+import sqlite3
+import hashlib
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+
+from nio.event_provenance import TimelineEventProvenance
+from nio.ingest import (
+    ConsumerBinding,
+    ConsumerBootstrap,
+    EventRecord,
+    LossBoundary,
+    LossReason,
+    LossRecord,
+    RecordKind,
+    RecordOrigin,
+    RoomHydrationStatus,
+    RoomSnapshot,
+    SystemOrigin,
+    SystemOriginKind,
+    TransportKind,
+)
+from nio.ingest.config import (
+    ClassicSourceConfig,
+    IngestionConfig,
+    SlidingSourceConfig,
+)
+from nio.ingest.errors import (
+    FreshIngestionRequired,
+    JournalConflictError,
+    JournalIntegrityError,
+)
+from nio.ingest.state import (
+    AckOutcome,
+    JournalTransition,
+    LaneStatus,
+    ReleasePhase,
+    ReadyRecord,
+    RoomLane,
+    RoomState,
+    SourceState,
+    StagedFrame,
+)
+from nio.ingest.serialization import _loss_id
+from nio.ingest.serialization import batch_from_records
+from nio.exceptions import LocalProtocolError
+from nio.store import SqliteStore
+from nio.store.sync_journal import (
+    EncryptedRowCodec,
+    SqliteIngestionJournal,
+    open_ingestion_store,
+)
+
+ACCOUNT_ID = "@alice:example.org"
+DEVICE_ID = "DEVICE"
+STREAM_ID = UUID("33333333-3333-3333-3333-333333333333")
+
+
+JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
+CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
+
+
+def test_ingestion_config_enforces_frozen_resource_ceilings() -> None:
+    source = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+    consumer = ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION)
+
+    config = IngestionConfig(source=source, consumer=consumer)
+
+    assert config.max_records_per_batch == 256
+    assert config.max_bytes_per_batch == 2 * 1024 * 1024
+    assert config.max_record_bytes == 1024 * 1024
+    with pytest.raises(ValueError, match="max_records_per_batch"):
+        IngestionConfig(
+            source=source,
+            consumer=consumer,
+            max_records_per_batch=257,
+        )
+
+
+def test_source_configs_are_frozen_and_validate_exact_wire_values() -> None:
+    classic = ClassicSourceConfig(timeout_ms=0, filter_json=b"{}")
+    sliding = SlidingSourceConfig(
+        timeout_ms=1,
+        connection_name="main",
+        lists_json=b"{}",
+        room_subscriptions_json=b"{}",
+        extensions_json=b"{}",
+    )
+
+    assert classic.full_state_on_cold_start is True
+    assert sliding.connection_name == "main"
+    with pytest.raises(TypeError, match="timeout_ms"):
+        ClassicSourceConfig(timeout_ms=True, filter_json=b"{}")
+    with pytest.raises(TypeError, match="filter_json"):
+        ClassicSourceConfig(timeout_ms=1, filter_json="{}")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="consumer"):
+        IngestionConfig(source=classic, consumer=object())  # type: ignore[arg-type]
+
+
+def test_ingestion_config_accepts_every_resource_bound_at_one() -> None:
+    source = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+    consumer = ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION)
+
+    config = IngestionConfig(
+        source=source,
+        consumer=consumer,
+        max_staged_frames=1,
+        max_unacknowledged_batches=1,
+        max_records_per_batch=1,
+        max_bytes_per_batch=1,
+        max_record_bytes=1,
+        max_crypto_inputs_per_commit=1,
+        max_crypto_input_bytes_per_commit=1,
+        sqlite_busy_timeout_ms=1,
+        sqlite_write_retry_limit=1,
+        max_concurrent_recovery_rooms=1,
+        max_concurrent_room_hydrations=1,
+        sliding_bootstrap_range_size=1,
+        max_recovery_events_per_room=1,
+        max_held_events_per_room=1,
+        max_held_bytes_per_room=1,
+    )
+
+    assert config.max_held_bytes_per_room == 1
+    with pytest.raises(ValueError, match="max_bytes_per_batch"):
+        IngestionConfig(
+            source=source,
+            consumer=consumer,
+            max_bytes_per_batch=2 * 1024 * 1024 + 1,
+        )
+    with pytest.raises(ValueError, match="max_record_bytes"):
+        IngestionConfig(
+            source=source,
+            consumer=consumer,
+            max_record_bytes=1024 * 1024 + 1,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "max_staged_frames",
+        "max_unacknowledged_batches",
+        "max_records_per_batch",
+        "max_bytes_per_batch",
+        "max_record_bytes",
+        "max_crypto_inputs_per_commit",
+        "max_crypto_input_bytes_per_commit",
+        "sqlite_busy_timeout_ms",
+        "sqlite_write_retry_limit",
+        "max_concurrent_recovery_rooms",
+        "max_concurrent_room_hydrations",
+        "sliding_bootstrap_range_size",
+        "max_recovery_events_per_room",
+        "max_held_events_per_room",
+        "max_held_bytes_per_room",
+    ),
+)
+def test_ingestion_config_rejects_nonpositive_bounds(field: str) -> None:
+    values = {
+        "source": ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}"),
+        "consumer": ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+        field: 0,
+    }
+
+    with pytest.raises(ValueError, match=field):
+        IngestionConfig(**values)
+
+
+def _table_names(database_path: Path) -> set[str]:
+    with sqlite3.connect(database_path) as connection:
+        return {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+
+def test_fresh_open_creates_independent_v1_schema_with_marker_first(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+        statement_observer=statements.append,
+    )
+    database_path = tmp_path / "journal.db"
+    try:
+        with sqlite3.connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT account_id, device_id, schema_version " "FROM NioIngestMeta"
+            ).fetchone()
+        assert row == (ACCOUNT_ID, DEVICE_ID, 1)
+        assert bootstrap.schema_version == 1
+        schema_mutations = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
+        ]
+        assert schema_mutations[0].startswith("CREATE TABLE NioIngestMeta")
+    finally:
+        bootstrap.close()
+
+
+def test_opening_v1_journal_never_reads_or_alters_legacy_sync_tables(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    bootstrap.close()
+    legacy_tables = (
+        "SyncTokens",
+        "SyncRecoveryGaps",
+        "SyncRecoveryAbandonedRooms",
+        "PendingTimelineEvents",
+        "SlidingWindowTokens",
+    )
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        for table in legacy_tables:
+            connection.execute(f'CREATE TABLE "{table}" (evidence TEXT)')
+            connection.execute(f'INSERT INTO "{table}" VALUES (?)', (table,))
+
+    statements: list[str] = []
+    reopened = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+        statement_observer=statements.append,
+    )
+    reopened.close()
+
+    assert all(table not in "\n".join(statements) for table in legacy_tables)
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        for table in legacy_tables:
+            assert connection.execute(f'SELECT evidence FROM "{table}"').fetchone() == (
+                table,
+            )
+
+
+def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> None:
+    first = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        with pytest.raises(LocalProtocolError, match="writer lock"):
+            open_ingestion_store(
+                tmp_path,
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                database_name="journal.db",
+            )
+    finally:
+        first.close()
+
+    with pytest.raises(LocalProtocolError, match="account_id"):
+        open_ingestion_store(
+            tmp_path,
+            account_id="@mallory:example.org",
+            device_id=DEVICE_ID,
+            database_name="journal.db",
+        )
+    with pytest.raises(LocalProtocolError, match="device_id"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id="OTHER",
+            database_name="journal.db",
+        )
+
+
+def test_schema_version_is_validated_independently(tmp_path: Path) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    bootstrap.close()
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        connection.execute("UPDATE NioIngestMeta SET schema_version = 10")
+
+    with pytest.raises(LocalProtocolError, match="schema_version"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name="journal.db",
+        )
+
+
+def test_nonempty_unmarked_database_is_refused_without_sql_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "legacy.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE Accounts (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO Accounts DEFAULT VALUES")
+
+    import nio.store.sync_journal as sync_journal
+
+    real_connect = sqlite3.connect
+    statements: list[str] = []
+
+    def observed_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sync_journal.sqlite3, "connect", observed_connect)
+
+    with pytest.raises(FreshIngestionRequired):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name="legacy.db",
+        )
+
+    assert _table_names(database_path) == {"Accounts"}
+    assert all(
+        statement.lstrip().upper().startswith("SELECT ") for statement in statements
+    )
+
+
+def test_v1_marker_blocks_legacy_store_but_bootstrap_opens_only_e2ee_tables(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        with pytest.raises(LocalProtocolError, match="ingestion v1"):
+            SqliteStore(
+                ACCOUNT_ID,
+                DEVICE_ID,
+                str(tmp_path),
+                database_name="journal.db",
+            )
+
+        store = bootstrap.open_matrix_store(SqliteStore)
+        try:
+            tables = _table_names(tmp_path / "journal.db")
+            assert "accounts" in tables
+            assert "NioIngestMeta" in tables
+            assert (
+                not {
+                    "synctokens",
+                    "syncrecoverygaps",
+                    "syncrecoveryabandonedrooms",
+                    "pendingtimelineevents",
+                    "slidingwindowtokens",
+                }
+                & tables
+            )
+        finally:
+            store.database.close()
+    finally:
+        bootstrap.close()
+
+
+def test_queue_database_is_refused_before_ingestion_schema_creation(
+    tmp_path: Path,
+) -> None:
+    from playhouse.sqliteq import SqliteQueueDatabase
+
+    database_path = tmp_path / "queued.db"
+    database = SqliteQueueDatabase(database_path)
+
+    with pytest.raises(LocalProtocolError, match="SqliteQueueDatabase"):
+        SqliteIngestionJournal.open(
+            database,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+        )
+
+    assert "NioIngestMeta" not in _table_names(database_path)
+
+
+def _consumer_bootstrap(
+    bootstrap,
+    room_ids: tuple[str, ...] = (),
+    *,
+    consumer_generation: UUID = CONSUMER_GENERATION,
+    baseline_sha256: bytes | None = None,
+) -> ConsumerBootstrap:
+    canonical = (
+        b"[" + b",".join(b'"' + room.encode() + b'"' for room in room_ids) + b"]"
+    )
+    return ConsumerBootstrap(
+        bootstrap.binding_operation_id,
+        ConsumerBinding(JOURNAL_GENERATION, consumer_generation),
+        bootstrap.next_batch_sequence,
+        room_ids,
+        baseline_sha256 or hashlib.sha256(canonical).digest(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    room_ids = ("!alpha:example.org", "!beta:example.org")
+    consumer = _consumer_bootstrap(bootstrap, room_ids)
+    try:
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            bootstrap.journal.oldest_unacknowledged()
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            bootstrap.assert_http_enabled()
+
+        await bootstrap.attach_consumer(consumer)
+        bootstrap.assert_http_enabled()
+
+        owner = bootstrap.journal.load_owner()
+        assert owner.binding == consumer.binding
+        assert owner.baseline_rooms_sha256 == consumer.baseline_sha256
+        assert owner.consumer_attached_revision == 1
+        rooms = bootstrap.journal.load_rooms(frozenset(room_ids))
+        assert set(rooms) == set(room_ids)
+        assert all(room.state.current_membership_epoch == 0 for room in rooms.values())
+        assert all(room.active_lane.membership_epoch == 0 for room in rooms.values())
+        assert all(
+            room.state.hydration_status is RoomHydrationStatus.PENDING
+            for room in rooms.values()
+        )
+
+        ready = bootstrap.journal.load_ready_heads(limit=10)
+        assert [row.ready_order for row in ready] == [0, 1]
+        assert [row.record.room_id for row in ready] == list(room_ids)
+        assert all(isinstance(row.record, LossRecord) for row in ready)
+        for row in ready:
+            loss = row.record
+            assert isinstance(loss, LossRecord)
+            assert loss.reason is LossReason.BASELINE_LOST
+            assert loss.membership_epoch == 0
+            assert loss.origin == SystemOrigin(
+                SystemOriginKind.FRESH_START,
+                bootstrap.binding_operation_id,
+            )
+            assert loss.boundary == LossBoundary(None, None, None, None)
+            assert loss.detail_json == (
+                b'{"cause":"fresh_start","scope":"consumer_baseline"}'
+            )
+
+        revision = owner.revision
+        await bootstrap.attach_consumer(consumer)
+        assert bootstrap.journal.load_owner().revision == revision
+        assert bootstrap.journal.load_ready_heads(limit=10) == ready
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_consumer_rejects_digest_operation_sequence_and_retry_drift(
+    tmp_path: Path,
+) -> None:
+    room_ids = ("!alpha:example.org",)
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        valid = _consumer_bootstrap(bootstrap, room_ids)
+        with pytest.raises(LocalProtocolError, match="baseline_sha256"):
+            await bootstrap.attach_consumer(
+                _consumer_bootstrap(bootstrap, room_ids, baseline_sha256=b"x" * 32)
+            )
+        assert bootstrap.journal.load_owner().binding is None
+
+        wrong_operation = ConsumerBootstrap(
+            UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            valid.binding,
+            valid.first_sequence,
+            valid.baseline_room_ids,
+            valid.baseline_sha256,
+        )
+        with pytest.raises(LocalProtocolError, match="binding_operation_id"):
+            await bootstrap.attach_consumer(wrong_operation)
+
+        wrong_sequence = ConsumerBootstrap(
+            valid.binding_operation_id,
+            valid.binding,
+            valid.first_sequence + 1,
+            valid.baseline_room_ids,
+            valid.baseline_sha256,
+        )
+        with pytest.raises(LocalProtocolError, match="first_sequence"):
+            await bootstrap.attach_consumer(wrong_sequence)
+
+        await bootstrap.attach_consumer(valid)
+        with pytest.raises(LocalProtocolError, match="consumer binding"):
+            await bootstrap.attach_consumer(
+                _consumer_bootstrap(
+                    bootstrap,
+                    room_ids,
+                    consumer_generation=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                )
+            )
+    finally:
+        bootstrap.close()
+
+
+def test_encrypted_row_codec_authenticates_every_aad_dimension() -> None:
+    digest = hashlib.sha256(b"payload").digest()
+    codec = EncryptedRowCodec("secret", ACCOUNT_ID, STREAM_ID)
+    ciphertext = codec.encrypt("NioIngestFrame", ("frame-1",), b"payload", digest)
+
+    assert (
+        codec.decrypt(
+            "NioIngestFrame",
+            ("frame-1",),
+            ciphertext,
+            digest,
+        )
+        == b"payload"
+    )
+    swaps = (
+        (
+            EncryptedRowCodec("secret", "@other:example.org", STREAM_ID),
+            "NioIngestFrame",
+            ("frame-1",),
+            digest,
+        ),
+        (codec, "NioIngestBatch", ("frame-1",), digest),
+        (codec, "NioIngestFrame", ("frame-2",), digest),
+        (
+            EncryptedRowCodec(
+                "secret", ACCOUNT_ID, UUID("44444444-4444-4444-4444-444444444444")
+            ),
+            "NioIngestFrame",
+            ("frame-1",),
+            digest,
+        ),
+        (codec, "NioIngestFrame", ("frame-1",), b"z" * 32),
+    )
+    for swapped_codec, table, primary_key, swapped_digest in swaps:
+        with pytest.raises(JournalIntegrityError):
+            swapped_codec.decrypt(
+                table,
+                primary_key,
+                ciphertext,
+                swapped_digest,
+            )
+
+
+def _lifecycle(room_id: str, membership_epoch: int, frame_index: int) -> EventRecord:
+    return EventRecord(
+        f"lifecycle-{membership_epoch}",
+        RecordKind.ROOM_LIFECYCLE,
+        RecordOrigin(TransportKind.CLASSIC, 1, 1, frame_index),
+        room_id,
+        membership_epoch,
+        membership_epoch,
+        None,
+        TimelineEventProvenance.LIVE,
+        f'{{"epoch":{membership_epoch}}}'.encode(),
+        None,
+    )
+
+
+def _snapshot(room_id: str, membership_epoch: int) -> RoomSnapshot:
+    return RoomSnapshot(
+        room_id,
+        membership_epoch,
+        ACCOUNT_ID,
+        "join",
+        True,
+        "Room",
+        None,
+        None,
+        None,
+        "invite",
+        "11",
+        "forbidden",
+        None,
+        (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_room_state_round_trips_active_lane_and_retiring_epoch_chain(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_id = "!room:example.org"
+    state = RoomState(
+        room_id=room_id,
+        current_membership_epoch=3,
+        next_room_sequence=8,
+        hydration_status=RoomHydrationStatus.READY,
+        snapshot=_snapshot(room_id, 3),
+    )
+    lanes = (
+        RoomLane(
+            room_id=room_id,
+            membership_epoch=1,
+            lane_status=LaneStatus.RETIRING,
+            successor_membership_epoch=2,
+            pending_lifecycle=_lifecycle(room_id, 2, 0),
+        ),
+        RoomLane(
+            room_id=room_id,
+            membership_epoch=2,
+            lane_status=LaneStatus.RETIRING,
+            successor_membership_epoch=3,
+            pending_lifecycle=_lifecycle(room_id, 3, 1),
+        ),
+        RoomLane(
+            room_id=room_id,
+            membership_epoch=3,
+            lane_status=LaneStatus.ACTIVE,
+            release_phase=ReleasePhase.IDLE,
+        ),
+    )
+    try:
+        bootstrap.journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(room_states=(state,), room_lanes=lanes),
+        )
+    finally:
+        bootstrap.close()
+
+    reopened = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        aggregate = reopened.journal.load_rooms(frozenset({room_id}))[room_id]
+        assert aggregate.state == state
+        assert aggregate.active_lane == lanes[2]
+        assert aggregate.retiring_lanes == lanes[:2]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_one_room_transition_never_scans_or_rewrites_other_rooms(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    room_a = "!a:example.org"
+    room_b = "!b:example.org"
+    initial = JournalTransition(
+        room_states=(
+            RoomState(room_a, 1, 1, RoomHydrationStatus.READY, _snapshot(room_a, 1)),
+            RoomState(room_b, 1, 1, RoomHydrationStatus.READY, _snapshot(room_b, 1)),
+        ),
+        room_lanes=(
+            RoomLane(room_a, 1, LaneStatus.ACTIVE),
+            RoomLane(room_b, 1, LaneStatus.ACTIVE),
+        ),
+    )
+    bootstrap.journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap.journal.writer_epoch,
+        transition=initial,
+    )
+    statements: list[str] = []
+    bootstrap.journal.connection.set_trace_callback(statements.append)
+    try:
+        updated_a = RoomState(
+            room_a,
+            1,
+            2,
+            RoomHydrationStatus.READY,
+            _snapshot(room_a, 1),
+        )
+        bootstrap.journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(room_states=(updated_a,)),
+        )
+
+        aggregate_b = bootstrap.journal.load_rooms(frozenset({room_b}))[room_b]
+        assert aggregate_b.state.next_room_sequence == 1
+        room_queries = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+            and ("NioIngestRoomState" in statement or "NioIngestRoomLane" in statement)
+        ]
+        assert room_queries
+        assert all("room_id IN" in statement for statement in room_queries)
+        writes = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE"))
+            and ("NioIngestRoomState" in statement or "NioIngestRoomLane" in statement)
+        ]
+        assert all(room_b not in statement for statement in writes)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_wrong_revision_or_writer_epoch_refuses_transition_without_write(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    transition = JournalTransition(
+        source_state=SourceState(1, TransportKind.CLASSIC, b'"cursor"', 2, True)
+    )
+    try:
+        with pytest.raises(JournalConflictError):
+            bootstrap.journal.commit(
+                expected_revision=0,
+                writer_epoch=bootstrap.journal.writer_epoch,
+                transition=transition,
+            )
+        with pytest.raises(JournalConflictError):
+            bootstrap.journal.commit(
+                expected_revision=1,
+                writer_epoch=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                transition=transition,
+            )
+        assert bootstrap.journal.load_owner().revision == 1
+        assert bootstrap.journal.load_source() is None
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_loss_round_trips_after_its_source_frame_is_compacted(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = StagedFrame(
+        UUID("55555555-5555-5555-5555-555555555555"),
+        4,
+        9,
+        b'{"next_batch":"s10"}',
+    )
+    origin = RecordOrigin(TransportKind.CLASSIC, 4, 9, 3)
+    boundary = LossBoundary("$prior", 1_700_000_000_000, "s1", "s9")
+    incomplete = LossRecord(
+        "",
+        origin,
+        "!loss:example.org",
+        7,
+        LossReason.FETCH_FAILED,
+        boundary,
+        b'{"errcode":"M_FORBIDDEN"}',
+    )
+    loss = LossRecord(
+        _loss_id(bootstrap.stream_id, incomplete),
+        origin,
+        incomplete.room_id,
+        incomplete.membership_epoch,
+        incomplete.reason,
+        boundary,
+        incomplete.detail_json,
+    )
+    try:
+        bootstrap.journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,), losses=(loss,)),
+        )
+        bootstrap.journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(delete_frame_ids=(frame.frame_id,)),
+        )
+        assert bootstrap.journal.load_frame(frame.frame_id) is None
+
+        loaded = bootstrap.journal.load_loss(loss.loss_id)
+        assert loaded == loss
+        row = bootstrap.journal.connection.execute(
+            "SELECT origin_sha256, boundary_sha256, detail_sha256, loss_sha256 "
+            "FROM NioIngestLoss WHERE account_id = ? AND loss_id = ?",
+            (ACCOUNT_ID, loss.loss_id),
+        ).fetchone()
+        assert all(len(bytes(value)) == 32 for value in row)
+    finally:
+        bootstrap.close()
+
+
+def _batch_event(sequence: int) -> EventRecord:
+    return EventRecord(
+        f"batch-record-{sequence}",
+        RecordKind.GLOBAL_ACCOUNT_DATA,
+        RecordOrigin(TransportKind.CLASSIC, 1, sequence, 0),
+        None,
+        None,
+        None,
+        None,
+        None,
+        f'{{"sequence":{sequence}}}'.encode(),
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    batches = tuple(
+        batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer=consumer.binding,
+            stream_id=bootstrap.stream_id,
+            sequence=sequence,
+            created_revision=2,
+            records=(_batch_event(sequence),),
+        )
+        for sequence in range(1, 4)
+    )
+    try:
+        bootstrap.journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(batches=batches),
+        )
+        assert bootstrap.journal.oldest_unacknowledged() == batches[0]
+
+        with pytest.raises(JournalConflictError, match="out of order"):
+            bootstrap.journal.acknowledge(batches[1].ref)
+        wrong_digest = type(batches[0].ref)(
+            batches[0].ref.stream_id,
+            batches[0].ref.sequence,
+            batches[0].ref.batch_id,
+            b"x" * 32,
+        )
+        with pytest.raises(JournalConflictError, match="reference"):
+            bootstrap.journal.acknowledge(wrong_digest)
+
+        assert bootstrap.journal.acknowledge(batches[0].ref) is AckOutcome.ACKNOWLEDGED
+        assert (
+            bootstrap.journal.acknowledge(batches[0].ref)
+            is AckOutcome.ALREADY_ACKNOWLEDGED
+        )
+        with pytest.raises(JournalConflictError, match="reference"):
+            bootstrap.journal.acknowledge(wrong_digest)
+
+        assert bootstrap.journal.acknowledge(batches[1].ref) is AckOutcome.ACKNOWLEDGED
+        rows = bootstrap.journal.connection.execute(
+            "SELECT sequence, acknowledged_revision FROM NioIngestBatch "
+            "WHERE account_id = ? ORDER BY sequence",
+            (ACCOUNT_ID,),
+        ).fetchall()
+        assert [(row[0], row[1] is not None) for row in rows] == [
+            (2, True),
+            (3, False),
+        ]
+        with pytest.raises(JournalConflictError, match="stale"):
+            bootstrap.journal.acknowledge(batches[0].ref)
+        assert bootstrap.journal.oldest_unacknowledged() == batches[2]
+    finally:
+        bootstrap.close()

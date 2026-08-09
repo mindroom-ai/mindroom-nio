@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING, ClassVar
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
         PendingTimelineEvent,
         RecoveryGap,
     )
+    from .sync_journal import StoreBootstrap
 
 
 _RECOVERY_PAYLOAD_VERSION = 1
@@ -81,6 +83,50 @@ _RECOVERY_TAG_SIZE = 16
 # SQLite's legacy 999-variable statement limit.
 _RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
+_INGESTION_STORE_BOOTSTRAP: ContextVar[StoreBootstrap | None] = ContextVar(
+    "nio_ingestion_store_bootstrap",
+    default=None,
+)
+
+
+def _database_has_ingestion_marker(database_path: str) -> bool:
+    if not os.path.exists(database_path) or os.path.getsize(database_path) == 0:
+        return False
+    connection = sqlite3.connect(
+        f"file:{os.path.abspath(database_path)}?mode=ro",
+        uri=True,
+    )
+    try:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'NioIngestMeta'"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        connection.close()
+
+
+def _open_matrix_store_from_ingestion(
+    bootstrap: StoreBootstrap,
+    store_class: type[MatrixStore],
+    pickle_key: str,
+) -> MatrixStore:
+    if not isinstance(store_class, type) or not issubclass(store_class, MatrixStore):
+        raise TypeError("store_class must be a MatrixStore subclass")
+    bootstrap.journal._assert_open()
+    token = _INGESTION_STORE_BOOTSTRAP.set(bootstrap)
+    try:
+        return store_class(
+            bootstrap.journal.account_id,
+            bootstrap.journal.device_id,
+            str(bootstrap.database_path.parent),
+            pickle_key=pickle_key,
+            database_name=bootstrap.database_path.name,
+        )
+    finally:
+        _INGESTION_STORE_BOOTSTRAP.reset(token)
 
 
 def _recovery_payload_aad(
@@ -386,6 +432,21 @@ class MatrixStore:
     def __post_init__(self):
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
+        bootstrap = _INGESTION_STORE_BOOTSTRAP.get()
+        marker_exists = _database_has_ingestion_marker(self.database_path)
+        if marker_exists:
+            if bootstrap is None:
+                raise LocalProtocolError(
+                    "this database is owned by ingestion v1; direct legacy store "
+                    "construction is unsupported"
+                )
+            self._post_init_ingestion_store(bootstrap)
+            return
+        if bootstrap is not None:
+            raise LocalProtocolError(
+                "StoreBootstrap marker disappeared before store open"
+            )
+
         self.database = self._create_database()
         self.database.connect()
 
@@ -420,6 +481,76 @@ class MatrixStore:
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
         self._repair_v10_recovery_abandonments()
+
+    def _post_init_ingestion_store(self, bootstrap: StoreBootstrap) -> None:
+        bootstrap.journal._assert_open()
+        if os.path.realpath(self.database_path) != os.path.realpath(
+            bootstrap.database_path
+        ):
+            raise LocalProtocolError("StoreBootstrap database path does not match")
+        if self.user_id != bootstrap.journal.account_id:
+            raise LocalProtocolError("StoreBootstrap account_id does not match")
+        if self.device_id != bootstrap.journal.device_id:
+            raise LocalProtocolError("StoreBootstrap device_id does not match")
+
+        self.database = self._create_database()
+        if isinstance(self.database, SqliteQueueDatabase):
+            raise LocalProtocolError(
+                "SqliteQueueDatabase cannot open an ingestion-v1 store"
+            )
+        self.database.connect()
+        try:
+            row = self.database.execute_sql(
+                "SELECT account_id, device_id, schema_version, writer_epoch "
+                "FROM NioIngestMeta"
+            ).fetchone()
+            if row != (
+                self.user_id,
+                self.device_id,
+                1,
+                str(bootstrap.journal.writer_epoch),
+            ):
+                raise LocalProtocolError(
+                    "StoreBootstrap no longer matches the ingestion-v1 marker"
+                )
+
+            e2ee_models = [
+                Accounts,
+                OlmSessions,
+                MegolmInboundSessions,
+                ForwardedChains,
+                DeviceKeys,
+                EncryptedRooms,
+                OutgoingKeyRequests,
+                Keys,
+            ]
+            if DeviceTrustState in self.models:
+                e2ee_models.append(DeviceTrustState)
+            existing_tables = set(self.database.get_tables())
+            expected_tables = {
+                model._meta.table_name for model in [StoreVersion, *e2ee_models]
+            }
+            present_e2ee = expected_tables & existing_tables
+
+            with self.database.bind_ctx([StoreVersion, *e2ee_models]):
+                if not present_e2ee:
+                    with self.database.atomic():
+                        self.database.create_tables([StoreVersion, *e2ee_models])
+                        StoreVersion.create(version=self.store_version)
+                else:
+                    if present_e2ee != expected_tables:
+                        raise LocalProtocolError(
+                            "ingestion-v1 store has an incomplete E2EE schema"
+                        )
+                    versions = tuple(StoreVersion.select())
+                    if len(versions) != 1 or versions[0].version != self.store_version:
+                        raise LocalProtocolError(
+                            "ingestion-v1 store requires the supported E2EE schema"
+                        )
+            self._ingestion_v1_store = True
+        except BaseException:
+            self.database.close()
+            raise
 
     def _get_store_version(self):
         with self.database.bind_ctx([StoreVersion]):
