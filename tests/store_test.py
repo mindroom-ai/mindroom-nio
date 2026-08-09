@@ -218,6 +218,30 @@ class TestClass:
         finally:
             store.database.close()
 
+    def test_memory_store_creates_no_filesystem_sidecar(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        store = SqliteMemoryStore("@memory:example.org", "DEVICE")
+        try:
+            assert store.database.database == ":memory:"
+            assert tuple(tmp_path.iterdir()) == ()
+        finally:
+            store.database.close()
+
+    def test_memory_store_opens_from_read_only_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        read_only = tmp_path / "read-only"
+        read_only.mkdir()
+        read_only.chmod(0o555)
+        monkeypatch.chdir(read_only)
+        try:
+            store = SqliteMemoryStore("@memory:example.org", "DEVICE")
+            store.database.close()
+            assert tuple(read_only.iterdir()) == ()
+        finally:
+            read_only.chmod(0o755)
+
     def test_atomic_recovery_capability_requires_each_subclass_to_opt_in(self):
         assert MatrixStore.supports_atomic_recovery is False
         assert DefaultStore.supports_atomic_recovery is True

@@ -154,6 +154,7 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
+    requires_filesystem_coordination: ClassVar[bool] = True
     supports_atomic_recovery: ClassVar[bool] = False
     supports_recovery_abandonment_reasons: ClassVar[bool] = False
     models = [
@@ -414,6 +415,11 @@ class MatrixStore:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
         bootstrap = self._ingestion_bootstrap
+        if not self.requires_filesystem_coordination:
+            if bootstrap is not None:
+                raise LocalProtocolError("memory store cannot use StoreBootstrap")
+            self._post_init_legacy_store()
+            return
         if bootstrap is not None:
             try:
                 with bootstrap._claim_store(self):
@@ -2040,6 +2046,7 @@ class SqliteMemoryStore(SqliteStore):
             encryption keys while they are in storage.
     """
 
+    requires_filesystem_coordination: ClassVar[bool] = False
     supports_atomic_recovery: ClassVar[bool] = True
     supports_recovery_abandonment_reasons: ClassVar[bool] = True
 
