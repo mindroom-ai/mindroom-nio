@@ -7,7 +7,7 @@ from uuid import UUID
 
 from ..exceptions import LocalProtocolError
 from ..ingest.model import ConsumerBootstrap
-from ._sync_journal import SqliteIngestionJournal
+from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 class StoreBootstrap:
     """Single-owner preflight handle retaining the ingestion writer lock."""
 
-    def __init__(self, journal: SqliteIngestionJournal) -> None:
+    def __init__(self, journal: _SqliteIngestionJournal) -> None:
         self._journal = journal
         self._store: MatrixStore | None = None
 
@@ -88,7 +88,7 @@ def open_ingestion_store(
     schema_statement_hook: Callable[[str], None] | None = None,
 ) -> StoreBootstrap:
     database_name = database_name or f"{account_id}_{device_id}.db"
-    journal = SqliteIngestionJournal.open(
+    journal = _SqliteIngestionJournal.open(
         Path(store_path) / database_name,
         account_id=account_id,
         device_id=device_id,

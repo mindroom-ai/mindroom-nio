@@ -71,12 +71,14 @@ CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 
 def test_store_public_surface_exposes_only_ingestion_bootstrap() -> None:
     import nio.store as store_api
+    import nio.store.sync_journal as bootstrap_api
 
     assert store_api.StoreBootstrap is not None
     assert store_api.open_ingestion_store is not None
     assert not hasattr(store_api, "EncryptedRowCodec")
     assert not hasattr(store_api, "IngestionJournal")
     assert not hasattr(store_api, "SqliteIngestionJournal")
+    assert not hasattr(bootstrap_api, "SqliteIngestionJournal")
 
 
 def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() -> None:
