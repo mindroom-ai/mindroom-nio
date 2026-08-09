@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from Crypto.Cipher import AES
-from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
+from peewee import EXCLUDED, Case, DoesNotExist, Model, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -78,7 +78,8 @@ if TYPE_CHECKING:
         PendingTimelineEvent,
         RecoveryGap,
     )
-    from .sync_journal import StoreBootstrap, _StoreOwnershipLease
+    from ._ingestion_store_owner import IngestionStoreOwner
+    from .sync_journal import StoreBootstrap
 
 
 _RECOVERY_PAYLOAD_VERSION = 1
@@ -95,9 +96,8 @@ def _open_matrix_store_from_ingestion(
     store_class: type[MatrixStore],
     pickle_key: str,
 ) -> MatrixStore:
-    if not isinstance(store_class, type) or not issubclass(store_class, MatrixStore):
-        raise TypeError("store_class must be a MatrixStore subclass")
-    bootstrap._journal._assert_file_owner()
+    if store_class is not SqliteStore:
+        raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
     return store_class(
         bootstrap._journal.account_id,
         bootstrap._journal.device_id,
@@ -124,7 +124,13 @@ def use_database(fn):
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self._database_operation():
+        owner = self._ingestion_owner
+        if owner is not None:
+            self._assert_ingestion_view()
+            with owner.read():
+                with self.database.bind_ctx(self.models):
+                    return fn(self, *args, **kwargs)
+        with nullcontext():
             with self.database.bind_ctx(self.models):
                 return fn(self, *args, **kwargs)
 
@@ -136,7 +142,14 @@ def use_database_atomic(fn):
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self._database_operation():
+        owner = self._ingestion_owner
+        if owner is not None:
+            self._assert_ingestion_view()
+            with owner.e2ee_write():
+                with self.database.bind_ctx(self.models):
+                    with self.database.atomic():
+                        return fn(self, *args, **kwargs)
+        with nullcontext():
             with self.database.bind_ctx(self.models):
                 if isinstance(self.database, SqliteQueueDatabase):
                     return fn(self, *args, **kwargs)
@@ -179,9 +192,11 @@ class MatrixStore:
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
     _ingestion_bootstrap: StoreBootstrap | None = field(default=None, repr=False)
-    _ingestion_lease: _StoreOwnershipLease | None = field(
+    _ingestion_owner: IngestionStoreOwner | None = field(
         default=None, init=False, repr=False
     )
+    _ingestion_revoked: bool = field(default=False, init=False, repr=False)
+    _ingestion_initialized: bool = field(default=False, init=False, repr=False)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -199,15 +214,16 @@ class MatrixStore:
             },
         )
 
-    def _database_operation(self):
-        lease = self._ingestion_lease
-        return lease.operation(self.database) if lease is not None else nullcontext()
+    def _assert_ingestion_view(self) -> None:
+        if self._ingestion_revoked:
+            raise LocalProtocolError("borrowed ingestion store is revoked")
 
     def _revoke_ingestion_lease(self) -> None:
-        assert self._ingestion_lease is not None
-        self._ingestion_lease.revoke()
+        if self._ingestion_owner is None:
+            raise LocalProtocolError("store is not borrowed from ingestion")
+        self._ingestion_revoked = True
 
-    @use_database
+    @use_database_atomic
     def upgrade_to_v2(self):
         with self.database.bind_ctx([DeviceKeys_v1]):
             self.database.drop_tables(
@@ -222,20 +238,20 @@ class MatrixStore:
             self.database.create_tables([DeviceKeys, DeviceTrustState])
         self._update_version(2)
 
-    @use_database
+    @use_database_atomic
     def upgrade_to_v3(self):
         with self.database.bind_ctx(self.models):
             self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
         self._update_version(3)
 
-    @use_database
+    @use_database_atomic
     def upgrade_to_v5(self):
         with self.database.bind_ctx(self.models):
             self.database.drop_tables([SlidingWindowTokens], safe=True)
             self.database.create_tables([SlidingWindowTokens])
         self._update_version(5)
 
-    @use_database
+    @use_database_atomic
     def upgrade_to_v6(self):
         with self.database.bind_ctx(self.models):
             table = PendingTimelineEvents._meta.table_name
@@ -432,12 +448,8 @@ class MatrixStore:
             return
         if bootstrap is not None:
             self._ingestion_bootstrap = None
-            with bootstrap._claim_store(self) as lease:
-                self._ingestion_lease = lease
-                if not database_has_ingestion_marker(self.database_path):
-                    raise LocalProtocolError(
-                        "StoreBootstrap marker disappeared before store open"
-                    )
+            with bootstrap._claim_store(self):
+                self._ingestion_owner = bootstrap._journal._owner
                 self._post_init_ingestion_store(bootstrap)
             return
 
@@ -486,7 +498,11 @@ class MatrixStore:
         self._repair_v10_recovery_abandonments()
 
     def _post_init_ingestion_store(self, bootstrap: StoreBootstrap) -> None:
-        bootstrap._journal._assert_file_owner()
+        if self._ingestion_initialized:
+            raise LocalProtocolError("borrowed ingestion store is already initialized")
+        owner = self._ingestion_owner
+        if owner is None:
+            raise LocalProtocolError("borrowed ingestion store has no owner")
         if os.path.realpath(self.database_path) != os.path.realpath(
             bootstrap.database_path
         ):
@@ -496,18 +512,13 @@ class MatrixStore:
         if self.device_id != bootstrap._journal.device_id:
             raise LocalProtocolError("StoreBootstrap device_id does not match")
 
-        self.database = self._create_database()
-        if isinstance(self.database, SqliteQueueDatabase):
-            raise LocalProtocolError(
-                "SqliteQueueDatabase cannot open an ingestion-v1 store"
-            )
-        self.database.connect()
-        try:
+        self.database = owner.database
+        with owner.read():
             row = self.database.execute_sql(
                 "SELECT account_id, device_id, schema_version, writer_epoch "
                 "FROM NioIngestMeta"
             ).fetchone()
-            if row != (
+            if row is None or tuple(row) != (
                 self.user_id,
                 self.device_id,
                 1,
@@ -517,7 +528,7 @@ class MatrixStore:
                     "StoreBootstrap no longer matches the ingestion-v1 marker"
                 )
 
-            e2ee_models = [
+            e2ee_models: list[type[Model]] = [
                 Accounts,
                 OlmSessions,
                 MegolmInboundSessions,
@@ -530,43 +541,30 @@ class MatrixStore:
             if DeviceTrustState in self.models:
                 e2ee_models.append(DeviceTrustState)
             existing_tables = set(self.database.get_tables())
-            expected_tables = {
-                model._meta.table_name for model in [StoreVersion, *e2ee_models]
-            }
+            expected_tables = {model._meta.table_name for model in e2ee_models}
+            expected_tables.add(StoreVersion._meta.table_name)
             present_e2ee = expected_tables & existing_tables
 
-            with self.database.bind_ctx([StoreVersion, *e2ee_models]):
-                if not present_e2ee:
-                    with self.database.atomic("IMMEDIATE"):
-                        cursor = self.database.execute_sql(
-                            "UPDATE NioIngestMeta "
-                            "SET writer_epoch = writer_epoch "
-                            "WHERE account_id = ? AND writer_epoch = ?",
-                            (
-                                self.user_id,
-                                str(bootstrap._journal.writer_epoch),
-                            ),
-                        )
-                        if cursor.rowcount != 1:
-                            raise LocalProtocolError(
-                                "ingestion writer_epoch changed during E2EE setup"
-                            )
+            if present_e2ee and present_e2ee != expected_tables:
+                raise LocalProtocolError(
+                    "ingestion-v1 store has an incomplete E2EE schema"
+                )
+
+        with self.database.bind_ctx([StoreVersion, *e2ee_models]):
+            if not present_e2ee:
+                with owner.e2ee_write():
+                    with self.database.atomic():
                         self.database.create_tables([StoreVersion, *e2ee_models])
                         StoreVersion.create(version=self.store_version)
-                else:
-                    if present_e2ee != expected_tables:
-                        raise LocalProtocolError(
-                            "ingestion-v1 store has an incomplete E2EE schema"
-                        )
+            else:
+                with owner.read():
                     versions = tuple(StoreVersion.select())
                     if len(versions) != 1 or versions[0].version != self.store_version:
                         raise LocalProtocolError(
                             "ingestion-v1 store requires the supported E2EE schema"
                         )
-            self._ingestion_v1_store = True
-        except BaseException:
-            self.database.close()
-            raise
+        self._ingestion_v1_store = True
+        self._ingestion_initialized = True
 
     def _get_store_version(self):
         with self.database.bind_ctx([StoreVersion]):
@@ -613,7 +611,7 @@ class MatrixStore:
 
         return olm_account
 
-    @use_database
+    @use_database_atomic
     def save_account(self, account):
         """Save the provided Olm account to the database.
 
@@ -637,7 +635,7 @@ class MatrixStore:
             (Accounts.user_id == self.user_id) & (Accounts.device_id == self.device_id)
         ).execute()
 
-    @use_database
+    @use_database_atomic
     def load_sessions(self) -> SessionStore:
         """Load all Olm sessions from the database.
 
@@ -663,7 +661,7 @@ class MatrixStore:
 
         return session_store
 
-    @use_database
+    @use_database_atomic
     def save_session(self, curve_key, session):
         """Save the provided Olm session to the database.
 
@@ -684,7 +682,7 @@ class MatrixStore:
             last_usage_date=session.use_time,
         ).execute()
 
-    @use_database
+    @use_database_atomic
     def load_inbound_group_sessions(self) -> GroupSessionStore:
         """Load all Olm sessions from the database.
 
@@ -717,7 +715,7 @@ class MatrixStore:
 
         return store
 
-    @use_database
+    @use_database_atomic
     def save_inbound_group_session(self, session):
         """Save the provided Megolm inbound group session to the database.
 
@@ -848,7 +846,7 @@ class MatrixStore:
             for request in account.out_key_requests
         }
 
-    @use_database
+    @use_database_atomic
     def add_outgoing_key_request(self, key_request: OutgoingKeyRequest) -> None:
         """Add an outgoing key request to the store."""
         account = self._get_account()
@@ -862,7 +860,7 @@ class MatrixStore:
             account=account,
         ).on_conflict_ignore().execute()
 
-    @use_database
+    @use_database_atomic
     def remove_outgoing_key_request(self, key_request: OutgoingKeyRequest) -> None:
         """Remove an active outgoing key request from the store."""
         account = self._get_account()
@@ -891,7 +889,7 @@ class MatrixStore:
                 rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
             ).on_conflict_ignore().execute()
 
-    @use_database
+    @use_database_atomic
     def save_sync_token(self, token: str) -> None:
         """Save the current Matrix transport token."""
         account = self._get_account()
@@ -1524,7 +1522,7 @@ class MatrixStore:
             SyncRecoveryGaps.generation == generation,
         ).execute()
 
-    @use_database
+    @use_database_atomic
     def delete_encrypted_room(self, room: str) -> None:
         """Delete an encrypted room from the store."""
         db_room = EncryptedRooms.get_or_none(EncryptedRooms.room_id == room)
@@ -1820,7 +1818,7 @@ class SqliteStore(MatrixStore):
         except DoesNotExist:
             return None
 
-    @use_database
+    @use_database_atomic
     def verify_device(self, device: OlmDevice) -> bool:
         if self.is_device_verified(device):
             return False
@@ -1834,7 +1832,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unverify_device(self, device: OlmDevice) -> bool:
         if not self.is_device_verified(device):
             return False
@@ -1862,7 +1860,7 @@ class SqliteStore(MatrixStore):
 
         return trust_state == TrustState.verified
 
-    @use_database
+    @use_database_atomic
     def blacklist_device(self, device: OlmDevice) -> bool:
         if self.is_device_blacklisted(device):
             return False
@@ -1876,7 +1874,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unblacklist_device(self, device: OlmDevice) -> bool:
         if not self.is_device_blacklisted(device):
             return False
@@ -1904,7 +1902,7 @@ class SqliteStore(MatrixStore):
 
         return trust_state == TrustState.blacklisted
 
-    @use_database
+    @use_database_atomic
     def ignore_device(self, device: OlmDevice) -> bool:
         if self.is_device_ignored(device):
             return False
@@ -1918,7 +1916,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unignore_device(self, device: OlmDevice) -> bool:
         if not self.is_device_ignored(device):
             return False

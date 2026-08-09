@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
+from peewee import DatabaseError as PeeweeDatabaseError
 from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
@@ -36,77 +35,29 @@ from ..ingest.source import (
     canonical_classic_cursor,
 )
 from ..ingest.state import SourceState
+from ._ingestion_store_owner import IngestionStoreOwner
+from ._ingestion_store_owner import StableFileLock as StableFileLock
 from ._sync_journal_codec import EncryptedRowCodec
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
 
-FileIdentity = tuple[int, int]
-
-
-@contextmanager
-def immediate_transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    else:
-        connection.execute("COMMIT")
-
-
-class StableFileLock:
-    def __init__(self, database_path: Path) -> None:
-        self.owner_pid = os.getpid()
-        self.path = Path(f"{database_path}.ingest.lock")
-        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            os.close(self._fd)
-            self._fd = -1
-            raise LocalProtocolError(
-                f"ingestion writer lock is already held for {database_path}"
-            ) from error
-        stat = os.fstat(self._fd)
-        self.identity = (stat.st_dev, stat.st_ino)
-
-    def assert_process_owner(self) -> None:
-        if os.getpid() != self.owner_pid:
-            raise LocalProtocolError("ownership belongs to the acquiring process")
-
-    def assert_identity(self) -> None:
-        self.assert_process_owner()
-        if self._fd < 0:
-            raise LocalProtocolError("ingestion writer lock is closed")
-        try:
-            stat = os.stat(self.path)
-        except FileNotFoundError as error:
-            raise LocalProtocolError(
-                "ingestion lock file identity is no longer present"
-            ) from error
-        if (stat.st_dev, stat.st_ino) != self.identity:
-            raise LocalProtocolError(
-                "ingestion lock file identity changed after lock acquisition"
-            )
-
-    def close(self) -> None:
-        self.assert_process_owner()
-        if self._fd < 0:
-            return
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
-        os.close(self._fd)
-        self._fd = -1
-
-    def __enter__(self) -> StableFileLock:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()
+_E2EE_TABLES = frozenset(
+    {
+        "accounts",
+        "devicekeys",
+        "devicetruststate",
+        "encryptedrooms",
+        "forwardedchains",
+        "keys",
+        "megolminboundsessions",
+        "olmsessions",
+        "outgoingkeyrequests",
+        "storeversion",
+    }
+)
 
 
 def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
@@ -119,17 +70,25 @@ def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
     path = os.fspath(database)
     if path == ":memory:":
         raise LocalProtocolError("the ingestion journal requires an on-disk database")
-    return Path(path).resolve()
+    return Path(os.path.abspath(path))
 
 
 def database_shape(path: str | os.PathLike[str]) -> tuple[bool, bool]:
     database = Path(path)
     if not database.exists() or database.stat().st_size == 0:
         return False, False
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-        rows = connection.execute(
+    connection = SqliteDatabase(
+        f"file:{database}?mode=ro",
+        autoconnect=False,
+        uri=True,
+    )
+    connection.connect()
+    try:
+        rows = connection.execute_sql(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
+    finally:
+        connection.close()
     names = {row[0] for row in rows}
     return "NioIngestMeta" in names, bool(names)
 
@@ -143,27 +102,41 @@ def _normalized_sql(sql: str | None) -> str | None:
 
 
 def _pragma_rows(
-    connection: sqlite3.Connection,
+    connection: sqlite3.Connection | SqliteDatabase,
     pragma: str,
     name: str,
 ) -> tuple[tuple[object, ...], ...]:
-    return tuple(tuple(row) for row in connection.execute(f'{pragma}("{name}")'))
+    return tuple(tuple(row) for row in _execute(connection, f'{pragma}("{name}")'))
 
 
-def _capture_contract(connection: sqlite3.Connection) -> tuple[object, ...]:
+def _execute(
+    connection: sqlite3.Connection | SqliteDatabase,
+    sql: str,
+    parameters: tuple[object, ...] = (),
+):
+    if isinstance(connection, SqliteDatabase):
+        return connection.execute_sql(sql, parameters)
+    return connection.execute(sql, parameters)
+
+
+def _capture_contract(
+    connection: sqlite3.Connection | SqliteDatabase,
+) -> tuple[object, ...]:
     table_names = tuple(
         row[0]
-        for row in connection.execute(
+        for row in _execute(
+            connection,
             "SELECT name FROM sqlite_master "
-            "WHERE type = 'table' AND name GLOB 'NioIngest*' ORDER BY name"
+            "WHERE type = 'table' AND name GLOB 'NioIngest*' ORDER BY name",
         )
     )
     master = tuple(
         (row[0], row[1], row[2], _normalized_sql(row[3]))
-        for row in connection.execute(
+        for row in _execute(
+            connection,
             "SELECT type, name, tbl_name, sql FROM sqlite_master "
             "WHERE name GLOB 'NioIngest*' OR tbl_name GLOB 'NioIngest*' "
-            "ORDER BY type, name"
+            "ORDER BY type, name",
         )
     )
     details = tuple(
@@ -177,7 +150,7 @@ def _capture_contract(connection: sqlite3.Connection) -> tuple[object, ...]:
                         tuple(row),
                         _pragma_rows(connection, "PRAGMA index_xinfo", row[1]),
                     )
-                    for row in connection.execute(f'PRAGMA index_list("{table}")')
+                    for row in _execute(connection, f'PRAGMA index_list("{table}")')
                 )
             ),
         )
@@ -196,13 +169,13 @@ def _expected_contract() -> tuple[object, ...]:
         return _capture_contract(connection)
 
 
-def validate_schema_topology(connection: sqlite3.Connection) -> None:
+def validate_schema_topology(connection: SqliteDatabase) -> None:
     try:
         if _capture_contract(connection) != _expected_contract():
             raise FreshIngestionRequired(
                 "ingestion-v1 schema topology does not match v1"
             )
-    except sqlite3.DatabaseError as error:
+    except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
         raise FreshIngestionRequired(
             "ingestion-v1 schema topology is invalid"
         ) from error
@@ -268,7 +241,7 @@ def _source_header(source: SourceState) -> bytes:
 
 
 def _create_fresh(
-    connection: sqlite3.Connection,
+    connection: SqliteDatabase,
     account_id: str,
     device_id: str,
     pickle_key: str,
@@ -295,51 +268,68 @@ def _create_fresh(
         source_state.cursor_json,
         header=_source_header(source_state),
     )
-    with immediate_transaction(connection):
-        connection.execute(META_TABLE_SQL)
+    connection.execute_sql(META_TABLE_SQL)
+    if statement_hook is not None:
+        statement_hook("create_meta")
+    connection.execute_sql(
+        "INSERT INTO NioIngestMeta ("
+        "account_id, device_id, schema_version, stream_id, transport_kind, "
+        "revision, writer_epoch, next_source_epoch, created_at_ns"
+        ") VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)",
+        (
+            account_id,
+            device_id,
+            SCHEMA_VERSION,
+            str(stream_id),
+            transport_kind.value,
+            str(writer_epoch),
+            time.time_ns(),
+        ),
+    )
+    if statement_hook is not None:
+        statement_hook("insert_meta")
+    for index, statement in enumerate(SCHEMA_SQL):
+        connection.execute_sql(statement)
         if statement_hook is not None:
-            statement_hook("create_meta")
-        connection.execute(
-            "INSERT INTO NioIngestMeta ("
-            "account_id, device_id, schema_version, stream_id, transport_kind, "
-            "revision, writer_epoch, next_source_epoch, created_at_ns"
-            ") VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)",
-            (
-                account_id,
-                device_id,
-                SCHEMA_VERSION,
-                str(stream_id),
-                transport_kind.value,
-                str(writer_epoch),
-                time.time_ns(),
-            ),
-        )
-        if statement_hook is not None:
-            statement_hook("insert_meta")
-        for index, statement in enumerate(SCHEMA_SQL):
-            connection.execute(statement)
-            if statement_hook is not None:
-                statement_hook(f"schema_{index}")
-        connection.execute(
-            "INSERT INTO NioIngestSourceState ("
-            "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
-            "next_request_id, active) VALUES (?, 0, ?, ?, 0, 1)",
-            (account_id, cursor_ciphertext, cursor_sha256),
-        )
-        if statement_hook is not None:
-            statement_hook("insert_source")
+            statement_hook(f"schema_{index}")
+    connection.execute_sql(
+        "INSERT INTO NioIngestSourceState ("
+        "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
+        "next_request_id, active) VALUES (?, 0, ?, ?, 0, 1)",
+        (account_id, cursor_ciphertext, cursor_sha256),
+    )
+    if statement_hook is not None:
+        statement_hook("insert_source")
     return stream_id, source_state
 
 
 def _inspect_existing(
-    connection: sqlite3.Connection,
+    connection: SqliteDatabase,
     account_id: str,
     device_id: str,
     pickle_key: str,
     source: SourceConfig,
 ) -> tuple[UUID, str]:
     validate_schema_topology(connection)
-    rows = connection.execute("SELECT * FROM NioIngestMeta").fetchall()
+    all_tables = {
+        row[0]
+        for row in connection.execute_sql(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT GLOB 'sqlite_*'"
+        )
+    }
+    borrowed_tables = {name for name in all_tables if not name.startswith("NioIngest")}
+    if borrowed_tables not in (set(), set(_E2EE_TABLES)):
+        raise FreshIngestionRequired(
+            "ingestion-v1 store has unexpected or incomplete borrowed tables"
+        )
+    if borrowed_tables:
+        versions = connection.execute_sql("SELECT version FROM storeversion").fetchall()
+        if len(versions) != 1 or versions[0][0] != 10:
+            raise FreshIngestionRequired(
+                "ingestion-v1 store has an unsupported borrowed schema"
+            )
+    rows = connection.execute_sql("SELECT * FROM NioIngestMeta").fetchall()
     if len(rows) != 1:
         raise FreshIngestionRequired("ingestion-v1 marker row cardinality is not one")
     row = rows[0]
@@ -363,7 +353,9 @@ def _inspect_existing(
     except (AttributeError, TypeError, ValueError) as error:
         raise JournalIntegrityError("ingestion owner UUID is invalid") from error
 
-    source_rows = connection.execute("SELECT * FROM NioIngestSourceState").fetchall()
+    source_rows = connection.execute_sql(
+        "SELECT * FROM NioIngestSourceState"
+    ).fetchall()
     if len(source_rows) != 1:
         raise JournalIntegrityError("ingestion source row cardinality is not one")
     source_row = source_rows[0]
@@ -408,11 +400,9 @@ def _inspect_existing(
 @dataclass(frozen=True)
 class OpenedJournalDatabase:
     path: Path
-    _connection: sqlite3.Connection
-    writer_lock: StableFileLock
+    owner: IngestionStoreOwner
     writer_epoch: UUID
     stream_id: UUID
-    file_identity: FileIdentity
 
 
 def open_journal_database(
@@ -429,32 +419,23 @@ def open_journal_database(
     source_transport(source)
     path = database_path(database)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fresh = not path.exists() or path.stat().st_size == 0
-    writer_lock = StableFileLock(path)
-    connection: sqlite3.Connection | None = None
+    owner = IngestionStoreOwner(path, sqlite_busy_timeout_ms, statement_observer)
+    connection = owner.database
     try:
-        connection = sqlite3.connect(
-            path,
-            isolation_level=None,
-            timeout=sqlite_busy_timeout_ms / 1000,
-        )
-        connection.row_factory = sqlite3.Row
-        if statement_observer is not None:
-            connection.set_trace_callback(statement_observer)
-
-        if fresh:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
+        if owner.is_fresh:
+            connection.execute_sql("PRAGMA foreign_keys = ON")
+            connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
             writer_epoch = uuid4()
-            stream_id, _source_state = _create_fresh(
-                connection,
-                account_id,
-                device_id,
-                pickle_key,
-                source,
-                writer_epoch,
-                schema_statement_hook,
-            )
+            with owner.bootstrap_write():
+                stream_id, _source_state = _create_fresh(
+                    connection,
+                    account_id,
+                    device_id,
+                    pickle_key,
+                    source,
+                    writer_epoch,
+                    schema_statement_hook,
+                )
         else:
             try:
                 stream_id, old_epoch = _inspect_existing(
@@ -464,16 +445,16 @@ def open_journal_database(
                     pickle_key,
                     source,
                 )
-            except sqlite3.DatabaseError as error:
+            except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
                 raise FreshIngestionRequired(
                     "nonempty store without a valid ingestion-v1 marker requires "
                     "fresh initialization"
                 ) from error
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
+            connection.execute_sql("PRAGMA foreign_keys = ON")
+            connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
             writer_epoch = uuid4()
-            with immediate_transaction(connection):
-                cursor = connection.execute(
+            with owner.bootstrap_write():
+                cursor = connection.execute_sql(
                     "UPDATE NioIngestMeta SET writer_epoch = ? "
                     "WHERE account_id = ? AND writer_epoch = ?",
                     (str(writer_epoch), account_id, old_epoch),
@@ -483,19 +464,15 @@ def open_journal_database(
                         "persisted writer_epoch changed during open"
                     )
 
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        stat = os.stat(path)
+        connection.execute_sql("PRAGMA journal_mode = WAL")
+        connection.execute_sql("PRAGMA synchronous = NORMAL")
+        owner.activate(account_id, writer_epoch)
         return OpenedJournalDatabase(
             path,
-            connection,
-            writer_lock,
+            owner,
             writer_epoch,
             stream_id,
-            (stat.st_dev, stat.st_ino),
         )
     except BaseException:
-        if connection is not None:
-            connection.close()
-        writer_lock.close()
+        owner.close()
         raise

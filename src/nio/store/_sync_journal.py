@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from peewee import SqliteDatabase
+from peewee import IntegrityError, SqliteDatabase
 
-from ..exceptions import LocalProtocolError
 from ..ingest.classic import ClassicSource
 from ..ingest.config import (
     ClassicSourceConfig,
@@ -24,9 +23,7 @@ from ..ingest.source import renormalize_staged_frame
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_codec import EncryptedRowCodec
 from ._sync_journal_preflight import (
-    FileIdentity,
-    StableFileLock,
-    immediate_transaction,
+    IngestionStoreOwner,
     open_journal_database,
 )
 from ._sync_journal_rows import JournalRows
@@ -45,11 +42,9 @@ class SqliteIngestionJournal(JournalRows):
         account_id: str,
         device_id: str,
         pickle_key: str,
-        connection: sqlite3.Connection,
-        writer_lock: StableFileLock,
+        owner: IngestionStoreOwner,
         writer_epoch: UUID,
         stream_id: UUID,
-        file_identity: FileIdentity,
         transition_statement_hook: Callable[[str], None] | None,
     ) -> None:
         self.database_path = database_path
@@ -57,11 +52,8 @@ class SqliteIngestionJournal(JournalRows):
         self.device_id = device_id
         self.pickle_key = pickle_key
         self.writer_epoch = writer_epoch
-        self._connection = connection
-        self._writer_lock = writer_lock
+        self._owner = owner
         self._transition_statement_hook = transition_statement_hook
-        self._closed = False
-        self._file_identity = file_identity
         self._codec = EncryptedRowCodec(pickle_key, account_id, stream_id)
 
     @classmethod
@@ -103,32 +95,24 @@ class SqliteIngestionJournal(JournalRows):
             account_id=account_id,
             device_id=device_id,
             pickle_key=pickle_key,
-            connection=opened._connection,
-            writer_lock=opened.writer_lock,
+            owner=opened.owner,
             writer_epoch=opened.writer_epoch,
             stream_id=opened.stream_id,
-            file_identity=opened.file_identity,
             transition_statement_hook=transition_statement_hook,
         )
 
-    def _assert_file_owner(self) -> None:
-        self._writer_lock.assert_process_owner()
-        if self._closed:
-            raise LocalProtocolError("ingestion journal is closed")
-        self._writer_lock.assert_identity()
-        try:
-            stat = os.stat(self.database_path)
-        except FileNotFoundError as error:
-            raise LocalProtocolError(
-                "ingestion database file identity is no longer present"
-            ) from error
-        if (stat.st_dev, stat.st_ino) != self._file_identity:
-            raise LocalProtocolError(
-                "ingestion database file identity changed after lock acquisition"
-            )
+    def _execute(
+        self,
+        statement: str,
+        parameters: tuple[object, ...] = (),
+    ) -> sqlite3.Cursor:
+        return self._owner.database.execute_sql(statement, parameters)
 
-    def _assert_open(self) -> None:
-        self._assert_file_owner()
+    def _read(self):
+        return self._owner.read()
+
+    def _transaction(self):
+        return self._owner.journal_write()
 
     @property
     def schema_version(self) -> int:
@@ -142,7 +126,8 @@ class SqliteIngestionJournal(JournalRows):
         self,
         hook: Callable[[str], None] | None,
     ) -> None:
-        self._assert_open()
+        with self._read():
+            pass
         self._transition_statement_hook = hook
 
     def _transition_hook(self, label: str) -> None:
@@ -155,7 +140,7 @@ class SqliteIngestionJournal(JournalRows):
         statement: str,
         parameters: tuple[object, ...] = (),
     ) -> sqlite3.Cursor:
-        cursor = self._connection.execute(statement, parameters)
+        cursor = self._execute(statement, parameters)
         self._transition_hook(label)
         return cursor
 
@@ -274,8 +259,7 @@ class SqliteIngestionJournal(JournalRows):
         if type(writer_epoch) is not UUID:
             raise TypeError("writer_epoch must be UUID")
 
-        self._assert_open()
-        with immediate_transaction(self._connection):
+        with self._transaction():
             owner = self.load_owner()
             current = self.load_source()
             if owner.revision != expected_revision:
@@ -336,16 +320,11 @@ class SqliteIngestionJournal(JournalRows):
             self._transition_hook("source_state_upsert")
             try:
                 self._write_frame(frame, new_revision)
-            except sqlite3.IntegrityError as error:
+            except (sqlite3.IntegrityError, IntegrityError) as error:
                 raise JournalIntegrityError("staged frame insert collided") from error
             self._transition_hook("frame_insert")
         self._transition_hook("commit")
         return CommitResult(new_revision)
 
     def close(self) -> None:
-        self._writer_lock.assert_process_owner()
-        if self._closed:
-            return
-        self._connection.close()
-        self._writer_lock.close()
-        self._closed = True
+        self._owner.close()

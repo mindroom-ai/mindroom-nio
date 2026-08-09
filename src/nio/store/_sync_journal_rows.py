@@ -172,7 +172,11 @@ def _source_header(source: SourceState) -> bytes:
 def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
     request = frame.response.request
     return _canonical_internal(
-        [request.source_epoch, request.request_id, staged_revision]
+        [
+            request.source_epoch,
+            request.request_id,
+            staged_revision,
+        ]
     )
 
 
@@ -181,8 +185,7 @@ class JournalRows:
     device_id: str
 
     def _meta(self) -> sqlite3.Row:
-        self._assert_open()  # type: ignore[attr-defined]
-        rows = self._connection.execute(  # type: ignore[attr-defined]
+        rows = self._execute(  # type: ignore[attr-defined]
             "SELECT * FROM NioIngestMeta"
         ).fetchall()
         if len(rows) != 1:
@@ -192,25 +195,26 @@ class JournalRows:
         return rows[0]
 
     def load_owner(self) -> OwnerView:
-        row = self._meta()
-        try:
-            owner = OwnerView(
-                row["account_id"],
-                row["device_id"],
-                row["schema_version"],
-                UUID(row["stream_id"]),
-                TransportKind(row["transport_kind"]),
-                row["revision"],
-                UUID(row["writer_epoch"]),
-                row["next_source_epoch"],
-            )
-            if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
-                raise ValueError("created_at_ns is invalid")
-        except (AttributeError, TypeError, ValueError) as error:
-            raise JournalIntegrityError("ingestion owner row is invalid") from error
-        if owner.account_id != self.account_id or owner.device_id != self.device_id:
-            raise JournalIntegrityError("ingestion owner identity changed")
-        return owner
+        with self._read():  # type: ignore[attr-defined]
+            row = self._meta()
+            try:
+                owner = OwnerView(
+                    row["account_id"],
+                    row["device_id"],
+                    row["schema_version"],
+                    UUID(row["stream_id"]),
+                    TransportKind(row["transport_kind"]),
+                    row["revision"],
+                    UUID(row["writer_epoch"]),
+                    row["next_source_epoch"],
+                )
+                if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
+                    raise ValueError("created_at_ns is invalid")
+            except (AttributeError, TypeError, ValueError) as error:
+                raise JournalIntegrityError("ingestion owner row is invalid") from error
+            if owner.account_id != self.account_id or owner.device_id != self.device_id:
+                raise JournalIntegrityError("ingestion owner identity changed")
+            return owner
 
     def _decode_source_row(
         self,
@@ -252,13 +256,16 @@ class JournalRows:
             raise JournalIntegrityError("persisted source state is invalid") from error
 
     def load_source(self) -> SourceState:
-        owner = self.load_owner()
-        rows = self._connection.execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestSourceState"
-        ).fetchall()
-        if len(rows) != 1:
-            raise JournalIntegrityError("ingestion source row cardinality is not one")
-        return self._decode_source_row(rows[0], owner)
+        with self._read():  # type: ignore[attr-defined]
+            owner = self.load_owner()
+            rows = self._execute(  # type: ignore[attr-defined]
+                "SELECT * FROM NioIngestSourceState"
+            ).fetchall()
+            if len(rows) != 1:
+                raise JournalIntegrityError(
+                    "ingestion source row cardinality is not one"
+                )
+            return self._decode_source_row(rows[0], owner)
 
     def _write_source(self, source: SourceState) -> sqlite3.Cursor:
         _validate_source_cursor(source.transport_kind, source.cursor_json)
@@ -268,7 +275,7 @@ class JournalRows:
             source.cursor_json,
             header=_source_header(source),
         )
-        return self._connection.execute(  # type: ignore[attr-defined]
+        return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestSourceState ("
             "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
             "next_request_id, active) VALUES (?, ?, ?, ?, ?, ?) "
@@ -350,7 +357,7 @@ class JournalRows:
             raise JournalIntegrityError("persisted staged frame is invalid") from error
 
     def _classify_frame_ids(self) -> frozenset[UUID]:
-        rows = self._connection.execute(  # type: ignore[attr-defined]
+        rows = self._execute(  # type: ignore[attr-defined]
             "SELECT frame_id FROM NioIngestFrame WHERE account_id = ? "
             "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
             (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
@@ -368,7 +375,7 @@ class JournalRows:
         return frozenset(identities)
 
     def _frame_row(self, frame_id: UUID) -> sqlite3.Row:
-        row = self._connection.execute(  # type: ignore[attr-defined]
+        row = self._execute(  # type: ignore[attr-defined]
             "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
             (self.account_id, str(frame_id)),
         ).fetchone()
@@ -388,22 +395,24 @@ class JournalRows:
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         if type(frame_id) is not UUID:
             raise TypeError("frame_id must be UUID")
-        return self._load_frame_with_owner(frame_id, self.load_owner())
+        with self._read():  # type: ignore[attr-defined]
+            return self._load_frame_with_owner(frame_id, self.load_owner())
 
     def list_frames(self, limit: int) -> tuple[StagedFrame, ...]:
         if type(limit) is not int or not 1 <= limit <= 256:
             raise ValueError("frame limit must be an integer from 1 through 256")
-        owner = self.load_owner()
-        self._classify_frame_ids()
-        rows = self._connection.execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestFrame WHERE account_id = ? "
-            "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
-            (self.account_id, limit),
-        ).fetchall()
-        return tuple(
-            self._decode_frame_row(self._parse_frame_id(row)[1], row, owner)
-            for row in rows
-        )
+        with self._read():  # type: ignore[attr-defined]
+            owner = self.load_owner()
+            self._classify_frame_ids()
+            rows = self._execute(  # type: ignore[attr-defined]
+                "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+                "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
+                (self.account_id, limit),
+            ).fetchall()
+            return tuple(
+                self._decode_frame_row(self._parse_frame_id(row)[1], row, owner)
+                for row in rows
+            )
 
     def _write_frame(
         self,
@@ -419,7 +428,7 @@ class JournalRows:
             header=_frame_header(stored, staged_revision),
         )
         request = stored.response.request
-        return self._connection.execute(  # type: ignore[attr-defined]
+        return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload_ciphertext, payload_sha256"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,66 +13,7 @@ from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from peewee import SqliteDatabase
-
     from .database import MatrixStore
-
-
-class _StoreOwnershipLease:
-    def __init__(self, journal: _SqliteIngestionJournal) -> None:
-        self._owner_pid = os.getpid()
-        self._active = True
-        self._lock = threading.RLock()
-        self._journal = journal
-        self._operation_depth = 0
-
-    def _assert_process_owner(self) -> None:
-        if os.getpid() != self._owner_pid:
-            raise LocalProtocolError("ownership lease belongs to acquiring process")
-
-    @contextmanager
-    def operation(self, database: SqliteDatabase) -> Iterator[None]:
-        self._assert_process_owner()
-        with self._lock:
-            if not self._active:
-                raise LocalProtocolError("store ownership lease is revoked")
-            self._journal._assert_file_owner()
-            if self._operation_depth:
-                self._operation_depth += 1
-                try:
-                    yield
-                finally:
-                    self._operation_depth -= 1
-                return
-            if database.transaction_depth():
-                raise LocalProtocolError(
-                    "ingestion store operation cannot use an ambient transaction"
-                )
-
-            self._operation_depth = 1
-            try:
-                with database.atomic("IMMEDIATE"):
-                    self._journal._assert_file_owner()
-                    cursor = database.execute_sql(
-                        "UPDATE NioIngestMeta SET writer_epoch = writer_epoch "
-                        "WHERE account_id = ? AND writer_epoch = ?",
-                        (
-                            self._journal.account_id,
-                            str(self._journal.writer_epoch),
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise LocalProtocolError(
-                            "ingestion store writer_epoch is stale"
-                        )
-                    yield
-            finally:
-                self._operation_depth = 0
-
-    def revoke(self) -> None:
-        self._assert_process_owner()
-        with self._lock:
-            self._active = False
 
 
 class StoreBootstrap:
@@ -82,28 +22,23 @@ class StoreBootstrap:
     def __init__(self, journal: _SqliteIngestionJournal) -> None:
         self._journal = journal
         self._store: MatrixStore | None = None
-        self._store_lock = threading.RLock()
+        self._store_revoked = False
 
     @contextmanager
-    def _claim_store(self, store: MatrixStore) -> Iterator[_StoreOwnershipLease]:
-        self._journal._assert_file_owner()
-        with self._store_lock:
-            if self._store is not None:
-                raise LocalProtocolError(
-                    "StoreBootstrap can open MatrixStore only once"
-                )
-            lease = _StoreOwnershipLease(self._journal)
-            self._store = store
-            try:
-                yield lease
-            except BaseException:
-                lease.revoke()
-                self._store = None
-                raise
+    def _claim_store(self, store: MatrixStore) -> Iterator[None]:
+        with self._journal._owner.read():
+            pass
+        if self._store is not None:
+            raise LocalProtocolError("StoreBootstrap can open MatrixStore only once")
+        self._store = store
+        try:
+            yield
+        except BaseException:
+            self._store = None
+            raise
 
     @property
     def database_path(self) -> Path:
-        self._journal._assert_file_owner()
         return self._journal.database_path
 
     @property
@@ -120,7 +55,10 @@ class StoreBootstrap:
         *,
         pickle_key: str | None = None,
     ) -> MatrixStore:
-        from .database import _open_matrix_store_from_ingestion
+        from .database import SqliteStore, _open_matrix_store_from_ingestion
+
+        if store_class is not SqliteStore:
+            raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
 
         return _open_matrix_store_from_ingestion(
             self,
@@ -129,13 +67,11 @@ class StoreBootstrap:
         )
 
     def close(self) -> None:
-        self._journal._writer_lock.assert_process_owner()
-        with self._store_lock:
-            if self._store is not None:
-                self._store._revoke_ingestion_lease()
-                if not self._store.database.is_closed():
-                    self._store.database.close()
-            self._journal.close()
+        self._journal._owner.prepare_close()
+        if self._store is not None and not self._store_revoked:
+            self._store._revoke_ingestion_lease()
+            self._store_revoked = True
+        self._journal.close()
 
 
 def open_ingestion_store(
