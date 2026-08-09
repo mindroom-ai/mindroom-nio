@@ -40,6 +40,7 @@ def immediate_transaction(connection: sqlite3.Connection) -> Iterator[None]:
 
 class StableFileLock:
     def __init__(self, database_path: Path) -> None:
+        self.owner_pid = os.getpid()
         self.path = Path(f"{database_path}.ingest.lock")
         self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -53,7 +54,14 @@ class StableFileLock:
         stat = os.fstat(self._fd)
         self.identity = (stat.st_dev, stat.st_ino)
 
+    def assert_process_owner(self) -> None:
+        if os.getpid() != self.owner_pid:
+            raise LocalProtocolError(
+                "ingestion ownership belongs to the acquiring process"
+            )
+
     def assert_identity(self) -> None:
+        self.assert_process_owner()
         if self._fd < 0:
             raise LocalProtocolError("ingestion writer lock is closed")
         try:
@@ -69,6 +77,7 @@ class StableFileLock:
             )
 
     def close(self) -> None:
+        self.assert_process_owner()
         if self._fd < 0:
             return
         fcntl.flock(self._fd, fcntl.LOCK_UN)

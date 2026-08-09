@@ -131,6 +131,7 @@ class SqliteIngestionJournal(JournalRows):
         )
 
     def _assert_open(self) -> None:
+        self._assert_process_owner()
         if self._closed:
             raise LocalProtocolError("ingestion journal is closed")
         self._writer_lock.assert_identity()
@@ -152,6 +153,9 @@ class SqliteIngestionJournal(JournalRows):
             self._writer_lock.identity
         ):
             raise LocalProtocolError("persisted ingestion lock file identity changed")
+
+    def _assert_process_owner(self) -> None:
+        self._writer_lock.assert_process_owner()
 
     def set_transition_statement_hook(
         self,
@@ -617,6 +621,7 @@ class SqliteIngestionJournal(JournalRows):
             self._ack_lock.release()
 
     def close(self) -> None:
+        self._assert_process_owner()
         if self._closed:
             return
         self.connection.close()

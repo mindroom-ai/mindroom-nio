@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import os
 import sqlite3
@@ -230,6 +231,34 @@ def _table_names(database_path: Path) -> set[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+
+
+def _fork_outcomes(operation) -> tuple[str, ...]:
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            outcomes = operation()
+            os.write(write_fd, "\0".join(outcomes).encode())
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    payload = os.read(read_fd, 64 * 1024)
+    os.close(read_fd)
+    waited_pid, status = os.waitpid(child_pid, 0)
+    assert waited_pid == child_pid
+    assert os.waitstatus_to_exitcode(status) == 0
+    return tuple(payload.decode().split("\0"))
+
+
+def _operation_outcome(operation) -> str:
+    try:
+        operation()
+    except LocalProtocolError as error:
+        return str(error)
+    return "accepted"
 
 
 def test_fresh_open_creates_independent_v1_schema_with_marker_first(
@@ -776,6 +805,84 @@ def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
         database_name="journal.db",
     )
     replacement.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_inherited_child_cannot_use_or_release_parent_ownership(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+
+    def inherited_operations() -> tuple[str, ...]:
+        return (
+            _operation_outcome(bootstrap._journal._assert_open),
+            _operation_outcome(bootstrap.close),
+            _operation_outcome(bootstrap._journal._writer_lock.close),
+        )
+
+    try:
+        outcomes = _fork_outcomes(inherited_operations)
+        assert len(outcomes) == 3
+        assert all("acquiring process" in outcome for outcome in outcomes)
+        assert not store.database.is_closed()
+        assert bootstrap._journal.load_owner().revision == 0
+        second = None
+        try:
+            second = open_ingestion_store(
+                tmp_path,
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                database_name="journal.db",
+            )
+        except LocalProtocolError as error:
+            assert "writer lock" in str(error)
+        else:
+            second.close()
+            pytest.fail("child cleanup released the parent's writer lock")
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_inherited_child_cannot_attach_or_open_e2ee_store(tmp_path: Path) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+
+    def inherited_operations() -> tuple[str, ...]:
+        return (
+            _operation_outcome(
+                lambda: asyncio.run(bootstrap.attach_consumer(consumer))
+            ),
+            _operation_outcome(
+                lambda: SqliteStore(
+                    ACCOUNT_ID,
+                    DEVICE_ID,
+                    str(tmp_path),
+                    database_name="journal.db",
+                    _ingestion_bootstrap=bootstrap,
+                )
+            ),
+        )
+
+    try:
+        outcomes = _fork_outcomes(inherited_operations)
+        assert len(outcomes) == 2
+        assert all("acquiring process" in outcome for outcome in outcomes)
+        assert bootstrap._journal.load_owner().revision == 0
+        assert "accounts" not in _table_names(tmp_path / "journal.db")
+    finally:
+        bootstrap.close()
 
 
 def test_queue_database_is_refused_before_ingestion_schema_creation(

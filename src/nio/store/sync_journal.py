@@ -68,6 +68,7 @@ class StoreBootstrap:
         self._journal._require_attached()
 
     def close(self) -> None:
+        self._journal._assert_process_owner()
         try:
             if self._store is not None and not self._store.database.is_closed():
                 self._store.database.close()
