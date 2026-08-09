@@ -4,6 +4,7 @@ from uuid import UUID
 
 from ..event_provenance import TimelineEventProvenance
 from .config import MAX_RECORDS_PER_BATCH
+from .effects import PersistedNetworkEffect
 from .membership import MembershipBaseline
 from .model import (
     ConsumerBinding,
@@ -505,6 +506,9 @@ class JournalTransition:
     frames: tuple[StagedFrame, ...] = ()
     batch_materialization: BatchMaterialization | None = None
     delete_frame_ids: tuple[UUID, ...] = ()
+    network_effect_inserts: tuple[PersistedNetworkEffect, ...] = ()
+    network_effect_updates: tuple[PersistedNetworkEffect, ...] = ()
+    network_effect_deletes: tuple[UUID, ...] = ()
 
     def __post_init__(self) -> None:
         if self.source_state is not None and type(self.source_state) is not SourceState:
@@ -516,6 +520,17 @@ class JournalTransition:
             ("ready_records", self.ready_records, ReadyRecord),
             ("frames", self.frames, StagedFrame),
             ("delete_frame_ids", self.delete_frame_ids, UUID),
+            (
+                "network_effect_inserts",
+                self.network_effect_inserts,
+                PersistedNetworkEffect,
+            ),
+            (
+                "network_effect_updates",
+                self.network_effect_updates,
+                PersistedNetworkEffect,
+            ),
+            ("network_effect_deletes", self.network_effect_deletes, UUID),
         )
         for name, values, expected in fields:
             if type(values) is not tuple:
@@ -529,6 +544,22 @@ class JournalTransition:
             raise TypeError(
                 "batch_materialization must be BatchMaterialization or None"
             )
+        effect_ids = (
+            tuple(
+                effect.request.effect_id
+                for effect in (
+                    *self.network_effect_inserts,
+                    *self.network_effect_updates,
+                )
+            )
+            + self.network_effect_deletes
+        )
+        if len(effect_ids) > MAX_RECORDS_PER_BATCH:
+            raise ValueError(
+                f"network effect mutations cannot exceed {MAX_RECORDS_PER_BATCH}"
+            )
+        if len(set(effect_ids)) != len(effect_ids):
+            raise ValueError("network effect mutation IDs duplicate or overlap")
 
 
 @dataclass(frozen=True, slots=True)

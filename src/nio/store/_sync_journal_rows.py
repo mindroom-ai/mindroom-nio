@@ -51,6 +51,7 @@ from ..ingest.state import (
     SourceState,
     StagedFrame,
 )
+from ._sync_journal_effects import NetworkEffectRows
 from ._sync_journal_preflight import _validate_source_cursor
 
 _FRAME_FIELDS = {"source_epoch", "request_id", "payload", "staged_revision"}
@@ -105,7 +106,7 @@ _LANE_RECORD_FIELDS = (
 )
 
 
-class JournalRows:
+class JournalRows(NetworkEffectRows):
     def _open_payload(self, domain, primary_key, row, prefix):
         return self._codec.decrypt(
             domain,
@@ -1162,15 +1163,11 @@ class JournalRows:
         except (TypeError, ValueError) as error:
             raise JournalIntegrityError(str(error)) from error
 
-    def load_rooms(
+    def _load_room_aggregates(
         self,
         room_ids: frozenset[str],
     ) -> dict[str, RoomAggregate]:
         owner = self._require_attached()
-        if type(room_ids) is not frozenset or any(
-            type(room_id) is not str for room_id in room_ids
-        ):
-            raise TypeError("room_ids must be a frozenset of str")
         if not room_ids:
             return {}
         ordered_ids = tuple(sorted(room_ids))
@@ -1201,4 +1198,24 @@ class JournalRows:
             lanes = tuple(lanes_by_room.get(room_id, ()))
             self._validate_room_aggregate(state, lanes)
             aggregates[room_id] = RoomAggregate(state, lanes[-1], lanes[:-1])
+        return aggregates
+
+    def load_rooms(
+        self,
+        room_ids: frozenset[str],
+    ) -> dict[str, RoomAggregate]:
+        if type(room_ids) is not frozenset or any(
+            type(room_id) is not str for room_id in room_ids
+        ):
+            raise TypeError("room_ids must be a frozenset of str")
+        owner = self._require_attached()
+        aggregates = self._load_room_aggregates(room_ids)
+        stored_effects = self._load_network_effect_rows_for_rooms(room_ids, owner)
+        self._validate_network_effect_graph(
+            aggregates,
+            {
+                stored.effect.request.effect_id: stored.effect
+                for stored in stored_effects
+            },
+        )
         return aggregates

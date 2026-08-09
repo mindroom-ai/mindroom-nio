@@ -7,7 +7,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pytest
 
@@ -26,6 +26,15 @@ from nio.ingest import (
     TransportKind,
 )
 from nio.ingest.config import ClassicSourceConfig
+from nio.ingest.effects import (
+    MembershipAction,
+    MembershipDeliveryState,
+    MembershipRequest,
+    PersistedNetworkEffect,
+    RecoveryRequest,
+)
+from nio.ingest.membership import MembershipBaseline
+from nio.ingest.recovery import RecoveryGap
 from nio.ingest.serialization import (
     _canonical_json,
     _record_to_dict,
@@ -42,6 +51,7 @@ from nio.ingest.state import (
     LaneStatus,
     ReadyRecord,
     ReadyRecordKey,
+    ReleasePhase,
     RoomLane,
     RoomState,
     SourceState,
@@ -166,6 +176,98 @@ def _many_room_consumer(bootstrap, count: int) -> ConsumerBootstrap:
         room_ids,
         hashlib.sha256(_canonical_json(list(room_ids))).digest(),
     )
+
+
+def _recovery_effect_graph(
+    stream_id: UUID,
+) -> tuple[PersistedNetworkEffect, RoomState, RoomLane]:
+    room_id = "!baseline:example.org"
+    gap_id = UUID("44444444-4444-4444-4444-444444444444")
+    effect_id = uuid5(gap_id, "page:1")
+    effect = PersistedNetworkEffect(
+        RecoveryRequest(
+            effect_id,
+            stream_id,
+            TransportKind.CLASSIC,
+            room_id,
+            0,
+            gap_id,
+            1,
+            "cursor-1",
+            "target-token",
+            100,
+            30_000,
+        ),
+        0,
+        None,
+        None,
+    )
+    state = RoomState(
+        room_id,
+        0,
+        0,
+        RoomHydrationStatus.PENDING,
+        None,
+        MembershipBaseline(room_id, 4, 0, "start-token", "$member"),
+    )
+    gap = RecoveryGap(
+        gap_id,
+        room_id,
+        4,
+        0,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 2),
+        "$member",
+        "start-token",
+        "target-token",
+        "cursor-1",
+        ("start-token", "cursor-1"),
+        1,
+        8,
+        effect_id,
+    )
+    lane = RoomLane(
+        room_id,
+        0,
+        LaneStatus.ACTIVE,
+        release_phase=ReleasePhase.RECOVERING,
+        recovery_gap=gap,
+    )
+    return effect, state, lane
+
+
+def _membership_effect(stream_id: UUID) -> PersistedNetworkEffect:
+    return PersistedNetworkEffect(
+        MembershipRequest(
+            UUID("55555555-5555-5555-5555-555555555555"),
+            stream_id,
+            TransportKind.CLASSIC,
+            "!baseline:example.org",
+            0,
+            MembershipAction.JOIN,
+            b'{"reason":"restart"}',
+            30_000,
+        ),
+        0,
+        MembershipDeliveryState.READY,
+        False,
+    )
+
+
+def _network_effect_graph_rows(journal) -> tuple[tuple[object, ...], ...]:
+    rows: list[tuple[object, ...]] = []
+    for table, order_by in (
+        ("NioIngestRoomState", "room_id"),
+        ("NioIngestRoomLane", "room_id, membership_epoch"),
+        ("NioIngestNetworkEffect", "effect_id"),
+    ):
+        rows.extend(
+            (table, *tuple(row))
+            for row in journal.connection.execute(
+                f'SELECT * FROM "{table}" WHERE account_id = ? ORDER BY {order_by}',
+                (ACCOUNT_ID,),
+            )
+        )
+    return tuple(rows)
 
 
 def _kill_during_attach(
@@ -691,3 +793,142 @@ async def test_acknowledgement_rolls_back_frontier_and_batch_cascade(
         assert [tuple(row) for row in index_rows] == [(2, 0)]
     finally:
         reopened.close()
+
+
+def _interrupt_network_effect_transition(
+    store_path: Path,
+    consumer: ConsumerBootstrap,
+    operation: str,
+    statement_ordinal: int,
+) -> None:
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    asyncio.run(bootstrap.attach_consumer(consumer))
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    recovery, recovery_state, recovery_lane = _recovery_effect_graph(
+        bootstrap.stream_id
+    )
+    if operation == "recovery_insert":
+        transition = JournalTransition(
+            room_states=(recovery_state,),
+            room_lanes=(recovery_lane,),
+            network_effect_inserts=(recovery,),
+        )
+    elif operation == "membership_update":
+        membership = journal.load_network_effect(
+            _membership_effect(bootstrap.stream_id).request.effect_id
+        )
+        assert membership is not None
+        transition = JournalTransition(
+            network_effect_updates=(
+                replace(
+                    membership,
+                    attempt_ordinal=1,
+                    membership_delivery_state=(
+                        MembershipDeliveryState.DISPATCHED_UNCONFIRMED
+                    ),
+                ),
+            )
+        )
+    else:
+        assert operation == "recovery_delete"
+        transition = JournalTransition(
+            room_lanes=(
+                replace(
+                    recovery_lane,
+                    release_phase=ReleasePhase.IDLE,
+                    recovery_gap=None,
+                ),
+            ),
+            network_effect_deletes=(recovery.request.effect_id,),
+        )
+    journal.set_transition_statement_hook(_exit_at_statement(statement_ordinal))
+    journal.commit(
+        expected_revision=owner.revision,
+        writer_epoch=journal.writer_epoch,
+        transition=transition,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "statement_count"),
+    (
+        ("recovery_insert", 4),
+        ("membership_update", 2),
+        ("recovery_delete", 3),
+    ),
+)
+async def test_network_effect_graph_rolls_back_at_every_persisted_statement(
+    tmp_path: Path,
+    operation: str,
+    statement_count: int,
+) -> None:
+    store_path = tmp_path / f"effect-{operation}"
+    bootstrap = open_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _one_room_consumer(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    journal = bootstrap._journal
+    if operation == "membership_update":
+        membership = _membership_effect(bootstrap.stream_id)
+        journal.commit(
+            expected_revision=1,
+            writer_epoch=journal.writer_epoch,
+            transition=JournalTransition(network_effect_inserts=(membership,)),
+        )
+    elif operation == "recovery_delete":
+        recovery, recovery_state, recovery_lane = _recovery_effect_graph(
+            bootstrap.stream_id
+        )
+        journal.commit(
+            expected_revision=1,
+            writer_epoch=journal.writer_epoch,
+            transition=JournalTransition(
+                room_states=(recovery_state,),
+                room_lanes=(recovery_lane,),
+                network_effect_inserts=(recovery,),
+            ),
+        )
+    expected_revision = journal.load_owner().revision
+    expected_rows = _network_effect_graph_rows(journal)
+    expected_effects = journal.list_network_effects(256)
+    bootstrap.close()
+
+    for statement_ordinal in range(1, statement_count + 1):
+        _assert_process_crashed(
+            _interrupt_network_effect_transition,
+            store_path,
+            consumer,
+            operation,
+            statement_ordinal,
+        )
+        reopened = open_ingestion_store(
+            store_path,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            pickle_key="secret",
+            database_name="journal.db",
+        )
+        try:
+            await reopened.attach_consumer(consumer)
+            assert reopened._journal.load_owner().revision == expected_revision
+            assert _network_effect_graph_rows(reopened._journal) == expected_rows
+            assert reopened._journal.list_network_effects(256) == expected_effects
+            reopened._journal.load_rooms(frozenset({"!baseline:example.org"}))
+        finally:
+            reopened.close()

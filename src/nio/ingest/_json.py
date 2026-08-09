@@ -1,6 +1,7 @@
 """Cycle-neutral strict Matrix JSON loading and canonical encoding."""
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 MATRIX_CANONICAL_INTEGER_MAX = (1 << 53) - 1
@@ -20,6 +21,10 @@ def _parse_json_integer(value: str) -> int:
     if not -MATRIX_CANONICAL_INTEGER_MAX <= parsed <= MATRIX_CANONICAL_INTEGER_MAX:
         raise ValueError("JSON integer exceeds the Matrix canonical range")
     return parsed
+
+
+def _parse_internal_json_integer(value: str) -> int:
+    return int(value)
 
 
 def _object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -54,7 +59,12 @@ def _validate_json_nesting(text: str, field_name: str) -> None:
             depth -= 1
 
 
-def load_json(data: bytes, field_name: str) -> Any:
+def _load_json(
+    data: bytes,
+    field_name: str,
+    *,
+    parse_integer: Callable[[str], int],
+) -> Any:
     if type(data) is not bytes:
         raise TypeError(f"{field_name} must be bytes")
     try:
@@ -64,11 +74,29 @@ def load_json(data: bytes, field_name: str) -> Any:
             text,
             parse_constant=_reject_json_constant,
             parse_float=_reject_json_float,
-            parse_int=_parse_json_integer,
+            parse_int=parse_integer,
             object_pairs_hook=_object_from_pairs,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError(f"{field_name} must contain valid UTF-8 JSON") from error
+
+
+def load_json(data: bytes, field_name: str) -> Any:
+    return _load_json(
+        data,
+        field_name,
+        parse_integer=_parse_json_integer,
+    )
+
+
+def load_internal_json(data: bytes, field_name: str) -> Any:
+    """Load canonical internal JSON without Matrix's wire-integer ceiling."""
+
+    return _load_json(
+        data,
+        field_name,
+        parse_integer=_parse_internal_json_integer,
+    )
 
 
 def canonical_json(value: Any) -> bytes:

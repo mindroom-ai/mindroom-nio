@@ -20,6 +20,11 @@ from ..ingest.config import (
     SourceConfig,
     source_transport,
 )
+from ..ingest.effects import (
+    MembershipDeliveryState,
+    MembershipRequest,
+    RoomHydrationRequest,
+)
 from ..ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
@@ -55,6 +60,7 @@ from ..ingest.state import (
     OwnerView,
     ReadyRecord,
     ReadyRecordKey,
+    RoomAggregate,
     RoomLane,
     RoomState,
 )
@@ -692,7 +698,11 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("writer_epoch must be UUID")
         if type(transition) is not JournalTransition:
             raise TypeError("transition must be JournalTransition")
-        if owner.revision != expected_revision or writer_epoch != self.writer_epoch:
+        if (
+            owner.revision != expected_revision
+            or owner.writer_epoch != writer_epoch
+            or writer_epoch != self.writer_epoch
+        ):
             raise JournalConflictError("journal revision or writer_epoch is stale")
         if transition.source_state is not None:
             if transition.source_state.transport_kind is not owner.transport_kind:
@@ -715,7 +725,20 @@ class SqliteIngestionJournal(JournalRows):
             )
         for ready in transition.ready_records:
             self._validate_ready_record(ready)
-
+        for effect in (
+            *transition.network_effect_inserts,
+            *transition.network_effect_updates,
+        ):
+            self._validate_network_effect(effect, owner)
+        for effect in transition.network_effect_inserts:
+            if type(effect.request) is MembershipRequest and (
+                effect.attempt_ordinal != 0
+                or effect.membership_delivery_state is not MembershipDeliveryState.READY
+                or effect.prior_delivery_uncertain is not False
+            ):
+                raise JournalIntegrityError(
+                    "new membership effect must start READY at attempt zero"
+                )
         new_revision = expected_revision + 1
         materialization = transition.batch_materialization
         if materialization is not None:
@@ -777,11 +800,18 @@ class SqliteIngestionJournal(JournalRows):
             if materialization is not None
             else ()
         )
-        touched_ids = frozenset(
+        touched_ids = set(
             [state.room_id for state in transition.room_states]
             + [lane.room_id for lane in transition.room_lanes]
             + [record.key.room_id for record in transition.lane_record_inserts]
             + [key.room_id for key in materialized_lane_keys]
+            + [
+                effect.request.room_id
+                for effect in (
+                    *transition.network_effect_inserts,
+                    *transition.network_effect_updates,
+                )
+            ]
         )
         insert_keys = tuple(record.key for record in transition.lane_record_inserts)
         insert_item_ids = tuple(
@@ -819,8 +849,56 @@ class SqliteIngestionJournal(JournalRows):
         if len(set(lane_update_ids)) != len(lane_update_ids):
             raise JournalIntegrityError("room lane transition keys contain duplicates")
         lane_updates = dict(zip(lane_update_ids, transition.room_lanes, strict=True))
+        room_state_ids = tuple(state.room_id for state in transition.room_states)
+        if len(set(room_state_ids)) != len(room_state_ids):
+            raise JournalIntegrityError("duplicate room state transition keys")
 
         with immediate_transaction(self.connection):
+            effect_mutation_ids = (
+                tuple(
+                    effect.request.effect_id
+                    for effect in (
+                        *transition.network_effect_inserts,
+                        *transition.network_effect_updates,
+                    )
+                )
+                + transition.network_effect_deletes
+            )
+            existing_effects_by_id = self._load_network_effect_rows_by_ids(
+                effect_mutation_ids,
+                owner,
+            )
+            genuinely_new_effects = []
+            for effect in transition.network_effect_inserts:
+                existing = existing_effects_by_id.get(effect.request.effect_id)
+                if existing is None:
+                    genuinely_new_effects.append(effect)
+                elif existing.effect != effect:
+                    raise JournalIntegrityError(
+                        "network effect identity collides with different contents"
+                    )
+            real_effect_updates = []
+            for effect in transition.network_effect_updates:
+                stored = existing_effects_by_id.get(effect.request.effect_id)
+                if stored is None:
+                    raise JournalIntegrityError(
+                        "network effect update target is absent"
+                    )
+                if self._validate_network_effect_update_edge(stored.effect, effect):
+                    real_effect_updates.append((stored, effect))
+            deleted_effects = []
+            for effect_id in transition.network_effect_deletes:
+                stored = existing_effects_by_id.get(effect_id)
+                if stored is None:
+                    raise JournalIntegrityError(
+                        "network effect delete target is absent"
+                    )
+                deleted_effects.append(stored)
+            touched_ids.update(
+                stored.effect.request.room_id
+                for stored in existing_effects_by_id.values()
+            )
+
             materialized_ready_ids: list[str] = []
             materialized_lane_ids: list[str] = []
             deleted_records: list[LaneRecord] = []
@@ -923,7 +1001,21 @@ class SqliteIngestionJournal(JournalRows):
             proposed: dict[str, tuple[RoomState, dict[int, RoomLane]]] = {}
             before_lanes: dict[tuple[str, int], RoomLane] = {}
             if touched_ids:
-                for room_id, aggregate in self.load_rooms(touched_ids).items():
+                frozen_touched_ids = frozenset(touched_ids)
+                current_aggregates = self._load_room_aggregates(frozen_touched_ids)
+                persisted_effect_rows = self._load_network_effect_rows_for_rooms(
+                    frozen_touched_ids,
+                    owner,
+                )
+                persisted_effects = {
+                    stored.effect.request.effect_id: stored.effect
+                    for stored in persisted_effect_rows
+                }
+                self._validate_network_effect_graph(
+                    current_aggregates,
+                    persisted_effects,
+                )
+                for room_id, aggregate in current_aggregates.items():
                     existing_lanes = (
                         *aggregate.retiring_lanes,
                         aggregate.active_lane,
@@ -962,11 +1054,88 @@ class SqliteIngestionJournal(JournalRows):
                         raise JournalIntegrityError(
                             "lane record transition requires its exact membership lane"
                         )
+                proposed_aggregates = {
+                    state.room_id: RoomAggregate(
+                        state,
+                        lanes[max(lanes)],
+                        tuple(lanes[epoch] for epoch in sorted(lanes)[:-1]),
+                    )
+                    for state, lanes in proposed.values()
+                }
+                proposed_effects = {
+                    stored.effect.request.effect_id: stored.effect
+                    for stored in persisted_effect_rows
+                }
+                proposed_effects.update(
+                    {
+                        effect.request.effect_id: effect
+                        for effect in genuinely_new_effects
+                    }
+                )
+                proposed_effects.update(
+                    {
+                        effect.request.effect_id: effect
+                        for _, effect in real_effect_updates
+                    }
+                )
+                for stored in deleted_effects:
+                    proposed_effects.pop(stored.effect.request.effect_id)
+                    if type(stored.effect.request) is RoomHydrationRequest:
+                        changed_state = proposed_aggregates[
+                            stored.effect.request.room_id
+                        ].state
+                        if stored.effect.request.room_id not in room_state_ids or (
+                            changed_state.current_membership_epoch
+                            == stored.effect.request.membership_epoch
+                            and changed_state.hydration_status
+                            is RoomHydrationStatus.PENDING
+                        ):
+                            raise JournalIntegrityError(
+                                "hydration deletion requires a room state transition"
+                            )
+                new_effect_ids = {
+                    effect.request.effect_id for effect in genuinely_new_effects
+                }
+                self._validate_network_effect_graph(
+                    proposed_aggregates,
+                    proposed_effects,
+                    insertion_ids=frozenset(new_effect_ids),
+                )
             self._validate_held_lane_reconciliation(
                 before_lanes,
                 lane_updates,
                 tuple(genuinely_new),
                 tuple(deleted_records),
+            )
+
+            has_other_mutation = (
+                transition.source_state is not None
+                or bool(transition.room_states)
+                or bool(transition.room_lanes)
+                or bool(transition.lane_record_inserts)
+                or bool(transition.ready_records)
+                or bool(transition.frames)
+                or transition.batch_materialization is not None
+                or bool(transition.delete_frame_ids)
+            )
+            effect_mutation_requested = bool(effect_mutation_ids)
+            if (
+                effect_mutation_requested
+                and not genuinely_new_effects
+                and not real_effect_updates
+                and not deleted_effects
+                and not has_other_mutation
+            ):
+                return CommitResult(owner.revision)
+
+            prepared_effect_inserts = self._prepare_network_effect_inserts(
+                tuple(genuinely_new_effects),
+                new_revision,
+                owner,
+            )
+            prepared_effect_updates = self._prepare_network_effect_state_updates(
+                tuple(real_effect_updates),
+                new_revision,
             )
 
             cursor = self._transition_execute(
@@ -997,6 +1166,12 @@ class SqliteIngestionJournal(JournalRows):
                 self._write_ready(ready, new_revision)
             for frame in transition.frames:
                 self._write_frame(frame, new_revision)
+            self._insert_network_effects(prepared_effect_inserts)
+            self._update_network_effects(
+                prepared_effect_updates,
+                new_revision,
+            )
+            self._delete_network_effects(tuple(deleted_effects))
             if batch is not None:
                 self._write_batch(batch, new_revision, owner)
                 self._write_batch_items(batch)

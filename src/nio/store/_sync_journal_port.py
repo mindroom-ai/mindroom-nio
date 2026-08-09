@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
+from ..ingest.effects import PersistedNetworkEffect
 from ..ingest.model import BatchRef, SyncBatch
 from ..ingest.state import (
     AckOutcome,
@@ -44,6 +45,21 @@ class IngestionJournal(Protocol):
     ) -> tuple[LaneRecord, ...]: ...
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None: ...
+
+    def load_network_effect(
+        self,
+        effect_id: UUID,
+    ) -> PersistedNetworkEffect | None: ...
+
+    def list_network_effects(
+        self,
+        limit: int,
+    ) -> tuple[PersistedNetworkEffect, ...]: ...
+
+    def list_schedulable_network_effects(
+        self,
+        limit: int,
+    ) -> tuple[PersistedNetworkEffect, ...]: ...
 
     def commit(
         self,

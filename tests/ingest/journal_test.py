@@ -138,8 +138,14 @@ def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() ->
         def load_frame(self, frame_id):
             return None
 
-        def load_loss(self, loss_id):
+        def load_network_effect(self, effect_id):
             return None
+
+        def list_network_effects(self, limit):
+            return ()
+
+        def list_schedulable_network_effects(self, limit):
+            return ()
 
         def commit(self, *, expected_revision, writer_epoch, transition):
             return None
@@ -2731,6 +2737,11 @@ async def test_attaching_prefix_keeps_all_attached_operations_closed(
                 LaneRecordKey("!missing:example.org", 0, LaneRecordSection.HELD, 0, 0)
             ),
             lambda: bootstrap._journal.list_lane_records("!missing:example.org", 0),
+            lambda: bootstrap._journal.load_network_effect(
+                UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+            ),
+            lambda: bootstrap._journal.list_network_effects(1),
+            lambda: bootstrap._journal.list_schedulable_network_effects(1),
         )
         for operation in operations:
             with pytest.raises(LocalProtocolError, match="consumer is not attached"):
@@ -2923,6 +2934,14 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
     try:
         with pytest.raises(LocalProtocolError, match="consumer is not attached"):
             bootstrap._journal.oldest_unacknowledged()
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            bootstrap._journal.load_network_effect(
+                UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+            )
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            bootstrap._journal.list_network_effects(1)
+        with pytest.raises(LocalProtocolError, match="consumer is not attached"):
+            bootstrap._journal.list_schedulable_network_effects(1)
         with pytest.raises(LocalProtocolError, match="consumer is not attached"):
             bootstrap.assert_http_enabled()
 
@@ -3421,7 +3440,7 @@ def _gap(
         (start_token, "cursor-1"),
         1,
         8,
-        UUID("55555555-5555-5555-5555-555555555555"),
+        None,
     )
 
 

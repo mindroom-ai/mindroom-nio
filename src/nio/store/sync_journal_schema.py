@@ -173,11 +173,80 @@ SCHEMA_SQL = (
         NioIngestPendingDecryption(account_id, room_id, sender_key, session_id)""",
     """CREATE TABLE NioIngestNetworkEffect (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
-        effect_id TEXT NOT NULL, effect_kind TEXT NOT NULL,
-        source_epoch INTEGER NOT NULL, membership_epoch INTEGER,
-        request_ciphertext BLOB NOT NULL, request_sha256 BLOB NOT NULL,
-        created_revision INTEGER NOT NULL, PRIMARY KEY (account_id, effect_id)
+        effect_id TEXT NOT NULL CHECK (
+            typeof(effect_id) = 'text' AND length(effect_id) > 0
+        ),
+        effect_kind TEXT NOT NULL CHECK (
+            effect_kind IN ('recovery', 'room_hydration', 'membership')
+        ),
+        room_id TEXT NOT NULL CHECK (
+            typeof(room_id) = 'text' AND length(room_id) > 0
+        ),
+        membership_epoch INTEGER NOT NULL CHECK (
+            typeof(membership_epoch) = 'integer' AND membership_epoch >= 0
+        ),
+        attempt_ordinal INTEGER NOT NULL CHECK (
+            typeof(attempt_ordinal) = 'integer' AND attempt_ordinal >= 0
+        ),
+        membership_delivery_state TEXT CHECK (
+            membership_delivery_state IN ('ready', 'dispatched_unconfirmed')
+        ),
+        prior_delivery_uncertain INTEGER CHECK (
+            prior_delivery_uncertain IS NULL OR (
+                typeof(prior_delivery_uncertain) = 'integer'
+                AND prior_delivery_uncertain IN (0, 1)
+            )
+        ),
+        request_ciphertext BLOB NOT NULL CHECK (typeof(request_ciphertext) = 'blob'),
+        request_sha256 BLOB NOT NULL CHECK (
+            typeof(request_sha256) = 'blob' AND length(request_sha256) = 32
+        ),
+        state_ciphertext BLOB NOT NULL CHECK (typeof(state_ciphertext) = 'blob'),
+        state_sha256 BLOB NOT NULL CHECK (
+            typeof(state_sha256) = 'blob' AND length(state_sha256) = 32
+        ),
+        created_revision INTEGER NOT NULL CHECK (
+            typeof(created_revision) = 'integer' AND created_revision >= 0
+        ),
+        updated_revision INTEGER NOT NULL CHECK (
+            typeof(updated_revision) = 'integer' AND updated_revision >= created_revision
+        ),
+        CHECK (
+            (effect_kind = 'membership')
+            = (membership_delivery_state IS NOT NULL)
+        ),
+        CHECK (
+            (effect_kind = 'membership')
+            = (prior_delivery_uncertain IS NOT NULL)
+        ),
+        CHECK (effect_kind = 'membership' OR attempt_ordinal = 0),
+        CHECK (
+            effect_kind != 'membership'
+            OR membership_delivery_state = 'ready'
+            OR (
+                membership_delivery_state = 'dispatched_unconfirmed'
+                AND attempt_ordinal >= 1
+                AND (prior_delivery_uncertain = 0 OR attempt_ordinal >= 2)
+            )
+        ),
+        CHECK (
+            effect_kind != 'membership'
+            OR attempt_ordinal != 0
+            OR prior_delivery_uncertain = 0
+        ),
+        PRIMARY KEY (account_id, effect_id)
     )""",
+    """CREATE UNIQUE INDEX NioIngestNetworkEffect_membership_room ON
+        NioIngestNetworkEffect(account_id, room_id)
+        WHERE effect_kind = 'membership'""",
+    """CREATE INDEX NioIngestNetworkEffect_room ON
+        NioIngestNetworkEffect(account_id, room_id)""",
+    """CREATE INDEX NioIngestNetworkEffect_order ON
+        NioIngestNetworkEffect(account_id, created_revision, effect_id)""",
+    """CREATE INDEX NioIngestNetworkEffect_schedulable ON
+        NioIngestNetworkEffect(account_id, created_revision, effect_id)
+        WHERE effect_kind != 'membership'
+        OR membership_delivery_state = 'ready'""",
     """CREATE TABLE NioIngestCryptoEffect (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
         effect_id TEXT NOT NULL, effect_kind TEXT NOT NULL,
