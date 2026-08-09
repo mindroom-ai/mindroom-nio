@@ -371,6 +371,44 @@ def test_second_writer_and_wrong_store_identity_are_refused(tmp_path: Path) -> N
         )
 
 
+def test_sqlite_backup_opens_at_a_distinct_path_with_a_new_sidecar(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    restored_path = tmp_path / "restored.db"
+    source = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=source_path.name,
+    )
+    stream_id = source.stream_id
+    source.close()
+
+    with (
+        sqlite3.connect(source_path) as source_connection,
+        sqlite3.connect(restored_path) as restored_connection,
+    ):
+        source_connection.backup(restored_connection)
+
+    restored_lock_path = Path(f"{restored_path}.ingest.lock")
+    assert not restored_lock_path.exists()
+
+    restored = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=restored_path.name,
+    )
+    try:
+        assert restored.stream_id == stream_id
+        store = restored.open_matrix_store(SqliteStore)
+        assert not store.database.is_closed()
+        assert restored_lock_path.exists()
+    finally:
+        restored.close()
+
+
 def test_schema_version_is_validated_independently(tmp_path: Path) -> None:
     bootstrap = open_ingestion_store(
         tmp_path,
@@ -534,8 +572,8 @@ def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
             "INSERT INTO NioIngestMeta SELECT ?, device_id, schema_version, "
             "stream_id, binding_operation_id, journal_generation, "
             "consumer_generation, consumer_first_sequence, baseline_rooms_sha256, "
-            "consumer_attached_revision, revision, writer_epoch, lock_device, "
-            "lock_inode, next_source_epoch, next_ready_order, "
+            "consumer_attached_revision, revision, writer_epoch, "
+            "next_source_epoch, next_ready_order, "
             "next_batch_sequence, last_acked_sequence, last_acked_batch_id, "
             "last_acked_sha256, created_at_ns "
             "FROM NioIngestMeta WHERE account_id = ?",
@@ -777,6 +815,7 @@ def test_e2ee_bootstrap_creation_is_writer_epoch_fenced(
         bootstrap.close()
 
     normalized = tuple(" ".join(statement.split()).upper() for statement in statements)
+    begin_index = normalized.index("BEGIN IMMEDIATE")
     fence_index = next(
         index
         for index, statement in enumerate(normalized)
@@ -787,7 +826,60 @@ def test_e2ee_bootstrap_creation_is_writer_epoch_fenced(
         for index, statement in enumerate(normalized)
         if statement.startswith("CREATE TABLE")
     )
-    assert fence_index < first_create
+    assert begin_index < fence_index < first_create
+
+
+def test_nested_e2ee_calls_share_one_outer_writer_epoch_fence(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    store.save_account(OlmAccount())
+    statements: list[str] = []
+    store.database.connection().set_trace_callback(statements.append)
+
+    try:
+        store.load_sessions()
+    finally:
+        store.database.connection().set_trace_callback(None)
+        bootstrap.close()
+
+    assert (
+        sum(
+            "UPDATE NioIngestMeta SET writer_epoch = writer_epoch" in statement
+            for statement in statements
+        )
+        == 1
+    )
+
+
+def test_e2ee_operation_rejects_an_ambient_transaction_before_sql(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+
+    try:
+        with store.database.atomic():
+            statements: list[str] = []
+            store.database.connection().set_trace_callback(statements.append)
+            with pytest.raises(LocalProtocolError, match="ambient transaction"):
+                store.load_account()
+            assert statements == []
+            store.database.connection().set_trace_callback(None)
+    finally:
+        store.database.connection().set_trace_callback(None)
+        bootstrap.close()
 
 
 def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
@@ -1522,7 +1614,7 @@ def test_current_owner_fails_closed_when_retained_lock_path_is_replaced(
         bootstrap.close()
 
 
-def test_replaced_lock_path_cannot_admit_second_owner_or_mutate_state(
+def test_lock_path_replacement_takeover_fences_every_stale_handle_before_sql(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "journal.db"
@@ -1533,20 +1625,10 @@ def test_replaced_lock_path_cannot_admit_second_owner_or_mutate_state(
         database_name=database_path.name,
     )
     store = bootstrap.open_matrix_store(SqliteStore)
-    writer_epoch = str(bootstrap._journal.writer_epoch)
-    with sqlite3.connect(database_path) as connection:
-        e2ee_tables = _table_names(database_path) - {
-            table
-            for table in _table_names(database_path)
-            if table.startswith("NioIngest")
-        }
-        store_versions = connection.execute(
-            "SELECT version FROM storeversion"
-        ).fetchall()
+    store.save_account(OlmAccount())
     _replace_lock_path(database_path)
 
     second = None
-    error: BaseException | None = None
     try:
         second = open_ingestion_store(
             tmp_path,
@@ -1554,35 +1636,66 @@ def test_replaced_lock_path_cannot_admit_second_owner_or_mutate_state(
             device_id=DEVICE_ID,
             database_name=database_path.name,
         )
-    except BaseException as caught:
-        error = caught
+        statements: list[str] = []
+        store.database.connection().set_trace_callback(statements.append)
+
+        with pytest.raises(LocalProtocolError, match="lock file identity"):
+            bootstrap._journal.load_owner()
+        for operation in (
+            store.load_account,
+            lambda: store.save_account(OlmAccount()),
+            store.upgrade_to_v2,
+        ):
+            with pytest.raises(LocalProtocolError, match="lock file identity"):
+                operation()
+        assert statements == []
     finally:
+        bootstrap.close()
         if second is not None:
             second.close()
+
+
+@pytest.mark.parametrize("operation", ("load", "save", "upgrade"))
+def test_stale_e2ee_writer_epoch_is_cas_fenced_before_store_sql(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    store.save_account(OlmAccount())
+    bootstrap._journal.connection.execute(
+        "UPDATE NioIngestMeta SET writer_epoch = ? WHERE account_id = ?",
+        ("ffffffff-ffff-ffff-ffff-ffffffffffff", ACCOUNT_ID),
+    )
+    statements: list[str] = []
+    store.database.connection().set_trace_callback(statements.append)
+    operations = {
+        "load": store.load_account,
+        "save": lambda: store.save_account(OlmAccount()),
+        "upgrade": store.upgrade_to_v2,
+    }
+
+    try:
+        with pytest.raises(LocalProtocolError, match="writer_epoch"):
+            operations[operation]()
+    finally:
+        store.database.connection().set_trace_callback(None)
         bootstrap.close()
 
-    assert isinstance(error, LocalProtocolError)
-    with sqlite3.connect(database_path) as connection:
-        assert (
-            connection.execute(
-                "SELECT writer_epoch FROM NioIngestMeta WHERE account_id = ?",
-                (ACCOUNT_ID,),
-            ).fetchone()[0]
-            == writer_epoch
-        )
-        assert (
-            _table_names(database_path)
-            - {
-                table
-                for table in _table_names(database_path)
-                if table.startswith("NioIngest")
-            }
-            == e2ee_tables
-        )
-        assert (
-            connection.execute("SELECT version FROM storeversion").fetchall()
-            == store_versions
-        )
+    normalized = tuple(" ".join(statement.split()).upper() for statement in statements)
+    assert any(
+        statement.startswith("UPDATE NIOINGESTMETA SET WRITER_EPOCH = WRITER_EPOCH")
+        for statement in normalized
+    )
+    assert all(
+        statement in {"BEGIN IMMEDIATE", "ROLLBACK"} or "NIOINGESTMETA" in statement
+        for statement in normalized
+    )
 
 
 def test_encrypted_row_codec_authenticates_every_aad_dimension() -> None:

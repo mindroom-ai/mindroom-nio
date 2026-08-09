@@ -14,26 +14,61 @@ from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from peewee import SqliteDatabase
+
     from .database import MatrixStore
 
 
 class _StoreOwnershipLease:
-    def __init__(self) -> None:
+    def __init__(self, journal: _SqliteIngestionJournal) -> None:
         self._owner_pid = os.getpid()
         self._active = True
         self._lock = threading.RLock()
+        self._journal = journal
+        self._operation_depth = 0
 
     def _assert_process_owner(self) -> None:
         if os.getpid() != self._owner_pid:
             raise LocalProtocolError("ownership lease belongs to acquiring process")
 
     @contextmanager
-    def operation(self) -> Iterator[None]:
+    def operation(self, database: SqliteDatabase) -> Iterator[None]:
         self._assert_process_owner()
         with self._lock:
             if not self._active:
                 raise LocalProtocolError("store ownership lease is revoked")
-            yield
+            self._journal._assert_file_owner()
+            if self._operation_depth:
+                self._operation_depth += 1
+                try:
+                    yield
+                finally:
+                    self._operation_depth -= 1
+                return
+            if database.transaction_depth():
+                raise LocalProtocolError(
+                    "ingestion store operation cannot use an ambient transaction"
+                )
+
+            self._operation_depth = 1
+            try:
+                with database.atomic("IMMEDIATE"):
+                    self._journal._assert_file_owner()
+                    cursor = database.execute_sql(
+                        "UPDATE NioIngestMeta SET writer_epoch = writer_epoch "
+                        "WHERE account_id = ? AND writer_epoch = ?",
+                        (
+                            self._journal.account_id,
+                            str(self._journal.writer_epoch),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise LocalProtocolError(
+                            "ingestion store writer_epoch is stale"
+                        )
+                    yield
+            finally:
+                self._operation_depth = 0
 
     def revoke(self) -> None:
         self._assert_process_owner()
@@ -57,7 +92,7 @@ class StoreBootstrap:
                 raise LocalProtocolError(
                     "StoreBootstrap can open MatrixStore only once"
                 )
-            lease = _StoreOwnershipLease()
+            lease = _StoreOwnershipLease(self._journal)
             self._store = store
             try:
                 yield lease

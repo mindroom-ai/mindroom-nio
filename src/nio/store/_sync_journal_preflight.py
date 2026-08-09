@@ -192,7 +192,6 @@ def _create_fresh(
     account_id: str,
     device_id: str,
     writer_epoch: UUID,
-    lock_identity: FileIdentity,
     statement_hook: Callable[[str], None] | None,
 ) -> None:
     with immediate_transaction(connection):
@@ -205,10 +204,10 @@ def _create_fresh(
                 binding_operation_id, journal_generation,
                 consumer_generation, consumer_first_sequence,
                 baseline_rooms_sha256, consumer_attached_revision, revision,
-                writer_epoch, lock_device, lock_inode, next_source_epoch,
-                next_ready_order, next_batch_sequence, last_acked_sequence,
-                last_acked_batch_id, last_acked_sha256, created_at_ns
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, ?, ?,
+                writer_epoch, next_source_epoch, next_ready_order,
+                next_batch_sequence, last_acked_sequence, last_acked_batch_id,
+                last_acked_sha256, created_at_ns
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?,
                       1, 0, 1, 0, NULL, NULL, ?)""",
             (
                 account_id,
@@ -217,7 +216,6 @@ def _create_fresh(
                 str(uuid4()),
                 str(uuid4()),
                 str(writer_epoch),
-                *lock_identity,
                 time.time_ns(),
             ),
         )
@@ -233,12 +231,11 @@ def _open_existing(
     connection: sqlite3.Connection,
     account_id: str,
     device_id: str,
-    lock_identity: FileIdentity,
 ) -> UUID:
     validate_schema_topology(connection)
     rows = connection.execute(
-        "SELECT account_id, device_id, schema_version, writer_epoch, "
-        "lock_device, lock_inode FROM NioIngestMeta"
+        "SELECT account_id, device_id, schema_version, writer_epoch "
+        "FROM NioIngestMeta"
     ).fetchall()
     if len(rows) != 1:
         raise LocalProtocolError("ingestion-v1 marker row cardinality is not one")
@@ -249,17 +246,13 @@ def _open_existing(
         raise LocalProtocolError("ingestion device_id does not match")
     if row["schema_version"] != SCHEMA_VERSION:
         raise LocalProtocolError(f"unsupported schema_version {row['schema_version']}")
-    if (row["lock_device"], row["lock_inode"]) != lock_identity:
-        raise LocalProtocolError("persisted ingestion lock file identity changed")
-
     old_epoch = row["writer_epoch"]
     writer_epoch = uuid4()
     with immediate_transaction(connection):
         cursor = connection.execute(
             "UPDATE NioIngestMeta SET writer_epoch = ? "
-            "WHERE account_id = ? AND writer_epoch = ? "
-            "AND lock_device = ? AND lock_inode = ?",
-            (str(writer_epoch), account_id, old_epoch, *lock_identity),
+            "WHERE account_id = ? AND writer_epoch = ?",
+            (str(writer_epoch), account_id, old_epoch),
         )
         if cursor.rowcount != 1:
             raise LocalProtocolError("persisted writer_epoch changed during open")
@@ -305,9 +298,7 @@ def open_journal_database(
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
         if marker_exists:
-            writer_epoch = _open_existing(
-                connection, account_id, device_id, writer_lock.identity
-            )
+            writer_epoch = _open_existing(connection, account_id, device_id)
         else:
             writer_epoch = uuid4()
             _create_fresh(
@@ -315,7 +306,6 @@ def open_journal_database(
                 account_id,
                 device_id,
                 writer_epoch,
-                writer_lock.identity,
                 schema_statement_hook,
             )
         connection.execute("PRAGMA journal_mode = WAL")

@@ -148,14 +148,6 @@ class SqliteIngestionJournal(JournalRows):
 
     def _assert_open(self) -> None:
         self._assert_file_owner()
-        row = self.connection.execute(
-            "SELECT lock_device, lock_inode FROM NioIngestMeta WHERE account_id = ?",
-            (self.account_id,),
-        ).fetchone()
-        if row is None or (row["lock_device"], row["lock_inode"]) != (
-            self._writer_lock.identity
-        ):
-            raise LocalProtocolError("persisted ingestion lock file identity changed")
 
     def set_transition_statement_hook(
         self,

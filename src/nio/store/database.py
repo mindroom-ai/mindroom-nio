@@ -201,7 +201,7 @@ class MatrixStore:
 
     def _database_operation(self):
         lease = self._ingestion_lease
-        return lease.operation() if lease is not None else nullcontext()
+        return lease.operation(self.database) if lease is not None else nullcontext()
 
     def _revoke_ingestion_lease(self) -> None:
         assert self._ingestion_lease is not None
@@ -504,8 +504,7 @@ class MatrixStore:
         self.database.connect()
         try:
             row = self.database.execute_sql(
-                "SELECT account_id, device_id, schema_version, writer_epoch, "
-                "lock_device, lock_inode "
+                "SELECT account_id, device_id, schema_version, writer_epoch "
                 "FROM NioIngestMeta"
             ).fetchone()
             if row != (
@@ -513,7 +512,6 @@ class MatrixStore:
                 self.device_id,
                 1,
                 str(bootstrap._journal.writer_epoch),
-                *bootstrap._journal._writer_lock.identity,
             ):
                 raise LocalProtocolError(
                     "StoreBootstrap no longer matches the ingestion-v1 marker"
@@ -539,7 +537,7 @@ class MatrixStore:
 
             with self.database.bind_ctx([StoreVersion, *e2ee_models]):
                 if not present_e2ee:
-                    with self.database.atomic():
+                    with self.database.atomic("IMMEDIATE"):
                         cursor = self.database.execute_sql(
                             "UPDATE NioIngestMeta "
                             "SET writer_epoch = writer_epoch "

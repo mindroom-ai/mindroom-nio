@@ -5,7 +5,7 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     stream_id TEXT NOT NULL, binding_operation_id TEXT NOT NULL, journal_generation TEXT,
     consumer_generation TEXT, consumer_first_sequence INTEGER, baseline_rooms_sha256 BLOB,
     consumer_attached_revision INTEGER, revision INTEGER NOT NULL, writer_epoch TEXT NOT NULL,
-    lock_device INTEGER NOT NULL, lock_inode INTEGER NOT NULL, next_source_epoch INTEGER NOT NULL,
+    next_source_epoch INTEGER NOT NULL,
     next_ready_order INTEGER NOT NULL, next_batch_sequence INTEGER NOT NULL,
     last_acked_sequence INTEGER NOT NULL, last_acked_batch_id TEXT,
     last_acked_sha256 BLOB, created_at_ns INTEGER NOT NULL
