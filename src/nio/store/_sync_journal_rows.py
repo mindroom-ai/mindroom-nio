@@ -7,6 +7,7 @@ from dataclasses import replace
 from uuid import UUID
 
 from ..exceptions import LocalProtocolError
+from ..ingest._json import load_internal_json
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import (
     EventRecord,
@@ -17,6 +18,7 @@ from ..ingest.model import (
     SystemOrigin,
     TransportKind,
 )
+from ..ingest.ports import NetworkRequest, StagedSourceResponse
 from ..ingest.serialization import (
     _batch_from_payload,
     _canonical_json,
@@ -54,7 +56,24 @@ from ..ingest.state import (
 from ._sync_journal_effects import NetworkEffectRows
 from ._sync_journal_preflight import _validate_source_cursor
 
-_FRAME_FIELDS = {"source_epoch", "request_id", "payload", "staged_revision"}
+_FRAME_FIELDS = (
+    "request",
+    "response_body",
+    "source_sha256",
+    "staged_revision",
+)
+_NETWORK_REQUEST_FIELDS = (
+    "stream_id",
+    "transport",
+    "source_epoch",
+    "request_id",
+    "method",
+    "path",
+    "query",
+    "body",
+    "timeout_ms",
+    "request_cursor_json",
+)
 _READY_FIELDS = (
     "item_id",
     "item_kind",
@@ -104,6 +123,96 @@ _LANE_RECORD_FIELDS = (
     "record",
     "created_revision",
 )
+
+
+def _network_request_to_dict(request: NetworkRequest) -> dict[str, object]:
+    if type(request) is not NetworkRequest:
+        raise TypeError("request must be NetworkRequest")
+    return {
+        "stream_id": str(request.stream_id),
+        "transport": request.transport.value,
+        "source_epoch": request.source_epoch,
+        "request_id": request.request_id,
+        "method": request.method,
+        "path": request.path,
+        "query": [[key, value] for key, value in request.query],
+        "body": _encoded_bytes(request.body),
+        "timeout_ms": request.timeout_ms,
+        "request_cursor_json": _encoded_bytes(request.request_cursor_json),
+    }
+
+
+def _network_request_from_dict(value: object) -> NetworkRequest:
+    if type(value) is not dict:
+        raise ValueError("network request must be an object")
+    request = value
+    if tuple(request) != _NETWORK_REQUEST_FIELDS:
+        raise ValueError("network request fields are not canonical")
+    query = request["query"]
+    if type(query) is not list:
+        raise ValueError("network request query must be an array")
+    pairs: list[tuple[str, str]] = []
+    for pair in query:
+        if type(pair) is not list or len(pair) != 2:
+            raise ValueError("network request query entries are invalid")
+        key, item = pair
+        if type(key) is not str or type(item) is not str:
+            raise ValueError("network request query entries are invalid")
+        pairs.append((key, item))
+    body = _decoded_bytes(request["body"], "request body", optional=True)
+    cursor = _decoded_bytes(request["request_cursor_json"], "request cursor")
+    if cursor is None:
+        raise ValueError("request cursor must be bytes")
+    if any(
+        type(request[name]) is not int
+        for name in ("source_epoch", "request_id", "timeout_ms")
+    ):
+        raise ValueError("network request integer fields are invalid")
+    for name in ("stream_id", "transport", "method", "path"):
+        if type(request[name]) is not str:
+            raise ValueError("network request string fields are invalid")
+    parsed = NetworkRequest(
+        UUID(request["stream_id"]),
+        TransportKind(request["transport"]),
+        request["source_epoch"],
+        request["request_id"],
+        request["method"],
+        request["path"],
+        tuple(pairs),
+        body,
+        request["timeout_ms"],
+        cursor,
+    )
+    if request != _network_request_to_dict(parsed):
+        raise ValueError("network request is not canonical")
+    return parsed
+
+
+def _frame_response_from_envelope(value: object) -> tuple[StagedSourceResponse, int]:
+    if type(value) is not dict:
+        raise ValueError("frame authenticated envelope must be an object")
+    envelope = value
+    if tuple(envelope) != _FRAME_FIELDS:
+        raise ValueError("frame authenticated envelope is invalid")
+    revision = envelope["staged_revision"]
+    if type(revision) is not int or revision < 0:
+        raise ValueError("frame staged revision is invalid")
+    body = _decoded_bytes(envelope["response_body"], "response body")
+    digest = _decoded_bytes(envelope["source_sha256"], "source digest")
+    if body is None or digest is None:
+        raise ValueError("frame response fields are invalid")
+    response = StagedSourceResponse(
+        _network_request_from_dict(envelope["request"]), body, digest
+    )
+    canonical = {
+        "request": _network_request_to_dict(response.request),
+        "response_body": _encoded_bytes(response.response_body),
+        "source_sha256": _encoded_bytes(response.source_sha256),
+        "staged_revision": revision,
+    }
+    if envelope != canonical:
+        raise ValueError("frame authenticated envelope is not canonical")
+    return response, revision
 
 
 class JournalRows(NetworkEffectRows):
@@ -717,12 +826,12 @@ class JournalRows(NetworkEffectRows):
             bool(row["active"]),
         )
 
-    def _write_frame(self, frame: StagedFrame, revision: int) -> None:
+    def _write_frame(self, frame: StagedFrame, revision: int, owner: OwnerView) -> None:
         payload = _canonical_json(
             {
-                "source_epoch": frame.source_epoch,
-                "request_id": frame.request_id,
-                "payload": _encoded_bytes(frame.payload),
+                "request": _network_request_to_dict(frame.response.request),
+                "response_body": _encoded_bytes(frame.response.response_body),
+                "source_sha256": _encoded_bytes(frame.response.source_sha256),
                 "staged_revision": revision,
             }
         )
@@ -739,8 +848,8 @@ class JournalRows(NetworkEffectRows):
             (
                 self.account_id,
                 str(frame.frame_id),
-                frame.source_epoch,
-                frame.request_id,
+                frame.response.request.source_epoch,
+                frame.response.request.request_id,
                 ciphertext,
                 digest,
                 revision,
@@ -748,41 +857,89 @@ class JournalRows(NetworkEffectRows):
         )
         self._revalidate_insert(
             cursor,
-            lambda: self.load_frame(frame.frame_id),
+            lambda: self._load_frame_with_owner(frame.frame_id, owner),
             replace(frame, staged_revision=revision),
             "frame_id collides with different authenticated contents",
         )
 
-    def load_frame(self, frame_id: UUID) -> StagedFrame | None:
-        self._require_attached()
+    def _decode_frame_row(
+        self,
+        frame_id: UUID,
+        row: sqlite3.Row,
+        owner: OwnerView,
+    ) -> StagedFrame:
+        payload = self._open_payload("NioIngestFrame", (frame_id,), row, "payload")
+        try:
+            response, revision = _frame_response_from_envelope(
+                load_internal_json(payload, "frame authenticated envelope")
+            )
+            if payload != _canonical_json(
+                {
+                    "request": _network_request_to_dict(response.request),
+                    "response_body": _encoded_bytes(response.response_body),
+                    "source_sha256": _encoded_bytes(response.source_sha256),
+                    "staged_revision": revision,
+                }
+            ):
+                raise ValueError("frame authenticated envelope is not canonical")
+            frame = StagedFrame(frame_id, response, revision)
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "frame authenticated envelope is invalid"
+            ) from error
+        request = response.request
+        if (
+            request.stream_id != owner.stream_id
+            or request.transport is not owner.transport_kind
+        ):
+            raise JournalIntegrityError("frame request does not match journal owner")
+        if (
+            request.source_epoch,
+            request.request_id,
+            revision,
+        ) != (
+            row["source_epoch"],
+            row["request_id"],
+            row["staged_revision"],
+        ):
+            raise JournalIntegrityError(
+                "frame columns do not match authenticated metadata"
+            )
+        return frame
+
+    def _load_frame_with_owner(
+        self,
+        frame_id: UUID,
+        owner: OwnerView,
+    ) -> StagedFrame | None:
         row = self.connection.execute(
             "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
             (self.account_id, str(frame_id)),
         ).fetchone()
-        if row is None:
-            return None
-        payload = self._open_payload("NioIngestFrame", (frame_id,), row, "payload")
-        envelope = _load_json_object(payload)
-        if set(envelope) != _FRAME_FIELDS:
-            raise JournalIntegrityError("frame authenticated envelope is invalid")
-        names = ("source_epoch", "request_id", "staged_revision")
-        metadata = tuple(envelope[name] for name in names)
-        if any(type(value) is not int for value in metadata):
-            raise JournalIntegrityError("frame authenticated metadata is invalid")
+        return self._decode_frame_row(frame_id, row, owner) if row is not None else None
+
+    def load_frame(self, frame_id: UUID) -> StagedFrame | None:
+        owner = self._require_attached()
+        if type(frame_id) is not UUID:
+            raise TypeError("frame_id must be UUID")
+        return self._load_frame_with_owner(frame_id, owner)
+
+    def list_frames(self, limit: int) -> tuple[StagedFrame, ...]:
+        owner = self._require_attached()
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("frame limit must be an integer from 1 through 256")
+        rows = self.connection.execute(
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+            "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
+            (self.account_id, limit),
+        ).fetchall()
         try:
-            frame_payload = _decoded_bytes(envelope["payload"], "frame payload")
-        except ValueError as error:
-            raise JournalIntegrityError(
-                "frame authenticated payload is invalid"
-            ) from error
-        assert frame_payload is not None
-        if metadata != tuple(row[name] for name in names):
-            raise JournalIntegrityError(
-                "frame columns do not match authenticated metadata"
+            return tuple(
+                self._decode_frame_row(UUID(row["frame_id"]), row, owner)
+                for row in rows
             )
-        return StagedFrame(
-            frame_id, metadata[0], metadata[1], frame_payload, metadata[2]
-        )
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError("selected frame identity is invalid") from error
 
     def _write_batch(
         self,

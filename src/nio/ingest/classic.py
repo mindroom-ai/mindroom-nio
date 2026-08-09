@@ -1,11 +1,11 @@
 import hashlib
 from dataclasses import dataclass
-from uuid import UUID, uuid5
+from uuid import UUID
 
 from .config import ClassicSourceConfig
 from .membership import _latest_own_membership, _membership_observation
 from .model import RecordOrigin, TransportKind
-from .ports import NetworkRequest, NetworkResult
+from .ports import NetworkRequest, NetworkResult, _frame_id_for_response
 from .source import (
     ClassicCursor,
     RoomSection,
@@ -97,7 +97,7 @@ class ClassicSource:
             return error_result
 
         try:
-            frame = self._normalize_frame(request, result.body)
+            frame, response_body = self._normalize_frame(request, result.body)
         except (TypeError, ValueError) as error:
             return malformed_success_result(request, result.body, error)
         return SourceResult(
@@ -108,7 +108,7 @@ class ClassicSource:
             network_failure=None,
             error_code=None,
             retry_after_ms=None,
-            response_body=b"",
+            response_body=response_body,
             detail=None,
         )
 
@@ -182,7 +182,9 @@ class ClassicSource:
         if request.query != tuple(expected):
             raise ValueError("request is not the planned classic sync request")
 
-    def _normalize_frame(self, request: NetworkRequest, body: bytes) -> SyncFrame:
+    def _normalize_frame(
+        self, request: NetworkRequest, body: bytes
+    ) -> tuple[SyncFrame, bytes]:
         root = load_json(body, "sync response")
         root = require_json_object(root, "sync response")
         next_batch = require_json_string(root.get("next_batch"), "next_batch")
@@ -345,48 +347,50 @@ class ClassicSource:
                 )
             )
 
-        digest = hashlib.sha256(source_json).hexdigest()
-        frame_id = uuid5(
-            self.stream_id,
-            f"{request.source_epoch}:{request.request_id}:{digest}",
-        )
-        return SyncFrame(
-            frame_id=frame_id,
-            origin=RecordOrigin(
-                TransportKind.CLASSIC,
-                request.source_epoch,
-                request.request_id,
-                0,
+        source_sha256 = hashlib.sha256(source_json).digest()
+        frame_id = _frame_id_for_response(request, source_sha256)
+        return (
+            SyncFrame(
+                frame_id=frame_id,
+                origin=RecordOrigin(
+                    TransportKind.CLASSIC,
+                    request.source_epoch,
+                    request.request_id,
+                    0,
+                ),
+                request_cursor_json=request_cursor_json,
+                candidate_cursor_json=canonical_classic_cursor(
+                    type(request_cursor)(next_batch)
+                ),
+                source_sha256=source_sha256,
+                to_device_json=tuple(
+                    canonical_json(event)
+                    for event in require_json_event_container(
+                        root.get("to_device", {}),
+                        "to_device",
+                    )
+                ),
+                device_list_delta_json=canonical_json(
+                    {"changed": changed, "left": left}
+                ),
+                one_time_key_counts_json=canonical_json(key_counts),
+                unused_fallback_key_types_json=canonical_json(fallback),
+                room_segments=tuple(segments),
+                ephemeral_json=tuple(ephemeral),
+                global_account_data_json=tuple(
+                    canonical_json(event)
+                    for event in require_json_event_container(
+                        root.get("account_data", {}),
+                        "account_data",
+                    )
+                ),
+                presence_json=tuple(
+                    canonical_json(event)
+                    for event in require_json_event_container(
+                        root.get("presence", {}),
+                        "presence",
+                    )
+                ),
             ),
-            request_cursor_json=request_cursor_json,
-            candidate_cursor_json=canonical_classic_cursor(
-                type(request_cursor)(next_batch)
-            ),
-            source_json=source_json,
-            to_device_json=tuple(
-                canonical_json(event)
-                for event in require_json_event_container(
-                    root.get("to_device", {}),
-                    "to_device",
-                )
-            ),
-            device_list_delta_json=canonical_json({"changed": changed, "left": left}),
-            one_time_key_counts_json=canonical_json(key_counts),
-            unused_fallback_key_types_json=canonical_json(fallback),
-            room_segments=tuple(segments),
-            ephemeral_json=tuple(ephemeral),
-            global_account_data_json=tuple(
-                canonical_json(event)
-                for event in require_json_event_container(
-                    root.get("account_data", {}),
-                    "account_data",
-                )
-            ),
-            presence_json=tuple(
-                canonical_json(event)
-                for event in require_json_event_container(
-                    root.get("presence", {}),
-                    "presence",
-                )
-            ),
+            source_json,
         )

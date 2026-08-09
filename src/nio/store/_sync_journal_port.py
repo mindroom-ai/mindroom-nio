@@ -53,6 +53,8 @@ class IngestionJournal(Protocol):
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None: ...
 
+    def list_frames(self, limit: int) -> tuple[StagedFrame, ...]: ...
+
     def load_network_effect(
         self,
         effect_id: UUID,

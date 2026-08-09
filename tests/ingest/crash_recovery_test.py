@@ -37,6 +37,7 @@ from nio.ingest.effects import (
     RecoveryRequest,
 )
 from nio.ingest.membership import MembershipBaseline
+from nio.ingest.ports import NetworkRequest, StagedSourceResponse
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.serialization import (
     _canonical_json,
@@ -441,7 +442,22 @@ def _event(record_id: str, frame_index: int) -> EventRecord:
     )
 
 
-def _transition() -> JournalTransition:
+def _transition(stream_id: UUID) -> JournalTransition:
+    request = NetworkRequest(
+        stream_id,
+        TransportKind.CLASSIC,
+        1,
+        1,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        b'{"next_batch":null}',
+    )
+    body = b'{"raw":true}'
+    response = StagedSourceResponse(request, body, hashlib.sha256(body).digest())
+    frame_id = uuid5(stream_id, f"1:1:{response.source_sha256.hex()}")
     ready_event = _event("ready", 0)
     return JournalTransition(
         source_state=SourceState(
@@ -461,8 +477,8 @@ def _transition() -> JournalTransition:
             ),
         ),
         room_lanes=(RoomLane("!room:example.org", 1, LaneStatus.ACTIVE),),
-        ready_records=(ReadyRecord(0, ready_event, FRAME_ID),),
-        frames=(StagedFrame(FRAME_ID, 1, 1, b'{"raw":true}'),),
+        ready_records=(ReadyRecord(0, ready_event, frame_id),),
+        frames=(StagedFrame(frame_id, response),),
     )
 
 
@@ -506,7 +522,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
     )
     consumer = _consumer(bootstrap)
     await bootstrap.attach_consumer(consumer)
-    transition = _transition()
+    transition = _transition(bootstrap.stream_id)
     bootstrap.close()
     _assert_process_crashed(
         _kill_during_transition,
@@ -538,7 +554,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
         )
         assert reopened._journal.load_rooms(frozenset({"!room:example.org"})) == {}
         assert reopened._journal.load_ready_heads(limit=10) == ()
-        assert reopened._journal.load_frame(FRAME_ID) is None
+        assert reopened._journal.load_frame(transition.frames[0].frame_id) is None
         assert reopened._journal.oldest_unacknowledged() is None
     finally:
         reopened.close()

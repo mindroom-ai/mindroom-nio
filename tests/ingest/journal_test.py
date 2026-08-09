@@ -36,6 +36,7 @@ from nio.ingest.config import (
     SlidingSourceConfig,
 )
 from nio.ingest.classic import ClassicSource
+from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
 from nio.ingest.errors import (
     FreshIngestionRequired,
     JournalConflictError,
@@ -45,7 +46,14 @@ from nio.ingest.effects import (
     MembershipOperationRef,
     MembershipOperationResolution,
 )
-from nio.ingest.membership import MembershipBaseline
+from nio.ingest.membership import MembershipBaseline, MembershipObservation
+from nio.ingest.ports import NetworkRequest, StagedSourceResponse
+from nio.ingest.source import (
+    RoomSection,
+    RoomSegment,
+    canonical_json,
+    renormalize_staged_frame,
+)
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.state import (
     AckOutcome,
@@ -66,6 +74,7 @@ from nio.ingest.state import (
 )
 from nio.ingest.serialization import (
     _canonical_json,
+    _encoded_bytes,
     _loss_id,
     _record_to_dict,
     batch_from_records,
@@ -92,6 +101,31 @@ JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+
+
+def _staged_frame(
+    stream_id: UUID,
+    source_epoch: int,
+    request_id: int,
+    body: bytes,
+) -> StagedFrame:
+    request = NetworkRequest(
+        stream_id,
+        TransportKind.CLASSIC,
+        source_epoch,
+        request_id,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        b'{"next_batch":null}',
+    )
+    response = StagedSourceResponse(request, body, hashlib.sha256(body).digest())
+    return StagedFrame(
+        uuid5(stream_id, f"{source_epoch}:{request_id}:{response.source_sha256.hex()}"),
+        response,
+    )
 
 
 def _sliding_source_config(*, all_rooms_page_size: int = 100) -> SlidingSourceConfig:
@@ -141,6 +175,9 @@ def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() ->
 
         def load_frame(self, frame_id):
             return None
+
+        def list_frames(self, limit):
+            return ()
 
         def load_network_effect(self, effect_id):
             return None
@@ -4999,12 +5036,7 @@ async def test_ready_owned_loss_round_trips_after_its_source_frame_is_compacted(
         database_name="journal.db",
     )
     await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
-    frame = StagedFrame(
-        UUID("55555555-5555-5555-5555-555555555555"),
-        4,
-        9,
-        b'{"next_batch":"s10"}',
-    )
+    frame = _staged_frame(bootstrap.stream_id, 4, 9, b'{"next_batch":"s10"}')
     origin = RecordOrigin(TransportKind.CLASSIC, 4, 9, 3)
     boundary = LossBoundary("$prior", 1_700_000_000_000, "s1", "s9")
     incomplete = LossRecord(
@@ -5245,27 +5277,984 @@ async def test_frame_id_is_insert_or_exact_revalidate_never_overwritten(
         database_name="journal.db",
     )
     await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
-    frame = StagedFrame(
-        UUID("55555555-5555-5555-5555-555555555555"),
-        1,
-        1,
-        b'{"raw":1}',
-    )
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}')
     try:
         bootstrap._journal.commit(
             expected_revision=1,
             writer_epoch=bootstrap._journal.writer_epoch,
             transition=JournalTransition(frames=(frame,)),
         )
-        changed = StagedFrame(frame.frame_id, 2, 9, b'{"raw":2}')
-        with pytest.raises(JournalIntegrityError, match="frame_id"):
+        bootstrap._journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        changed = _staged_frame(bootstrap.stream_id, 2, 9, b'{"raw":2}')
+        transition = JournalTransition(frames=(changed,))
+        object.__setattr__(changed, "frame_id", frame.frame_id)
+        with pytest.raises(JournalIntegrityError, match="staged frame"):
             bootstrap._journal.commit(
                 expected_revision=2,
                 writer_epoch=bootstrap._journal.writer_epoch,
-                transition=JournalTransition(frames=(changed,)),
+                transition=transition,
             )
         assert bootstrap._journal.load_owner().revision == 2
         assert bootstrap._journal.load_frame(frame.frame_id) == frame
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_frame_id_changed_content_collision_rejects_before_any_sql_mutation(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    stored = _staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}')
+    changed = _staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(stored,)),
+        )
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            exact = bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    frames=(_staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}'),)
+                ),
+            )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert exact.revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+
+        transition = JournalTransition(frames=(changed,))
+        object.__setattr__(changed.response.request, "timeout_ms", 1)
+        statements = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(JournalIntegrityError, match="frame_id collides"):
+                bootstrap._journal.commit(
+                    expected_revision=2,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=transition,
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_frame_id_reinsert_rejects_forged_staged_revision_before_sql(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        transition = JournalTransition(frames=(frame,))
+        object.__setattr__(frame, "staged_revision", 999)
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(JournalIntegrityError, match="frame_id collides"):
+                bootstrap._journal.commit(
+                    expected_revision=2,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=transition,
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_new_frame_rejects_forged_staged_revision_before_sql(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"raw":1}')
+    transition = JournalTransition(frames=(frame,))
+    object.__setattr__(frame, "staged_revision", 999)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="staged_revision"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+    finally:
+        bootstrap._journal.connection.set_trace_callback(None)
+        bootstrap.close()
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_frames_reads_owner_once_and_frames_once(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    first = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    second = _staged_frame(bootstrap.stream_id, 1, 2, b'{"next_batch":"s2"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(first, second)),
+        )
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            assert bootstrap._journal.list_frames(2) == (
+                replace(first, staged_revision=2),
+                replace(second, staged_revision=2),
+            )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        selects = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+        ]
+        assert len(selects) == 2
+        assert sum("NioIngestMeta" in statement for statement in selects) == 1
+        assert sum("NioIngestFrame" in statement for statement in selects) == 1
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_list_frames_validates_limit_orders_by_staged_request_and_uses_index(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    later = _staged_frame(bootstrap.stream_id, 3, 2, b'{"next_batch":"s2"}')
+    earlier = _staged_frame(bootstrap.stream_id, 3, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(later, earlier)),
+        )
+        assert bootstrap._journal.list_frames(1) == (
+            replace(earlier, staged_revision=2),
+        )
+        assert bootstrap._journal.list_frames(2) == (
+            replace(earlier, staged_revision=2),
+            replace(later, staged_revision=2),
+        )
+        for limit in (0, 257, True, "1"):
+            with pytest.raises(ValueError, match="frame limit"):
+                bootstrap._journal.list_frames(limit)  # type: ignore[arg-type]
+        plan = bootstrap._journal.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM NioIngestFrame WHERE account_id = ? "
+            "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
+            (ACCOUNT_ID, 2),
+        ).fetchall()
+        assert any("NioIngestFrame_drain" in row[3] for row in plan)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", (TransportKind.CLASSIC, TransportKind.SLIDING))
+async def test_reopened_journal_staged_response_renormalizes_after_runtime_drift(
+    tmp_path: Path,
+    transport: TransportKind,
+) -> None:
+    source_config = (
+        ClassicSourceConfig(1, b'{"room":{"timeline":{"limit":1}}}')
+        if transport is TransportKind.CLASSIC
+        else SlidingSourceConfig(1, "first", b"{}", b"{}", b"{}", 1)
+    )
+    drifted_config = (
+        ClassicSourceConfig(90_000, b'{"room":{"timeline":{"limit":99}}}')
+        if transport is TransportKind.CLASSIC
+        else SlidingSourceConfig(
+            90_000, "drifted", b'{"x":{}}', b'{"!r":{}}', b'{"e":{}}', 99
+        )
+    )
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=source_config,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    source = (
+        ClassicSource(bootstrap.stream_id, source_config, "@own:example.org")
+        if transport is TransportKind.CLASSIC
+        else SlidingSource(bootstrap.stream_id, source_config, "@own:example.org")
+    )
+    request = source.plan_request(bootstrap._journal.load_source(), 1)
+    assert request is not None
+    own_member = {
+        "type": "m.room.member",
+        "state_key": "@own:example.org",
+        "event_id": "$own-join",
+        "content": {"membership": "join"},
+        "unsigned": {
+            "prev_content": {"membership": "leave"},
+            "replaces_state": "$prior-membership",
+        },
+    }
+    expected_segment = RoomSegment(
+        "!room:example.org",
+        RoomSection.JOIN,
+        (canonical_json(own_member),),
+        (),
+        (),
+        False,
+        None,
+        True,
+        False,
+        0,
+        MembershipObservation(
+            "join",
+            "join",
+            "$own-join",
+            "leave",
+            "$prior-membership",
+            False,
+            True,
+            False,
+            False,
+        ),
+    )
+    if transport is TransportKind.CLASSIC:
+        body = _canonical_json(
+            {
+                "next_batch": "s1",
+                "rooms": {
+                    "join": {"!room:example.org": {"state": {"events": [own_member]}}}
+                },
+            }
+        )
+    else:
+        body = _canonical_json(
+            {
+                "pos": "p1",
+                "txn_id": json.loads(request.body)["txn_id"],
+                "lists": {RESERVED_ALL_ROOMS_LIST: {"count": 1}},
+                "rooms": {
+                    "!room:example.org": {
+                        "membership": "join",
+                        "required_state": [own_member],
+                    }
+                },
+            }
+        )
+    normalized = source.normalize(
+        request,
+        __import__("nio.ingest.ports", fromlist=["NetworkResult"]).NetworkResult(
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            200,
+            body,
+            None,
+            None,
+        ),
+    )
+    assert normalized.frame is not None
+    assert normalized.frame.room_segments == (expected_segment,)
+    staged = StagedFrame(
+        normalized.frame.frame_id,
+        StagedSourceResponse(
+            request, normalized.response_body, normalized.frame.source_sha256
+        ),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(frames=(staged,)),
+    )
+    bootstrap.close()
+    reopened = open_ingestion_store(
+        tmp_path,
+        source=drifted_config,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    try:
+        await reopened.attach_consumer(_consumer_bootstrap(reopened))
+        loaded = reopened._journal.load_frame(staged.frame_id)
+        assert loaded is not None
+        drifted_source = (
+            ClassicSource(reopened.stream_id, drifted_config, "@own:example.org")
+            if transport is TransportKind.CLASSIC
+            else SlidingSource(reopened.stream_id, drifted_config, "@own:example.org")
+        )
+        renormalized = renormalize_staged_frame(drifted_source, loaded)
+        assert renormalized.room_segments == (expected_segment,)
+        assert renormalized == normalized.frame
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_payload",
+    (
+        b'{"request":' + b'{"x":' * 260 + b"0" + b"}" * 260 + b"}",
+        b'{"request":{},"request":{}}',
+        b'{"request":NaN}',
+    ),
+    ids=("deep", "duplicate", "non-finite"),
+)
+async def test_frame_envelope_malformed_internal_json_fails_stopped(
+    tmp_path: Path,
+    malformed_payload: bytes,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        ciphertext, digest = EncryptedRowCodec(
+            "secret", ACCOUNT_ID, bootstrap.stream_id
+        ).seal("NioIngestFrame", (frame.frame_id,), malformed_payload)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, str(frame.frame_id)),
+        )
+        with pytest.raises(JournalIntegrityError, match="frame authenticated envelope"):
+            bootstrap._journal.load_frame(frame.frame_id)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_resealed_noncanonical_frame_envelope_whitespace_fails_stopped(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame.frame_id)),
+        ).fetchone()
+        assert row is not None
+        payload = bootstrap._journal._open_payload(
+            "NioIngestFrame", (frame.frame_id,), row, "payload"
+        )
+        noncanonical = payload.replace(b'{"request":', b'{ "request":', 1)
+        assert noncanonical != payload
+        ciphertext, digest = EncryptedRowCodec(
+            "secret", ACCOUNT_ID, bootstrap.stream_id
+        ).seal("NioIngestFrame", (frame.frame_id,), noncanonical)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, str(frame.frame_id)),
+        )
+        with pytest.raises(JournalIntegrityError, match="frame authenticated envelope"):
+            bootstrap._journal.load_frame(frame.frame_id)
+        assert bootstrap._journal.load_owner().revision == 2
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_frame_envelope_persists_one_response_and_no_normalized_frame(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame.frame_id)),
+        ).fetchone()
+        assert row is not None
+        payload = bootstrap._journal._open_payload(
+            "NioIngestFrame", (frame.frame_id,), row, "payload"
+        )
+        envelope = json.loads(payload)
+        assert tuple(envelope) == (
+            "request",
+            "response_body",
+            "source_sha256",
+            "staged_revision",
+        )
+        assert payload.count(_encoded_bytes(frame.response.response_body).encode()) == 1
+        assert {
+            "room_segments",
+            "request_cursor_json",
+            "candidate_cursor_json",
+            "to_device_json",
+            "device_list_delta_json",
+            "membership_observation",
+            "event_arrays",
+        }.isdisjoint(envelope)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "operation", "field", "value"),
+    (
+        *(
+            pytest.param(
+                "envelope", "missing", field, None, id=f"envelope-missing-{field}"
+            )
+            for field in (
+                "request",
+                "response_body",
+                "source_sha256",
+                "staged_revision",
+            )
+        ),
+        pytest.param("envelope", "extra", "unexpected", True, id="envelope-extra"),
+        pytest.param("envelope", "wrong", "request", [], id="envelope-request-type"),
+        pytest.param(
+            "envelope", "wrong", "response_body", 1, id="envelope-response-type"
+        ),
+        pytest.param(
+            "envelope", "wrong", "source_sha256", 1, id="envelope-digest-type"
+        ),
+        pytest.param(
+            "envelope", "wrong", "staged_revision", "1", id="envelope-revision-type"
+        ),
+        *(
+            pytest.param(
+                "request", "missing", field, None, id=f"request-missing-{field}"
+            )
+            for field in (
+                "stream_id",
+                "transport",
+                "source_epoch",
+                "request_id",
+                "method",
+                "path",
+                "query",
+                "body",
+                "timeout_ms",
+                "request_cursor_json",
+            )
+        ),
+        pytest.param("request", "extra", "unexpected", True, id="request-extra"),
+        pytest.param("request", "wrong", "stream_id", 1, id="request-stream-type"),
+        pytest.param("request", "wrong", "transport", 1, id="request-transport-type"),
+        pytest.param("request", "wrong", "source_epoch", "1", id="request-epoch-type"),
+        pytest.param("request", "wrong", "request_id", "1", id="request-id-type"),
+        pytest.param("request", "wrong", "method", 1, id="request-method-type"),
+        pytest.param("request", "wrong", "path", 1, id="request-path-type"),
+        pytest.param("request", "wrong", "query", {}, id="request-query-type"),
+        pytest.param("request", "wrong", "body", 1, id="request-body-type"),
+        pytest.param("request", "wrong", "timeout_ms", "1", id="request-timeout-type"),
+        pytest.param(
+            "request", "wrong", "request_cursor_json", 1, id="request-cursor-type"
+        ),
+    ),
+)
+async def test_resealed_staged_frame_envelope_and_request_shape_matrix_fails_stopped(
+    tmp_path: Path,
+    scope: str,
+    operation: str,
+    field: str,
+    value: object,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame.frame_id)),
+        ).fetchone()
+        assert row is not None
+        payload = bootstrap._journal._open_payload(
+            "NioIngestFrame", (frame.frame_id,), row, "payload"
+        )
+        envelope = json.loads(payload)
+        target = envelope if scope == "envelope" else envelope["request"]
+        assert isinstance(target, dict)
+        if operation == "missing":
+            del target[field]
+        elif operation == "extra":
+            target[field] = value
+        else:
+            target[field] = value
+        ciphertext, digest = EncryptedRowCodec(
+            "secret", ACCOUNT_ID, bootstrap.stream_id
+        ).seal("NioIngestFrame", (frame.frame_id,), _canonical_json(envelope))
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, str(frame.frame_id)),
+        )
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(
+                JournalIntegrityError, match="staged frame delete target is invalid"
+            ):
+                bootstrap._journal.commit(
+                    expected_revision=2,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=JournalTransition(delete_frame_ids=(frame.frame_id,)),
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tamper",),
+    (
+        pytest.param("response_body", id="response-body"),
+        pytest.param("request_method", id="request"),
+        pytest.param("source_digest_length", id="source-digest-length"),
+        pytest.param("source_digest_mismatch", id="source-digest-mismatch"),
+        pytest.param("ciphertext", id="ciphertext"),
+        pytest.param("tag", id="tag"),
+        pytest.param("aad", id="aad"),
+        pytest.param("payload_digest", id="payload-digest"),
+    ),
+)
+async def test_resealed_staged_frame_tamper_matrix_fails_stopped_before_revision(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame.frame_id)),
+        ).fetchone()
+        assert row is not None
+        payload = bootstrap._journal._open_payload(
+            "NioIngestFrame", (frame.frame_id,), row, "payload"
+        )
+        envelope = json.loads(payload)
+        codec = EncryptedRowCodec("secret", ACCOUNT_ID, bootstrap.stream_id)
+        if tamper == "response_body":
+            envelope["response_body"] = _encoded_bytes(b'{"next_batch":"forged"}')
+        elif tamper == "request_method":
+            request = envelope["request"]
+            assert isinstance(request, dict)
+            request["method"] = ""
+        elif tamper == "source_digest_length":
+            envelope["source_sha256"] = _encoded_bytes(b"short")
+        elif tamper == "source_digest_mismatch":
+            envelope["source_sha256"] = _encoded_bytes(bytes(32))
+
+        if tamper == "ciphertext":
+            ciphertext = b"\x00"
+            digest = bytes(row["payload_sha256"])
+        elif tamper == "tag":
+            ciphertext = bytearray(row["payload_ciphertext"])
+            ciphertext[13] ^= 1
+            ciphertext = bytes(ciphertext)
+            digest = bytes(row["payload_sha256"])
+        elif tamper == "aad":
+            ciphertext, digest = codec.seal(
+                "NioIngestFrame",
+                (UUID("00000000-0000-0000-0000-000000000000"),),
+                payload,
+            )
+        elif tamper == "payload_digest":
+            ciphertext = bytes(row["payload_ciphertext"])
+            digest = bytes(32)
+        else:
+            ciphertext, digest = codec.seal(
+                "NioIngestFrame", (frame.frame_id,), _canonical_json(envelope)
+            )
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ciphertext, digest, ACCOUNT_ID, str(frame.frame_id)),
+        )
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(JournalIntegrityError):
+                bootstrap._journal.commit(
+                    expected_revision=2,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=JournalTransition(delete_frame_ids=(frame.frame_id,)),
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert bootstrap._journal.load_owner().revision == 2
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_row_staged_frame_swap_fails_stopped_before_revision_mutation(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    first = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    second = _staged_frame(bootstrap.stream_id, 1, 2, b'{"next_batch":"s2"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(first, second)),
+        )
+        rows = bootstrap._journal.connection.execute(
+            "SELECT frame_id, payload_ciphertext, payload_sha256 FROM NioIngestFrame "
+            "WHERE account_id = ? ORDER BY frame_id",
+            (ACCOUNT_ID,),
+        ).fetchall()
+        assert len(rows) == 2
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND frame_id = ?",
+            (
+                rows[1]["payload_ciphertext"],
+                rows[1]["payload_sha256"],
+                ACCOUNT_ID,
+                rows[0]["frame_id"],
+            ),
+        )
+        with pytest.raises(JournalIntegrityError):
+            bootstrap._journal.load_frame(UUID(rows[0]["frame_id"]))
+        assert bootstrap._journal.load_owner().revision == 2
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("response_body", b"{}"),
+        ("source_sha256", bytes(32)),
+        ("request.path", "relative"),
+        ("request.timeout_ms", -1),
+        ("request.query", (("key", 1),)),
+    ),
+)
+async def test_deep_mutated_staged_carrier_rejects_before_adapter_or_sql(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    class NeverNormalize:
+        called = False
+
+        def plan_request(self, state: SourceState, request_id: int):
+            return None
+
+        def normalize(self, request: NetworkRequest, result: object):
+            self.called = True
+            raise AssertionError("adapter must not be invoked for a corrupt carrier")
+
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    staged = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    transition = JournalTransition(frames=(staged,))
+    target = (
+        staged.response.request if field.startswith("request.") else staged.response
+    )
+    object.__setattr__(target, field.removeprefix("request."), value)
+    source = NeverNormalize()
+    try:
+        with pytest.raises((TypeError, ValueError)):
+            renormalize_staged_frame(source, staged)
+        assert not source.called
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(JournalIntegrityError, match="staged frame is invalid"):
+                bootstrap._journal.commit(
+                    expected_revision=1,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=transition,
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_nested_network_request_rejects_without_normalization_or_sql(
+    tmp_path: Path,
+) -> None:
+    class ForeignNetworkRequest(NetworkRequest):
+        pass
+
+    class NeverNormalize:
+        called = False
+
+        def plan_request(self, state: SourceState, request_id: int):
+            return None
+
+        def normalize(self, request: NetworkRequest, result: object):
+            self.called = True
+            raise AssertionError("adapter must not be invoked for a foreign request")
+
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    staged = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    transition = JournalTransition(frames=(staged,))
+    request = staged.response.request
+    foreign = ForeignNetworkRequest(
+        request.stream_id,
+        request.transport,
+        request.source_epoch,
+        request.request_id,
+        request.method,
+        request.path,
+        request.query,
+        request.body,
+        request.timeout_ms,
+        request.request_cursor_json,
+    )
+    object.__setattr__(staged.response, "request", foreign)
+    source = NeverNormalize()
+    try:
+        with pytest.raises(TypeError, match="request must be NetworkRequest"):
+            renormalize_staged_frame(source, staged)
+        assert not source.called
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(JournalIntegrityError, match="staged frame is invalid"):
+                bootstrap._journal.commit(
+                    expected_revision=1,
+                    writer_epoch=bootstrap._journal.writer_epoch,
+                    transition=transition,
+                )
+        finally:
+            bootstrap._journal.connection.set_trace_callback(None)
+        assert bootstrap._journal.load_owner().revision == 1
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("ciphertext", "missing"))
+async def test_staged_frame_delete_authenticates_target_before_revision_mutation(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = _staged_frame(bootstrap.stream_id, 1, 1, b'{"next_batch":"s1"}')
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        if corruption == "ciphertext":
+            bootstrap._journal.connection.execute(
+                "UPDATE NioIngestFrame SET payload_ciphertext = zeroblob(1) "
+                "WHERE account_id = ? AND frame_id = ?",
+                (ACCOUNT_ID, str(frame.frame_id)),
+            )
+        else:
+            bootstrap._journal.connection.execute(
+                "DELETE FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+                (ACCOUNT_ID, str(frame.frame_id)),
+            )
+        with pytest.raises(JournalIntegrityError, match="staged frame delete target"):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(delete_frame_ids=(frame.frame_id,)),
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        row = bootstrap._journal.connection.execute(
+            "SELECT 1 FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame.frame_id)),
+        ).fetchone()
+        assert (row is not None) is (corruption == "ciphertext")
     finally:
         bootstrap.close()
 
@@ -5767,12 +6756,7 @@ async def test_frame_read_authenticates_every_returned_metadata_field(
         database_name="journal.db",
     )
     await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
-    frame = StagedFrame(
-        UUID("55555555-5555-5555-5555-555555555555"),
-        4,
-        9,
-        b'{"raw":true}',
-    )
+    frame = _staged_frame(bootstrap.stream_id, 4, 9, b'{"raw":true}')
     try:
         bootstrap._journal.commit(
             expected_revision=1,

@@ -17,6 +17,11 @@ from .model import (
     SystemOrigin,
     TransportKind,
 )
+from .ports import (
+    StagedSourceResponse,
+    _frame_id_for_response,
+    _revalidated_staged_source_response,
+)
 from .recovery import RecoveryGap
 
 
@@ -490,10 +495,22 @@ class BatchMaterialization:
 @dataclass(frozen=True, slots=True)
 class StagedFrame:
     frame_id: UUID
-    source_epoch: int
-    request_id: int
-    payload: bytes
+    response: StagedSourceResponse
     staged_revision: int = field(default=0, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.frame_id) is not UUID:
+            raise TypeError("frame_id must be UUID")
+        if type(self.response) is not StagedSourceResponse:
+            raise TypeError("response must be StagedSourceResponse")
+        if type(self.staged_revision) is not int:
+            raise TypeError("staged_revision must be int")
+        if self.staged_revision < 0:
+            raise ValueError("staged_revision must be nonnegative")
+        response = _revalidated_staged_source_response(self.response)
+        expected = _frame_id_for_response(response.request, response.source_sha256)
+        if self.frame_id != expected:
+            raise ValueError("frame_id does not match staged source response")
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +554,17 @@ class JournalTransition:
                 raise TypeError(f"{name} must be a tuple")
             if any(type(value) is not expected for value in values):
                 raise TypeError(f"{name} must contain {expected.__name__} values")
+        frame_ids = tuple(frame.frame_id for frame in self.frames)
+        if len(frame_ids) != len(set(frame_ids)):
+            raise ValueError("frames must not contain duplicate frame IDs")
+        if len(self.delete_frame_ids) != len(set(self.delete_frame_ids)):
+            raise ValueError("delete_frame_ids must not contain duplicates")
+        if set(frame_ids) & set(self.delete_frame_ids):
+            raise ValueError("frames and delete_frame_ids must not overlap")
+        if len(frame_ids) + len(self.delete_frame_ids) > 256:
+            raise ValueError("frame mutations cannot exceed 256 entries")
+        for frame in self.frames:
+            StagedFrame(frame.frame_id, frame.response, frame.staged_revision)
         if (
             self.batch_materialization is not None
             and type(self.batch_materialization) is not BatchMaterialization

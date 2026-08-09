@@ -17,6 +17,7 @@ from nio.ingest.ports import (
     NetworkFailureKind,
     NetworkRequest,
     NetworkResult,
+    StagedSourceResponse,
 )
 from nio.ingest.source import (
     ClassicCursor,
@@ -26,8 +27,9 @@ from nio.ingest.source import (
     SourceResultKind,
     SyncSource,
     canonical_classic_cursor,
+    renormalize_staged_frame,
 )
-from nio.ingest.state import SourceState
+from nio.ingest.state import SourceState, StagedFrame
 
 STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
 OTHER_STREAM_ID = UUID("234c90aa-7625-4aa8-acd5-ef6005af3250")
@@ -330,7 +332,6 @@ def test_initial_sync_normalizes_every_classic_section_in_fixed_order(
     assert result.kind is SourceResultKind.FRAME
     assert result.request is request
     assert result.status_code == 200
-    assert result.response_body == b""
     assert result.frame is not None
     frame = result.frame
     assert frame.origin.transport is TransportKind.CLASSIC
@@ -348,8 +349,9 @@ def test_initial_sync_normalizes_every_classic_section_in_fixed_order(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    assert frame.source_json == expected_source
-    expected_digest = hashlib.sha256(expected_source).hexdigest()
+    assert result.response_body == expected_source
+    assert frame.source_sha256 == hashlib.sha256(expected_source).digest()
+    expected_digest = frame.source_sha256.hex()
     assert frame.frame_id == uuid5(STREAM_ID, f"4:9:{expected_digest}")
 
     assert tuple(
@@ -555,7 +557,8 @@ def test_semantically_identical_object_order_produces_identical_frame_bytes(
     assert first == second
     assert first.frame is not None
     assert second.frame is not None
-    assert first.frame.source_json == second.frame.source_json
+    assert first.frame.source_sha256 == second.frame.source_sha256
+    assert first.response_body == second.response_body
 
 
 def test_same_body_under_distinct_request_ids_has_exact_distinct_frame_ids(
@@ -586,6 +589,55 @@ def test_same_body_under_distinct_request_ids_has_exact_distinct_frame_ids(
     assert frame_ten is not None
     assert frame_nine.frame_id == UUID("8c49ed56-b163-579c-aa98-6a24fee3cbcc")
     assert frame_ten.frame_id == UUID("4f19ea14-734e-5f01-b358-52aeb84c973f")
+
+
+def test_restart_renormalizes_only_the_staged_response(
+    classic_source: ClassicSource,
+    classic_sync_body: bytes,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor(None)), request_id=9
+    )
+    assert request is not None
+    original = classic_source.normalize(
+        request, _network_result(request, classic_sync_body)
+    )
+    assert original.frame is not None
+    staged = StagedFrame(
+        original.frame.frame_id,
+        StagedSourceResponse(
+            request, original.response_body, original.frame.source_sha256
+        ),
+    )
+
+    assert renormalize_staged_frame(classic_source, staged) == original.frame
+
+
+def test_restart_rejects_a_mutated_frozen_carrier_before_invoking_adapter(
+    classic_source: ClassicSource,
+    classic_sync_body: bytes,
+) -> None:
+    request = classic_source.plan_request(_source_state(ClassicCursor(None)), 9)
+    assert request is not None
+    original = classic_source.normalize(
+        request, _network_result(request, classic_sync_body)
+    )
+    assert original.frame is not None
+    staged = StagedFrame(
+        original.frame.frame_id,
+        StagedSourceResponse(
+            request, original.response_body, original.frame.source_sha256
+        ),
+    )
+    object.__setattr__(staged, "frame_id", UUID("00000000-0000-0000-0000-000000000000"))
+
+    with pytest.raises(ValueError, match="frame_id"):
+        renormalize_staged_frame(classic_source, staged)
+
+    object.__setattr__(staged, "frame_id", original.frame.frame_id)
+    object.__setattr__(staged.response, "response_body", b"{}")
+    with pytest.raises(ValueError, match="digest"):
+        renormalize_staged_frame(classic_source, staged)
 
 
 @pytest.mark.parametrize(
@@ -1180,7 +1232,7 @@ def test_frozen_source_values_reject_mutable_nested_inputs(
             body=bytearray(b"{}"),  # type: ignore[arg-type]
         )
     with pytest.raises(TypeError):
-        replace(good.frame, source_json=bytearray(good.frame.source_json))  # type: ignore[arg-type]
+        replace(good.frame, source_sha256=bytearray(good.frame.source_sha256))  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         replace(good.frame, room_segments=list(good.frame.room_segments))  # type: ignore[arg-type]
     with pytest.raises(TypeError):

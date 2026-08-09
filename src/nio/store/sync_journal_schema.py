@@ -157,6 +157,9 @@ SCHEMA_SQL = (
         payload_ciphertext BLOB NOT NULL, payload_sha256 BLOB NOT NULL,
         staged_revision INTEGER NOT NULL, PRIMARY KEY (account_id, frame_id)
     )""",
+    """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
+        account_id, staged_revision, source_epoch, request_id, frame_id
+    )""",
     """CREATE TABLE NioIngestCryptoReceipt (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id), input_id TEXT NOT NULL,
         input_sha256 BLOB NOT NULL, result_ciphertext BLOB NOT NULL, result_sha256 BLOB NOT NULL,

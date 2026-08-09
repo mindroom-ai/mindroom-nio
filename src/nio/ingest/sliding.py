@@ -12,7 +12,7 @@ from .membership import (
     _OwnMembershipEvidence,
 )
 from .model import RecordOrigin, TransportKind
-from .ports import NetworkRequest, NetworkResult
+from .ports import NetworkRequest, NetworkResult, _frame_id_for_response
 from .source import (
     RoomSection,
     RoomSegment,
@@ -353,7 +353,7 @@ class SlidingSource:
         if error_result is not None:
             return error_result
         try:
-            frame = self._normalize_frame(request, result.body)
+            frame, response_body = self._normalize_frame(request, result.body)
         except (TypeError, ValueError) as error:
             return malformed_success_result(request, result.body, error)
         return SourceResult(
@@ -364,7 +364,7 @@ class SlidingSource:
             network_failure=None,
             error_code=None,
             retry_after_ms=None,
-            response_body=b"",
+            response_body=response_body,
             detail=None,
         )
 
@@ -560,7 +560,9 @@ class SlidingSource:
                 )
         validate_network_result_identity(request, result)
 
-    def _normalize_frame(self, request: NetworkRequest, body: bytes) -> SyncFrame:
+    def _normalize_frame(
+        self, request: NetworkRequest, body: bytes
+    ) -> tuple[SyncFrame, bytes]:
         root = _object(
             load_json(body, "sliding sync response"), "sliding sync response"
         )
@@ -838,32 +840,36 @@ class SlidingSource:
             "extensions.presence.events",
         )
         source_json = canonical_json(root)
-        digest = hashlib.sha256(source_json).hexdigest()
-        frame_id = uuid5(
-            self.stream_id,
-            f"{request.source_epoch}:{request.request_id}:{digest}",
-        )
-        return SyncFrame(
-            frame_id=frame_id,
-            origin=RecordOrigin(
-                TransportKind.SLIDING,
-                request.source_epoch,
-                request.request_id,
-                0,
+        source_sha256 = hashlib.sha256(source_json).digest()
+        frame_id = _frame_id_for_response(request, source_sha256)
+        return (
+            SyncFrame(
+                frame_id=frame_id,
+                origin=RecordOrigin(
+                    TransportKind.SLIDING,
+                    request.source_epoch,
+                    request.request_id,
+                    0,
+                ),
+                request_cursor_json=request.request_cursor_json,
+                candidate_cursor_json=canonical_sliding_cursor(candidate),
+                source_sha256=source_sha256,
+                to_device_json=tuple(
+                    canonical_json(event) for event in to_device_events
+                ),
+                device_list_delta_json=canonical_json(
+                    {"changed": changed, "left": left}
+                ),
+                one_time_key_counts_json=canonical_json(key_counts),
+                unused_fallback_key_types_json=canonical_json(fallback),
+                room_segments=room_segments,
+                ephemeral_json=tuple(ephemeral),
+                global_account_data_json=tuple(
+                    canonical_json(event) for event in global_account_data
+                ),
+                presence_json=tuple(canonical_json(event) for event in presence),
             ),
-            request_cursor_json=request.request_cursor_json,
-            candidate_cursor_json=canonical_sliding_cursor(candidate),
-            source_json=source_json,
-            to_device_json=tuple(canonical_json(event) for event in to_device_events),
-            device_list_delta_json=canonical_json({"changed": changed, "left": left}),
-            one_time_key_counts_json=canonical_json(key_counts),
-            unused_fallback_key_types_json=canonical_json(fallback),
-            room_segments=room_segments,
-            ephemeral_json=tuple(ephemeral),
-            global_account_data_json=tuple(
-                canonical_json(event) for event in global_account_data
-            ),
-            presence_json=tuple(canonical_json(event) for event in presence),
+            source_json,
         )
 
     @staticmethod

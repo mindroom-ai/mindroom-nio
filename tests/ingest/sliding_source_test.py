@@ -2323,7 +2323,7 @@ def test_same_payload_has_deterministic_but_request_bound_frame_identity(
 
     assert frame_seven is not None
     assert frame_eight is not None
-    digest = hashlib.sha256(frame_seven.source_json).hexdigest()
+    digest = frame_seven.source_sha256.hex()
     assert frame_seven.frame_id == uuid5(STREAM_ID, f"4:7:{digest}")
     assert frame_eight.frame_id == uuid5(STREAM_ID, f"4:8:{digest}")
     assert frame_seven.frame_id != frame_eight.frame_id

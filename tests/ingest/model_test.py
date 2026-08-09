@@ -1,6 +1,7 @@
+import hashlib
 from dataclasses import FrozenInstanceError, fields, replace
 from enum import StrEnum
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pytest
 
@@ -24,6 +25,8 @@ from nio.ingest import (
     TransportKind,
 )
 from nio.ingest.membership import MembershipBaseline, MembershipObservation
+import nio.ingest.ports as ingest_ports
+from nio.ingest.ports import NetworkRequest, _frame_id_for_response
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.serialization import _loss_id, batch_from_records
 from nio.ingest.source import RoomSection, RoomSegment
@@ -37,6 +40,7 @@ from nio.ingest.state import (
     RoomAggregate,
     RoomLane,
     RoomState,
+    StagedFrame,
 )
 
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
@@ -45,6 +49,7 @@ OPERATION_ID = UUID("33333333-3333-3333-3333-333333333333")
 GAP_ID = UUID("44444444-4444-4444-4444-444444444444")
 EFFECT_ID = UUID("55555555-5555-5555-5555-555555555555")
 FRAME_ID = UUID("66666666-6666-6666-6666-666666666666")
+STREAM_ID = UUID("77777777-7777-7777-7777-777777777777")
 
 
 class ForeignWireValue(StrEnum):
@@ -165,6 +170,77 @@ def test_wire_dataclasses_are_frozen_and_slotted() -> None:
         assert not hasattr(value, "__dict__")
         with pytest.raises(FrozenInstanceError):
             setattr(value, fields(value)[0].name, "mutable")
+
+
+def test_staged_source_response_is_exact_canonical_and_digest_bound() -> None:
+    body = b'{"next_batch":"s1"}'
+    request = NetworkRequest(
+        STREAM_ID,
+        TransportKind.CLASSIC,
+        4,
+        9,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        b'{"next_batch":null}',
+    )
+    staged_class = getattr(ingest_ports, "StagedSourceResponse", None)
+    assert staged_class is not None
+    staged = staged_class(request, body, hashlib.sha256(body).digest())
+
+    assert tuple(field.name for field in fields(staged_class)) == (
+        "request",
+        "response_body",
+        "source_sha256",
+    )
+    assert not hasattr(staged, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        staged.response_body = b"{}"  # type: ignore[misc]
+    noncanonical = b'{ "next_batch":"s1"}'
+    with pytest.raises(ValueError, match="canonical"):
+        staged_class(request, noncanonical, hashlib.sha256(noncanonical).digest())
+    with pytest.raises(ValueError, match="digest"):
+        staged_class(request, body, b"x" * 32)
+    with pytest.raises(ValueError, match="32"):
+        staged_class(request, body, b"x")
+
+
+def test_staged_frame_wraps_only_the_frozen_response_and_derived_identity() -> None:
+    body = b'{"next_batch":"s1"}'
+    request = NetworkRequest(
+        STREAM_ID,
+        TransportKind.CLASSIC,
+        4,
+        9,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        b'{"next_batch":null}',
+    )
+    response = ingest_ports.StagedSourceResponse(
+        request, body, hashlib.sha256(body).digest()
+    )
+    frame_id = uuid5(STREAM_ID, f"4:9:{response.source_sha256.hex()}")
+    assert _frame_id_for_response(request, response.source_sha256) == frame_id
+    frame = StagedFrame(frame_id, response)
+
+    assert tuple(field.name for field in fields(StagedFrame)) == (
+        "frame_id",
+        "response",
+        "staged_revision",
+    )
+    assert frame.staged_revision == 0
+    assert not hasattr(frame, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        frame.frame_id = FRAME_ID  # type: ignore[misc]
+    with pytest.raises(ValueError, match="frame_id"):
+        StagedFrame(FRAME_ID, response)
+    with pytest.raises(TypeError, match="response"):
+        StagedFrame(frame_id, object())  # type: ignore[arg-type]
 
 
 def test_room_segment_carries_an_exact_membership_observation() -> None:

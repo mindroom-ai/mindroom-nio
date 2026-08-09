@@ -42,6 +42,7 @@ from ..ingest.model import (
     SystemOriginKind,
     TransportKind,
 )
+from ..ingest.ports import _revalidated_staged_source_response
 from ..ingest.serialization import (
     _canonical_json,
     _loss_id,
@@ -725,6 +726,22 @@ class SqliteIngestionJournal(JournalRows):
             )
         for ready in transition.ready_records:
             self._validate_ready_record(ready)
+        for frame in transition.frames:
+            try:
+                replace(
+                    frame,
+                    response=_revalidated_staged_source_response(frame.response),
+                )
+            except (TypeError, ValueError) as error:
+                raise JournalIntegrityError("staged frame is invalid") from error
+            request = frame.response.request
+            if (
+                request.stream_id != owner.stream_id
+                or request.transport is not owner.transport_kind
+            ):
+                raise JournalIntegrityError(
+                    "staged frame request does not match journal owner"
+                )
         for effect in (
             *transition.network_effect_inserts,
             *transition.network_effect_updates,
@@ -853,7 +870,51 @@ class SqliteIngestionJournal(JournalRows):
         if len(set(room_state_ids)) != len(room_state_ids):
             raise JournalIntegrityError("duplicate room state transition keys")
 
+        genuinely_new_frames = transition.frames
         with immediate_transaction(self.connection):
+            if transition.frames:
+                frame_ids = tuple(frame.frame_id for frame in transition.frames)
+                placeholders = self._sql_placeholders(len(frame_ids))
+                rows = self.connection.execute(
+                    "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+                    f"AND frame_id IN ({placeholders})",
+                    (self.account_id, *(str(frame_id) for frame_id in frame_ids)),
+                ).fetchall()
+                existing_by_id = {UUID(row["frame_id"]): row for row in rows}
+                for frame in transition.frames:
+                    row = existing_by_id.get(frame.frame_id)
+                    if row is None:
+                        if frame.staged_revision != 0:
+                            raise JournalIntegrityError(
+                                "new staged frame staged_revision must be zero"
+                            )
+                        continue
+                    try:
+                        stored = self._decode_frame_row(frame.frame_id, row, owner)
+                        expected = replace(
+                            frame,
+                            response=_revalidated_staged_source_response(
+                                frame.response
+                            ),
+                            staged_revision=stored.staged_revision,
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise JournalIntegrityError(
+                            "staged frame is invalid"
+                        ) from error
+                    if (
+                        frame.staged_revision not in (0, stored.staged_revision)
+                        or stored != expected
+                    ):
+                        raise JournalIntegrityError(
+                            "frame_id collides with different authenticated contents"
+                        )
+                genuinely_new_frames = tuple(
+                    frame
+                    for frame in transition.frames
+                    if frame.frame_id not in existing_by_id
+                )
+
             effect_mutation_ids = (
                 tuple(
                     effect.request.effect_id
@@ -1108,17 +1169,40 @@ class SqliteIngestionJournal(JournalRows):
                 tuple(deleted_records),
             )
 
+            deleted_frame_ids = transition.delete_frame_ids
+            if deleted_frame_ids:
+                placeholders = self._sql_placeholders(len(deleted_frame_ids))
+                frame_rows = self.connection.execute(
+                    "SELECT * FROM NioIngestFrame WHERE account_id = ? "
+                    f"AND frame_id IN ({placeholders})",
+                    (
+                        self.account_id,
+                        *(str(frame_id) for frame_id in deleted_frame_ids),
+                    ),
+                ).fetchall()
+                if len(frame_rows) != len(deleted_frame_ids):
+                    raise JournalIntegrityError("staged frame delete target is missing")
+                try:
+                    for row in frame_rows:
+                        self._decode_frame_row(UUID(row["frame_id"]), row, owner)
+                except (TypeError, ValueError) as error:
+                    raise JournalIntegrityError(
+                        "staged frame delete target is invalid"
+                    ) from error
+
             has_other_mutation = (
                 transition.source_state is not None
                 or bool(transition.room_states)
                 or bool(transition.room_lanes)
                 or bool(transition.lane_record_inserts)
                 or bool(transition.ready_records)
-                or bool(transition.frames)
+                or bool(genuinely_new_frames)
                 or transition.batch_materialization is not None
                 or bool(transition.delete_frame_ids)
             )
             effect_mutation_requested = bool(effect_mutation_ids)
+            if not has_other_mutation and not effect_mutation_requested:
+                return CommitResult(owner.revision)
             if (
                 effect_mutation_requested
                 and not genuinely_new_effects
@@ -1164,8 +1248,8 @@ class SqliteIngestionJournal(JournalRows):
                 self._write_lane_record(lane_record, new_revision)
             for ready in transition.ready_records:
                 self._write_ready(ready, new_revision)
-            for frame in transition.frames:
-                self._write_frame(frame, new_revision)
+            for frame in genuinely_new_frames:
+                self._write_frame(frame, new_revision, owner)
             self._insert_network_effects(prepared_effect_inserts)
             self._update_network_effects(
                 prepared_effect_updates,
@@ -1179,12 +1263,19 @@ class SqliteIngestionJournal(JournalRows):
                     tuple(materialized_ready_ids),
                     tuple(materialized_lane_ids),
                 )
-            for frame_id in transition.delete_frame_ids:
-                self._transition_execute(
+            if deleted_frame_ids:
+                placeholders = self._sql_placeholders(len(deleted_frame_ids))
+                cursor = self._transition_execute(
                     "delete_frame",
-                    "DELETE FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
-                    (self.account_id, str(frame_id)),
+                    "DELETE FROM NioIngestFrame WHERE account_id = ? "
+                    f"AND frame_id IN ({placeholders})",
+                    (
+                        self.account_id,
+                        *(str(frame_id) for frame_id in deleted_frame_ids),
+                    ),
                 )
+                if cursor.rowcount != len(deleted_frame_ids):
+                    raise JournalIntegrityError("staged frame delete is incomplete")
         return CommitResult(new_revision)
 
     def oldest_unacknowledged(self) -> SyncBatch | None:

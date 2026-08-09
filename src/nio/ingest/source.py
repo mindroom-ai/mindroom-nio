@@ -14,8 +14,15 @@ from ._json import (
 )
 from .membership import MembershipObservation
 from .model import RecordOrigin, TransportKind
-from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
-from .state import SourceState
+from .ports import (
+    NetworkFailureKind,
+    NetworkRequest,
+    NetworkResult,
+    StagedSourceResponse,
+    _frame_id_for_response,
+    _revalidated_staged_source_response,
+)
+from .state import SourceState, StagedFrame
 
 
 def require_json_object(value: Any, field_name: str) -> dict[str, Any]:
@@ -236,7 +243,7 @@ class SyncFrame:
     origin: RecordOrigin
     request_cursor_json: bytes
     candidate_cursor_json: bytes
-    source_json: bytes
+    source_sha256: bytes
     to_device_json: tuple[bytes, ...]
     device_list_delta_json: bytes
     one_time_key_counts_json: bytes
@@ -251,7 +258,9 @@ class SyncFrame:
         _require_exact(self.origin, RecordOrigin, "origin")
         _require_exact(self.request_cursor_json, bytes, "request_cursor_json")
         _require_exact(self.candidate_cursor_json, bytes, "candidate_cursor_json")
-        _require_exact(self.source_json, bytes, "source_json")
+        _require_exact(self.source_sha256, bytes, "source_sha256")
+        if len(self.source_sha256) != 32:
+            raise ValueError("source_sha256 must be exactly 32 bytes")
         _require_json_bytes_tuple(self.to_device_json, "to_device_json")
         _require_exact(
             self.device_list_delta_json,
@@ -326,15 +335,21 @@ class SourceResult:
                 or self.network_failure is not None
                 or self.error_code is not None
                 or self.retry_after_ms is not None
-                or self.response_body
                 or self.detail is not None
             ):
                 raise ValueError("frame result contains error metadata")
+            StagedSourceResponse(
+                self.request,
+                self.response_body,
+                self.frame.source_sha256,
+            )
             if (
                 self.frame.origin.transport is not self.request.transport
                 or self.frame.origin.source_epoch != self.request.source_epoch
                 or self.frame.origin.request_id != self.request.request_id
                 or self.frame.request_cursor_json != self.request.request_cursor_json
+                or self.frame.frame_id
+                != _frame_id_for_response(self.request, self.frame.source_sha256)
             ):
                 raise ValueError("frame does not match its network request")
             return
@@ -373,6 +388,42 @@ class SourceResult:
             )
         if not valid:
             raise ValueError("source result contradicts its error classification")
+
+
+def renormalize_staged_frame(source: SyncSource, staged: StagedFrame) -> SyncFrame:
+    """Rebuild the normalized view from the sole durable source response."""
+    if not isinstance(source, SyncSource):
+        raise TypeError("source must satisfy SyncSource")
+    _require_exact(staged, StagedFrame, "staged")
+    # Frozen dataclasses can still be corrupted through object.__setattr__.
+    # Reconstruct before invoking an adapter so restart never acts on it.
+    staged = StagedFrame(
+        staged.frame_id,
+        _revalidated_staged_source_response(staged.response),
+        staged.staged_revision,
+    )
+    request = staged.response.request
+    result = NetworkResult(
+        request.stream_id,
+        request.transport,
+        request.source_epoch,
+        request.request_id,
+        200,
+        staged.response.response_body,
+        None,
+        None,
+    )
+    normalized = source.normalize(request, result)
+    if normalized.kind is not SourceResultKind.FRAME or normalized.frame is None:
+        raise ValueError("staged response did not re-normalize to a frame")
+    frame = normalized.frame
+    if (
+        frame.source_sha256 != staged.response.source_sha256
+        or frame.frame_id != staged.frame_id
+        or normalized.response_body != staged.response.response_body
+    ):
+        raise ValueError("re-normalized frame does not match staged response")
+    return frame
 
 
 def canonical_json_or_raw(data: bytes) -> bytes:
