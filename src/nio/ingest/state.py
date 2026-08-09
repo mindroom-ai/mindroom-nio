@@ -43,7 +43,6 @@ class OwnerView:
     consumer_attached_revision: int | None
     revision: int
     writer_epoch: UUID
-    next_source_epoch: int
     next_ready_order: int
     next_batch_sequence: int
     last_acked_sequence: int

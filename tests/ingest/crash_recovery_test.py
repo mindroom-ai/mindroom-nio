@@ -148,7 +148,7 @@ def _kill_during_attach(
         pickle_key="secret",
         database_name="journal.db",
     )
-    bootstrap.journal.set_transition_statement_hook(_exit_at_statement(kill_after))
+    bootstrap._journal.set_transition_statement_hook(_exit_at_statement(kill_after))
     asyncio.run(bootstrap.attach_consumer(consumer))
 
 
@@ -178,7 +178,7 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
         database_name="journal.db",
     )
     try:
-        owner = reopened.journal.load_owner()
+        owner = reopened._journal.load_owner()
         assert owner.binding is None
         assert owner.revision == 0
         for table in (
@@ -188,7 +188,7 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
             "NioIngestLoss",
         ):
             assert (
-                reopened.journal.connection.execute(
+                reopened._journal.connection.execute(
                     f'SELECT COUNT(*) FROM "{table}"'
                 ).fetchone()[0]
                 == 0
@@ -301,10 +301,10 @@ def _kill_during_transition(
         database_name="journal.db",
     )
     asyncio.run(bootstrap.attach_consumer(consumer))
-    bootstrap.journal.set_transition_statement_hook(_exit_at_statement(kill_after))
-    bootstrap.journal.commit(
+    bootstrap._journal.set_transition_statement_hook(_exit_at_statement(kill_after))
+    bootstrap._journal.commit(
         expected_revision=1,
-        writer_epoch=bootstrap.journal.writer_epoch,
+        writer_epoch=bootstrap._journal.writer_epoch,
         transition=transition,
     )
 
@@ -344,15 +344,15 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
     )
     try:
         await reopened.attach_consumer(_consumer(reopened))
-        assert reopened.journal.load_owner().revision == 1
-        assert reopened.journal.load_owner().next_ready_order == 0
-        assert reopened.journal.load_owner().next_batch_sequence == 1
-        assert reopened.journal.load_source() is None
-        assert reopened.journal.load_rooms(frozenset({"!room:example.org"})) == {}
-        assert reopened.journal.load_ready_heads(limit=10) == ()
-        assert reopened.journal.load_frame(FRAME_ID) is None
-        assert reopened.journal.oldest_unacknowledged() is None
-        assert reopened.journal.load_loss(loss.loss_id) is None
+        assert reopened._journal.load_owner().revision == 1
+        assert reopened._journal.load_owner().next_ready_order == 0
+        assert reopened._journal.load_owner().next_batch_sequence == 1
+        assert reopened._journal.load_source() is None
+        assert reopened._journal.load_rooms(frozenset({"!room:example.org"})) == {}
+        assert reopened._journal.load_ready_heads(limit=10) == ()
+        assert reopened._journal.load_frame(FRAME_ID) is None
+        assert reopened._journal.oldest_unacknowledged() is None
+        assert reopened._journal.load_loss(loss.loss_id) is None
     finally:
         reopened.close()
 
@@ -371,8 +371,8 @@ def _kill_during_acknowledgement(
         database_name="journal.db",
     )
     asyncio.run(bootstrap.attach_consumer(consumer))
-    bootstrap.journal.set_transition_statement_hook(_exit_at_statement(kill_after))
-    bootstrap.journal.acknowledge(ref)
+    bootstrap._journal.set_transition_statement_hook(_exit_at_statement(kill_after))
+    bootstrap._journal.acknowledge(ref)
 
 
 @pytest.mark.asyncio
@@ -403,12 +403,12 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
         )
         for sequence in (1, 2)
     )
-    bootstrap.journal.commit(
+    bootstrap._journal.commit(
         expected_revision=1,
-        writer_epoch=bootstrap.journal.writer_epoch,
+        writer_epoch=bootstrap._journal.writer_epoch,
         transition=JournalTransition(batches=batches),
     )
-    assert bootstrap.journal.acknowledge(batches[0].ref) is AckOutcome.ACKNOWLEDGED
+    assert bootstrap._journal.acknowledge(batches[0].ref) is AckOutcome.ACKNOWLEDGED
     bootstrap.close()
     _assert_process_crashed(
         _kill_during_acknowledgement,
@@ -427,15 +427,15 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
     )
     try:
         await reopened.attach_consumer(consumer)
-        owner = reopened.journal.load_owner()
+        owner = reopened._journal.load_owner()
         assert owner.last_acked_sequence == 1
         assert owner.revision == 3
         assert (
-            reopened.journal.acknowledge(batches[0].ref)
+            reopened._journal.acknowledge(batches[0].ref)
             is AckOutcome.ALREADY_ACKNOWLEDGED
         )
-        assert reopened.journal.oldest_unacknowledged() == batches[1]
-        rows = reopened.journal.connection.execute(
+        assert reopened._journal.oldest_unacknowledged() == batches[1]
+        rows = reopened._journal.connection.execute(
             "SELECT sequence, acknowledged_revision FROM NioIngestBatch "
             "WHERE account_id = ? ORDER BY sequence",
             (ACCOUNT_ID,),

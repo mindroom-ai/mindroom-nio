@@ -96,10 +96,10 @@ def _open_matrix_store_from_ingestion(
 ) -> MatrixStore:
     if not isinstance(store_class, type) or not issubclass(store_class, MatrixStore):
         raise TypeError("store_class must be a MatrixStore subclass")
-    bootstrap.journal._assert_open()
+    bootstrap._journal._assert_open()
     return store_class(
-        bootstrap.journal.account_id,
-        bootstrap.journal.device_id,
+        bootstrap._journal.account_id,
+        bootstrap._journal.device_id,
         str(bootstrap.database_path.parent),
         pickle_key=pickle_key,
         database_name=bootstrap.database_path.name,
@@ -428,7 +428,6 @@ class MatrixStore:
             self._post_init_legacy_store()
 
     def _post_init_legacy_store(self) -> None:
-
         self.database = self._create_database()
         self.database.connect()
 
@@ -465,14 +464,14 @@ class MatrixStore:
         self._repair_v10_recovery_abandonments()
 
     def _post_init_ingestion_store(self, bootstrap: StoreBootstrap) -> None:
-        bootstrap.journal._assert_open()
+        bootstrap._journal._assert_open()
         if os.path.realpath(self.database_path) != os.path.realpath(
             bootstrap.database_path
         ):
             raise LocalProtocolError("StoreBootstrap database path does not match")
-        if self.user_id != bootstrap.journal.account_id:
+        if self.user_id != bootstrap._journal.account_id:
             raise LocalProtocolError("StoreBootstrap account_id does not match")
-        if self.device_id != bootstrap.journal.device_id:
+        if self.device_id != bootstrap._journal.device_id:
             raise LocalProtocolError("StoreBootstrap device_id does not match")
 
         self.database = self._create_database()
@@ -490,7 +489,7 @@ class MatrixStore:
                 self.user_id,
                 self.device_id,
                 1,
-                str(bootstrap.journal.writer_epoch),
+                str(bootstrap._journal.writer_epoch),
             ):
                 raise LocalProtocolError(
                     "StoreBootstrap no longer matches the ingestion-v1 marker"
@@ -523,7 +522,7 @@ class MatrixStore:
                             "WHERE account_id = ? AND writer_epoch = ?",
                             (
                                 self.user_id,
-                                str(bootstrap.journal.writer_epoch),
+                                str(bootstrap._journal.writer_epoch),
                             ),
                         )
                         if cursor.rowcount != 1:

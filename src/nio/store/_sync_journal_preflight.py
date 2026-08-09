@@ -53,12 +53,8 @@ class StableFileLock:
         stat = os.fstat(self._fd)
         self.identity = (stat.st_dev, stat.st_ino)
 
-    @property
-    def active(self) -> bool:
-        return self._fd >= 0
-
-    def assert_identity(self, expected: FileIdentity | None = None) -> None:
-        if not self.active:
+    def assert_identity(self) -> None:
+        if self._fd < 0:
             raise LocalProtocolError("ingestion writer lock is closed")
         try:
             stat = os.stat(self.path)
@@ -67,7 +63,7 @@ class StableFileLock:
                 "ingestion lock file identity is no longer present"
             ) from error
         actual = (stat.st_dev, stat.st_ino)
-        if actual != self.identity or (expected is not None and actual != expected):
+        if actual != self.identity:
             raise LocalProtocolError(
                 "ingestion lock file identity changed after lock acquisition"
             )
@@ -99,15 +95,11 @@ def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
     return Path(path).resolve()
 
 
-def _connect_read_only(path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
-
-
 def database_shape(path: str | os.PathLike[str]) -> tuple[bool, bool]:
     database = Path(path)
     if not database.exists() or database.stat().st_size == 0:
         return False, False
-    with _connect_read_only(database) as connection:
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
         rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
@@ -123,20 +115,13 @@ def _normalized_sql(sql: str | None) -> str | None:
     return " ".join(sql.split()) if sql is not None else None
 
 
-@dataclass(frozen=True)
-class _SchemaContract:
-    master: tuple[tuple[object, ...], ...]
-    tables: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
-    foreign_keys: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
-    indexes: tuple[
-        tuple[
-            str, tuple[tuple[str, int, str, int, tuple[tuple[object, ...], ...]], ...]
-        ],
-        ...,
-    ]
+def _pragma_rows(
+    connection: sqlite3.Connection, pragma: str, name: str
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(tuple(row) for row in connection.execute(f'{pragma}("{name}")'))
 
 
-def _capture_contract(connection: sqlite3.Connection) -> _SchemaContract:
+def _capture_contract(connection: sqlite3.Connection) -> tuple[object, ...]:
     table_names = tuple(
         row[0]
         for row in connection.execute(
@@ -153,57 +138,34 @@ def _capture_contract(connection: sqlite3.Connection) -> _SchemaContract:
             "ORDER BY type, name"
         )
     )
-    tables = tuple(
+    details = tuple(
         (
-            name,
+            table,
+            _pragma_rows(connection, "PRAGMA table_info", table),
+            _pragma_rows(connection, "PRAGMA foreign_key_list", table),
             tuple(
-                tuple(row) for row in connection.execute(f'PRAGMA table_info("{name}")')
-            ),
-        )
-        for name in table_names
-    )
-    foreign_keys = tuple(
-        (
-            name,
-            tuple(
-                tuple(row)
-                for row in connection.execute(f'PRAGMA foreign_key_list("{name}")')
-            ),
-        )
-        for name in table_names
-    )
-    indexes = []
-    for table in table_names:
-        values = []
-        for row in connection.execute(f'PRAGMA index_list("{table}")'):
-            name = row[1]
-            values.append(
-                (
-                    name,
-                    row[2],
-                    row[3],
-                    row[4],
-                    tuple(
-                        tuple(item)
-                        for item in connection.execute(f'PRAGMA index_xinfo("{name}")')
-                    ),
+                sorted(
+                    (
+                        tuple(row),
+                        _pragma_rows(connection, "PRAGMA index_xinfo", row[1]),
+                    )
+                    for row in connection.execute(f'PRAGMA index_list("{table}")')
                 )
-            )
-        indexes.append((table, tuple(sorted(values))))
-    return _SchemaContract(master, tables, foreign_keys, tuple(indexes))
+            ),
+        )
+        for table in table_names
+    )
+    return master, details
 
 
 @cache
-def _expected_contract() -> _SchemaContract:
-    connection = sqlite3.connect(":memory:")
-    try:
+def _expected_contract() -> tuple[object, ...]:
+    with sqlite3.connect(":memory:") as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(META_TABLE_SQL)
         for statement in SCHEMA_SQL:
             connection.execute(statement.strip())
         return _capture_contract(connection)
-    finally:
-        connection.close()
 
 
 def validate_schema_topology(connection: sqlite3.Connection) -> None:
@@ -220,7 +182,6 @@ def validate_schema_topology(connection: sqlite3.Connection) -> None:
 
 def _create_fresh(
     connection: sqlite3.Connection,
-    *,
     account_id: str,
     device_id: str,
     writer_epoch: UUID,
@@ -232,8 +193,7 @@ def _create_fresh(
         if statement_hook is not None:
             statement_hook("create_meta")
         connection.execute(
-            """
-            INSERT INTO NioIngestMeta (
+            """INSERT INTO NioIngestMeta (
                 account_id, device_id, schema_version, stream_id,
                 binding_operation_id, journal_generation,
                 consumer_generation, consumer_first_sequence,
@@ -242,8 +202,7 @@ def _create_fresh(
                 next_ready_order, next_batch_sequence, last_acked_sequence,
                 last_acked_batch_id, last_acked_sha256, created_at_ns
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, ?, ?,
-                      1, 0, 1, 0, NULL, NULL, ?)
-            """,
+                      1, 0, 1, 0, NULL, NULL, ?)""",
             (
                 account_id,
                 device_id,
@@ -265,7 +224,6 @@ def _create_fresh(
 
 def _open_existing(
     connection: sqlite3.Connection,
-    *,
     account_id: str,
     device_id: str,
     lock_identity: FileIdentity,
@@ -283,9 +241,7 @@ def _open_existing(
     if row["device_id"] != device_id:
         raise LocalProtocolError("ingestion device_id does not match")
     if row["schema_version"] != SCHEMA_VERSION:
-        raise LocalProtocolError(
-            f"unsupported ingestion schema_version {row['schema_version']}"
-        )
+        raise LocalProtocolError(f"unsupported schema_version {row['schema_version']}")
     if (row["lock_device"], row["lock_inode"]) != lock_identity:
         raise LocalProtocolError("persisted ingestion lock file identity changed")
 
@@ -329,8 +285,7 @@ def open_journal_database(
         marker_exists, has_tables = database_shape(path)
         if not marker_exists and has_tables:
             raise FreshIngestionRequired(
-                "nonempty store has no ingestion-v1 marker; explicit fresh "
-                "initialization is required"
+                "nonempty store without ingestion-v1 marker requires fresh initialization"
             )
         connection = sqlite3.connect(
             path,
@@ -344,20 +299,17 @@ def open_journal_database(
         connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
         if marker_exists:
             writer_epoch = _open_existing(
-                connection,
-                account_id=account_id,
-                device_id=device_id,
-                lock_identity=writer_lock.identity,
+                connection, account_id, device_id, writer_lock.identity
             )
         else:
             writer_epoch = uuid4()
             _create_fresh(
                 connection,
-                account_id=account_id,
-                device_id=device_id,
-                writer_epoch=writer_epoch,
-                lock_identity=writer_lock.identity,
-                statement_hook=schema_statement_hook,
+                account_id,
+                device_id,
+                writer_epoch,
+                writer_lock.identity,
+                schema_statement_hook,
             )
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
