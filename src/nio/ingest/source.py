@@ -147,6 +147,54 @@ def _require_json_bytes_tuple(value: object, field_name: str) -> None:
         raise TypeError(f"{field_name} elements must be bytes")
 
 
+class SourceScheduleStatus(StrEnum):
+    READY = "ready"
+    AT_CAPACITY = "at_capacity"
+    INACTIVE = "inactive"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceScheduleDecision:
+    status: SourceScheduleStatus
+    request: NetworkRequest | None
+
+    def __post_init__(self) -> None:
+        _require_exact(self.status, SourceScheduleStatus, "status")
+        if self.request is not None:
+            _require_exact(self.request, NetworkRequest, "request")
+        if (self.status is SourceScheduleStatus.READY) is (self.request is None):
+            raise ValueError("only a ready source schedule has a request")
+
+
+def plan_source_poll(
+    source: SyncSource,
+    state: SourceState,
+    request_id: int,
+    staged_frames: tuple[StagedFrame, ...],
+    max_staged_frames: int,
+) -> SourceScheduleDecision:
+    if not isinstance(source, SyncSource):
+        raise TypeError("source must satisfy SyncSource")
+    _require_exact(state, SourceState, "state")
+    _require_exact(request_id, int, "request_id")
+    if request_id < 0:
+        raise ValueError("request_id must be nonnegative")
+    _require_exact(staged_frames, tuple, "staged_frames")
+    if any(type(frame) is not StagedFrame for frame in staged_frames):
+        raise TypeError("staged_frames elements must be StagedFrame")
+    _require_exact(max_staged_frames, int, "max_staged_frames")
+    if not 1 <= max_staged_frames <= 256:
+        raise ValueError("max_staged_frames must be from 1 through 256")
+
+    if len(staged_frames) >= max_staged_frames:
+        return SourceScheduleDecision(SourceScheduleStatus.AT_CAPACITY, None)
+    request = source.plan_request(state, request_id)
+    if request is None:
+        return SourceScheduleDecision(SourceScheduleStatus.INACTIVE, None)
+    _require_exact(request, NetworkRequest, "planned request")
+    return SourceScheduleDecision(SourceScheduleStatus.READY, request)
+
+
 @dataclass(frozen=True, slots=True)
 class RoomSegment:
     room_id: str

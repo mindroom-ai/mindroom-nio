@@ -4,15 +4,19 @@ import inspect
 import json
 import multiprocessing
 import os
+import resource
 import sqlite3
-from dataclasses import dataclass, fields, replace
+import time
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from pathlib import Path
 from typing import get_type_hints
 from uuid import UUID, uuid4
 
 import pytest
+from peewee import OperationalError as PeeweeOperationalError
 
 import nio.ingest.state as ingest_state
+from nio.crypto import OlmAccount
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import (
     ClassicSourceConfig,
@@ -763,6 +767,190 @@ def test_source_only_ingestion_config_is_exact() -> None:
             error = TypeError if type(value) is not int else ValueError
             with pytest.raises(error, match=field_name):
                 IngestionConfig(CLASSIC_SOURCE, **{field_name: value})
+
+
+class _PlanningSource:
+    def __init__(self, request: NetworkRequest | None) -> None:
+        self.request = request
+        self.plan_calls = 0
+
+    def plan_request(
+        self,
+        _state: SourceState,
+        _request_id: int,
+    ) -> NetworkRequest | None:
+        self.plan_calls += 1
+        return self.request
+
+    def normalize(
+        self,
+        _request: NetworkRequest,
+        _result: NetworkResult,
+    ) -> object:
+        raise AssertionError("capacity planning must not normalize a response")
+
+
+class _FakeSender:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, _request: NetworkRequest) -> None:
+        self.calls += 1
+
+
+def test_source_schedule_values_are_exact_frozen_and_slotted() -> None:
+    from nio.ingest.source import SourceScheduleDecision, SourceScheduleStatus
+
+    assert tuple(SourceScheduleStatus) == (
+        SourceScheduleStatus.READY,
+        SourceScheduleStatus.AT_CAPACITY,
+        SourceScheduleStatus.INACTIVE,
+    )
+    assert tuple(status.value for status in SourceScheduleStatus) == (
+        "ready",
+        "at_capacity",
+        "inactive",
+    )
+    assert tuple(field.name for field in fields(SourceScheduleDecision)) == (
+        "status",
+        "request",
+    )
+    assert SourceScheduleDecision.__slots__ == ("status", "request")
+    decision = SourceScheduleDecision(SourceScheduleStatus.INACTIVE, None)
+    with pytest.raises(FrozenInstanceError):
+        decision.status = SourceScheduleStatus.READY  # type: ignore[misc]
+
+    request = NetworkRequest(
+        uuid4(),
+        TransportKind.CLASSIC,
+        0,
+        0,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        b'{"next_batch":null}',
+    )
+    for invalid in (
+        lambda: SourceScheduleDecision("ready", request),
+        lambda: SourceScheduleDecision(SourceScheduleStatus.READY, None),
+        lambda: SourceScheduleDecision(SourceScheduleStatus.INACTIVE, request),
+        lambda: SourceScheduleDecision(SourceScheduleStatus.AT_CAPACITY, request),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            invalid()
+
+
+def test_plan_source_poll_returns_ready_or_inactive_from_adapter() -> None:
+    from nio.ingest.source import (
+        SourceScheduleDecision,
+        SourceScheduleStatus,
+        plan_source_poll,
+    )
+
+    state = SourceState(0, TransportKind.CLASSIC, b'{"next_batch":null}', 0, True)
+    request = NetworkRequest(
+        uuid4(),
+        TransportKind.CLASSIC,
+        0,
+        0,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        state.cursor_json,
+    )
+    ready_source = _PlanningSource(request)
+    inactive_source = _PlanningSource(None)
+    staged = _frame_for_request(request, canonical_json({"next_batch": "s1"}))
+
+    assert plan_source_poll(ready_source, state, 0, (staged,), 2) == (
+        SourceScheduleDecision(SourceScheduleStatus.READY, request)
+    )
+    assert plan_source_poll(inactive_source, state, 0, (), 2) == (
+        SourceScheduleDecision(SourceScheduleStatus.INACTIVE, None)
+    )
+    assert (ready_source.plan_calls, inactive_source.plan_calls) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid"),
+    (
+        ("source", object()),
+        ("state", object()),
+        ("request_id", True),
+        ("request_id", -1),
+        ("staged_frames", []),
+        ("staged_frames", (object(),)),
+        ("max_staged_frames", True),
+        ("max_staged_frames", 0),
+        ("max_staged_frames", 257),
+    ),
+)
+def test_plan_source_poll_exact_validates_every_input(
+    field_name: str,
+    invalid: object,
+) -> None:
+    from nio.ingest.source import plan_source_poll
+
+    state = SourceState(0, TransportKind.CLASSIC, b'{"next_batch":null}', 0, True)
+    values: dict[str, object] = {
+        "source": _PlanningSource(None),
+        "state": state,
+        "request_id": 0,
+        "staged_frames": (),
+        "max_staged_frames": 2,
+    }
+    values[field_name] = invalid
+    with pytest.raises((TypeError, ValueError), match=field_name):
+        plan_source_poll(**values)  # type: ignore[arg-type]
+
+
+def test_full_bounded_journal_tuple_stops_planning_sends_and_rss_growth(
+    tmp_path: Path,
+) -> None:
+    from nio.ingest.source import SourceScheduleStatus, plan_source_poll
+
+    config = IngestionConfig(CLASSIC_SOURCE, max_staged_frames=1)
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statements=statements)
+    journal = bootstrap._journal
+    try:
+        proposal = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+        _stage(journal, proposal=proposal)
+        state = journal.load_source()
+        staged_frames = journal.list_frames(config.max_staged_frames)
+        source = _PlanningSource(proposal.frame.response.request)
+        sender = _FakeSender()
+        statements.clear()
+        rss_before_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        at_capacity = 0
+
+        for _ in range(10_000):
+            decision = plan_source_poll(
+                source,
+                state,
+                state.next_request_id,
+                staged_frames,
+                config.max_staged_frames,
+            )
+            at_capacity += decision.status is SourceScheduleStatus.AT_CAPACITY
+            if decision.status is SourceScheduleStatus.READY:
+                assert decision.request is not None
+                sender(decision.request)
+
+        rss_growth_bytes = (
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss_before_kib
+        ) * 1024
+        assert at_capacity == 10_000
+        assert source.plan_calls == 0
+        assert sender.calls == 0
+        assert statements == []
+        assert rss_growth_bytes < 8 * 1024 * 1024
+    finally:
+        bootstrap.close()
 
 
 @pytest.mark.parametrize("precreate_zero_length", (False, True))
@@ -1787,6 +1975,30 @@ def _assert_stage_process_crashed(
     return tuple(sequence_path.read_text(encoding="utf-8").splitlines())
 
 
+def _kill_nested_e2ee_stage(
+    store_path: Path,
+    proposal: _StageProposal,
+    sequence_path: Path,
+) -> None:
+    bootstrap = _open(store_path)
+    journal = bootstrap._journal
+    store = bootstrap.open_matrix_store(SqliteStore)
+
+    def kill_after_frame_insert(label: str) -> None:
+        with sequence_path.open("a", encoding="utf-8") as sequence:
+            sequence.write(f"{label}\n")
+            sequence.flush()
+            os.fsync(sequence.fileno())
+        if label == "frame_insert":
+            os._exit(CRASH_EXIT_CODE)
+
+    journal.set_transition_statement_hook(kill_after_frame_insert)
+    with journal._owner.journal_write():
+        store.save_account(OlmAccount())
+        _stage(journal, proposal=proposal)
+    bootstrap.close()
+
+
 STAGE_HOOK_LABELS = (
     "frame_collision_probe",
     "meta_revision_epoch_cas",
@@ -1829,6 +2041,95 @@ def test_stage_crash_boundary_reopens_to_exact_old_or_new_graph(
         )
     finally:
         reopened.close()
+
+
+def test_nested_real_e2ee_write_rolls_back_with_crashed_source_stage(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "nested-e2ee"
+    bootstrap = _open(store_path)
+    bootstrap.open_matrix_store(SqliteStore)
+    owner = bootstrap._journal.load_owner()
+    proposal = _stage_proposal(bootstrap._journal, CLASSIC_SOURCE, 1)
+    bootstrap.close()
+
+    sequence_path = store_path / "nested-stage-hook-sequence.txt"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_kill_nested_e2ee_stage,
+        args=(store_path, proposal, sequence_path),
+    )
+    process.start()
+    process.join(timeout=15)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        pytest.fail("nested E2EE crash-injection child did not exit")
+    assert process.exitcode == CRASH_EXIT_CODE
+    assert tuple(sequence_path.read_text(encoding="utf-8").splitlines()) == (
+        "frame_collision_probe",
+        "meta_revision_epoch_cas",
+        "source_state_upsert",
+        "frame_insert",
+    )
+
+    reopened = _open(store_path)
+    try:
+        store = reopened.open_matrix_store(SqliteStore)
+        assert (
+            reopened._journal.load_owner().revision,
+            reopened._journal.load_source(),
+            reopened._journal.load_frame(proposal.frame.frame_id),
+            store.load_account(),
+        ) == (owner.revision, proposal.prior_source, None, None)
+    finally:
+        reopened.close()
+
+
+def test_external_sqlite_write_lock_times_out_stage_without_partial_writes(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path, sqlite_busy_timeout_ms=100)
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    proposal = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+    external = sqlite3.connect(
+        bootstrap.database_path,
+        isolation_level=None,
+        timeout=0,
+    )
+    try:
+        external.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with pytest.raises(
+            (sqlite3.OperationalError, PeeweeOperationalError),
+            match="locked",
+        ):
+            _stage(journal, proposal=proposal)
+        elapsed = time.monotonic() - started
+
+        assert 0.100 <= elapsed <= 0.350
+        assert (
+            journal.load_owner(),
+            journal.load_source(),
+            journal.list_frames(256),
+        ) == (owner, proposal.prior_source, ())
+
+        external.rollback()
+        committed = _stage(journal, proposal=proposal)
+        assert (
+            committed,
+            journal.load_source(),
+            journal.load_frame(proposal.frame.frame_id),
+        ) == (
+            CommitResult(owner.revision + 1),
+            proposal.successor_source,
+            replace(proposal.frame, staged_revision=owner.revision + 1),
+        )
+    finally:
+        if external.in_transaction:
+            external.rollback()
+        external.close()
+        bootstrap.close()
 
 
 @pytest.mark.parametrize(

@@ -7,11 +7,13 @@ import shutil
 import sqlite3
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from peewee import OperationalError as PeeweeOperationalError
 from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
@@ -576,6 +578,39 @@ def test_raw_journal_and_real_orm_dml_share_one_outer_transaction(
             if "SET CREATED_AT_NS = CREATED_AT_NS + 1" in sql
         )
     finally:
+        bootstrap.close()
+
+
+def test_external_sqlite_write_lock_times_out_e2ee_without_partial_writes(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path, timeout=100)
+    store = bootstrap.open_matrix_store(SqliteStore)
+    external = sqlite3.connect(
+        bootstrap.database_path,
+        isolation_level=None,
+        timeout=0,
+    )
+    try:
+        external.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with pytest.raises(
+            (sqlite3.OperationalError, PeeweeOperationalError),
+            match="locked",
+        ):
+            store.save_account(OlmAccount())
+        elapsed = time.monotonic() - started
+
+        assert 0.100 <= elapsed <= 0.350
+        assert store.load_account() is None
+
+        external.rollback()
+        store.save_account(OlmAccount())
+        assert store.load_account() is not None
+    finally:
+        if external.in_transaction:
+            external.rollback()
+        external.close()
         bootstrap.close()
 
 
