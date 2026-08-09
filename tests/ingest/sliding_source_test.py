@@ -12,7 +12,7 @@ from nio.ingest.sliding import (
     SlidingCursor,
     SlidingSource,
     canonical_sliding_cursor,
-    reset_sliding_cursor,
+    reset_sliding_connection,
 )
 from nio.ingest.source import SourceResultKind, SyncSource
 from nio.ingest.state import SourceState
@@ -150,7 +150,7 @@ def test_source_constructs_initial_cursor_without_creating_an_identity(
 def test_reset_is_coordinator_seeded_and_preserves_only_independent_state() -> None:
     cursor = SlidingCursor("p9", "td8", CONNECTION, 31, True)
 
-    transition = reset_sliding_cursor(cursor, NEXT_CONNECTION)
+    transition = reset_sliding_connection(cursor, NEXT_CONNECTION)
 
     assert transition == SlidingConnectionReset(
         SlidingCursor(None, "td8", NEXT_CONNECTION, 31, False),
@@ -159,7 +159,7 @@ def test_reset_is_coordinator_seeded_and_preserves_only_independent_state() -> N
     assert transition.history_uncertain is True
     assert cursor == SlidingCursor("p9", "td8", CONNECTION, 31, True)
     with pytest.raises(ValueError, match="new"):
-        reset_sliding_cursor(cursor, CONNECTION)
+        reset_sliding_connection(cursor, CONNECTION)
 
 
 def test_initial_request_reserves_non_weakenable_all_room_coverage(
@@ -267,7 +267,6 @@ def test_planning_does_not_mutate_frozen_config_json(
         ([], [RESERVED_LIST]),
         (["foreground"], ["foreground", RESERVED_LIST]),
         (["*"], ["*"]),
-        (["*", "ignored"], ["*", "ignored", RESERVED_LIST]),
     ],
 )
 def test_room_extension_scope_cannot_exclude_the_reserved_list(
@@ -300,6 +299,27 @@ def test_room_extension_scope_cannot_exclude_the_reserved_list(
     typing = extensions["typing"]
     assert isinstance(typing, dict)
     assert typing["lists"] == expected_scope
+
+
+def test_non_exact_wildcard_extension_scope_is_rejected() -> None:
+    source = SlidingSource(
+        STREAM_ID,
+        SlidingSourceConfig(
+            0,
+            "worker",
+            b"{}",
+            b"{}",
+            b'{"typing":{"lists":["*","foreground"]}}',
+        ),
+        bootstrap_range_size=2,
+        own_user_id=OWN_USER_ID,
+    )
+
+    with pytest.raises(ValueError, match="wildcard"):
+        source.plan_request(
+            _state(SlidingCursor(None, None, CONNECTION, 1, False)),
+            7,
+        )
 
 
 @pytest.mark.parametrize(

@@ -126,7 +126,7 @@ def _sliding_cursor_from_json(data: bytes) -> SlidingCursor:
         raise ValueError(str(error)) from error
 
 
-def reset_sliding_cursor(
+def reset_sliding_connection(
     cursor: SlidingCursor,
     new_connection_instance: UUID,
 ) -> SlidingConnectionReset:
@@ -328,6 +328,10 @@ class SlidingSource:
                         raise ValueError(
                             f"extensions.{name}.lists must contain strings"
                         )
+                    if "*" in scoped_lists:
+                        raise ValueError(
+                            f"extensions.{name}.lists wildcard must be exactly ['*']"
+                        )
                 if RESERVED_ALL_ROOMS_LIST not in scoped_lists:
                     scoped_lists.append(RESERVED_ALL_ROOMS_LIST)
                 extension["lists"] = scoped_lists
@@ -421,6 +425,10 @@ class SlidingSource:
             if any(type(item) is not str for item in scope):
                 raise ValueError(
                     f"sliding request extensions.{name}.lists must contain strings"
+                )
+            if "*" in scope and scope != ["*"]:
+                raise ValueError(
+                    f"sliding request {name} extension wildcard is not exact"
                 )
             if scope != ["*"] and RESERVED_ALL_ROOMS_LIST not in scope:
                 raise ValueError(
