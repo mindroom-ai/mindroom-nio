@@ -105,10 +105,10 @@ def prove_membership(
             return unsafe
         if baseline is None:
             return MembershipProof(MembershipProofKind.ESTABLISHED, event_id)
-        if event_id == baseline.membership_event_id:
-            return MembershipProof(MembershipProofKind.CONTINUES, event_id)
         if observation.is_live:
             return MembershipProof(MembershipProofKind.CHANGED, event_id)
+        if event_id == baseline.membership_event_id:
+            return MembershipProof(MembershipProofKind.CONTINUES, event_id)
         if (
             observation.previous_membership == "join"
             and observation.replaces_state == baseline.membership_event_id

@@ -97,6 +97,28 @@ def test_membership_values_are_frozen_slotted_and_exact() -> None:
             MembershipBaseline("w1", "$m1"),
             observation(
                 event_membership="join",
+                event_id="$m1",
+                is_live=True,
+            ),
+            MembershipProof(MembershipProofKind.CHANGED, "$m1"),
+            id="live-redelivery-of-the-baseline-still-breaks-continuity",
+        ),
+        pytest.param(
+            MembershipBaseline("w1", "$m1"),
+            observation(
+                event_membership="join",
+                event_id="$m2",
+                previous_membership="join",
+                replaces_state="$m1",
+                is_live=True,
+            ),
+            MembershipProof(MembershipProofKind.CHANGED, "$m2"),
+            id="live-linked-rotation-still-breaks-continuity",
+        ),
+        pytest.param(
+            MembershipBaseline("w1", "$m1"),
+            observation(
+                event_membership="join",
                 event_id="$m2",
                 previous_membership="join",
                 replaces_state="$m1",
