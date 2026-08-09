@@ -96,7 +96,7 @@ def _open_matrix_store_from_ingestion(
 ) -> MatrixStore:
     if not isinstance(store_class, type) or not issubclass(store_class, MatrixStore):
         raise TypeError("store_class must be a MatrixStore subclass")
-    bootstrap._journal._assert_open()
+    bootstrap._journal._assert_file_owner()
     return store_class(
         bootstrap._journal.account_id,
         bootstrap._journal.device_id,
@@ -412,11 +412,12 @@ class MatrixStore:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
         if _ingestion_bootstrap is not None:
-            if not database_has_ingestion_marker(self.database_path):
-                raise LocalProtocolError(
-                    "StoreBootstrap marker disappeared before store open"
-                )
-            self._post_init_ingestion_store(_ingestion_bootstrap)
+            with _ingestion_bootstrap._claim_store(self):
+                if not database_has_ingestion_marker(self.database_path):
+                    raise LocalProtocolError(
+                        "StoreBootstrap marker disappeared before store open"
+                    )
+                self._post_init_ingestion_store(_ingestion_bootstrap)
             return
 
         with StableFileLock(Path(self.database_path)):
@@ -464,7 +465,7 @@ class MatrixStore:
         self._repair_v10_recovery_abandonments()
 
     def _post_init_ingestion_store(self, bootstrap: StoreBootstrap) -> None:
-        bootstrap._journal._assert_open()
+        bootstrap._journal._assert_file_owner()
         if os.path.realpath(self.database_path) != os.path.realpath(
             bootstrap.database_path
         ):
@@ -482,7 +483,8 @@ class MatrixStore:
         self.database.connect()
         try:
             row = self.database.execute_sql(
-                "SELECT account_id, device_id, schema_version, writer_epoch "
+                "SELECT account_id, device_id, schema_version, writer_epoch, "
+                "lock_device, lock_inode "
                 "FROM NioIngestMeta"
             ).fetchone()
             if row != (
@@ -490,6 +492,7 @@ class MatrixStore:
                 self.device_id,
                 1,
                 str(bootstrap._journal.writer_epoch),
+                *bootstrap._journal._writer_lock.identity,
             ):
                 raise LocalProtocolError(
                     "StoreBootstrap no longer matches the ingestion-v1 marker"

@@ -130,7 +130,7 @@ class SqliteIngestionJournal(JournalRows):
             transition_statement_hook=transition_statement_hook,
         )
 
-    def _assert_open(self) -> None:
+    def _assert_file_owner(self) -> None:
         self._assert_process_owner()
         if self._closed:
             raise LocalProtocolError("ingestion journal is closed")
@@ -145,6 +145,9 @@ class SqliteIngestionJournal(JournalRows):
             raise LocalProtocolError(
                 "ingestion database file identity changed after lock acquisition"
             )
+
+    def _assert_open(self) -> None:
+        self._assert_file_owner()
         row = self.connection.execute(
             "SELECT lock_device, lock_inode FROM NioIngestMeta WHERE account_id = ?",
             (self.account_id,),

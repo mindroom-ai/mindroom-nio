@@ -807,6 +807,160 @@ def test_bootstrap_close_closes_its_e2ee_store_before_releasing_lock(
     replacement.close()
 
 
+def test_direct_bootstrap_authority_is_consumed_and_registered_once(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    stores = []
+    try:
+        stores.append(
+            SqliteStore(
+                ACCOUNT_ID,
+                DEVICE_ID,
+                str(tmp_path),
+                database_name="journal.db",
+                _ingestion_bootstrap=bootstrap,
+            )
+        )
+        with pytest.raises(LocalProtocolError, match="only once"):
+            stores.append(
+                SqliteStore(
+                    ACCOUNT_ID,
+                    DEVICE_ID,
+                    str(tmp_path),
+                    database_name="journal.db",
+                    _ingestion_bootstrap=bootstrap,
+                )
+            )
+
+        bootstrap.close()
+        assert stores[0].database.is_closed()
+    finally:
+        for store in stores:
+            if not store.database.is_closed():
+                store.database.close()
+        bootstrap.close()
+
+
+def test_concurrent_direct_bootstrap_claims_admit_exactly_one_store(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    first_entered = threading.Event()
+    allow_first = threading.Event()
+    second_started = threading.Event()
+    second_finished = threading.Event()
+    results: list[object] = []
+
+    class PausingStore(SqliteStore):
+        def _post_init_ingestion_store(self, authority) -> None:
+            first_entered.set()
+            assert allow_first.wait(timeout=5)
+            super()._post_init_ingestion_store(authority)
+
+    def open_first() -> None:
+        try:
+            results.append(
+                PausingStore(
+                    ACCOUNT_ID,
+                    DEVICE_ID,
+                    str(tmp_path),
+                    database_name="journal.db",
+                    _ingestion_bootstrap=bootstrap,
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+
+    def open_second() -> None:
+        second_started.set()
+        try:
+            results.append(
+                SqliteStore(
+                    ACCOUNT_ID,
+                    DEVICE_ID,
+                    str(tmp_path),
+                    database_name="journal.db",
+                    _ingestion_bootstrap=bootstrap,
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+        finally:
+            second_finished.set()
+
+    first = threading.Thread(target=open_first)
+    second = threading.Thread(target=open_second)
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert second_started.wait(timeout=5)
+    try:
+        assert not second_finished.wait(timeout=0.1)
+    finally:
+        allow_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    try:
+        stores = [result for result in results if isinstance(result, SqliteStore)]
+        errors = [result for result in results if isinstance(result, BaseException)]
+        assert len(stores) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], LocalProtocolError)
+        assert "only once" in str(errors[0])
+    finally:
+        for result in results:
+            if isinstance(result, SqliteStore) and not result.database.is_closed():
+                result.database.close()
+        bootstrap.close()
+
+
+def test_failed_direct_bootstrap_claim_rolls_back_for_retry(tmp_path: Path) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+
+    class FailingStore(SqliteStore):
+        def _post_init_ingestion_store(self, authority) -> None:
+            raise RuntimeError("injected constructor failure")
+
+    try:
+        with pytest.raises(RuntimeError, match="injected constructor failure"):
+            FailingStore(
+                ACCOUNT_ID,
+                DEVICE_ID,
+                str(tmp_path),
+                database_name="journal.db",
+                _ingestion_bootstrap=bootstrap,
+            )
+
+        store = SqliteStore(
+            ACCOUNT_ID,
+            DEVICE_ID,
+            str(tmp_path),
+            database_name="journal.db",
+            _ingestion_bootstrap=bootstrap,
+        )
+        bootstrap.close()
+        assert store.database.is_closed()
+    finally:
+        bootstrap.close()
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
 def test_inherited_child_cannot_use_or_release_parent_ownership(
     tmp_path: Path,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -10,7 +12,7 @@ from ..ingest.model import ConsumerBootstrap
 from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from .database import MatrixStore
 
@@ -21,10 +23,26 @@ class StoreBootstrap:
     def __init__(self, journal: _SqliteIngestionJournal) -> None:
         self._journal = journal
         self._store: MatrixStore | None = None
+        self._store_lock = threading.RLock()
+
+    @contextmanager
+    def _claim_store(self, store: MatrixStore) -> Iterator[None]:
+        self._journal._assert_file_owner()
+        with self._store_lock:
+            if self._store is not None:
+                raise LocalProtocolError(
+                    "StoreBootstrap can open MatrixStore only once"
+                )
+            self._store = store
+            try:
+                yield
+            except BaseException:
+                self._store = None
+                raise
 
     @property
     def database_path(self) -> Path:
-        self._journal._assert_open()
+        self._journal._assert_file_owner()
         return self._journal.database_path
 
     @property
@@ -49,17 +67,13 @@ class StoreBootstrap:
         *,
         pickle_key: str | None = None,
     ) -> MatrixStore:
-        if self._store is not None:
-            raise LocalProtocolError("StoreBootstrap can open MatrixStore only once")
         from .database import _open_matrix_store_from_ingestion
 
-        store = _open_matrix_store_from_ingestion(
+        return _open_matrix_store_from_ingestion(
             self,
             store_class,
             self._journal.pickle_key if pickle_key is None else pickle_key,
         )
-        self._store = store
-        return store
 
     async def attach_consumer(self, consumer: ConsumerBootstrap) -> None:
         self._journal.attach_consumer(consumer)
@@ -69,11 +83,12 @@ class StoreBootstrap:
 
     def close(self) -> None:
         self._journal._assert_process_owner()
-        try:
-            if self._store is not None and not self._store.database.is_closed():
-                self._store.database.close()
-        finally:
-            self._journal.close()
+        with self._store_lock:
+            try:
+                if self._store is not None and not self._store.database.is_closed():
+                    self._store.database.close()
+            finally:
+                self._journal.close()
 
 
 def open_ingestion_store(
