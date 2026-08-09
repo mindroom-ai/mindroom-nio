@@ -23,6 +23,13 @@ from .source import (
 )
 from .state import SourceState
 
+_CLASSIC_ROOM_SECTIONS = (
+    RoomSection.INVITE,
+    RoomSection.KNOCK,
+    RoomSection.JOIN,
+    RoomSection.LEAVE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ClassicSource:
@@ -174,7 +181,9 @@ class ClassicSource:
         request_cursor_json = canonical_classic_cursor(request_cursor)
 
         rooms = self._object(root.get("rooms", {}), "rooms")
-        unknown_sections = set(rooms) - {section.value for section in RoomSection}
+        unknown_sections = set(rooms) - {
+            section.value for section in _CLASSIC_ROOM_SECTIONS
+        }
         if unknown_sections:
             raise ValueError(f"unsupported room sections: {sorted(unknown_sections)!r}")
 
@@ -182,7 +191,7 @@ class ClassicSource:
         ephemeral: list[bytes] = []
         seen_room_ids: set[str] = set()
         initial = request_cursor.next_batch is None
-        for section in RoomSection:
+        for section in _CLASSIC_ROOM_SECTIONS:
             section_rooms = self._object(rooms.get(section.value, {}), section.value)
             for room_id in sorted(section_rooms):
                 if type(room_id) is not str or not room_id:
@@ -244,6 +253,7 @@ class ClassicSource:
                         timeline_limited=limited,
                         timeline_prev_batch=prev_batch,
                         initial=initial,
+                        expanded_timeline=False,
                         live_event_count=0 if initial else len(timeline),
                     )
                 )

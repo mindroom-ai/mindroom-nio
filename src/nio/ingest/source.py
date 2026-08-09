@@ -94,6 +94,7 @@ class RoomSection(StrEnum):
     KNOCK = "knock"
     JOIN = "join"
     LEAVE = "leave"
+    UNCHANGED = "unchanged"
 
 
 class SourceResultKind(StrEnum):
@@ -143,6 +144,7 @@ class RoomSegment:
     timeline_limited: bool
     timeline_prev_batch: str | None
     initial: bool
+    expanded_timeline: bool
     live_event_count: int
 
     def __post_init__(self) -> None:
@@ -162,6 +164,7 @@ class RoomSegment:
                 "timeline_prev_batch",
             )
         _require_exact(self.initial, bool, "initial")
+        _require_exact(self.expanded_timeline, bool, "expanded_timeline")
         _require_exact(self.live_event_count, int, "live_event_count")
         if not self.room_id:
             raise ValueError("room_id must not be empty")

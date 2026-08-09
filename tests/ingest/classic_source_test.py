@@ -240,6 +240,7 @@ def test_initial_sync_normalizes_every_classic_section_in_fixed_order(
         (RoomSection.LEAVE, "!leave:example.org"),
     )
     assert all(segment.initial for segment in frame.room_segments)
+    assert all(not segment.expanded_timeline for segment in frame.room_segments)
     assert all(segment.live_event_count == 0 for segment in frame.room_segments)
 
     invite = frame.room_segments[1]
@@ -346,6 +347,28 @@ def test_continuation_marks_all_classic_timeline_events_live(
     assert tuple(
         segment.live_event_count for segment in result.frame.room_segments
     ) == (0, 0, 0, 1, 2, 1)
+
+
+def test_classic_wire_sections_do_not_expand_with_shared_room_section_enum(
+    classic_source: ClassicSource,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior")),
+        request_id=9,
+    )
+    assert request is not None
+
+    result = classic_source.normalize(
+        request,
+        _network_result(
+            request,
+            b'{"next_batch":"s-next","rooms":{"unchanged":{"!r:a":{}}}}',
+        ),
+    )
+
+    assert result.kind is SourceResultKind.TERMINAL_ERROR
+    assert result.detail is not None
+    assert "unsupported room sections" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -1021,6 +1044,7 @@ def test_frozen_source_values_reject_mutable_nested_inputs(
             False,
             None,
             False,
+            False,
             0,
         )
 
@@ -1213,6 +1237,7 @@ def test_classic_adapter_is_synchronous_and_owns_no_runtime_resources(
             False,
             None,
             True,
+            False,
             0,
         ),
     ):
