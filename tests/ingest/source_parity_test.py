@@ -1,11 +1,12 @@
 import json
+from dataclasses import fields
 from uuid import UUID
 
 import pytest
 
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
-from nio.ingest.model import RecordKind, TransportKind
+from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
 from nio.ingest.ports import NetworkRequest, NetworkResult
 from nio.ingest.sliding import (
     SlidingCursor,
@@ -62,6 +63,30 @@ def _shape(frame: SyncFrame) -> tuple[tuple[RecordKind, str | None, bytes], ...]
     )
     records.extend((RecordKind.PRESENCE, None, event) for event in frame.presence_json)
     return tuple(records)
+
+
+def test_sync_frame_keeps_only_a_digest_while_event_records_keep_source_json() -> None:
+    sync_frame_fields = {field.name for field in fields(SyncFrame)}
+    event_record_fields = {field.name for field in fields(EventRecord)}
+    source_json = b'{"content":{"body":"record-owned"},"type":"m.room.message"}'
+    record = EventRecord(
+        "$record",
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 1, 2, 0),
+        ROOM_ID,
+        1,
+        1,
+        "$record",
+        None,
+        source_json,
+        None,
+    )
+
+    assert "source_sha256" in sync_frame_fields
+    assert "source_json" not in sync_frame_fields
+    assert "response_body" not in sync_frame_fields
+    assert "source_json" in event_record_fields
+    assert record.source_json == source_json
 
 
 def _membership_observation_pair(

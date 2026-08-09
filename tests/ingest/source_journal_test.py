@@ -32,8 +32,7 @@ from nio.ingest.ports import (
     _frame_id_for_response,
 )
 from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
-from nio.ingest.source import canonical_json
-from nio.ingest.source import renormalize_staged_frame
+from nio.ingest.source import SyncFrame, canonical_json, renormalize_staged_frame
 from nio.ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal_codec import EncryptedRowCodec
@@ -78,6 +77,7 @@ class _StageProposal:
     prior_source: SourceState
     successor_source: SourceState
     frame: StagedFrame
+    normalized_frame: SyncFrame
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +201,7 @@ def _stage_proposal(
         request.request_id + 1,
         prior_source.active,
     )
-    return _StageProposal(prior_source, successor, frame)
+    return _StageProposal(prior_source, successor, frame, normalized.frame)
 
 
 def _stage(
@@ -317,6 +317,51 @@ def _stage_one(
 
 def _codec_for(stage: _StoredStage, account_id: str = ACCOUNT_ID) -> EncryptedRowCodec:
     return EncryptedRowCodec("secret", account_id, stage.stream_id)
+
+
+def _reseal_frame_envelope(
+    stage: _StoredStage,
+    envelope: dict[str, object],
+    *,
+    frame_id: UUID | None = None,
+) -> UUID:
+    original_id = stage.proposal.frame.frame_id
+    stored_id = original_id if frame_id is None else frame_id
+    header = _frame_header(stage.proposal.frame, stage.committed.revision)
+    ciphertext, digest = _codec_for(stage).seal(
+        "NioIngestFrame",
+        (stored_id,),
+        _canonical_internal(envelope),
+        header=header,
+    )
+    with sqlite3.connect(stage.database_path) as connection:
+        connection.execute(
+            "UPDATE NioIngestFrame SET frame_id = ?, payload_ciphertext = ?, "
+            "payload_sha256 = ? WHERE account_id = ? AND frame_id = ?",
+            (
+                str(stored_id),
+                ciphertext,
+                digest,
+                ACCOUNT_ID,
+                str(original_id),
+            ),
+        )
+    return stored_id
+
+
+def _decrypted_frame_envelope(stage: _StoredStage) -> dict[str, object]:
+    frame = stage.proposal.frame
+    row = _stored_row(stage.database_path, frame.frame_id)
+    payload = _codec_for(stage).decrypt(
+        "NioIngestFrame",
+        (frame.frame_id,),
+        bytes(row["payload_ciphertext"]),
+        bytes(row["payload_sha256"]),
+        header=_frame_header(frame, stage.committed.revision),
+    )
+    envelope = json.loads(payload)
+    assert type(envelope) is dict
+    return envelope
 
 
 def _stored_row(database_path: Path, frame_id: UUID | None = None) -> sqlite3.Row:
@@ -1819,9 +1864,9 @@ def test_reopened_deserialized_frame_renormalizes_exactly_across_config_drift(
     bootstrap = _open(tmp_path, source_config)
     owner = bootstrap._journal.load_owner()
     proposal = _stage_proposal(bootstrap._journal, source_config, 1)
-    expected = renormalize_staged_frame(
-        _source_adapter(owner.stream_id, source_config),
-        proposal.frame,
+    expected = proposal.normalized_frame
+    expected_observations = tuple(
+        segment.membership_observation for segment in expected.room_segments
     )
     committed = _stage(
         bootstrap._journal,
@@ -1850,9 +1895,7 @@ def test_reopened_deserialized_frame_renormalizes_exactly_across_config_drift(
         observations = tuple(
             segment.membership_observation for segment in actual.room_segments
         )
-        assert observations == tuple(
-            segment.membership_observation for segment in expected.room_segments
-        )
+        assert observations == expected_observations
         assert tuple(
             (
                 observation.room_membership,
@@ -1862,5 +1905,170 @@ def test_reopened_deserialized_frame_renormalizes_exactly_across_config_drift(
             )
             for observation in observations
         ) == (("join", "join", "$own-1", True),)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("source_config", (CLASSIC_SOURCE, SLIDING_SOURCE))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "stream",
+        "transport",
+        "source_epoch",
+        "request_id",
+        "response_body",
+        "source_digest",
+        "frame_id",
+        "normalization_version",
+    ),
+)
+def test_replay_rejects_each_authenticated_common_frame_mutation(
+    tmp_path: Path,
+    source_config: ClassicSourceConfig | SlidingSourceConfig,
+    mutation: str,
+) -> None:
+    stage = _stage_one(tmp_path, source_config)
+    envelope = _decrypted_frame_envelope(stage)
+    request = envelope["request"]
+    assert type(request) is dict
+    stored_id = stage.proposal.frame.frame_id
+    if mutation == "stream":
+        request["stream_id"] = str(uuid4())
+    elif mutation == "transport":
+        request["transport"] = (
+            TransportKind.SLIDING.value
+            if source_config is CLASSIC_SOURCE
+            else TransportKind.CLASSIC.value
+        )
+    elif mutation == "source_epoch":
+        request["source_epoch"] += 1
+    elif mutation == "request_id":
+        request["request_id"] += 1
+    elif mutation == "response_body":
+        envelope["response_body"] = _encoded_bytes(b'{"changed":true}')
+    elif mutation == "source_digest":
+        envelope["source_sha256"] = _encoded_bytes(bytes(32))
+    elif mutation == "frame_id":
+        stored_id = uuid4()
+    else:
+        assert mutation == "normalization_version"
+        envelope["normalization_version"] = 2
+    _reseal_frame_envelope(stage, envelope, frame_id=stored_id)
+
+    reopened = _open(tmp_path, source_config)
+    try:
+        with pytest.raises(JournalIntegrityError):
+            reopened._journal.load_frame(stored_id)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("method", "path", "query", "full_state", "filter", "cursor", "timeout"),
+)
+def test_classic_replay_rejects_each_authenticated_frozen_request_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    stage = _stage_one(tmp_path, CLASSIC_SOURCE)
+    envelope = _decrypted_frame_envelope(stage)
+    request = envelope["request"]
+    assert type(request) is dict
+    query = request["query"]
+    assert type(query) is list
+    if mutation == "method":
+        request["method"] = "POST"
+    elif mutation == "path":
+        request["path"] = "/_matrix/client/v3/rooms"
+    elif mutation == "query":
+        query.append(["extra", "unsafe"])
+    elif mutation == "full_state":
+        query[0][1] = "false"
+    elif mutation == "filter":
+        query[-1][1] = "{ }"
+    elif mutation == "cursor":
+        request["request_cursor_json"] = _encoded_bytes(b'{"next_batch":"other"}')
+    else:
+        assert mutation == "timeout"
+        request["timeout_ms"] += 1
+    _reseal_frame_envelope(stage, envelope)
+
+    reopened = _open(tmp_path, CLASSIC_SOURCE)
+    try:
+        loaded = reopened._journal.load_frame(stage.proposal.frame.frame_id)
+        assert loaded is not None
+        with pytest.raises(ValueError):
+            renormalize_staged_frame(
+                _source_adapter(stage.stream_id, CLASSIC_SOURCE),
+                loaded,
+            )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "connection_name",
+        "reserved_list",
+        "reserved_range",
+        "subscription",
+        "extensions",
+        "to_device_since",
+        "e2ee_flags",
+        "cursor",
+        "body",
+    ),
+)
+def test_sliding_replay_rejects_each_authenticated_frozen_request_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    stage = _stage_one(tmp_path, SLIDING_SOURCE)
+    envelope = _decrypted_frame_envelope(stage)
+    request = envelope["request"]
+    assert type(request) is dict
+    body = json.loads(base64.b64decode(request["body"], validate=True))
+    cursor = json.loads(base64.b64decode(request["request_cursor_json"], validate=True))
+    if mutation == "connection_name":
+        cursor["connection_name"] = "other-worker"
+    elif mutation == "reserved_list":
+        del body["lists"][RESERVED_ALL_ROOMS_LIST]["required_state"]
+    elif mutation == "reserved_range":
+        body["lists"][RESERVED_ALL_ROOMS_LIST]["ranges"] = [[0, 99]]
+    elif mutation == "subscription":
+        body["room_subscriptions"] = {
+            f"!room-{index}:example.org": {} for index in range(101)
+        }
+    elif mutation == "extensions":
+        body["extensions"]["typing"]["lists"] = []
+    elif mutation == "to_device_since":
+        body["extensions"]["to_device"]["since"] = "td-unsafe"
+    elif mutation == "e2ee_flags":
+        body["extensions"]["e2ee"]["enabled"] = False
+    elif mutation == "cursor":
+        request["request_cursor_json"] = _encoded_bytes(
+            base64.b64decode(request["request_cursor_json"], validate=True) + b" "
+        )
+    else:
+        assert mutation == "body"
+        request["body"] = _encoded_bytes(b"{}")
+    if mutation == "connection_name":
+        request["request_cursor_json"] = _encoded_bytes(canonical_json(cursor))
+    elif mutation not in {"cursor", "body"}:
+        request["body"] = _encoded_bytes(canonical_json(body))
+    _reseal_frame_envelope(stage, envelope)
+
+    reopened = _open(tmp_path, SLIDING_SOURCE)
+    try:
+        loaded = reopened._journal.load_frame(stage.proposal.frame.frame_id)
+        assert loaded is not None
+        with pytest.raises(ValueError):
+            renormalize_staged_frame(
+                _source_adapter(stage.stream_id, SLIDING_SOURCE),
+                loaded,
+            )
     finally:
         reopened.close()
