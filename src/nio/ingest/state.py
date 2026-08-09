@@ -3,6 +3,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from ..event_provenance import TimelineEventProvenance
+from .config import MAX_RECORDS_PER_BATCH
 from .membership import MembershipBaseline
 from .model import (
     ConsumerBinding,
@@ -424,11 +425,65 @@ class ReadyRecord:
     created_revision: int = field(default=0, compare=False)
 
     def __post_init__(self) -> None:
+        for name in ("ready_order", "canonical_bytes", "created_revision"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be int")
+            if value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if type(self.record) not in (EventRecord, LossRecord):
+            raise TypeError("record must be EventRecord or LossRecord")
+        if self.source_frame_id is not None and type(self.source_frame_id) is not UUID:
+            raise TypeError("source_frame_id must be UUID or None")
         if (
             type(self.record.origin) is SystemOrigin
             and self.source_frame_id is not None
         ):
             raise ValueError("SystemOrigin ReadyRecord source_frame_id must be None")
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyRecordKey:
+    item_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.item_id) is not str:
+            raise TypeError("item_id must be str")
+        if not self.item_id:
+            raise ValueError("item_id must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class BatchMaterialization:
+    batch: SyncBatch
+    sources: tuple[ReadyRecordKey | LaneRecordKey, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.batch) is not SyncBatch:
+            raise TypeError("batch must be SyncBatch")
+        if type(self.sources) is not tuple:
+            raise TypeError("sources must be a tuple")
+        if any(
+            type(source) not in (ReadyRecordKey, LaneRecordKey)
+            for source in self.sources
+        ):
+            raise TypeError(
+                "sources must contain ReadyRecordKey or LaneRecordKey values"
+            )
+        if len(self.sources) != len(self.batch.records):
+            raise ValueError("materialization requires one source per batch record")
+        if len(self.sources) > MAX_RECORDS_PER_BATCH:
+            raise ValueError(
+                f"materialization cannot exceed {MAX_RECORDS_PER_BATCH} records"
+            )
+        if len(set(self.sources)) != len(self.sources):
+            raise ValueError("materialization sources contain duplicates")
+        item_ids = tuple(
+            record.record_id if type(record) is EventRecord else record.loss_id
+            for record in self.batch.records
+        )
+        if len(set(item_ids)) != len(item_ids):
+            raise ValueError("materialization batch item identities must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,11 +501,9 @@ class JournalTransition:
     room_states: tuple[RoomState, ...] = ()
     room_lanes: tuple[RoomLane, ...] = ()
     lane_record_inserts: tuple[LaneRecord, ...] = ()
-    lane_record_deletes: tuple[LaneRecordKey, ...] = ()
     ready_records: tuple[ReadyRecord, ...] = ()
     frames: tuple[StagedFrame, ...] = ()
-    batches: tuple[SyncBatch, ...] = ()
-    losses: tuple[LossRecord, ...] = ()
+    batch_materialization: BatchMaterialization | None = None
     delete_frame_ids: tuple[UUID, ...] = ()
 
     def __post_init__(self) -> None:
@@ -460,11 +513,8 @@ class JournalTransition:
             ("room_states", self.room_states, RoomState),
             ("room_lanes", self.room_lanes, RoomLane),
             ("lane_record_inserts", self.lane_record_inserts, LaneRecord),
-            ("lane_record_deletes", self.lane_record_deletes, LaneRecordKey),
             ("ready_records", self.ready_records, ReadyRecord),
             ("frames", self.frames, StagedFrame),
-            ("batches", self.batches, SyncBatch),
-            ("losses", self.losses, LossRecord),
             ("delete_frame_ids", self.delete_frame_ids, UUID),
         )
         for name, values, expected in fields:
@@ -472,6 +522,13 @@ class JournalTransition:
                 raise TypeError(f"{name} must be a tuple")
             if any(type(value) is not expected for value in values):
                 raise TypeError(f"{name} must contain {expected.__name__} values")
+        if (
+            self.batch_materialization is not None
+            and type(self.batch_materialization) is not BatchMaterialization
+        ):
+            raise TypeError(
+                "batch_materialization must be BatchMaterialization or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)

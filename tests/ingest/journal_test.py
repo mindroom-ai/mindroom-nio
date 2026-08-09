@@ -45,6 +45,7 @@ from nio.ingest.membership import MembershipBaseline
 from nio.ingest.recovery import RecoveryGap
 from nio.ingest.state import (
     AckOutcome,
+    BatchMaterialization,
     ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
@@ -53,6 +54,7 @@ from nio.ingest.state import (
     LaneStatus,
     ReleasePhase,
     ReadyRecord,
+    ReadyRecordKey,
     RoomLane,
     RoomState,
     SourceState,
@@ -149,6 +151,12 @@ def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() ->
             return AckOutcome.ACKNOWLEDGED
 
     assert isinstance(RecordingJournal(), IngestionJournal)
+
+
+def test_internal_journal_protocol_has_no_parallel_loss_ledger_lookup() -> None:
+    from nio.store._sync_journal_port import IngestionJournal
+
+    assert "load_loss" not in IngestionJournal.__dict__
 
 
 def test_ingestion_config_enforces_frozen_resource_ceilings() -> None:
@@ -606,6 +614,159 @@ def test_fresh_open_creates_independent_v1_schema_with_marker_first(
             if statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
         ]
         assert schema_mutations[0].startswith("CREATE TABLE NioIngestMeta")
+    finally:
+        bootstrap.close()
+
+
+def test_v1_schema_has_only_ready_lane_and_unacknowledged_batch_record_owners(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        connection = bootstrap._journal.connection
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "NioIngestLoss" not in tables
+        assert "NioIngestConsumerResetRoom" not in tables
+        assert "NioIngestBatchItem" in tables
+
+        ready_columns = tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_info(NioIngestReadyRecord)")
+        )
+        assert ready_columns == (
+            "account_id",
+            "ready_order",
+            "item_id",
+            "item_kind",
+            "source_frame_id",
+            "room_id",
+            "membership_epoch",
+            "room_sequence",
+            "payload_ciphertext",
+            "payload_sha256",
+            "canonical_bytes",
+            "created_revision",
+        )
+        batch_columns = tuple(
+            row[1] for row in connection.execute("PRAGMA table_info(NioIngestBatch)")
+        )
+        assert batch_columns == (
+            "account_id",
+            "sequence",
+            "batch_id",
+            "payload_ciphertext",
+            "payload_sha256",
+            "created_revision",
+        )
+        batch_item_info = connection.execute(
+            "PRAGMA table_info(NioIngestBatchItem)"
+        ).fetchall()
+        batch_item_columns = tuple(row[1] for row in batch_item_info)
+        assert batch_item_columns == (
+            "account_id",
+            "item_id",
+            "item_kind",
+            "sequence",
+            "record_ordinal",
+        )
+        assert tuple(
+            row[1] for row in sorted(batch_item_info, key=lambda row: row[5]) if row[5]
+        ) == ("account_id", "item_id")
+        unique_indexes = {
+            tuple(
+                column[2]
+                for column in connection.execute(
+                    f'PRAGMA index_info("{index[1]}")'
+                ).fetchall()
+            )
+            for index in connection.execute(
+                "PRAGMA index_list(NioIngestBatchItem)"
+            ).fetchall()
+            if index[2]
+        }
+        assert unique_indexes == {
+            ("account_id", "item_id"),
+            ("account_id", "sequence", "record_ordinal"),
+        }
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(NioIngestBatchItem)"
+        ).fetchall()
+        assert {(row[2], row[3], row[4], row[6]) for row in foreign_keys} == {
+            ("NioIngestBatch", "account_id", "account_id", "CASCADE"),
+            ("NioIngestBatch", "sequence", "sequence", "CASCADE"),
+        }
+    finally:
+        bootstrap.close()
+
+
+def test_batch_item_schema_rejects_invalid_or_ambiguous_derived_ownership(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    connection = bootstrap._journal.connection
+    try:
+        connection.execute(
+            "INSERT INTO NioIngestBatch VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                ACCOUNT_ID,
+                1,
+                "11111111-1111-1111-1111-111111111111",
+                b"ciphertext",
+                b"d" * 32,
+                1,
+            ),
+        )
+        for values in (
+            (ACCOUNT_ID, "orphan", "event", 2, 0),
+            (ACCOUNT_ID, "", "event", 1, 0),
+            (ACCOUNT_ID, "bad-kind", "unknown", 1, 0),
+            (ACCOUNT_ID, "negative", "loss", 1, -1),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO NioIngestBatchItem VALUES (?, ?, ?, ?, ?)",
+                    values,
+                )
+
+        connection.execute(
+            "INSERT INTO NioIngestBatchItem VALUES (?, ?, ?, ?, ?)",
+            (ACCOUNT_ID, "owned", "loss", 1, 0),
+        )
+        for values in (
+            (ACCOUNT_ID, "owned", "loss", 1, 1),
+            (ACCOUNT_ID, "other", "event", 1, 0),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO NioIngestBatchItem VALUES (?, ?, ?, ?, ?)",
+                    values,
+                )
+
+        connection.execute(
+            "DELETE FROM NioIngestBatch WHERE account_id = ? AND sequence = 1",
+            (ACCOUNT_ID,),
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestBatchItem").fetchone()[0]
+            == 0
+        )
     finally:
         bootstrap.close()
 
@@ -2433,7 +2594,6 @@ async def test_attach_consumer_10000_rooms_has_exact_transaction_and_order_bound
             "NioIngestRoomState",
             "NioIngestRoomLane",
             "NioIngestReadyRecord",
-            "NioIngestLoss",
         ):
             assert (
                 bootstrap._journal.connection.execute(
@@ -2564,7 +2724,6 @@ async def test_attaching_prefix_keeps_all_attached_operations_closed(
             lambda: bootstrap._journal.acknowledge(ref),
             lambda: bootstrap._journal.load_rooms(frozenset()),
             lambda: bootstrap._journal.load_ready_heads(limit=1),
-            lambda: bootstrap._journal.load_loss("missing"),
             lambda: bootstrap._journal.load_frame(
                 UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
             ),
@@ -2802,6 +2961,13 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
             assert loss.detail_json == (
                 b'{"cause":"fresh_start","scope":"consumer_baseline"}'
             )
+        ready_owner_rows = bootstrap._journal.connection.execute(
+            "SELECT item_id, item_kind FROM NioIngestReadyRecord "
+            "ORDER BY ready_order"
+        ).fetchall()
+        assert [(row[0], row[1]) for row in ready_owner_rows] == [
+            (ready_row.record.loss_id, "loss") for ready_row in ready
+        ]
 
         revision = owner.revision
         statements: list[str] = []
@@ -2819,7 +2985,6 @@ async def test_attach_consumer_installs_priority_baseline_loss_plan_atomically(
             for table in (
                 "NioIngestRoomState",
                 "NioIngestRoomLane",
-                "NioIngestLoss",
                 "NioIngestReadyRecord",
             )
             for statement in statements
@@ -2897,15 +3062,16 @@ async def test_exact_attach_retry_is_metadata_only_even_if_baseline_loss_is_corr
     consumer = _consumer_bootstrap(bootstrap, room_ids)
     await bootstrap.attach_consumer(consumer)
     row = bootstrap._journal.connection.execute(
-        "SELECT loss_id, detail_ciphertext FROM NioIngestLoss WHERE account_id = ?",
+        "SELECT item_id, payload_ciphertext FROM NioIngestReadyRecord "
+        "WHERE account_id = ?",
         (ACCOUNT_ID,),
     ).fetchone()
-    tampered = bytearray(row["detail_ciphertext"])
+    tampered = bytearray(row["payload_ciphertext"])
     tampered[-1] ^= 1
     bootstrap._journal.connection.execute(
-        "UPDATE NioIngestLoss SET detail_ciphertext = ? "
-        "WHERE account_id = ? AND loss_id = ?",
-        (bytes(tampered), ACCOUNT_ID, row["loss_id"]),
+        "UPDATE NioIngestReadyRecord SET payload_ciphertext = ? "
+        "WHERE account_id = ? AND item_id = ?",
+        (bytes(tampered), ACCOUNT_ID, row["item_id"]),
     )
     bootstrap.close()
 
@@ -2927,12 +3093,9 @@ async def test_exact_attach_retry_is_metadata_only_even_if_baseline_loss_is_corr
             statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
             for statement in statements
         )
-        assert not any(
-            "NioIngestLoss" in statement or "NioIngestReadyRecord" in statement
-            for statement in statements
-        )
+        assert not any("NioIngestReadyRecord" in statement for statement in statements)
         with pytest.raises(JournalIntegrityError, match="authentication"):
-            reopened._journal.load_loss(row["loss_id"])
+            reopened._journal.load_ready_heads(limit=1)
     finally:
         reopened.close()
 
@@ -2948,8 +3111,10 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
         device_id=DEVICE_ID,
         database_name="journal.db",
     )
-    consumer = _consumer_bootstrap(bootstrap)
+    consumer = _consumer_bootstrap(bootstrap, ("!baseline:example.org",))
     await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
     batch = batch_from_records(
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
@@ -2957,12 +3122,17 @@ async def test_exact_attach_retry_survives_batch_frontier_advance_and_restart(
         stream_id=bootstrap.stream_id,
         sequence=consumer.first_sequence,
         created_revision=2,
-        records=(_batch_event(1),),
+        records=(ready.record,),
     )
     bootstrap._journal.commit(
         expected_revision=1,
         writer_epoch=bootstrap._journal.writer_epoch,
-        transition=JournalTransition(batches=(batch,)),
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(ready.record.loss_id),),
+            )
+        ),
     )
     assert bootstrap.next_batch_sequence == consumer.first_sequence + 1
     assert bootstrap._journal.acknowledge(batch.ref) is AckOutcome.ACKNOWLEDGED
@@ -3456,7 +3626,7 @@ async def test_empty_room_carriers_are_always_authenticated_after_attach(
 
 
 @pytest.mark.asyncio
-async def test_lane_records_round_trip_list_in_section_order_and_delete_after_restart(
+async def test_lane_records_round_trip_and_materialize_after_restart(
     tmp_path: Path,
 ) -> None:
     bootstrap = open_ingestion_store(
@@ -3528,11 +3698,23 @@ async def test_lane_records_round_trip_list_in_section_order_and_delete_after_re
             LaneRecordSection.RECOVERED,
         ) == (records[1],)
 
+        batch = batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer=consumer.binding,
+            stream_id=reopened.stream_id,
+            sequence=1,
+            created_revision=3,
+            records=(records[1].record,),
+        )
         reopened._journal.commit(
             expected_revision=2,
             writer_epoch=reopened._journal.writer_epoch,
             transition=JournalTransition(
-                lane_record_deletes=(records[1].key,),
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (records[1].key,),
+                ),
             ),
         )
         assert reopened._journal.load_lane_record(records[1].key) is None
@@ -3607,12 +3789,24 @@ async def test_held_lane_record_deltas_reconcile_exact_counters_and_never_rewind
             held_record_count=1,
             held_canonical_bytes=inserted.canonical_bytes,
         )
+        batch = batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer=bootstrap._journal.load_owner().binding,
+            stream_id=bootstrap.stream_id,
+            sequence=1,
+            created_revision=4,
+            records=(existing.record,),
+        )
         bootstrap._journal.commit(
             expected_revision=3,
             writer_epoch=bootstrap._journal.writer_epoch,
             transition=JournalTransition(
                 room_lanes=(after_delete,),
-                lane_record_deletes=(existing.key,),
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (existing.key,),
+                ),
             ),
         )
 
@@ -3655,7 +3849,7 @@ async def test_held_lane_record_deltas_reject_counter_or_ordinal_drift_before_ca
         next_held_ordinal=2,
     )
     inserts = (inserted,)
-    deletes: tuple[LaneRecordKey, ...] = ()
+    materialization = None
     lanes = (expected_lane,)
     if case == "missing_lane_update":
         lanes = ()
@@ -3670,8 +3864,19 @@ async def test_held_lane_record_deltas_reject_counter_or_ordinal_drift_before_ca
         lanes = (replace(lane, next_held_ordinal=2),)
     elif case == "delete_wrong_count":
         inserts = ()
-        deletes = (existing.key,)
         lanes = (lane,)
+        owner = bootstrap._journal.load_owner()
+        assert owner.binding is not None
+        batch = batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer=owner.binding,
+            stream_id=bootstrap.stream_id,
+            sequence=1,
+            created_revision=3,
+            records=(existing.record,),
+        )
+        materialization = BatchMaterialization(batch, (existing.key,))
 
     statements: list[str] = []
     bootstrap._journal.connection.set_trace_callback(statements.append)
@@ -3683,7 +3888,7 @@ async def test_held_lane_record_deltas_reject_counter_or_ordinal_drift_before_ca
                 transition=JournalTransition(
                     room_lanes=lanes,
                     lane_record_inserts=inserts,
-                    lane_record_deletes=deletes,
+                    batch_materialization=materialization,
                 ),
             )
         assert bootstrap._journal.load_owner().revision == 2
@@ -3701,7 +3906,24 @@ async def test_lane_record_delete_authenticates_target_before_meta_cas(
     tmp_path: Path,
     part: str,
 ) -> None:
-    bootstrap, _, _, existing = await _journal_with_carriers(tmp_path)
+    bootstrap, room_id, _, existing = await _journal_with_carriers(tmp_path)
+    lane = bootstrap._journal.load_rooms(frozenset({room_id}))[room_id].active_lane
+    after_delete = replace(
+        lane,
+        held_record_count=0,
+        held_canonical_bytes=0,
+    )
+    owner = bootstrap._journal.load_owner()
+    assert owner.binding is not None
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=owner.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=(existing.record,),
+    )
     if part == "metadata":
         statement = (
             "UPDATE NioIngestLaneRecord SET canonical_bytes = 999 "
@@ -3730,7 +3952,11 @@ async def test_lane_record_delete_authenticates_target_before_meta_cas(
                 expected_revision=2,
                 writer_epoch=bootstrap._journal.writer_epoch,
                 transition=JournalTransition(
-                    lane_record_deletes=(existing.key,),
+                    room_lanes=(after_delete,),
+                    batch_materialization=BatchMaterialization(
+                        batch,
+                        (existing.key,),
+                    ),
                 ),
             )
         assert bootstrap._journal.load_owner().revision == 2
@@ -4292,15 +4518,6 @@ async def test_lane_record_insert_revalidates_key_item_identity_and_exact_bytes(
             assert bootstrap._journal.load_owner().revision == 3
             assert bootstrap._journal.load_lane_record(existing.key) == existing
 
-        with pytest.raises(JournalIntegrityError, match="lane record.*missing"):
-            bootstrap._journal.commit(
-                expected_revision=3,
-                writer_epoch=bootstrap._journal.writer_epoch,
-                transition=JournalTransition(
-                    lane_record_deletes=(replace(existing.key, record_ordinal=99),),
-                ),
-            )
-        assert bootstrap._journal.load_owner().revision == 3
     finally:
         bootstrap.close()
 
@@ -4313,8 +4530,6 @@ async def test_lane_record_insert_revalidates_key_item_identity_and_exact_bytes(
         "missing_epoch",
         "duplicate_insert",
         "duplicate_item",
-        "duplicate_delete",
-        "insert_delete_overlap",
     ),
 )
 async def test_lane_record_transition_rejects_invalid_key_sets_before_write(
@@ -4376,14 +4591,12 @@ async def test_lane_record_transition_rejects_invalid_key_sets_before_write(
                 replace(candidate, key=replace(candidate.key, record_ordinal=2)),
             ),
         )
-    elif case == "duplicate_delete":
-        transition = JournalTransition(
-            lane_record_deletes=(existing.key, existing.key),
-        )
     else:
         transition = JournalTransition(
-            lane_record_inserts=(candidate,),
-            lane_record_deletes=(candidate.key,),
+            lane_record_inserts=(
+                candidate,
+                replace(candidate, key=replace(candidate.key, record_ordinal=2)),
+            ),
         )
 
     statements: list[str] = []
@@ -4702,7 +4915,7 @@ async def test_wrong_revision_or_writer_epoch_refuses_transition_without_write(
 
 
 @pytest.mark.asyncio
-async def test_loss_round_trips_after_its_source_frame_is_compacted(
+async def test_ready_owned_loss_round_trips_after_its_source_frame_is_compacted(
     tmp_path: Path,
 ) -> None:
     bootstrap = open_ingestion_store(
@@ -4744,7 +4957,10 @@ async def test_loss_round_trips_after_its_source_frame_is_compacted(
         bootstrap._journal.commit(
             expected_revision=1,
             writer_epoch=bootstrap._journal.writer_epoch,
-            transition=JournalTransition(frames=(frame,), losses=(loss,)),
+            transition=JournalTransition(
+                frames=(frame,),
+                ready_records=(ReadyRecord(0, loss, frame.frame_id),),
+            ),
         )
         bootstrap._journal.commit(
             expected_revision=2,
@@ -4753,37 +4969,17 @@ async def test_loss_round_trips_after_its_source_frame_is_compacted(
         )
         assert bootstrap._journal.load_frame(frame.frame_id) is None
 
-        loaded = bootstrap._journal.load_loss(loss.loss_id)
-        assert loaded == loss
+        loaded = bootstrap._journal.load_ready_heads(limit=1)[0]
+        assert loaded.record == loss
         row = bootstrap._journal.connection.execute(
-            "SELECT origin_sha256, boundary_sha256, detail_sha256, loss_sha256 "
-            "FROM NioIngestLoss WHERE account_id = ? AND loss_id = ?",
+            "SELECT item_id, item_kind, canonical_bytes "
+            "FROM NioIngestReadyRecord WHERE account_id = ? AND item_id = ?",
             (ACCOUNT_ID, loss.loss_id),
         ).fetchone()
-        origin_payload = (
-            b'{"origin_type":"transport","transport":"classic",'
-            b'"source_epoch":4,"request_id":9,"frame_index":3}'
-        )
-        boundary_payload = (
-            b'{"prior_event_id":"$prior",'
-            b'"prior_origin_server_ts":1700000000000,'
-            b'"start_token":"s1","target_token":"s9"}'
-        )
-        whole_loss_payload = (
-            b'{"record_type":"loss","loss_id":"'
-            + loss.loss_id.encode()
-            + b'","origin":'
-            + origin_payload
-            + b',"room_id":"!loss:example.org","membership_epoch":7,'
-            b'"reason":"fetch_failed","boundary":'
-            + boundary_payload
-            + b',"detail_json":"eyJlcnJjb2RlIjoiTV9GT1JCSURERU4ifQ=="}'
-        )
-        assert tuple(bytes(value) for value in row) == (
-            hashlib.sha256(origin_payload).digest(),
-            hashlib.sha256(boundary_payload).digest(),
-            hashlib.sha256(loss.detail_json).digest(),
-            hashlib.sha256(whole_loss_payload).digest(),
+        assert tuple(row) == (
+            loss.loss_id,
+            "loss",
+            len(_canonical_json(_record_to_dict(loss))),
         )
     finally:
         bootstrap.close()
@@ -4828,8 +5024,7 @@ async def test_deterministic_loss_and_ready_ids_fail_closed_on_payload_drift(
             expected_revision=1,
             writer_epoch=bootstrap._journal.writer_epoch,
             transition=JournalTransition(
-                ready_records=(ReadyRecord(0, event),),
-                losses=(loss,),
+                ready_records=(ReadyRecord(0, event), ReadyRecord(1, loss)),
             ),
         )
         changed_loss = LossRecord(
@@ -4853,25 +5048,31 @@ async def test_deterministic_loss_and_ready_ids_fail_closed_on_payload_drift(
             b'{"sequence":"changed"}',
             None,
         )
-        with pytest.raises(JournalIntegrityError, match="ready record_id"):
+        with pytest.raises(JournalIntegrityError, match="ready item"):
             bootstrap._journal.commit(
                 expected_revision=2,
                 writer_epoch=bootstrap._journal.writer_epoch,
                 transition=JournalTransition(
-                    ready_records=(ReadyRecord(1, changed_event),),
+                    ready_records=(ReadyRecord(2, changed_event),),
                 ),
             )
-        with pytest.raises(JournalIntegrityError, match="loss_id"):
+        with pytest.raises(JournalIntegrityError, match="ready item"):
             bootstrap._journal.commit(
                 expected_revision=2,
                 writer_epoch=bootstrap._journal.writer_epoch,
-                transition=JournalTransition(losses=(changed_loss,)),
+                transition=JournalTransition(
+                    ready_records=(ReadyRecord(2, changed_loss),)
+                ),
             )
         owner = bootstrap._journal.load_owner()
         assert owner.revision == 2
-        assert owner.next_ready_order == 1
-        assert bootstrap._journal.load_loss(loss.loss_id) == loss
-        assert bootstrap._journal.load_ready_heads(limit=10)[0].record == event
+        assert owner.next_ready_order == 2
+        assert [
+            ready.record for ready in bootstrap._journal.load_ready_heads(limit=10)
+        ] == [
+            event,
+            loss,
+        ]
 
         forged_loss = LossRecord(
             loss.loss_id,
@@ -4882,24 +5083,37 @@ async def test_deterministic_loss_and_ready_ids_fail_closed_on_payload_drift(
             loss.boundary,
             loss.detail_json,
         )
-        forged_digest = hashlib.sha256(
-            _canonical_json(_record_to_dict(forged_loss))
-        ).digest()
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestReadyRecord WHERE account_id = ? AND item_id = ?",
+            (ACCOUNT_ID, loss.loss_id),
+        ).fetchone()
+        payload = bootstrap._journal._open_payload(
+            "NioIngestReadyRecord", (loss.loss_id,), row, "payload"
+        )
+        envelope = json.loads(payload)
+        envelope["record"] = _record_to_dict(forged_loss)
+        forged_canonical_bytes = len(_canonical_json(_record_to_dict(forged_loss)))
+        envelope["canonical_bytes"] = forged_canonical_bytes
+        forged_payload = _canonical_json(envelope)
+        ciphertext, digest = bootstrap._journal._codec.seal(
+            "NioIngestReadyRecord",
+            (loss.loss_id,),
+            forged_payload,
+        )
         bootstrap._journal.connection.execute(
-            "UPDATE NioIngestLoss SET room_id = ?, loss_sha256 = ? "
-            "WHERE account_id = ? AND loss_id = ?",
-            (forged_loss.room_id, forged_digest, ACCOUNT_ID, loss.loss_id),
+            "UPDATE NioIngestReadyRecord SET room_id = ?, canonical_bytes = ?, "
+            "payload_ciphertext = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND item_id = ?",
+            (
+                forged_loss.room_id,
+                forged_canonical_bytes,
+                ciphertext,
+                digest,
+                ACCOUNT_ID,
+                loss.loss_id,
+            ),
         )
         with pytest.raises(JournalIntegrityError, match="loss_id"):
-            bootstrap._journal.load_loss(loss.loss_id)
-
-        bootstrap._journal.connection.execute(
-            "UPDATE NioIngestReadyRecord SET room_id = ?, "
-            "membership_epoch = ?, room_sequence = ? "
-            "WHERE account_id = ? AND record_id = ?",
-            ("!forged:example.org", 9, 9, ACCOUNT_ID, event.record_id),
-        )
-        with pytest.raises(JournalIntegrityError, match="ready record columns"):
             bootstrap._journal.load_ready_heads(limit=10)
     finally:
         bootstrap.close()
@@ -4920,7 +5134,7 @@ async def test_ready_canonical_byte_accounting_is_derived_and_revalidated(
     await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
     event = _batch_event(1)
     try:
-        with pytest.raises(JournalIntegrityError, match="canonical_bytes"):
+        with pytest.raises(JournalIntegrityError, match="ready"):
             bootstrap._journal.commit(
                 expected_revision=1,
                 writer_epoch=bootstrap._journal.writer_epoch,
@@ -4937,10 +5151,10 @@ async def test_ready_canonical_byte_accounting_is_derived_and_revalidated(
         )
         bootstrap._journal.connection.execute(
             "UPDATE NioIngestReadyRecord SET canonical_bytes = canonical_bytes + 1 "
-            "WHERE account_id = ? AND record_id = ?",
+            "WHERE account_id = ? AND item_id = ?",
             (ACCOUNT_ID, event.record_id),
         )
-        with pytest.raises(JournalIntegrityError, match="canonical_bytes"):
+        with pytest.raises(JournalIntegrityError, match="ready"):
             bootstrap._journal.load_ready_heads(limit=1)
     finally:
         bootstrap.close()
@@ -5137,7 +5351,12 @@ async def test_system_event_identity_rejects_before_journal_dml(
             "batch_id",
             uuid5(bootstrap.stream_id, f"1:{digest.hex()}"),
         )
-        transition = JournalTransition(batches=(batch,))
+        transition = JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(STALE_SYSTEM_RECORD_ID),),
+            )
+        )
 
     statements: list[str] = []
     bootstrap._journal.connection.set_trace_callback(statements.append)
@@ -5188,23 +5407,31 @@ async def test_authenticated_system_event_identity_is_revalidated_on_read(
                 ),
             )
             forged = replace(valid, record_id=STALE_SYSTEM_RECORD_ID)
-            payload = _canonical_json(
-                {
-                    "ready_order": 0,
-                    "record": _record_to_dict(forged),
-                    "source_frame_id": None,
-                    "created_revision": 2,
-                }
+            row = bootstrap._journal.connection.execute(
+                "SELECT * FROM NioIngestReadyRecord "
+                "WHERE account_id = ? AND item_id = ?",
+                (ACCOUNT_ID, valid.record_id),
+            ).fetchone()
+            envelope = json.loads(
+                bootstrap._journal._open_payload(
+                    "NioIngestReadyRecord",
+                    (valid.record_id,),
+                    row,
+                    "payload",
+                )
             )
+            envelope["item_id"] = forged.record_id
+            envelope["record"] = _record_to_dict(forged)
+            payload = _canonical_json(envelope)
             ciphertext, digest = codec.seal(
                 "NioIngestReadyRecord",
                 (forged.record_id,),
                 payload,
             )
             bootstrap._journal.connection.execute(
-                "UPDATE NioIngestReadyRecord SET record_id = ?, "
+                "UPDATE NioIngestReadyRecord SET item_id = ?, "
                 "payload_ciphertext = ?, payload_sha256 = ? "
-                "WHERE account_id = ? AND record_id = ?",
+                "WHERE account_id = ? AND item_id = ?",
                 (
                     forged.record_id,
                     ciphertext,
@@ -5253,19 +5480,31 @@ async def test_authenticated_system_event_identity_is_revalidated_on_read(
             load = lambda: bootstrap._journal.load_rooms(frozenset({lane.room_id}))
         else:
             valid = _journal_system_event(bootstrap.stream_id, RecordKind.STATE)
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    ready_records=(ReadyRecord(0, valid),),
+                ),
+            )
             batch = batch_from_records(
                 account_id=ACCOUNT_ID,
                 device_id=DEVICE_ID,
                 consumer=consumer.binding,
                 stream_id=bootstrap.stream_id,
                 sequence=1,
-                created_revision=2,
+                created_revision=3,
                 records=(valid,),
             )
             bootstrap._journal.commit(
-                expected_revision=1,
+                expected_revision=2,
                 writer_epoch=bootstrap._journal.writer_epoch,
-                transition=JournalTransition(batches=(batch,)),
+                transition=JournalTransition(
+                    batch_materialization=BatchMaterialization(
+                        batch,
+                        (ReadyRecordKey(valid.record_id),),
+                    )
+                ),
             )
             payload = canonical_batch_payload(batch).replace(
                 valid.record_id.encode(),
@@ -5325,14 +5564,21 @@ async def test_authenticated_ready_wraps_strict_system_origin_decode_errors(
         origin_payload = record_payload["origin"]
         assert isinstance(origin_payload, dict)
         origin_payload["extra"] = True
-        payload = _canonical_json(
-            {
-                "ready_order": 0,
-                "record": record_payload,
-                "source_frame_id": None,
-                "created_revision": 2,
-            }
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestReadyRecord "
+            "WHERE account_id = ? AND item_id = ?",
+            (ACCOUNT_ID, record.record_id),
+        ).fetchone()
+        envelope = json.loads(
+            bootstrap._journal._open_payload(
+                "NioIngestReadyRecord",
+                (record.record_id,),
+                row,
+                "payload",
+            )
         )
+        envelope["record"] = record_payload
+        payload = _canonical_json(envelope)
         ciphertext, digest = EncryptedRowCodec(
             "secret",
             ACCOUNT_ID,
@@ -5340,7 +5586,7 @@ async def test_authenticated_ready_wraps_strict_system_origin_decode_errors(
         ).seal("NioIngestReadyRecord", (record.record_id,), payload)
         bootstrap._journal.connection.execute(
             "UPDATE NioIngestReadyRecord SET payload_ciphertext = ?, "
-            "payload_sha256 = ? WHERE account_id = ? AND record_id = ?",
+            "payload_sha256 = ? WHERE account_id = ? AND item_id = ?",
             (ciphertext, digest, ACCOUNT_ID, record.record_id),
         )
 
@@ -5398,14 +5644,21 @@ async def test_system_ready_lineage_rejects_source_frame_on_write_and_read(
             writer_epoch=bootstrap._journal.writer_epoch,
             transition=JournalTransition(ready_records=(ready,)),
         )
-        payload = _canonical_json(
-            {
-                "ready_order": 0,
-                "record": _record_to_dict(record),
-                "source_frame_id": str(source_frame_id),
-                "created_revision": 2,
-            }
+        row = bootstrap._journal.connection.execute(
+            "SELECT * FROM NioIngestReadyRecord "
+            "WHERE account_id = ? AND item_id = ?",
+            (ACCOUNT_ID, item_id),
+        ).fetchone()
+        envelope = json.loads(
+            bootstrap._journal._open_payload(
+                "NioIngestReadyRecord",
+                (item_id,),
+                row,
+                "payload",
+            )
         )
+        envelope["source_frame_id"] = str(source_frame_id)
+        payload = _canonical_json(envelope)
         ciphertext, digest = EncryptedRowCodec(
             "secret",
             ACCOUNT_ID,
@@ -5414,7 +5667,7 @@ async def test_system_ready_lineage_rejects_source_frame_on_write_and_read(
         bootstrap._journal.connection.execute(
             "UPDATE NioIngestReadyRecord SET source_frame_id = ?, "
             "payload_ciphertext = ?, payload_sha256 = ? "
-            "WHERE account_id = ? AND record_id = ?",
+            "WHERE account_id = ? AND item_id = ?",
             (
                 str(source_frame_id),
                 ciphertext,
@@ -5499,26 +5752,85 @@ async def test_ready_read_authenticates_every_returned_metadata_field(
             ),
         )
         for column, original, forged in (
+            ("item_id", event.record_id, "forged-item"),
+            ("item_kind", "event", "loss"),
             ("ready_order", 0, 99),
             (
                 "source_frame_id",
                 str(source_frame_id),
                 "66666666-6666-6666-6666-666666666666",
             ),
+            ("room_id", None, "!forged:example.org"),
+            ("membership_epoch", None, 9),
+            ("room_sequence", None, 9),
+            (
+                "canonical_bytes",
+                len(_canonical_json(_record_to_dict(event))),
+                999,
+            ),
             ("created_revision", 2, 77),
         ):
             bootstrap._journal.connection.execute(
                 f"UPDATE NioIngestReadyRecord SET {column} = ? "
-                "WHERE account_id = ? AND record_id = ?",
+                "WHERE account_id = ? AND item_id = ?",
                 (forged, ACCOUNT_ID, event.record_id),
             )
-            with pytest.raises(JournalIntegrityError, match="ready"):
+            with pytest.raises(JournalIntegrityError, match="ready|authentication"):
                 bootstrap._journal.load_ready_heads(limit=1)
+            current_item_id = forged if column == "item_id" else event.record_id
             bootstrap._journal.connection.execute(
                 f"UPDATE NioIngestReadyRecord SET {column} = ? "
-                "WHERE account_id = ? AND record_id = ?",
-                (original, ACCOUNT_ID, event.record_id),
+                "WHERE account_id = ? AND item_id = ?",
+                (original, ACCOUNT_ID, current_item_id),
             )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_decode_rejects_equal_but_wrong_typed_canonical_bytes(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    event = _batch_event(1)
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(ready_records=(ReadyRecord(0, event),)),
+    )
+    row = bootstrap._journal.connection.execute(
+        "SELECT * FROM NioIngestReadyRecord WHERE account_id = ? AND item_id = ?",
+        (ACCOUNT_ID, event.record_id),
+    ).fetchone()
+    envelope = json.loads(
+        bootstrap._journal._open_payload(
+            "NioIngestReadyRecord",
+            (event.record_id,),
+            row,
+            "payload",
+        )
+    )
+    envelope["canonical_bytes"] = float(envelope["canonical_bytes"])
+    payload = _canonical_json(envelope)
+    ciphertext, digest = bootstrap._journal._codec.seal(
+        "NioIngestReadyRecord", (event.record_id,), payload
+    )
+    bootstrap._journal.connection.execute(
+        "UPDATE NioIngestReadyRecord SET payload_ciphertext = ?, "
+        "payload_sha256 = ? WHERE account_id = ? AND item_id = ?",
+        (ciphertext, digest, ACCOUNT_ID, event.record_id),
+    )
+    try:
+        with pytest.raises(JournalIntegrityError, match="canonical_bytes"):
+            bootstrap._journal.load_ready_heads(limit=1)
     finally:
         bootstrap.close()
 
@@ -5551,23 +5863,39 @@ async def test_batch_commit_and_read_validate_full_owner_and_row_identity(
             bootstrap._journal.commit(
                 expected_revision=1,
                 writer_epoch=bootstrap._journal.writer_epoch,
-                transition=JournalTransition(batches=(wrong_revision,)),
+                transition=JournalTransition(
+                    batch_materialization=BatchMaterialization(
+                        wrong_revision,
+                        (ReadyRecordKey(_batch_event(1).record_id),),
+                    )
+                ),
             )
         assert bootstrap._journal.load_owner().revision == 1
 
+        event = _batch_event(1)
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(ready_records=(ReadyRecord(0, event),)),
+        )
         batch = batch_from_records(
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             consumer=consumer.binding,
             stream_id=bootstrap.stream_id,
             sequence=1,
-            created_revision=2,
-            records=(_batch_event(1),),
+            created_revision=3,
+            records=(event,),
         )
         bootstrap._journal.commit(
-            expected_revision=1,
+            expected_revision=2,
             writer_epoch=bootstrap._journal.writer_epoch,
-            transition=JournalTransition(batches=(batch,)),
+            transition=JournalTransition(
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (ReadyRecordKey(event.record_id),),
+                )
+            ),
         )
         bootstrap._journal.connection.execute(
             "UPDATE NioIngestBatch SET created_revision = 98 "
@@ -5577,7 +5905,7 @@ async def test_batch_commit_and_read_validate_full_owner_and_row_identity(
         with pytest.raises(JournalIntegrityError, match="created_revision"):
             bootstrap._journal.oldest_unacknowledged()
         bootstrap._journal.connection.execute(
-            "UPDATE NioIngestBatch SET created_revision = 2 "
+            "UPDATE NioIngestBatch SET created_revision = 3 "
             "WHERE account_id = ? AND sequence = 1",
             (ACCOUNT_ID,),
         )
@@ -5587,8 +5915,8 @@ async def test_batch_commit_and_read_validate_full_owner_and_row_identity(
             consumer=consumer.binding,
             stream_id=bootstrap.stream_id,
             sequence=1,
-            created_revision=2,
-            records=(_batch_event(1),),
+            created_revision=3,
+            records=(event,),
         )
         payload = canonical_batch_payload(forged)
         digest = hashlib.sha256(payload).digest()
@@ -5609,7 +5937,7 @@ async def test_batch_commit_and_read_validate_full_owner_and_row_identity(
 
 
 @pytest.mark.asyncio
-async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
+async def test_acknowledgement_is_fifo_idempotent_and_deletes_payloads(
     tmp_path: Path,
 ) -> None:
     bootstrap = open_ingestion_store(
@@ -5620,26 +5948,34 @@ async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
         pickle_key="secret",
         database_name="journal.db",
     )
-    consumer = _consumer_bootstrap(bootstrap)
+    consumer = _consumer_bootstrap(bootstrap, _baseline_room_ids(3))
     await bootstrap.attach_consumer(consumer)
-    batches = tuple(
-        batch_from_records(
+    ready = bootstrap._journal.load_ready_heads(limit=3)
+    batches = []
+    for sequence, source in enumerate(ready, start=1):
+        assert type(source.record) is LossRecord
+        batch = batch_from_records(
             account_id=ACCOUNT_ID,
             device_id=DEVICE_ID,
             consumer=consumer.binding,
             stream_id=bootstrap.stream_id,
             sequence=sequence,
-            created_revision=2,
-            records=(_batch_event(sequence),),
+            created_revision=sequence + 1,
+            records=(source.record,),
         )
-        for sequence in range(1, 4)
-    )
-    try:
         bootstrap._journal.commit(
-            expected_revision=1,
+            expected_revision=sequence,
             writer_epoch=bootstrap._journal.writer_epoch,
-            transition=JournalTransition(batches=batches),
+            transition=JournalTransition(
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (ReadyRecordKey(source.record.loss_id),),
+                )
+            ),
         )
+        batches.append(batch)
+    batches = tuple(batches)
+    try:
         assert bootstrap._journal.oldest_unacknowledged() == batches[0]
 
         with pytest.raises(JournalConflictError, match="out of order"):
@@ -5663,14 +5999,11 @@ async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
 
         assert bootstrap._journal.acknowledge(batches[1].ref) is AckOutcome.ACKNOWLEDGED
         rows = bootstrap._journal.connection.execute(
-            "SELECT sequence, acknowledged_revision FROM NioIngestBatch "
+            "SELECT sequence FROM NioIngestBatch "
             "WHERE account_id = ? ORDER BY sequence",
             (ACCOUNT_ID,),
         ).fetchall()
-        assert [(row[0], row[1] is not None) for row in rows] == [
-            (2, True),
-            (3, False),
-        ]
+        assert [row[0] for row in rows] == [3]
         with pytest.raises(JournalConflictError, match="stale"):
             bootstrap._journal.acknowledge(batches[0].ref)
         assert bootstrap._journal.oldest_unacknowledged() == batches[2]
@@ -5679,7 +6012,189 @@ async def test_acknowledgement_is_fifo_idempotent_and_keeps_only_latest_ack(
 
 
 @pytest.mark.asyncio
-async def test_latest_ack_retry_revalidates_persisted_frontier_and_payload(
+async def test_latest_ack_retry_rejects_corrupt_frontier_without_payload(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, ("!baseline:example.org",))
+    await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=2,
+        records=(ready.record,),
+    )
+    try:
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (ReadyRecordKey(ready.record.loss_id),),
+                )
+            ),
+        )
+        bootstrap._journal.acknowledge(batch.ref)
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestMeta SET last_acked_sha256 = ? WHERE account_id = ?",
+            (b"z" * 32, ACCOUNT_ID),
+        )
+
+        with pytest.raises(JournalConflictError, match="frontier"):
+            bootstrap._journal.acknowledge(batch.ref)
+    finally:
+        bootstrap.close()
+
+
+def _owned_loss(
+    stream_id: UUID,
+    *,
+    room_id: str = "!lane:example.org",
+    request_id: int = 10,
+) -> LossRecord:
+    loss = LossRecord(
+        "",
+        RecordOrigin(TransportKind.CLASSIC, 1, request_id, 0),
+        room_id,
+        0,
+        LossReason.FETCH_FAILED,
+        LossBoundary(None, None, "old", "new"),
+        f'{{"request":{request_id}}}'.encode(),
+    )
+    return replace(loss, loss_id=_loss_id(stream_id, loss))
+
+
+def _loss_lane_record(loss: LossRecord, *, ordinal: int = 0) -> LaneRecord:
+    return LaneRecord(
+        LaneRecordKey(
+            loss.room_id,
+            loss.membership_epoch,
+            LaneRecordSection.LOSS,
+            0,
+            ordinal,
+        ),
+        loss,
+        UUID("55555555-5555-5555-5555-555555555555"),
+        None,
+        len(_canonical_json(_record_to_dict(loss))),
+    )
+
+
+@pytest.mark.asyncio
+async def test_materialization_moves_exact_ready_and_lane_sources_with_grouped_sql(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    room_id = "!lane:example.org"
+    consumer = _consumer_bootstrap(bootstrap, (room_id,))
+    await bootstrap.attach_consumer(consumer)
+    ready_loss = bootstrap._journal.load_ready_heads(limit=1)[0].record
+    assert type(ready_loss) is LossRecord
+    lane_record = _loss_lane_record(_owned_loss(bootstrap.stream_id, room_id=room_id))
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(lane_record_inserts=(lane_record,)),
+    )
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=(ready_loss, lane_record.record),
+    )
+    transition = JournalTransition(
+        batch_materialization=BatchMaterialization(
+            batch,
+            (ReadyRecordKey(ready_loss.loss_id), lane_record.key),
+        )
+    )
+    statements: list[str] = []
+    labels: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    bootstrap._journal.set_transition_statement_hook(labels.append)
+    try:
+        result = bootstrap._journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=transition,
+        )
+        bootstrap._journal.connection.set_trace_callback(None)
+
+        assert result.revision == 3
+        assert bootstrap._journal.load_ready_heads(limit=10) == ()
+        assert bootstrap._journal.load_lane_record(lane_record.key) is None
+        assert bootstrap._journal.oldest_unacknowledged() == batch
+        index_rows = bootstrap._journal.connection.execute(
+            "SELECT item_id, item_kind, sequence, record_ordinal "
+            "FROM NioIngestBatchItem ORDER BY record_ordinal"
+        ).fetchall()
+        assert [tuple(row) for row in index_rows] == [
+            (ready_loss.loss_id, "loss", 1, 0),
+            (lane_record.record.loss_id, "loss", 1, 1),
+        ]
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("SELECT")
+                and "NioIngestReadyRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("SELECT")
+                and "NioIngestLaneRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("DELETE")
+                and "NioIngestReadyRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("DELETE")
+                and "NioIngestLaneRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert labels.count("batch_items") == 1
+        assert sum(statement == "BEGIN IMMEDIATE" for statement in statements) == 1
+        assert sum(statement == "COMMIT" for statement in statements) == 1
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_materialization_rejects_changed_source_contents_before_dml(
     tmp_path: Path,
 ) -> None:
     bootstrap = open_ingestion_store(
@@ -5691,6 +6206,83 @@ async def test_latest_ack_retry_revalidates_persisted_frontier_and_payload(
     )
     consumer = _consumer_bootstrap(bootstrap)
     await bootstrap.attach_consumer(consumer)
+    source = _batch_event(1)
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(ready_records=(ReadyRecord(0, source),)),
+    )
+    changed = replace(source, source_json=b'{"sequence":999}')
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=(changed,),
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="source.*batch|batch.*source"):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    batch_materialization=BatchMaterialization(
+                        batch,
+                        (ReadyRecordKey(source.record_id),),
+                    )
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        assert bootstrap._journal.load_ready_heads(limit=1)[0].record == source
+        assert bootstrap._journal.oldest_unacknowledged() is None
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_lane_and_batch_item_ownership_collisions_fail_before_dml(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    room_id = "!lane:example.org"
+    consumer = _consumer_bootstrap(bootstrap, (room_id,))
+    await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
+    duplicate_lane = LaneRecord(
+        LaneRecordKey(room_id, 0, LaneRecordSection.LOSS, 0, 0),
+        ready.record,
+        None,
+        None,
+        ready.canonical_bytes,
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    with pytest.raises(JournalIntegrityError, match="owner|owned"):
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(lane_record_inserts=(duplicate_lane,)),
+        )
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+
     batch = batch_from_records(
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
@@ -5698,21 +6290,711 @@ async def test_latest_ack_retry_revalidates_persisted_frontier_and_payload(
         stream_id=bootstrap.stream_id,
         sequence=1,
         created_revision=2,
-        records=(_batch_event(1),),
+        records=(ready.record,),
     )
+    bootstrap._journal.connection.set_trace_callback(None)
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(ready.record.loss_id),),
+            )
+        ),
+    )
+    for transition in (
+        JournalTransition(ready_records=(replace(ready, ready_order=1),)),
+        JournalTransition(lane_record_inserts=(duplicate_lane,)),
+    ):
+        statements = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        with pytest.raises(JournalIntegrityError, match="batch|owner|owned"):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=transition,
+            )
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("missing", "extra", "item_id", "kind", "ordinal"))
+async def test_batch_reads_reject_mutated_derived_item_index(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, ("!room:example.org",))
+    await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=2,
+        records=(ready.record,),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(ready.record.loss_id),),
+            )
+        ),
+    )
+    if mutation == "missing":
+        bootstrap._journal.connection.execute(
+            "DELETE FROM NioIngestBatchItem WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
+    elif mutation == "extra":
+        bootstrap._journal.connection.execute(
+            "INSERT INTO NioIngestBatchItem VALUES (?, ?, ?, ?, ?)",
+            (ACCOUNT_ID, "extra", "event", 1, 1),
+        )
+    elif mutation == "item_id":
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestBatchItem SET item_id = 'forged' " "WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
+    elif mutation == "kind":
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestBatchItem SET item_kind = 'event' " "WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
+    else:
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestBatchItem SET record_ordinal = 7 " "WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
     try:
+        with pytest.raises(JournalIntegrityError, match="batch item"):
+            bootstrap._journal.oldest_unacknowledged()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate_owner", ("ready", "lane"))
+async def test_batch_read_and_ack_reject_resurrected_authenticated_source_owner(
+    tmp_path: Path,
+    duplicate_owner: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(
+        bootstrap,
+        ("!ready:example.org",) if duplicate_owner == "ready" else (),
+    )
+    await bootstrap.attach_consumer(consumer)
+    if duplicate_owner == "ready":
+        ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+        record = ready.record
+        source: ReadyRecordKey | LaneRecordKey = ReadyRecordKey(record.loss_id)
+        revision = 1
+    else:
+        record = _owned_loss(bootstrap.stream_id)
+        lane_record = _loss_lane_record(record)
         bootstrap._journal.commit(
             expected_revision=1,
             writer_epoch=bootstrap._journal.writer_epoch,
-            transition=JournalTransition(batches=(batch,)),
+            transition=_room_carrier_transition(
+                record.room_id,
+                record.membership_epoch,
+                lane_records=(lane_record,),
+            ),
         )
-        bootstrap._journal.acknowledge(batch.ref)
-        bootstrap._journal.connection.execute(
-            "UPDATE NioIngestMeta SET last_acked_sha256 = ? WHERE account_id = ?",
-            (b"z" * 32, ACCOUNT_ID),
-        )
+        source = lane_record.key
+        revision = 2
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=revision + 1,
+        records=(record,),
+    )
+    bootstrap._journal.commit(
+        expected_revision=revision,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(batch, (source,))
+        ),
+    )
+    if duplicate_owner == "ready":
+        bootstrap._journal._write_ready(ready, revision + 1)
+    else:
+        bootstrap._journal._write_lane_record(lane_record, revision + 1)
 
-        with pytest.raises(JournalIntegrityError, match="frontier"):
+    owner_before = bootstrap._journal.load_owner()
+    batch_rows_before = bootstrap._journal.connection.execute(
+        "SELECT * FROM NioIngestBatch WHERE account_id = ?",
+        (ACCOUNT_ID,),
+    ).fetchall()
+    index_rows_before = bootstrap._journal.connection.execute(
+        "SELECT * FROM NioIngestBatchItem WHERE account_id = ?",
+        (ACCOUNT_ID,),
+    ).fetchall()
+    try:
+        with pytest.raises(JournalIntegrityError, match="duplicate.*owner"):
+            bootstrap._journal.oldest_unacknowledged()
+
+        statements: list[str] = []
+        bootstrap._journal.connection.set_trace_callback(statements.append)
+        with pytest.raises(JournalIntegrityError, match="duplicate.*owner"):
             bootstrap._journal.acknowledge(batch.ref)
+        bootstrap._journal.connection.set_trace_callback(None)
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+        assert bootstrap._journal.load_owner() == owner_before
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT * FROM NioIngestBatch WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchall()
+            == batch_rows_before
+        )
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT * FROM NioIngestBatchItem WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchall()
+            == index_rows_before
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_ack_deletes_payload_and_exact_retry_uses_only_frontier_metadata(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, ("!room:example.org",))
+    await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=2,
+        records=(ready.record,),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(ready.record.loss_id),),
+            )
+        ),
+    )
+    read_statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(read_statements.append)
+    assert bootstrap._journal.oldest_unacknowledged() == batch
+    bootstrap._journal.connection.set_trace_callback(None)
+    assert (
+        sum(
+            statement.lstrip().upper().startswith("SELECT")
+            and "NioIngestBatchItem" in statement
+            for statement in read_statements
+        )
+        == 1
+    )
+    assert bootstrap._journal.acknowledge(batch.ref) is AckOutcome.ACKNOWLEDGED
+    assert (
+        bootstrap._journal.connection.execute(
+            "SELECT COUNT(*) FROM NioIngestBatch"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        bootstrap._journal.connection.execute(
+            "SELECT COUNT(*) FROM NioIngestBatchItem"
+        ).fetchone()[0]
+        == 0
+    )
+
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    assert bootstrap._journal.acknowledge(batch.ref) is AckOutcome.ALREADY_ACKNOWLEDGED
+    bootstrap._journal.connection.set_trace_callback(None)
+    assert not any("NioIngestBatch" in statement for statement in statements)
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+    bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_materialization_of_256_records_uses_bounded_grouped_sql(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    records = tuple(_batch_event(sequence) for sequence in range(1, 257))
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            ready_records=tuple(
+                ReadyRecord(ordinal, record) for ordinal, record in enumerate(records)
+            )
+        ),
+    )
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=records,
+    )
+    statements: list[str] = []
+    labels: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    bootstrap._journal.set_transition_statement_hook(labels.append)
+    try:
+        bootstrap._journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    tuple(ReadyRecordKey(record.record_id) for record in records),
+                )
+            ),
+        )
+        bootstrap._journal.connection.set_trace_callback(None)
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT COUNT(*) FROM NioIngestBatchItem"
+            ).fetchone()[0]
+            == 256
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("SELECT")
+                and "NioIngestReadyRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("DELETE")
+                and "NioIngestReadyRecord" in statement
+                for statement in statements
+            )
+            == 1
+        )
+        assert labels.count("batch_items") == 1
+        assert sum(statement == "BEGIN IMMEDIATE" for statement in statements) == 1
+        assert sum(statement == "COMMIT" for statement in statements) == 1
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload_sizes", "message"),
+    (
+        ((1024 * 1024 + 1,), "record"),
+        ((700_000, 700_000, 700_000), "batch"),
+    ),
+)
+async def test_materialization_enforces_immutable_record_and_batch_byte_ceilings(
+    tmp_path: Path,
+    payload_sizes: tuple[int, ...],
+    message: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    records = tuple(
+        replace(
+            _batch_event(ordinal + 1),
+            source_json=b"x" * payload_size,
+        )
+        for ordinal, payload_size in enumerate(payload_sizes)
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            ready_records=tuple(
+                ReadyRecord(ordinal, record) for ordinal, record in enumerate(records)
+            )
+        ),
+    )
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=records,
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match=message):
+            bootstrap._journal.commit(
+                expected_revision=2,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    batch_materialization=BatchMaterialization(
+                        batch,
+                        tuple(ReadyRecordKey(record.record_id) for record in records),
+                    )
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == 2
+        assert bootstrap._journal.oldest_unacknowledged() is None
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("missing", "wrong_owner", "changed_lane"))
+async def test_materialization_requires_the_exact_positional_source_before_dml(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    source_record = _lane_event(
+        "held-source",
+        "!lane:example.org",
+        1,
+        1,
+        TimelineEventProvenance.LIVE,
+    )
+    lane_record = _lane_record(
+        LaneRecordKey(
+            "!lane:example.org",
+            1,
+            LaneRecordSection.HELD,
+            0,
+            0,
+        ),
+        source_record,
+        source_frame_id=UUID("55555555-5555-5555-5555-555555555555"),
+    )
+    if case != "missing":
+        bootstrap._journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=_room_carrier_transition(
+                lane_record.key.room_id,
+                lane_record.key.membership_epoch,
+                lane_records=(lane_record,),
+            ),
+        )
+        revision = 2
+    else:
+        revision = 1
+    batch_record = (
+        replace(source_record, source_json=b'{"changed":true}')
+        if case == "changed_lane"
+        else source_record
+    )
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=revision + 1,
+        records=(batch_record,),
+    )
+    source = (
+        ReadyRecordKey(source_record.record_id)
+        if case == "wrong_owner"
+        else lane_record.key
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="source|owner"):
+            bootstrap._journal.commit(
+                expected_revision=revision,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    batch_materialization=BatchMaterialization(batch, (source,))
+                ),
+            )
+        assert bootstrap._journal.load_owner().revision == revision
+        assert bootstrap._journal.oldest_unacknowledged() is None
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_owned_item_cannot_be_inserted_into_ready_or_both_in_one_transition(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    loss = _owned_loss(bootstrap.stream_id)
+    lane_record = _loss_lane_record(loss)
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=_room_carrier_transition(
+            loss.room_id,
+            loss.membership_epoch,
+            lane_records=(lane_record,),
+        ),
+    )
+    same_id_event = replace(_batch_event(1), record_id=loss.loss_id)
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    with pytest.raises(JournalIntegrityError, match="owned"):
+        bootstrap._journal.commit(
+            expected_revision=2,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                ready_records=(ReadyRecord(0, same_id_event),)
+            ),
+        )
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+
+    other = open_ingestion_store(
+        tmp_path / "same-transition",
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    await other.attach_consumer(_consumer_bootstrap(other))
+    other_loss = _owned_loss(other.stream_id)
+    other_lane = _loss_lane_record(other_loss)
+    other_event = replace(_batch_event(1), record_id=other_loss.loss_id)
+    transition = replace(
+        _room_carrier_transition(
+            other_loss.room_id,
+            other_loss.membership_epoch,
+            lane_records=(other_lane,),
+        ),
+        ready_records=(ReadyRecord(0, other_event),),
+    )
+    try:
+        statements: list[str] = []
+        other._journal.connection.set_trace_callback(statements.append)
+        with pytest.raises(JournalIntegrityError, match="same item"):
+            other._journal.commit(
+                expected_revision=1,
+                writer_epoch=other._journal.writer_epoch,
+                transition=transition,
+            )
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        other.close()
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_commit_revalidates_a_mutated_materialization_carrier_before_dml(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap)
+    await bootstrap.attach_consumer(consumer)
+    record = _batch_event(1)
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=2,
+        records=(record,),
+    )
+    materialization = BatchMaterialization(
+        batch,
+        (ReadyRecordKey(record.record_id),),
+    )
+    object.__setattr__(
+        materialization,
+        "sources",
+        (
+            ReadyRecordKey(record.record_id),
+            *tuple(ReadyRecordKey(f"record-{ordinal}") for ordinal in range(256)),
+        ),
+    )
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError, match="source|256"):
+            bootstrap._journal.commit(
+                expected_revision=1,
+                writer_epoch=bootstrap._journal.writer_epoch,
+                transition=JournalTransition(
+                    batch_materialization=materialization,
+                ),
+            )
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("batch", "batch_item"))
+async def test_ack_authenticates_payload_and_item_index_before_any_dml(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    consumer = _consumer_bootstrap(bootstrap, ("!room:example.org",))
+    await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
+    assert type(ready.record) is LossRecord
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=2,
+        records=(ready.record,),
+    )
+    bootstrap._journal.commit(
+        expected_revision=1,
+        writer_epoch=bootstrap._journal.writer_epoch,
+        transition=JournalTransition(
+            batch_materialization=BatchMaterialization(
+                batch,
+                (ReadyRecordKey(ready.record.loss_id),),
+            )
+        ),
+    )
+    if corruption == "batch":
+        row = bootstrap._journal.connection.execute(
+            "SELECT payload_ciphertext FROM NioIngestBatch WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        ).fetchone()
+        ciphertext = bytearray(row[0])
+        ciphertext[-1] ^= 1
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestBatch SET payload_ciphertext = ? WHERE account_id = ?",
+            (bytes(ciphertext), ACCOUNT_ID),
+        )
+    else:
+        bootstrap._journal.connection.execute(
+            "UPDATE NioIngestBatchItem SET item_kind = 'event' " "WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        )
+    before = bootstrap._journal.load_owner()
+    statements: list[str] = []
+    bootstrap._journal.connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(JournalIntegrityError):
+            bootstrap._journal.acknowledge(batch.ref)
+        assert bootstrap._journal.load_owner() == before
+        assert (
+            bootstrap._journal.connection.execute(
+                "SELECT COUNT(*) FROM NioIngestBatch"
+            ).fetchone()[0]
+            == 1
+        )
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        )
     finally:
         bootstrap.close()

@@ -18,8 +18,6 @@ from nio.ingest import (
     ConsumerBinding,
     ConsumerBootstrap,
     EventRecord,
-    LossBoundary,
-    LossReason,
     LossRecord,
     RecordKind,
     RecordOrigin,
@@ -30,12 +28,12 @@ from nio.ingest import (
 from nio.ingest.config import ClassicSourceConfig
 from nio.ingest.serialization import (
     _canonical_json,
-    _loss_id,
     _record_to_dict,
     batch_from_records,
 )
 from nio.ingest.state import (
     AckOutcome,
+    BatchMaterialization,
     ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
@@ -43,6 +41,7 @@ from nio.ingest.state import (
     LaneRecordSection,
     LaneStatus,
     ReadyRecord,
+    ReadyRecordKey,
     RoomLane,
     RoomState,
     SourceState,
@@ -187,7 +186,7 @@ def _kill_during_attach(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kill_after", range(1, 6))
+@pytest.mark.parametrize("kill_after", range(1, 5))
 async def test_consumer_attach_is_atomic_at_every_persisted_statement(
     tmp_path: Path,
     kill_after: int,
@@ -223,7 +222,6 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
             "NioIngestRoomState",
             "NioIngestRoomLane",
             "NioIngestReadyRecord",
-            "NioIngestLoss",
         ):
             assert (
                 reopened._journal.connection.execute(
@@ -236,7 +234,7 @@ async def test_consumer_attach_is_atomic_at_every_persisted_statement(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kill_after", range(1026, 1031))
+@pytest.mark.parametrize("kill_after", range(770, 774))
 async def test_final_attach_chunk_rolls_back_and_resumes_exact_prefix_after_kill(
     tmp_path: Path,
     kill_after: int,
@@ -274,7 +272,6 @@ async def test_final_attach_chunk_rolls_back_and_resumes_exact_prefix_after_kill
             "NioIngestRoomState",
             "NioIngestRoomLane",
             "NioIngestReadyRecord",
-            "NioIngestLoss",
         ):
             assert (
                 reopened._journal.connection.execute(
@@ -294,7 +291,6 @@ async def test_final_attach_chunk_rolls_back_and_resumes_exact_prefix_after_kill
             "NioIngestRoomState",
             "NioIngestRoomLane",
             "NioIngestReadyRecord",
-            "NioIngestLoss",
         ):
             assert (
                 reopened._journal.connection.execute(
@@ -340,37 +336,9 @@ def _event(record_id: str, frame_index: int) -> EventRecord:
     )
 
 
-def _transition(bootstrap) -> tuple[JournalTransition, LossRecord]:
+def _transition() -> JournalTransition:
     ready_event = _event("ready", 0)
-    batch_event = _event("batch", 1)
-    incomplete_loss = LossRecord(
-        "",
-        RecordOrigin(TransportKind.CLASSIC, 1, 1, 2),
-        "!room:example.org",
-        1,
-        LossReason.FETCH_FAILED,
-        LossBoundary("$prior", 1234, "s1", "s2"),
-        b'{"errcode":"M_FORBIDDEN"}',
-    )
-    loss = LossRecord(
-        _loss_id(bootstrap.stream_id, incomplete_loss),
-        incomplete_loss.origin,
-        incomplete_loss.room_id,
-        incomplete_loss.membership_epoch,
-        incomplete_loss.reason,
-        incomplete_loss.boundary,
-        incomplete_loss.detail_json,
-    )
-    batch = batch_from_records(
-        account_id=ACCOUNT_ID,
-        device_id=DEVICE_ID,
-        consumer=ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
-        stream_id=bootstrap.stream_id,
-        sequence=1,
-        created_revision=2,
-        records=(batch_event,),
-    )
-    transition = JournalTransition(
+    return JournalTransition(
         source_state=SourceState(
             1,
             TransportKind.CLASSIC,
@@ -390,10 +358,7 @@ def _transition(bootstrap) -> tuple[JournalTransition, LossRecord]:
         room_lanes=(RoomLane("!room:example.org", 1, LaneStatus.ACTIVE),),
         ready_records=(ReadyRecord(0, ready_event, FRAME_ID),),
         frames=(StagedFrame(FRAME_ID, 1, 1, b'{"raw":true}'),),
-        batches=(batch,),
-        losses=(loss,),
     )
-    return transition, loss
 
 
 def _kill_during_transition(
@@ -420,7 +385,7 @@ def _kill_during_transition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kill_after", range(1, 9))
+@pytest.mark.parametrize("kill_after", range(1, 7))
 async def test_transition_rolls_back_after_each_sql_statement_and_restart(
     tmp_path: Path,
     kill_after: int,
@@ -436,7 +401,7 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
     )
     consumer = _consumer(bootstrap)
     await bootstrap.attach_consumer(consumer)
-    transition, loss = _transition(bootstrap)
+    transition = _transition()
     bootstrap.close()
     _assert_process_crashed(
         _kill_during_transition,
@@ -470,7 +435,6 @@ async def test_transition_rolls_back_after_each_sql_statement_and_restart(
         assert reopened._journal.load_ready_heads(limit=10) == ()
         assert reopened._journal.load_frame(FRAME_ID) is None
         assert reopened._journal.oldest_unacknowledged() is None
-        assert reopened._journal.load_loss(loss.loss_id) is None
     finally:
         reopened.close()
 
@@ -516,7 +480,7 @@ def _kill_during_carrier_transition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kill_after", range(1, 6))
+@pytest.mark.parametrize("kill_after", range(1, 9))
 async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
     tmp_path: Path,
     kill_after: int,
@@ -530,8 +494,9 @@ async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
         pickle_key="secret",
         database_name="journal.db",
     )
-    consumer = _consumer(bootstrap)
+    consumer = _one_room_consumer(bootstrap)
     await bootstrap.attach_consumer(consumer)
+    ready = bootstrap._journal.load_ready_heads(limit=1)[0]
     room_id = "!room:example.org"
     existing = _held_lane_record("carrier-existing", 0)
     original_state = RoomState(
@@ -559,6 +524,15 @@ async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
         ),
     )
     inserted = _held_lane_record("carrier-inserted", 1)
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer=consumer.binding,
+        stream_id=bootstrap.stream_id,
+        sequence=1,
+        created_revision=3,
+        records=(ready.record, existing.record),
+    )
     transition = JournalTransition(
         room_states=(replace(original_state, next_room_sequence=2),),
         room_lanes=(
@@ -569,7 +543,10 @@ async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
             ),
         ),
         lane_record_inserts=(inserted,),
-        lane_record_deletes=(existing.key,),
+        batch_materialization=BatchMaterialization(
+            batch,
+            (ReadyRecordKey(ready.record.loss_id), existing.key),
+        ),
     )
     bootstrap.close()
 
@@ -595,8 +572,16 @@ async def test_carrier_insert_delete_rolls_back_as_one_restart_unit(
         aggregate = reopened._journal.load_rooms(frozenset({room_id}))[room_id]
         assert aggregate.state == original_state
         assert aggregate.active_lane == original_lane
+        assert reopened._journal.load_ready_heads(limit=10) == (ready,)
         assert reopened._journal.load_lane_record(existing.key) == existing
         assert reopened._journal.load_lane_record(inserted.key) is None
+        assert reopened._journal.oldest_unacknowledged() is None
+        assert (
+            reopened._journal.connection.execute(
+                "SELECT COUNT(*) FROM NioIngestBatchItem"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         reopened.close()
 
@@ -621,8 +606,8 @@ def _kill_during_acknowledgement(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kill_after", range(1, 4))
-async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
+@pytest.mark.parametrize("kill_after", range(1, 3))
+async def test_acknowledgement_rolls_back_frontier_and_batch_cascade(
     tmp_path: Path,
     kill_after: int,
 ) -> None:
@@ -635,8 +620,9 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
         pickle_key="secret",
         database_name="journal.db",
     )
-    consumer = _consumer(bootstrap)
+    consumer = _many_room_consumer(bootstrap, 2)
     await bootstrap.attach_consumer(consumer)
+    ready_records = bootstrap._journal.load_ready_heads(limit=2)
     batches = tuple(
         batch_from_records(
             account_id=ACCOUNT_ID,
@@ -644,16 +630,25 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
             consumer=consumer.binding,
             stream_id=bootstrap.stream_id,
             sequence=sequence,
-            created_revision=2,
-            records=(_event(f"ack-{sequence}", sequence),),
+            created_revision=sequence + 1,
+            records=(ready.record,),
         )
-        for sequence in (1, 2)
+        for sequence, ready in enumerate(ready_records, start=1)
     )
-    bootstrap._journal.commit(
-        expected_revision=1,
-        writer_epoch=bootstrap._journal.writer_epoch,
-        transition=JournalTransition(batches=batches),
-    )
+    for sequence, (batch, ready) in enumerate(
+        zip(batches, ready_records, strict=True),
+        start=1,
+    ):
+        bootstrap._journal.commit(
+            expected_revision=sequence,
+            writer_epoch=bootstrap._journal.writer_epoch,
+            transition=JournalTransition(
+                batch_materialization=BatchMaterialization(
+                    batch,
+                    (ReadyRecordKey(ready.record.loss_id),),
+                )
+            ),
+        )
     assert bootstrap._journal.acknowledge(batches[0].ref) is AckOutcome.ACKNOWLEDGED
     bootstrap.close()
     _assert_process_crashed(
@@ -676,20 +671,23 @@ async def test_acknowledgement_rolls_back_frontier_row_and_prior_delete(
         await reopened.attach_consumer(consumer)
         owner = reopened._journal.load_owner()
         assert owner.last_acked_sequence == 1
-        assert owner.revision == 3
+        assert owner.revision == 4
         assert (
             reopened._journal.acknowledge(batches[0].ref)
             is AckOutcome.ALREADY_ACKNOWLEDGED
         )
         assert reopened._journal.oldest_unacknowledged() == batches[1]
         rows = reopened._journal.connection.execute(
-            "SELECT sequence, acknowledged_revision FROM NioIngestBatch "
+            "SELECT sequence FROM NioIngestBatch "
             "WHERE account_id = ? ORDER BY sequence",
             (ACCOUNT_ID,),
         ).fetchall()
-        assert [(row[0], row[1] is not None) for row in rows] == [
-            (1, True),
-            (2, False),
-        ]
+        assert [row[0] for row in rows] == [2]
+        index_rows = reopened._journal.connection.execute(
+            "SELECT sequence, record_ordinal FROM NioIngestBatchItem "
+            "WHERE account_id = ? ORDER BY sequence, record_ordinal",
+            (ACCOUNT_ID,),
+        ).fetchall()
+        assert [tuple(row) for row in index_rows] == [(2, 0)]
     finally:
         reopened.close()

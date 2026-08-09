@@ -14,7 +14,12 @@ from uuid import UUID
 from peewee import SqliteDatabase
 
 from ..exceptions import LocalProtocolError
-from ..ingest.config import SourceConfig, source_transport
+from ..ingest.config import (
+    MAX_BYTES_PER_BATCH,
+    MAX_RECORD_BYTES,
+    SourceConfig,
+    source_transport,
+)
 from ..ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
@@ -36,6 +41,7 @@ from ..ingest.serialization import (
     _canonical_json,
     _loss_id,
     _record_to_dict,
+    canonical_batch_payload,
 )
 from ..ingest.state import (
     AckOutcome,
@@ -43,10 +49,12 @@ from ..ingest.state import (
     ConsumerAttachStatus,
     JournalTransition,
     LaneRecord,
+    LaneRecordKey,
     LaneRecordSection,
     LaneStatus,
     OwnerView,
     ReadyRecord,
+    ReadyRecordKey,
     RoomLane,
     RoomState,
 )
@@ -365,7 +373,7 @@ class SqliteIngestionJournal(JournalRows):
         consumer: ConsumerBootstrap,
         room_ids: tuple[str, ...],
         first_ready_order: int,
-    ) -> tuple[tuple[RoomState, RoomLane, LossRecord, ReadyRecord], ...]:
+    ) -> tuple[tuple[RoomState, RoomLane, ReadyRecord], ...]:
         origin = SystemOrigin(
             SystemOriginKind.FRESH_START,
             consumer.binding_operation_id,
@@ -389,7 +397,6 @@ class SqliteIngestionJournal(JournalRows):
                 (
                     RoomState(room_id, 0, 0, RoomHydrationStatus.PENDING, None),
                     RoomLane(room_id, 0, LaneStatus.ACTIVE),
-                    loss,
                     ReadyRecord(
                         first_ready_order + offset,
                         loss,
@@ -525,10 +532,9 @@ class SqliteIngestionJournal(JournalRows):
             )
             if cursor.rowcount != 1:
                 raise JournalConflictError("consumer attach compare-and-swap failed")
-            for state, lane, loss, ready in planned:
+            for state, lane, ready in planned:
                 self._write_room_state(state, new_revision)
                 self._write_room_lane(lane, new_revision, owner.transport_kind)
-                self._write_loss(loss, new_revision)
                 self._write_ready(ready, new_revision)
         if final:
             self._consumer_validated = True
@@ -590,6 +596,88 @@ class SqliteIngestionJournal(JournalRows):
                     "HELD lane ordinals are not an exact monotonic append"
                 )
 
+    @staticmethod
+    def _sql_placeholders(count: int) -> str:
+        return ",".join("?" for _ in range(count))
+
+    def _load_ready_items(
+        self,
+        item_ids: tuple[str, ...],
+    ) -> dict[str, ReadyRecord]:
+        if not item_ids:
+            return {}
+        rows = self.connection.execute(
+            "SELECT * FROM NioIngestReadyRecord WHERE account_id = ? "
+            f"AND item_id IN ({self._sql_placeholders(len(item_ids))})",
+            (self.account_id, *item_ids),
+        ).fetchall()
+        decoded = tuple(self._decode_ready_row(row) for row in rows)
+        return {self._validated_record_id(ready.record): ready for ready in decoded}
+
+    def _load_lane_items(
+        self,
+        item_ids: tuple[str, ...],
+        transport_kind: TransportKind,
+    ) -> dict[str, LaneRecord]:
+        if not item_ids:
+            return {}
+        rows = self.connection.execute(
+            "SELECT * FROM NioIngestLaneRecord WHERE account_id = ? "
+            f"AND item_id IN ({self._sql_placeholders(len(item_ids))})",
+            (self.account_id, *item_ids),
+        ).fetchall()
+        decoded = tuple(
+            self._decode_lane_record_row(row, transport_kind) for row in rows
+        )
+        return {self._validated_record_id(record.record): record for record in decoded}
+
+    def _load_batch_item_ids(self, item_ids: tuple[str, ...]) -> frozenset[str]:
+        if not item_ids:
+            return frozenset()
+        rows = self.connection.execute(
+            "SELECT item_id FROM NioIngestBatchItem WHERE account_id = ? "
+            f"AND item_id IN ({self._sql_placeholders(len(item_ids))})",
+            (self.account_id, *item_ids),
+        ).fetchall()
+        return frozenset(row["item_id"] for row in rows)
+
+    def _validate_materialization_limits(self, batch: SyncBatch) -> None:
+        for record in batch.records:
+            if len(_canonical_json(_record_to_dict(record))) > MAX_RECORD_BYTES:
+                raise JournalIntegrityError(
+                    "materialized record exceeds immutable byte ceiling"
+                )
+        if len(canonical_batch_payload(batch)) > MAX_BYTES_PER_BATCH:
+            raise JournalIntegrityError(
+                "materialized batch exceeds immutable byte ceiling"
+            )
+
+    def _delete_materialization_sources(
+        self,
+        ready_item_ids: tuple[str, ...],
+        lane_item_ids: tuple[str, ...],
+    ) -> None:
+        if ready_item_ids:
+            cursor = self._transition_execute(
+                "delete_ready_sources",
+                "DELETE FROM NioIngestReadyRecord WHERE account_id = ? "
+                f"AND item_id IN ({self._sql_placeholders(len(ready_item_ids))})",
+                (self.account_id, *ready_item_ids),
+            )
+            if cursor.rowcount != len(ready_item_ids):
+                raise JournalIntegrityError(
+                    "ready materialization delete is incomplete"
+                )
+        if lane_item_ids:
+            cursor = self._transition_execute(
+                "delete_lane_sources",
+                "DELETE FROM NioIngestLaneRecord WHERE account_id = ? "
+                f"AND item_id IN ({self._sql_placeholders(len(lane_item_ids))})",
+                (self.account_id, *lane_item_ids),
+            )
+            if cursor.rowcount != len(lane_item_ids):
+                raise JournalIntegrityError("lane materialization delete is incomplete")
+
     def commit(
         self,
         *,
@@ -627,8 +715,50 @@ class SqliteIngestionJournal(JournalRows):
             )
         for ready in transition.ready_records:
             self._validate_ready_record(ready)
-        for batch in transition.batches:
+
+        new_revision = expected_revision + 1
+        materialization = transition.batch_materialization
+        if materialization is not None:
+            try:
+                materialization = replace(materialization)
+            except (TypeError, ValueError) as error:
+                raise JournalIntegrityError(
+                    "batch materialization sources are invalid"
+                ) from error
+        batch = materialization.batch if materialization is not None else None
+        batch_item_ids: tuple[str, ...] = ()
+        if batch is not None:
             self._validate_batch_integrity(batch)
+            self._validate_materialization_limits(batch)
+            if batch.ref.sequence != owner.next_batch_sequence:
+                raise JournalConflictError(
+                    "batch sequence allocation is not contiguous"
+                )
+            if batch.created_revision != new_revision:
+                raise JournalIntegrityError(
+                    "batch created_revision does not match commit revision"
+                )
+            if (
+                batch.account_id != self.account_id
+                or batch.device_id != self.device_id
+                or batch.consumer != owner.binding
+                or batch.ref.stream_id != owner.stream_id
+            ):
+                raise JournalIntegrityError(
+                    "batch owner identity does not match journal"
+                )
+            batch_item_ids = tuple(
+                self._validated_record_id(record) for record in batch.records
+            )
+            for source, item_id in zip(
+                materialization.sources,
+                batch_item_ids,
+                strict=True,
+            ):
+                if type(source) is ReadyRecordKey and source.item_id != item_id:
+                    raise JournalIntegrityError(
+                        "ready materialization source does not match batch position"
+                    )
 
         ready_orders = tuple(
             sorted(ready.ready_order for ready in transition.ready_records)
@@ -637,22 +767,21 @@ class SqliteIngestionJournal(JournalRows):
             range(owner.next_ready_order, owner.next_ready_order + len(ready_orders))
         ):
             raise JournalConflictError("ready_order allocation is not contiguous")
-        batch_sequences = tuple(
-            sorted(batch.ref.sequence for batch in transition.batches)
-        )
-        if batch_sequences and batch_sequences != tuple(
-            range(
-                owner.next_batch_sequence,
-                owner.next_batch_sequence + len(batch_sequences),
-            )
-        ):
-            raise JournalConflictError("batch sequence allocation is not contiguous")
 
+        materialized_lane_keys = (
+            tuple(
+                source
+                for source in materialization.sources
+                if type(source) is LaneRecordKey
+            )
+            if materialization is not None
+            else ()
+        )
         touched_ids = frozenset(
             [state.room_id for state in transition.room_states]
             + [lane.room_id for lane in transition.room_lanes]
             + [record.key.room_id for record in transition.lane_record_inserts]
-            + [key.room_id for key in transition.lane_record_deletes]
+            + [key.room_id for key in materialized_lane_keys]
         )
         insert_keys = tuple(record.key for record in transition.lane_record_inserts)
         insert_item_ids = tuple(
@@ -665,15 +794,25 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalIntegrityError(
                     "lane record canonical_bytes does not match canonical payload"
                 )
-        delete_keys = transition.lane_record_deletes
+        ready_insert_ids = tuple(
+            self._validated_record_id(ready.record)
+            for ready in transition.ready_records
+        )
         if len(set(insert_keys)) != len(insert_keys):
             raise JournalIntegrityError("lane record insert keys contain duplicates")
         if len(set(insert_item_ids)) != len(insert_item_ids):
             raise JournalIntegrityError("lane record insert items contain duplicates")
-        if len(set(delete_keys)) != len(delete_keys):
-            raise JournalIntegrityError("lane record delete keys contain duplicates")
-        if set(insert_keys) & set(delete_keys):
-            raise JournalIntegrityError("lane record insert/delete keys overlap")
+        if len(set(ready_insert_ids)) != len(ready_insert_ids):
+            raise JournalIntegrityError("ready record insert items contain duplicates")
+        if set(insert_item_ids) & set(ready_insert_ids):
+            raise JournalIntegrityError(
+                "ready and lane inserts cannot claim the same item"
+            )
+        inserted_item_ids = (*insert_item_ids, *ready_insert_ids)
+        if set(inserted_item_ids) & set(batch_item_ids):
+            raise JournalIntegrityError(
+                "materialized items cannot also be inserted as ready or lane records"
+            )
         lane_update_ids = tuple(
             (lane.room_id, lane.membership_epoch) for lane in transition.room_lanes
         )
@@ -681,14 +820,97 @@ class SqliteIngestionJournal(JournalRows):
             raise JournalIntegrityError("room lane transition keys contain duplicates")
         lane_updates = dict(zip(lane_update_ids, transition.room_lanes, strict=True))
 
-        new_revision = expected_revision + 1
         with immediate_transaction(self.connection):
+            materialized_ready_ids: list[str] = []
+            materialized_lane_ids: list[str] = []
+            deleted_records: list[LaneRecord] = []
+            if materialization is not None:
+                ready_sources = self._load_ready_items(batch_item_ids)
+                lane_sources = self._load_lane_items(
+                    batch_item_ids,
+                    owner.transport_kind,
+                )
+                if self._load_batch_item_ids(batch_item_ids):
+                    raise JournalIntegrityError(
+                        "materialized item is already owned by an unacknowledged batch"
+                    )
+                for source, expected_record, item_id in zip(
+                    materialization.sources,
+                    batch.records,
+                    batch_item_ids,
+                    strict=True,
+                ):
+                    ready_source = ready_sources.get(item_id)
+                    lane_source = lane_sources.get(item_id)
+                    if (ready_source is None) == (lane_source is None):
+                        raise JournalIntegrityError(
+                            "materialization source must have exactly one durable owner"
+                        )
+                    if type(source) is ReadyRecordKey:
+                        if ready_source is None or lane_source is not None:
+                            raise JournalIntegrityError(
+                                "ready materialization source has the wrong owner"
+                            )
+                        if ready_source.record != expected_record:
+                            raise JournalIntegrityError(
+                                "ready source record does not match batch record"
+                            )
+                        materialized_ready_ids.append(item_id)
+                    else:
+                        if lane_source is None or ready_source is not None:
+                            raise JournalIntegrityError(
+                                "lane materialization source has the wrong owner"
+                            )
+                        if lane_source.key != source:
+                            raise JournalIntegrityError(
+                                "lane source key does not match batch position"
+                            )
+                        if lane_source.record != expected_record:
+                            raise JournalIntegrityError(
+                                "lane source record does not match batch record"
+                            )
+                        materialized_lane_ids.append(item_id)
+                        deleted_records.append(lane_source)
+
+            inserted_ready_rows = self._load_ready_items(inserted_item_ids)
+            inserted_lane_rows = self._load_lane_items(
+                inserted_item_ids,
+                owner.transport_kind,
+            )
+            batch_owned_insert_ids = self._load_batch_item_ids(inserted_item_ids)
+            if batch_owned_insert_ids:
+                raise JournalIntegrityError(
+                    "ready or lane insert item is already owned by a batch"
+                )
+            for ready, item_id in zip(
+                transition.ready_records,
+                ready_insert_ids,
+                strict=True,
+            ):
+                if item_id in inserted_lane_rows:
+                    raise JournalIntegrityError(
+                        "ready insert item is already owned by a lane"
+                    )
+                existing = inserted_ready_rows.get(item_id)
+                if existing is not None:
+                    canonical_bytes = len(
+                        _canonical_json(_record_to_dict(ready.record))
+                    )
+                    if existing != replace(ready, canonical_bytes=canonical_bytes):
+                        raise JournalIntegrityError(
+                            "ready item identity collides with different contents"
+                        )
+
             genuinely_new: list[LaneRecord] = []
             for lane_record, item_id in zip(
                 transition.lane_record_inserts,
                 insert_item_ids,
                 strict=True,
             ):
+                if item_id in inserted_ready_rows:
+                    raise JournalIntegrityError(
+                        "lane insert item is already owned by ready"
+                    )
                 by_key = self.load_lane_record(lane_record.key)
                 by_item = self._load_lane_record_by_item_id(item_id)
                 if by_key is None and by_item is None:
@@ -697,13 +919,6 @@ class SqliteIngestionJournal(JournalRows):
                     raise JournalIntegrityError(
                         "lane record key or item identity collides with different contents"
                     )
-
-            deleted_records: list[LaneRecord] = []
-            for key in delete_keys:
-                target = self.load_lane_record(key)
-                if target is None:
-                    raise JournalIntegrityError("lane record delete target is missing")
-                deleted_records.append(target)
 
             proposed: dict[str, tuple[RoomState, dict[int, RoomLane]]] = {}
             before_lanes: dict[tuple[str, int], RoomLane] = {}
@@ -741,7 +956,7 @@ class SqliteIngestionJournal(JournalRows):
                         state,
                         tuple(lanes[epoch] for epoch in sorted(lanes)),
                     )
-                for key in (*insert_keys, *delete_keys):
+                for key in (*insert_keys, *materialized_lane_keys):
                     room = proposed.get(key.room_id)
                     if room is None or key.membership_epoch not in room[1]:
                         raise JournalIntegrityError(
@@ -762,7 +977,7 @@ class SqliteIngestionJournal(JournalRows):
                 (
                     new_revision,
                     owner.next_ready_order + len(ready_orders),
-                    owner.next_batch_sequence + len(batch_sequences),
+                    owner.next_batch_sequence + (batch is not None),
                     self.account_id,
                     expected_revision,
                     str(writer_epoch),
@@ -778,16 +993,17 @@ class SqliteIngestionJournal(JournalRows):
                 self._write_room_lane(lane, new_revision, owner.transport_kind)
             for lane_record in transition.lane_record_inserts:
                 self._write_lane_record(lane_record, new_revision)
-            for key in transition.lane_record_deletes:
-                self._delete_lane_record(key)
             for ready in transition.ready_records:
                 self._write_ready(ready, new_revision)
             for frame in transition.frames:
                 self._write_frame(frame, new_revision)
-            for batch in transition.batches:
+            if batch is not None:
                 self._write_batch(batch, new_revision, owner)
-            for loss in transition.losses:
-                self._write_loss(loss, new_revision)
+                self._write_batch_items(batch)
+                self._delete_materialization_sources(
+                    tuple(materialized_ready_ids),
+                    tuple(materialized_lane_ids),
+                )
             for frame_id in transition.delete_frame_ids:
                 self._transition_execute(
                     "delete_frame",
@@ -800,8 +1016,7 @@ class SqliteIngestionJournal(JournalRows):
         self._require_attached()
         row = self.connection.execute(
             "SELECT * FROM NioIngestBatch "
-            "WHERE account_id = ? AND acknowledged_revision IS NULL "
-            "ORDER BY sequence LIMIT 1",
+            "WHERE account_id = ? ORDER BY sequence LIMIT 1",
             (self.account_id,),
         ).fetchone()
         return self._decode_batch(row) if row is not None else None
@@ -828,53 +1043,36 @@ class SqliteIngestionJournal(JournalRows):
             if ref.sequence < owner.last_acked_sequence:
                 raise JournalConflictError("stale acknowledgement")
             if ref.sequence == owner.last_acked_sequence:
-                row = self.connection.execute(
-                    "SELECT * FROM NioIngestBatch "
-                    "WHERE account_id = ? AND sequence = ? "
-                    "AND acknowledged_revision IS NOT NULL",
-                    (self.account_id, ref.sequence),
-                ).fetchone()
-                if row is None:
-                    raise JournalIntegrityError(
-                        "latest acknowledged batch row is not retained"
-                    )
-                batch = self._decode_batch(row)
                 frontier = self._meta()
                 if (
-                    frontier["last_acked_batch_id"] != str(batch.ref.batch_id)
+                    frontier["last_acked_batch_id"] != str(ref.batch_id)
                     or frontier["last_acked_sha256"] is None
                     or not hmac.compare_digest(
                         bytes(frontier["last_acked_sha256"]),
-                        batch.ref.sha256,
+                        ref.sha256,
                     )
                 ):
-                    raise JournalIntegrityError(
-                        "acknowledgement frontier does not match retained payload"
-                    )
-                if not self._reference_matches(batch, ref):
                     raise JournalConflictError(
-                        "acknowledgement reference does not match payload"
+                        "acknowledgement reference does not match frontier"
                     )
                 return AckOutcome.ALREADY_ACKNOWLEDGED
 
             if ref.sequence != owner.last_acked_sequence + 1:
                 raise JournalConflictError("acknowledgement is out of order")
-            row = self.connection.execute(
-                "SELECT * FROM NioIngestBatch "
-                "WHERE account_id = ? AND sequence = ? "
-                "AND acknowledged_revision IS NULL",
-                (self.account_id, ref.sequence),
-            ).fetchone()
-            if row is None:
-                raise JournalConflictError("acknowledgement is out of order")
-            batch = self._decode_batch(row)
-            if not self._reference_matches(batch, ref):
-                raise JournalConflictError(
-                    "acknowledgement reference does not match payload"
-                )
-
             new_revision = owner.revision + 1
             with immediate_transaction(self.connection):
+                row = self.connection.execute(
+                    "SELECT * FROM NioIngestBatch WHERE account_id = ? "
+                    "ORDER BY sequence LIMIT 1",
+                    (self.account_id,),
+                ).fetchone()
+                if row is None:
+                    raise JournalConflictError("acknowledgement is out of order")
+                batch = self._decode_batch(row)
+                if not self._reference_matches(batch, ref):
+                    raise JournalConflictError(
+                        "acknowledgement reference does not match payload"
+                    )
                 cursor = self._transition_execute(
                     "ack_meta",
                     """UPDATE NioIngestMeta
@@ -898,26 +1096,18 @@ class SqliteIngestionJournal(JournalRows):
                         "acknowledgement compare-and-swap failed"
                     )
                 cursor = self._transition_execute(
-                    "ack_batch",
-                    "UPDATE NioIngestBatch SET acknowledged_revision = ? "
-                    "WHERE account_id = ? AND sequence = ? "
-                    "AND acknowledged_revision IS NULL",
-                    (new_revision, self.account_id, ref.sequence),
+                    "ack_delete_batch",
+                    "DELETE FROM NioIngestBatch WHERE account_id = ? "
+                    "AND sequence = ? AND batch_id = ? AND payload_sha256 = ?",
+                    (
+                        self.account_id,
+                        ref.sequence,
+                        str(ref.batch_id),
+                        ref.sha256,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise JournalConflictError("batch acknowledgement row changed")
-                if owner.last_acked_sequence:
-                    cursor = self._transition_execute(
-                        "ack_delete_previous",
-                        "DELETE FROM NioIngestBatch "
-                        "WHERE account_id = ? AND sequence = ? "
-                        "AND acknowledged_revision IS NOT NULL",
-                        (self.account_id, owner.last_acked_sequence),
-                    )
-                    if cursor.rowcount != 1:
-                        raise JournalIntegrityError(
-                            "previous acknowledged batch row is missing"
-                        )
             return AckOutcome.ACKNOWLEDGED
         finally:
             self._ack_lock.release()

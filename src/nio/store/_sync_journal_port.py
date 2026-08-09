@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from ..ingest.model import BatchRef, LossRecord, SyncBatch
+from ..ingest.model import BatchRef, SyncBatch
 from ..ingest.state import (
     AckOutcome,
     CommitResult,
@@ -44,8 +44,6 @@ class IngestionJournal(Protocol):
     ) -> tuple[LaneRecord, ...]: ...
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None: ...
-
-    def load_loss(self, loss_id: str) -> LossRecord | None: ...
 
     def commit(
         self,

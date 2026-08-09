@@ -10,7 +10,6 @@ from ..exceptions import LocalProtocolError
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import (
     EventRecord,
-    LossReason,
     LossRecord,
     RecordOrigin,
     RoomHydrationStatus,
@@ -20,8 +19,6 @@ from ..ingest.model import (
 )
 from ..ingest.serialization import (
     _batch_from_payload,
-    _boundary_from_dict,
-    _boundary_to_dict,
     _canonical_json,
     _decoded_bytes,
     _encoded_bytes,
@@ -29,8 +26,6 @@ from ..ingest.serialization import (
     _loss_id,
     _membership_baseline_from_dict,
     _membership_baseline_to_dict,
-    _origin_from_dict,
-    _origin_to_dict,
     _record_from_dict,
     _record_from_exact_dict,
     _record_to_dict,
@@ -59,7 +54,18 @@ from ..ingest.state import (
 from ._sync_journal_preflight import _validate_source_cursor
 
 _FRAME_FIELDS = {"source_epoch", "request_id", "payload", "staged_revision"}
-_READY_FIELDS = {"ready_order", "record", "source_frame_id", "created_revision"}
+_READY_FIELDS = (
+    "item_id",
+    "item_kind",
+    "ready_order",
+    "source_frame_id",
+    "room_id",
+    "membership_epoch",
+    "room_sequence",
+    "canonical_bytes",
+    "record",
+    "created_revision",
+)
 _ROOM_STATE_FIELDS = (
     "room_id",
     "current_membership_epoch",
@@ -284,55 +290,6 @@ class JournalRows:
             ),
         )
 
-    def _write_loss(self, loss: LossRecord, revision: int) -> None:
-        if loss.loss_id != _loss_id(self.stream_id, loss):
-            raise JournalIntegrityError("loss_id does not match loss contents")
-        origin_payload = _canonical_json(_origin_to_dict(loss.origin))
-        boundary_payload = _canonical_json(_boundary_to_dict(loss.boundary))
-        detail_payload = loss.detail_json
-        primary_key = (loss.loss_id,)
-        origin_ciphertext, origin_digest = self._codec.seal(
-            "NioIngestLoss.origin", primary_key, origin_payload
-        )
-        boundary_ciphertext, boundary_digest = self._codec.seal(
-            "NioIngestLoss.boundary", primary_key, boundary_payload
-        )
-        detail_ciphertext, detail_digest = self._codec.seal(
-            "NioIngestLoss.detail", primary_key, detail_payload
-        )
-        loss_digest = hashlib.sha256(_canonical_json(_record_to_dict(loss))).digest()
-        cursor = self._transition_execute(
-            "loss",
-            """INSERT INTO NioIngestLoss (
-                account_id, loss_id, room_id, membership_epoch, reason,
-                origin_ciphertext, origin_sha256, boundary_ciphertext,
-                boundary_sha256, detail_ciphertext, detail_sha256,
-                loss_sha256, detected_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, loss_id) DO NOTHING""",
-            (
-                self.account_id,
-                loss.loss_id,
-                loss.room_id,
-                loss.membership_epoch,
-                loss.reason.value,
-                origin_ciphertext,
-                origin_digest,
-                boundary_ciphertext,
-                boundary_digest,
-                detail_ciphertext,
-                detail_digest,
-                loss_digest,
-                revision,
-            ),
-        )
-        self._revalidate_insert(
-            cursor,
-            lambda: self.load_loss(loss.loss_id),
-            loss,
-            "loss_id collides with different authenticated contents",
-        )
-
     def _validated_record_id(self, record: EventRecord | LossRecord) -> str:
         if isinstance(record, EventRecord):
             if type(record.origin) is SystemOrigin:
@@ -366,22 +323,32 @@ class JournalRows:
             raise JournalIntegrityError(str(error)) from error
 
     def _write_ready(self, ready: ReadyRecord, revision: int) -> None:
-        record_id = self._validate_ready_record(ready)
+        item_id = self._validate_ready_record(ready)
+        item_kind = "event" if type(ready.record) is EventRecord else "loss"
         record_payload = _canonical_json(_record_to_dict(ready.record))
+        canonical_bytes = len(record_payload)
+        room_sequence = (
+            ready.record.room_sequence if type(ready.record) is EventRecord else None
+        )
         payload = _canonical_json(
             {
+                "item_id": item_id,
+                "item_kind": item_kind,
                 "ready_order": ready.ready_order,
-                "record": _record_to_dict(ready.record),
                 "source_frame_id": (
                     str(ready.source_frame_id) if ready.source_frame_id else None
                 ),
+                "room_id": ready.record.room_id,
+                "membership_epoch": ready.record.membership_epoch,
+                "room_sequence": room_sequence,
+                "canonical_bytes": canonical_bytes,
+                "record": _record_to_dict(ready.record),
                 "created_revision": revision,
             }
         )
         ciphertext, digest = self._codec.seal(
-            "NioIngestReadyRecord", (record_id,), payload
+            "NioIngestReadyRecord", (item_id,), payload
         )
-        canonical_bytes = len(record_payload)
         if ready.canonical_bytes not in (0, canonical_bytes):
             raise JournalIntegrityError(
                 "ready canonical_bytes does not match canonical payload"
@@ -389,23 +356,20 @@ class JournalRows:
         cursor = self._transition_execute(
             "ready_record",
             """INSERT INTO NioIngestReadyRecord (
-                account_id, ready_order, record_id, source_frame_id, room_id,
+                account_id, ready_order, item_id, item_kind, source_frame_id, room_id,
                 membership_epoch, room_sequence, payload_ciphertext,
                 payload_sha256, canonical_bytes, created_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id, record_id) DO NOTHING""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, item_id) DO NOTHING""",
             (
                 self.account_id,
                 ready.ready_order,
-                record_id,
+                item_id,
+                item_kind,
                 str(ready.source_frame_id) if ready.source_frame_id else None,
                 ready.record.room_id,
                 ready.record.membership_epoch,
-                (
-                    ready.record.room_sequence
-                    if isinstance(ready.record, EventRecord)
-                    else None
-                ),
+                room_sequence,
                 ciphertext,
                 digest,
                 canonical_bytes,
@@ -416,8 +380,8 @@ class JournalRows:
         def load_ready():
             row = self.connection.execute(
                 "SELECT * FROM NioIngestReadyRecord "
-                "WHERE account_id = ? AND record_id = ?",
-                (self.account_id, record_id),
+                "WHERE account_id = ? AND item_id = ?",
+                (self.account_id, item_id),
             ).fetchone()
             return self._decode_ready_row(row) if row is not None else None
 
@@ -425,7 +389,7 @@ class JournalRows:
             cursor,
             load_ready,
             replace(ready, canonical_bytes=canonical_bytes, created_revision=revision),
-            "ready record_id or ready_order collides with different contents",
+            "ready item_id or ready_order collides with different contents",
         )
 
     @staticmethod
@@ -705,17 +669,6 @@ class JournalRows:
             self._decode_lane_record_row(row, owner.transport_kind) for row in rows
         )
 
-    def _delete_lane_record(self, key: LaneRecordKey) -> None:
-        cursor = self._transition_execute(
-            "lane_record_delete",
-            "DELETE FROM NioIngestLaneRecord WHERE account_id = ? "
-            "AND room_id = ? AND membership_epoch = ? AND section = ? "
-            "AND page_ordinal = ? AND record_ordinal = ?",
-            (self.account_id, *self._lane_record_primary_key(key)),
-        )
-        if cursor.rowcount != 1:
-            raise JournalIntegrityError("lane record delete target is missing")
-
     def _write_source(self, source: SourceState) -> None:
         ciphertext, digest = self._codec.seal(
             "NioIngestSourceState", (self.account_id,), source.cursor_json
@@ -862,8 +815,8 @@ class JournalRows:
             "batch",
             """INSERT INTO NioIngestBatch (
                 account_id, sequence, batch_id, payload_ciphertext,
-                payload_sha256, created_revision, acknowledged_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                payload_sha256, created_revision
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 self.account_id,
                 batch.ref.sequence,
@@ -873,6 +826,64 @@ class JournalRows:
                 revision,
             ),
         )
+
+    def _write_batch_items(self, batch: SyncBatch) -> None:
+        values = []
+        parameters: list[object] = []
+        for ordinal, record in enumerate(batch.records):
+            item_id = self._validated_record_id(record)
+            item_kind = "event" if type(record) is EventRecord else "loss"
+            values.append("(?, ?, ?, ?, ?)")
+            parameters.extend(
+                (self.account_id, item_id, item_kind, batch.ref.sequence, ordinal)
+            )
+        cursor = self._transition_execute(
+            "batch_items",
+            "INSERT INTO NioIngestBatchItem "
+            "(account_id, item_id, item_kind, sequence, record_ordinal) VALUES "
+            + ",".join(values),
+            tuple(parameters),
+        )
+        if cursor.rowcount != len(batch.records):
+            raise JournalIntegrityError("batch item index insert is incomplete")
+
+    def _validate_batch_items(self, batch: SyncBatch) -> None:
+        rows = self.connection.execute(
+            "SELECT item_id, item_kind, record_ordinal "
+            "FROM NioIngestBatchItem WHERE account_id = ? AND sequence = ? "
+            "ORDER BY record_ordinal",
+            (self.account_id, batch.ref.sequence),
+        ).fetchall()
+        actual = tuple(
+            (row["item_id"], row["item_kind"], row["record_ordinal"]) for row in rows
+        )
+        expected = tuple(
+            (
+                self._validated_record_id(record),
+                "event" if type(record) is EventRecord else "loss",
+                ordinal,
+            )
+            for ordinal, record in enumerate(batch.records)
+        )
+        if actual != expected:
+            raise JournalIntegrityError(
+                "batch item index does not match authenticated batch payload"
+            )
+
+    def _validate_batch_has_no_source_owner(self, batch: SyncBatch) -> None:
+        item_ids = tuple(self._validated_record_id(record) for record in batch.records)
+        placeholders = ",".join("?" for _ in item_ids)
+        duplicate = self.connection.execute(
+            "SELECT item_id FROM NioIngestReadyRecord WHERE account_id = ? "
+            f"AND item_id IN ({placeholders}) UNION ALL "
+            "SELECT item_id FROM NioIngestLaneRecord WHERE account_id = ? "
+            f"AND item_id IN ({placeholders}) LIMIT 1",
+            (self.account_id, *item_ids, self.account_id, *item_ids),
+        ).fetchone()
+        if duplicate is not None:
+            raise JournalIntegrityError(
+                "batch item has a duplicate ready or lane durable owner"
+            )
 
     def _decode_batch(self, row: sqlite3.Row) -> SyncBatch:
         digest = bytes(row["payload_sha256"])
@@ -902,14 +913,16 @@ class JournalRows:
             or batch.ref.stream_id != owner.stream_id
         ):
             raise JournalIntegrityError("batch owner does not match journal owner")
+        self._validate_batch_items(batch)
+        self._validate_batch_has_no_source_owner(batch)
         return batch
 
     def _decode_ready_row(self, row: sqlite3.Row) -> ReadyRecord:
         payload = self._open_payload(
-            "NioIngestReadyRecord", (row["record_id"],), row, "payload"
+            "NioIngestReadyRecord", (row["item_id"],), row, "payload"
         )
         envelope = _load_json_object(payload)
-        if set(envelope) != _READY_FIELDS:
+        if tuple(envelope) != _READY_FIELDS:
             raise JournalIntegrityError("ready authenticated envelope is invalid")
         ready_order = envelope["ready_order"]
         created_revision = envelope["created_revision"]
@@ -929,36 +942,43 @@ class JournalRows:
             raise JournalIntegrityError(
                 "ready authenticated record is invalid"
             ) from error
-        if row["canonical_bytes"] != len(record_payload):
+        if envelope["canonical_bytes"] != len(record_payload):
             raise JournalIntegrityError(
                 "ready canonical_bytes does not match canonical payload"
             )
         actual_id = self._validated_record_id(record)
-        if actual_id != row["record_id"]:
+        item_kind = "event" if type(record) is EventRecord else "loss"
+        if actual_id != envelope["item_id"]:
             raise JournalIntegrityError("ready record identity does not match row")
         expected_sequence = (
             record.room_sequence if isinstance(record, EventRecord) else None
         )
         authenticated = (
+            envelope["item_id"],
+            envelope["item_kind"],
             record.room_id,
             record.membership_epoch,
             expected_sequence,
             ready_order,
             str(source_frame_id) if source_frame_id is not None else None,
+            envelope["canonical_bytes"],
             created_revision,
         )
         columns = tuple(
             row[name]
             for name in (
+                "item_id",
+                "item_kind",
                 "room_id",
                 "membership_epoch",
                 "room_sequence",
                 "ready_order",
                 "source_frame_id",
+                "canonical_bytes",
                 "created_revision",
             )
         )
-        if authenticated != columns:
+        if envelope["item_kind"] != item_kind or authenticated != columns:
             raise JournalIntegrityError(
                 "ready record columns do not match authenticated payload"
             )
@@ -967,7 +987,7 @@ class JournalRows:
                 ready_order,
                 record,
                 source_frame_id,
-                row["canonical_bytes"],
+                envelope["canonical_bytes"],
                 created_revision,
             )
         except (TypeError, ValueError) as error:
@@ -980,12 +1000,12 @@ class JournalRows:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be positive")
         rows = self.connection.execute(
-            """SELECT ready_order, record_id, source_frame_id, room_id,
+            """SELECT ready_order, item_id, item_kind, source_frame_id, room_id,
                    membership_epoch, room_sequence, payload_ciphertext,
                    payload_sha256, canonical_bytes, created_revision
             FROM NioIngestReadyRecord
             WHERE account_id = ?
-            ORDER BY ready_order, record_id
+            ORDER BY ready_order, item_id
             LIMIT ?""",
             (self.account_id, limit),
         ).fetchall()
@@ -1182,32 +1202,3 @@ class JournalRows:
             self._validate_room_aggregate(state, lanes)
             aggregates[room_id] = RoomAggregate(state, lanes[-1], lanes[:-1])
         return aggregates
-
-    def load_loss(self, loss_id: str) -> LossRecord | None:
-        self._require_attached()
-        row = self.connection.execute(
-            "SELECT * FROM NioIngestLoss WHERE account_id = ? AND loss_id = ?",
-            (self.account_id, loss_id),
-        ).fetchone()
-        if row is None:
-            return None
-        primary_key = (loss_id,)
-        origin_payload, boundary_payload, detail = (
-            self._open_payload(f"NioIngestLoss.{field}", primary_key, row, field)
-            for field in ("origin", "boundary", "detail")
-        )
-        loss = LossRecord(
-            loss_id,
-            _origin_from_dict(_load_json_object(origin_payload)),
-            row["room_id"],
-            row["membership_epoch"],
-            LossReason(row["reason"]),
-            _boundary_from_dict(_load_json_object(boundary_payload)),
-            detail,
-        )
-        loss_digest = hashlib.sha256(_canonical_json(_record_to_dict(loss))).digest()
-        if not hmac.compare_digest(loss_digest, bytes(row["loss_sha256"])):
-            raise JournalIntegrityError("whole loss digest mismatch")
-        if loss.loss_id != _loss_id(self.stream_id, loss):
-            raise JournalIntegrityError("loss_id does not match loss contents")
-        return loss

@@ -25,6 +25,7 @@ from nio.ingest import (
 )
 from nio.ingest.membership import MembershipBaseline
 from nio.ingest.recovery import RecoveryGap
+from nio.ingest.serialization import _loss_id, batch_from_records
 from nio.ingest.state import (
     LaneRecord,
     LaneRecordKey,
@@ -799,6 +800,147 @@ def test_system_origin_ready_records_cannot_claim_a_source_frame(
 
     assert ReadyRecord(0, record).source_frame_id is None
     assert ReadyRecord(0, _lane_event()).source_frame_id is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"ready_order": False},
+        {"ready_order": -1},
+        {"record": object()},
+        {"source_frame_id": "frame"},
+        {"canonical_bytes": False},
+        {"canonical_bytes": -1},
+        {"created_revision": False},
+        {"created_revision": -1},
+    ),
+)
+def test_ready_record_validates_exact_nonnegative_carrier_fields(
+    changes: dict[str, object],
+) -> None:
+    values = {
+        "ready_order": 0,
+        "record": _lane_event(),
+        "source_frame_id": None,
+        "canonical_bytes": 0,
+        "created_revision": 0,
+        **changes,
+    }
+
+    with pytest.raises((TypeError, ValueError)):
+        ReadyRecord(**values)
+
+
+def test_batch_materialization_carriers_are_exact_frozen_and_slotted() -> None:
+    ready_key_type = getattr(ingest_state, "ReadyRecordKey", None)
+    materialization_type = getattr(ingest_state, "BatchMaterialization", None)
+    assert ready_key_type is not None
+    assert materialization_type is not None
+
+    ready_key = ready_key_type("$event")
+    lane_key = LaneRecordKey(
+        "!room:example.org",
+        7,
+        LaneRecordSection.HELD,
+        0,
+        1,
+    )
+    batch = batch_from_records(
+        account_id="@alice:example.org",
+        device_id="DEVICE",
+        consumer=ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+        stream_id=JOURNAL_GENERATION,
+        sequence=1,
+        created_revision=1,
+        records=(
+            _lane_event(),
+            replace(
+                _lane_event(room_id="!other:example.org"),
+                record_id="$other-event",
+            ),
+        ),
+    )
+    materialization = materialization_type(batch, (ready_key, lane_key))
+
+    assert not hasattr(ready_key, "__dict__")
+    assert not hasattr(materialization, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        ready_key.item_id = "changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="item_id"):
+        ready_key_type(1)
+    with pytest.raises(ValueError, match="item_id"):
+        ready_key_type("")
+    with pytest.raises(TypeError, match="batch"):
+        materialization_type(object(), (ready_key,))
+    with pytest.raises(TypeError, match="sources must be a tuple"):
+        materialization_type(batch, [ready_key, lane_key])
+    with pytest.raises(TypeError, match="sources.*ReadyRecordKey or LaneRecordKey"):
+        materialization_type(batch, (object(), object()))
+    with pytest.raises(ValueError, match="one source per batch record"):
+        materialization_type(batch, (ready_key,))
+    with pytest.raises(ValueError, match="duplicate"):
+        materialization_type(batch, (ready_key, ready_key))
+
+    too_many_records = tuple(
+        replace(_lane_event(), record_id=f"$event-{ordinal}") for ordinal in range(257)
+    )
+    too_large = batch_from_records(
+        account_id="@alice:example.org",
+        device_id="DEVICE",
+        consumer=ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+        stream_id=JOURNAL_GENERATION,
+        sequence=1,
+        created_revision=1,
+        records=too_many_records,
+    )
+    with pytest.raises(ValueError, match="256"):
+        materialization_type(
+            too_large,
+            tuple(ready_key_type(record.record_id) for record in too_many_records),
+        )
+
+    loss = _lane_loss()
+    loss = replace(loss, loss_id=_loss_id(JOURNAL_GENERATION, loss))
+    duplicate_item_batch = batch_from_records(
+        account_id="@alice:example.org",
+        device_id="DEVICE",
+        consumer=ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION),
+        stream_id=JOURNAL_GENERATION,
+        sequence=1,
+        created_revision=1,
+        records=(replace(_lane_event(), record_id=loss.loss_id), loss),
+    )
+    with pytest.raises(ValueError, match="item identities"):
+        materialization_type(
+            duplicate_item_batch,
+            (
+                LaneRecordKey(
+                    "!room:example.org",
+                    7,
+                    LaneRecordSection.HELD,
+                    0,
+                    1,
+                ),
+                LaneRecordKey(
+                    "!room:example.org",
+                    7,
+                    LaneRecordSection.LOSS,
+                    0,
+                    0,
+                ),
+            ),
+        )
+
+
+def test_journal_transition_exposes_only_the_atomic_batch_transfer() -> None:
+    transition_fields = {field.name for field in fields(ingest_state.JournalTransition)}
+
+    assert "batch_materialization" in transition_fields
+    assert "batches" not in transition_fields
+    assert "losses" not in transition_fields
+    assert "lane_record_deletes" not in transition_fields
+    with pytest.raises(TypeError, match="batch_materialization"):
+        ingest_state.JournalTransition(batch_materialization=object())
 
 
 @pytest.mark.parametrize(

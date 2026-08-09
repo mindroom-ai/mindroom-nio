@@ -117,11 +117,13 @@ SCHEMA_SQL = (
     "CREATE INDEX NioIngestRoomLane_ready ON NioIngestRoomLane(account_id, ready_order)",
     """CREATE TABLE NioIngestReadyRecord (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
-        ready_order INTEGER NOT NULL, record_id TEXT NOT NULL,
+        ready_order INTEGER NOT NULL, item_id TEXT NOT NULL,
+        item_kind TEXT NOT NULL CHECK (item_kind IN ('event', 'loss')),
         source_frame_id TEXT, room_id TEXT, membership_epoch INTEGER,
         room_sequence INTEGER, payload_ciphertext BLOB NOT NULL,
         payload_sha256 BLOB NOT NULL, canonical_bytes INTEGER NOT NULL,
-        created_revision INTEGER NOT NULL, PRIMARY KEY (account_id, record_id),
+        created_revision INTEGER NOT NULL, PRIMARY KEY (account_id, item_id),
+        CHECK (length(item_id) > 0), CHECK (canonical_bytes > 0),
         UNIQUE (account_id, ready_order)
     )""",
     """CREATE TABLE NioIngestLaneRecord (
@@ -188,24 +190,18 @@ SCHEMA_SQL = (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
         sequence INTEGER NOT NULL, batch_id TEXT NOT NULL,
         payload_ciphertext BLOB NOT NULL, payload_sha256 BLOB NOT NULL,
-        created_revision INTEGER NOT NULL, acknowledged_revision INTEGER,
+        created_revision INTEGER NOT NULL,
         PRIMARY KEY (account_id, sequence),
         UNIQUE (account_id, batch_id)
     )""",
-    """CREATE TABLE NioIngestLoss (
-        account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
-        loss_id TEXT NOT NULL, room_id TEXT NOT NULL,
-        membership_epoch INTEGER NOT NULL, reason TEXT NOT NULL,
-        origin_ciphertext BLOB NOT NULL, origin_sha256 BLOB NOT NULL,
-        boundary_ciphertext BLOB NOT NULL, boundary_sha256 BLOB NOT NULL,
-        detail_ciphertext BLOB NOT NULL, detail_sha256 BLOB NOT NULL,
-        loss_sha256 BLOB NOT NULL, detected_revision INTEGER NOT NULL,
-        PRIMARY KEY (account_id, loss_id)
-    )""",
-    """CREATE TABLE NioIngestConsumerResetRoom (
-        account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
-        binding_operation_id TEXT NOT NULL, room_id TEXT NOT NULL,
-        evidence_ciphertext BLOB NOT NULL, evidence_sha256 BLOB NOT NULL,
-        PRIMARY KEY (account_id, binding_operation_id, room_id)
+    """CREATE TABLE NioIngestBatchItem (
+        account_id TEXT NOT NULL, item_id TEXT NOT NULL,
+        item_kind TEXT NOT NULL CHECK (item_kind IN ('event', 'loss')),
+        sequence INTEGER NOT NULL, record_ordinal INTEGER NOT NULL,
+        CHECK (length(item_id) > 0), CHECK (record_ordinal >= 0),
+        PRIMARY KEY (account_id, item_id),
+        UNIQUE (account_id, sequence, record_ordinal),
+        FOREIGN KEY (account_id, sequence)
+            REFERENCES NioIngestBatch(account_id, sequence) ON DELETE CASCADE
     )""",
 )
