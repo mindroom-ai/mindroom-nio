@@ -1,24 +1,20 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
 import os
 import sqlite3
 import threading
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
-from uuid import UUID, uuid4
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from Crypto.Cipher import AES
 from peewee import SqliteDatabase
-from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..exceptions import LocalProtocolError
 from ..ingest.errors import (
-    FreshIngestionRequired,
     JournalConflictError,
     JournalIntegrityError,
 )
@@ -43,6 +39,8 @@ from ..ingest.serialization import (
     _boundary_to_dict,
     _canonical_json,
     _canonical_room_snapshot_payload,
+    _decoded_bytes,
+    _encoded_bytes,
     _load_json_object,
     _loss_id,
     _origin_from_dict,
@@ -66,12 +64,12 @@ from ..ingest.state import (
     SourceState,
     StagedFrame,
 )
-from .sync_journal_schema import (
-    INGESTION_TABLES,
-    META_TABLE_SQL,
-    SCHEMA_SQL,
-    SCHEMA_VERSION,
+from ._sync_journal_preflight import (
+    FileIdentity,
+    StableFileLock,
+    open_journal_database,
 )
+from .sync_journal_schema import SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -195,98 +193,6 @@ class EncryptedRowCodec:
         return payload
 
 
-class IngestionJournal(Protocol):
-    """Durable compare-and-swap journal used by the ingestion owner."""
-
-    def load_owner(self) -> OwnerView: ...
-
-    def load_rooms(
-        self,
-        room_ids: frozenset[str],
-    ) -> dict[str, RoomAggregate]: ...
-
-    def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]: ...
-
-    def commit(
-        self,
-        *,
-        expected_revision: int,
-        writer_epoch: UUID,
-        transition: JournalTransition,
-    ) -> CommitResult: ...
-
-    def oldest_unacknowledged(self) -> SyncBatch | None: ...
-
-    def acknowledge(self, ref: BatchRef) -> AckOutcome: ...
-
-
-class _WriterLock:
-    def __init__(self, database_path: Path) -> None:
-        self.path = Path(f"{database_path}.ingest.lock")
-        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            os.close(self._fd)
-            self._fd = -1
-            raise LocalProtocolError(
-                f"ingestion writer lock is already held for {database_path}"
-            ) from error
-
-    @property
-    def active(self) -> bool:
-        return self._fd >= 0
-
-    def close(self) -> None:
-        if self._fd < 0:
-            return
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
-        os.close(self._fd)
-        self._fd = -1
-
-
-def _database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
-    if isinstance(database, SqliteQueueDatabase):
-        raise LocalProtocolError(
-            "SqliteQueueDatabase cannot provide atomic ingestion transactions"
-        )
-    if isinstance(database, SqliteDatabase):
-        database = database.database
-    path = os.fspath(database)
-    if path == ":memory:":
-        raise LocalProtocolError("the ingestion journal requires an on-disk database")
-    return Path(path).resolve()
-
-
-def _connect_read_only(database_path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(
-        f"file:{database_path}?mode=ro",
-        uri=True,
-        isolation_level=None,
-    )
-
-
-def _has_v1_marker(database_path: Path) -> bool:
-    if not database_path.exists() or database_path.stat().st_size == 0:
-        return False
-    with _connect_read_only(database_path) as connection:
-        row = connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'NioIngestMeta'"
-        ).fetchone()
-    return row is not None
-
-
-def _has_any_table(database_path: Path) -> bool:
-    if not database_path.exists() or database_path.stat().st_size == 0:
-        return False
-    with _connect_read_only(database_path) as connection:
-        row = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
-        ).fetchone()
-    return row is not None
-
-
 class SqliteIngestionJournal:
     """Direct-SQLite implementation of the version-1 ingestion journal."""
 
@@ -298,9 +204,9 @@ class SqliteIngestionJournal:
         device_id: str,
         pickle_key: str,
         connection: sqlite3.Connection,
-        writer_lock: _WriterLock,
+        writer_lock: StableFileLock,
         writer_epoch: UUID,
-        statement_observer: Callable[[str], None] | None,
+        file_identity: FileIdentity,
         transition_statement_hook: Callable[[str], None] | None,
     ) -> None:
         self.database_path = database_path
@@ -310,11 +216,9 @@ class SqliteIngestionJournal:
         self.connection = connection
         self.writer_epoch = writer_epoch
         self._writer_lock = writer_lock
-        self._statement_observer = statement_observer
         self._transition_statement_hook = transition_statement_hook
         self._closed = False
-        stat = os.stat(database_path)
-        self._file_identity = (stat.st_dev, stat.st_ino)
+        self._file_identity = file_identity
         self._consumer_validated = False
         self._codec = EncryptedRowCodec(pickle_key, account_id, self.stream_id)
         self._ack_lock = threading.Lock()
@@ -341,167 +245,30 @@ class SqliteIngestionJournal:
         if type(sqlite_busy_timeout_ms) is not int or sqlite_busy_timeout_ms <= 0:
             raise ValueError("sqlite_busy_timeout_ms must be positive")
 
-        database_path = _database_path(database)
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        writer_lock = _WriterLock(database_path)
-        connection: sqlite3.Connection | None = None
-        try:
-            marker_exists = _has_v1_marker(database_path)
-            database_is_new = not _has_any_table(database_path)
-            if not marker_exists and not database_is_new:
-                raise FreshIngestionRequired(
-                    "nonempty store has no ingestion-v1 marker; explicit fresh "
-                    "initialization is required"
-                )
-
-            connection = sqlite3.connect(
-                database_path,
-                isolation_level=None,
-                timeout=sqlite_busy_timeout_ms / 1000,
-            )
-            connection.row_factory = sqlite3.Row
-            if statement_observer is not None:
-                connection.set_trace_callback(statement_observer)
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
-
-            if marker_exists:
-                writer_epoch = cls._open_existing(
-                    connection,
-                    account_id=account_id,
-                    device_id=device_id,
-                )
-            else:
-                writer_epoch = uuid4()
-                cls._create_fresh(
-                    connection,
-                    account_id=account_id,
-                    device_id=device_id,
-                    writer_epoch=writer_epoch,
-                    statement_hook=schema_statement_hook,
-                )
-
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = NORMAL")
-            return cls(
-                database_path=database_path,
-                account_id=account_id,
-                device_id=device_id,
-                pickle_key=pickle_key,
-                connection=connection,
-                writer_lock=writer_lock,
-                writer_epoch=writer_epoch,
-                statement_observer=statement_observer,
-                transition_statement_hook=transition_statement_hook,
-            )
-        except BaseException:
-            if connection is not None:
-                connection.close()
-            writer_lock.close()
-            raise
-
-    @staticmethod
-    def _create_fresh(
-        connection: sqlite3.Connection,
-        *,
-        account_id: str,
-        device_id: str,
-        writer_epoch: UUID,
-        statement_hook: Callable[[str], None] | None,
-    ) -> None:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(META_TABLE_SQL)
-            if statement_hook is not None:
-                statement_hook("create_meta")
-            connection.execute(
-                """
-                INSERT INTO NioIngestMeta (
-                    account_id, device_id, schema_version, stream_id,
-                    binding_operation_id, journal_generation,
-                    consumer_generation, consumer_first_sequence,
-                    baseline_rooms_sha256,
-                    consumer_attached_revision, revision, writer_epoch,
-                    next_source_epoch, next_ready_order, next_batch_sequence,
-                    last_acked_sequence, last_acked_batch_id,
-                    last_acked_sha256, created_at_ns
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, 1, 0, 1,
-                          0, NULL, NULL, ?)
-                """,
-                (
-                    account_id,
-                    device_id,
-                    SCHEMA_VERSION,
-                    str(uuid4()),
-                    str(uuid4()),
-                    str(writer_epoch),
-                    time.time_ns(),
-                ),
-            )
-            if statement_hook is not None:
-                statement_hook("insert_meta")
-            for index, statement in enumerate(SCHEMA_SQL):
-                connection.execute(statement.strip())
-                if statement_hook is not None:
-                    statement_hook(f"schema_{index}")
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-
-    @staticmethod
-    def _open_existing(
-        connection: sqlite3.Connection,
-        *,
-        account_id: str,
-        device_id: str,
-    ) -> UUID:
-        row = connection.execute(
-            "SELECT account_id, device_id, schema_version, writer_epoch "
-            "FROM NioIngestMeta"
-        ).fetchone()
-        if row is None:
-            raise LocalProtocolError("ingestion-v1 marker row is missing")
-        if row["account_id"] != account_id:
-            raise LocalProtocolError("ingestion account_id does not match")
-        if row["device_id"] != device_id:
-            raise LocalProtocolError("ingestion device_id does not match")
-        if row["schema_version"] != SCHEMA_VERSION:
-            raise LocalProtocolError(
-                f"unsupported ingestion schema_version {row['schema_version']}"
-            )
-        tables = {
-            table["name"]
-            for table in connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name GLOB 'NioIngest*'"
-            ).fetchall()
-        }
-        if tables != INGESTION_TABLES:
-            raise LocalProtocolError("ingestion-v1 schema is incomplete or unexpected")
-
-        old_epoch = row["writer_epoch"]
-        writer_epoch = uuid4()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                "UPDATE NioIngestMeta SET writer_epoch = ? "
-                "WHERE account_id = ? AND writer_epoch = ?",
-                (str(writer_epoch), account_id, old_epoch),
-            )
-            if cursor.rowcount != 1:
-                raise LocalProtocolError("persisted writer_epoch changed during open")
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        return writer_epoch
+        opened = open_journal_database(
+            database,
+            account_id=account_id,
+            device_id=device_id,
+            sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
+            statement_observer=statement_observer,
+            schema_statement_hook=schema_statement_hook,
+        )
+        return cls(
+            database_path=opened.path,
+            account_id=account_id,
+            device_id=device_id,
+            pickle_key=pickle_key,
+            connection=opened.connection,
+            writer_lock=opened.writer_lock,
+            writer_epoch=opened.writer_epoch,
+            file_identity=opened.file_identity,
+            transition_statement_hook=transition_statement_hook,
+        )
 
     def _assert_open(self) -> None:
         if self._closed or not self._writer_lock.active:
             raise LocalProtocolError("ingestion journal is closed")
+        self._writer_lock.assert_identity(self._writer_lock.identity)
         try:
             stat = os.stat(self.database_path)
         except FileNotFoundError as error:
@@ -512,6 +279,14 @@ class SqliteIngestionJournal:
             raise LocalProtocolError(
                 "ingestion database file identity changed after lock acquisition"
             )
+        row = self.connection.execute(
+            "SELECT lock_device, lock_inode FROM NioIngestMeta " "WHERE account_id = ?",
+            (self.account_id,),
+        ).fetchone()
+        if row is None or (row["lock_device"], row["lock_inode"]) != (
+            self._writer_lock.identity
+        ):
+            raise LocalProtocolError("persisted ingestion lock file identity changed")
 
     def set_transition_statement_hook(
         self,
@@ -948,10 +723,20 @@ class SqliteIngestionJournal:
         return record.loss_id
 
     def _write_ready(self, ready: ReadyRecord, revision: int) -> None:
-        payload = _canonical_json(_record_to_dict(ready.record))
+        record_payload = _canonical_json(_record_to_dict(ready.record))
+        payload = _canonical_json(
+            {
+                "ready_order": ready.ready_order,
+                "record": _record_to_dict(ready.record),
+                "source_frame_id": (
+                    str(ready.source_frame_id) if ready.source_frame_id else None
+                ),
+                "created_revision": revision,
+            }
+        )
         digest = hashlib.sha256(payload).digest()
         record_id = self._validated_record_id(ready.record)
-        canonical_bytes = len(payload)
+        canonical_bytes = len(record_payload)
         if ready.canonical_bytes not in (0, canonical_bytes):
             raise JournalIntegrityError(
                 "ready canonical_bytes does not match canonical payload"
@@ -1005,6 +790,7 @@ class SqliteIngestionJournal:
                 or existing.record != ready.record
                 or existing.source_frame_id != ready.source_frame_id
                 or existing.canonical_bytes != canonical_bytes
+                or existing.created_revision != revision
             ):
                 raise JournalIntegrityError(
                     "ready record_id or ready_order collides with different contents"
@@ -1067,11 +853,19 @@ class SqliteIngestionJournal:
         )
 
     def _write_frame(self, frame: StagedFrame, revision: int) -> None:
-        digest = hashlib.sha256(frame.payload).digest()
+        payload = _canonical_json(
+            {
+                "source_epoch": frame.source_epoch,
+                "request_id": frame.request_id,
+                "payload": _encoded_bytes(frame.payload),
+                "staged_revision": revision,
+            }
+        )
+        digest = hashlib.sha256(payload).digest()
         ciphertext = self._codec.encrypt(
             "NioIngestFrame",
             (frame.frame_id,),
-            frame.payload,
+            payload,
             digest,
         )
         cursor = self._transition_execute(
@@ -1100,6 +894,7 @@ class SqliteIngestionJournal:
                 or existing.source_epoch != frame.source_epoch
                 or existing.request_id != frame.request_id
                 or existing.payload != frame.payload
+                or existing.staged_revision != revision
             ):
                 raise JournalIntegrityError(
                     "frame_id collides with different authenticated contents"
@@ -1119,12 +914,43 @@ class SqliteIngestionJournal:
             bytes(row["payload_ciphertext"]),
             bytes(row["payload_sha256"]),
         )
+        envelope = _load_json_object(payload)
+        if set(envelope) != {
+            "source_epoch",
+            "request_id",
+            "payload",
+            "staged_revision",
+        }:
+            raise JournalIntegrityError("frame authenticated envelope is invalid")
+        source_epoch = envelope["source_epoch"]
+        request_id = envelope["request_id"]
+        staged_revision = envelope["staged_revision"]
+        if any(
+            type(value) is not int
+            for value in (source_epoch, request_id, staged_revision)
+        ):
+            raise JournalIntegrityError("frame authenticated metadata is invalid")
+        try:
+            frame_payload = _decoded_bytes(envelope["payload"], "frame payload")
+        except ValueError as error:
+            raise JournalIntegrityError(
+                "frame authenticated payload is invalid"
+            ) from error
+        assert frame_payload is not None
+        if (
+            source_epoch != row["source_epoch"]
+            or request_id != row["request_id"]
+            or staged_revision != row["staged_revision"]
+        ):
+            raise JournalIntegrityError(
+                "frame columns do not match authenticated metadata"
+            )
         return StagedFrame(
             frame_id,
-            row["source_epoch"],
-            row["request_id"],
-            payload,
-            row["staged_revision"],
+            source_epoch,
+            request_id,
+            frame_payload,
+            staged_revision,
         )
 
     def _write_batch(
@@ -1209,8 +1035,28 @@ class SqliteIngestionJournal:
             bytes(row["payload_ciphertext"]),
             digest,
         )
-        record = _record_from_dict(_load_json_object(payload))
-        if row["canonical_bytes"] != len(payload):
+        envelope = _load_json_object(payload)
+        if set(envelope) != {
+            "ready_order",
+            "record",
+            "source_frame_id",
+            "created_revision",
+        }:
+            raise JournalIntegrityError("ready authenticated envelope is invalid")
+        ready_order = envelope["ready_order"]
+        created_revision = envelope["created_revision"]
+        source_frame_value = envelope["source_frame_id"]
+        if type(ready_order) is not int or type(created_revision) is not int:
+            raise JournalIntegrityError("ready authenticated metadata is invalid")
+        try:
+            source_frame_id = (
+                UUID(source_frame_value) if source_frame_value is not None else None
+            )
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError("ready source_frame_id is invalid") from error
+        record = _record_from_dict(envelope["record"])
+        record_payload = _canonical_json(_record_to_dict(record))
+        if row["canonical_bytes"] != len(record_payload):
             raise JournalIntegrityError(
                 "ready canonical_bytes does not match canonical payload"
             )
@@ -1224,20 +1070,20 @@ class SqliteIngestionJournal:
             record.room_id != row["room_id"]
             or record.membership_epoch != row["membership_epoch"]
             or expected_sequence != row["room_sequence"]
+            or ready_order != row["ready_order"]
+            or (str(source_frame_id) if source_frame_id is not None else None)
+            != row["source_frame_id"]
+            or created_revision != row["created_revision"]
         ):
             raise JournalIntegrityError(
                 "ready record columns do not match authenticated payload"
             )
         return ReadyRecord(
-            row["ready_order"],
+            ready_order,
             record,
-            (
-                UUID(row["source_frame_id"])
-                if row["source_frame_id"] is not None
-                else None
-            ),
+            source_frame_id,
             row["canonical_bytes"],
-            row["created_revision"],
+            created_revision,
         )
 
     def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]:

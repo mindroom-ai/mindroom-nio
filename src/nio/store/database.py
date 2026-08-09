@@ -16,9 +16,9 @@ import hashlib
 import json
 import os
 import sqlite3
-from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import InitVar, asdict, dataclass, field
 from functools import wraps
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from Crypto.Cipher import AES
@@ -63,6 +63,10 @@ from . import (
     SyncRecoveryGaps,
     SyncTokens,
 )
+from ._sync_journal_preflight import (
+    StableFileLock,
+    database_has_ingestion_marker,
+)
 from .log import logger
 
 if TYPE_CHECKING:
@@ -83,29 +87,6 @@ _RECOVERY_TAG_SIZE = 16
 # SQLite's legacy 999-variable statement limit.
 _RECOVERY_WRITE_CHUNK_SIZE = 80
 _RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
-_INGESTION_STORE_BOOTSTRAP: ContextVar[StoreBootstrap | None] = ContextVar(
-    "nio_ingestion_store_bootstrap",
-    default=None,
-)
-
-
-def _database_has_ingestion_marker(database_path: str) -> bool:
-    if not os.path.exists(database_path) or os.path.getsize(database_path) == 0:
-        return False
-    connection = sqlite3.connect(
-        f"file:{os.path.abspath(database_path)}?mode=ro",
-        uri=True,
-    )
-    try:
-        return (
-            connection.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'NioIngestMeta'"
-            ).fetchone()
-            is not None
-        )
-    finally:
-        connection.close()
 
 
 def _open_matrix_store_from_ingestion(
@@ -116,17 +97,14 @@ def _open_matrix_store_from_ingestion(
     if not isinstance(store_class, type) or not issubclass(store_class, MatrixStore):
         raise TypeError("store_class must be a MatrixStore subclass")
     bootstrap.journal._assert_open()
-    token = _INGESTION_STORE_BOOTSTRAP.set(bootstrap)
-    try:
-        return store_class(
-            bootstrap.journal.account_id,
-            bootstrap.journal.device_id,
-            str(bootstrap.database_path.parent),
-            pickle_key=pickle_key,
-            database_name=bootstrap.database_path.name,
-        )
-    finally:
-        _INGESTION_STORE_BOOTSTRAP.reset(token)
+    return store_class(
+        bootstrap.journal.account_id,
+        bootstrap.journal.device_id,
+        str(bootstrap.database_path.parent),
+        pickle_key=pickle_key,
+        database_name=bootstrap.database_path.name,
+        _ingestion_bootstrap=bootstrap,
+    )
 
 
 def _recovery_payload_aad(
@@ -202,6 +180,7 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
+    _ingestion_bootstrap: InitVar[StoreBootstrap | None] = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -429,23 +408,26 @@ class MatrixStore:
         if self._repair_recovery_abandonment_schema():
             self._seed_terminal_recovery_abandonments()
 
-    def __post_init__(self):
+    def __post_init__(self, _ingestion_bootstrap: StoreBootstrap | None) -> None:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
-        bootstrap = _INGESTION_STORE_BOOTSTRAP.get()
-        marker_exists = _database_has_ingestion_marker(self.database_path)
-        if marker_exists:
-            if bootstrap is None:
+        if _ingestion_bootstrap is not None:
+            if not database_has_ingestion_marker(self.database_path):
+                raise LocalProtocolError(
+                    "StoreBootstrap marker disappeared before store open"
+                )
+            self._post_init_ingestion_store(_ingestion_bootstrap)
+            return
+
+        with StableFileLock(Path(self.database_path)):
+            if database_has_ingestion_marker(self.database_path):
                 raise LocalProtocolError(
                     "this database is owned by ingestion v1; direct legacy store "
                     "construction is unsupported"
                 )
-            self._post_init_ingestion_store(bootstrap)
-            return
-        if bootstrap is not None:
-            raise LocalProtocolError(
-                "StoreBootstrap marker disappeared before store open"
-            )
+            self._post_init_legacy_store()
+
+    def _post_init_legacy_store(self) -> None:
 
         self.database = self._create_database()
         self.database.connect()

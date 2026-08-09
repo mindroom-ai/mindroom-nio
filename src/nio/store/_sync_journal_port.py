@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+from uuid import UUID
+
+from ..ingest.model import BatchRef, LossRecord, SyncBatch
+from ..ingest.state import (
+    AckOutcome,
+    CommitResult,
+    JournalTransition,
+    OwnerView,
+    ReadyRecord,
+    RoomAggregate,
+    SourceState,
+    StagedFrame,
+)
+
+
+@runtime_checkable
+class IngestionJournal(Protocol):
+    """Dependency-light durable journal port for ingestion actors and fakes."""
+
+    def load_owner(self) -> OwnerView: ...
+
+    def load_source(self) -> SourceState | None: ...
+
+    def load_rooms(
+        self,
+        room_ids: frozenset[str],
+    ) -> dict[str, RoomAggregate]: ...
+
+    def load_ready_heads(self, limit: int) -> tuple[ReadyRecord, ...]: ...
+
+    def load_frame(self, frame_id: UUID) -> StagedFrame | None: ...
+
+    def load_loss(self, loss_id: str) -> LossRecord | None: ...
+
+    def commit(
+        self,
+        *,
+        expected_revision: int,
+        writer_epoch: UUID,
+        transition: JournalTransition,
+    ) -> CommitResult: ...
+
+    def oldest_unacknowledged(self) -> SyncBatch | None: ...
+
+    def acknowledge(self, ref: BatchRef) -> AckOutcome: ...

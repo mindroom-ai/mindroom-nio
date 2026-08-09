@@ -14,6 +14,8 @@ CREATE TABLE NioIngestMeta (
     consumer_attached_revision INTEGER,
     revision INTEGER NOT NULL,
     writer_epoch TEXT NOT NULL,
+    lock_device INTEGER NOT NULL,
+    lock_inode INTEGER NOT NULL,
     next_source_epoch INTEGER NOT NULL,
     next_ready_order INTEGER NOT NULL,
     next_batch_sequence INTEGER NOT NULL,

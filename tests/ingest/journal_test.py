@@ -1,6 +1,7 @@
 import hashlib
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -66,6 +67,50 @@ STREAM_ID = UUID("33333333-3333-3333-3333-333333333333")
 
 JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
+
+
+def test_store_public_surface_exposes_only_ingestion_bootstrap() -> None:
+    import nio.store as store_api
+
+    assert store_api.StoreBootstrap is not None
+    assert store_api.open_ingestion_store is not None
+    assert not hasattr(store_api, "EncryptedRowCodec")
+    assert not hasattr(store_api, "IngestionJournal")
+    assert not hasattr(store_api, "SqliteIngestionJournal")
+
+
+def test_internal_journal_protocol_accepts_a_dependency_free_recording_fake() -> None:
+    from nio.store._sync_journal_port import IngestionJournal
+
+    class RecordingJournal:
+        def load_owner(self):
+            return None
+
+        def load_source(self):
+            return None
+
+        def load_rooms(self, room_ids):
+            return {}
+
+        def load_ready_heads(self, limit):
+            return ()
+
+        def load_frame(self, frame_id):
+            return None
+
+        def load_loss(self, loss_id):
+            return None
+
+        def commit(self, *, expected_revision, writer_epoch, transition):
+            return None
+
+        def oldest_unacknowledged(self):
+            return None
+
+        def acknowledge(self, ref):
+            return AckOutcome.ACKNOWLEDGED
+
+    assert isinstance(RecordingJournal(), IngestionJournal)
 
 
 def test_ingestion_config_enforces_frozen_resource_ceilings() -> None:
@@ -321,7 +366,7 @@ def test_existing_v1_schema_is_validated_without_repair(tmp_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TABLE NioIngestBatch")
 
-    with pytest.raises(LocalProtocolError, match="incomplete"):
+    with pytest.raises(LocalProtocolError, match="topology"):
         open_ingestion_store(
             tmp_path,
             account_id=ACCOUNT_ID,
@@ -330,6 +375,193 @@ def test_existing_v1_schema_is_validated_without_repair(tmp_path: Path) -> None:
         )
 
     assert "NioIngestBatch" not in _table_names(database_path)
+
+
+def _rewrite_table_sql(
+    connection: sqlite3.Connection,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    original = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()[0]
+    changed = original.replace(old, new)
+    assert changed != original
+    schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    connection.execute("PRAGMA writable_schema = ON")
+    connection.execute(
+        "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+        (changed, table),
+    )
+    connection.execute("PRAGMA writable_schema = OFF")
+    connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "column",
+        "missing_index",
+        "unexpected_index",
+        "foreign_key",
+        "primary_key",
+        "check_constraint",
+        "view",
+    ),
+)
+def test_existing_v1_open_rejects_every_topology_drift_before_epoch_write(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    database_path = tmp_path / f"{mutation}.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=database_path.name,
+    )
+    writer_epoch = str(bootstrap.journal.writer_epoch)
+    bootstrap.close()
+
+    with sqlite3.connect(database_path) as connection:
+        if mutation == "column":
+            connection.execute("ALTER TABLE NioIngestFrame ADD COLUMN unexpected TEXT")
+        elif mutation == "missing_index":
+            connection.execute("DROP INDEX NioIngestRoomLane_ready")
+        elif mutation == "unexpected_index":
+            connection.execute(
+                "CREATE INDEX NioIngestFrame_unexpected "
+                "ON NioIngestFrame(account_id)"
+            )
+        elif mutation == "foreign_key":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestFrame",
+                "account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id)",
+                "account_id TEXT NOT NULL",
+            )
+        elif mutation == "primary_key":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestFrame",
+                "PRIMARY KEY (account_id, frame_id)",
+                "UNIQUE (account_id, frame_id)",
+            )
+        elif mutation == "check_constraint":
+            _rewrite_table_sql(
+                connection,
+                "NioIngestSourceState",
+                "active INTEGER NOT NULL CHECK (active IN (0, 1))",
+                "active INTEGER NOT NULL",
+            )
+        else:
+            connection.execute(
+                "CREATE VIEW NioIngestUnexpectedView AS "
+                "SELECT account_id FROM NioIngestMeta"
+            )
+
+    with pytest.raises(LocalProtocolError, match="topology"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name=database_path.name,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT writer_epoch FROM NioIngestMeta WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchone()[0]
+            == writer_epoch
+        )
+
+
+def test_existing_v1_open_rejects_multiple_marker_rows_before_epoch_write(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=database_path.name,
+    )
+    writer_epoch = str(bootstrap.journal.writer_epoch)
+    bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO NioIngestMeta SELECT ?, device_id, schema_version, "
+            "stream_id, binding_operation_id, journal_generation, "
+            "consumer_generation, consumer_first_sequence, baseline_rooms_sha256, "
+            "consumer_attached_revision, revision, writer_epoch, lock_device, "
+            "lock_inode, next_source_epoch, next_ready_order, "
+            "next_batch_sequence, last_acked_sequence, last_acked_batch_id, "
+            "last_acked_sha256, created_at_ns "
+            "FROM NioIngestMeta WHERE account_id = ?",
+            ("@mallory:example.org", ACCOUNT_ID),
+        )
+
+    with pytest.raises(LocalProtocolError, match="marker row"):
+        open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name=database_path.name,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT DISTINCT writer_epoch FROM NioIngestMeta"
+        ).fetchall() == [(writer_epoch,)]
+
+
+def test_unexpected_trigger_is_rejected_before_it_can_mutate_legacy_state(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=database_path.name,
+    )
+    writer_epoch = str(bootstrap.journal.writer_epoch)
+    bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE SyncTokens (token TEXT NOT NULL)")
+        connection.execute(
+            "CREATE TRIGGER unexpected_ingest_meta_update "
+            "AFTER UPDATE OF writer_epoch ON NioIngestMeta "
+            "BEGIN INSERT INTO SyncTokens VALUES ('triggered'); END"
+        )
+
+    error: BaseException | None = None
+    try:
+        reopened = open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name=database_path.name,
+        )
+    except BaseException as caught:
+        error = caught
+    else:
+        reopened.close()
+
+    assert isinstance(error, LocalProtocolError)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT * FROM SyncTokens").fetchall() == []
+        assert (
+            connection.execute(
+                "SELECT writer_epoch FROM NioIngestMeta WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchone()[0]
+            == writer_epoch
+        )
 
 
 def test_nonempty_unmarked_database_is_refused_without_sql_write(
@@ -377,7 +609,7 @@ def test_v1_marker_blocks_legacy_store_but_bootstrap_opens_only_e2ee_tables(
         database_name="journal.db",
     )
     try:
-        with pytest.raises(LocalProtocolError, match="ingestion v1"):
+        with pytest.raises(LocalProtocolError, match="writer lock|ingestion v1"):
             SqliteStore(
                 ACCOUNT_ID,
                 DEVICE_ID,
@@ -404,6 +636,78 @@ def test_v1_marker_blocks_legacy_store_but_bootstrap_opens_only_e2ee_tables(
             store.database.close()
     finally:
         bootstrap.close()
+
+
+def test_concurrent_v1_and_legacy_initialization_cannot_interleave(
+    tmp_path: Path,
+) -> None:
+    marker_is_uncommitted = threading.Event()
+    allow_v1_commit = threading.Event()
+    legacy_passed_marker_check = threading.Event()
+    legacy_finished = threading.Event()
+    v1_result: list[object] = []
+    legacy_result: list[object] = []
+
+    class ObservedLegacyStore(SqliteStore):
+        def _create_database(self):
+            legacy_passed_marker_check.set()
+            return super()._create_database()
+
+    def pause_after_marker(label: str) -> None:
+        if label == "create_meta":
+            marker_is_uncommitted.set()
+            assert allow_v1_commit.wait(timeout=5)
+
+    def initialize_v1() -> None:
+        try:
+            bootstrap = open_ingestion_store(
+                tmp_path,
+                account_id=ACCOUNT_ID,
+                device_id=DEVICE_ID,
+                database_name="journal.db",
+                schema_statement_hook=pause_after_marker,
+            )
+            v1_result.append("opened")
+            assert legacy_finished.wait(timeout=5)
+            bootstrap.close()
+        except BaseException as error:
+            v1_result.append(error)
+
+    def initialize_legacy() -> None:
+        try:
+            store = ObservedLegacyStore(
+                ACCOUNT_ID,
+                DEVICE_ID,
+                str(tmp_path),
+                database_name="journal.db",
+            )
+            legacy_result.append("opened")
+            store.database.close()
+        except BaseException as error:
+            legacy_result.append(error)
+        finally:
+            legacy_finished.set()
+
+    v1_thread = threading.Thread(target=initialize_v1)
+    legacy_thread = threading.Thread(target=initialize_legacy)
+    v1_thread.start()
+    assert marker_is_uncommitted.wait(timeout=5)
+    legacy_thread.start()
+    legacy_passed_marker_check.wait(timeout=1)
+    allow_v1_commit.set()
+    v1_thread.join(timeout=5)
+    legacy_thread.join(timeout=5)
+    assert not v1_thread.is_alive()
+    assert not legacy_thread.is_alive()
+
+    assert v1_result == ["opened"]
+    assert len(legacy_result) == 1
+    assert isinstance(legacy_result[0], LocalProtocolError)
+    assert not {
+        "synctokens",
+        "pendingtimelineevents",
+        "slidingwindowtokens",
+    } & _table_names(tmp_path / "journal.db")
 
 
 def test_e2ee_bootstrap_creation_is_writer_epoch_fenced(
@@ -734,6 +1038,93 @@ def test_bootstrap_rejects_database_path_replaced_after_lock_acquisition(
             bootstrap.open_matrix_store(SqliteStore)
     finally:
         bootstrap.close()
+
+
+def _replace_lock_path(database_path: Path) -> None:
+    lock_path = Path(f"{database_path}.ingest.lock")
+    lock_path.unlink()
+    lock_path.write_bytes(b"replacement")
+
+
+def test_current_owner_fails_closed_when_retained_lock_path_is_replaced(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name="journal.db",
+    )
+    try:
+        _replace_lock_path(tmp_path / "journal.db")
+
+        with pytest.raises(LocalProtocolError, match="lock file identity"):
+            bootstrap.journal.load_owner()
+    finally:
+        bootstrap.close()
+
+
+def test_replaced_lock_path_cannot_admit_second_owner_or_mutate_state(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        database_name=database_path.name,
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    writer_epoch = str(bootstrap.journal.writer_epoch)
+    with sqlite3.connect(database_path) as connection:
+        e2ee_tables = _table_names(database_path) - {
+            table
+            for table in _table_names(database_path)
+            if table.startswith("NioIngest")
+        }
+        store_versions = connection.execute(
+            "SELECT version FROM storeversion"
+        ).fetchall()
+    _replace_lock_path(database_path)
+
+    second = None
+    error: BaseException | None = None
+    try:
+        second = open_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            database_name=database_path.name,
+        )
+    except BaseException as caught:
+        error = caught
+    finally:
+        if second is not None:
+            second.close()
+        bootstrap.close()
+
+    assert isinstance(error, LocalProtocolError)
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT writer_epoch FROM NioIngestMeta WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchone()[0]
+            == writer_epoch
+        )
+        assert (
+            _table_names(database_path)
+            - {
+                table
+                for table in _table_names(database_path)
+                if table.startswith("NioIngest")
+            }
+            == e2ee_tables
+        )
+        assert (
+            connection.execute("SELECT version FROM storeversion").fetchall()
+            == store_versions
+        )
 
 
 def test_encrypted_row_codec_authenticates_every_aad_dimension() -> None:
@@ -1272,6 +1663,98 @@ def _batch_event(sequence: int) -> EventRecord:
         f'{{"sequence":{sequence}}}'.encode(),
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_frame_read_authenticates_every_returned_metadata_field(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    frame = StagedFrame(
+        UUID("55555555-5555-5555-5555-555555555555"),
+        4,
+        9,
+        b'{"raw":true}',
+    )
+    try:
+        bootstrap.journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(frames=(frame,)),
+        )
+        for column, original, forged in (
+            ("source_epoch", 4, 99),
+            ("request_id", 9, 88),
+            ("staged_revision", 2, 77),
+        ):
+            bootstrap.journal.connection.execute(
+                f"UPDATE NioIngestFrame SET {column} = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (forged, ACCOUNT_ID, str(frame.frame_id)),
+            )
+            with pytest.raises(JournalIntegrityError, match="frame"):
+                bootstrap.journal.load_frame(frame.frame_id)
+            bootstrap.journal.connection.execute(
+                f"UPDATE NioIngestFrame SET {column} = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (original, ACCOUNT_ID, str(frame.frame_id)),
+            )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_read_authenticates_every_returned_metadata_field(
+    tmp_path: Path,
+) -> None:
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        pickle_key="secret",
+        database_name="journal.db",
+    )
+    await bootstrap.attach_consumer(_consumer_bootstrap(bootstrap))
+    source_frame_id = UUID("55555555-5555-5555-5555-555555555555")
+    event = _batch_event(1)
+    try:
+        bootstrap.journal.commit(
+            expected_revision=1,
+            writer_epoch=bootstrap.journal.writer_epoch,
+            transition=JournalTransition(
+                ready_records=(ReadyRecord(0, event, source_frame_id),),
+            ),
+        )
+        for column, original, forged in (
+            ("ready_order", 0, 99),
+            (
+                "source_frame_id",
+                str(source_frame_id),
+                "66666666-6666-6666-6666-666666666666",
+            ),
+            ("created_revision", 2, 77),
+        ):
+            bootstrap.journal.connection.execute(
+                f"UPDATE NioIngestReadyRecord SET {column} = ? "
+                "WHERE account_id = ? AND record_id = ?",
+                (forged, ACCOUNT_ID, event.record_id),
+            )
+            with pytest.raises(JournalIntegrityError, match="ready"):
+                bootstrap.journal.load_ready_heads(limit=1)
+            bootstrap.journal.connection.execute(
+                f"UPDATE NioIngestReadyRecord SET {column} = ? "
+                "WHERE account_id = ? AND record_id = ?",
+                (original, ACCOUNT_ID, event.record_id),
+            )
+    finally:
+        bootstrap.close()
 
 
 @pytest.mark.asyncio
