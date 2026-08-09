@@ -1489,7 +1489,7 @@ async def _collect_slice(
                 ),
                 timeout=remaining,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Limited-timeline recovery timed out in %s", gap.room_id)
             break
         except Exception:
@@ -1708,7 +1708,7 @@ async def _drain_gap(
             callback_error = error.error
         except _DispatchFinishError as error:
             raise error.error from error
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Recovered event callback timed out: %s", pending.event_id)
             return
         except Exception:

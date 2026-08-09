@@ -691,6 +691,30 @@ def test_malformed_or_unsupported_success_is_terminal_and_retains_evidence(
     assert result.detail
 
 
+@pytest.mark.parametrize(
+    ("depth", "expected_kind"),
+    [
+        (256, SourceResultKind.FRAME),
+        (257, SourceResultKind.TERMINAL_ERROR),
+    ],
+)
+def test_json_nesting_limit_is_independent_of_python_parser_depth(
+    classic_source: ClassicSource,
+    depth: int,
+    expected_kind: SourceResultKind,
+) -> None:
+    request = classic_source.plan_request(
+        _source_state(ClassicCursor("s-prior")),
+        request_id=9,
+    )
+    assert request is not None
+    body = b'{"next_batch":"s","value":' + (b"[" * depth) + (b"]" * depth) + b"}"
+
+    result = classic_source.normalize(request, _network_result(request, body))
+
+    assert result.kind is expected_kind
+
+
 def test_arbitrary_nonnegative_one_time_key_algorithms_are_retained(
     classic_source: ClassicSource,
 ) -> None:

@@ -1,8 +1,8 @@
 from collections.abc import Iterable
-from enum import Enum
+from enum import StrEnum
 
 
-class RecoveryAbandonment(str, Enum):
+class RecoveryAbandonment(StrEnum):
     """Why nio stopped recovering a room's limited-timeline gap.
 
     Abandonment covers situations an application has to treat differently, and

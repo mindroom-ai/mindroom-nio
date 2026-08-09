@@ -103,8 +103,8 @@ async def register(homeserver: str, name: str, store: bool = False) -> AsyncClie
     return client
 
 
-async def _wait_for(predicate, timeout: float = 30.0) -> bool:
-    deadline = time.monotonic() + timeout
+async def _wait_for(predicate, deadline_seconds: float = 30.0) -> bool:
+    deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < deadline:
         if predicate():
             return True
@@ -112,8 +112,11 @@ async def _wait_for(predicate, timeout: float = 30.0) -> bool:
     return predicate()
 
 
-async def _wait_server_up(client: AsyncClient, timeout: float = 60.0) -> bool:
-    deadline = time.monotonic() + timeout
+async def _wait_server_up(
+    client: AsyncClient,
+    deadline_seconds: float = 60.0,
+) -> bool:
+    deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < deadline:
         try:
             resp = await client.send("GET", "/_matrix/client/versions", timeout=2)
@@ -267,7 +270,10 @@ async def restart_checks(
     )
     check(
         "restart: loop recovers and delivers after the restart",
-        await _wait_for(lambda: counts.get("restart-after") == 1, timeout=90),
+        await _wait_for(
+            lambda: counts.get("restart-after") == 1,
+            deadline_seconds=90,
+        ),
         repr(counts),
     )
     check(

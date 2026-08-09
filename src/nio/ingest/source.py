@@ -9,6 +9,7 @@ from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
 from .state import SourceState
 
 MATRIX_CANONICAL_INTEGER_MAX = (1 << 53) - 1
+_MAX_JSON_CONTAINER_DEPTH = 257
 
 
 def _reject_json_constant(value: str) -> None:
@@ -35,11 +36,35 @@ def _object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _validate_json_nesting(text: str, field_name: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_JSON_CONTAINER_DEPTH:
+                raise ValueError(f"{field_name} exceeds the JSON nesting limit")
+        elif character in "]}":
+            depth -= 1
+
+
 def load_json(data: bytes, field_name: str) -> Any:
     if type(data) is not bytes:
         raise TypeError(f"{field_name} must be bytes")
     try:
         text = data.decode("utf-8")
+        _validate_json_nesting(text, field_name)
         return json.loads(
             text,
             parse_constant=_reject_json_constant,

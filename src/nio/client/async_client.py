@@ -315,8 +315,6 @@ _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
 
 _ProfileGetDisplayNameT = ProfileGetDisplayNameResponse | ProfileGetDisplayNameError
 _ProfileSetDisplayNameT = ProfileSetDisplayNameResponse | ProfileSetDisplayNameError
-_RunToCompletionT = TypeVar("_RunToCompletionT")
-
 _ChangePasswordT = ChangePasswordResponse | ChangePasswordError
 _RoomMembershipResponseT = TypeVar(
     "_RoomMembershipResponseT",
@@ -409,9 +407,9 @@ class _CallbackScope:
     active: bool = True
 
 
-async def _run_to_completion(
-    operation: Coroutine[Any, Any, _RunToCompletionT],
-) -> _RunToCompletionT:
+async def _run_to_completion[RunToCompletionT](
+    operation: Coroutine[Any, Any, RunToCompletionT],
+) -> RunToCompletionT:
     """Drain owned work through repeated cancellation before propagating it."""
     task = asyncio.create_task(operation)
     cancellations = 0
@@ -2749,7 +2747,7 @@ class AsyncClient(Client):
                 else:
                     break
 
-            except (ClientConnectionError, TimeoutError, asyncio.TimeoutError):
+            except (ClientConnectionError, TimeoutError):
                 got_timeouts += 1
 
                 if max_timeouts is not None and got_timeouts > max_timeouts:
