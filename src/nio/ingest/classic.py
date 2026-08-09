@@ -1,6 +1,5 @@
 import hashlib
 from dataclasses import dataclass
-from typing import Any
 from uuid import UUID, uuid5
 
 from .config import ClassicSourceConfig
@@ -19,6 +18,11 @@ from .source import (
     load_json,
     malformed_success_result,
     normalize_source_error,
+    require_json_event_container,
+    require_json_events,
+    require_json_object,
+    require_json_string,
+    require_json_strings,
     validate_network_result_identity,
 )
 from .state import SourceState
@@ -174,13 +178,13 @@ class ClassicSource:
 
     def _normalize_frame(self, request: NetworkRequest, body: bytes) -> SyncFrame:
         root = load_json(body, "sync response")
-        root = self._object(root, "sync response")
-        next_batch = self._string(root.get("next_batch"), "next_batch")
+        root = require_json_object(root, "sync response")
+        next_batch = require_json_string(root.get("next_batch"), "next_batch")
         source_json = canonical_json(root)
         request_cursor = _classic_cursor_from_json(request.request_cursor_json)
         request_cursor_json = canonical_classic_cursor(request_cursor)
 
-        rooms = self._object(root.get("rooms", {}), "rooms")
+        rooms = require_json_object(root.get("rooms", {}), "rooms")
         unknown_sections = set(rooms) - {
             section.value for section in _CLASSIC_ROOM_SECTIONS
         }
@@ -192,14 +196,17 @@ class ClassicSource:
         seen_room_ids: set[str] = set()
         initial = request_cursor.next_batch is None
         for section in _CLASSIC_ROOM_SECTIONS:
-            section_rooms = self._object(rooms.get(section.value, {}), section.value)
+            section_rooms = require_json_object(
+                rooms.get(section.value, {}),
+                section.value,
+            )
             for room_id in sorted(section_rooms):
                 if type(room_id) is not str or not room_id:
                     raise ValueError("room IDs must be nonempty strings")
                 if room_id in seen_room_ids:
                     raise ValueError(f"room appears in multiple sections: {room_id}")
                 seen_room_ids.add(room_id)
-                room = self._object(
+                room = require_json_object(
                     section_rooms[room_id],
                     f"rooms.{section.value}.{room_id}",
                 )
@@ -212,12 +219,15 @@ class ClassicSource:
                     RoomSection.JOIN: "state",
                     RoomSection.LEAVE: "state",
                 }[section]
-                state = self._event_container(room.get(state_key, {}), state_key)
-                timeline_container = self._object(
+                state = require_json_event_container(
+                    room.get(state_key, {}),
+                    state_key,
+                )
+                timeline_container = require_json_object(
                     room.get("timeline", {}),
                     "timeline",
                 )
-                timeline = self._events(
+                timeline = require_json_events(
                     timeline_container.get("events", []),
                     "timeline.events",
                 )
@@ -227,11 +237,11 @@ class ClassicSource:
                 prev_batch = timeline_container.get("prev_batch")
                 if prev_batch is not None and type(prev_batch) is not str:
                     raise ValueError("timeline.prev_batch must be string or null")
-                account_data = self._event_container(
+                account_data = require_json_event_container(
                     room.get("account_data", {}),
                     "account_data",
                 )
-                ephemeral_events = self._event_container(
+                ephemeral_events = require_json_event_container(
                     room.get("ephemeral", {}),
                     "ephemeral",
                 )
@@ -258,19 +268,27 @@ class ClassicSource:
                     )
                 )
 
-        device_lists = self._object(root.get("device_lists", {}), "device_lists")
+        device_lists = require_json_object(
+            root.get("device_lists", {}),
+            "device_lists",
+        )
         changed = sorted(
             set(
-                self._strings(
+                require_json_strings(
                     device_lists.get("changed", []),
                     "device_lists.changed",
                 )
             )
         )
         left = sorted(
-            set(self._strings(device_lists.get("left", []), "device_lists.left"))
+            set(
+                require_json_strings(
+                    device_lists.get("left", []),
+                    "device_lists.left",
+                )
+            )
         )
-        key_counts = self._object(
+        key_counts = require_json_object(
             root.get("device_one_time_keys_count", {}),
             "device_one_time_keys_count",
         )
@@ -284,7 +302,7 @@ class ClassicSource:
         if "device_unused_fallback_key_types" in root:
             fallback = sorted(
                 set(
-                    self._strings(
+                    require_json_strings(
                         fallback,
                         "device_unused_fallback_key_types",
                     )
@@ -311,7 +329,7 @@ class ClassicSource:
             source_json=source_json,
             to_device_json=tuple(
                 canonical_json(event)
-                for event in self._event_container(
+                for event in require_json_event_container(
                     root.get("to_device", {}),
                     "to_device",
                 )
@@ -323,52 +341,16 @@ class ClassicSource:
             ephemeral_json=tuple(ephemeral),
             global_account_data_json=tuple(
                 canonical_json(event)
-                for event in self._event_container(
+                for event in require_json_event_container(
                     root.get("account_data", {}),
                     "account_data",
                 )
             ),
             presence_json=tuple(
                 canonical_json(event)
-                for event in self._event_container(
+                for event in require_json_event_container(
                     root.get("presence", {}),
                     "presence",
                 )
             ),
         )
-
-    @staticmethod
-    def _object(value: Any, field_name: str) -> dict[str, Any]:
-        if type(value) is not dict:
-            raise ValueError(f"{field_name} must be an object")
-        return value
-
-    @classmethod
-    def _events(cls, value: Any, field_name: str) -> list[dict[str, Any]]:
-        if type(value) is not list:
-            raise ValueError(f"{field_name} must be an array")
-        for event in value:
-            if type(event) is not dict:
-                raise ValueError(f"{field_name} elements must be objects")
-        return value
-
-    @classmethod
-    def _event_container(
-        cls,
-        value: Any,
-        field_name: str,
-    ) -> list[dict[str, Any]]:
-        container = cls._object(value, field_name)
-        return cls._events(container.get("events", []), f"{field_name}.events")
-
-    @staticmethod
-    def _string(value: Any, field_name: str) -> str:
-        if type(value) is not str:
-            raise ValueError(f"{field_name} must be a string")
-        return value
-
-    @staticmethod
-    def _strings(value: Any, field_name: str) -> list[str]:
-        if type(value) is not list or any(type(item) is not str for item in value):
-            raise ValueError(f"{field_name} must be an array of strings")
-        return value

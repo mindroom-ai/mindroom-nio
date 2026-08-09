@@ -64,6 +64,58 @@ def canonical_json(value: Any) -> bytes:
         raise ValueError("JSON value exceeds the canonical nesting limit") from error
 
 
+def require_json_object(value: Any, field_name: str) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError(f"{field_name} must be an object")
+    return value
+
+
+def require_json_array(value: Any, field_name: str) -> list[Any]:
+    if type(value) is not list:
+        raise ValueError(f"{field_name} must be an array")
+    return value
+
+
+def require_json_events(value: Any, field_name: str) -> list[dict[str, Any]]:
+    events = require_json_array(value, field_name)
+    if any(type(event) is not dict for event in events):
+        raise ValueError(f"{field_name} must contain event objects")
+    return events
+
+
+def require_json_strings(value: Any, field_name: str) -> list[str]:
+    strings = require_json_array(value, field_name)
+    if any(type(item) is not str for item in strings):
+        raise ValueError(f"{field_name} must contain strings")
+    return strings
+
+
+def require_json_string(value: Any, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a string")
+    return value
+
+
+def require_optional_json_string(value: Any, field_name: str) -> str | None:
+    if value is not None and type(value) is not str:
+        raise ValueError(f"{field_name} must be a string or null")
+    return value
+
+
+def require_json_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be bool")
+    return value
+
+
+def require_json_event_container(
+    value: Any,
+    field_name: str,
+) -> list[dict[str, Any]]:
+    container = require_json_object(value, field_name)
+    return require_json_events(container.get("events", []), f"{field_name}.events")
+
+
 @dataclass(frozen=True, slots=True)
 class ClassicCursor:
     next_batch: str | None
@@ -147,6 +199,10 @@ class RoomSegment:
     expanded_timeline: bool
     live_event_count: int
 
+    @property
+    def history_discontinuity(self) -> bool:
+        return self.timeline_limited or self.initial or self.expanded_timeline
+
     def __post_init__(self) -> None:
         _require_exact(self.room_id, str, "room_id")
         _require_exact(self.section, RoomSection, "section")
@@ -170,6 +226,17 @@ class RoomSegment:
             raise ValueError("room_id must not be empty")
         if not 0 <= self.live_event_count <= len(self.timeline_json):
             raise ValueError("live_event_count must index the timeline suffix")
+        if self.section is RoomSection.UNCHANGED and (
+            self.state_json
+            or self.timeline_json
+            or not self.room_account_data_json
+            or self.timeline_limited
+            or self.timeline_prev_batch is not None
+            or self.initial
+            or self.expanded_timeline
+            or self.live_event_count
+        ):
+            raise ValueError("unchanged room segments must be account-data-only")
 
 
 @dataclass(frozen=True, slots=True)
