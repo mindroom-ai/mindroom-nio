@@ -1,92 +1,20 @@
-import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
+from ._json import (
+    MATRIX_CANONICAL_INTEGER_MAX as MATRIX_CANONICAL_INTEGER_MAX,
+)
+from ._json import (
+    canonical_json as canonical_json,
+)
+from ._json import (
+    load_json as load_json,
+)
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkFailureKind, NetworkRequest, NetworkResult
 from .state import SourceState
-
-MATRIX_CANONICAL_INTEGER_MAX = (1 << 53) - 1
-_MAX_JSON_CONTAINER_DEPTH = 257
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
-def _reject_json_float(value: str) -> None:
-    raise ValueError(f"JSON floats are not canonical: {value}")
-
-
-def _parse_json_integer(value: str) -> int:
-    parsed = int(value)
-    if not -MATRIX_CANONICAL_INTEGER_MAX <= parsed <= MATRIX_CANONICAL_INTEGER_MAX:
-        raise ValueError("JSON integer exceeds the Matrix canonical range")
-    return parsed
-
-
-def _object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def _validate_json_nesting(text: str, field_name: str) -> None:
-    depth = 0
-    in_string = False
-    escaped = False
-    for character in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character in "[{":
-            depth += 1
-            if depth > _MAX_JSON_CONTAINER_DEPTH:
-                raise ValueError(f"{field_name} exceeds the JSON nesting limit")
-        elif character in "]}":
-            depth -= 1
-
-
-def load_json(data: bytes, field_name: str) -> Any:
-    if type(data) is not bytes:
-        raise TypeError(f"{field_name} must be bytes")
-    try:
-        text = data.decode("utf-8")
-        _validate_json_nesting(text, field_name)
-        return json.loads(
-            text,
-            parse_constant=_reject_json_constant,
-            parse_float=_reject_json_float,
-            parse_int=_parse_json_integer,
-            object_pairs_hook=_object_from_pairs,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
-        raise ValueError(f"{field_name} must contain valid UTF-8 JSON") from error
-
-
-def canonical_json(value: Any) -> bytes:
-    try:
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except RecursionError as error:
-        raise ValueError("JSON value exceeds the canonical nesting limit") from error
 
 
 def require_json_object(value: Any, field_name: str) -> dict[str, Any]:
