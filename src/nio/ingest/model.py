@@ -46,7 +46,9 @@ class RecordKind(StrEnum):
 
 class SystemOriginKind(StrEnum):
     FRESH_START = "fresh_start"
+    CONSUMER_RESET = "consumer_reset"
     MEMBERSHIP_CHANGE = "membership_change"
+    SOURCE_REBIND = "source_rebind"
     STORE_VALIDATION = "store_validation"
 
 

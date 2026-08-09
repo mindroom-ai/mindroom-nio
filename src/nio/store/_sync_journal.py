@@ -291,13 +291,12 @@ class SqliteIngestionJournal(JournalRows):
                 frame,
             )
 
-            row = self._connection.execute(
-                "SELECT * FROM NioIngestFrame " "WHERE account_id = ? AND frame_id = ?",
-                (self.account_id, str(frame.frame_id)),
-            ).fetchone()
+            rows = self._frame_rows_for_identity(frame.frame_id)
             self._transition_hook("frame_collision_probe")
-            if row is not None:
-                stored = self._decode_frame_row(frame.frame_id, row, owner)
+            if len(rows) > 1:
+                raise JournalIntegrityError("frame_id has multiple textual identities")
+            if rows:
+                stored = self._decode_frame_row(frame.frame_id, rows[0], owner)
                 if stored.response != frame.response or frame.staged_revision not in (
                     0,
                     stored.staged_revision,

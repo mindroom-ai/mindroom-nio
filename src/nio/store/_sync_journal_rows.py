@@ -36,6 +36,10 @@ _FRAME_FIELDS = (
     "response_body",
     "source_sha256",
 )
+_FRAME_ID_HEX_SQL = (
+    "replace(replace(replace(replace(lower(frame_id), "
+    "'urn:uuid:', ''), '-', ''), '{', ''), '}', '')"
+)
 
 
 def _canonical_internal(value: object) -> bytes:
@@ -291,7 +295,15 @@ class JournalRows:
         owner: OwnerView,
     ) -> StagedFrame:
         try:
-            stored_id = UUID(row["frame_id"])
+            raw_frame_id = row["frame_id"]
+            if type(raw_frame_id) is not str:
+                raise TypeError
+            stored_id = UUID(raw_frame_id)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("persisted frame_id is invalid") from error
+        if raw_frame_id != str(stored_id):
+            raise JournalIntegrityError("persisted frame_id is not canonical")
+        try:
             if stored_id != frame_id or row["account_id"] != self.account_id:
                 raise ValueError("selected frame identity changed")
             source_epoch = row["source_epoch"]
@@ -332,16 +344,23 @@ class JournalRows:
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise JournalIntegrityError("persisted staged frame is invalid") from error
 
+    def _frame_rows_for_identity(self, frame_id: UUID) -> list[sqlite3.Row]:
+        canonical = str(frame_id)
+        return self._connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND "
+            f"(frame_id = ? OR {_FRAME_ID_HEX_SQL} = ?) ORDER BY frame_id",
+            (self.account_id, canonical, frame_id.hex),
+        ).fetchall()
+
     def _load_frame_with_owner(
         self,
         frame_id: UUID,
         owner: OwnerView,
     ) -> StagedFrame | None:
-        row = self._connection.execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
-            (self.account_id, str(frame_id)),
-        ).fetchone()
-        return self._decode_frame_row(frame_id, row, owner) if row is not None else None
+        rows = self._frame_rows_for_identity(frame_id)
+        if len(rows) > 1:
+            raise JournalIntegrityError("frame_id has multiple textual identities")
+        return self._decode_frame_row(frame_id, rows[0], owner) if rows else None
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         if type(frame_id) is not UUID:
@@ -362,6 +381,8 @@ class JournalRows:
                 self._decode_frame_row(UUID(row["frame_id"]), row, owner)
                 for row in rows
             )
+        except JournalIntegrityError:
+            raise
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("selected frame identity is invalid") from error
 
@@ -382,15 +403,15 @@ class JournalRows:
         return self._connection.execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
-            "payload_ciphertext, payload_sha256, staged_revision"
+            "staged_revision, payload_ciphertext, payload_sha256"
             ") VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 self.account_id,
                 str(stored.frame_id),
                 request.source_epoch,
                 request.request_id,
+                staged_revision,
                 ciphertext,
                 digest,
-                staged_revision,
             ),
         )

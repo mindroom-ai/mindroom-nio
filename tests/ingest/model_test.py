@@ -64,7 +64,9 @@ def test_wire_enums_have_stable_string_values() -> None:
     }
     assert {member.name: member.value for member in SystemOriginKind} == {
         "FRESH_START": "fresh_start",
+        "CONSUMER_RESET": "consumer_reset",
         "MEMBERSHIP_CHANGE": "membership_change",
+        "SOURCE_REBIND": "source_rebind",
         "STORE_VALIDATION": "store_validation",
     }
     assert {member.name: member.value for member in LossReason} == {

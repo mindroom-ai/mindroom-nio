@@ -358,6 +358,33 @@ def test_transport_and_system_loss_origins_round_trip() -> None:
     assert isinstance(decoded.records[1].origin, SystemOrigin)
 
 
+@pytest.mark.parametrize("wire_value", ("consumer_reset", "source_rebind"))
+def test_retained_system_loss_origin_values_round_trip(wire_value: str) -> None:
+    kind = SystemOriginKind(wire_value)
+    origin = SystemOrigin(kind, OPERATION_ID)
+    boundary = LossBoundary(None, None, None, None)
+    loss = LossRecord(
+        loss_id(
+            origin,
+            "!system:example.org",
+            0,
+            LossReason.BASELINE_LOST,
+            boundary,
+        ),
+        origin,
+        "!system:example.org",
+        0,
+        LossReason.BASELINE_LOST,
+        boundary,
+        b'{"cause":"reset"}',
+    )
+    batch = make_batch(loss)
+    payload = canonical_batch_payload(batch)
+
+    assert f'"kind":"{wire_value}"'.encode() in payload
+    assert _batch_from_payload(payload) == batch
+
+
 def test_system_loss_rejects_kind_or_operation_inconsistent_with_loss_id() -> None:
     origin = SystemOrigin(SystemOriginKind.FRESH_START, OPERATION_ID)
     boundary = LossBoundary(None, None, None, None)

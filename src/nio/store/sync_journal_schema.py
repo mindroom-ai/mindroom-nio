@@ -64,14 +64,14 @@ SCHEMA_SQL = (
     request_id INTEGER NOT NULL CHECK (
         typeof(request_id) = 'integer' AND request_id >= 0
     ),
+    staged_revision INTEGER NOT NULL CHECK (
+        typeof(staged_revision) = 'integer' AND staged_revision >= 1
+    ),
     payload_ciphertext BLOB NOT NULL CHECK (
         typeof(payload_ciphertext) = 'blob' AND length(payload_ciphertext) >= 29
     ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
-    ),
-    staged_revision INTEGER NOT NULL CHECK (
-        typeof(staged_revision) = 'integer' AND staged_revision >= 1
     ),
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(

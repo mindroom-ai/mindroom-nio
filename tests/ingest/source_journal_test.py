@@ -394,14 +394,14 @@ EXPECTED_DDL = {
         request_id INTEGER NOT NULL CHECK (
             typeof(request_id) = 'integer' AND request_id >= 0
         ),
+        staged_revision INTEGER NOT NULL CHECK (
+            typeof(staged_revision) = 'integer' AND staged_revision >= 1
+        ),
         payload_ciphertext BLOB NOT NULL CHECK (
             typeof(payload_ciphertext) = 'blob' AND length(payload_ciphertext) >= 29
         ),
         payload_sha256 BLOB NOT NULL CHECK (
             typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
-        ),
-        staged_revision INTEGER NOT NULL CHECK (
-            typeof(staged_revision) = 'integer' AND staged_revision >= 1
         ),
         PRIMARY KEY (account_id, frame_id))"""),
     ("index", "NioIngestFrame_drain"): _normalized_sql(
@@ -951,6 +951,44 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
         bootstrap.close()
 
 
+@pytest.mark.parametrize("mutation", ("rename", "copy"))
+@pytest.mark.parametrize("reader", ("load", "list"))
+def test_noncanonical_frame_id_alias_fails_stopped_for_every_read_path(
+    tmp_path: Path,
+    mutation: str,
+    reader: str,
+) -> None:
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    with sqlite3.connect(stage.database_path) as connection:
+        if mutation == "rename":
+            connection.execute(
+                "UPDATE NioIngestFrame SET frame_id = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (frame_id.hex, ACCOUNT_ID, str(frame_id)),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO NioIngestFrame ("
+                "account_id, frame_id, source_epoch, request_id, staged_revision, "
+                "payload_ciphertext, payload_sha256) "
+                "SELECT account_id, ?, source_epoch, request_id, staged_revision, "
+                "payload_ciphertext, payload_sha256 FROM NioIngestFrame "
+                "WHERE account_id = ? AND frame_id = ?",
+                (frame_id.hex, ACCOUNT_ID, str(frame_id)),
+            )
+
+    reopened = _open(tmp_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="frame_id"):
+            if reader == "load":
+                reopened._journal.load_frame(frame_id)
+            else:
+                reopened._journal.list_frames(256)
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("mutation", ("request", "body", "digest", "revision"))
 def test_same_frame_id_changed_content_or_revision_fails_before_dml(
     tmp_path: Path,
@@ -1148,16 +1186,16 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
             )
             connection.execute(
                 "INSERT INTO NioIngestFrame (account_id, frame_id, source_epoch, "
-                "request_id, payload_ciphertext, payload_sha256, staged_revision) "
+                "request_id, staged_revision, payload_ciphertext, payload_sha256) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     ACCOUNT_ID,
                     str(frame.frame_id),
                     frame.response.request.source_epoch,
                     frame.response.request.request_id,
+                    committed.revision,
                     ciphertext,
                     digest,
-                    committed.revision,
                 ),
             )
 
