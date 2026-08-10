@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import hashlib
 import importlib.util
 import json
@@ -51,6 +52,7 @@ SNAPSHOT_FILES = {
     "src/nio/store/_sync_journal_rows.py",
     "tests/ingest/staging_benchmark_test.py",
     "tests/ingest/run_staging_benchmark_corpus.py",
+    "tests/ingest/source_journal_test.py",
     *(f"tests/data/ingest/{name}" for name in FIXTURE_SHA256),
 }
 
@@ -432,6 +434,14 @@ def test_candidate_snapshot_accepts_clean_commit_and_rejects_unexpected_changes(
     assert not (clone / ".superpowers/sdd/.gitignore").exists()
     assert benchmark._verify_snapshot(clone, True, commit, digest) == clean
 
+    ignored = clone / ".pytest_cache/rogue"
+    ignored.parent.mkdir()
+    ignored.write_text("unexpected ignored dirt")
+    with pytest.raises(RuntimeError, match="clean"):
+        benchmark._verify_snapshot(clone, True, commit, digest)
+    ignored.unlink()
+    ignored.parent.rmdir()
+
     fixture = clone / "tests/data/ingest/classic_continuation_1.json"
     fixture.write_bytes(fixture.read_bytes() + b" ")
     with pytest.raises(RuntimeError, match="clean|snapshot"):
@@ -451,7 +461,8 @@ def test_worker_rejects_manifest_mutate_and_restore_during_sample(
 ) -> None:
     benchmark = _module()
     repo, commit, digest = candidate_worktree
-    target = repo / "tests/data/ingest/classic_continuation_1.json"
+    fixture = repo / "tests/data/ingest/classic_continuation_1.json"
+    target = repo / "README.md"
     fake_nio = ModuleType("nio")
     fake_nio.__file__ = str(repo / "src/nio/__init__.py")
     monkeypatch.setitem(sys.modules, "nio", fake_nio)
@@ -469,13 +480,125 @@ def test_worker_rejects_manifest_mutate_and_restore_during_sample(
         mode="candidate",
         expected_candidate_commit=commit,
         expected_snapshot_sha256=digest,
-        fixture=target,
+        fixture=fixture,
         setup_fixture=[],
         busy_timeout_ms=100,
         phase="measured",
     )
     with pytest.raises(RuntimeError, match="changed while sampling"):
         benchmark._worker(args)
+
+
+def test_worker_binds_control_tracked_files_and_external_inputs(
+    tmp_path: Path, control_worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    benchmark = _module()
+    fixture = tmp_path / "fixture.json"
+    setup = tmp_path / "setup.json"
+    fixture.write_bytes((DATA / "classic_continuation_2.json").read_bytes())
+    setup.write_bytes((DATA / "classic_continuation_1.json").read_bytes())
+    stats = benchmark._manifest_stats(control_worktree, [fixture, setup])
+    tracked = (
+        subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=control_worktree,
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .split("\0")
+    )
+    assert set(stats) == {
+        *(str((control_worktree / path).resolve()) for path in tracked if path),
+        str(fixture.resolve()),
+        str(setup.resolve()),
+    }
+    fake_nio = ModuleType("nio")
+    fake_nio.__file__ = str(control_worktree / "src/nio/__init__.py")
+    monkeypatch.setitem(sys.modules, "nio", fake_nio)
+    monkeypatch.setattr(benchmark, "_deny_network", lambda: None)
+
+    def mutate_setup(*_args):
+        replacement = setup.with_suffix(".replacement")
+        replacement.write_bytes(setup.read_bytes())
+        os.replace(replacement, setup)
+        return {}
+
+    monkeypatch.setattr(benchmark, "_floor_sample", mutate_setup)
+    snapshot = benchmark._snapshot(control_worktree, False)
+    args = argparse.Namespace(
+        repo=control_worktree,
+        mode="legacy_normalization_floor",
+        expected_candidate_commit=None,
+        expected_snapshot_sha256=snapshot["snapshot_sha256"],
+        fixture=fixture,
+        setup_fixture=[setup],
+        busy_timeout_ms=100,
+        phase="measured",
+    )
+    with pytest.raises(RuntimeError, match="changed while sampling"):
+        benchmark._worker(args)
+
+
+def test_worker_installs_complete_network_denial_before_target_import(
+    candidate_worktree: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    benchmark = _module()
+    repo, commit, digest = candidate_worktree
+    order: list[str] = []
+    fake_nio = ModuleType("nio")
+    fake_nio.__file__ = str(repo / "src/nio/__init__.py")
+    real_import = builtins.__import__
+
+    def observed_import(name, *args, **kwargs):
+        if name == "nio":
+            order.append("import")
+            return fake_nio
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", observed_import)
+    monkeypatch.setattr(benchmark, "_deny_network", lambda: order.append("deny"))
+    monkeypatch.setattr(benchmark, "_candidate_sample", lambda *_args: {})
+    benchmark._worker(
+        argparse.Namespace(
+            repo=repo,
+            mode="candidate",
+            expected_candidate_commit=commit,
+            expected_snapshot_sha256=digest,
+            fixture=repo / "tests/data/ingest/classic_continuation_1.json",
+            setup_fixture=[],
+            busy_timeout_ms=100,
+            phase="measured",
+        )
+    )
+    assert order[:2] == ["deny", "import"]
+
+    code = f"""
+import importlib.util, socket
+spec = importlib.util.spec_from_file_location('benchmark', {str(SCRIPT)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._deny_network()
+attempts = (
+    lambda: socket.getaddrinfo('localhost', 80),
+    lambda: socket.socket().connect(('127.0.0.1', 9)),
+    lambda: socket.socket().connect_ex(('127.0.0.1', 9)),
+    lambda: socket.socket().bind(('127.0.0.1', 0)),
+    lambda: socket.socket().sendto(b'x', ('127.0.0.1', 9)),
+    lambda: socket.socket().sendmsg([b'x'], [], 0, ('127.0.0.1', 9)),
+)
+for attempt in attempts:
+    try:
+        attempt()
+    except RuntimeError as error:
+        assert 'network denied' in str(error)
+    else:
+        raise AssertionError('network operation escaped denial')
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code], text=True, capture_output=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_environment_has_real_cpu_filesystem_and_classic_busy_timeout() -> None:

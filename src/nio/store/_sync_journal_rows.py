@@ -224,12 +224,13 @@ class JournalRows:
 
     def _load_stage_snapshot(self) -> tuple[OwnerView, SourceState]:
         rows = self._execute(  # type: ignore[attr-defined]
-            "SELECT m.*, s.source_epoch AS joined_source_epoch, "
+            "SELECT m.*, s.account_id AS joined_source_account_id, "
+            "s.source_epoch AS joined_source_epoch, "
             "s.cursor_ciphertext AS joined_cursor_ciphertext, "
             "s.cursor_sha256 AS joined_cursor_sha256, "
             "s.next_request_id AS joined_next_request_id, "
             "s.active AS joined_active FROM NioIngestMeta AS m "
-            "JOIN NioIngestSourceState AS s ON s.account_id = m.account_id"
+            "CROSS JOIN NioIngestSourceState AS s"
         ).fetchall()
         if len(rows) != 1:
             raise JournalIntegrityError(
@@ -238,7 +239,7 @@ class JournalRows:
         row = rows[0]
         owner = self._decode_owner_row(row)
         source_row = {
-            "account_id": row["account_id"],
+            "account_id": row["joined_source_account_id"],
             "source_epoch": row["joined_source_epoch"],
             "cursor_ciphertext": row["joined_cursor_ciphertext"],
             "cursor_sha256": row["joined_cursor_sha256"],

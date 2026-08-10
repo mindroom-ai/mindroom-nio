@@ -1590,6 +1590,69 @@ def test_stage_rejects_owner_source_and_request_relation_drift_before_dml(
         bootstrap.close()
 
 
+@pytest.mark.parametrize(
+    "corruption", ("extra_meta", "extra_source", "mismatched_source")
+)
+def test_stage_snapshot_preserves_independent_global_cardinality_before_dml(
+    tmp_path: Path, corruption: str
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statements=statements)
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    proposal = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+    foreign_account = "@mallory:example.org"
+    with sqlite3.connect(tmp_path / "journal.db") as external:
+        if corruption == "extra_meta":
+            row = external.execute(
+                "SELECT device_id, schema_version, stream_id, transport_kind, "
+                "revision, writer_epoch, next_source_epoch, created_at_ns "
+                "FROM NioIngestMeta WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchone()
+            external.execute(
+                "INSERT INTO NioIngestMeta VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (foreign_account, *row),
+            )
+        else:
+            row = external.execute(
+                "SELECT source_epoch, cursor_ciphertext, cursor_sha256, "
+                "next_request_id, active FROM NioIngestSourceState "
+                "WHERE account_id = ?",
+                (ACCOUNT_ID,),
+            ).fetchone()
+            if corruption == "mismatched_source":
+                external.execute(
+                    "DELETE FROM NioIngestSourceState WHERE account_id = ?",
+                    (ACCOUNT_ID,),
+                )
+            external.execute(
+                "INSERT INTO NioIngestSourceState VALUES (?, ?, ?, ?, ?, ?)",
+                (foreign_account, *row),
+            )
+
+    with pytest.raises(JournalIntegrityError):
+        journal.load_owner() if corruption == "extra_meta" else journal.load_source()
+    statements.clear()
+    with pytest.raises(JournalIntegrityError):
+        journal.stage_source_response(
+            expected_revision=owner.revision,
+            writer_epoch=owner.writer_epoch,
+            source=proposal.successor_source,
+            frame=proposal.frame,
+        )
+
+    assert _business_dml(statements) == []
+    with sqlite3.connect(tmp_path / "journal.db") as external:
+        assert external.execute(
+            "SELECT revision FROM NioIngestMeta WHERE account_id = ?", (ACCOUNT_ID,)
+        ).fetchone() == (owner.revision,)
+        assert external.execute("SELECT COUNT(*) FROM NioIngestFrame").fetchone() == (
+            0,
+        )
+    bootstrap.close()
+
+
 def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
     tmp_path: Path,
 ) -> None:

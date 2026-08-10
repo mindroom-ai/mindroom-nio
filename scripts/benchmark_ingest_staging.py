@@ -33,6 +33,7 @@ SNAPSHOT_PATHS = (
     *TRACKED_PATHS,
     "tests/ingest/staging_benchmark_test.py",
     "tests/ingest/run_staging_benchmark_corpus.py",
+    "tests/ingest/source_journal_test.py",
     *(
         f"tests/data/ingest/{name}.json"
         for name in "canonical_1mib classic_continuation_1 classic_continuation_2 classic_steady_100_rooms_1000_events classic_sync sliding_continuation_1 sliding_continuation_2 sliding_steady_100_rooms_1000_events".split()
@@ -61,12 +62,12 @@ def _git(repo: Path, *arguments: str) -> bytes:
     ).stdout
 
 
-def _snapshot(
-    repo: Path, candidate: bool, expected_commit: str | None = None
-) -> dict[str, Any]:
+def _snapshot(repo: Path, candidate: bool, expected_commit=None):
     head = _git(repo, "rev-parse", "HEAD").decode().strip()
     tree = _git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
-    status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all").decode()
+    status = _git(
+        repo, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
+    ).decode()
     expected = expected_commit if candidate else CONTROL_COMMIT
     if expected is None or head != expected:
         raise RuntimeError(f"target commit is {head}, expected {expected}")
@@ -89,17 +90,18 @@ def _snapshot(
 
 def _verify_snapshot(repo: Path, candidate: bool, expected_commit, expected_digest):
     snapshot = _snapshot(repo, candidate, expected_commit)
-    if expected_digest != snapshot["snapshot_sha256"] and (
-        candidate or expected_digest
-    ):
+    actual = snapshot["snapshot_sha256"]
+    if expected_digest != actual and (candidate or expected_digest):
         raise RuntimeError("target snapshot does not match expected snapshot")
     return snapshot
 
 
-def _manifest_stats(repo: Path, candidate: bool) -> dict[str, tuple[Any, ...]]:
+def _manifest_stats(repo: Path, external: list[Path]) -> dict[str, tuple[Any, ...]]:
+    tracked = _git(repo, "ls-files", "-z").decode().split("\0")
+    paths = [*external, *(repo / path for path in tracked if path)]
     return {
-        path: (stat := (repo / path).stat())[1:7] + (stat.st_ctime_ns,)
-        for path in (SNAPSHOT_PATHS if candidate else ())
+        str(path.resolve()): (stat := path.stat())[1:7] + (stat.st_ctime_ns,)
+        for path in paths
     }
 
 
@@ -163,7 +165,7 @@ def _sample(
         "wal_bytes": wal_bytes,
         "canonical_bytes": len(raw),
         "worker_pid": os.getpid(),
-        "network_denied": True,
+        "network_denied": getattr(_deny_network, "installed", False),
         "target_import_path": str(Path(sys.modules["nio"].__file__).resolve()),
         "sql_trace": [_sql_shape(sql) for sql in trace],
         "statement_count": sum(_significant(sql) for sql in trace),
@@ -197,10 +199,14 @@ def calculate_statistics(
 
 def _deny_network() -> None:
     def deny(event: str, _args: tuple[object, ...]) -> None:
-        if event in {"socket.connect", "socket.connect_ex", "socket.bind"}:
+        if (
+            event
+            in "socket.bind socket.connect socket.connect_ex socket.getaddrinfo socket.sendmsg socket.sendto".split()
+        ):
             raise RuntimeError(f"network denied by benchmark: {event}")
 
     sys.addaudithook(deny)
+    setattr(_deny_network, "installed", True)
 
 
 def _native_response(raw: bytes, transport: str):
@@ -454,15 +460,15 @@ def _classic_durability_sample(
 def _worker(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     candidate = args.mode == "candidate"
+    binding = args.expected_candidate_commit, args.expected_snapshot_sha256
+    inputs = [args.fixture, *args.setup_fixture]
+    _deny_network()
     expected_src = (repo / "src").resolve()
     imported = Path(__import__("nio").__file__).resolve()
     if not imported.is_relative_to(expected_src):
         raise RuntimeError(f"nio import escaped target repo: {imported}")
-    snapshot = _verify_snapshot(
-        repo, candidate, args.expected_candidate_commit, args.expected_snapshot_sha256
-    )
-    before_stats = _manifest_stats(repo, candidate)
-    _deny_network()
+    snapshot = _verify_snapshot(repo, candidate, *binding)
+    before_stats = _manifest_stats(repo, inputs)
     if args.mode == "candidate":
         sample = _candidate_sample(
             args.fixture.resolve(), args.setup_fixture, args.busy_timeout_ms, args.phase
@@ -473,10 +479,8 @@ def _worker(args: argparse.Namespace) -> int:
         sample = _classic_durability_sample(
             args.fixture.resolve(), args.setup_fixture, args.busy_timeout_ms, args.phase
         )
-    after = _verify_snapshot(
-        repo, candidate, args.expected_candidate_commit, args.expected_snapshot_sha256
-    )
-    if after != snapshot or _manifest_stats(repo, candidate) != before_stats:
+    after = _verify_snapshot(repo, candidate, *binding)
+    if after != snapshot or _manifest_stats(repo, inputs) != before_stats:
         raise RuntimeError("target snapshot changed while sampling")
     sample["repo_head"] = snapshot["commit"]
     sample["snapshot_sha256"] = snapshot["snapshot_sha256"]
@@ -551,9 +555,8 @@ def _orchestrate(args: argparse.Namespace) -> int:
     raw = fixture.read_bytes()
     transport = _transport(raw)
     candidate = args.mode == "candidate"
-    snapshot = _verify_snapshot(
-        repo, candidate, args.expected_candidate_commit, args.expected_snapshot_sha256
-    )
+    binding = args.expected_candidate_commit, args.expected_snapshot_sha256
+    snapshot = _verify_snapshot(repo, candidate, *binding)
     base = {
         "schema_version": 1,
         "fixed_control_commit": CONTROL_COMMIT,
@@ -634,9 +637,7 @@ def _orchestrate(args: argparse.Namespace) -> int:
             )
         else:
             samples.append(json.loads(completed.stdout))
-    final = _verify_snapshot(
-        repo, candidate, args.expected_candidate_commit, snapshot["snapshot_sha256"]
-    )
+    final = _verify_snapshot(repo, candidate, *binding)
     if final != snapshot:
         raise RuntimeError("target snapshot changed while sampling")
     report = {**base, "availability": "available", "samples": samples}
