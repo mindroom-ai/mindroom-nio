@@ -26,6 +26,7 @@ PICKLE_KEY = "benchmark-secret"
 TRACKED_PATHS = (
     "src/nio/ingest/state.py",
     "src/nio/store/_sync_journal.py",
+    "src/nio/store/_sync_journal_plan.py",
     "src/nio/store/_sync_journal_rows.py",
 )
 SNAPSHOT_PATHS = (

@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from uuid import UUID
 
 from ..ingest._json import canonical_json, load_internal_json
@@ -20,10 +20,13 @@ from ..ingest.serialization import (
     _origin_from_dict,
     _origin_to_dict,
     _record_from_dict,
-    _record_to_dict,
 )
 from ..ingest.source import MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
+from ._sync_journal_plan import (
+    AuthenticatedWork,
+    _canonical_work_plaintext,
+)
 from ._sync_journal_preflight import _validate_source_cursor
 from ._sync_journal_values import RoomAggregateValue
 
@@ -69,14 +72,6 @@ def _canonical_internal(value: object) -> bytes:
         allow_nan=False,
         separators=(",", ":"),
     ).encode("utf-8")
-
-
-def _canonical_work_plaintext(kind: str, value: EventRecord) -> bytes:
-    if type(kind) is not str:
-        raise TypeError("work kind must be str")
-    if kind != "event" or type(value) is not EventRecord:
-        raise ValueError("Task 3 supports only event Work values")
-    return canonical_json({"kind": kind, "value": _record_to_dict(value)})
 
 
 def _work_value_from_plaintext(
@@ -393,10 +388,7 @@ class _FrameDrainRow(NamedTuple):
 
 class _Task3WorkInventory(NamedTuple):
     storage_rows: tuple[tuple[object, ...], ...]
-    work_ids: frozenset[str]
-    ready_count: int
-    ready_canonical_bytes: int
-    canonical_bytes: int
+    work: tuple[AuthenticatedWork, ...]
 
 
 class JournalRows:
@@ -757,6 +749,7 @@ class JournalRows:
         canonical_bytes = 0
         ready_count = 0
         ready_bytes = 0
+        work: list[AuthenticatedWork] = []
         for row in storage_rows:
             plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
                 "NioIngestWork",
@@ -825,6 +818,13 @@ class JournalRows:
                     raise ValueError("HELD Work value is invalid")
             except (TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work value") from error
+            work.append(
+                AuthenticatedWork(
+                    value,
+                    cast("Literal['ready', 'held']", row[3]),
+                    len(plaintext),
+                )
+            )
             canonical_bytes += len(plaintext)
         if (
             ready_count > _MAX_READY_WORK_COUNT
@@ -836,13 +836,7 @@ class JournalRows:
             or canonical_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
         ):
             raise JournalIntegrityError("total Work exceeds immutable capacity")
-        return _Task3WorkInventory(
-            tuple(storage_rows),
-            frozenset(cast("str", row[1]) for row in storage_rows),
-            ready_count,
-            ready_bytes,
-            canonical_bytes,
-        )
+        return _Task3WorkInventory(tuple(storage_rows), tuple(work))
 
     def _load_room_aggregate(
         self,

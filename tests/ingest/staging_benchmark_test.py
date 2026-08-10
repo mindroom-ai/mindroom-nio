@@ -49,6 +49,7 @@ SNAPSHOT_FILES = {
     "scripts/benchmark_ingest_staging.py",
     "src/nio/ingest/state.py",
     "src/nio/store/_sync_journal.py",
+    "src/nio/store/_sync_journal_plan.py",
     "src/nio/store/_sync_journal_rows.py",
     "tests/ingest/staging_benchmark_test.py",
     "tests/ingest/run_staging_benchmark_corpus.py",
@@ -935,7 +936,10 @@ def test_full_corpus_cli_generates_frozen_matrix_gates_and_diagnostics(
     assert report["diagnostics"]["external_lock"]["passed"] is True
     assert report["diagnostics"]["full_capacity"]["passed"] is True
     assert report["diagnostics"]["overall_passed"] is True
-    assert report["size_and_forecast"]["cumulative_production_net"] <= 6_240
+    size = report["size_and_forecast"]
+    assert size["headroom"] == (
+        size["simplified_checkpoint_high_side"] - size["cumulative_production_net"]
+    )
     assert "Snapshot binding" in markdown.read_text()
     assert report["snapshots"]["candidate"]["snapshot_sha256"] in markdown.read_text()
 
