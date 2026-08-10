@@ -75,6 +75,8 @@ EXPECTED_INGESTION_OBJECTS = {
     ("table", "NioIngestSourceState"),
     ("table", "NioIngestFrame"),
     ("index", "NioIngestFrame_drain"),
+    ("table", "NioIngestRoomAggregate"),
+    ("index", "NioIngestRoomAggregate_intent"),
     ("table", "NioIngestWork"),
     ("index", "NioIngestWork_ready"),
     ("index", "NioIngestWork_held_release"),
@@ -562,6 +564,35 @@ EXPECTED_DDL = {
         """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
         account_id, staged_revision, source_epoch, request_id, frame_id)"""
     ),
+    ("table", "NioIngestRoomAggregate"): _normalized_sql(
+        """CREATE TABLE NioIngestRoomAggregate (
+        account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id) CHECK (
+            typeof(account_id) = 'text' AND length(account_id) > 0
+        ),
+        room_id TEXT NOT NULL CHECK (
+            typeof(room_id) = 'text' AND length(room_id) > 0
+        ),
+        updated_revision INTEGER NOT NULL CHECK (
+            typeof(updated_revision) = 'integer' AND updated_revision >= 1
+        ),
+        intent_kind TEXT NULL CHECK (
+            intent_kind IS NULL OR
+            (typeof(intent_kind) = 'text'
+             AND intent_kind IN ('recovery','hydration'))
+        ),
+        payload_ciphertext BLOB NOT NULL CHECK (
+            typeof(payload_ciphertext) = 'blob'
+            AND length(payload_ciphertext) >= 29
+        ),
+        payload_sha256 BLOB NOT NULL CHECK (
+            typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+        ),
+        PRIMARY KEY (account_id, room_id))"""
+    ),
+    ("index", "NioIngestRoomAggregate_intent"): _normalized_sql(
+        """CREATE INDEX NioIngestRoomAggregate_intent
+        ON NioIngestRoomAggregate(account_id, intent_kind, room_id)"""
+    ),
     ("table", "NioIngestWork"): _normalized_sql("""CREATE TABLE NioIngestWork (
         account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id) CHECK (
             typeof(account_id) = 'text' AND length(account_id) > 0
@@ -675,7 +706,7 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
     assert {(kind, name) for kind, name, _sql in topology} == (
         EXPECTED_INGESTION_OBJECTS
     )
-    assert len(topology) == 8
+    assert len(topology) == 10
 
     assert {(kind, name): sql for kind, name, sql in topology} == EXPECTED_DDL
     with sqlite3.connect(database_path) as actual, sqlite3.connect(":memory:") as exact:
@@ -685,6 +716,7 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
             "NioIngestMeta",
             "NioIngestSourceState",
             "NioIngestFrame",
+            "NioIngestRoomAggregate",
             "NioIngestWork",
         ):
             for pragma in ("table_info", "foreign_key_list"):
@@ -693,6 +725,7 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
                 )
         for index in (
             "NioIngestFrame_drain",
+            "NioIngestRoomAggregate_intent",
             "NioIngestWork_ready",
             "NioIngestWork_held_release",
             "NioIngestWork_frame_kind",
@@ -1328,6 +1361,8 @@ def test_nonfresh_preflight_rejects_without_any_write_or_store_construction(
     case: str,
 ) -> None:
     database_path = _create_rejected_path(tmp_path, case)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     bytes_before = database_path.read_bytes()
     schema_before = _all_schema_objects(database_path)
     epoch_before = _writer_epoch(database_path)

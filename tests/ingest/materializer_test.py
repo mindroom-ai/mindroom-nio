@@ -50,6 +50,9 @@ from nio.ingest.ports import (
 )
 from nio.ingest.reducer import (
     DescriptorRoute,
+    HydrationIntent,
+    MembershipBaseline,
+    RecoveryGap,
     ReducerInputError,
     RoomContinuity,
     reduce_staged_frame,
@@ -119,10 +122,20 @@ _TASK6_SCHEMA_OBJECT_ORDER = (
     "NioIngestSourceState",
     "NioIngestFrame",
     "NioIngestFrame_drain",
+    "NioIngestRoomAggregate",
+    "NioIngestRoomAggregate_intent",
     "NioIngestWork",
     "NioIngestWork_ready",
     "NioIngestWork_held_release",
     "NioIngestWork_frame_kind",
+)
+_AGGREGATE_COLUMNS = (
+    ("account_id", "TEXT", True, 1),
+    ("room_id", "TEXT", True, 2),
+    ("updated_revision", "INTEGER", True, 0),
+    ("intent_kind", "TEXT", False, 0),
+    ("payload_ciphertext", "BLOB", True, 0),
+    ("payload_sha256", "BLOB", True, 0),
 )
 _FRAME_COLUMNS = (
     ("account_id", "TEXT", True, 1),
@@ -155,13 +168,19 @@ _TASK6_SCHEMA_OBJECTS = frozenset(
         ("table", "NioIngestMeta"),
         ("table", "NioIngestSourceState"),
         ("table", "NioIngestFrame"),
+        ("table", "NioIngestRoomAggregate"),
         ("table", "NioIngestWork"),
         ("index", "NioIngestFrame_drain"),
+        ("index", "NioIngestRoomAggregate_intent"),
         ("index", "NioIngestWork_ready"),
         ("index", "NioIngestWork_held_release"),
         ("index", "NioIngestWork_frame_kind"),
     }
 )
+_PRE_TASK4_WORK_ONLY_SCHEMA_OBJECTS = _TASK6_SCHEMA_OBJECTS - {
+    ("table", "NioIngestRoomAggregate"),
+    ("index", "NioIngestRoomAggregate_intent"),
+}
 
 # Frozen Task2 Frame-only physical schema. This fixture intentionally does not
 # derive from SCHEMA_SQL: a pre-Task3 store must be refused rather than silently
@@ -329,6 +348,7 @@ def test_contract_private_journal_values_expose_exact_symbols() -> None:
         "MaterializeStatus",
         "MaterializerLimits",
         "MaterializeResult",
+        "RoomAggregateValue",
     ):
         assert hasattr(values, name), name
 
@@ -352,6 +372,306 @@ def test_contract_private_value_types_are_exact_frozen_and_slotted() -> None:
         values.MaterializeResult,
         ("status", "frame_id", "revision"),
     )
+    _assert_frozen_slotted(
+        values.RoomAggregateValue,
+        (
+            "continuity",
+            "next_room_sequence",
+            "updated_revision",
+            "pending_hydration",
+        ),
+    )
+
+
+_AGGREGATE_ROOM_ID = "!aggregate:example.org"
+_HYDRATION_ID = UUID("12345678-1234-5678-9234-567812345678")
+
+
+def _hydrating_aggregate_value() -> object:
+    values = _values()
+    origin = RecordOrigin(TransportKind.CLASSIC, 4, 9, 0)
+    return values.RoomAggregateValue(
+        RoomContinuity(
+            _AGGREGATE_ROOM_ID,
+            2,
+            "join",
+            None,
+            None,
+            _HYDRATION_ID,
+        ),
+        3,
+        7,
+        HydrationIntent(_HYDRATION_ID, origin),
+    )
+
+
+def test_contract_room_aggregate_value_catches_invalid_counter_or_intent_relation() -> (
+    None
+):
+    values = _values()
+    origin = RecordOrigin(TransportKind.CLASSIC, 4, 9, 0)
+    hydration = HydrationIntent(_HYDRATION_ID, origin)
+    clear = RoomContinuity(
+        _AGGREGATE_ROOM_ID,
+        2,
+        "join",
+        MembershipBaseline("$member", "s0"),
+        None,
+        None,
+    )
+    gap = RecoveryGap(
+        UUID("22345678-1234-5678-9234-567812345678"),
+        _AGGREGATE_ROOM_ID,
+        2,
+        origin,
+        "s0",
+        "s1",
+    )
+
+    assert values.RoomAggregateValue(clear, 0, 1, None).continuity == clear
+    assert _hydrating_aggregate_value().pending_hydration == hydration
+    assert (
+        values.RoomAggregateValue(
+            replace(clear, baseline=None, gap=gap), 0, 1, None
+        ).continuity.gap
+        == gap
+    )
+    for arguments, error_type in (
+        ((object(), 0, 1, None), TypeError),
+        ((clear, True, 1, None), TypeError),
+        ((clear, -1, 1, None), ValueError),
+        ((clear, 0, True, None), TypeError),
+        ((clear, 0, 0, None), ValueError),
+        ((clear, 0, 1, hydration), ValueError),
+        ((replace(clear, baseline=None, gap=gap), 0, 1, hydration), ValueError),
+        (
+            (
+                replace(clear, baseline=None, hydration_id=_HYDRATION_ID),
+                0,
+                1,
+                None,
+            ),
+            ValueError,
+        ),
+        (
+            (
+                replace(clear, baseline=None, hydration_id=_HYDRATION_ID),
+                0,
+                1,
+                HydrationIntent(UUID(int=1), origin),
+            ),
+            ValueError,
+        ),
+    ):
+        with pytest.raises(error_type):
+            values.RoomAggregateValue(*arguments)
+
+
+def _expected_aggregate_plaintext() -> bytes:
+    return canonical_json(
+        {
+            "continuity": {
+                "baseline": None,
+                "gap": None,
+                "hydration_id": str(_HYDRATION_ID),
+                "membership": "join",
+                "membership_epoch": 2,
+                "room_id": _AGGREGATE_ROOM_ID,
+            },
+            "next_room_sequence": 3,
+            "pending_hydration": {
+                "hydration_id": str(_HYDRATION_ID),
+                "origin": {
+                    "frame_index": 0,
+                    "origin_type": "transport",
+                    "request_id": 9,
+                    "source_epoch": 4,
+                    "transport": "classic",
+                },
+            },
+            "updated_revision": 7,
+        }
+    )
+
+
+def test_contract_aggregate_plaintext_catches_shape_or_canonical_reencode_drift() -> (
+    None
+):
+    rows = _rows()
+    value = _hydrating_aggregate_value()
+    expected = _expected_aggregate_plaintext()
+
+    assert rows._canonical_room_aggregate_plaintext(value) == expected
+    assert (
+        rows._room_aggregate_value_from_plaintext(
+            _AGGREGATE_ROOM_ID,
+            7,
+            "hydration",
+            expected,
+        )
+        == value
+    )
+    with pytest.raises(ValueError, match=r".+"):
+        rows._room_aggregate_value_from_plaintext(
+            _AGGREGATE_ROOM_ID,
+            7,
+            "hydration",
+            expected.replace(b'{"continuity":', b'{ "continuity":', 1),
+        )
+    for room_id, revision, intent_kind in (
+        ("!other:example.org", 7, "hydration"),
+        (_AGGREGATE_ROOM_ID, 8, "hydration"),
+        (_AGGREGATE_ROOM_ID, 7, None),
+        (_AGGREGATE_ROOM_ID, 7, "recovery"),
+    ):
+        with pytest.raises(ValueError, match=r".+"):
+            rows._room_aggregate_value_from_plaintext(
+                room_id,
+                revision,
+                intent_kind,
+                expected,
+            )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "wrong-key",
+        "missing-key",
+        "uuid-spelling",
+        "wrong-type",
+        "negative-counter",
+        "negative-source-epoch",
+        "negative-request-id",
+        "negative-frame-index",
+    ],
+)
+def test_contract_aggregate_plaintext_rejects_malformed_live_hydration(
+    corruption: str,
+) -> None:
+    value = json.loads(_expected_aggregate_plaintext())
+    if corruption == "wrong-key":
+        value["pending"] = value.pop("pending_hydration")
+    elif corruption == "missing-key":
+        del value["continuity"]["gap"]
+    elif corruption == "uuid-spelling":
+        value["pending_hydration"]["hydration_id"] = f"{{{_HYDRATION_ID}}}"
+    elif corruption == "wrong-type":
+        value["continuity"]["membership_epoch"] = True
+    elif corruption == "negative-counter":
+        value["next_room_sequence"] = -1
+    else:
+        field = corruption.removeprefix("negative-").replace("-", "_")
+        value["pending_hydration"]["origin"][field] = -1
+
+    with pytest.raises(ValueError, match=r".+"):
+        _rows()._room_aggregate_value_from_plaintext(
+            _AGGREGATE_ROOM_ID,
+            7,
+            "hydration",
+            canonical_json(value),
+        )
+
+
+def test_materializer_aggregate_load_rejects_origin_transport_mismatch(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        staged, _normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_present=True,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        row = _aggregate_rows(journal)[0]
+        plaintext, _value = _decrypt_aggregate(journal, row)
+        payload = json.loads(plaintext)
+        payload["pending_hydration"]["origin"]["transport"] = "sliding"
+        forged = canonical_json(payload)
+        ciphertext, digest = journal._codec.seal(
+            "NioIngestRoomAggregate",
+            (row[0],),
+            forged,
+            header=_canonical_internal([row[0], row[1], row[2]]),
+        )
+        with journal._owner.journal_write():
+            updated = journal._execute(
+                "UPDATE NioIngestRoomAggregate SET payload_ciphertext = ?, "
+                "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
+                (ciphertext, digest, journal.account_id, row[0]),
+            )
+            assert updated.rowcount == 1
+
+        with pytest.raises(JournalIntegrityError):
+            journal._load_room_aggregate(journal.load_owner(), row[0])
+        assert _frame_storage_row(journal, staged.frame_id) is None
+    finally:
+        bootstrap.close()
+
+
+def test_contract_aggregate_codec_catches_table_pk_aad_cipher_or_digest_drift() -> None:
+    plaintext = _expected_aggregate_plaintext()
+    codec = EncryptedRowCodec("aggregate-secret", _SCHEMA_ACCOUNT_ID, _STREAM_ID)
+    header = _canonical_internal([_AGGREGATE_ROOM_ID, 7, "hydration"])
+    ciphertext, digest = codec.seal(
+        "NioIngestRoomAggregate",
+        (_AGGREGATE_ROOM_ID,),
+        plaintext,
+        header=header,
+    )
+    assert (
+        codec.decrypt(
+            "NioIngestRoomAggregate",
+            (_AGGREGATE_ROOM_ID,),
+            ciphertext,
+            digest,
+            header=header,
+        )
+        == plaintext
+    )
+    corruptions = (
+        ("NioIngestWork", (_AGGREGATE_ROOM_ID,), ciphertext, digest, header),
+        ("NioIngestRoomAggregate", ("!other:example.org",), ciphertext, digest, header),
+        (
+            "NioIngestRoomAggregate",
+            (_AGGREGATE_ROOM_ID,),
+            ciphertext,
+            digest,
+            _canonical_internal([_AGGREGATE_ROOM_ID, 8, "hydration"]),
+        ),
+        (
+            "NioIngestRoomAggregate",
+            (_AGGREGATE_ROOM_ID,),
+            bytes((ciphertext[0] ^ 1,)) + ciphertext[1:],
+            digest,
+            header,
+        ),
+        (
+            "NioIngestRoomAggregate",
+            (_AGGREGATE_ROOM_ID,),
+            ciphertext,
+            bytes((digest[0] ^ 1,)) + digest[1:],
+            header,
+        ),
+    )
+    for (
+        table,
+        primary_key,
+        stored_ciphertext,
+        stored_digest,
+        stored_header,
+    ) in corruptions:
+        with pytest.raises(JournalIntegrityError):
+            codec.decrypt(
+                table,
+                primary_key,
+                stored_ciphertext,
+                stored_digest,
+                header=stored_header,
+            )
 
 
 def _event_record() -> EventRecord:
@@ -1261,11 +1581,17 @@ def test_contract_task6_schema_topology_is_exact() -> None:
             == _TASK6_SCHEMA_OBJECTS
         )
         assert _table_columns(connection, "NioIngestFrame") == _FRAME_COLUMNS
+        assert (
+            _table_columns(connection, "NioIngestRoomAggregate") == _AGGREGATE_COLUMNS
+        )
         assert _table_columns(connection, "NioIngestWork") == _WORK_COLUMNS
         assert _foreign_keys(connection, "NioIngestFrame") == (
             ("NioIngestMeta", "account_id", "account_id"),
         )
         assert _foreign_keys(connection, "NioIngestWork") == (
+            ("NioIngestMeta", "account_id", "account_id"),
+        )
+        assert _foreign_keys(connection, "NioIngestRoomAggregate") == (
             ("NioIngestMeta", "account_id", "account_id"),
         )
         assert _index_columns(connection, "NioIngestFrame_drain") == (
@@ -1281,6 +1607,11 @@ def test_contract_task6_schema_topology_is_exact() -> None:
             "ready_revision",
             "ready_ordinal",
             "work_id",
+        )
+        assert _index_columns(connection, "NioIngestRoomAggregate_intent") == (
+            "account_id",
+            "intent_kind",
+            "room_id",
         )
         assert _index_columns(connection, "NioIngestWork_held_release") == (
             "account_id",
@@ -1641,10 +1972,10 @@ def _all_schema_objects(
 
 
 def _sqlite_artifacts(database_path: Path) -> dict[str, bytes]:
+    # WAL read marks live in transient -shm bytes; only durable files are evidence.
     paths = (
         database_path,
         database_path.with_name(database_path.name + "-wal"),
-        database_path.with_name(database_path.name + "-shm"),
     )
     return {path.name: path.read_bytes() for path in paths if path.exists()}
 
@@ -1653,13 +1984,24 @@ def _assert_persisted_task6_topology(database_path: Path) -> None:
     assert _ingestion_schema_objects(database_path) == _TASK6_SCHEMA_OBJECTS
     with sqlite3.connect(database_path) as connection:
         assert _table_columns(connection, "NioIngestFrame") == _FRAME_COLUMNS
+        assert _table_columns(connection, "NioIngestRoomAggregate") == (
+            _AGGREGATE_COLUMNS
+        )
         assert _table_columns(connection, "NioIngestWork") == _WORK_COLUMNS
+        assert _foreign_keys(connection, "NioIngestRoomAggregate") == (
+            ("NioIngestMeta", "account_id", "account_id"),
+        )
         assert _index_columns(connection, "NioIngestFrame_drain") == (
             "account_id",
             "staged_revision",
             "source_epoch",
             "request_id",
             "frame_id",
+        )
+        assert _index_columns(connection, "NioIngestRoomAggregate_intent") == (
+            "account_id",
+            "intent_kind",
+            "room_id",
         )
         assert _index_columns(connection, "NioIngestWork_ready") == (
             "account_id",
@@ -1722,6 +2064,22 @@ def _create_pre_task3_frame_only_store(database_path: Path) -> tuple[int, str]:
             (_SCHEMA_ACCOUNT_ID, cursor_ciphertext, cursor_sha256),
         )
     return revision, writer_epoch
+
+
+def _create_pre_task4_work_only_store(database_path: Path) -> tuple[int, str]:
+    bootstrap = _open_task6_bootstrap(
+        database_path.parent,
+        database_name=database_path.name,
+    )
+    try:
+        owner = bootstrap._journal.load_owner()
+    finally:
+        bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX IF EXISTS NioIngestRoomAggregate_intent")
+        connection.execute("DROP TABLE IF EXISTS NioIngestRoomAggregate")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return owner.revision, str(owner.writer_epoch)
 
 
 def _assert_read_only_preflight(statements: list[str]) -> None:
@@ -1852,6 +2210,60 @@ def test_preflight_rejects_valid_pre_task3_frame_only_store_without_mutation(
     assert _all_schema_objects(database_path) == schema_before
 
 
+def test_preflight_rejects_valid_pre_task4_work_only_store_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "pre-task4.db"
+    revision_before, writer_epoch_before = _create_pre_task4_work_only_store(
+        database_path
+    )
+    assert (
+        _ingestion_schema_objects(database_path) == _PRE_TASK4_WORK_ONLY_SCHEMA_OBJECTS
+    )
+    bytes_before = _sqlite_artifacts(database_path)
+    schema_before = _all_schema_objects(database_path)
+    e2ee_constructions: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    statements: list[str] = []
+
+    def reject_e2ee_construction(
+        _self: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        e2ee_constructions.append((args, kwargs))
+        raise AssertionError("pre-Task4 preflight constructed an E2EE store")
+
+    monkeypatch.setattr(SqliteStore, "__init__", reject_e2ee_construction)
+    opened = None
+    error: BaseException | None = None
+    try:
+        opened = _open_task6_bootstrap(
+            tmp_path,
+            database_name=database_path.name,
+            statements=statements,
+        )
+    except BaseException as caught:  # noqa: BLE001 - exact type below is contractual
+        error = caught
+    finally:
+        if opened is not None:
+            opened.close()
+
+    with sqlite3.connect(database_path) as connection:
+        revision_after, writer_epoch_after = connection.execute(
+            "SELECT revision, writer_epoch FROM NioIngestMeta"
+        ).fetchone()
+    assert type(error) is FreshIngestionRequired
+    assert e2ee_constructions == []
+    _assert_read_only_preflight(statements)
+    assert (revision_after, writer_epoch_after) == (
+        revision_before,
+        writer_epoch_before,
+    )
+    assert _sqlite_artifacts(database_path) == bytes_before
+    assert _all_schema_objects(database_path) == schema_before
+
+
 _DISCOVERY_ACCOUNT_ID = "@discovery:example.org"
 _DISCOVERY_DEVICE_ID = "DISCOVERY"
 _DISCOVERY_CLASSIC = ClassicSourceConfig(30_000, b"{}")
@@ -1891,6 +2303,7 @@ def _discovery_body(
     *,
     crypto: bool = False,
     nonempty: bool = False,
+    room_present: bool = False,
     room_nonempty: bool = False,
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
@@ -1935,7 +2348,9 @@ def _discovery_body(
             body["account_data"] = {
                 "events": [{"content": {"enabled": True}, "type": "m.push_rules"}]
             }
-        if room_nonempty:
+        if room_present and not room_nonempty:
+            body["rooms"] = {"join": {"!unsupported:example.org": {}}}
+        elif room_nonempty:
             body["rooms"] = {
                 "join": {
                     "!unsupported:example.org": {
@@ -1977,7 +2392,10 @@ def _discovery_body(
         extensions["account_data"] = {
             "global": [{"content": {"enabled": True}, "type": "m.push_rules"}]
         }
-    if room_nonempty:
+    if room_present and not room_nonempty:
+        body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
+        body["rooms"] = {"!unsupported:example.org": {"membership": "join"}}
+    elif room_nonempty:
         body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
         body["rooms"] = {
             "!unsupported:example.org": {
@@ -2019,6 +2437,7 @@ def _stage_discovery_frame(
     *,
     crypto: bool = False,
     nonempty: bool = False,
+    room_present: bool = False,
     room_nonempty: bool = False,
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
@@ -2033,6 +2452,7 @@ def _stage_discovery_frame(
         sequence,
         crypto=crypto,
         nonempty=nonempty,
+        room_present=room_present,
         room_nonempty=room_nonempty,
         global_ready_count=global_ready_count,
         padding_bytes=padding_bytes,
@@ -2167,9 +2587,40 @@ def _materializer_dml(statements: list[str]) -> tuple[str, ...]:
                 "NioIngestMeta",
                 "NioIngestSourceState",
                 "NioIngestFrame",
+                "NioIngestRoomAggregate",
                 "NioIngestWork",
             )
         )
+    )
+
+
+def _aggregate_rows(journal: SqliteIngestionJournal) -> tuple[tuple[object, ...], ...]:
+    with journal._owner.read():
+        rows = journal._execute(
+            "SELECT room_id, updated_revision, intent_kind, payload_ciphertext, "
+            "payload_sha256 FROM NioIngestRoomAggregate "
+            "WHERE account_id = ? ORDER BY room_id",
+            (journal.account_id,),
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _decrypt_aggregate(
+    journal: SqliteIngestionJournal,
+    row: tuple[object, ...],
+) -> tuple[bytes, object]:
+    plaintext = journal._codec.decrypt(
+        "NioIngestRoomAggregate",
+        (row[0],),
+        row[3],
+        row[4],
+        header=_canonical_internal([row[0], row[1], row[2]]),
+    )
+    return plaintext, _rows()._room_aggregate_value_from_plaintext(
+        row[0],
+        row[1],
+        row[2],
+        plaintext,
     )
 
 
@@ -2218,9 +2669,10 @@ def _insert_authenticated_event_work(
     record: EventRecord,
     *,
     frame_id: UUID,
-    ready_revision: int,
-    ready_ordinal: int,
+    ready_revision: int | None,
+    ready_ordinal: int | None,
     created_revision: int,
+    status: str = "ready",
 ) -> None:
     values = _authenticated_event_work_values(
         journal,
@@ -2229,6 +2681,7 @@ def _insert_authenticated_event_work(
         ready_revision=ready_revision,
         ready_ordinal=ready_ordinal,
         created_revision=created_revision,
+        status=status,
     )
     with journal._owner.journal_write():
         inserted = journal._execute(
@@ -2247,15 +2700,16 @@ def _authenticated_event_work_values(
     record: EventRecord,
     *,
     frame_id: UUID,
-    ready_revision: int,
-    ready_ordinal: int,
+    ready_revision: int | None,
+    ready_ordinal: int | None,
     created_revision: int,
+    status: str = "ready",
 ) -> tuple[object, ...]:
     return _sealed_work_values(
         journal,
         work_id=record.record_id,
         kind="event",
-        status="ready",
+        status=status,
         frame_id=str(frame_id),
         room_id=record.room_id,
         membership_epoch=record.membership_epoch,
@@ -2301,6 +2755,90 @@ def _sealed_work_values(
         header=_canonical_internal([journal.account_id, *header_values]),
     )
     return (journal.account_id, *header_values, ciphertext, digest)
+
+
+@pytest.mark.parametrize(
+    ("transport", "crypto"),
+    [
+        (TransportKind.CLASSIC, False),
+        (TransportKind.SLIDING, True),
+    ],
+    ids=("classic-plain", "sliding-crypto"),
+)
+def test_materializer_empty_first_seen_room_creates_hydration_owner(
+    tmp_path: Path,
+    transport: TransportKind,
+    crypto: bool,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            crypto=crypto,
+            room_present=True,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert proposal.descriptors == ()
+        assert len(proposal.room_proposals) == 1
+        room = proposal.room_proposals[0]
+        assert room.before is None
+        assert room.hydration is not None
+        assert proposal.crypto_deferred is crypto
+
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        assert raw_before is not None
+        statements.clear()
+
+        result = _materialize(journal)
+
+        revision = owner_before.revision + 1
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            revision,
+        )
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        plaintext, aggregate = _decrypt_aggregate(journal, aggregate_rows[0])
+        expected = _values().RoomAggregateValue(
+            room.after,
+            0,
+            revision,
+            room.hydration,
+        )
+        assert aggregate == expected
+        assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+        assert _work_rows(journal) == ()
+
+        raw_after = _frame_storage_row(journal, staged.frame_id)
+        if crypto:
+            assert raw_after is not None
+            assert raw_after[:6] == raw_before[:6]
+            assert raw_after[6] == revision
+            assert raw_after[7] != raw_before[7]
+        else:
+            assert raw_after is None
+        dml = _materializer_dml(statements)
+        assert sum("UPDATE NioIngestMeta" in statement for statement in dml) == 1
+        assert sum("NioIngestRoomAggregate" in statement for statement in dml) == 1
+        assert sum("NioIngestFrame" in statement for statement in dml) == 1
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+    finally:
+        bootstrap.close()
 
 
 @pytest.mark.parametrize(
@@ -3174,7 +3712,6 @@ def test_materializer_authenticated_inventory_catches_work_row_corruption(
         "future-ready-revision",
         "created-after-ready",
         "room-ready",
-        "held",
         "loss",
     ],
 )
@@ -3307,10 +3844,6 @@ def test_materializer_authenticated_inventory_rejects_semantically_invalid_work(
                 plaintext_to_insert = canonical_json(
                     {"kind": "event", "value": _record_to_dict(event)}
                 )
-                if semantic_case == "held":
-                    status = "held"
-                    ready_revision = None
-                    ready_ordinal = None
             values = _sealed_work_values(
                 journal,
                 work_id=work_id,
@@ -3816,13 +4349,243 @@ def test_materializer_retained_crypto_frame_catches_head_of_line_blocking(
 
 
 @pytest.mark.parametrize(
-    "transport",
-    [TransportKind.CLASSIC, TransportKind.SLIDING],
-    ids=["classic", "sliding"],
+    ("transport", "crypto"),
+    [
+        (TransportKind.CLASSIC, False),
+        (TransportKind.SLIDING, True),
+    ],
+    ids=("classic-plain", "sliding-crypto"),
 )
-def test_materializer_nonempty_selected_frame_catches_entry_into_writer(
+def test_materializer_first_seen_room_catches_missing_hydration_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    transport: TransportKind,
+    crypto: bool,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            crypto=crypto,
+            room_nonempty=True,
+            global_ready_count=1,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+            RecordKind.TIMELINE,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordKind.PRESENCE,
+        )
+        assert len(proposal.room_proposals) == 1
+        room_proposal = proposal.room_proposals[0]
+        assert room_proposal.hydration is not None
+        assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+            DescriptorRoute.READY,
+            DescriptorRoute.READY,
+        )
+        assert proposal.crypto_deferred is crypto
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        assert raw_before is not None
+        writer_entries: list[None] = []
+        real_journal_write = type(journal._owner).journal_write
+
+        @contextmanager
+        def count_writer(owner: object) -> Iterator[None]:
+            assert owner is journal._owner
+            writer_entries.append(None)
+            with real_journal_write(journal._owner):
+                yield
+
+        statements.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(type(journal._owner), "journal_write", count_writer)
+            result = _materialize(journal)
+
+        revision = owner_before.revision + 1
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            revision,
+        )
+        assert writer_entries == [None]
+        assert journal.load_owner() == replace(owner_before, revision=revision)
+
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        aggregate_row = aggregate_rows[0]
+        assert aggregate_row[:3] == (
+            room_proposal.after.room_id,
+            revision,
+            "hydration",
+        )
+        aggregate_plaintext, aggregate = _decrypt_aggregate(journal, aggregate_row)
+        expected_aggregate = _values().RoomAggregateValue(
+            room_proposal.after,
+            1,
+            revision,
+            room_proposal.hydration,
+        )
+        assert aggregate == expected_aggregate
+        assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            expected_aggregate
+        )
+
+        work_rows = _work_rows(journal)
+        assert len(work_rows) == 3
+        rows_by_id = {str(row[0]): row for row in work_rows}
+        expected_records: list[EventRecord] = []
+        room_sequence = 0
+        for index, descriptor in enumerate(proposal.descriptors):
+            record_id = str(
+                uuid5(staged.frame_id, f"event:{descriptor.descriptor_key}")
+            )
+            is_room = descriptor.room_id is not None
+            expected_record = EventRecord(
+                record_id,
+                descriptor.kind,
+                replace(normalized.origin, frame_index=index),
+                descriptor.room_id,
+                room_proposal.after.membership_epoch if is_room else None,
+                room_sequence if is_room else None,
+                None,
+                descriptor.provenance,
+                descriptor.source_json,
+                None,
+            )
+            expected_records.append(expected_record)
+            row = rows_by_id[record_id]
+            assert row[1:10] == (
+                "event",
+                "held" if is_room else "ready",
+                str(staged.frame_id),
+                descriptor.room_id,
+                room_proposal.after.membership_epoch if is_room else None,
+                room_sequence if is_room else None,
+                None if is_room else revision,
+                None if is_room else index - 1,
+                revision,
+            )
+            plaintext, record = _decrypt_event_work(journal, row)
+            assert record == expected_record
+            assert plaintext == _rows()._canonical_work_plaintext(
+                "event", expected_record
+            )
+            if is_room:
+                room_sequence += 1
+        ready_rows = tuple(row for row in work_rows if row[2] == "ready")
+        assert tuple(row[0] for row in ready_rows) == tuple(
+            record.record_id for record in expected_records[1:]
+        )
+        assert tuple(row[8] for row in ready_rows) == (0, 1)
+
+        raw_after = _frame_storage_row(journal, staged.frame_id)
+        if crypto:
+            assert raw_after is not None
+            assert raw_after[:6] == raw_before[:6]
+            assert raw_after[6] == revision
+            assert raw_after[7] != raw_before[7]
+        else:
+            assert raw_after is None
+
+        dml = _materializer_dml(statements)
+        assert sum("UPDATE NioIngestMeta" in statement for statement in dml) == 1
+        assert any("NioIngestRoomAggregate" in statement for statement in dml)
+        assert any("NioIngestWork" in statement for statement in dml)
+        frame_dml_index = next(
+            index
+            for index, statement in enumerate(dml)
+            if "NioIngestFrame" in statement
+        )
+        assert all(
+            index < frame_dml_index
+            for index, statement in enumerate(dml)
+            if "NioIngestRoomAggregate" in statement or "NioIngestWork" in statement
+        )
+
+        owner_after = journal.load_owner()
+        aggregate_after = _aggregate_rows(journal)
+        work_after = _work_rows(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert journal.load_owner() == owner_after
+        assert _aggregate_rows(journal) == aggregate_after
+        assert _work_rows(journal) == work_after
+
+        later, _ = _stage_discovery_frame(
+            journal,
+            transport,
+            2,
+            global_ready_count=1,
+        )
+        later_owner = journal.load_owner()
+        later_raw = _frame_storage_row(journal, later.frame_id)
+        assert later_raw is not None
+        held_before = next(row for row in work_after if row[2] == "held")
+        statements.clear()
+        assert _materialize(
+            journal,
+            limits=replace(
+                MaterializerLimits(),
+                max_ready_work_count=4,
+                max_total_work_count=4,
+            ),
+        ) == MaterializeResult(MaterializeStatus.AT_CAPACITY, later.frame_id, None)
+        assert journal.load_owner() == later_owner
+        assert _frame_storage_row(journal, later.frame_id) == later_raw
+        assert _aggregate_rows(journal) == aggregate_after
+        assert _work_rows(journal) == work_after
+        assert _materializer_dml(statements) == ()
+
+        later_result = _materialize(
+            journal,
+            limits=replace(
+                MaterializerLimits(),
+                max_ready_work_count=4,
+                max_total_work_count=5,
+            ),
+        )
+        assert later_result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            later.frame_id,
+            later_owner.revision + 1,
+        )
+        assert _aggregate_rows(journal) == aggregate_after
+        later_work = _work_rows(journal)
+        assert len(later_work) == 5
+        assert (
+            next(row for row in later_work if row[0] == held_before[0]) == held_before
+        )
+        later_ready = tuple(
+            row
+            for row in later_work
+            if row[7] == later_result.revision and row[2] == "ready"
+        )
+        assert tuple(row[8] for row in later_ready) == (0, 1)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [TransportKind.CLASSIC, TransportKind.SLIDING],
+    ids=("classic", "sliding"),
+)
+def test_materializer_empty_first_seen_room_catches_orphan_held_work(
+    tmp_path: Path,
     transport: TransportKind,
 ) -> None:
     statements: list[str] = []
@@ -3833,33 +4596,71 @@ def test_materializer_nonempty_selected_frame_catches_entry_into_writer(
             journal,
             transport,
             1,
-            crypto=True,
-            room_nonempty=True,
+            room_present=True,
         )
+        assert len(normalized.room_segments) == 1
+        segment = normalized.room_segments[0]
+        assert segment.room_id == "!unsupported:example.org"
+        assert segment.state_json == ()
+        assert segment.timeline_json == ()
+        assert segment.room_account_data_json == ()
         proposal = reduce_staged_frame(
             journal.load_owner().stream_id,
             staged.frame_id,
             normalized,
             (),
         )
-        assert len(proposal.descriptors) == 1
+        assert proposal.descriptors == ()
         assert len(proposal.room_proposals) == 1
-        assert proposal.room_proposals[0].hydration is not None
-        assert proposal.descriptors[0].route is DescriptorRoute.HOLD_FOR_HYDRATION
-        assert proposal.crypto_deferred
+        room_proposal = proposal.room_proposals[0]
+        assert room_proposal.before is None
+        assert room_proposal.hydration is not None
+
         owner_before = journal.load_owner()
-        row_before = _frame_storage_row(journal, staged.frame_id)
+        orphan_frame_id = uuid5(staged.frame_id, "orphan-held-frame")
+        orphan_work_id = str(uuid5(orphan_frame_id, "event:orphan-held"))
+        orphan = EventRecord(
+            orphan_work_id,
+            RecordKind.STATE,
+            replace(normalized.origin, frame_index=0),
+            segment.room_id,
+            room_proposal.after.membership_epoch,
+            0,
+            None,
+            None,
+            canonical_json(
+                {
+                    "content": {"name": "orphan"},
+                    "state_key": "",
+                    "type": "m.room.name",
+                }
+            ),
+            None,
+        )
+        _insert_authenticated_event_work(
+            journal,
+            orphan,
+            frame_id=orphan_frame_id,
+            ready_revision=None,
+            ready_ordinal=None,
+            created_revision=owner_before.revision,
+            status="held",
+        )
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        work_before = _work_rows(journal)
+        assert raw_before is not None
+        assert len(work_before) == 1
+        assert _decrypt_event_work(journal, work_before[0])[1] == orphan
+        assert _aggregate_rows(journal) == ()
         statements.clear()
 
-        def reject_writer(_self: object) -> object:
-            raise AssertionError("nonempty frame entered journal_write")
-
-        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
-        with pytest.raises((JournalIntegrityError, ReducerInputError)):
+        with pytest.raises(JournalIntegrityError, match="orphan HELD Work"):
             _materialize(journal)
 
         assert journal.load_owner() == owner_before
-        assert _frame_storage_row(journal, staged.frame_id) == row_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == work_before
+        assert _aggregate_rows(journal) == ()
         assert _materializer_dml(statements) == ()
     finally:
         bootstrap.close()

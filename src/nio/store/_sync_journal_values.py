@@ -4,6 +4,8 @@ from dataclasses import dataclass, fields
 from enum import StrEnum
 from uuid import UUID
 
+from ..ingest.reducer import HydrationIntent, RoomContinuity
+
 
 def _require_exact(value: object, expected: type, field_name: str) -> None:
     if type(value) is not expected:
@@ -77,3 +79,39 @@ class MaterializeResult:
                 raise ValueError("at-capacity materialization has only a frame")
         elif self.frame_id is None or self.revision is None:
             raise ValueError("materialized result requires a frame and revision")
+
+
+@dataclass(frozen=True, slots=True)
+class RoomAggregateValue:
+    continuity: RoomContinuity
+    next_room_sequence: int
+    updated_revision: int
+    pending_hydration: HydrationIntent | None
+
+    def __post_init__(self) -> None:
+        _require_exact(self.continuity, RoomContinuity, "continuity")
+        _require_exact(self.next_room_sequence, int, "next_room_sequence")
+        _require_exact(self.updated_revision, int, "updated_revision")
+        if self.pending_hydration is not None:
+            _require_exact(
+                self.pending_hydration,
+                HydrationIntent,
+                "pending_hydration",
+            )
+        if self.next_room_sequence < 0:
+            raise ValueError("next_room_sequence must be nonnegative")
+        if self.updated_revision < 1:
+            raise ValueError("updated_revision must be positive")
+
+        gap = self.continuity.gap
+        hydration_id = self.continuity.hydration_id
+        if gap is not None:
+            if self.pending_hydration is not None:
+                raise ValueError("recovery and hydration intents are exclusive")
+        elif hydration_id is None:
+            if self.pending_hydration is not None:
+                raise ValueError("pending hydration requires a hydration barrier")
+        elif self.pending_hydration is None or (
+            self.pending_hydration.hydration_id != hydration_id
+        ):
+            raise ValueError("hydration barrier and pending intent must agree")

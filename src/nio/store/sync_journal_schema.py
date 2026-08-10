@@ -87,6 +87,31 @@ SCHEMA_SQL = (
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
     account_id, staged_revision, source_epoch, request_id, frame_id)""",
+    """CREATE TABLE NioIngestRoomAggregate (
+    account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id) CHECK (
+        typeof(account_id) = 'text' AND length(account_id) > 0
+    ),
+    room_id TEXT NOT NULL CHECK (
+        typeof(room_id) = 'text' AND length(room_id) > 0
+    ),
+    updated_revision INTEGER NOT NULL CHECK (
+        typeof(updated_revision) = 'integer' AND updated_revision >= 1
+    ),
+    intent_kind TEXT NULL CHECK (
+        intent_kind IS NULL OR
+        (typeof(intent_kind) = 'text'
+         AND intent_kind IN ('recovery','hydration'))
+    ),
+    payload_ciphertext BLOB NOT NULL CHECK (
+        typeof(payload_ciphertext) = 'blob'
+        AND length(payload_ciphertext) >= 29
+    ),
+    payload_sha256 BLOB NOT NULL CHECK (
+        typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+    ),
+    PRIMARY KEY (account_id, room_id))""",
+    """CREATE INDEX NioIngestRoomAggregate_intent
+    ON NioIngestRoomAggregate(account_id, intent_kind, room_id)""",
     """CREATE TABLE NioIngestWork (
     account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id) CHECK (
         typeof(account_id) = 'text' AND length(account_id) > 0

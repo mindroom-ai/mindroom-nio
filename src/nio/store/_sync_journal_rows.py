@@ -9,16 +9,23 @@ from uuid import UUID
 
 from ..ingest._json import canonical_json, load_internal_json
 from ..ingest.errors import JournalIntegrityError
-from ..ingest.model import EventRecord, RecordKind, TransportKind
+from ..ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
 from ..ingest.ports import (
     NetworkRequest,
     StagedSourceResponse,
     _revalidated_staged_source_response,
 )
-from ..ingest.serialization import _record_from_dict, _record_to_dict
+from ..ingest.reducer import HydrationIntent, RoomContinuity
+from ..ingest.serialization import (
+    _origin_from_dict,
+    _origin_to_dict,
+    _record_from_dict,
+    _record_to_dict,
+)
 from ..ingest.source import MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_preflight import _validate_source_cursor
+from ._sync_journal_values import RoomAggregateValue
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -51,6 +58,8 @@ _EMPTY_SHA256 = hashlib.sha256(b"").digest()
 _MAX_WORK_PLAINTEXT_BYTES = 1024 * 1024
 _MAX_READY_WORK_COUNT = 2_048
 _MAX_READY_WORK_CANONICAL_BYTES = 16 * 1024 * 1024
+_MAX_TOTAL_WORK_COUNT = 20_000
+_MAX_TOTAL_WORK_CANONICAL_BYTES = 64 * 1024 * 1024
 
 
 def _canonical_internal(value: object) -> bytes:
@@ -102,6 +111,122 @@ def _work_value_from_plaintext(
         return value
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("event Work plaintext is invalid") from error
+
+
+def _aggregate_uuid(value: object, label: str) -> UUID:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be a UUID string")
+    parsed = UUID(value)
+    if value != str(parsed):
+        raise ValueError(f"{label} is not canonical")
+    return parsed
+
+
+def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
+    if type(value) is not RoomAggregateValue:
+        raise TypeError("aggregate value must be RoomAggregateValue")
+    hydration = value.pending_hydration
+    if (
+        hydration is None
+        or value.continuity.hydration_id is None
+        or value.continuity.baseline is not None
+        or value.continuity.gap is not None
+    ):
+        raise ValueError("Slice A persists only hydration Aggregate values")
+    continuity = value.continuity
+    return canonical_json(
+        {
+            "continuity": {
+                "baseline": None,
+                "gap": None,
+                "hydration_id": str(continuity.hydration_id),
+                "membership": continuity.membership,
+                "membership_epoch": continuity.membership_epoch,
+                "room_id": continuity.room_id,
+            },
+            "next_room_sequence": value.next_room_sequence,
+            "pending_hydration": {
+                "hydration_id": str(hydration.hydration_id),
+                "origin": _origin_to_dict(hydration.origin),
+            },
+            "updated_revision": value.updated_revision,
+        }
+    )
+
+
+def _room_aggregate_value_from_plaintext(
+    room_id: str,
+    updated_revision: int,
+    intent_kind: str | None,
+    plaintext: bytes,
+) -> RoomAggregateValue:
+    try:
+        if type(room_id) is not str or not room_id:
+            raise ValueError("aggregate room_id is invalid")
+        if type(updated_revision) is not int or updated_revision < 1:
+            raise ValueError("aggregate revision is invalid")
+        if intent_kind != "hydration":
+            raise ValueError("Slice A loads only hydration Aggregate rows")
+        if type(plaintext) is not bytes:
+            raise TypeError("aggregate plaintext must be bytes")
+        decoded = load_internal_json(plaintext, "room aggregate plaintext")
+        if type(decoded) is not dict or type(decoded.get("continuity")) is not dict:
+            raise ValueError("Aggregate and continuity must be objects")
+        aggregate = cast("dict[str, object]", decoded)
+        continuity = cast("dict[str, object]", aggregate["continuity"])
+        if continuity["baseline"] is not None or continuity["gap"] is not None:
+            raise ValueError("hydration Aggregate baseline and gap must be null")
+
+        raw_hydration_id = continuity["hydration_id"]
+        hydration_id = (
+            _aggregate_uuid(raw_hydration_id, "hydration_id")
+            if raw_hydration_id is not None
+            else None
+        )
+        state = RoomContinuity(
+            cast("str", continuity["room_id"]),
+            cast("int", continuity["membership_epoch"]),
+            cast("str | None", continuity["membership"]),
+            None,
+            None,
+            hydration_id,
+        )
+
+        pending_value = aggregate["pending_hydration"]
+        if type(pending_value) is not dict:
+            raise ValueError("pending hydration must be an object")
+        pending_map = cast("dict[str, object]", pending_value)
+        pending_origin = _origin_from_dict(pending_map["origin"], exact=False)
+        if (
+            type(pending_origin) is not RecordOrigin
+            or min(
+                pending_origin.source_epoch,
+                pending_origin.request_id,
+                pending_origin.frame_index,
+            )
+            < 0
+        ):
+            raise ValueError("hydration origin must be a transport origin")
+        pending = HydrationIntent(
+            _aggregate_uuid(pending_map["hydration_id"], "hydration_id"),
+            pending_origin,
+        )
+
+        value = RoomAggregateValue(
+            state,
+            cast("int", aggregate["next_room_sequence"]),
+            cast("int", aggregate["updated_revision"]),
+            pending,
+        )
+        if (
+            value.continuity.room_id != room_id
+            or value.updated_revision != updated_revision
+            or plaintext != _canonical_room_aggregate_plaintext(value)
+        ):
+            raise ValueError("aggregate plaintext does not match its row")
+        return value
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("room Aggregate plaintext is invalid") from error
 
 
 def _encoded_bytes(value: bytes | None) -> str | None:
@@ -269,6 +394,8 @@ class _FrameDrainRow(NamedTuple):
 class _Task3WorkInventory(NamedTuple):
     storage_rows: tuple[tuple[object, ...], ...]
     work_ids: frozenset[str]
+    ready_count: int
+    ready_canonical_bytes: int
     canonical_bytes: int
 
 
@@ -587,32 +714,49 @@ class JournalRows:
                     or type(raw_frame_id) is not str
                     or raw_frame_id != str(UUID(raw_frame_id))
                     or kind != "event"
-                    or status != "ready"
-                    or (room_id, membership_epoch, room_sequence) != (None, None, None)
-                    or type(ready_revision) is not int
-                    or not 1 <= ready_revision <= owner.revision
-                    or type(ready_ordinal) is not int
-                    or ready_ordinal < 0
+                    or status not in ("ready", "held")
                     or type(created_revision) is not int
-                    or not 1 <= created_revision <= ready_revision
+                    or not 1 <= created_revision <= owner.revision
                     or type(ciphertext) is not bytes
                     or not 29 <= len(ciphertext) <= _MAX_WORK_PLAINTEXT_BYTES + 29
                     or type(digest) is not bytes
                     or len(digest) != 32
                 ):
                     raise ValueError("Work columns are invalid")
+                if status == "ready":
+                    if (
+                        (room_id, membership_epoch, room_sequence) != (None, None, None)
+                        or type(ready_revision) is not int
+                        or not created_revision <= ready_revision <= owner.revision
+                        or type(ready_ordinal) is not int
+                        or ready_ordinal < 0
+                    ):
+                        raise ValueError("READY Work columns are invalid")
+                elif (
+                    type(room_id) is not str
+                    or not room_id
+                    or type(membership_epoch) is not int
+                    or membership_epoch < 0
+                    or type(room_sequence) is not int
+                    or room_sequence < 0
+                    or ready_revision is not None
+                    or ready_ordinal is not None
+                ):
+                    raise ValueError("HELD Work columns are invalid")
             except (AttributeError, TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work row") from error
             storage_rows.append(row)
             framed_payload_bytes += len(ciphertext) - 29
             if (
-                len(storage_rows) > _MAX_READY_WORK_COUNT
-                or framed_payload_bytes > _MAX_READY_WORK_CANONICAL_BYTES
+                len(storage_rows) > _MAX_TOTAL_WORK_COUNT
+                or framed_payload_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
             ):
                 break
 
         storage_rows.sort(key=lambda row: cast("str", row[1]))
         canonical_bytes = 0
+        ready_count = 0
+        ready_bytes = 0
         for row in storage_rows:
             plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
                 "NioIngestWork",
@@ -630,35 +774,127 @@ class JournalRows:
                 )
                 origin = value.origin
                 if (
-                    value.kind
-                    not in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.PRESENCE)
-                    or origin.transport is not owner.transport_kind
+                    origin.transport is not owner.transport_kind
                     or min(origin.source_epoch, origin.request_id, origin.frame_index)
                     < 0
-                    or (
-                        value.room_id,
-                        value.membership_epoch,
-                        value.room_sequence,
-                        value.event_id,
-                        value.provenance,
-                        value.clear_json,
-                    )
-                    != (None, None, None, None, None, None)
+                    or value.event_id is not None
+                    or value.clear_json is not None
                 ):
-                    raise ValueError("Work value is not a room-free READY event")
+                    raise ValueError("Work event value is invalid")
+                if row[3] == "ready":
+                    if (
+                        value.kind
+                        not in (
+                            RecordKind.GLOBAL_ACCOUNT_DATA,
+                            RecordKind.PRESENCE,
+                        )
+                        or (
+                            value.room_id,
+                            value.membership_epoch,
+                            value.room_sequence,
+                        )
+                        != (
+                            None,
+                            None,
+                            None,
+                        )
+                        or value.provenance is not None
+                    ):
+                        raise ValueError("READY Work value is invalid")
+                    ready_count += 1
+                    ready_bytes += len(plaintext)
+                elif (
+                    (value.room_id, value.membership_epoch, value.room_sequence)
+                    != (
+                        row[5],
+                        row[6],
+                        row[7],
+                    )
+                    or value.kind
+                    not in (
+                        RecordKind.STATE,
+                        RecordKind.TIMELINE,
+                        RecordKind.EPHEMERAL,
+                        RecordKind.ROOM_ACCOUNT_DATA,
+                    )
+                    or (
+                        (value.kind is RecordKind.TIMELINE)
+                        != (value.provenance is not None)
+                    )
+                ):
+                    raise ValueError("HELD Work value is invalid")
             except (TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work value") from error
             canonical_bytes += len(plaintext)
         if (
-            len(storage_rows) > _MAX_READY_WORK_COUNT
-            or canonical_bytes > _MAX_READY_WORK_CANONICAL_BYTES
+            ready_count > _MAX_READY_WORK_COUNT
+            or ready_bytes > _MAX_READY_WORK_CANONICAL_BYTES
         ):
             raise JournalIntegrityError("READY Work exceeds immutable capacity")
+        if (
+            len(storage_rows) > _MAX_TOTAL_WORK_COUNT
+            or canonical_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
+        ):
+            raise JournalIntegrityError("total Work exceeds immutable capacity")
         return _Task3WorkInventory(
             tuple(storage_rows),
             frozenset(cast("str", row[1]) for row in storage_rows),
+            ready_count,
+            ready_bytes,
             canonical_bytes,
         )
+
+    def _load_room_aggregate(
+        self,
+        owner: OwnerView,
+        room_id: str,
+    ) -> tuple[tuple[object, ...], RoomAggregateValue] | None:
+        row = self._execute(  # type: ignore[attr-defined]
+            "SELECT account_id, room_id, updated_revision, intent_kind, "
+            "payload_ciphertext, payload_sha256 "
+            "FROM NioIngestRoomAggregate WHERE account_id = ? AND room_id = ?",
+            (self.account_id, room_id),
+        ).fetchone()
+        if row is None:
+            return None
+        stored = tuple(row)
+        try:
+            account_id, stored_room, revision, kind, ciphertext, digest = stored
+            if (
+                account_id != self.account_id
+                or stored_room != room_id
+                or type(revision) is not int
+                or not 1 <= revision <= owner.revision
+                or kind != "hydration"
+                or type(ciphertext) is not bytes
+                or len(ciphertext) < 29
+                or type(digest) is not bytes
+                or len(digest) != 32
+            ):
+                raise ValueError("Aggregate columns are invalid")
+            plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
+                "NioIngestRoomAggregate",
+                (room_id,),
+                ciphertext,
+                digest,
+                header=_canonical_internal([room_id, revision, kind]),
+            )
+            value = _room_aggregate_value_from_plaintext(
+                room_id,
+                revision,
+                kind,
+                plaintext,
+            )
+            if (
+                value.pending_hydration is None
+                or value.pending_hydration.origin.transport is not owner.transport_kind
+            ):
+                raise ValueError("Aggregate origin transport does not match owner")
+            return stored, value
+        except JournalIntegrityError:
+            raise
+        except (AttributeError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("invalid room Aggregate row") from error
 
     def _frame_drain_row_from_full(
         self,

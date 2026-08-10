@@ -19,7 +19,7 @@ from ..ingest.config import (
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
 from ..ingest.model import EventRecord, RecordKind, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
-from ..ingest.reducer import DescriptorRoute, reduce_staged_frame
+from ..ingest.reducer import DescriptorRoute, RecoveryRelease, reduce_staged_frame
 from ..ingest.sliding import SlidingSource
 from ..ingest.source import (
     MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES,
@@ -35,6 +35,7 @@ from ._sync_journal_preflight import (
 from ._sync_journal_rows import (
     JournalRows,
     _canonical_internal,
+    _canonical_room_aggregate_plaintext,
     _canonical_work_plaintext,
     _frame_drain_header,
     _frame_envelope,
@@ -43,6 +44,7 @@ from ._sync_journal_values import (
     MaterializeResult,
     MaterializerLimits,
     MaterializeStatus,
+    RoomAggregateValue,
 )
 
 if TYPE_CHECKING:
@@ -425,30 +427,81 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalIntegrityError(
                     "selected frame does not reduce from empty room state"
                 ) from error
-            if proposal.room_proposals or any(
-                descriptor.route is not DescriptorRoute.READY
-                or descriptor.room_id is not None
-                or descriptor.kind
-                not in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.PRESENCE)
-                or descriptor.provenance is not None
-                for descriptor in proposal.descriptors
-            ):
-                raise JournalIntegrityError(
-                    "selected frame requires unsupported materialization state"
-                )
-
             new_revision = expected_revision + 1
+            room_plans = {room.after.room_id: room for room in proposal.room_proposals}
+            if len(room_plans) != len(proposal.room_proposals) or any(
+                room.before is not None
+                or room.recovery is not None
+                or room.hydration is None
+                or room.retirement_epoch is not None
+                or room.losses
+                or room.release is not RecoveryRelease.NONE
+                for room in proposal.room_proposals
+            ):
+                raise JournalIntegrityError("selected frame requires a later room path")
+            aggregate_rooms = tuple(room_plans)
+            if any(
+                self._load_room_aggregate(owner, room_id) is not None
+                for room_id in aggregate_rooms
+            ):
+                raise JournalIntegrityError("existing room Aggregate requires Slice B")
+
             planned_clear: list[tuple[str, tuple[object, ...], bytes]] = []
             frame_id = staged.frame_id
+            room_sequences = dict.fromkeys(aggregate_rooms, 0)
+            room_bytes = dict.fromkeys(aggregate_rooms, 0)
+            ready_ordinal = 0
             for index, descriptor in enumerate(proposal.descriptors):
+                room_id = descriptor.room_id
+                epoch: int | None
+                sequence: int | None
+                ready_revision: int | None
+                ordinal: int | None
+                if room_id is None:
+                    if (
+                        descriptor.route is not DescriptorRoute.READY
+                        or descriptor.kind
+                        not in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.PRESENCE)
+                        or descriptor.provenance is not None
+                    ):
+                        raise JournalIntegrityError(
+                            "unsupported account-wide descriptor"
+                        )
+                    epoch = sequence = None
+                    ready_revision = new_revision
+                    ordinal = ready_ordinal
+                    ready_ordinal += 1
+                    status = "ready"
+                else:
+                    if (
+                        room_id not in room_plans
+                        or descriptor.route is not DescriptorRoute.HOLD_FOR_HYDRATION
+                        or descriptor.kind
+                        not in (
+                            RecordKind.STATE,
+                            RecordKind.TIMELINE,
+                            RecordKind.EPHEMERAL,
+                            RecordKind.ROOM_ACCOUNT_DATA,
+                        )
+                        or (
+                            (descriptor.kind is RecordKind.TIMELINE)
+                            != (descriptor.provenance is not None)
+                        )
+                    ):
+                        raise JournalIntegrityError("unsupported room descriptor")
+                    epoch = room_plans[room_id].after.membership_epoch
+                    sequence = room_sequences[room_id]
+                    room_sequences[room_id] += 1
+                    ready_revision = ordinal = None
+                    status = "held"
                 work_id = str(uuid5(frame_id, f"event:{descriptor.descriptor_key}"))
                 value = EventRecord(
                     work_id,
                     descriptor.kind,
                     replace(normalized.origin, frame_index=index),
-                    None,
-                    None,
-                    None,
+                    room_id,
+                    epoch,
+                    sequence,
                     None,
                     descriptor.provenance,
                     descriptor.source_json,
@@ -462,35 +515,80 @@ class SqliteIngestionJournal(JournalRows):
                 clear = (
                     work_id,
                     "event",
-                    "ready",
+                    status,
                     str(frame_id),
-                    None,
-                    None,
-                    None,
-                    new_revision,
-                    index,
+                    room_id,
+                    epoch,
+                    sequence,
+                    ready_revision,
+                    ordinal,
                     new_revision,
                 )
                 planned_clear.append((work_id, clear, plaintext))
+                if room_id is not None:
+                    room_bytes[room_id] += len(plaintext)
+
+            if any(
+                room_sequences[room_id] > limits.max_held_records_per_room
+                or room_bytes[room_id] > limits.max_held_canonical_bytes_per_room
+                for room_id in aggregate_rooms
+            ):
+                raise JournalIntegrityError("planned HELD Work exceeds room capacity")
+
+            planned_aggregates: list[tuple[object, ...]] = []
+            for room_id, room in room_plans.items():
+                aggregate_value = RoomAggregateValue(
+                    room.after,
+                    room_sequences[room_id],
+                    new_revision,
+                    room.hydration,
+                )
+                plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
+                ciphertext, digest = self._codec.seal(
+                    "NioIngestRoomAggregate",
+                    (room_id,),
+                    plaintext,
+                    header=_canonical_internal([room_id, new_revision, "hydration"]),
+                )
+                planned_aggregates.append(
+                    (
+                        self.account_id,
+                        room_id,
+                        new_revision,
+                        "hydration",
+                        ciphertext,
+                        digest,
+                    )
+                )
 
             inventory = None
             planned_rows: list[tuple[object, ...]] = []
-            if planned_clear:
+            if planned_clear or planned_aggregates:
                 inventory = self._load_task3_work_inventory(owner)
                 planned_ids = {item[0] for item in planned_clear}
                 if len(planned_ids) != len(planned_clear) or planned_ids & (
                     inventory.work_ids
                 ):
                     raise JournalIntegrityError("planned Work identity collides")
-                projected_count = len(inventory.storage_rows) + len(planned_clear)
-                projected_bytes = inventory.canonical_bytes + sum(
-                    len(item[2]) for item in planned_clear
+                if any(
+                    row[3] == "held" and row[5] in room_plans
+                    for row in inventory.storage_rows
+                ):
+                    raise JournalIntegrityError("new Aggregate has orphan HELD Work")
+                planned_ready = tuple(
+                    item for item in planned_clear if item[1][2] == "ready"
                 )
-                if projected_count > min(
-                    limits.max_ready_work_count, limits.max_total_work_count
-                ) or projected_bytes > min(
-                    limits.max_ready_work_canonical_bytes,
-                    limits.max_total_work_canonical_bytes,
+                if (
+                    inventory.ready_count + len(planned_ready)
+                    > limits.max_ready_work_count
+                    or inventory.ready_canonical_bytes
+                    + sum(len(item[2]) for item in planned_ready)
+                    > limits.max_ready_work_canonical_bytes
+                    or len(inventory.storage_rows) + len(planned_clear)
+                    > limits.max_total_work_count
+                    or inventory.canonical_bytes
+                    + sum(len(item[2]) for item in planned_clear)
+                    > limits.max_total_work_canonical_bytes
                 ):
                     return MaterializeResult(
                         MaterializeStatus.AT_CAPACITY,
@@ -538,6 +636,11 @@ class SqliteIngestionJournal(JournalRows):
                 != inventory.storage_rows
             ):
                 raise JournalIntegrityError("Work inventory snapshot changed")
+            if any(
+                self._load_room_aggregate(write_owner, room_id) is not None
+                for room_id in aggregate_rooms
+            ):
+                raise JournalIntegrityError("room Aggregate snapshot changed")
 
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
@@ -556,6 +659,17 @@ class SqliteIngestionJournal(JournalRows):
                 )
 
             try:
+                for row in planned_aggregates:
+                    aggregate_cursor = self._execute(
+                        "INSERT INTO NioIngestRoomAggregate("
+                        "account_id, room_id, updated_revision, intent_kind, "
+                        "payload_ciphertext, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+                    if aggregate_cursor.rowcount != 1:
+                        raise JournalIntegrityError(
+                            "Aggregate insert did not write a row"
+                        )
                 for row in planned_rows:
                     work_cursor = self._execute(
                         "INSERT INTO NioIngestWork("
@@ -569,7 +683,9 @@ class SqliteIngestionJournal(JournalRows):
                     if work_cursor.rowcount != 1:
                         raise JournalIntegrityError("Work insert did not write a row")
             except (sqlite3.IntegrityError, IntegrityError) as error:
-                raise JournalIntegrityError("planned Work insert collided") from error
+                raise JournalIntegrityError(
+                    "planned materialization collided"
+                ) from error
 
             row_predicate = (
                 write_selected_row["account_id"],
