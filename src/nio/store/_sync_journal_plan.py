@@ -45,33 +45,83 @@ def plan_frame_materialization(
     revision: int,
     limits: MaterializerLimits,
 ) -> MaterializationPlan | None:
-    if aggregates:
-        raise ValueError("existing room Aggregate requires a later room path")
-    proposal = reduce_staged_frame(stream_id, frame.frame_id, frame, ())
+    aggregate_by_room = {item.continuity.room_id: item for item in aggregates}
+    if len(aggregate_by_room) != len(aggregates):
+        raise ValueError("room Aggregates must have unique room IDs")
+    continuities = tuple(aggregate.continuity for aggregate in aggregates)
+    proposal = reduce_staged_frame(stream_id, frame.frame_id, frame, continuities)
     room_plans = {room.after.room_id: room for room in proposal.room_proposals}
-    if len(room_plans) != len(proposal.room_proposals) or any(
-        room.before is not None
-        or room.recovery is not None
-        or room.hydration is None
-        or room.retirement_epoch is not None
-        or room.losses
-        or room.release is not RecoveryRelease.NONE
-        for room in proposal.room_proposals
+    if (
+        len(room_plans) != len(proposal.room_proposals)
+        or aggregate_by_room.keys() - room_plans.keys()
+        or any(
+            room.recovery is not None
+            or room.retirement_epoch is not None
+            or room.losses
+            or room.release is not RecoveryRelease.NONE
+            for room in proposal.room_proposals
+        )
     ):
         raise ValueError("selected frame requires a later room path")
 
     existing_ids = {item.value.record_id for item in work}
-    if any(item.status == "held" and item.value.room_id in room_plans for item in work):
-        raise ValueError("new Aggregate has orphan HELD Work")
+    room_sequences: dict[str, int] = {}
+    pending_hydrations = {}
+    for room_id, room in room_plans.items():
+        if (hydration := room.hydration) is None:
+            raise ValueError("selected frame requires a later room path")
+        aggregate = aggregate_by_room.get(room_id)
+        if aggregate is None:
+            if room.before is not None:
+                raise ValueError("room proposal is missing its Aggregate")
+            room_sequences[room_id] = 0
+            pending_hydrations[room_id] = hydration
+        else:
+            pending = aggregate.pending_hydration
+            if (
+                room.before != aggregate.continuity
+                or pending is None
+                or hydration.hydration_id != pending.hydration_id
+            ):
+                raise ValueError("room proposal does not continue its Aggregate")
+            room_sequences[room_id] = aggregate.next_room_sequence
+            pending_hydrations[room_id] = pending
 
-    room_sequences = dict.fromkeys(room_plans, 0)
+    room_counts = dict.fromkeys(room_plans, 0)
     room_bytes = dict.fromkeys(room_plans, 0)
+    seen_sequences: set[tuple[str, int, int]] = set()
+    for item in work:
+        value = item.value
+        if item.status != "held":
+            continue
+        held_room_id = value.room_id
+        if held_room_id is None or held_room_id not in room_plans:
+            continue
+        aggregate = aggregate_by_room.get(held_room_id)
+        if aggregate is None:
+            raise ValueError("new Aggregate has orphan HELD Work")
+        membership_epoch = value.membership_epoch
+        sequence = value.room_sequence
+        if (
+            membership_epoch is None
+            or sequence is None
+            or membership_epoch != aggregate.continuity.membership_epoch
+            or sequence >= aggregate.next_room_sequence
+        ):
+            raise ValueError("HELD Work does not match its Aggregate")
+        key = (held_room_id, membership_epoch, sequence)
+        if key in seen_sequences:
+            raise ValueError("HELD Work does not match its Aggregate")
+        seen_sequences.add(key)
+        room_counts[held_room_id] += 1
+        room_bytes[held_room_id] += item.canonical_size
+
     inserts: list[PlannedWork] = []
     planned_ids: set[str] = set()
     ready_ordinal = 0
     for index, descriptor in enumerate(proposal.descriptors):
-        room_id = descriptor.room_id
-        if room_id is None:
+        descriptor_room_id = descriptor.room_id
+        if descriptor_room_id is None:
             if (
                 descriptor.route is not DescriptorRoute.READY
                 or descriptor.kind
@@ -84,7 +134,7 @@ def plan_frame_materialization(
             ready_ordinal += 1
         else:
             if (
-                room_id not in room_plans
+                descriptor_room_id not in room_plans
                 or descriptor.route is not DescriptorRoute.HOLD_FOR_HYDRATION
                 or descriptor.kind
                 not in (
@@ -99,16 +149,16 @@ def plan_frame_materialization(
                 )
             ):
                 raise ValueError("unsupported room descriptor")
-            epoch = room_plans[room_id].after.membership_epoch
-            sequence = room_sequences[room_id]
-            room_sequences[room_id] += 1
+            epoch = room_plans[descriptor_room_id].after.membership_epoch
+            sequence = room_sequences[descriptor_room_id]
+            room_sequences[descriptor_room_id] += 1
             ordinal = None
         work_id = str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}"))
         value = EventRecord(
             work_id,
             descriptor.kind,
             replace(frame.origin, frame_index=index),
-            room_id,
+            descriptor_room_id,
             epoch,
             sequence,
             None,
@@ -123,11 +173,12 @@ def plan_frame_materialization(
             raise ValueError("planned Work identity collides")
         planned_ids.add(work_id)
         inserts.append((value, plaintext, ordinal))
-        if room_id is not None:
-            room_bytes[room_id] += len(plaintext)
+        if descriptor_room_id is not None:
+            room_counts[descriptor_room_id] += 1
+            room_bytes[descriptor_room_id] += len(plaintext)
 
     if any(
-        room_sequences[room_id] > limits.max_held_records_per_room
+        room_counts[room_id] > limits.max_held_records_per_room
         or room_bytes[room_id] > limits.max_held_canonical_bytes_per_room
         for room_id in room_plans
     ):
@@ -147,13 +198,24 @@ def plan_frame_materialization(
     ):
         return None
 
-    room_values = tuple(
-        RoomAggregateValue(
-            room.after,
-            room_sequences[room.after.room_id],
-            revision,
-            room.hydration,
+    room_values: list[RoomAggregateValue] = []
+    for room in proposal.room_proposals:
+        room_id = room.after.room_id
+        aggregate = aggregate_by_room.get(room_id)
+        if (
+            aggregate is not None
+            and room.after == aggregate.continuity
+            and room_sequences[room_id] == aggregate.next_room_sequence
+        ):
+            continue
+        room_values.append(
+            RoomAggregateValue(
+                room.after,
+                room_sequences[room_id],
+                revision,
+                pending_hydrations[room_id],
+            )
         )
-        for room in proposal.room_proposals
+    return MaterializationPlan(
+        tuple(room_values), tuple(inserts), proposal.crypto_deferred
     )
-    return MaterializationPlan(room_values, tuple(inserts), proposal.crypto_deferred)

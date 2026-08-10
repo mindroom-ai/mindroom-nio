@@ -420,6 +420,11 @@ class SqliteIngestionJournal(JournalRows):
                     (room_id, self._load_room_aggregate(owner, room_id))
                     for room_id in aggregate_rooms
                 )
+                existing_aggregate_rooms = {
+                    room_id
+                    for room_id, loaded in aggregate_snapshot
+                    if loaded is not None
+                }
                 aggregates = tuple(
                     loaded[1]
                     for _room_id, loaded in aggregate_snapshot
@@ -554,15 +559,24 @@ class SqliteIngestionJournal(JournalRows):
 
             try:
                 for row in planned_aggregates:
-                    aggregate_cursor = self._execute(
-                        "INSERT INTO NioIngestRoomAggregate("
-                        "account_id, room_id, updated_revision, intent_kind, "
-                        "payload_ciphertext, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
-                        row,
-                    )
+                    if row[1] in existing_aggregate_rooms:
+                        aggregate_cursor = self._execute(
+                            "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
+                            "intent_kind = ?, payload_ciphertext = ?, "
+                            "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
+                            (*row[2:], row[0], row[1]),
+                        )
+                    else:
+                        aggregate_cursor = self._execute(
+                            "INSERT INTO NioIngestRoomAggregate("
+                            "account_id, room_id, updated_revision, intent_kind, "
+                            "payload_ciphertext, payload_sha256) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            row,
+                        )
                     if aggregate_cursor.rowcount != 1:
                         raise JournalIntegrityError(
-                            "Aggregate insert did not write a row"
+                            "Aggregate write did not affect one row"
                         )
                 for row in planned_rows:
                     work_cursor = self._execute(

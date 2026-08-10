@@ -2842,6 +2842,366 @@ def test_materializer_empty_first_seen_room_creates_hydration_owner(
 
 
 @pytest.mark.parametrize(
+    ("transport", "crypto"),
+    [
+        (TransportKind.CLASSIC, False),
+        (TransportKind.SLIDING, True),
+    ],
+    ids=("classic-plain", "sliding-crypto"),
+)
+def test_materializer_repeated_hydration_preserves_original_intent_and_continuity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: TransportKind,
+    crypto: bool,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        transport,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, first_normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            crypto=crypto,
+            room_nonempty=True,
+            global_ready_count=1,
+        )
+        assert first.staged_revision == 1
+        first_proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert tuple(descriptor.route for descriptor in first_proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+            DescriptorRoute.READY,
+            DescriptorRoute.READY,
+        )
+        first_room = first_proposal.room_proposals[0]
+        assert first_room.hydration is not None
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+
+        first_aggregate_rows = _aggregate_rows(journal)
+        assert len(first_aggregate_rows) == 1
+        _, first_aggregate = _decrypt_aggregate(journal, first_aggregate_rows[0])
+        assert first_aggregate == _values().RoomAggregateValue(
+            first_room.after,
+            1,
+            2,
+            first_room.hydration,
+        )
+        stored_pending = first_aggregate.pending_hydration
+        assert stored_pending is not None
+        first_work = _work_rows(journal)
+        assert len(first_work) == 3
+
+        second, second_normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            2,
+            crypto=crypto,
+            room_nonempty=True,
+            global_ready_count=1,
+        )
+        assert second.staged_revision == 3
+        second_proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            second.frame_id,
+            second_normalized,
+            (first_aggregate.continuity,),
+        )
+        assert tuple(
+            descriptor.route for descriptor in second_proposal.descriptors
+        ) == (
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+            DescriptorRoute.READY,
+            DescriptorRoute.READY,
+        )
+        second_room = second_proposal.room_proposals[0]
+        assert second_room.before == first_aggregate.continuity
+        assert second_room.hydration is not None
+        assert second_room.hydration.hydration_id == stored_pending.hydration_id
+        assert second_room.hydration.origin == second_normalized.origin
+        assert second_room.hydration.origin != stored_pending.origin
+        second_raw_before = _frame_storage_row(journal, second.frame_id)
+        assert second_raw_before is not None
+        owner_before_capacity = journal.load_owner()
+        aggregate_before_capacity = _aggregate_rows(journal)
+        work_before_capacity = _work_rows(journal)
+
+        def reject_writer(_owner: object) -> NoReturn:
+            raise AssertionError("held-cap rejection entered writer")
+
+        statements.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(type(journal._owner), "journal_write", reject_writer)
+            with pytest.raises(
+                JournalIntegrityError,
+                match="HELD Work exceeds room capacity",
+            ):
+                _materialize(
+                    journal,
+                    limits=replace(
+                        MaterializerLimits(),
+                        max_held_records_per_room=1,
+                    ),
+                )
+        assert journal.load_owner() == owner_before_capacity
+        assert _frame_storage_row(journal, second.frame_id) == second_raw_before
+        assert _aggregate_rows(journal) == aggregate_before_capacity
+        assert _work_rows(journal) == work_before_capacity
+        assert _materializer_dml(statements) == ()
+
+        statements.clear()
+
+        assert _materialize(
+            journal,
+            limits=replace(
+                MaterializerLimits(),
+                max_held_records_per_room=2,
+            ),
+        ) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            second.frame_id,
+            4,
+        )
+        aggregate_dml = tuple(
+            statement.strip().upper()
+            for statement in _materializer_dml(statements)
+            if "NioIngestRoomAggregate" in statement
+        )
+        assert len(aggregate_dml) == 1
+        assert aggregate_dml[0].startswith("UPDATE NIOINGESTROOMAGGREGATE ")
+        assert not any(
+            keyword in aggregate_dml[0] for keyword in ("INSERT", "REPLACE", "UPSERT")
+        )
+
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        assert aggregate_rows[0][:3] == (second_room.after.room_id, 4, "hydration")
+        aggregate_plaintext, aggregate = _decrypt_aggregate(journal, aggregate_rows[0])
+        expected_aggregate = _values().RoomAggregateValue(
+            second_room.after,
+            2,
+            4,
+            stored_pending,
+        )
+        assert aggregate == expected_aggregate
+        assert aggregate.pending_hydration == first_room.hydration
+        assert aggregate.pending_hydration != second_room.hydration
+        assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            expected_aggregate
+        )
+
+        work_rows = _work_rows(journal)
+        assert len(work_rows) == 6
+        expected_work_ids = {
+            str(uuid5(frame_id, f"event:{descriptor.descriptor_key}"))
+            for frame_id, proposal in (
+                (first.frame_id, first_proposal),
+                (second.frame_id, second_proposal),
+            )
+            for descriptor in proposal.descriptors
+        }
+        assert {str(row[0]) for row in work_rows} == expected_work_ids
+        assert {tuple(row) for row in work_rows if row[3] == str(first.frame_id)} == {
+            tuple(row) for row in first_work
+        }
+        second_rows = {
+            str(row[0]): row for row in work_rows if row[3] == str(second.frame_id)
+        }
+        assert len(second_rows) == 3
+        expected_second_ids: list[str] = []
+        ready_ordinal = 0
+        for index, descriptor in enumerate(second_proposal.descriptors):
+            work_id = str(uuid5(second.frame_id, f"event:{descriptor.descriptor_key}"))
+            expected_second_ids.append(work_id)
+            is_room = descriptor.room_id is not None
+            expected_record = EventRecord(
+                work_id,
+                descriptor.kind,
+                replace(second_normalized.origin, frame_index=index),
+                descriptor.room_id,
+                second_room.after.membership_epoch if is_room else None,
+                1 if is_room else None,
+                None,
+                descriptor.provenance,
+                descriptor.source_json,
+                None,
+            )
+            row = second_rows[work_id]
+            assert row[1:10] == (
+                "event",
+                "held" if is_room else "ready",
+                str(second.frame_id),
+                descriptor.room_id,
+                second_room.after.membership_epoch if is_room else None,
+                1 if is_room else None,
+                None if is_room else 4,
+                None if is_room else ready_ordinal,
+                4,
+            )
+            plaintext, record = _decrypt_event_work(journal, row)
+            assert record == expected_record
+            assert plaintext == _rows()._canonical_work_plaintext(
+                "event", expected_record
+            )
+            if not is_room:
+                ready_ordinal += 1
+        assert set(second_rows) == set(expected_second_ids)
+        assert tuple(
+            row[8]
+            for row in work_rows
+            if row[3] == str(second.frame_id) and row[2] == "ready"
+        ) == (0, 1)
+        assert sorted(int(row[6]) for row in work_rows if row[2] == "held") == [0, 1]
+
+        second_raw_after = _frame_storage_row(journal, second.frame_id)
+        if crypto:
+            assert second_raw_after is not None
+            assert second_raw_after[:6] == second_raw_before[:6]
+            assert second_raw_after[6] == 4
+            assert second_raw_after[7] != second_raw_before[7]
+            assert (
+                EncryptedRowCodec(
+                    "discovery-secret",
+                    journal.account_id,
+                    journal.load_owner().stream_id,
+                ).decrypt(
+                    "NioIngestFrameDrainHeader",
+                    (second.frame_id,),
+                    second_raw_after[7],
+                    hashlib.sha256(b"").digest(),
+                    header=_canonical_expected_drain_header(second_raw_after, 4),
+                )
+                == b""
+            )
+        else:
+            assert second_raw_after is None
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_repeated_hydration_rejects_aggregate_reseal_at_writer_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_present=True,
+        )
+        assert first.staged_revision == 1
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        aggregate_before = _aggregate_rows(journal)
+        assert len(aggregate_before) == 1
+        plaintext_before, value_before = _decrypt_aggregate(
+            journal, aggregate_before[0]
+        )
+
+        second, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            room_present=True,
+        )
+        assert second.staged_revision == 3
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, second.frame_id)
+        assert raw_before is not None
+        real_journal_write = type(journal._owner).journal_write
+        raced = False
+
+        @contextmanager
+        def reseal_aggregate_before_writer(owner: object) -> Iterator[None]:
+            nonlocal raced
+            assert owner is journal._owner
+            assert not raced
+            raced = True
+            row = aggregate_before[0]
+            ciphertext, digest = journal._codec.seal(
+                "NioIngestRoomAggregate",
+                (row[0],),
+                plaintext_before,
+                header=_canonical_internal([row[0], row[1], row[2]]),
+            )
+            assert ciphertext != row[3]
+            assert digest == row[4]
+            with sqlite3.connect(journal.database_path) as connection:
+                updated = connection.execute(
+                    "UPDATE NioIngestRoomAggregate SET payload_ciphertext = ?, "
+                    "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
+                    (ciphertext, digest, journal.account_id, row[0]),
+                )
+                assert updated.rowcount == 1
+            with real_journal_write(journal._owner):
+                yield
+
+        monkeypatch.setattr(
+            type(journal._owner),
+            "journal_write",
+            reseal_aggregate_before_writer,
+        )
+        statements.clear()
+        with pytest.raises(
+            JournalIntegrityError,
+            match=r"[Aa]ggregate snapshot changed",
+        ):
+            _materialize(journal)
+
+        assert raced
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, second.frame_id) == raw_before
+        assert _work_rows(journal) == ()
+        aggregate_after = _aggregate_rows(journal)
+        assert aggregate_after[0][:3] == aggregate_before[0][:3]
+        assert aggregate_after[0][3] != aggregate_before[0][3]
+        assert aggregate_after[0][4] == aggregate_before[0][4]
+        plaintext_after, value_after = _decrypt_aggregate(journal, aggregate_after[0])
+        assert plaintext_after == plaintext_before
+        assert value_after == value_before
+        assert _materializer_dml(statements) == ()
+
+        monkeypatch.undo()
+        statements.clear()
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            second.frame_id,
+            4,
+        )
+        assert _aggregate_rows(journal) == aggregate_after
+        assert not any(
+            "NioIngestRoomAggregate" in statement
+            for statement in _materializer_dml(statements)
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
     "transport",
     [TransportKind.CLASSIC, TransportKind.SLIDING],
     ids=("classic", "sliding"),
