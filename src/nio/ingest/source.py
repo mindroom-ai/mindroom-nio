@@ -341,6 +341,25 @@ class SyncFrame:
             raise ValueError("a room may appear in only one frame section")
 
 
+def _continuity_bounds(
+    frame: SyncFrame,
+    segment: RoomSegment,
+    baseline_window_token: str | None,
+) -> tuple[str, str] | None:
+    if frame.origin.transport is TransportKind.CLASSIC:
+        start = _classic_cursor_from_json(frame.request_cursor_json).next_batch
+        target = (
+            segment.timeline_prev_batch
+            or _classic_cursor_from_json(frame.candidate_cursor_json).next_batch
+        )
+    else:
+        start = baseline_window_token
+        target = segment.timeline_prev_batch
+    if not start or not target or start == target:
+        return None
+    return start, target
+
+
 @dataclass(frozen=True, slots=True)
 class SourceResult:
     kind: SourceResultKind
