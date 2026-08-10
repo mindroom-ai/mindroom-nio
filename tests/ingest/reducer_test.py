@@ -661,6 +661,37 @@ def test_unparsed_or_transition_evidence_invalidates_old_gap_once() -> None:
     )
 
 
+def test_membership_transition_terminates_pending_hydration_before_retirement() -> None:
+    frame = _mixed_frame()
+    hydration_id = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    hydrating = replace(_state(), baseline=None, hydration_id=hydration_id)
+    observation = MembershipObservation(
+        "leave", "leave", "$leave", "join", None, False, False, False, False
+    )
+    segment = replace(
+        frame.room_segments[0],
+        section=RoomSection.LEAVE,
+        membership_observation=observation,
+    )
+    frame = replace(frame, room_segments=(segment,))
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (hydrating,))
+
+    room = proposal.room_proposals[0]
+    assert room.retirement_epoch == 0
+    assert room.after.membership_epoch == 1
+    assert room.after.hydration_id is None
+    assert room.losses == (
+        LossProposal(
+            "!room:example.org",
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        ),
+    )
+    assert room.release is RecoveryRelease.LOSS_THEN_HELD
+
+
 def test_classic_gap_falls_back_to_candidate_cursor_target() -> None:
     frame = _mixed_frame()
     segment = replace(

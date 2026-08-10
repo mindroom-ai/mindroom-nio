@@ -253,6 +253,9 @@ def _plan_room(
                     ),
                 )
                 release = RecoveryRelease.LOSS_THEN_HELD
+            elif before.hydration_id is not None:
+                losses = (_loss(before, LossReason.UNVERIFIABLE),)
+                release = RecoveryRelease.LOSS_THEN_HELD
             return (
                 RoomProposal(before, after, None, None, epoch, losses, release),
                 DescriptorRoute.HOLD_FOR_RETIREMENT,
