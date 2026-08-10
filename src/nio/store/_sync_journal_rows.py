@@ -9,7 +9,11 @@ from uuid import UUID
 from ..ingest._json import load_internal_json
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import TransportKind
-from ..ingest.ports import NetworkRequest, StagedSourceResponse
+from ..ingest.ports import (
+    NetworkRequest,
+    StagedSourceResponse,
+    _revalidated_staged_source_response,
+)
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_preflight import _validate_source_cursor
 
@@ -194,27 +198,54 @@ class JournalRows:
             )
         return rows[0]
 
+    def _decode_owner_row(self, row: Mapping[str, object]) -> OwnerView:
+        try:
+            owner = OwnerView(
+                row["account_id"],
+                row["device_id"],
+                row["schema_version"],
+                UUID(row["stream_id"]),
+                TransportKind(row["transport_kind"]),
+                row["revision"],
+                UUID(row["writer_epoch"]),
+                row["next_source_epoch"],
+            )
+            if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
+                raise ValueError("created_at_ns is invalid")
+        except (AttributeError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("ingestion owner row is invalid") from error
+        if owner.account_id != self.account_id or owner.device_id != self.device_id:
+            raise JournalIntegrityError("ingestion owner identity changed")
+        return owner
+
     def load_owner(self) -> OwnerView:
         with self._read():  # type: ignore[attr-defined]
-            row = self._meta()
-            try:
-                owner = OwnerView(
-                    row["account_id"],
-                    row["device_id"],
-                    row["schema_version"],
-                    UUID(row["stream_id"]),
-                    TransportKind(row["transport_kind"]),
-                    row["revision"],
-                    UUID(row["writer_epoch"]),
-                    row["next_source_epoch"],
-                )
-                if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
-                    raise ValueError("created_at_ns is invalid")
-            except (AttributeError, TypeError, ValueError) as error:
-                raise JournalIntegrityError("ingestion owner row is invalid") from error
-            if owner.account_id != self.account_id or owner.device_id != self.device_id:
-                raise JournalIntegrityError("ingestion owner identity changed")
-            return owner
+            return self._decode_owner_row(self._meta())
+
+    def _load_stage_snapshot(self) -> tuple[OwnerView, SourceState]:
+        rows = self._execute(  # type: ignore[attr-defined]
+            "SELECT m.*, s.source_epoch AS joined_source_epoch, "
+            "s.cursor_ciphertext AS joined_cursor_ciphertext, "
+            "s.cursor_sha256 AS joined_cursor_sha256, "
+            "s.next_request_id AS joined_next_request_id, "
+            "s.active AS joined_active FROM NioIngestMeta AS m "
+            "JOIN NioIngestSourceState AS s ON s.account_id = m.account_id"
+        ).fetchall()
+        if len(rows) != 1:
+            raise JournalIntegrityError(
+                "ingestion stage snapshot cardinality is not one"
+            )
+        row = rows[0]
+        owner = self._decode_owner_row(row)
+        source_row = {
+            "account_id": row["account_id"],
+            "source_epoch": row["joined_source_epoch"],
+            "cursor_ciphertext": row["joined_cursor_ciphertext"],
+            "cursor_sha256": row["joined_cursor_sha256"],
+            "next_request_id": row["joined_next_request_id"],
+            "active": row["joined_active"],
+        }
+        return owner, self._decode_source_row(source_row, owner)
 
     def _decode_source_row(
         self,
@@ -419,7 +450,11 @@ class JournalRows:
         frame: StagedFrame,
         staged_revision: int,
     ) -> sqlite3.Cursor:
-        stored = StagedFrame(frame.frame_id, frame.response, staged_revision)
+        stored = StagedFrame(
+            frame.frame_id,
+            _revalidated_staged_source_response(frame.response),
+            staged_revision,
+        )
         payload = _canonical_internal(_frame_envelope(stored))
         ciphertext, digest = self._codec.seal(  # type: ignore[attr-defined]
             "NioIngestFrame",

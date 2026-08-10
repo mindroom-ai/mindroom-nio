@@ -260,8 +260,7 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("writer_epoch must be UUID")
 
         with self._transaction():
-            owner = self.load_owner()
-            current = self.load_source()
+            owner, current = self._load_stage_snapshot()
             if owner.revision != expected_revision:
                 raise JournalConflictError("journal revision is stale")
             if owner.writer_epoch != writer_epoch:

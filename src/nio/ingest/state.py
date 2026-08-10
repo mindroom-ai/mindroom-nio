@@ -5,7 +5,6 @@ from .model import TransportKind
 from .ports import (
     StagedSourceResponse,
     _frame_id_for_response,
-    _revalidated_staged_source_response,
 )
 
 
@@ -76,8 +75,10 @@ class StagedFrame:
         _require_exact(self.frame_id, UUID, "frame_id")
         _require_exact(self.response, StagedSourceResponse, "response")
         _require_nonnegative(self.staged_revision, "staged_revision")
-        response = _revalidated_staged_source_response(self.response)
-        expected = _frame_id_for_response(response.request, response.source_sha256)
+        expected = _frame_id_for_response(
+            self.response.request,
+            self.response.source_sha256,
+        )
         if self.frame_id != expected:
             raise ValueError("frame_id does not match staged source response")
 
