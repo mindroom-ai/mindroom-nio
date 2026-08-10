@@ -2,7 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid5
 
 from .errors import BatchIntegrityError
@@ -100,11 +100,13 @@ def _origin_to_dict(origin: RecordOrigin | SystemOrigin) -> dict[str, object]:
     }
 
 
-def _origin_from_dict(value: object) -> RecordOrigin | SystemOrigin:
+def _origin_from_dict(
+    value: object, *, exact: bool = True
+) -> RecordOrigin | SystemOrigin:
     origin = _dict(value, "origin")
     origin_type = origin.get("origin_type")
     if origin_type == "transport":
-        if tuple(origin) != _TRANSPORT_ORIGIN_FIELDS:
+        if exact and tuple(origin) != _TRANSPORT_ORIGIN_FIELDS:
             raise ValueError("transport origin fields are not canonical")
         return RecordOrigin(
             TransportKind(_string(origin.get("transport"), "transport")),
@@ -113,7 +115,7 @@ def _origin_from_dict(value: object) -> RecordOrigin | SystemOrigin:
             _integer(origin.get("frame_index"), "frame_index"),
         )
     if origin_type == "system":
-        if tuple(origin) != _SYSTEM_ORIGIN_FIELDS:
+        if exact and tuple(origin) != _SYSTEM_ORIGIN_FIELDS:
             raise ValueError("system origin fields are not canonical")
         return SystemOrigin(
             SystemOriginKind(_string(origin.get("kind"), "kind")),
@@ -179,11 +181,13 @@ def _record_to_dict(record: EventRecord | LossRecord) -> dict[str, object]:
     }
 
 
-def _record_from_dict(value: object) -> EventRecord | LossRecord:
+def _record_from_dict(value: object, *, exact: bool = True) -> EventRecord | LossRecord:
     record = _dict(value, "record")
     record_type = record.get("record_type")
     if record_type == "event":
-        origin = _origin_from_dict(record.get("origin"))
+        origin = cast(
+            "RecordOrigin", _origin_from_dict(record.get("origin"), exact=exact)
+        )
         return EventRecord(
             _string(record.get("record_id"), "record_id"),
             RecordKind(_string(record.get("kind"), "kind")),
@@ -203,7 +207,7 @@ def _record_from_dict(value: object) -> EventRecord | LossRecord:
     if record_type == "loss":
         return LossRecord(
             _string(record.get("loss_id"), "loss_id"),
-            _origin_from_dict(record.get("origin")),
+            _origin_from_dict(record.get("origin"), exact=exact),
             _string(record.get("room_id"), "room_id"),
             _integer(record.get("membership_epoch"), "membership_epoch"),
             LossReason(_string(record.get("reason"), "reason")),

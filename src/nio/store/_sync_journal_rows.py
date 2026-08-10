@@ -7,14 +7,15 @@ import sqlite3
 from typing import TYPE_CHECKING, NamedTuple, cast
 from uuid import UUID
 
-from ..ingest._json import load_internal_json
+from ..ingest._json import canonical_json, load_internal_json
 from ..ingest.errors import JournalIntegrityError
-from ..ingest.model import TransportKind
+from ..ingest.model import EventRecord, RecordKind, TransportKind
 from ..ingest.ports import (
     NetworkRequest,
     StagedSourceResponse,
     _revalidated_staged_source_response,
 )
+from ..ingest.serialization import _record_from_dict, _record_to_dict
 from ..ingest.source import MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_preflight import _validate_source_cursor
@@ -47,6 +48,9 @@ _FRAME_FIELDS = (
 _MAX_STAGED_FRAMES = 256
 _FRAME_CLASSIFICATION_LIMIT = _MAX_STAGED_FRAMES + 1
 _EMPTY_SHA256 = hashlib.sha256(b"").digest()
+_MAX_WORK_PLAINTEXT_BYTES = 1024 * 1024
+_MAX_READY_WORK_COUNT = 2_048
+_MAX_READY_WORK_CANONICAL_BYTES = 16 * 1024 * 1024
 
 
 def _canonical_internal(value: object) -> bytes:
@@ -56,6 +60,48 @@ def _canonical_internal(value: object) -> bytes:
         allow_nan=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _canonical_work_plaintext(kind: str, value: EventRecord) -> bytes:
+    if type(kind) is not str:
+        raise TypeError("work kind must be str")
+    if kind != "event" or type(value) is not EventRecord:
+        raise ValueError("Task 3 supports only event Work values")
+    return canonical_json({"kind": kind, "value": _record_to_dict(value)})
+
+
+def _work_value_from_plaintext(
+    stream_id: UUID,
+    work_id: str,
+    kind: str,
+    plaintext: bytes,
+) -> EventRecord:
+    if type(stream_id) is not UUID:
+        raise TypeError("stream_id must be UUID")
+    if type(work_id) is not str or type(kind) is not str:
+        raise TypeError("work identity must contain strings")
+    if type(plaintext) is not bytes:
+        raise TypeError("work plaintext must be bytes")
+    if len(plaintext) > _MAX_WORK_PLAINTEXT_BYTES:
+        raise ValueError("work plaintext exceeds 1 MiB")
+    if kind != "event":
+        raise ValueError("Task 3 supports only event Work values")
+    try:
+        wrapper = load_internal_json(plaintext, "work plaintext")
+        if type(wrapper) is not dict or wrapper.get("kind") != kind:
+            raise ValueError("work wrapper kind is invalid")
+        value = _record_from_dict(wrapper.get("value"), exact=False)
+        parsed_id = UUID(work_id)
+        if (
+            type(value) is not EventRecord
+            or work_id != str(parsed_id)
+            or value.record_id != work_id
+            or plaintext != _canonical_work_plaintext(kind, value)
+        ):
+            raise ValueError("work plaintext is not canonical")
+        return value
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("event Work plaintext is invalid") from error
 
 
 def _encoded_bytes(value: bytes | None) -> str | None:
@@ -220,6 +266,12 @@ class _FrameDrainRow(NamedTuple):
     drain_header_ciphertext: bytes
 
 
+class _Task3WorkInventory(NamedTuple):
+    storage_rows: tuple[tuple[object, ...], ...]
+    work_ids: frozenset[str]
+    canonical_bytes: int
+
+
 class JournalRows:
     account_id: str
     device_id: str
@@ -241,7 +293,7 @@ class JournalRows:
                 row["device_id"],
                 row["schema_version"],
                 UUID(row["stream_id"]),
-                TransportKind(row["transport_kind"]),
+                TransportKind(cast("str", row["transport_kind"])),
                 row["revision"],
                 UUID(row["writer_epoch"]),
                 row["next_source_epoch"],
@@ -495,6 +547,117 @@ class JournalRows:
                     row.raw_frame_id,
                 ),
             )
+        )
+
+    def _load_task3_work_inventory(
+        self,
+        owner: OwnerView,
+    ) -> _Task3WorkInventory:
+        cursor = self._execute(  # type: ignore[attr-defined]
+            "SELECT account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload_ciphertext, payload_sha256 "
+            "FROM NioIngestWork WHERE account_id = ? LIMIT 20001",
+            (self.account_id,),
+        )
+        storage_rows: list[tuple[object, ...]] = []
+        framed_payload_bytes = 0
+        while (fetched := cursor.fetchone()) is not None:
+            row = tuple(fetched)
+            try:
+                (
+                    account_id,
+                    work_id,
+                    kind,
+                    status,
+                    raw_frame_id,
+                    room_id,
+                    membership_epoch,
+                    room_sequence,
+                    ready_revision,
+                    ready_ordinal,
+                    created_revision,
+                    ciphertext,
+                    digest,
+                ) = row
+                if (
+                    account_id != self.account_id
+                    or type(work_id) is not str
+                    or work_id != str(UUID(work_id))
+                    or type(raw_frame_id) is not str
+                    or raw_frame_id != str(UUID(raw_frame_id))
+                    or kind != "event"
+                    or status != "ready"
+                    or (room_id, membership_epoch, room_sequence) != (None, None, None)
+                    or type(ready_revision) is not int
+                    or not 1 <= ready_revision <= owner.revision
+                    or type(ready_ordinal) is not int
+                    or ready_ordinal < 0
+                    or type(created_revision) is not int
+                    or not 1 <= created_revision <= ready_revision
+                    or type(ciphertext) is not bytes
+                    or not 29 <= len(ciphertext) <= _MAX_WORK_PLAINTEXT_BYTES + 29
+                    or type(digest) is not bytes
+                    or len(digest) != 32
+                ):
+                    raise ValueError("Work columns are invalid")
+            except (AttributeError, TypeError, ValueError) as error:
+                raise JournalIntegrityError("invalid Work row") from error
+            storage_rows.append(row)
+            framed_payload_bytes += len(ciphertext) - 29
+            if (
+                len(storage_rows) > _MAX_READY_WORK_COUNT
+                or framed_payload_bytes > _MAX_READY_WORK_CANONICAL_BYTES
+            ):
+                break
+
+        storage_rows.sort(key=lambda row: cast("str", row[1]))
+        canonical_bytes = 0
+        for row in storage_rows:
+            plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
+                "NioIngestWork",
+                (cast("str", row[1]),),
+                cast("bytes", row[11]),
+                cast("bytes", row[12]),
+                header=_canonical_internal(list(row[:11])),
+            )
+            try:
+                value = _work_value_from_plaintext(
+                    owner.stream_id,
+                    cast("str", row[1]),
+                    cast("str", row[2]),
+                    plaintext,
+                )
+                origin = value.origin
+                if (
+                    value.kind
+                    not in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.PRESENCE)
+                    or origin.transport is not owner.transport_kind
+                    or min(origin.source_epoch, origin.request_id, origin.frame_index)
+                    < 0
+                    or (
+                        value.room_id,
+                        value.membership_epoch,
+                        value.room_sequence,
+                        value.event_id,
+                        value.provenance,
+                        value.clear_json,
+                    )
+                    != (None, None, None, None, None, None)
+                ):
+                    raise ValueError("Work value is not a room-free READY event")
+            except (TypeError, ValueError) as error:
+                raise JournalIntegrityError("invalid Work value") from error
+            canonical_bytes += len(plaintext)
+        if (
+            len(storage_rows) > _MAX_READY_WORK_COUNT
+            or canonical_bytes > _MAX_READY_WORK_CANONICAL_BYTES
+        ):
+            raise JournalIntegrityError("READY Work exceeds immutable capacity")
+        return _Task3WorkInventory(
+            tuple(storage_rows),
+            frozenset(cast("str", row[1]) for row in storage_rows),
+            canonical_bytes,
         )
 
     def _frame_drain_row_from_full(

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from peewee import IntegrityError, SqliteDatabase
 
@@ -16,9 +17,9 @@ from ..ingest.config import (
     source_transport,
 )
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
-from ..ingest.model import TransportKind
+from ..ingest.model import EventRecord, RecordKind, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
-from ..ingest.reducer import reduce_staged_frame
+from ..ingest.reducer import DescriptorRoute, reduce_staged_frame
 from ..ingest.sliding import SlidingSource
 from ..ingest.source import (
     MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES,
@@ -34,6 +35,7 @@ from ._sync_journal_preflight import (
 from ._sync_journal_rows import (
     JournalRows,
     _canonical_internal,
+    _canonical_work_plaintext,
     _frame_drain_header,
     _frame_envelope,
 )
@@ -423,10 +425,88 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalIntegrityError(
                     "selected frame does not reduce from empty room state"
                 ) from error
-            if proposal.room_proposals or proposal.descriptors:
+            if proposal.room_proposals or any(
+                descriptor.route is not DescriptorRoute.READY
+                or descriptor.room_id is not None
+                or descriptor.kind
+                not in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.PRESENCE)
+                or descriptor.provenance is not None
+                for descriptor in proposal.descriptors
+            ):
                 raise JournalIntegrityError(
                     "selected frame requires unsupported materialization state"
                 )
+
+            new_revision = expected_revision + 1
+            planned_clear: list[tuple[str, tuple[object, ...], bytes]] = []
+            frame_id = staged.frame_id
+            for index, descriptor in enumerate(proposal.descriptors):
+                work_id = str(uuid5(frame_id, f"event:{descriptor.descriptor_key}"))
+                value = EventRecord(
+                    work_id,
+                    descriptor.kind,
+                    replace(normalized.origin, frame_index=index),
+                    None,
+                    None,
+                    None,
+                    None,
+                    descriptor.provenance,
+                    descriptor.source_json,
+                    None,
+                )
+                plaintext = _canonical_work_plaintext("event", value)
+                if len(plaintext) > limits.max_record_canonical_bytes:
+                    raise JournalIntegrityError(
+                        "planned Work record exceeds the canonical byte limit"
+                    )
+                clear = (
+                    work_id,
+                    "event",
+                    "ready",
+                    str(frame_id),
+                    None,
+                    None,
+                    None,
+                    new_revision,
+                    index,
+                    new_revision,
+                )
+                planned_clear.append((work_id, clear, plaintext))
+
+            inventory = None
+            planned_rows: list[tuple[object, ...]] = []
+            if planned_clear:
+                inventory = self._load_task3_work_inventory(owner)
+                planned_ids = {item[0] for item in planned_clear}
+                if len(planned_ids) != len(planned_clear) or planned_ids & (
+                    inventory.work_ids
+                ):
+                    raise JournalIntegrityError("planned Work identity collides")
+                projected_count = len(inventory.storage_rows) + len(planned_clear)
+                projected_bytes = inventory.canonical_bytes + sum(
+                    len(item[2]) for item in planned_clear
+                )
+                if projected_count > min(
+                    limits.max_ready_work_count, limits.max_total_work_count
+                ) or projected_bytes > min(
+                    limits.max_ready_work_canonical_bytes,
+                    limits.max_total_work_canonical_bytes,
+                ):
+                    return MaterializeResult(
+                        MaterializeStatus.AT_CAPACITY,
+                        selected.frame_id,
+                        None,
+                    )
+                for work_id, clear_values, plaintext in planned_clear:
+                    ciphertext, digest = self._codec.seal(
+                        "NioIngestWork",
+                        (work_id,),
+                        plaintext,
+                        header=_canonical_internal([self.account_id, *clear_values]),
+                    )
+                    planned_rows.append(
+                        (self.account_id, *clear_values, ciphertext, digest)
+                    )
 
         with self._transaction():
             write_owner = self._decode_owner_row(
@@ -453,8 +533,12 @@ class SqliteIngestionJournal(JournalRows):
                 != selected
             ):
                 raise JournalIntegrityError("selected frame snapshot changed")
+            if inventory is not None and (
+                self._load_task3_work_inventory(write_owner).storage_rows
+                != inventory.storage_rows
+            ):
+                raise JournalIntegrityError("Work inventory snapshot changed")
 
-            new_revision = expected_revision + 1
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
                 "UPDATE NioIngestMeta SET revision = ? "
@@ -470,6 +554,22 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalConflictError(
                     "journal materializer compare-and-swap failed"
                 )
+
+            try:
+                for row in planned_rows:
+                    work_cursor = self._execute(
+                        "INSERT INTO NioIngestWork("
+                        "account_id, work_id, kind, status, frame_id, room_id, "
+                        "membership_epoch, room_sequence, ready_revision, "
+                        "ready_ordinal, created_revision, payload_ciphertext, "
+                        "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?)",
+                        row,
+                    )
+                    if work_cursor.rowcount != 1:
+                        raise JournalIntegrityError("Work insert did not write a row")
+            except (sqlite3.IntegrityError, IntegrityError) as error:
+                raise JournalIntegrityError("planned Work insert collided") from error
 
             row_predicate = (
                 write_selected_row["account_id"],

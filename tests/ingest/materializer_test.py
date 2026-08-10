@@ -14,8 +14,8 @@ from enum import StrEnum
 from operator import itemgetter
 from pathlib import Path
 from types import ModuleType
-from typing import get_type_hints
-from uuid import UUID, uuid4
+from typing import NoReturn, get_type_hints
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -33,7 +33,15 @@ from nio.ingest.errors import (
     JournalIntegrityError,
 )
 from nio.ingest.membership import MembershipObservation
-from nio.ingest.model import RecordKind, RecordOrigin, TransportKind
+from nio.ingest.model import (
+    EventRecord,
+    LossBoundary,
+    LossReason,
+    LossRecord,
+    RecordKind,
+    RecordOrigin,
+    TransportKind,
+)
 from nio.ingest.ports import (
     NetworkRequest,
     NetworkResult,
@@ -41,10 +49,12 @@ from nio.ingest.ports import (
     _frame_id_for_response,
 )
 from nio.ingest.reducer import (
+    DescriptorRoute,
     ReducerInputError,
     RoomContinuity,
     reduce_staged_frame,
 )
+from nio.ingest.serialization import _record_to_dict
 from nio.ingest.sliding import (
     RESERVED_ALL_ROOMS_LIST,
     SlidingCursor,
@@ -97,6 +107,7 @@ _FRAME_ID = UUID("12345678-1234-5678-1234-567812345678")
 _STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
 _SOURCE_BODY_LIMIT = 16 * 1024 * 1024
 _FRAME_ENVELOPE_LIMIT = 24 * 1024 * 1024
+_WORK_CIPHERTEXT_LIMIT = 1 * 1024 * 1024 + 29
 _SCHEMA_ACCOUNT_ID = "@schema:example.org"
 _SCHEMA_FRAME_ID = "12345678-1234-5678-1234-567812345678"
 _SQLITE_CONSTRAINT_MATCH = (
@@ -108,11 +119,10 @@ _TASK6_SCHEMA_OBJECT_ORDER = (
     "NioIngestSourceState",
     "NioIngestFrame",
     "NioIngestFrame_drain",
-)
-_TASK6_TABLE_NAMES = (
-    "NioIngestFrame",
-    "NioIngestMeta",
-    "NioIngestSourceState",
+    "NioIngestWork",
+    "NioIngestWork_ready",
+    "NioIngestWork_held_release",
+    "NioIngestWork_frame_kind",
 )
 _FRAME_COLUMNS = (
     ("account_id", "TEXT", True, 1),
@@ -125,19 +135,38 @@ _FRAME_COLUMNS = (
     ("room_materialized_revision", "INTEGER", False, 0),
     ("drain_header_ciphertext", "BLOB", True, 0),
 )
+_WORK_COLUMNS = (
+    ("account_id", "TEXT", True, 1),
+    ("work_id", "TEXT", True, 2),
+    ("kind", "TEXT", True, 0),
+    ("status", "TEXT", True, 0),
+    ("frame_id", "TEXT", True, 0),
+    ("room_id", "TEXT", False, 0),
+    ("membership_epoch", "INTEGER", False, 0),
+    ("room_sequence", "INTEGER", False, 0),
+    ("ready_revision", "INTEGER", False, 0),
+    ("ready_ordinal", "INTEGER", False, 0),
+    ("created_revision", "INTEGER", True, 0),
+    ("payload_ciphertext", "BLOB", True, 0),
+    ("payload_sha256", "BLOB", True, 0),
+)
 _TASK6_SCHEMA_OBJECTS = frozenset(
     {
         ("table", "NioIngestMeta"),
         ("table", "NioIngestSourceState"),
         ("table", "NioIngestFrame"),
+        ("table", "NioIngestWork"),
         ("index", "NioIngestFrame_drain"),
+        ("index", "NioIngestWork_ready"),
+        ("index", "NioIngestWork_held_release"),
+        ("index", "NioIngestWork_frame_kind"),
     }
 )
 
-# Frozen pre-Task6 v1 physical schema.  This fixture intentionally does not
-# derive from SCHEMA_SQL: a source-only v1 store must be refused rather than
-# silently treated as a Task6-capable owner.
-_LEGACY_V1_DDL = (
+# Frozen Task2 Frame-only physical schema. This fixture intentionally does not
+# derive from SCHEMA_SQL: a pre-Task3 store must be refused rather than silently
+# treated as a Work-capable owner.
+_PRE_TASK3_FRAME_ONLY_DDL = (
     """CREATE TABLE NioIngestMeta (
     account_id TEXT PRIMARY KEY CHECK (
         typeof(account_id) = 'text' AND length(account_id) > 0
@@ -204,10 +233,21 @@ _LEGACY_V1_DDL = (
         typeof(staged_revision) = 'integer' AND staged_revision >= 1
     ),
     payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob' AND length(payload_ciphertext) >= 29
+        typeof(payload_ciphertext) = 'blob'
+        AND length(payload_ciphertext) >= 29
+        AND length(payload_ciphertext) <= 24 * 1024 * 1024
     ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+    ),
+    room_materialized_revision INTEGER NULL CHECK (
+        room_materialized_revision IS NULL OR
+        (typeof(room_materialized_revision) = 'integer'
+         AND room_materialized_revision >= 1)
+    ),
+    drain_header_ciphertext BLOB NOT NULL CHECK (
+        typeof(drain_header_ciphertext) = 'blob'
+        AND length(drain_header_ciphertext) = 29
     ),
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
@@ -217,6 +257,10 @@ _LEGACY_V1_DDL = (
 
 def _values() -> ModuleType:
     return importlib.import_module("nio.store._sync_journal_values")
+
+
+def _rows() -> ModuleType:
+    return importlib.import_module("nio.store._sync_journal_rows")
 
 
 def _assert_frozen_slotted(value_type: type, field_names: tuple[str, ...]) -> None:
@@ -308,6 +352,117 @@ def test_contract_private_value_types_are_exact_frozen_and_slotted() -> None:
         values.MaterializeResult,
         ("status", "frame_id", "revision"),
     )
+
+
+def _event_record() -> EventRecord:
+    return EventRecord(
+        "12345678-1234-5678-1234-567812345679",
+        RecordKind.GLOBAL_ACCOUNT_DATA,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 2),
+        None,
+        None,
+        None,
+        None,
+        None,
+        b"{}",
+        None,
+    )
+
+
+def _expected_event_work_plaintext(record: EventRecord) -> bytes:
+    assert type(record.origin) is RecordOrigin
+    return canonical_json(
+        {
+            "kind": "event",
+            "value": {
+                "record_type": "event",
+                "record_id": record.record_id,
+                "kind": record.kind.value,
+                "origin": {
+                    "origin_type": "transport",
+                    "transport": record.origin.transport.value,
+                    "source_epoch": record.origin.source_epoch,
+                    "request_id": record.origin.request_id,
+                    "frame_index": record.origin.frame_index,
+                },
+                "room_id": record.room_id,
+                "membership_epoch": record.membership_epoch,
+                "room_sequence": record.room_sequence,
+                "event_id": record.event_id,
+                "provenance": (
+                    record.provenance.value if record.provenance is not None else None
+                ),
+                "source_json": base64.b64encode(record.source_json).decode("ascii"),
+                "clear_json": (
+                    base64.b64encode(record.clear_json).decode("ascii")
+                    if record.clear_json is not None
+                    else None
+                ),
+            },
+        }
+    )
+
+
+def test_contract_work_plaintext_catches_kind_or_record_encoding_drift() -> None:
+    rows = _rows()
+    value = _event_record()
+    expected = (
+        b'{"kind":"event","value":{"clear_json":null,"event_id":null,'
+        b'"kind":"global_account_data","membership_epoch":null,'
+        b'"origin":{"frame_index":2,'
+        b'"origin_type":"transport","request_id":9,"source_epoch":4,'
+        b'"transport":"classic"},"provenance":null,'
+        b'"record_id":"12345678-1234-5678-1234-567812345679",'
+        b'"record_type":"event","room_id":null,"room_sequence":null,'
+        b'"source_json":"e30="}}'
+    )
+
+    assert _expected_event_work_plaintext(value) == expected
+    plaintext = rows._canonical_work_plaintext("event", value)
+
+    assert plaintext == expected
+    decoded = rows._work_value_from_plaintext(
+        _STREAM_ID,
+        value.record_id,
+        "event",
+        plaintext,
+    )
+    assert decoded == value
+    noncanonical = plaintext.replace(b'{"kind":', b'{ "kind":', 1)
+    with pytest.raises(ValueError, match=r".+"):
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            value.record_id,
+            "event",
+            noncanonical,
+        )
+
+
+@pytest.mark.parametrize("kind", ["loss", "recovery", "hydration", "crypto_frame"])
+def test_contract_work_plaintext_rejects_deferred_roles(kind: str) -> None:
+    rows = _rows()
+    with pytest.raises((TypeError, ValueError)):
+        rows._canonical_work_plaintext(kind, _event_record())
+
+
+def test_contract_work_decode_catches_duplicate_identity_or_kind_corruption() -> None:
+    rows = _rows()
+    event = _event_record()
+    payload = rows._canonical_work_plaintext("event", event)
+    with pytest.raises(ValueError, match=r".+"):
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            "22345678-1234-5678-1234-567812345679",
+            "event",
+            payload,
+        )
+    with pytest.raises(ValueError, match=r".+"):
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            event.record_id,
+            "loss",
+            payload,
+        )
 
 
 def test_contract_materializer_limits_have_exact_defaults_ceilings_and_strict_types() -> (
@@ -1017,13 +1172,6 @@ def _open_task6_schema() -> sqlite3.Connection:
         for statement in SCHEMA_SQL:
             connection.execute(statement)
 
-        table_names = tuple(
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master " "WHERE type = 'table' ORDER BY name"
-            )
-        )
-        assert table_names == _TASK6_TABLE_NAMES
         connection.execute(
             """INSERT INTO NioIngestMeta(
                 account_id, device_id, schema_version, stream_id, transport_kind,
@@ -1113,7 +1261,11 @@ def test_contract_task6_schema_topology_is_exact() -> None:
             == _TASK6_SCHEMA_OBJECTS
         )
         assert _table_columns(connection, "NioIngestFrame") == _FRAME_COLUMNS
+        assert _table_columns(connection, "NioIngestWork") == _WORK_COLUMNS
         assert _foreign_keys(connection, "NioIngestFrame") == (
+            ("NioIngestMeta", "account_id", "account_id"),
+        )
+        assert _foreign_keys(connection, "NioIngestWork") == (
             ("NioIngestMeta", "account_id", "account_id"),
         )
         assert _index_columns(connection, "NioIngestFrame_drain") == (
@@ -1122,6 +1274,26 @@ def test_contract_task6_schema_topology_is_exact() -> None:
             "source_epoch",
             "request_id",
             "frame_id",
+        )
+        assert _index_columns(connection, "NioIngestWork_ready") == (
+            "account_id",
+            "status",
+            "ready_revision",
+            "ready_ordinal",
+            "work_id",
+        )
+        assert _index_columns(connection, "NioIngestWork_held_release") == (
+            "account_id",
+            "room_id",
+            "membership_epoch",
+            "status",
+            "room_sequence",
+            "work_id",
+        )
+        assert _index_columns(connection, "NioIngestWork_frame_kind") == (
+            "account_id",
+            "frame_id",
+            "kind",
         )
     finally:
         connection.close()
@@ -1244,6 +1416,183 @@ def test_contract_task6_ddl_frame_ciphertext_ceiling_is_isolated() -> None:
         connection.close()
 
 
+def _insert_work(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    row: dict[str, object] = {
+        "account_id": _SCHEMA_ACCOUNT_ID,
+        "work_id": "12345678-1234-5678-1234-567812345679",
+        "kind": "event",
+        "status": "ready",
+        "frame_id": _SCHEMA_FRAME_ID,
+        "room_id": None,
+        "membership_epoch": None,
+        "room_sequence": None,
+        "ready_revision": 1,
+        "ready_ordinal": 0,
+        "created_revision": 1,
+        "payload_ciphertext": b"w" * 29,
+        "payload_sha256": b"d" * 32,
+    }
+    row.update(overrides)
+    connection.execute(
+        "INSERT INTO NioIngestWork ("
+        + ", ".join(row)
+        + ") VALUES ("
+        + ", ".join("?" for _ in row)
+        + ")",
+        tuple(row.values()),
+    )
+
+
+def _insert_work_zeroblob(
+    connection: sqlite3.Connection,
+    *,
+    work_id: str,
+    ready_ordinal: int,
+    ciphertext_bytes: int,
+) -> None:
+    connection.execute(
+        """INSERT INTO NioIngestWork(
+            account_id, work_id, kind, status, frame_id, room_id,
+            membership_epoch, room_sequence, ready_revision, ready_ordinal,
+            created_revision, payload_ciphertext, payload_sha256
+        ) VALUES (?, ?, 'event', 'ready', ?, NULL, NULL, NULL, 1, ?, 1,
+                  zeroblob(?), ?)""",
+        (
+            _SCHEMA_ACCOUNT_ID,
+            work_id,
+            _SCHEMA_FRAME_ID,
+            ready_ordinal,
+            ciphertext_bytes,
+            b"d" * 32,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"account_id": None},
+        {"account_id": ""},
+        {"account_id": "@missing:example.org"},
+        {"work_id": None},
+        {"work_id": ""},
+        {"kind": "recovery"},
+        {"kind": "hydration"},
+        {"kind": "crypto_frame"},
+        {"status": "pending"},
+        {"status": "marker"},
+        {"frame_id": None},
+        {"frame_id": ""},
+        {"frame_id": b"frame"},
+        {"room_id": ""},
+        {"membership_epoch": -1},
+        {"membership_epoch": 0.5},
+        {"room_sequence": -1},
+        {"room_sequence": 0.5},
+        {"ready_revision": 0},
+        {"ready_revision": 1.5},
+        {"ready_ordinal": -1},
+        {"ready_ordinal": 0.5},
+        {"created_revision": None},
+        {"created_revision": 0},
+        {"created_revision": 1.5},
+        {"payload_ciphertext": b"w" * 28},
+        {"payload_sha256": b"d" * 31},
+        {"status": "held"},
+        {"ready_revision": None},
+        {"ready_ordinal": None},
+        {"room_id": "!room:example.org"},
+        {"kind": "loss", "room_id": None},
+        {
+            "kind": "loss",
+            "room_id": "!room:example.org",
+            "membership_epoch": 0,
+            "room_sequence": 0,
+        },
+    ],
+)
+def test_contract_task6_ddl_work_constraints_catch_invalid_role_metadata(
+    overrides: dict[str, object],
+) -> None:
+    connection = _open_task6_schema()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match=_SQLITE_CONSTRAINT_MATCH):
+            _insert_work(connection, **overrides)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {
+            "work_id": "event-room-ready",
+            "room_id": "!room:example.org",
+            "membership_epoch": 0,
+            "room_sequence": 7,
+        },
+        {
+            "work_id": "event-room-held",
+            "status": "held",
+            "room_id": "!room:example.org",
+            "membership_epoch": 0,
+            "room_sequence": 7,
+            "ready_revision": None,
+            "ready_ordinal": None,
+        },
+        {
+            "work_id": "loss-ready",
+            "kind": "loss",
+            "room_id": "!room:example.org",
+            "membership_epoch": 0,
+        },
+    ],
+    ids=("global-ready-event", "room-ready-event", "room-held-event", "ready-loss"),
+)
+def test_contract_task6_ddl_work_accepts_only_event_and_loss_relations(
+    overrides: dict[str, object],
+) -> None:
+    connection = _open_task6_schema()
+    try:
+        _insert_work(connection, **overrides)
+    finally:
+        connection.close()
+
+
+def test_contract_task6_ddl_work_ciphertext_ceiling_is_exact() -> None:
+    connection = _open_task6_schema()
+    try:
+        _insert_work_zeroblob(
+            connection,
+            work_id="work-maximum",
+            ready_ordinal=0,
+            ciphertext_bytes=_WORK_CIPHERTEXT_LIMIT,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match=_SQLITE_CONSTRAINT_MATCH):
+            _insert_work_zeroblob(
+                connection,
+                work_id="work-over-maximum",
+                ready_ordinal=1,
+                ciphertext_bytes=_WORK_CIPHERTEXT_LIMIT + 1,
+            )
+    finally:
+        connection.close()
+
+
+def test_contract_task6_ddl_work_ready_pair_is_unique_per_account() -> None:
+    connection = _open_task6_schema()
+    try:
+        _insert_work(connection)
+        with pytest.raises(sqlite3.IntegrityError, match=_SQLITE_CONSTRAINT_MATCH):
+            _insert_work(connection, work_id="different-id")
+    finally:
+        connection.close()
+
+
 def _open_task6_bootstrap(
     store_path: Path,
     *,
@@ -1304,6 +1653,7 @@ def _assert_persisted_task6_topology(database_path: Path) -> None:
     assert _ingestion_schema_objects(database_path) == _TASK6_SCHEMA_OBJECTS
     with sqlite3.connect(database_path) as connection:
         assert _table_columns(connection, "NioIngestFrame") == _FRAME_COLUMNS
+        assert _table_columns(connection, "NioIngestWork") == _WORK_COLUMNS
         assert _index_columns(connection, "NioIngestFrame_drain") == (
             "account_id",
             "staged_revision",
@@ -1311,9 +1661,29 @@ def _assert_persisted_task6_topology(database_path: Path) -> None:
             "request_id",
             "frame_id",
         )
+        assert _index_columns(connection, "NioIngestWork_ready") == (
+            "account_id",
+            "status",
+            "ready_revision",
+            "ready_ordinal",
+            "work_id",
+        )
+        assert _index_columns(connection, "NioIngestWork_held_release") == (
+            "account_id",
+            "room_id",
+            "membership_epoch",
+            "status",
+            "room_sequence",
+            "work_id",
+        )
+        assert _index_columns(connection, "NioIngestWork_frame_kind") == (
+            "account_id",
+            "frame_id",
+            "kind",
+        )
 
 
-def _create_pre_task6_source_only_store(database_path: Path) -> tuple[int, str]:
+def _create_pre_task3_frame_only_store(database_path: Path) -> tuple[int, str]:
     source = SourceState(
         0,
         TransportKind.CLASSIC,
@@ -1335,7 +1705,7 @@ def _create_pre_task6_source_only_store(database_path: Path) -> tuple[int, str]:
     writer_epoch = str(_FRAME_ID)
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        for statement in _LEGACY_V1_DDL:
+        for statement in _PRE_TASK3_FRAME_ONLY_DDL:
             connection.execute(statement)
         connection.execute(
             """INSERT INTO NioIngestMeta(
@@ -1423,12 +1793,12 @@ def test_preflight_exact_same_owner_reopen_preserves_task6_topology(
         reopened.close()
 
 
-def test_preflight_rejects_valid_pre_task6_source_only_store_without_mutation(
+def test_preflight_rejects_valid_pre_task3_frame_only_store_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database_path = tmp_path / "pre-task6.db"
-    revision_before, writer_epoch_before = _create_pre_task6_source_only_store(
+    revision_before, writer_epoch_before = _create_pre_task3_frame_only_store(
         database_path
     )
     assert _ingestion_schema_objects(database_path) == frozenset(
@@ -1521,7 +1891,32 @@ def _discovery_body(
     *,
     crypto: bool = False,
     nonempty: bool = False,
+    room_nonempty: bool = False,
+    global_ready_count: int | None = None,
+    padding_bytes: int = 0,
 ) -> bytes:
+    global_events = [
+        {
+            "content": {
+                "generation": sequence,
+                "index": index,
+                "padding": "x" * padding_bytes,
+            },
+            "type": "m.push_rules",
+        }
+        for index in range(global_ready_count or 0)
+    ]
+    presence_events = (
+        [
+            {
+                "content": {"presence": "online"},
+                "sender": "@friend:example.org",
+                "type": "m.presence",
+            }
+        ]
+        if global_ready_count is not None
+        else []
+    )
     if request.transport is TransportKind.CLASSIC:
         body: dict[str, object] = {"next_batch": f"s{sequence}"}
         if crypto:
@@ -1533,9 +1928,27 @@ def _discovery_body(
                     }
                 ]
             }
-        if nonempty:
+        if global_ready_count is not None:
+            body["account_data"] = {"events": global_events}
+            body["presence"] = {"events": presence_events}
+        elif nonempty:
             body["account_data"] = {
                 "events": [{"content": {"enabled": True}, "type": "m.push_rules"}]
+            }
+        if room_nonempty:
+            body["rooms"] = {
+                "join": {
+                    "!unsupported:example.org": {
+                        "timeline": {
+                            "events": [
+                                {
+                                    "content": {"body": "held", "msgtype": "m.text"},
+                                    "type": "m.room.message",
+                                }
+                            ]
+                        }
+                    }
+                }
             }
         return canonical_json(body)
 
@@ -1557,9 +1970,25 @@ def _discovery_body(
             ],
             "next_batch": f"td{sequence}",
         }
-    if nonempty:
+    if global_ready_count is not None:
+        extensions["account_data"] = {"global": global_events}
+        extensions["presence"] = {"events": presence_events}
+    elif nonempty:
         extensions["account_data"] = {
             "global": [{"content": {"enabled": True}, "type": "m.push_rules"}]
+        }
+    if room_nonempty:
+        body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
+        body["rooms"] = {
+            "!unsupported:example.org": {
+                "membership": "join",
+                "timeline": [
+                    {
+                        "content": {"body": "held", "msgtype": "m.text"},
+                        "type": "m.room.message",
+                    }
+                ],
+            }
         }
     if extensions:
         body["extensions"] = extensions
@@ -1590,6 +2019,9 @@ def _stage_discovery_frame(
     *,
     crypto: bool = False,
     nonempty: bool = False,
+    room_nonempty: bool = False,
+    global_ready_count: int | None = None,
+    padding_bytes: int = 0,
 ) -> tuple[StagedFrame, SyncFrame]:
     owner = journal.load_owner()
     prior = journal.load_source()
@@ -1601,6 +2033,9 @@ def _stage_discovery_frame(
         sequence,
         crypto=crypto,
         nonempty=nonempty,
+        room_nonempty=room_nonempty,
+        global_ready_count=global_ready_count,
+        padding_bytes=padding_bytes,
     )
     normalized = adapter.normalize(
         request,
@@ -1638,6 +2073,36 @@ def _stage_discovery_frame(
         frame=staged,
     )
     return replace(staged, staged_revision=committed.revision), normalized.frame
+
+
+def _planned_global_event_records(
+    journal: SqliteIngestionJournal,
+    staged: StagedFrame,
+    normalized: SyncFrame,
+) -> tuple[EventRecord, ...]:
+    proposal = reduce_staged_frame(
+        journal.load_owner().stream_id,
+        staged.frame_id,
+        normalized,
+        (),
+    )
+    assert proposal.room_proposals == ()
+    assert all(descriptor.room_id is None for descriptor in proposal.descriptors)
+    return tuple(
+        EventRecord(
+            str(uuid5(staged.frame_id, f"event:frame:{staged.frame_id}:{index}")),
+            descriptor.kind,
+            replace(normalized.origin, frame_index=index),
+            None,
+            None,
+            None,
+            None,
+            None,
+            descriptor.source_json,
+            None,
+        )
+        for index, descriptor in enumerate(proposal.descriptors)
+    )
 
 
 def _frame_storage_row(
@@ -1679,6 +2144,7 @@ def _materialize(
     *,
     expected_revision: int | None = None,
     writer_epoch: UUID | None = None,
+    limits: MaterializerLimits | None = None,
 ) -> MaterializeResult:
     owner = journal.load_owner()
     return journal.materialize_oldest_frame(
@@ -1686,7 +2152,7 @@ def _materialize(
             owner.revision if expected_revision is None else expected_revision
         ),
         writer_epoch=owner.writer_epoch if writer_epoch is None else writer_epoch,
-        limits=MaterializerLimits(),
+        limits=limits or MaterializerLimits(),
     )
 
 
@@ -1701,9 +2167,1470 @@ def _materializer_dml(statements: list[str]) -> tuple[str, ...]:
                 "NioIngestMeta",
                 "NioIngestSourceState",
                 "NioIngestFrame",
+                "NioIngestWork",
             )
         )
     )
+
+
+def _work_rows(journal: SqliteIngestionJournal) -> tuple[tuple[object, ...], ...]:
+    with journal._owner.read():
+        rows = journal._execute(
+            "SELECT work_id, kind, status, frame_id, room_id, membership_epoch, "
+            "room_sequence, ready_revision, ready_ordinal, created_revision, "
+            "payload_ciphertext, payload_sha256 FROM NioIngestWork "
+            "WHERE account_id = ? ORDER BY ready_revision, ready_ordinal, work_id",
+            (journal.account_id,),
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _work_header(
+    account_id: str,
+    row: tuple[object, ...],
+) -> bytes:
+    return _canonical_internal([account_id, *row[:10]])
+
+
+def _decrypt_event_work(
+    journal: SqliteIngestionJournal,
+    row: tuple[object, ...],
+) -> tuple[bytes, EventRecord]:
+    plaintext = journal._codec.decrypt(
+        "NioIngestWork",
+        (row[0],),
+        row[10],
+        row[11],
+        header=_work_header(journal.account_id, row),
+    )
+    value = _rows()._work_value_from_plaintext(
+        journal.load_owner().stream_id,
+        row[0],
+        row[1],
+        plaintext,
+    )
+    assert type(value) is EventRecord
+    return plaintext, value
+
+
+def _insert_authenticated_event_work(
+    journal: SqliteIngestionJournal,
+    record: EventRecord,
+    *,
+    frame_id: UUID,
+    ready_revision: int,
+    ready_ordinal: int,
+    created_revision: int,
+) -> None:
+    values = _authenticated_event_work_values(
+        journal,
+        record,
+        frame_id=frame_id,
+        ready_revision=ready_revision,
+        ready_ordinal=ready_ordinal,
+        created_revision=created_revision,
+    )
+    with journal._owner.journal_write():
+        inserted = journal._execute(
+            "INSERT INTO NioIngestWork("
+            "account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload_ciphertext, payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+        assert inserted.rowcount == 1
+
+
+def _authenticated_event_work_values(
+    journal: SqliteIngestionJournal,
+    record: EventRecord,
+    *,
+    frame_id: UUID,
+    ready_revision: int,
+    ready_ordinal: int,
+    created_revision: int,
+) -> tuple[object, ...]:
+    return _sealed_work_values(
+        journal,
+        work_id=record.record_id,
+        kind="event",
+        status="ready",
+        frame_id=str(frame_id),
+        room_id=record.room_id,
+        membership_epoch=record.membership_epoch,
+        room_sequence=record.room_sequence,
+        ready_revision=ready_revision,
+        ready_ordinal=ready_ordinal,
+        created_revision=created_revision,
+        plaintext=_rows()._canonical_work_plaintext("event", record),
+    )
+
+
+def _sealed_work_values(
+    journal: SqliteIngestionJournal,
+    *,
+    work_id: str,
+    kind: str,
+    status: str,
+    frame_id: str,
+    room_id: str | None,
+    membership_epoch: int | None,
+    room_sequence: int | None,
+    ready_revision: int | None,
+    ready_ordinal: int | None,
+    created_revision: int,
+    plaintext: bytes,
+) -> tuple[object, ...]:
+    header_values: tuple[object, ...] = (
+        work_id,
+        kind,
+        status,
+        frame_id,
+        room_id,
+        membership_epoch,
+        room_sequence,
+        ready_revision,
+        ready_ordinal,
+        created_revision,
+    )
+    ciphertext, digest = journal._codec.seal(
+        "NioIngestWork",
+        (work_id,),
+        plaintext,
+        header=_canonical_internal([journal.account_id, *header_values]),
+    )
+    return (journal.account_id, *header_values, ciphertext, digest)
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [TransportKind.CLASSIC, TransportKind.SLIDING],
+    ids=("classic", "sliding"),
+)
+@pytest.mark.parametrize("crypto", [False, True], ids=("plain", "crypto"))
+def test_materializer_global_ready_catches_wrong_order_or_partial_owner_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: TransportKind,
+    crypto: bool,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            crypto=crypto,
+            global_ready_count=2,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert proposal.room_proposals == ()
+        assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordKind.PRESENCE,
+        )
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        assert raw_before is not None
+        writer_entries: list[None] = []
+        real_journal_write = type(journal._owner).journal_write
+
+        @contextmanager
+        def count_writer(owner: object) -> Iterator[None]:
+            assert owner is journal._owner
+            writer_entries.append(None)
+            with real_journal_write(journal._owner):
+                yield
+
+        statements.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(type(journal._owner), "journal_write", count_writer)
+            result = _materialize(journal)
+
+        revision = owner_before.revision + 1
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            revision,
+        )
+        assert writer_entries == [None]
+        assert journal.load_owner() == replace(owner_before, revision=revision)
+        rows = _work_rows(journal)
+        assert len(rows) == 3
+        assert tuple(row[8] for row in rows) == (0, 1, 2)
+        assert tuple(row[7] for row in rows) == (revision,) * 3
+        assert tuple(row[9] for row in rows) == (revision,) * 3
+        assert tuple(row[1:3] for row in rows) == (("event", "ready"),) * 3
+        assert tuple(row[3] for row in rows) == (str(staged.frame_id),) * 3
+        assert all(row[4:7] == (None, None, None) for row in rows)
+        expected_sources = (
+            b'{"content":{"generation":1,"index":0,"padding":""},'
+            b'"type":"m.push_rules"}',
+            b'{"content":{"generation":1,"index":1,"padding":""},'
+            b'"type":"m.push_rules"}',
+            b'{"content":{"presence":"online"},'
+            b'"sender":"@friend:example.org","type":"m.presence"}',
+        )
+        for index, (row, source_json) in enumerate(
+            zip(rows, expected_sources, strict=True)
+        ):
+            expected_id = str(
+                uuid5(
+                    staged.frame_id,
+                    f"event:frame:{staged.frame_id}:{index}",
+                )
+            )
+            assert row[0] == expected_id
+            plaintext, record = _decrypt_event_work(journal, row)
+            assert plaintext == _rows()._canonical_work_plaintext("event", record)
+            assert record == EventRecord(
+                expected_id,
+                (RecordKind.GLOBAL_ACCOUNT_DATA if index < 2 else RecordKind.PRESENCE),
+                RecordOrigin(
+                    transport,
+                    normalized.origin.source_epoch,
+                    normalized.origin.request_id,
+                    index,
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+                source_json,
+                None,
+            )
+
+        raw_after = _frame_storage_row(journal, staged.frame_id)
+        if crypto:
+            assert raw_after is not None
+            assert raw_after[:6] == raw_before[:6]
+            assert raw_after[6] == revision
+            assert raw_after[7] != raw_before[7]
+        else:
+            assert raw_after is None
+        dml = _materializer_dml(statements)
+        assert sum("UPDATE NioIngestMeta" in statement for statement in dml) == 1
+        assert any("NioIngestWork" in statement for statement in dml)
+        frame_dml_index = next(
+            index
+            for index, statement in enumerate(dml)
+            if "NioIngestFrame" in statement
+        )
+        assert all(
+            index < frame_dml_index
+            for index, statement in enumerate(dml)
+            if "NioIngestWork" in statement
+        )
+
+        owner_after = journal.load_owner()
+        work_after = _work_rows(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert journal.load_owner() == owner_after
+        assert _work_rows(journal) == work_after
+
+        later, _ = _stage_discovery_frame(
+            journal,
+            transport,
+            2,
+            global_ready_count=1,
+        )
+        later_before = journal.load_owner()
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            later.frame_id,
+            later_before.revision + 1,
+        )
+        assert len(_work_rows(journal)) == 5
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [TransportKind.CLASSIC, TransportKind.SLIDING],
+    ids=("classic", "sliding"),
+)
+def test_materializer_record_limit_accepts_exact_length_and_rejects_one_less(
+    tmp_path: Path,
+    transport: TransportKind,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            global_ready_count=1,
+            padding_bytes=64,
+        )
+        expected_plaintexts = tuple(
+            _expected_event_work_plaintext(record)
+            for record in _planned_global_event_records(journal, staged, normalized)
+        )
+        exact_limit = max(map(len, expected_plaintexts))
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        statements.clear()
+
+        with pytest.raises(JournalIntegrityError):
+            _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_record_canonical_bytes=exact_limit - 1,
+                ),
+            )
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _materializer_dml(statements) == ()
+
+        result = _materialize(
+            journal,
+            limits=replace(
+                MaterializerLimits(),
+                max_record_canonical_bytes=exact_limit,
+            ),
+        )
+
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            owner_before.revision + 1,
+        )
+        stored_plaintexts = tuple(
+            _decrypt_event_work(journal, row)[0] for row in _work_rows(journal)
+        )
+        assert stored_plaintexts == expected_plaintexts
+        assert max(map(len, stored_plaintexts)) == exact_limit
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [TransportKind.CLASSIC, TransportKind.SLIDING],
+    ids=("classic", "sliding"),
+)
+def test_materializer_global_oversize_catches_writer_entry_or_partial_dml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: TransportKind,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            global_ready_count=1,
+            padding_bytes=256,
+        )
+        descriptor = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        ).descriptors[0]
+        expected_id = str(uuid5(staged.frame_id, f"event:frame:{staged.frame_id}:0"))
+        expected = EventRecord(
+            expected_id,
+            descriptor.kind,
+            replace(normalized.origin, frame_index=0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            descriptor.source_json,
+            None,
+        )
+        assert len(_rows()._canonical_work_plaintext("event", expected)) > 128
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        statements.clear()
+
+        def reject_writer(_self: object) -> object:
+            raise AssertionError("oversized global record entered journal_write")
+
+        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
+        with pytest.raises(JournalIntegrityError):
+            _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_record_canonical_bytes=128,
+                ),
+            )
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == ()
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value"),
+    [
+        ("max_ready_work_count", 4),
+        ("max_ready_work_canonical_bytes", 1),
+        ("max_total_work_count", 4),
+        ("max_total_work_canonical_bytes", 1),
+    ],
+)
+def test_materializer_global_capacity_catches_partial_plan_or_caller_limited_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=2,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        inventory_before = _work_rows(journal)
+        assert len(inventory_before) == 3
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        queries: list[tuple[str, tuple[object, ...]]] = []
+        work_decrypts: list[str] = []
+        incrementally_fetched: list[int] = []
+        real_execute = journal._execute
+        real_decrypt = EncryptedRowCodec.decrypt
+
+        class IncrementalInventoryCursor:
+            def __init__(self, cursor: sqlite3.Cursor) -> None:
+                self._cursor = cursor
+                self._fetched = 0
+                incrementally_fetched.append(0)
+
+            def fetchone(self) -> sqlite3.Row | None:
+                row = self._cursor.fetchone()
+                if row is not None:
+                    self._fetched += 1
+                    incrementally_fetched[-1] = self._fetched
+                return row
+
+            def __iter__(self) -> Iterator[sqlite3.Row]:
+                return self
+
+            def __next__(self) -> sqlite3.Row:
+                row = self.fetchone()
+                if row is None:
+                    raise StopIteration
+                return row
+
+            def fetchall(self) -> NoReturn:
+                raise AssertionError("Work inventory used unbounded fetchall")
+
+        def trace_execute(
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> object:
+            cursor = real_execute(statement, parameters)
+            if statement.lstrip().upper().startswith("SELECT") and (
+                "NIOINGESTWORK" in statement.upper()
+            ):
+                queries.append((statement, parameters))
+                if "LIMIT" in statement.upper():
+                    return IncrementalInventoryCursor(cursor)
+            return cursor
+
+        def trace_decrypt(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            if table == "NioIngestWork":
+                work_decrypts.append(str(primary_key[0]))
+            return real_decrypt(codec, table, primary_key, ciphertext, digest, header)
+
+        statements.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(journal, "_execute", trace_execute)
+            guard.setattr(EncryptedRowCodec, "decrypt", trace_decrypt)
+            result = _materialize(
+                journal,
+                limits=replace(MaterializerLimits(), **{limit_name: limit_value}),
+            )
+
+        assert result == MaterializeResult(
+            MaterializeStatus.AT_CAPACITY,
+            staged.frame_id,
+            None,
+        )
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == inventory_before
+        assert _materializer_dml(statements) == ()
+        assert sorted(work_decrypts) == sorted(str(row[0]) for row in inventory_before)
+        assert len(queries) == 1
+        assert incrementally_fetched == [len(inventory_before)]
+        statement, parameters = queries[0]
+        normalized_sql = " ".join(statement.upper().split())
+        assert "COUNT(" not in normalized_sql
+        assert "SUM(" not in normalized_sql
+        assert "ORDER BY" not in normalized_sql
+        projection, predicate = normalized_sql.split(" FROM NIOINGESTWORK", 1)
+        assert "LENGTH(" not in projection
+        if not re.fullmatch(r"SELECT (?:NIOINGESTWORK\.)?\*", projection):
+            for column_name, _type, _not_null, _primary_key in _WORK_COLUMNS:
+                assert re.search(rf"\b{column_name.upper()}\b", projection)
+        assert re.search(r"\bWHERE\s+ACCOUNT_ID\s*=\s*\?", predicate)
+        assert " AND " not in predicate
+        assert " OR " not in predicate
+        for forbidden in ("KIND", "STATUS", "READY_REVISION", "READY_ORDINAL"):
+            assert not re.search(rf"\b{forbidden}\b", predicate)
+        assert "LIMIT 20001" in normalized_sql or (
+            "LIMIT ?" in normalized_sql and parameters[-1] == 20_001
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "metric"),
+    [
+        ("max_ready_work_count", "count"),
+        ("max_total_work_count", "count"),
+        ("max_ready_work_canonical_bytes", "bytes"),
+        ("max_total_work_canonical_bytes", "bytes"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("projected_excess", "expected_status"),
+    [(0, MaterializeStatus.MATERIALIZED), (1, MaterializeStatus.AT_CAPACITY)],
+    ids=("exact", "one-over"),
+)
+def test_materializer_projected_global_capacity_has_inclusive_caller_boundary(
+    tmp_path: Path,
+    limit_name: str,
+    metric: str,
+    projected_excess: int,
+    expected_status: MaterializeStatus,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        inventory_before = _work_rows(journal)
+        assert len(inventory_before) == 2
+        inventory_bytes = sum(
+            len(_decrypt_event_work(journal, row)[0]) for row in inventory_before
+        )
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        planned_plaintexts = tuple(
+            _expected_event_work_plaintext(record)
+            for record in _planned_global_event_records(journal, staged, normalized)
+        )
+        expected_work_count = len(inventory_before) + len(planned_plaintexts)
+        projected = (
+            expected_work_count
+            if metric == "count"
+            else inventory_bytes + sum(map(len, planned_plaintexts))
+        )
+        limit_value = projected - projected_excess
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        statements.clear()
+
+        result = _materialize(
+            journal,
+            limits=replace(MaterializerLimits(), **{limit_name: limit_value}),
+        )
+
+        assert result.status is expected_status
+        assert result.frame_id == staged.frame_id
+        if expected_status is MaterializeStatus.AT_CAPACITY:
+            assert result.revision is None
+            assert journal.load_owner() == owner_before
+            assert _frame_storage_row(journal, staged.frame_id) == raw_before
+            assert _work_rows(journal) == inventory_before
+            assert _materializer_dml(statements) == ()
+        else:
+            assert result.revision == owner_before.revision + 1
+            assert journal.load_owner().revision == owner_before.revision + 1
+            assert _frame_storage_row(journal, staged.frame_id) is None
+            assert len(_work_rows(journal)) == expected_work_count
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_existing_inventory_beyond_immutable_ready_bytes_is_corruption(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        revision = journal.load_owner().revision
+        storage_rows: list[tuple[object, ...]] = []
+        plaintext_lengths: list[int] = []
+        for index in range(17):
+            record = EventRecord(
+                str(uuid5(staged.frame_id, f"corrupt-existing:{index}")),
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                replace(normalized.origin, frame_index=index),
+                None,
+                None,
+                None,
+                None,
+                None,
+                b'{"padding":"' + (b"x" * 750_000) + b'"}',
+                None,
+            )
+            plaintext = _expected_event_work_plaintext(record)
+            plaintext_lengths.append(len(plaintext))
+            storage_rows.append(
+                _authenticated_event_work_values(
+                    journal,
+                    record,
+                    frame_id=staged.frame_id,
+                    ready_revision=revision,
+                    ready_ordinal=index,
+                    created_revision=revision,
+                )
+            )
+        limits = MaterializerLimits()
+        assert max(plaintext_lengths) <= limits.max_record_canonical_bytes
+        assert sum(plaintext_lengths) > limits.max_ready_work_canonical_bytes
+        with journal._owner.journal_write():
+            for values in storage_rows:
+                inserted = journal._execute(
+                    "INSERT INTO NioIngestWork("
+                    "account_id, work_id, kind, status, frame_id, room_id, "
+                    "membership_epoch, room_sequence, ready_revision, "
+                    "ready_ordinal, created_revision, payload_ciphertext, "
+                    "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?)",
+                    values,
+                )
+                assert inserted.rowcount == 1
+
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        work_before = _work_rows(journal)
+        statements.clear()
+
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == work_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_existing_inventory_beyond_immutable_ready_count_is_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        revision = journal.load_owner().revision
+        insert_sql = (
+            "INSERT INTO NioIngestWork("
+            "account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload_ciphertext, payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        with journal._owner.journal_write():
+            for index in range(MaterializerLimits().max_ready_work_count + 1):
+                record = EventRecord(
+                    str(uuid5(staged.frame_id, f"corrupt-ready-count:{index}")),
+                    RecordKind.GLOBAL_ACCOUNT_DATA,
+                    replace(normalized.origin, frame_index=index),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    b"{}",
+                    None,
+                )
+                inserted = journal._execute(
+                    insert_sql,
+                    _authenticated_event_work_values(
+                        journal,
+                        record,
+                        frame_id=staged.frame_id,
+                        ready_revision=revision,
+                        ready_ordinal=index,
+                        created_revision=revision,
+                    ),
+                )
+                assert inserted.rowcount == 1
+        with journal._owner.read():
+            work_count = journal._execute(
+                "SELECT COUNT(*) FROM NioIngestWork WHERE account_id = ?",
+                (journal.account_id,),
+            ).fetchone()[0]
+        assert work_count == MaterializerLimits().max_ready_work_count + 1
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        statements.clear()
+
+        def reject_writer(_self: object) -> object:
+            raise AssertionError("immutable ready-count corruption entered writer")
+
+        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize("payload_case", ["exact", "different"])
+def test_materializer_planned_id_collision_catches_any_preexisting_id_as_corruption(
+    tmp_path: Path,
+    payload_case: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        descriptor = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        ).descriptors[0]
+        colliding_id = str(uuid5(staged.frame_id, f"event:frame:{staged.frame_id}:0"))
+        revision = journal.load_owner().revision
+        source_json = (
+            descriptor.source_json
+            if payload_case == "exact"
+            else b'{"content":{"forged":true},"type":"m.push_rules"}'
+        )
+        colliding = EventRecord(
+            colliding_id,
+            descriptor.kind,
+            replace(normalized.origin, frame_index=0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            source_json,
+            None,
+        )
+        _insert_authenticated_event_work(
+            journal,
+            colliding,
+            frame_id=staged.frame_id,
+            ready_revision=revision,
+            ready_ordinal=99,
+            created_revision=revision,
+        )
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        work_before = _work_rows(journal)
+        statements.clear()
+
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == work_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "primary-key",
+        "aad-frame",
+        "aad-room-fields",
+        "aad-role",
+        "aad-ready-revision",
+        "aad-ready-ordinal",
+        "aad-created-revision",
+        "ciphertext",
+        "digest",
+        "table-domain",
+        "clear-payload-identity",
+    ],
+)
+def test_materializer_authenticated_inventory_catches_work_row_corruption(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        target = _work_rows(journal)[0]
+        column: str
+        value: object
+        if mutation == "primary-key":
+            column, value = "work_id", str(uuid4())
+        elif mutation == "aad-frame":
+            column, value = "frame_id", str(uuid4())
+        elif mutation in {"aad-room-fields", "aad-role"}:
+            assignments = (
+                "room_id = ?, membership_epoch = ?, room_sequence = ?"
+                if mutation == "aad-room-fields"
+                else "kind = ?, room_id = ?, membership_epoch = ?"
+            )
+            parameters: tuple[object, ...] = (
+                ("!forged:example.org", 0, 0)
+                if mutation == "aad-room-fields"
+                else ("loss", "!forged:example.org", 0)
+            )
+            with journal._owner.journal_write():
+                updated = journal._execute(
+                    f"UPDATE NioIngestWork SET {assignments} "
+                    "WHERE account_id = ? AND work_id = ?",
+                    (*parameters, journal.account_id, target[0]),
+                )
+                assert updated.rowcount == 1
+            column, value = "", None
+        elif mutation == "aad-ready-revision":
+            column, value = "ready_revision", target[7] + 1
+        elif mutation == "aad-ready-ordinal":
+            column, value = "ready_ordinal", 77
+        elif mutation == "aad-created-revision":
+            column, value = "created_revision", target[9] + 1
+        elif mutation == "ciphertext":
+            column, value = "payload_ciphertext", _flip_first(target[10])
+        elif mutation == "digest":
+            column, value = "payload_sha256", _flip_first(target[11])
+        else:
+            plaintext, record = _decrypt_event_work(journal, target)
+            if mutation == "table-domain":
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestFrame",
+                    (target[0],),
+                    plaintext,
+                    header=_work_header(journal.account_id, target),
+                )
+            else:
+                mismatched = replace(
+                    record,
+                    room_id="!forged:example.org",
+                    membership_epoch=0,
+                    room_sequence=0,
+                )
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (target[0],),
+                    _rows()._canonical_work_plaintext("event", mismatched),
+                    header=_work_header(journal.account_id, target),
+                )
+            with journal._owner.journal_write():
+                updated = journal._execute(
+                    "UPDATE NioIngestWork SET payload_ciphertext = ?, "
+                    "payload_sha256 = ? WHERE account_id = ? AND work_id = ?",
+                    (ciphertext, digest, journal.account_id, target[0]),
+                )
+                assert updated.rowcount == 1
+            column = ""
+            value = None
+        if column:
+            with journal._owner.journal_write():
+                updated = journal._execute(
+                    f"UPDATE NioIngestWork SET {column} = ? "
+                    "WHERE account_id = ? AND work_id = ?",
+                    (value, journal.account_id, target[0]),
+                )
+                assert updated.rowcount == 1
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        corrupt_before = _work_rows(journal)
+        statements.clear()
+
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == corrupt_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "semantic_case",
+    [
+        "noncanonical-wrapper",
+        "noncanonical-work-id",
+        "noncanonical-frame-id",
+        "future-ready-revision",
+        "created-after-ready",
+        "room-ready",
+        "held",
+        "loss",
+    ],
+)
+def test_materializer_authenticated_inventory_rejects_semantically_invalid_work(
+    tmp_path: Path,
+    semantic_case: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, first_normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        inventory = _work_rows(journal)
+        assert len(inventory) == 2
+        target = inventory[0]
+        plaintext, _record = _decrypt_event_work(journal, target)
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        owner = journal.load_owner()
+        insert_sql = (
+            "INSERT INTO NioIngestWork("
+            "account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload_ciphertext, payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+
+        if semantic_case in {
+            "noncanonical-wrapper",
+            "noncanonical-work-id",
+            "noncanonical-frame-id",
+            "future-ready-revision",
+            "created-after-ready",
+        }:
+            changed_work_id = str(target[0])
+            changed_frame_id = str(target[3])
+            changed_ready_revision = int(target[7])
+            changed_created_revision = int(target[9])
+            changed_plaintext = plaintext
+            if semantic_case == "noncanonical-wrapper":
+                changed_plaintext = plaintext.replace(b'{"kind":', b'{ "kind":', 1)
+            elif semantic_case == "noncanonical-work-id":
+                changed_work_id = "{" + str(target[0]) + "}"
+                changed_plaintext = plaintext.replace(
+                    str(target[0]).encode(),
+                    changed_work_id.encode(),
+                    1,
+                )
+            elif semantic_case == "noncanonical-frame-id":
+                changed_frame_id = "{" + str(target[3]) + "}"
+            elif semantic_case == "future-ready-revision":
+                changed_ready_revision = owner.revision + 1
+            else:
+                changed_created_revision = changed_ready_revision + 1
+            changed_values = _sealed_work_values(
+                journal,
+                work_id=changed_work_id,
+                kind=str(target[1]),
+                status=str(target[2]),
+                frame_id=changed_frame_id,
+                room_id=target[4],
+                membership_epoch=target[5],
+                room_sequence=target[6],
+                ready_revision=changed_ready_revision,
+                ready_ordinal=int(target[8]),
+                created_revision=changed_created_revision,
+                plaintext=changed_plaintext,
+            )
+            with journal._owner.journal_write():
+                updated = journal._execute(
+                    "UPDATE NioIngestWork SET work_id = ?, kind = ?, status = ?, "
+                    "frame_id = ?, room_id = ?, membership_epoch = ?, "
+                    "room_sequence = ?, ready_revision = ?, ready_ordinal = ?, "
+                    "created_revision = ?, payload_ciphertext = ?, "
+                    "payload_sha256 = ? WHERE account_id = ? AND work_id = ?",
+                    (*changed_values[1:], journal.account_id, target[0]),
+                )
+                assert updated.rowcount == 1
+        else:
+            room_id = "!deferred:example.org"
+            work_id = str(uuid5(first.frame_id, f"deferred:{semantic_case}"))
+            origin = replace(first_normalized.origin, frame_index=99)
+            ready_revision: int | None = owner.revision
+            ready_ordinal: int | None = 100
+            room_sequence: int | None = 0
+            kind = "event"
+            status = "ready"
+            if semantic_case == "loss":
+                loss = LossRecord(
+                    work_id,
+                    origin,
+                    room_id,
+                    0,
+                    LossReason.EVENT_LIMIT,
+                    LossBoundary(None, None, None, None),
+                    b"{}",
+                )
+                kind = "loss"
+                room_sequence = None
+                plaintext_to_insert = canonical_json(
+                    {"kind": "loss", "value": _record_to_dict(loss)}
+                )
+            else:
+                event = EventRecord(
+                    work_id,
+                    RecordKind.TIMELINE,
+                    origin,
+                    room_id,
+                    0,
+                    0,
+                    None,
+                    None,
+                    b'{"content":{"body":"deferred"},' b'"type":"m.room.message"}',
+                    None,
+                )
+                plaintext_to_insert = canonical_json(
+                    {"kind": "event", "value": _record_to_dict(event)}
+                )
+                if semantic_case == "held":
+                    status = "held"
+                    ready_revision = None
+                    ready_ordinal = None
+            values = _sealed_work_values(
+                journal,
+                work_id=work_id,
+                kind=kind,
+                status=status,
+                frame_id=str(first.frame_id),
+                room_id=room_id,
+                membership_epoch=0,
+                room_sequence=room_sequence,
+                ready_revision=ready_revision,
+                ready_ordinal=ready_ordinal,
+                created_revision=owner.revision,
+                plaintext=plaintext_to_insert,
+            )
+            with journal._owner.journal_write():
+                inserted = journal._execute(insert_sql, values)
+                assert inserted.rowcount == 1
+
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        corrupt_before = _work_rows(journal)
+        statements.clear()
+
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _work_rows(journal) == corrupt_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_inventory_catches_oversized_ciphertext_before_decrypt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        target = _work_rows(journal)[0]
+        with sqlite3.connect(journal.database_path) as connection:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            updated = connection.execute(
+                "UPDATE NioIngestWork SET payload_ciphertext = ? "
+                "WHERE account_id = ? AND work_id = ?",
+                (
+                    b"x" * (_WORK_CIPHERTEXT_LIMIT + 1),
+                    journal.account_id,
+                    target[0],
+                ),
+            )
+            assert updated.rowcount == 1
+            connection.execute("PRAGMA ignore_check_constraints = OFF")
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        real_decrypt = EncryptedRowCodec.decrypt
+
+        def reject_target_decrypt(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            if table == "NioIngestWork" and primary_key == (target[0],):
+                raise AssertionError("oversized Work ciphertext reached AES-GCM")
+            return real_decrypt(codec, table, primary_key, ciphertext, digest, header)
+
+        monkeypatch.setattr(EncryptedRowCodec, "decrypt", reject_target_decrypt)
+        statements.clear()
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        "removal",
+        "frame-id",
+        "work-id-reorder",
+        "ready-revision",
+        "ready-ordinal",
+        "created-revision",
+        "same-plaintext-reseal",
+        "payload-reseal",
+    ],
+)
+def test_materializer_writer_revalidation_catches_exact_work_row_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        inventory_before = _work_rows(journal)
+        assert len(inventory_before) == 2
+        target = min(inventory_before, key=lambda row: str(row[0]))
+        plaintext, record = _decrypt_event_work(journal, target)
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            global_ready_count=1,
+        )
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        preflight_decoded = False
+        race_applied = False
+        writer_decrypts: list[str] = []
+        real_decrypt = EncryptedRowCodec.decrypt
+        real_journal_write = type(journal._owner).journal_write
+        reordered_work_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        assert reordered_work_id > max(str(row[0]) for row in inventory_before)
+
+        def observe_preflight(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            nonlocal preflight_decoded
+            plaintext = real_decrypt(
+                codec,
+                table,
+                primary_key,
+                ciphertext,
+                digest,
+                header,
+            )
+            if table == "NioIngestWork":
+                if journal._owner._outer_scope == "journal_write":
+                    writer_decrypts.append(str(primary_key[0]))
+                else:
+                    preflight_decoded = True
+            return plaintext
+
+        @contextmanager
+        def remove_before_writer(owner: object) -> Iterator[None]:
+            nonlocal race_applied
+            assert owner is journal._owner
+            assert preflight_decoded
+            assert not race_applied
+            race_applied = True
+            assignments: str
+            parameters: tuple[object, ...]
+            if race == "frame-id":
+                changed = list(target)
+                changed[3] = str(uuid4())
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (target[0],),
+                    plaintext,
+                    header=_work_header(journal.account_id, tuple(changed)),
+                )
+                assignments = "frame_id = ?, payload_ciphertext = ?, payload_sha256 = ?"
+                parameters = (changed[3], ciphertext, digest)
+            elif race == "work-id-reorder":
+                changed = list(target)
+                changed[0] = reordered_work_id
+                changed_plaintext = _rows()._canonical_work_plaintext(
+                    "event",
+                    replace(record, record_id=reordered_work_id),
+                )
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (reordered_work_id,),
+                    changed_plaintext,
+                    header=_work_header(journal.account_id, tuple(changed)),
+                )
+                assignments = "work_id = ?, payload_ciphertext = ?, payload_sha256 = ?"
+                parameters = (reordered_work_id, ciphertext, digest)
+            elif race in {"ready-revision", "ready-ordinal", "created-revision"}:
+                changed = list(target)
+                if race == "ready-revision":
+                    assert int(target[7]) < owner_before.revision
+                    assert int(target[9]) <= owner_before.revision
+                    changed[7] = owner_before.revision
+                elif race == "ready-ordinal":
+                    changed[8] = 77
+                else:
+                    assert int(target[7]) > 1
+                    changed[9] = 1
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (target[0],),
+                    plaintext,
+                    header=_work_header(journal.account_id, tuple(changed)),
+                )
+                column_index = {
+                    "ready-revision": ("ready_revision", 7),
+                    "ready-ordinal": ("ready_ordinal", 8),
+                    "created-revision": ("created_revision", 9),
+                }[race]
+                assignments = (
+                    f"{column_index[0]} = ?, payload_ciphertext = ?, "
+                    "payload_sha256 = ?"
+                )
+                parameters = (changed[column_index[1]], ciphertext, digest)
+            elif race == "same-plaintext-reseal":
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (target[0],),
+                    plaintext,
+                    header=_work_header(journal.account_id, target),
+                )
+                assert ciphertext != target[10]
+                assert digest == target[11]
+                assignments = "payload_ciphertext = ?, payload_sha256 = ?"
+                parameters = (ciphertext, digest)
+            elif race == "payload-reseal":
+                changed_plaintext = _rows()._canonical_work_plaintext(
+                    "event",
+                    replace(
+                        record,
+                        source_json=b'{"content":{"raced":true},'
+                        b'"type":"m.push_rules"}',
+                    ),
+                )
+                ciphertext, digest = journal._codec.seal(
+                    "NioIngestWork",
+                    (target[0],),
+                    changed_plaintext,
+                    header=_work_header(journal.account_id, target),
+                )
+                assert digest != target[11]
+                assignments = "payload_ciphertext = ?, payload_sha256 = ?"
+                parameters = (ciphertext, digest)
+            else:
+                assignments = ""
+                parameters = ()
+            with sqlite3.connect(journal.database_path) as connection:
+                if race == "removal":
+                    changed_row = connection.execute(
+                        "DELETE FROM NioIngestWork "
+                        "WHERE account_id = ? AND work_id = ?",
+                        (journal.account_id, target[0]),
+                    )
+                else:
+                    changed_row = connection.execute(
+                        f"UPDATE NioIngestWork SET {assignments} "
+                        "WHERE account_id = ? AND work_id = ?",
+                        (*parameters, journal.account_id, target[0]),
+                    )
+                assert changed_row.rowcount == 1
+            with real_journal_write(journal._owner):
+                yield
+
+        monkeypatch.setattr(EncryptedRowCodec, "decrypt", observe_preflight)
+        monkeypatch.setattr(
+            type(journal._owner),
+            "journal_write",
+            remove_before_writer,
+        )
+        statements.clear()
+        with pytest.raises(JournalIntegrityError):
+            _materialize(journal)
+
+        assert preflight_decoded
+        assert race_applied
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        current_inventory = _work_rows(journal)
+        assert writer_decrypts == sorted(str(row[0]) for row in current_inventory)
+        matching = [row for row in current_inventory if row[0] == target[0]]
+        if race in {"removal", "work-id-reorder"}:
+            assert matching == []
+            if race == "work-id-reorder":
+                assert any(row[0] == reordered_work_id for row in current_inventory)
+        else:
+            assert len(matching) == 1
+            assert matching[0] != target
+            if race == "ready-revision":
+                assert matching[0][7] == owner_before.revision
+                assert matching[0][9] == target[9]
+                assert int(matching[0][9]) <= int(matching[0][7])
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
 
 
 def test_materializer_no_frame_catches_spurious_writer_or_revision_advance(
@@ -1907,7 +3834,7 @@ def test_materializer_nonempty_selected_frame_catches_entry_into_writer(
             transport,
             1,
             crypto=True,
-            nonempty=True,
+            room_nonempty=True,
         )
         proposal = reduce_staged_frame(
             journal.load_owner().stream_id,
@@ -1916,6 +3843,9 @@ def test_materializer_nonempty_selected_frame_catches_entry_into_writer(
             (),
         )
         assert len(proposal.descriptors) == 1
+        assert len(proposal.room_proposals) == 1
+        assert proposal.room_proposals[0].hydration is not None
+        assert proposal.descriptors[0].route is DescriptorRoute.HOLD_FOR_HYDRATION
         assert proposal.crypto_deferred
         owner_before = journal.load_owner()
         row_before = _frame_storage_row(journal, staged.frame_id)

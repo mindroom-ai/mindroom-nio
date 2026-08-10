@@ -1367,16 +1367,18 @@ effect API.
   empty crypto-bearing frames advance Meta, set/reseal the positive Frame state,
   and retain raw. A selected nonempty/reducer-output route rejects before DML
   and retains raw.
-- [ ] **Checkpoint 3 — first live aggregate/work path:** introduce final
-  Aggregate/Work DDL, preflight, and codecs only with their first live writer
-  and reader. Admit only a fully READY route with no gap, hydration, retirement,
-  loss, or release; validate the whole route before the writer and retain raw
-  with zero DML for every other barrier.
-- [ ] **Checkpoint 4 — barriers and durable transitions:** first enable held
-  work, recovery/hydration intent, retirement/lifecycle, loss, release, and
-  capacity fates. Plan each complete route before DML, preserving the existing
-  recovery/hydration origin for repeated IDs and never leaving a partial
-  aggregate barrier or intent.
+- [ ] **Checkpoint 3 — first naturally reachable global Work path:** introduce
+  final Work DDL and accept only room-free READY global-account-data/presence
+  records. Do not add Aggregate production code that only a test-seeded room
+  could call. Authenticate the complete bounded Work inventory, enforce
+  account-wide per-record fail-stop and global ready/total capacity, and retain
+  raw with zero DML for every room/barrier route or projected overflow.
+- [ ] **Checkpoint 4 — first Aggregate owner and durable room transitions:**
+  introduce Aggregate DDL/value/codecs with the first real hydration owner,
+  then enable room READY/held work, recovery/hydration intent,
+  retirement/lifecycle, loss, release, and room capacity fates. Plan each
+  complete route before DML, preserving the existing recovery/hydration origin
+  for repeated IDs and never leaving a partial aggregate barrier or intent.
 - [ ] Prove frame proof/state corruption, full-set read-to-writer races,
   deterministic ordering, raw-retention fates, and bounded authenticated
   capacity scans. Record SQL, writer wait, memory, and exact runtime-source
@@ -1384,7 +1386,9 @@ effect API.
 
 Gate: a crypto-free frame retires only after its active durable owners commit;
 a crypto-bearing frame is Frame-flagged and retained for Task 7. One blocked
-route cannot cause partial durable state or hide a later eligible raw frame.
+route cannot cause partial durable state. An authenticated flagged frame never
+hides a later unowned frame; an unsupported or capacity-blocked oldest unowned
+frame deliberately remains head-of-line backpressure until its fate changes.
 
 ---
 
