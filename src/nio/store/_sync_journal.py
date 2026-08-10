@@ -16,7 +16,7 @@ from ..ingest.config import (
     source_transport,
 )
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
-from ..ingest.model import TransportKind
+from ..ingest.model import EventRecord, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
 from ..ingest.sliding import SlidingSource
 from ..ingest.source import (
@@ -27,7 +27,7 @@ from ..ingest.source import (
 )
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_codec import EncryptedRowCodec
-from ._sync_journal_plan import plan_frame_materialization
+from ._sync_journal_plan import _work_id, plan_frame_materialization
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
     open_journal_database,
@@ -459,19 +459,20 @@ class SqliteIngestionJournal(JournalRows):
             planned_aggregates: list[tuple[object, ...]] = []
             for aggregate_value in plan.room_values:
                 room_id = aggregate_value.continuity.room_id
+                intent_kind = "hydration" if aggregate_value.pending_hydration else None
                 plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
                 ciphertext, digest = self._codec.seal(
                     "NioIngestRoomAggregate",
                     (room_id,),
                     plaintext,
-                    header=_canonical_internal([room_id, new_revision, "hydration"]),
+                    header=_canonical_internal([room_id, new_revision, intent_kind]),
                 )
                 planned_aggregates.append(
                     (
                         self.account_id,
                         room_id,
                         new_revision,
-                        "hydration",
+                        intent_kind,
                         ciphertext,
                         digest,
                     )
@@ -479,28 +480,49 @@ class SqliteIngestionJournal(JournalRows):
 
             planned_rows: list[tuple[object, ...]] = []
             for value, plaintext, ordinal in plan.work_inserts:
+                is_event = isinstance(value, EventRecord)
+                work_id = _work_id(value)
+                kind = "event" if is_event else "loss"
+                room_sequence = (
+                    value.room_sequence if isinstance(value, EventRecord) else None
+                )
                 status = "held" if ordinal is None else "ready"
                 clear_values = (
-                    value.record_id,
-                    "event",
+                    work_id,
+                    kind,
                     status,
                     str(staged.frame_id),
                     value.room_id,
                     value.membership_epoch,
-                    value.room_sequence,
+                    room_sequence,
                     None if ordinal is None else new_revision,
                     ordinal,
                     new_revision,
                 )
                 ciphertext, digest = self._codec.seal(
                     "NioIngestWork",
-                    (value.record_id,),
+                    (work_id,),
                     plaintext,
                     header=_canonical_internal([self.account_id, *clear_values]),
                 )
                 planned_rows.append(
                     (self.account_id, *clear_values, ciphertext, digest)
                 )
+
+            stored_rows = inventory.storage_rows if inventory is not None else ()
+            storage_by_id = {row[1]: row for row in stored_rows}
+            planned_releases: list[tuple[object, ...]] = []
+            for value, plaintext, ordinal in plan.work_releases:
+                old = storage_by_id[value.record_id]
+                clear = (*old[1:3], "ready", *old[4:8], new_revision, ordinal, old[10])
+                ciphertext = self._codec.encrypt(
+                    "NioIngestWork",
+                    (value.record_id,),
+                    plaintext,
+                    digest=cast("bytes", old[12]),
+                    header=_canonical_internal([self.account_id, *clear]),
+                )
+                planned_releases.append((ordinal, ciphertext, value.record_id))
 
         with self._transaction():
             write_owner = self._decode_owner_row(
@@ -590,6 +612,15 @@ class SqliteIngestionJournal(JournalRows):
                     )
                     if work_cursor.rowcount != 1:
                         raise JournalIntegrityError("Work insert did not write a row")
+                for row in planned_releases:
+                    work_cursor = self._execute(
+                        "UPDATE NioIngestWork SET status = 'ready', "
+                        "ready_revision = ?, ready_ordinal = ?, payload_ciphertext = ? "
+                        "WHERE account_id = ? AND work_id = ? AND status = 'held'",
+                        (new_revision, row[0], row[1], self.account_id, row[2]),
+                    )
+                    if work_cursor.rowcount != 1:
+                        raise JournalIntegrityError("Work release did not update a row")
             except (sqlite3.IntegrityError, IntegrityError) as error:
                 raise JournalIntegrityError(
                     "planned materialization collided"

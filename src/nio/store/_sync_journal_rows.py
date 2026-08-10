@@ -9,7 +9,13 @@ from uuid import UUID
 
 from ..ingest._json import canonical_json, load_internal_json
 from ..ingest.errors import JournalIntegrityError
-from ..ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
+from ..ingest.model import (
+    EventRecord,
+    LossRecord,
+    RecordKind,
+    RecordOrigin,
+    TransportKind,
+)
 from ..ingest.ports import (
     NetworkRequest,
     StagedSourceResponse,
@@ -17,6 +23,7 @@ from ..ingest.ports import (
 )
 from ..ingest.reducer import HydrationIntent, RoomContinuity
 from ..ingest.serialization import (
+    _loss_id,
     _origin_from_dict,
     _origin_to_dict,
     _record_from_dict,
@@ -79,7 +86,7 @@ def _work_value_from_plaintext(
     work_id: str,
     kind: str,
     plaintext: bytes,
-) -> EventRecord:
+) -> EventRecord | LossRecord:
     if type(stream_id) is not UUID:
         raise TypeError("stream_id must be UUID")
     if type(work_id) is not str or type(kind) is not str:
@@ -88,24 +95,26 @@ def _work_value_from_plaintext(
         raise TypeError("work plaintext must be bytes")
     if len(plaintext) > _MAX_WORK_PLAINTEXT_BYTES:
         raise ValueError("work plaintext exceeds 1 MiB")
-    if kind != "event":
-        raise ValueError("Task 3 supports only event Work values")
+    if kind not in ("event", "loss"):
+        raise ValueError("unsupported Work kind")
     try:
         wrapper = load_internal_json(plaintext, "work plaintext")
         if type(wrapper) is not dict or wrapper.get("kind") != kind:
             raise ValueError("work wrapper kind is invalid")
         value = _record_from_dict(wrapper.get("value"), exact=False)
-        parsed_id = UUID(work_id)
+        identity = value.record_id if isinstance(value, EventRecord) else value.loss_id
         if (
-            type(value) is not EventRecord
-            or work_id != str(parsed_id)
-            or value.record_id != work_id
+            type(value) not in (EventRecord, LossRecord)
+            or work_id != str(UUID(work_id))
+            or identity != work_id
             or plaintext != _canonical_work_plaintext(kind, value)
+            or type(value) is LossRecord
+            and _loss_id(stream_id, value) != work_id
         ):
             raise ValueError("work plaintext is not canonical")
         return value
     except (AttributeError, TypeError, ValueError) as error:
-        raise ValueError("event Work plaintext is invalid") from error
+        raise ValueError("Work plaintext is invalid") from error
 
 
 def _aggregate_uuid(value: object, label: str) -> UUID:
@@ -121,29 +130,28 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
     if type(value) is not RoomAggregateValue:
         raise TypeError("aggregate value must be RoomAggregateValue")
     hydration = value.pending_hydration
-    if (
-        hydration is None
-        or value.continuity.hydration_id is None
-        or value.continuity.baseline is not None
-        or value.continuity.gap is not None
-    ):
-        raise ValueError("Slice A persists only hydration Aggregate values")
     continuity = value.continuity
+    if continuity.baseline is not None or continuity.gap is not None:
+        raise ValueError("this checkpoint persists no baseline or recovery gap")
     return canonical_json(
         {
             "continuity": {
                 "baseline": None,
                 "gap": None,
-                "hydration_id": str(continuity.hydration_id),
+                "hydration_id": str(hydration.hydration_id) if hydration else None,
                 "membership": continuity.membership,
                 "membership_epoch": continuity.membership_epoch,
                 "room_id": continuity.room_id,
             },
             "next_room_sequence": value.next_room_sequence,
-            "pending_hydration": {
-                "hydration_id": str(hydration.hydration_id),
-                "origin": _origin_to_dict(hydration.origin),
-            },
+            "pending_hydration": (
+                {
+                    "hydration_id": str(hydration.hydration_id),
+                    "origin": _origin_to_dict(hydration.origin),
+                }
+                if hydration is not None
+                else None
+            ),
             "updated_revision": value.updated_revision,
         }
     )
@@ -160,8 +168,8 @@ def _room_aggregate_value_from_plaintext(
             raise ValueError("aggregate room_id is invalid")
         if type(updated_revision) is not int or updated_revision < 1:
             raise ValueError("aggregate revision is invalid")
-        if intent_kind != "hydration":
-            raise ValueError("Slice A loads only hydration Aggregate rows")
+        if intent_kind not in (None, "hydration"):
+            raise ValueError("unsupported Aggregate intent kind")
         if type(plaintext) is not bytes:
             raise TypeError("aggregate plaintext must be bytes")
         decoded = load_internal_json(plaintext, "room aggregate plaintext")
@@ -188,24 +196,29 @@ def _room_aggregate_value_from_plaintext(
         )
 
         pending_value = aggregate["pending_hydration"]
-        if type(pending_value) is not dict:
-            raise ValueError("pending hydration must be an object")
-        pending_map = cast("dict[str, object]", pending_value)
-        pending_origin = _origin_from_dict(pending_map["origin"], exact=False)
-        if (
-            type(pending_origin) is not RecordOrigin
-            or min(
-                pending_origin.source_epoch,
-                pending_origin.request_id,
-                pending_origin.frame_index,
+        if intent_kind is None:
+            if pending_value is not None or hydration_id is not None:
+                raise ValueError("NULL Aggregate must have no hydration barrier")
+            pending = None
+        else:
+            if type(pending_value) is not dict or hydration_id is None:
+                raise ValueError("hydration Aggregate requires its pending intent")
+            pending_map = cast("dict[str, object]", pending_value)
+            pending_origin = _origin_from_dict(pending_map["origin"], exact=False)
+            if (
+                type(pending_origin) is not RecordOrigin
+                or min(
+                    pending_origin.source_epoch,
+                    pending_origin.request_id,
+                    pending_origin.frame_index,
+                )
+                < 0
+            ):
+                raise ValueError("hydration origin must be a transport origin")
+            pending = HydrationIntent(
+                _aggregate_uuid(pending_map["hydration_id"], "hydration_id"),
+                pending_origin,
             )
-            < 0
-        ):
-            raise ValueError("hydration origin must be a transport origin")
-        pending = HydrationIntent(
-            _aggregate_uuid(pending_map["hydration_id"], "hydration_id"),
-            pending_origin,
-        )
 
         value = RoomAggregateValue(
             state,
@@ -705,7 +718,7 @@ class JournalRows:
                     or work_id != str(UUID(work_id))
                     or type(raw_frame_id) is not str
                     or raw_frame_id != str(UUID(raw_frame_id))
-                    or kind != "event"
+                    or kind not in ("event", "loss")
                     or status not in ("ready", "held")
                     or type(created_revision) is not int
                     or not 1 <= created_revision <= owner.revision
@@ -717,15 +730,15 @@ class JournalRows:
                     raise ValueError("Work columns are invalid")
                 if status == "ready":
                     if (
-                        (room_id, membership_epoch, room_sequence) != (None, None, None)
-                        or type(ready_revision) is not int
+                        type(ready_revision) is not int
                         or not created_revision <= ready_revision <= owner.revision
                         or type(ready_ordinal) is not int
                         or ready_ordinal < 0
                     ):
                         raise ValueError("READY Work columns are invalid")
                 elif (
-                    type(room_id) is not str
+                    kind != "event"
+                    or type(room_id) is not str
                     or not room_id
                     or type(membership_epoch) is not int
                     or membership_epoch < 0
@@ -765,53 +778,62 @@ class JournalRows:
                 )
                 origin = value.origin
                 if (
-                    origin.transport is not owner.transport_kind
+                    type(origin) is not RecordOrigin
+                    or origin.transport is not owner.transport_kind
                     or min(origin.source_epoch, origin.request_id, origin.frame_index)
                     < 0
-                    or value.event_id is not None
-                    or value.clear_json is not None
                 ):
-                    raise ValueError("Work event value is invalid")
-                if row[3] == "ready":
+                    raise ValueError("Work origin is invalid")
+                if type(value) is LossRecord:
                     if (
-                        value.kind
-                        not in (
-                            RecordKind.GLOBAL_ACCOUNT_DATA,
-                            RecordKind.PRESENCE,
-                        )
-                        or (
-                            value.room_id,
-                            value.membership_epoch,
-                            value.room_sequence,
-                        )
-                        != (
-                            None,
-                            None,
-                            None,
-                        )
-                        or value.provenance is not None
+                        row[3] != "ready"
+                        or not value.room_id
+                        or value.membership_epoch < 0
+                        or (value.room_id, value.membership_epoch, None)
+                        != tuple(row[5:8])
+                        or value.detail_json != b"{}"
                     ):
-                        raise ValueError("READY Work value is invalid")
-                elif (
-                    (value.room_id, value.membership_epoch, value.room_sequence)
-                    != (
-                        row[5],
-                        row[6],
-                        row[7],
+                        raise ValueError("READY loss Work value is invalid")
+                elif type(value) is EventRecord:
+                    room_value = (
+                        value.room_id,
+                        value.membership_epoch,
+                        value.room_sequence,
                     )
-                    or value.kind
-                    not in (
+                    room_kinds = (
                         RecordKind.STATE,
                         RecordKind.TIMELINE,
                         RecordKind.EPHEMERAL,
                         RecordKind.ROOM_ACCOUNT_DATA,
                     )
-                    or (
+                    if value.event_id is not None or value.clear_json is not None:
+                        raise ValueError("Work event value is invalid")
+                    if row[3] == "held":
+                        valid = value.kind in room_kinds and room_value == tuple(
+                            row[5:8]
+                        )
+                    elif value.room_id is None:
+                        valid = value.kind in (
+                            RecordKind.GLOBAL_ACCOUNT_DATA,
+                            RecordKind.PRESENCE,
+                        ) and room_value == (None, None, None)
+                    else:
+                        valid = (
+                            bool(value.room_id)
+                            and value.membership_epoch is not None
+                            and value.membership_epoch >= 0
+                            and value.room_sequence is not None
+                            and value.room_sequence >= 0
+                            and value.kind in (*room_kinds, RecordKind.ROOM_LIFECYCLE)
+                            and room_value == tuple(row[5:8])
+                        )
+                    if not valid or (
                         (value.kind is RecordKind.TIMELINE)
                         != (value.provenance is not None)
-                    )
-                ):
-                    raise ValueError("HELD Work value is invalid")
+                    ):
+                        raise ValueError("Work event value is invalid")
+                else:
+                    raise ValueError("unsupported Work value")
             except (TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work value") from error
             work.append(
@@ -857,7 +879,7 @@ class JournalRows:
                 or stored_room != room_id
                 or type(revision) is not int
                 or not 1 <= revision <= owner.revision
-                or kind != "hydration"
+                or kind not in (None, "hydration")
                 or type(ciphertext) is not bytes
                 or len(ciphertext) < 29
                 or type(digest) is not bytes
@@ -877,9 +899,8 @@ class JournalRows:
                 kind,
                 plaintext,
             )
-            if (
-                value.pending_hydration is None
-                or value.pending_hydration.origin.transport is not owner.transport_kind
+            if value.pending_hydration is not None and (
+                value.pending_hydration.origin.transport is not owner.transport_kind
             ):
                 raise ValueError("Aggregate origin transport does not match owner")
             return stored, value

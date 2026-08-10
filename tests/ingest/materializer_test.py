@@ -53,11 +53,12 @@ from nio.ingest.reducer import (
     HydrationIntent,
     MembershipBaseline,
     RecoveryGap,
+    RecoveryRelease,
     ReducerInputError,
     RoomContinuity,
     reduce_staged_frame,
 )
-from nio.ingest.serialization import _record_to_dict
+from nio.ingest.serialization import _loss_id, _record_to_dict
 from nio.ingest.sliding import (
     RESERVED_ALL_ROOMS_LIST,
     SlidingCursor,
@@ -543,6 +544,69 @@ def test_contract_aggregate_plaintext_catches_shape_or_canonical_reencode_drift(
             )
 
 
+def test_contract_null_aggregate_plaintext_is_exact_and_strict() -> None:
+    rows = _rows()
+    value = _values().RoomAggregateValue(
+        RoomContinuity(
+            _AGGREGATE_ROOM_ID,
+            3,
+            "leave",
+            None,
+            None,
+            None,
+        ),
+        5,
+        8,
+        None,
+    )
+    expected = (
+        b'{"continuity":{"baseline":null,"gap":null,"hydration_id":null,'
+        b'"membership":"leave","membership_epoch":3,'
+        b'"room_id":"!aggregate:example.org"},"next_room_sequence":5,'
+        b'"pending_hydration":null,"updated_revision":8}'
+    )
+
+    assert rows._canonical_room_aggregate_plaintext(value) == expected
+    assert (
+        rows._room_aggregate_value_from_plaintext(
+            _AGGREGATE_ROOM_ID,
+            8,
+            None,
+            expected,
+        )
+        == value
+    )
+
+    malformed = json.loads(expected)
+    del malformed["pending_hydration"]
+    barrier = json.loads(expected)
+    barrier["continuity"]["hydration_id"] = str(_HYDRATION_ID)
+    wrong_type = json.loads(expected)
+    wrong_type["continuity"]["membership_epoch"] = True
+    for room_id, revision, intent_kind, plaintext in (
+        (
+            _AGGREGATE_ROOM_ID,
+            8,
+            None,
+            expected.replace(b'{"continuity":', b'{ "continuity":', 1),
+        ),
+        (_AGGREGATE_ROOM_ID, 8, None, canonical_json(malformed)),
+        (_AGGREGATE_ROOM_ID, 8, None, canonical_json(barrier)),
+        (_AGGREGATE_ROOM_ID, 8, None, canonical_json(wrong_type)),
+        ("!other:example.org", 8, None, expected),
+        (_AGGREGATE_ROOM_ID, 9, None, expected),
+        (_AGGREGATE_ROOM_ID, 8, "hydration", expected),
+        (_AGGREGATE_ROOM_ID, 8, "recovery", expected),
+    ):
+        with pytest.raises(ValueError, match=r".+"):
+            rows._room_aggregate_value_from_plaintext(
+                room_id,
+                revision,
+                intent_kind,
+                plaintext,
+            )
+
+
 @pytest.mark.parametrize(
     "corruption",
     [
@@ -733,6 +797,36 @@ def _expected_event_work_plaintext(record: EventRecord) -> bytes:
     )
 
 
+def _expected_loss_work_plaintext(record: LossRecord) -> bytes:
+    assert type(record.origin) is RecordOrigin
+    return canonical_json(
+        {
+            "kind": "loss",
+            "value": {
+                "record_type": "loss",
+                "loss_id": record.loss_id,
+                "origin": {
+                    "origin_type": "transport",
+                    "transport": record.origin.transport.value,
+                    "source_epoch": record.origin.source_epoch,
+                    "request_id": record.origin.request_id,
+                    "frame_index": record.origin.frame_index,
+                },
+                "room_id": record.room_id,
+                "membership_epoch": record.membership_epoch,
+                "reason": record.reason.value,
+                "boundary": {
+                    "prior_event_id": record.boundary.prior_event_id,
+                    "prior_origin_server_ts": record.boundary.prior_origin_server_ts,
+                    "start_token": record.boundary.start_token,
+                    "target_token": record.boundary.target_token,
+                },
+                "detail_json": base64.b64encode(record.detail_json).decode("ascii"),
+            },
+        }
+    )
+
+
 def test_contract_work_plaintext_catches_kind_or_record_encoding_drift() -> None:
     rows = _rows()
     value = _event_record()
@@ -768,7 +862,79 @@ def test_contract_work_plaintext_catches_kind_or_record_encoding_drift() -> None
         )
 
 
-@pytest.mark.parametrize("kind", ["loss", "recovery", "hydration", "crypto_frame"])
+def test_contract_work_plaintext_supports_loss_and_room_ready_event() -> None:
+    rows = _rows()
+    room_event = EventRecord(
+        "32345678-1234-5678-9234-567812345678",
+        RecordKind.STATE,
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 1),
+        _AGGREGATE_ROOM_ID,
+        3,
+        5,
+        None,
+        None,
+        b"{}",
+        None,
+    )
+    room_plaintext = _expected_event_work_plaintext(room_event)
+    assert rows._canonical_work_plaintext("event", room_event) == room_plaintext
+    assert (
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            room_event.record_id,
+            "event",
+            room_plaintext,
+        )
+        == room_event
+    )
+
+    loss_without_id = LossRecord(
+        "",
+        RecordOrigin(TransportKind.CLASSIC, 4, 9, 0),
+        _AGGREGATE_ROOM_ID,
+        2,
+        LossReason.UNVERIFIABLE,
+        LossBoundary(None, None, None, None),
+        b"{}",
+    )
+    assert _loss_id(_STREAM_ID, loss_without_id) == (
+        "04401626-ee8d-5953-a38f-06d618e9e40f"
+    )
+    loss = replace(
+        loss_without_id,
+        loss_id="04401626-ee8d-5953-a38f-06d618e9e40f",
+    )
+    expected_loss = (
+        b'{"kind":"loss","value":{"boundary":{"prior_event_id":null,'
+        b'"prior_origin_server_ts":null,"start_token":null,"target_token":null},'
+        b'"detail_json":"e30=",'
+        b'"loss_id":"04401626-ee8d-5953-a38f-06d618e9e40f",'
+        b'"membership_epoch":2,"origin":{"frame_index":0,'
+        b'"origin_type":"transport","request_id":9,"source_epoch":4,'
+        b'"transport":"classic"},"reason":"unverifiable",'
+        b'"record_type":"loss","room_id":"!aggregate:example.org"}}'
+    )
+    assert _expected_loss_work_plaintext(loss) == expected_loss
+    assert rows._canonical_work_plaintext("loss", loss) == expected_loss
+    assert (
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            loss.loss_id,
+            "loss",
+            expected_loss,
+        )
+        == loss
+    )
+    with pytest.raises(ValueError, match=r".+"):
+        rows._work_value_from_plaintext(
+            _STREAM_ID,
+            loss.loss_id,
+            "loss",
+            expected_loss.replace(b'{"kind":', b'{ "kind":', 1),
+        )
+
+
+@pytest.mark.parametrize("kind", ["recovery", "hydration", "crypto_frame"])
 def test_contract_work_plaintext_rejects_deferred_roles(kind: str) -> None:
     rows = _rows()
     with pytest.raises((TypeError, ValueError)):
@@ -2345,9 +2511,12 @@ def _discovery_body(
     nonempty: bool = False,
     room_present: bool = False,
     room_nonempty: bool = False,
+    room_membership: str = "join",
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
 ) -> bytes:
+    if room_membership not in {"join", "leave"}:
+        raise ValueError("discovery room membership must be join or leave")
     global_events = [
         {
             "content": {
@@ -2389,10 +2558,10 @@ def _discovery_body(
                 "events": [{"content": {"enabled": True}, "type": "m.push_rules"}]
             }
         if room_present and not room_nonempty:
-            body["rooms"] = {"join": {"!unsupported:example.org": {}}}
+            body["rooms"] = {room_membership: {"!unsupported:example.org": {}}}
         elif room_nonempty:
             body["rooms"] = {
-                "join": {
+                room_membership: {
                     "!unsupported:example.org": {
                         "timeline": {
                             "events": [
@@ -2434,12 +2603,12 @@ def _discovery_body(
         }
     if room_present and not room_nonempty:
         body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
-        body["rooms"] = {"!unsupported:example.org": {"membership": "join"}}
+        body["rooms"] = {"!unsupported:example.org": {"membership": room_membership}}
     elif room_nonempty:
         body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
         body["rooms"] = {
             "!unsupported:example.org": {
-                "membership": "join",
+                "membership": room_membership,
                 "timeline": [
                     {
                         "content": {"body": "held", "msgtype": "m.text"},
@@ -2479,6 +2648,7 @@ def _stage_discovery_frame(
     nonempty: bool = False,
     room_present: bool = False,
     room_nonempty: bool = False,
+    room_membership: str = "join",
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
 ) -> tuple[StagedFrame, SyncFrame]:
@@ -2494,6 +2664,7 @@ def _stage_discovery_frame(
         nonempty=nonempty,
         room_present=room_present,
         room_nonempty=room_nonempty,
+        room_membership=room_membership,
         global_ready_count=global_ready_count,
         padding_bytes=padding_bytes,
     )
@@ -2683,10 +2854,10 @@ def _work_header(
     return _canonical_internal([account_id, *row[:10]])
 
 
-def _decrypt_event_work(
+def _decrypt_work(
     journal: SqliteIngestionJournal,
     row: tuple[object, ...],
-) -> tuple[bytes, EventRecord]:
+) -> tuple[bytes, EventRecord | LossRecord]:
     plaintext = journal._codec.decrypt(
         "NioIngestWork",
         (row[0],),
@@ -2700,6 +2871,15 @@ def _decrypt_event_work(
         row[1],
         plaintext,
     )
+    assert type(value) in (EventRecord, LossRecord)
+    return plaintext, value
+
+
+def _decrypt_event_work(
+    journal: SqliteIngestionJournal,
+    row: tuple[object, ...],
+) -> tuple[bytes, EventRecord]:
+    plaintext, value = _decrypt_work(journal, row)
     assert type(value) is EventRecord
     return plaintext, value
 
@@ -3128,6 +3308,459 @@ def test_materializer_repeated_hydration_preserves_original_intent_and_continuit
             )
         else:
             assert second_raw_after is None
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("transport", "crypto"),
+    [
+        (TransportKind.CLASSIC, False),
+        (TransportKind.SLIDING, True),
+    ],
+    ids=("classic-plain", "sliding-crypto"),
+)
+def test_materializer_pending_hydration_membership_transition_is_one_ordered_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: TransportKind,
+    crypto: bool,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        transport,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, first_normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            1,
+            crypto=crypto,
+            room_nonempty=True,
+            global_ready_count=1,
+        )
+        first_proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        first_room = first_proposal.room_proposals[0]
+        assert first_room.hydration is not None
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        _, first_aggregate = _decrypt_aggregate(journal, aggregate_rows[0])
+        first_work = _work_rows(journal)
+        held_before = tuple(row for row in first_work if row[2] == "held")
+        assert len(held_before) == 1
+        held_row = held_before[0]
+        held_plaintext, held_record = _decrypt_event_work(journal, held_row)
+        assert held_record.room_sequence == 0
+
+        transition, transition_normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            2,
+            crypto=crypto,
+            room_nonempty=True,
+            room_membership="leave",
+            global_ready_count=1,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            transition.frame_id,
+            transition_normalized,
+            (first_aggregate.continuity,),
+        )
+        assert len(proposal.room_proposals) == 1
+        room = proposal.room_proposals[0]
+        assert room.before == first_aggregate.continuity
+        assert room.after == RoomContinuity(
+            room.after.room_id,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert room.retirement_epoch == 0
+        assert room.recovery is None
+        assert room.hydration is None
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert len(room.losses) == 1
+        assert room.losses[0].reason is LossReason.UNVERIFIABLE
+        assert room.losses[0].boundary == LossBoundary(None, None, None, None)
+        assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_RETIREMENT,
+            DescriptorRoute.READY,
+            DescriptorRoute.READY,
+        )
+        assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+            RecordKind.TIMELINE,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordKind.PRESENCE,
+        )
+        owner_before = journal.load_owner()
+        assert owner_before.revision == 3
+        raw_before = _frame_storage_row(journal, transition.frame_id)
+        assert raw_before is not None
+        writer_entries: list[None] = []
+        real_journal_write = type(journal._owner).journal_write
+
+        @contextmanager
+        def count_writer(owner: object) -> Iterator[None]:
+            assert owner is journal._owner
+            writer_entries.append(None)
+            with real_journal_write(journal._owner):
+                yield
+
+        statements.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(type(journal._owner), "journal_write", count_writer)
+            result = _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_held_work_count=1,
+                    max_held_work_canonical_bytes=1,
+                    max_ready_work_count=1,
+                    max_ready_work_canonical_bytes=1,
+                    max_total_work_count=1,
+                    max_total_work_canonical_bytes=1,
+                ),
+            )
+
+        revision = 4
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            transition.frame_id,
+            revision,
+        )
+        assert writer_entries == [None]
+        assert journal.load_owner() == replace(owner_before, revision=revision)
+        raw_after = _frame_storage_row(journal, transition.frame_id)
+        if crypto:
+            assert raw_after is not None
+            assert raw_after[:6] == raw_before[:6]
+            assert raw_after[6] == revision
+            assert raw_after[7] != raw_before[7]
+            assert (
+                EncryptedRowCodec(
+                    "discovery-secret",
+                    journal.account_id,
+                    journal.load_owner().stream_id,
+                ).decrypt(
+                    "NioIngestFrameDrainHeader",
+                    (transition.frame_id,),
+                    raw_after[7],
+                    hashlib.sha256(b"").digest(),
+                    header=_canonical_expected_drain_header(raw_after, revision),
+                )
+                == b""
+            )
+        else:
+            assert raw_after is None
+
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        assert aggregate_rows[0][:3] == (room.after.room_id, revision, None)
+        aggregate_plaintext, aggregate = _decrypt_aggregate(journal, aggregate_rows[0])
+        expected_aggregate = _values().RoomAggregateValue(
+            room.after,
+            3,
+            revision,
+            None,
+        )
+        assert aggregate == expected_aggregate
+        assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            expected_aggregate
+        )
+
+        loss_without_id = LossRecord(
+            "",
+            transition_normalized.origin,
+            room.after.room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(
+            loss_without_id,
+            loss_id=_loss_id(journal.load_owner().stream_id, loss_without_id),
+        )
+        lifecycle_id = str(
+            uuid5(
+                transition.frame_id,
+                f"lifecycle:{room.after.room_id}:0:1",
+            )
+        )
+        lifecycle = EventRecord(
+            lifecycle_id,
+            RecordKind.ROOM_LIFECYCLE,
+            transition_normalized.origin,
+            room.after.room_id,
+            1,
+            1,
+            None,
+            None,
+            canonical_json(
+                {
+                    "membership": "leave",
+                    "membership_epoch": 1,
+                    "previous_membership_epoch": 0,
+                }
+            ),
+            None,
+        )
+        descriptor_records: list[EventRecord] = []
+        for index, descriptor in enumerate(proposal.descriptors):
+            is_room = descriptor.room_id is not None
+            descriptor_records.append(
+                EventRecord(
+                    str(
+                        uuid5(
+                            transition.frame_id,
+                            f"event:{descriptor.descriptor_key}",
+                        )
+                    ),
+                    descriptor.kind,
+                    replace(transition_normalized.origin, frame_index=index),
+                    descriptor.room_id,
+                    1 if is_room else None,
+                    2 if is_room else None,
+                    None,
+                    descriptor.provenance,
+                    descriptor.source_json,
+                    None,
+                )
+            )
+        expected_records: tuple[EventRecord | LossRecord, ...] = (
+            loss,
+            held_record,
+            lifecycle,
+            *descriptor_records,
+        )
+        ready_rows = tuple(row for row in _work_rows(journal) if row[7] == revision)
+        assert tuple(row[8] for row in ready_rows) == tuple(range(6))
+        assert tuple(row[0] for row in ready_rows) == tuple(
+            record.loss_id if type(record) is LossRecord else record.record_id
+            for record in expected_records
+        )
+        assert tuple(row[1] for row in ready_rows) == (
+            "loss",
+            "event",
+            "event",
+            "event",
+            "event",
+            "event",
+        )
+        assert tuple(row[2] for row in ready_rows) == ("ready",) * 6
+        assert tuple(row[3] for row in ready_rows) == (
+            str(transition.frame_id),
+            str(first.frame_id),
+            str(transition.frame_id),
+            str(transition.frame_id),
+            str(transition.frame_id),
+            str(transition.frame_id),
+        )
+        assert tuple(row[4:7] for row in ready_rows) == (
+            (room.after.room_id, 0, None),
+            (room.after.room_id, 0, 0),
+            (room.after.room_id, 1, 1),
+            (room.after.room_id, 1, 2),
+            (None, None, None),
+            (None, None, None),
+        )
+        assert tuple(row[9] for row in ready_rows) == (
+            revision,
+            2,
+            revision,
+            revision,
+            revision,
+            revision,
+        )
+        for row, expected_record in zip(
+            ready_rows,
+            expected_records,
+            strict=True,
+        ):
+            plaintext, record = _decrypt_work(journal, row)
+            assert record == expected_record
+            assert plaintext == (
+                _expected_loss_work_plaintext(expected_record)
+                if type(expected_record) is LossRecord
+                else _expected_event_work_plaintext(expected_record)
+            )
+
+        released = ready_rows[1]
+        assert released[:7] == (
+            held_row[0],
+            held_row[1],
+            "ready",
+            held_row[3],
+            held_row[4],
+            held_row[5],
+            held_row[6],
+        )
+        assert released[7:10] == (revision, 1, held_row[9])
+        assert released[10] != held_row[10]
+        assert released[11] == held_row[11]
+        assert _decrypt_work(journal, released)[0] == held_plaintext
+        with pytest.raises(JournalIntegrityError):
+            journal._codec.decrypt(
+                "NioIngestWork",
+                (released[0],),
+                released[10],
+                released[11],
+                header=_work_header(journal.account_id, held_row),
+            )
+
+        dml = _materializer_dml(statements)
+        assert sum("UPDATE NioIngestMeta" in statement for statement in dml) == 1
+        aggregate_dml = tuple(
+            statement.strip().upper()
+            for statement in dml
+            if "NioIngestRoomAggregate" in statement
+        )
+        assert len(aggregate_dml) == 1
+        assert aggregate_dml[0].startswith("UPDATE NIOINGESTROOMAGGREGATE ")
+        assert not any(
+            keyword in aggregate_dml[0] for keyword in ("INSERT", "REPLACE", "UPSERT")
+        )
+        work_updates = tuple(
+            statement.strip().upper()
+            for statement in dml
+            if statement.lstrip().upper().startswith("UPDATE NIOINGESTWORK")
+        )
+        assert len(work_updates) == 1
+        assert not any(
+            keyword in work_updates[0] for keyword in ("INSERT", "REPLACE", "UPSERT")
+        )
+        assert (
+            sum(
+                statement.lstrip().upper().startswith("INSERT INTO NIOINGESTWORK")
+                for statement in dml
+            )
+            == 5
+        )
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_pending_hydration_release_revalidates_held_row_at_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_nonempty=True,
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        aggregate_before = _aggregate_rows(journal)
+        assert len(aggregate_before) == 1
+        _, aggregate = _decrypt_aggregate(journal, aggregate_before[0])
+        work_before = _work_rows(journal)
+        held_before = tuple(row for row in work_before if row[2] == "held")
+        assert len(held_before) == 1
+        target = held_before[0]
+        plaintext, value = _decrypt_event_work(journal, target)
+
+        transition, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            room_nonempty=True,
+            room_membership="leave",
+        )
+        room = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            transition.frame_id,
+            normalized,
+            (aggregate.continuity,),
+        ).room_proposals[0]
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, transition.frame_id)
+        assert raw_before is not None
+        raced = False
+        real_journal_write = type(journal._owner).journal_write
+
+        @contextmanager
+        def reseal_held_before_writer(owner: object) -> Iterator[None]:
+            nonlocal raced
+            assert owner is journal._owner
+            assert not raced
+            raced = True
+            ciphertext, digest = journal._codec.seal(
+                "NioIngestWork",
+                (target[0],),
+                plaintext,
+                header=_work_header(journal.account_id, target),
+            )
+            assert ciphertext != target[10]
+            assert digest == target[11]
+            with sqlite3.connect(journal.database_path) as connection:
+                updated = connection.execute(
+                    "UPDATE NioIngestWork SET payload_ciphertext = ?, "
+                    "payload_sha256 = ? WHERE account_id = ? AND work_id = ?",
+                    (
+                        ciphertext,
+                        digest,
+                        journal.account_id,
+                        target[0],
+                    ),
+                )
+                assert updated.rowcount == 1
+            with real_journal_write(journal._owner):
+                yield
+
+        monkeypatch.setattr(
+            type(journal._owner),
+            "journal_write",
+            reseal_held_before_writer,
+        )
+        statements.clear()
+
+        with pytest.raises(
+            JournalIntegrityError,
+            match="Work inventory snapshot changed",
+        ):
+            _materialize(journal)
+
+        assert raced
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, transition.frame_id) == raw_before
+        assert _aggregate_rows(journal) == aggregate_before
+        work_after = _work_rows(journal)
+        changed = next(row for row in work_after if row[0] == target[0])
+        assert changed[:10] == target[:10]
+        assert changed[10] != target[10]
+        assert changed[11] == target[11]
+        assert _decrypt_event_work(journal, changed) == (plaintext, value)
+        assert _materializer_dml(statements) == ()
     finally:
         bootstrap.close()
 
