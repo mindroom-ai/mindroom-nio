@@ -96,16 +96,18 @@ def plan_frame_materialization(
         ephemeral_room_id is None and aggregate_by_room.keys() - room_plans.keys()
     ):
         raise ValueError("selected frame has inconsistent room ownership")
-    retirement = None
-    if any(
-        room.retirement_epoch is not None
+    retirements = tuple(
+        room
+        for room in proposal.room_proposals
+        if room.retirement_epoch is not None
         or room.losses
         or room.release is not RecoveryRelease.NONE
-        for room in proposal.room_proposals
-    ):
-        if len(proposal.room_proposals) != 1 or len(aggregate_by_room) != 1:
-            raise ValueError("this checkpoint retires exactly one room")
-        retirement = proposal.room_proposals[0]
+    )
+    if len(retirements) > 1:
+        raise ValueError("this checkpoint retires exactly one room")
+    retirement = retirements[0] if retirements else None
+    retirement_room_id = retirement.after.room_id if retirement is not None else None
+    if retirement is not None:
         before = aggregate_by_room[retirement.after.room_id].continuity
         pending = aggregate_by_room[retirement.after.room_id].pending_hydration
         after = replace(
@@ -140,7 +142,7 @@ def plan_frame_materialization(
     room_sequences: dict[str, int] = {}
     pending_hydrations = {}
     for room_id, room in room_plans.items():
-        if retirement is not None:
+        if room_id == retirement_room_id:
             room_sequences[room_id] = aggregate_by_room[room_id].next_room_sequence
             continue
         if (hydration := room.hydration) is None:
@@ -230,7 +232,7 @@ def plan_frame_materialization(
         seen_sequences.add(key)
         if held_room_id == ephemeral_room_id and held_room_id not in pending_hydrations:
             raise ValueError("READY ephemeral room has orphan HELD Work")
-        if retirement is not None or held_room_id == capacity_room_id:
+        if held_room_id in {retirement_room_id, capacity_room_id}:
             retired_work.append(value)
 
     inserts: list[PlannedWork] = []
@@ -304,7 +306,7 @@ def plan_frame_materialization(
             is_ephemeral_room = descriptor_room_id == ephemeral_room_id
             route = (
                 DescriptorRoute.HOLD_FOR_RETIREMENT
-                if retirement is not None
+                if descriptor_room_id == retirement_room_id
                 else (
                     DescriptorRoute.READY
                     if is_ephemeral_room
@@ -337,7 +339,8 @@ def plan_frame_materialization(
             room_sequences[descriptor_room_id] += 1
             ordinal = (
                 ready_ordinal
-                if retirement is not None or descriptor.route is DescriptorRoute.READY
+                if descriptor_room_id == retirement_room_id
+                or descriptor.route is DescriptorRoute.READY
                 else None
             )
             if ordinal is not None:
@@ -465,7 +468,8 @@ def plan_frame_materialization(
             revision,
             (
                 None
-                if retirement is not None or capacity_reason is not None
+                if room.after.room_id == retirement_room_id
+                or capacity_reason is not None
                 else pending_hydrations[room.after.room_id]
             ),
         )

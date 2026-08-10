@@ -3564,6 +3564,128 @@ def _stage_discovery_frame(
     return replace(staged, staged_revision=committed.revision), normalized.frame
 
 
+def _stage_discovery_rooms_frame(
+    journal: SqliteIngestionJournal,
+    transport: TransportKind,
+    sequence: int,
+    *,
+    rooms: tuple[tuple[str, str, str], ...],
+    crypto: bool = False,
+    global_tail: bool = False,
+) -> tuple[StagedFrame, SyncFrame]:
+    owner = journal.load_owner()
+    prior = journal.load_source()
+    adapter = _discovery_adapter(owner.stream_id, transport)
+    request = adapter.plan_request(prior, prior.next_request_id)
+    assert request is not None
+
+    def room_event(body: str) -> dict[str, object]:
+        return {
+            "content": {"body": body, "msgtype": "m.text"},
+            "type": "m.room.message",
+        }
+
+    global_event = {
+        "content": {"generation": sequence, "index": 0, "padding": ""},
+        "type": "m.push_rules",
+    }
+    presence_event = {
+        "content": {"presence": "online"},
+        "sender": "@friend:example.org",
+        "type": "m.presence",
+    }
+    if transport is TransportKind.CLASSIC:
+        room_sections: dict[str, dict[str, object]] = {}
+        for room_id, membership, event_body in rooms:
+            room_sections.setdefault(membership, {})[room_id] = {
+                "timeline": {"events": [room_event(event_body)]}
+            }
+        response: dict[str, object] = {
+            "next_batch": f"s{sequence}",
+            "rooms": room_sections,
+        }
+        if crypto:
+            response["to_device"] = {
+                "events": [
+                    {
+                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                        "type": "m.room_key",
+                    }
+                ]
+            }
+        if global_tail:
+            response["account_data"] = {"events": [global_event]}
+            response["presence"] = {"events": [presence_event]}
+    else:
+        assert request.body is not None
+        request_body = json.loads(request.body)
+        response = {
+            "lists": {RESERVED_ALL_ROOMS_LIST: {"count": len(rooms)}},
+            "pos": f"p{sequence}",
+            "rooms": {
+                room_id: {
+                    "membership": membership,
+                    "timeline": [room_event(event_body)],
+                }
+                for room_id, membership, event_body in rooms
+            },
+            "txn_id": request_body["txn_id"],
+        }
+        extensions: dict[str, object] = {}
+        if crypto:
+            extensions["to_device"] = {
+                "events": [
+                    {
+                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                        "type": "m.room_key",
+                    }
+                ],
+                "next_batch": f"td{sequence}",
+            }
+        if global_tail:
+            extensions["account_data"] = {"global": [global_event]}
+            extensions["presence"] = {"events": [presence_event]}
+        if extensions:
+            response["extensions"] = extensions
+
+    normalized = adapter.normalize(
+        request,
+        NetworkResult(
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            200,
+            canonical_json(response),
+            None,
+            None,
+        ),
+    )
+    assert normalized.frame is not None
+    staged = StagedFrame(
+        normalized.frame.frame_id,
+        StagedSourceResponse(
+            request,
+            normalized.response_body,
+            normalized.frame.source_sha256,
+        ),
+    )
+    successor = SourceState(
+        prior.source_epoch,
+        prior.transport_kind,
+        normalized.frame.candidate_cursor_json,
+        prior.next_request_id + 1,
+        prior.active,
+    )
+    committed = journal.stage_source_response(
+        expected_revision=owner.revision,
+        writer_epoch=owner.writer_epoch,
+        source=successor,
+        frame=staged,
+    )
+    return replace(staged, staged_revision=committed.revision), normalized.frame
+
+
 def _planned_global_event_records(
     journal: SqliteIngestionJournal,
     staged: StagedFrame,
@@ -9413,6 +9535,1243 @@ def test_materializer_empty_retirement_anchors_lifecycle_before_later_work(
             None,
         )
         assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_two_room_classic_plain_retirement_preserves_other_h1(
+    tmp_path: Path,
+) -> None:
+    room_a = "!a-retire:example.org"
+    room_b = "!b-hydrate:example.org"
+    first_origin = RecordOrigin(TransportKind.CLASSIC, 0, 0, 0)
+    selected_origin = RecordOrigin(TransportKind.CLASSIC, 0, 1, 0)
+    first_a_json = (
+        b'{"content":{"body":"classic-a-held","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_b_json = (
+        b'{"content":{"body":"classic-b-h1","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_a_json = (
+        b'{"content":{"body":"classic-a-retired","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    global_json = (
+        b'{"content":{"generation":2,"index":0,"padding":""},' b'"type":"m.push_rules"}'
+    )
+    presence_json = (
+        b'{"content":{"presence":"online"},'
+        b'"sender":"@friend:example.org","type":"m.presence"}'
+    )
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        stream_id = journal.load_owner().stream_id
+        first, first_normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            rooms=((room_a, "join", "classic-a-held"),),
+        )
+        assert first_normalized.origin == first_origin
+        assert tuple(segment.room_id for segment in first_normalized.room_segments) == (
+            room_a,
+        )
+        assert first_normalized.room_segments[0].timeline_json == (first_a_json,)
+        first_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_a}:0:{first.frame_id}",
+        )
+        first_continuity = RoomContinuity(
+            room_a,
+            0,
+            "join",
+            None,
+            None,
+            first_hydration_id,
+        )
+        first_hydration = HydrationIntent(first_hydration_id, first_origin)
+        first_proposal = reduce_staged_frame(
+            stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert first_proposal.crypto_deferred is False
+        assert len(first_proposal.room_proposals) == 1
+        first_room = first_proposal.room_proposals[0]
+        assert first_room.before is None
+        assert first_room.after == first_continuity
+        assert first_room.hydration == first_hydration
+        assert first_room.recovery is None
+        assert first_room.retirement_epoch is None
+        assert first_room.losses == ()
+        assert first_room.release is RecoveryRelease.NONE
+        assert len(first_proposal.descriptors) == 1
+        first_descriptor = first_proposal.descriptors[0]
+        assert (
+            first_descriptor.kind,
+            first_descriptor.room_id,
+            first_descriptor.source_json,
+            first_descriptor.provenance,
+            first_descriptor.descriptor_key,
+            first_descriptor.route,
+        ) == (
+            RecordKind.TIMELINE,
+            room_a,
+            first_a_json,
+            TimelineEventProvenance.HISTORY,
+            f"frame:{first.frame_id}:0",
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        assert _frame_storage_row(journal, first.frame_id) is None
+        first_aggregate = RoomAggregateValue(
+            first_continuity,
+            1,
+            2,
+            first_hydration,
+        )
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        first_plaintext, stored_first_aggregate = _decrypt_aggregate(
+            journal,
+            aggregate_rows[0],
+        )
+        assert aggregate_rows[0][:3] == (room_a, 2, "hydration")
+        assert stored_first_aggregate == first_aggregate
+        assert first_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            first_aggregate
+        )
+        first_held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:0")),
+            RecordKind.TIMELINE,
+            first_origin,
+            room_a,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_a_json,
+            None,
+        )
+        first_work = _work_rows(journal)
+        _assert_exact_materializer_work(
+            journal,
+            first_work,
+            (
+                _ExpectedMaterializerWork(
+                    first_held,
+                    "held",
+                    first.frame_id,
+                    None,
+                    None,
+                    2,
+                ),
+            ),
+            (),
+        )
+
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            rooms=(
+                (room_a, "leave", "classic-a-retired"),
+                (room_b, "join", "classic-b-h1"),
+            ),
+            global_tail=True,
+        )
+        assert normalized.origin == selected_origin
+        assert tuple(segment.room_id for segment in normalized.room_segments) == (
+            room_b,
+            room_a,
+        )
+        assert tuple(segment.timeline_json for segment in normalized.room_segments) == (
+            (selected_b_json,),
+            (selected_a_json,),
+        )
+        proposal = reduce_staged_frame(
+            stream_id,
+            selected.frame_id,
+            normalized,
+            (first_continuity,),
+        )
+        assert proposal.crypto_deferred is False
+        assert len(proposal.room_proposals) == 2
+        room_b_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_b}:0:{selected.frame_id}",
+        )
+        room_b_continuity = RoomContinuity(
+            room_b,
+            0,
+            "join",
+            None,
+            None,
+            room_b_hydration_id,
+        )
+        room_b_hydration = HydrationIntent(room_b_hydration_id, selected_origin)
+        room_b_proposal, room_a_proposal = proposal.room_proposals
+        assert room_b_proposal.before is None
+        assert room_b_proposal.after == room_b_continuity
+        assert room_b_proposal.hydration == room_b_hydration
+        assert room_b_proposal.recovery is None
+        assert room_b_proposal.retirement_epoch is None
+        assert room_b_proposal.losses == ()
+        assert room_b_proposal.release is RecoveryRelease.NONE
+        room_a_continuity = RoomContinuity(
+            room_a,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert room_a_proposal.before == first_continuity
+        assert room_a_proposal.after == room_a_continuity
+        assert room_a_proposal.hydration is None
+        assert room_a_proposal.recovery is None
+        assert room_a_proposal.retirement_epoch == 0
+        assert room_a_proposal.losses == (
+            LossProposal(
+                room_a,
+                0,
+                LossReason.UNVERIFIABLE,
+                LossBoundary(None, None, None, None),
+            ),
+        )
+        assert room_a_proposal.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                selected_b_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                selected_a_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_json,
+                None,
+                f"frame:{selected.frame_id}:2",
+                DescriptorRoute.READY,
+            ),
+            (
+                RecordKind.PRESENCE,
+                None,
+                presence_json,
+                None,
+                f"frame:{selected.frame_id}:3",
+                DescriptorRoute.READY,
+            ),
+        )
+
+        old_graph = _materializer_storage_graph(journal)
+        old_owner, old_source, old_frames, old_aggregates, old_work = old_graph
+        assert old_owner.revision == 3
+        assert old_aggregates == aggregate_rows
+        assert old_work == first_work
+        assert len(old_frames) == 1
+        selected_before = old_frames[0]
+        assert selected_before[0] == str(selected.frame_id)
+        assert selected_before[6] is None
+        statements.clear()
+        try:
+            result = _materialize(journal)
+        except JournalIntegrityError as error:
+            if str(error) != "this checkpoint retires exactly one room":
+                raise AssertionError("unexpected two-room retirement RED") from error
+            assert _materializer_storage_graph(journal) == old_graph
+            assert _frame_storage_row(journal, selected.frame_id) == selected_before
+            assert _materializer_dml(statements) == ()
+            raise
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            4,
+        )
+
+        owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+        assert owner == replace(old_owner, revision=4)
+        assert source == old_source
+        assert frames == ()
+        expected_a_aggregate = RoomAggregateValue(room_a_continuity, 3, 4, None)
+        expected_b_aggregate = RoomAggregateValue(
+            room_b_continuity,
+            1,
+            4,
+            room_b_hydration,
+        )
+        assert tuple(row[:3] for row in aggregates) == (
+            (room_a, 4, None),
+            (room_b, 4, "hydration"),
+        )
+        for row, expected in zip(
+            aggregates,
+            (expected_a_aggregate, expected_b_aggregate),
+            strict=True,
+        ):
+            plaintext, stored = _decrypt_aggregate(journal, row)
+            assert stored == expected
+            assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+
+        loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_a,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(
+            loss_without_id,
+            loss_id=_loss_id(stream_id, loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_a}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            selected_origin,
+            room_a,
+            1,
+            1,
+            None,
+            None,
+            canonical_json(
+                {
+                    "membership": "leave",
+                    "membership_epoch": 1,
+                    "previous_membership_epoch": 0,
+                }
+            ),
+            None,
+        )
+        selected_b = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.CLASSIC, 0, 1, 0),
+            room_b,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.LIVE,
+            selected_b_json,
+            None,
+        )
+        selected_a = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.CLASSIC, 0, 1, 1),
+            room_a,
+            1,
+            2,
+            None,
+            TimelineEventProvenance.LIVE,
+            selected_a_json,
+            None,
+        )
+        global_account_data = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.CLASSIC, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:3")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.CLASSIC, 0, 1, 3),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        expected_work = (
+            _ExpectedMaterializerWork(
+                selected_b,
+                "held",
+                selected.frame_id,
+                None,
+                None,
+                4,
+            ),
+            _ExpectedMaterializerWork(loss, "ready", selected.frame_id, 4, 0, 4),
+            _ExpectedMaterializerWork(first_held, "ready", first.frame_id, 4, 1, 2),
+            _ExpectedMaterializerWork(
+                lifecycle,
+                "ready",
+                selected.frame_id,
+                4,
+                2,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                selected_a,
+                "ready",
+                selected.frame_id,
+                4,
+                3,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                global_account_data,
+                "ready",
+                selected.frame_id,
+                4,
+                4,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                presence,
+                "ready",
+                selected.frame_id,
+                4,
+                5,
+                4,
+            ),
+        )
+        _assert_exact_materializer_work(journal, work, expected_work, old_work)
+        assert tuple(row[8] for row in work if row[2] == "ready") == tuple(range(6))
+        assert tuple((row[4], row[6]) for row in work if row[4] is not None) == (
+            (room_b, 0),
+            (room_a, None),
+            (room_a, 0),
+            (room_a, 1),
+            (room_a, 2),
+        )
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_two_room_sliding_crypto_retirement_preserves_other_h2(
+    tmp_path: Path,
+) -> None:
+    room_a = "!a-retire:example.org"
+    room_b = "!b-hydrate:example.org"
+    first_origin = RecordOrigin(TransportKind.SLIDING, 0, 0, 0)
+    selected_origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+    first_a_json = (
+        b'{"content":{"body":"sliding-a-held","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    first_b_json = (
+        b'{"content":{"body":"sliding-b-held","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_b_json = (
+        b'{"content":{"body":"sliding-b-h2","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_a_json = (
+        b'{"content":{"body":"sliding-a-retired","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    global_json = (
+        b'{"content":{"generation":2,"index":0,"padding":""},' b'"type":"m.push_rules"}'
+    )
+    presence_json = (
+        b'{"content":{"presence":"online"},'
+        b'"sender":"@friend:example.org","type":"m.presence"}'
+    )
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.SLIDING,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        stream_id = journal.load_owner().stream_id
+        first, first_normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            1,
+            rooms=(
+                (room_a, "join", "sliding-a-held"),
+                (room_b, "join", "sliding-b-held"),
+            ),
+            crypto=True,
+        )
+        assert first_normalized.origin == first_origin
+        assert tuple(segment.room_id for segment in first_normalized.room_segments) == (
+            room_a,
+            room_b,
+        )
+        assert tuple(
+            segment.timeline_json for segment in first_normalized.room_segments
+        ) == ((first_a_json,), (first_b_json,))
+        first_a_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_a}:0:{first.frame_id}",
+        )
+        first_b_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_b}:0:{first.frame_id}",
+        )
+        first_a_continuity = RoomContinuity(
+            room_a,
+            0,
+            "join",
+            None,
+            None,
+            first_a_hydration_id,
+        )
+        first_b_continuity = RoomContinuity(
+            room_b,
+            0,
+            "join",
+            None,
+            None,
+            first_b_hydration_id,
+        )
+        first_a_hydration = HydrationIntent(first_a_hydration_id, first_origin)
+        first_b_hydration = HydrationIntent(first_b_hydration_id, first_origin)
+        first_proposal = reduce_staged_frame(
+            stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert first_proposal.crypto_deferred is True
+        assert tuple(
+            (
+                room.before,
+                room.after,
+                room.hydration,
+                room.recovery,
+                room.retirement_epoch,
+                room.losses,
+                room.release,
+            )
+            for room in first_proposal.room_proposals
+        ) == (
+            (
+                None,
+                first_a_continuity,
+                first_a_hydration,
+                None,
+                None,
+                (),
+                RecoveryRelease.NONE,
+            ),
+            (
+                None,
+                first_b_continuity,
+                first_b_hydration,
+                None,
+                None,
+                (),
+                RecoveryRelease.NONE,
+            ),
+        )
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in first_proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                first_a_json,
+                TimelineEventProvenance.HISTORY,
+                f"frame:{first.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                first_b_json,
+                TimelineEventProvenance.HISTORY,
+                f"frame:{first.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        first_raw_before = _frame_storage_row(journal, first.frame_id)
+        assert first_raw_before is not None
+        assert first_raw_before[6] == 2
+        first_a_aggregate = RoomAggregateValue(
+            first_a_continuity,
+            1,
+            2,
+            first_a_hydration,
+        )
+        first_b_aggregate = RoomAggregateValue(
+            first_b_continuity,
+            1,
+            2,
+            first_b_hydration,
+        )
+        aggregate_rows = _aggregate_rows(journal)
+        assert tuple(row[:3] for row in aggregate_rows) == (
+            (room_a, 2, "hydration"),
+            (room_b, 2, "hydration"),
+        )
+        for row, expected in zip(
+            aggregate_rows,
+            (first_a_aggregate, first_b_aggregate),
+            strict=True,
+        ):
+            plaintext, stored = _decrypt_aggregate(journal, row)
+            assert stored == expected
+            assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+        first_a_held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:0")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 0, 0),
+            room_a,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_a_json,
+            None,
+        )
+        first_b_held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:1")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 0, 1),
+            room_b,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_b_json,
+            None,
+        )
+        first_expected_work = tuple(
+            sorted(
+                (
+                    _ExpectedMaterializerWork(
+                        first_a_held,
+                        "held",
+                        first.frame_id,
+                        None,
+                        None,
+                        2,
+                    ),
+                    _ExpectedMaterializerWork(
+                        first_b_held,
+                        "held",
+                        first.frame_id,
+                        None,
+                        None,
+                        2,
+                    ),
+                ),
+                key=_expected_materializer_work_id,
+            )
+        )
+        first_work = _work_rows(journal)
+        _assert_exact_materializer_work(
+            journal,
+            first_work,
+            first_expected_work,
+            (),
+        )
+
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            2,
+            rooms=(
+                (room_a, "leave", "sliding-a-retired"),
+                (room_b, "join", "sliding-b-h2"),
+            ),
+            crypto=True,
+            global_tail=True,
+        )
+        assert normalized.origin == selected_origin
+        assert tuple(segment.room_id for segment in normalized.room_segments) == (
+            room_b,
+            room_a,
+        )
+        assert tuple(segment.timeline_json for segment in normalized.room_segments) == (
+            (selected_b_json,),
+            (selected_a_json,),
+        )
+        proposal = reduce_staged_frame(
+            stream_id,
+            selected.frame_id,
+            normalized,
+            (first_a_continuity, first_b_continuity),
+        )
+        assert proposal.crypto_deferred is True
+        assert len(proposal.room_proposals) == 2
+        room_b_proposal, room_a_proposal = proposal.room_proposals
+        assert room_b_proposal.before == first_b_continuity
+        assert room_b_proposal.after == first_b_continuity
+        assert room_b_proposal.hydration == HydrationIntent(
+            first_b_hydration_id,
+            selected_origin,
+        )
+        assert room_b_proposal.recovery is None
+        assert room_b_proposal.retirement_epoch is None
+        assert room_b_proposal.losses == ()
+        assert room_b_proposal.release is RecoveryRelease.NONE
+        room_a_continuity = RoomContinuity(
+            room_a,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert room_a_proposal.before == first_a_continuity
+        assert room_a_proposal.after == room_a_continuity
+        assert room_a_proposal.hydration is None
+        assert room_a_proposal.recovery is None
+        assert room_a_proposal.retirement_epoch == 0
+        assert room_a_proposal.losses == (
+            LossProposal(
+                room_a,
+                0,
+                LossReason.UNVERIFIABLE,
+                LossBoundary(None, None, None, None),
+            ),
+        )
+        assert room_a_proposal.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                selected_b_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                selected_a_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_json,
+                None,
+                f"frame:{selected.frame_id}:2",
+                DescriptorRoute.READY,
+            ),
+            (
+                RecordKind.PRESENCE,
+                None,
+                presence_json,
+                None,
+                f"frame:{selected.frame_id}:3",
+                DescriptorRoute.READY,
+            ),
+        )
+
+        old_graph = _materializer_storage_graph(journal)
+        old_owner, old_source, old_frames, old_aggregates, old_work = old_graph
+        assert old_owner.revision == 3
+        assert old_aggregates == aggregate_rows
+        assert old_work == first_work
+        old_frames_by_id = {str(row[0]): row for row in old_frames}
+        assert set(old_frames_by_id) == {
+            str(first.frame_id),
+            str(selected.frame_id),
+        }
+        assert old_frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_before = old_frames_by_id[str(selected.frame_id)]
+        assert selected_before[6] is None
+        statements.clear()
+        try:
+            result = _materialize(journal)
+        except JournalIntegrityError as error:
+            if str(error) != "this checkpoint retires exactly one room":
+                raise AssertionError("unexpected two-room retirement RED") from error
+            assert _materializer_storage_graph(journal) == old_graph
+            assert _frame_storage_row(journal, first.frame_id) == first_raw_before
+            assert _frame_storage_row(journal, selected.frame_id) == selected_before
+            assert _materializer_dml(statements) == ()
+            raise
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            4,
+        )
+
+        owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+        assert owner == replace(old_owner, revision=4)
+        assert source == old_source
+        expected_a_aggregate = RoomAggregateValue(room_a_continuity, 3, 4, None)
+        expected_b_aggregate = RoomAggregateValue(
+            first_b_continuity,
+            2,
+            4,
+            first_b_hydration,
+        )
+        assert tuple(row[:3] for row in aggregates) == (
+            (room_a, 4, None),
+            (room_b, 4, "hydration"),
+        )
+        for row, expected in zip(
+            aggregates,
+            (expected_a_aggregate, expected_b_aggregate),
+            strict=True,
+        ):
+            plaintext, stored = _decrypt_aggregate(journal, row)
+            assert stored == expected
+            assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+
+        loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_a,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(
+            loss_without_id,
+            loss_id=_loss_id(stream_id, loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_a}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            selected_origin,
+            room_a,
+            1,
+            1,
+            None,
+            None,
+            canonical_json(
+                {
+                    "membership": "leave",
+                    "membership_epoch": 1,
+                    "previous_membership_epoch": 0,
+                }
+            ),
+            None,
+        )
+        selected_b = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 0),
+            room_b,
+            0,
+            1,
+            None,
+            TimelineEventProvenance.LIVE,
+            selected_b_json,
+            None,
+        )
+        selected_a = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 1),
+            room_a,
+            1,
+            2,
+            None,
+            TimelineEventProvenance.LIVE,
+            selected_a_json,
+            None,
+        )
+        global_account_data = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:3")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 3),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        held_expected = tuple(
+            sorted(
+                (
+                    _ExpectedMaterializerWork(
+                        first_b_held,
+                        "held",
+                        first.frame_id,
+                        None,
+                        None,
+                        2,
+                    ),
+                    _ExpectedMaterializerWork(
+                        selected_b,
+                        "held",
+                        selected.frame_id,
+                        None,
+                        None,
+                        4,
+                    ),
+                ),
+                key=_expected_materializer_work_id,
+            )
+        )
+        expected_work = (
+            *held_expected,
+            _ExpectedMaterializerWork(loss, "ready", selected.frame_id, 4, 0, 4),
+            _ExpectedMaterializerWork(
+                first_a_held,
+                "ready",
+                first.frame_id,
+                4,
+                1,
+                2,
+            ),
+            _ExpectedMaterializerWork(
+                lifecycle,
+                "ready",
+                selected.frame_id,
+                4,
+                2,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                selected_a,
+                "ready",
+                selected.frame_id,
+                4,
+                3,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                global_account_data,
+                "ready",
+                selected.frame_id,
+                4,
+                4,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                presence,
+                "ready",
+                selected.frame_id,
+                4,
+                5,
+                4,
+            ),
+        )
+        _assert_exact_materializer_work(journal, work, expected_work, old_work)
+        old_work_by_id = {str(row[0]): row for row in old_work}
+        work_by_id = {str(row[0]): row for row in work}
+        assert (
+            work_by_id[first_b_held.record_id] == old_work_by_id[first_b_held.record_id]
+        )
+        assert work_by_id[first_a_held.record_id][2:10] == (
+            "ready",
+            str(first.frame_id),
+            room_a,
+            0,
+            0,
+            4,
+            1,
+            2,
+        )
+        assert tuple(row[8] for row in work if row[2] == "ready") == tuple(range(6))
+        assert sorted((row[6], row[2], row[8]) for row in work if row[4] == room_b) == [
+            (0, "held", None),
+            (1, "held", None),
+        ]
+
+        frames_by_id = {str(row[0]): row for row in frames}
+        assert frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_after = frames_by_id[str(selected.frame_id)]
+        assert selected_after[:6] == selected_before[:6]
+        assert selected_after[6] == 4
+        assert selected_after[7] != selected_before[7]
+        assert journal.load_frame(first.frame_id) == first
+        assert journal.load_frame(selected.frame_id) == selected
+        assert (
+            EncryptedRowCodec(
+                "discovery-secret",
+                journal.account_id,
+                owner.stream_id,
+            ).decrypt(
+                "NioIngestFrameDrainHeader",
+                (selected.frame_id,),
+                selected_after[7],
+                hashlib.sha256(b"").digest(),
+                header=_canonical_expected_drain_header(selected_after, 4),
+            )
+            == b""
+        )
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_rejects_two_pending_hydration_retirements_before_writer(
+    tmp_path: Path,
+) -> None:
+    room_a = "!a-retire:example.org"
+    room_b = "!b-retire:example.org"
+    selected_origin = RecordOrigin(TransportKind.CLASSIC, 0, 1, 0)
+    selected_a_json = (
+        b'{"content":{"body":"classic-a-retired","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_b_json = (
+        b'{"content":{"body":"classic-b-retired","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        stream_id = journal.load_owner().stream_id
+        first, first_normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            rooms=(
+                (room_a, "join", "classic-a-held"),
+                (room_b, "join", "classic-b-held"),
+            ),
+        )
+        first_origin = RecordOrigin(TransportKind.CLASSIC, 0, 0, 0)
+        first_continuities = tuple(
+            RoomContinuity(
+                room_id,
+                0,
+                "join",
+                None,
+                None,
+                uuid5(stream_id, f"hydrate:{room_id}:0:{first.frame_id}"),
+            )
+            for room_id in (room_a, room_b)
+        )
+        first_proposal = reduce_staged_frame(
+            stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert tuple(room.after for room in first_proposal.room_proposals) == (
+            first_continuities
+        )
+        assert tuple(room.hydration for room in first_proposal.room_proposals) == tuple(
+            HydrationIntent(continuity.hydration_id, first_origin)
+            for continuity in first_continuities
+            if continuity.hydration_id is not None
+        )
+        assert tuple(descriptor.route for descriptor in first_proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        assert _frame_storage_row(journal, first.frame_id) is None
+        aggregate_rows = _aggregate_rows(journal)
+        assert tuple(row[:3] for row in aggregate_rows) == (
+            (room_a, 2, "hydration"),
+            (room_b, 2, "hydration"),
+        )
+        for row, continuity in zip(
+            aggregate_rows,
+            first_continuities,
+            strict=True,
+        ):
+            assert continuity.hydration_id is not None
+            _, aggregate = _decrypt_aggregate(journal, row)
+            assert aggregate == RoomAggregateValue(
+                continuity,
+                1,
+                2,
+                HydrationIntent(continuity.hydration_id, first_origin),
+            )
+        assert len(_work_rows(journal)) == 2
+        assert all(row[2] == "held" for row in _work_rows(journal))
+
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            rooms=(
+                (room_a, "leave", "classic-a-retired"),
+                (room_b, "leave", "classic-b-retired"),
+            ),
+        )
+        assert normalized.origin == selected_origin
+        assert tuple(segment.room_id for segment in normalized.room_segments) == (
+            room_a,
+            room_b,
+        )
+        assert tuple(segment.timeline_json for segment in normalized.room_segments) == (
+            (selected_a_json,),
+            (selected_b_json,),
+        )
+        proposal = reduce_staged_frame(
+            stream_id,
+            selected.frame_id,
+            normalized,
+            first_continuities,
+        )
+        assert proposal.crypto_deferred is False
+        for room, before in zip(
+            proposal.room_proposals,
+            first_continuities,
+            strict=True,
+        ):
+            assert room.before == before
+            assert room.after == RoomContinuity(
+                before.room_id,
+                1,
+                "leave",
+                None,
+                None,
+                None,
+            )
+            assert room.hydration is None
+            assert room.recovery is None
+            assert room.retirement_epoch == 0
+            assert room.losses == (
+                LossProposal(
+                    before.room_id,
+                    0,
+                    LossReason.UNVERIFIABLE,
+                    LossBoundary(None, None, None, None),
+                ),
+            )
+            assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                selected_a_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                selected_b_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+        )
+
+        old_graph = _materializer_storage_graph(journal)
+        selected_before = _frame_storage_row(journal, selected.frame_id)
+        assert old_graph[0].revision == 3
+        assert selected_before is not None
+        assert selected_before[6] is None
+        assert journal.load_frame(selected.frame_id) == selected
+        statements.clear()
+        with pytest.raises(
+            JournalIntegrityError,
+            match="^this checkpoint retires exactly one room$",
+        ):
+            _materialize(journal)
+        assert _materializer_storage_graph(journal) == old_graph
+        assert _frame_storage_row(journal, selected.frame_id) == selected_before
+        assert journal.load_frame(selected.frame_id) == selected
+        assert _materializer_dml(statements) == ()
     finally:
         bootstrap.close()
 
