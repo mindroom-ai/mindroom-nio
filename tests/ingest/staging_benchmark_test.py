@@ -84,7 +84,7 @@ def _commit_candidate(path: Path) -> tuple[Path, str]:
         ("config", "user.email", "benchmark@example.org"),
         ("config", "user.name", "Benchmark"),
         ("add", "."),
-        ("commit", "-m", "frozen candidate"),
+        ("commit", "--allow-empty", "-m", "frozen candidate"),
     ):
         subprocess.run(["git", *command], cwd=path, capture_output=True, check=True)
     commit = subprocess.run(
