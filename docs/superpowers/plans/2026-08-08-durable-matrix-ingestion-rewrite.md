@@ -1299,22 +1299,29 @@ scope, not retroactive estimate compliance.
 
 ## Task 5: Define the Pure Reducer
 
-**Scope:** Define frozen, deterministic room/recovery transition values and
-pure reduction functions. Task 5 performs no SQL, opens no store, schedules no
-HTTP, and does not introduce lanes, batches, effects, or attachment rows.
+**Scope:** Define frozen, deterministic frame-time room/recovery transition
+values and pure reduction functions. Task 5 performs no SQL, opens no store,
+schedules no HTTP, and does not introduce lanes, batches, effects, or
+attachment rows. Recovery/hydration *outcome* grammars remain with their Task 8
+executor because no result consumer is reachable yet; durable capacity
+allocation remains with Task 6's transaction.
 
-- [ ] Consume the durable StagedFrame identity and its restart-renormalized
+- [x] Consume the durable StagedFrame identity and its restart-renormalized
   SyncFrame, not a live SourceResult or mutable SourceState. Task 4.5 has
   already advanced source state when it staged the canonical response.
-- [ ] Give every restart-renormalized frame and stored membership observation a
+- [x] Give every restart-renormalized frame and stored membership observation a
   deterministic room/recovery transition result.
-- [ ] Represent recovery/hydration intent as typed proposed values only; Task 6
+- [x] Represent recovery/hydration intent as typed proposed values only; Task 6
   is the first durable owner.
-- [ ] Prove with synchronous state-machine tests that gap/loss classification,
+- [x] Prove with synchronous state-machine tests that gap/loss classification,
   membership-epoch retirement, ordering, and retry/terminal distinctions are
   deterministic and room-local.
-- [ ] Publish the Task 5 line envelope, RED/GREEN evidence, and independent
+- [x] Publish the Task 5 line envelope, RED/GREEN evidence, and independent
   review before Task 6.
+
+Task 5 closed at **+515 runtime source lines** after its reviewed terminal
+hydration fix. It allocates no record IDs, room sequence, capacity counters, or
+durable result state.
 
 Gate: no deferred persistence guarantee becomes reachable; the reducer is
 independent of SQLite, callbacks, clocks, and AsyncClient.
@@ -1323,26 +1330,35 @@ independent of SQLite, callbacks, clocks, and AsyncClient.
 
 ## Task 6: Add the First Durable Aggregate and Materializer
 
-**Scope:** Add only the minimal per-room aggregate, ready queue, batch/outbox,
-frame retirement, and loss/gap ownership required to consume Task 5 proposals.
-This is the first task allowed to reintroduce room/lane/ready/batch persistence.
+**Scope:** Add only one encrypted per-room aggregate and one encrypted union
+work table: the minimal internal durable outbox, frame retirement, and
+loss/gap/hydration ownership required to consume Task 5 proposals. This task
+does not create lanes, consumer bindings, batches, acknowledgement state, or a
+generic effect platform.
 
 - [ ] Commit room transition and its minimal recovery/hydration request row
   atomically. A crypto-free frame may retire only after all of its derived room
   work has a durable owner.
 - [ ] Retain every frame containing to-device, device-list, one-time-key-count,
   or fallback-key crypto input. Task 6 neither interprets nor clears those
-  inputs and does not claim final retirement for that frame.
-- [ ] Materialize bounded FIFO batches without per-record transactions; retain
-  one durable owner for every loss and frame-derived record.
-- [ ] Prove frame-to-room-to-batch crash fate, recovery/loss ordering,
-  acknowledgement replay, limits, and unrelated-room progress.
+  inputs and does not claim final retirement for that frame. The materializer
+  skips authenticated room-materialized markers so retained crypto frames do
+  not head-of-line block later unmaterialized frames.
+- [ ] Allocate one deterministic global ready order into the internal work
+  table without per-record transactions; retain one durable owner for every
+  loss, intent, and non-dropped frame-derived record.
+- [ ] Enforce ready, held-room, and total-work capacity inside the same owner
+  transaction, with whole-room terminal-loss fate and account-wide fail-stop.
+- [ ] Prove frame-to-room-to-work crash fate, recovery/loss/lifecycle ordering,
+  crypto-marker idempotency, limits, corruption handling, and unrelated-room
+  progress.
 - [ ] Record SQL, writer wait, memory, and actual line changes before Task 7.
 
 Gate: a crypto-free frame never retires before all of its derived work has a
 durable owner; a crypto-bearing frame remains staged until Task 7 completes its
 receipt-safe handoff. One blocked room cannot block unrelated eligible rooms
-beyond bounded shared-writer occupancy.
+beyond bounded shared-writer occupancy. Task 6 exposes no ready-work read or
+delivery API.
 
 ---
 
@@ -1371,7 +1387,9 @@ and no crypto result before its durable outcome.
 
 **Scope:** Execute the typed recovery/hydration requests made durable by Task 6
 and reschedule them after retryable result or restart. It owns execution, not
-the task-5 proposal grammar or task-6 durable state.
+the Task 5 frame-time proposal grammar or Task 6 durable storage shape. Task 8
+defines the result/outcome grammar at the first point that an executor can
+consume it.
 
 - [ ] Dispatch only frozen durable requests and return tagged results to the
   owner.
@@ -1404,9 +1422,14 @@ success or terminal session failure.
 ## Task 10: Integrate nio and Freeze End-to-End Budgets
 
 **Scope:** Publish the first integration candidate and measure the now-complete
-nio path. Add observability only after it cannot alter correctness ownership.
+nio path. Add consumer binding, bounded SyncBatch materialization from Task 6's
+internal ready work, and FIFO acknowledgement here, where a real consumer
+identity first exists. Add observability only after it cannot alter correctness
+ownership.
 
-- [ ] Freeze batch schema/API and record end-to-end transaction, latency,
+- [ ] Freeze batch schema/API; commit batch creation and source-work ownership
+  transfer atomically; make FIFO acknowledgement replay-safe.
+- [ ] Record end-to-end transaction, latency,
   memory, backpressure, and one-room-versus-all-room work budgets.
 - [ ] Reforecast actual production changes and deletion dependencies before any
   MindRoom activation work.
