@@ -9270,6 +9270,408 @@ def test_materializer_bounded_queries_catch_filtered_ordered_or_partial_scan(
         bootstrap.close()
 
 
+def test_materializer_exact_max_frame_scan_authenticates_headers_without_raw_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        staged_frames = tuple(
+            _stage_discovery_frame(
+                journal,
+                TransportKind.CLASSIC,
+                sequence,
+                crypto=sequence < 256,
+            )
+            for sequence in range(1, 257)
+        )
+        frames = tuple(staged for staged, _ in staged_frames)
+        normalized_frames = tuple(normalized for _, normalized in staged_frames)
+        assert len(frames) == 256
+        assert all(
+            frame.to_device_json
+            == (
+                b'{"content":{"algorithm":"m.megolm.v1.aes-sha2"},'
+                b'"type":"m.room_key"}',
+            )
+            for frame in normalized_frames[:-1]
+        )
+        assert normalized_frames[-1].to_device_json == ()
+        _retain_discovery_frames(
+            journal,
+            tuple(frame.frame_id for frame in frames[:-1]),
+        )
+        selected = frames[-1]
+        retained_rows = tuple(
+            _frame_storage_row(journal, frame.frame_id) for frame in frames[:-1]
+        )
+        selected_row = _frame_storage_row(journal, selected.frame_id)
+        assert all(
+            row is not None and type(row[6]) is int and row[6] > 0
+            for row in retained_rows
+        )
+        assert selected_row is not None
+        assert selected_row[6] is None
+        owner_before = journal.load_owner()
+        source_before = journal.load_source()
+        assert _aggregate_rows(journal) == ()
+        assert _work_rows(journal) == ()
+        queries: list[tuple[str | None, str, tuple[object, ...]]] = []
+        decrypts: list[tuple[str | None, str, tuple[str | int | UUID, ...]]] = []
+        real_execute = journal._execute
+        real_decrypt = EncryptedRowCodec.decrypt
+
+        def trace_execute(
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor | _ReverseDrainRows:
+            scope = journal._owner._outer_scope
+            queries.append((scope, statement, parameters))
+            cursor = real_execute(statement, parameters)
+            if _is_frame_header_select(statement):
+                assert scope in {"read", "journal_write"}
+                return _ReverseDrainRows(cursor)
+            return cursor
+
+        def trace_decrypt(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            decrypts.append((journal._owner._outer_scope, table, primary_key))
+            return real_decrypt(
+                codec,
+                table,
+                primary_key,
+                ciphertext,
+                digest,
+                header,
+            )
+
+        monkeypatch.setattr(journal, "_execute", trace_execute)
+        monkeypatch.setattr(EncryptedRowCodec, "decrypt", trace_decrypt)
+
+        result = _materialize(journal)
+
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            owner_before.revision + 1,
+        )
+        materialize_queries = tuple(queries)
+        assert len(materialize_queries) == 9
+        assert _frame_storage_row(journal, selected.frame_id) is None
+        assert (
+            tuple(_frame_storage_row(journal, frame.frame_id) for frame in frames[:-1])
+            == retained_rows
+        )
+        assert journal.load_owner() == replace(
+            owner_before,
+            revision=owner_before.revision + 1,
+        )
+        assert journal.load_source() == source_before
+        assert _aggregate_rows(journal) == ()
+        assert _work_rows(journal) == ()
+        assert not any(
+            table in statement.lower()
+            for _, statement, _ in materialize_queries
+            for table in ("nioingestroomaggregate", "nioingestwork")
+        )
+        dml = tuple(
+            statement
+            for _, statement, _ in materialize_queries
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        )
+        assert len(dml) == 2
+        assert "UPDATE NioIngestMeta SET revision" in dml[0]
+        assert "DELETE FROM NioIngestFrame" in dml[1]
+        frame_selects = [
+            item for item in materialize_queries if _is_frame_discovery_select(item[1])
+        ]
+        header_queries = [
+            item for item in frame_selects if _is_frame_header_select(item[1])
+        ]
+        assert [scope for scope, _, _ in header_queries] == [
+            "read",
+            "journal_write",
+        ]
+        for _, statement, parameters in header_queries:
+            upper = " ".join(statement.upper().split())
+            projection = _frame_select_projection(statement)
+            assert not _PROJECTION_WILDCARD.search(projection)
+            assert _PAYLOAD_LENGTH.search(projection)
+            assert not _projection_fetches_full_payload(projection)
+            assert "ORDER BY" not in upper
+            assert "WHERE ACCOUNT_ID = ? LIMIT ?" in upper
+            assert parameters == (journal.account_id, 257)
+        selected_queries = [
+            item for item in frame_selects if item not in header_queries
+        ]
+        assert [scope for scope, _, _ in selected_queries] == [
+            "read",
+            "journal_write",
+        ]
+        for _, statement, parameters in selected_queries:
+            projection = _frame_select_projection(statement)
+            assert _projection_fetches_full_payload(projection)
+            assert parameters == (journal.account_id, str(selected.frame_id))
+        assert len(frame_selects) == 4
+        for _, statement, _ in frame_selects:
+            upper = statement.upper()
+            assert "ORDER BY" not in upper
+            assert "WHERE" in upper
+            predicate = upper.split("WHERE", 1)[1]
+            assert "ROOM_MATERIALIZED_REVISION" not in predicate
+        frame_decrypts = [
+            item
+            for item in decrypts
+            if item[1] in {"NioIngestFrameDrainHeader", "NioIngestFrame"}
+        ]
+        expected_ids = frozenset(frame.frame_id for frame in frames)
+        read_proofs = frame_decrypts[:256]
+        assert len(read_proofs) == 256
+        assert {scope for scope, _, _ in read_proofs} == {"read"}
+        assert {table for _, table, _ in read_proofs} == {"NioIngestFrameDrainHeader"}
+        assert frozenset(primary_key[0] for _, _, primary_key in read_proofs) == (
+            expected_ids
+        )
+        selected_scope, selected_table, selected_key = frame_decrypts[256]
+        assert selected_scope == "read"
+        assert selected_table == "NioIngestFrame"
+        assert selected_key == (selected.frame_id,)
+        writer_proofs = frame_decrypts[257:]
+        assert len(writer_proofs) == 256
+        assert {scope for scope, _, _ in writer_proofs} == {"journal_write"}
+        assert {table for _, table, _ in writer_proofs} == {"NioIngestFrameDrainHeader"}
+        assert frozenset(primary_key[0] for _, _, primary_key in writer_proofs) == (
+            expected_ids
+        )
+        assert len(frame_decrypts) == 513
+        assert not any(
+            scope == "journal_write" and table == "NioIngestFrame"
+            for scope, table, _ in frame_decrypts
+        )
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_max_retained_encrypted_backlog_size_is_arithmetic_only() -> None:
+    retained_frame_count = 255
+    encrypted_frame_bytes = 25_165_824
+
+    retained_bytes = retained_frame_count * encrypted_frame_bytes
+
+    assert retained_bytes == 6_417_285_120
+    assert retained_bytes / (1024**3) == 5.9765625
+
+
+def test_materializer_accepts_exact_24_mib_encrypted_selected_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filter_padding_bytes = 25_165_313
+    assert 482 + filter_padding_bytes == 25_165_795
+    filter_json = b'{"padding":"' + (b"x" * filter_padding_bytes) + b'"}'
+    assert len(filter_json) == 25_165_327
+    config = ClassicSourceConfig(30_000, filter_json)
+    statements: list[str] = []
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id="@envelope:example.org",
+        device_id="ENVELOPE",
+        source=config,
+        pickle_key="envelope-secret",
+        database_name="envelope.db",
+        statement_observer=statements.append,
+    )
+    journal = bootstrap._journal
+    try:
+        owner = journal.load_owner()
+        source_state = journal.load_source()
+        adapter = ClassicSource(owner.stream_id, config, owner.account_id)
+        request = adapter.plan_request(source_state, source_state.next_request_id)
+        assert request is not None
+        assert tuple(key for key, _ in request.query) == (
+            "full_state",
+            "timeout",
+            "filter",
+        )
+        request_filter = request.query[-1][1]
+        assert len(request_filter) == 25_165_327
+        assert request_filter.startswith('{"padding":"')
+        assert request_filter.endswith('"}')
+        assert request_filter.count("x") == filter_padding_bytes
+        response_body = b'{"next_batch":"s1","rooms":{}}'
+        normalized = adapter.normalize(
+            request,
+            NetworkResult(
+                request.stream_id,
+                request.transport,
+                request.source_epoch,
+                request.request_id,
+                200,
+                response_body,
+                None,
+                None,
+            ),
+        )
+        assert normalized.frame is not None
+        assert normalized.response_body == response_body
+        assert normalized.frame.room_segments == ()
+        assert normalized.frame.to_device_json == ()
+        assert normalized.frame.ephemeral_json == ()
+        assert normalized.frame.global_account_data_json == ()
+        assert normalized.frame.presence_json == ()
+        staged = StagedFrame(
+            normalized.frame.frame_id,
+            StagedSourceResponse(
+                request,
+                normalized.response_body,
+                normalized.frame.source_sha256,
+            ),
+        )
+        proposal = reduce_staged_frame(
+            owner.stream_id,
+            staged.frame_id,
+            normalized.frame,
+            (),
+        )
+        assert proposal.room_proposals == ()
+        assert proposal.descriptors == ()
+        canonical_plaintext = _canonical_internal(_frame_envelope(staged))
+        assert len(canonical_plaintext) == 25_165_795
+        assert len(canonical_plaintext) + 29 == _FRAME_ENVELOPE_LIMIT
+        canonical_digest = hashlib.sha256(canonical_plaintext).digest()
+        del canonical_plaintext
+        proposed_source = SourceState(
+            source_state.source_epoch,
+            source_state.transport_kind,
+            normalized.frame.candidate_cursor_json,
+            source_state.next_request_id + 1,
+            source_state.active,
+        )
+        staged_result = journal.stage_source_response(
+            expected_revision=owner.revision,
+            writer_epoch=owner.writer_epoch,
+            source=proposed_source,
+            frame=staged,
+        )
+        stored = _frame_storage_row(journal, staged.frame_id)
+        assert stored is not None
+        stored_ciphertext = stored[4]
+        stored_digest = stored[5]
+        assert type(stored_ciphertext) is bytes
+        assert type(stored_digest) is bytes
+        assert len(stored_ciphertext) == 25_165_824
+        assert stored_digest == canonical_digest
+        assert stored[6] is None
+        del stored
+        owner_before = journal.load_owner()
+        source_before = journal.load_source()
+        assert staged_result.revision == owner_before.revision
+        assert source_before == proposed_source
+        assert _aggregate_rows(journal) == ()
+        assert _work_rows(journal) == ()
+        decrypts: list[
+            tuple[str | None, str, tuple[str | int | UUID, ...], int, bytes]
+        ] = []
+        renormalizations: list[tuple[str | None, UUID]] = []
+        real_decrypt = EncryptedRowCodec.decrypt
+        real_renormalized_frame = journal._renormalized_frame
+
+        def trace_decrypt(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            plaintext = real_decrypt(
+                codec,
+                table,
+                primary_key,
+                ciphertext,
+                digest,
+                header,
+            )
+            decrypts.append(
+                (
+                    journal._owner._outer_scope,
+                    table,
+                    primary_key,
+                    len(ciphertext),
+                    hashlib.sha256(plaintext).digest(),
+                )
+            )
+            return plaintext
+
+        def trace_renormalized_frame(
+            current_owner: OwnerView,
+            current_frame: StagedFrame,
+        ) -> SyncFrame:
+            renormalizations.append(
+                (journal._owner._outer_scope, current_frame.frame_id)
+            )
+            return real_renormalized_frame(current_owner, current_frame)
+
+        statements.clear()
+        monkeypatch.setattr(EncryptedRowCodec, "decrypt", trace_decrypt)
+        monkeypatch.setattr(journal, "_renormalized_frame", trace_renormalized_frame)
+
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            owner_before.revision + 1,
+        )
+
+        empty_digest = hashlib.sha256(b"").digest()
+        assert decrypts == [
+            (
+                "read",
+                "NioIngestFrameDrainHeader",
+                (staged.frame_id,),
+                29,
+                empty_digest,
+            ),
+            (
+                "read",
+                "NioIngestFrame",
+                (staged.frame_id,),
+                25_165_824,
+                canonical_digest,
+            ),
+            (
+                "journal_write",
+                "NioIngestFrameDrainHeader",
+                (staged.frame_id,),
+                29,
+                empty_digest,
+            ),
+        ]
+        assert renormalizations == [("read", staged.frame_id)]
+        materialize_statements = tuple(statements)
+        assert not any(
+            table in statement.lower()
+            for statement in materialize_statements
+            for table in ("nioingestroomaggregate", "nioingestwork")
+        )
+        assert _frame_storage_row(journal, staged.frame_id) is None
+        assert journal.load_owner() == replace(
+            owner_before,
+            revision=owner_before.revision + 1,
+        )
+        assert journal.load_source() == source_before
+        assert _aggregate_rows(journal) == ()
+        assert _work_rows(journal) == ()
+    finally:
+        bootstrap.close()
+
+
 def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
