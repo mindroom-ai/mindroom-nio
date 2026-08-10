@@ -1133,6 +1133,173 @@ def _pending_hydration_ephemeral_planner_case() -> (
     return frame, aggregate, held
 
 
+def _retirement_capacity_planner_case(
+    successor_json: tuple[bytes, ...],
+    *,
+    room_id: str = "!planner-retire:example.org",
+) -> tuple[SyncFrame, RoomAggregateValue, AuthenticatedWork]:
+    frame_origin = RecordOrigin(TransportKind.CLASSIC, 1, 2, 0)
+    hydration_origin = RecordOrigin(TransportKind.CLASSIC, 1, 1, 0)
+    hydration_id = uuid5(_STREAM_ID, "planner-retirement-hydration")
+    continuity = RoomContinuity(room_id, 0, "join", None, None, hydration_id)
+    aggregate = RoomAggregateValue(
+        continuity,
+        1,
+        1,
+        HydrationIntent(hydration_id, hydration_origin),
+    )
+    segment = RoomSegment(
+        room_id,
+        RoomSection.LEAVE,
+        (),
+        successor_json,
+        (),
+        False,
+        None,
+        False,
+        False,
+        len(successor_json),
+        MembershipObservation(
+            "leave",
+            None,
+            None,
+            None,
+            None,
+            False,
+            False,
+            False,
+            False,
+        ),
+    )
+    frame = SyncFrame(
+        _FRAME_ID,
+        frame_origin,
+        b'{"next_batch":"s1"}',
+        b'{"next_batch":"s2"}',
+        b"r" * 32,
+        (),
+        b'{"changed":[],"left":[]}',
+        b"{}",
+        b"null",
+        (segment,),
+        (),
+        (b'{"content":{"generation":2},"type":"m.push_rules"}',),
+        (),
+    )
+    held = EventRecord(
+        str(uuid5(_FRAME_ID, "planner-retirement-held")),
+        RecordKind.TIMELINE,
+        hydration_origin,
+        room_id,
+        0,
+        0,
+        None,
+        TimelineEventProvenance.HISTORY,
+        b'{"content":{"body":"old"},"type":"m.room.message"}',
+        None,
+    )
+    return (
+        frame,
+        aggregate,
+        AuthenticatedWork(
+            held,
+            "held",
+            len(_expected_event_work_plaintext(held)),
+        ),
+    )
+
+
+def _expected_retirement_capacity_records(
+    successor_json: tuple[bytes, ...],
+    global_json: tuple[bytes, ...],
+    *,
+    room_id: str = "!planner-retire:example.org",
+    capacity_reason: LossReason = LossReason.EVENT_LIMIT,
+) -> tuple[
+    LossRecord,
+    EventRecord,
+    tuple[EventRecord, ...],
+    tuple[EventRecord, ...],
+    LossRecord,
+]:
+    origin = RecordOrigin(TransportKind.CLASSIC, 1, 2, 0)
+    old_loss_without_id = LossRecord(
+        "",
+        origin,
+        room_id,
+        0,
+        LossReason.UNVERIFIABLE,
+        LossBoundary(None, None, None, None),
+        b"{}",
+    )
+    old_loss = replace(
+        old_loss_without_id,
+        loss_id=_loss_id(_STREAM_ID, old_loss_without_id),
+    )
+    lifecycle = EventRecord(
+        str(uuid5(_FRAME_ID, f"lifecycle:{room_id}:0:1")),
+        RecordKind.ROOM_LIFECYCLE,
+        origin,
+        room_id,
+        1,
+        1,
+        None,
+        None,
+        b'{"membership":"leave","membership_epoch":1,'
+        b'"previous_membership_epoch":0}',
+        None,
+    )
+    successors = tuple(
+        EventRecord(
+            str(uuid5(_FRAME_ID, f"event:frame:{_FRAME_ID}:{index}")),
+            RecordKind.TIMELINE,
+            replace(origin, frame_index=index),
+            room_id,
+            1,
+            index + 2,
+            None,
+            TimelineEventProvenance.LIVE,
+            source_json,
+            None,
+        )
+        for index, source_json in enumerate(successor_json)
+    )
+    globals_ = tuple(
+        EventRecord(
+            str(
+                uuid5(
+                    _FRAME_ID,
+                    f"event:frame:{_FRAME_ID}:{len(successor_json) + index}",
+                )
+            ),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            replace(origin, frame_index=len(successor_json) + index),
+            None,
+            None,
+            None,
+            None,
+            None,
+            source_json,
+            None,
+        )
+        for index, source_json in enumerate(global_json)
+    )
+    capacity_loss_without_id = LossRecord(
+        "",
+        origin,
+        room_id,
+        1,
+        capacity_reason,
+        LossBoundary(None, None, None, None),
+        b"{}",
+    )
+    capacity_loss = replace(
+        capacity_loss_without_id,
+        loss_id=_loss_id(_STREAM_ID, capacity_loss_without_id),
+    )
+    return old_loss, lifecycle, successors, globals_, capacity_loss
+
+
 def _planner_ready_work(
     frame: SyncFrame,
     index: int,
@@ -1401,6 +1568,569 @@ def test_materializer_terminal_plan_obeys_immutable_total_exact_boundary(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "successor_count", "global_count"),
+    [
+        pytest.param("pre-capacity-exact", 9_997, 1, id="pre-capacity-exact"),
+        pytest.param("pre-capacity-one-over", 9_998, 1, id="pre-capacity-one-over"),
+        pytest.param("replacement-one-over", 1, 9_998, id="replacement-one-over"),
+    ],
+)
+def test_materializer_retirement_immutable_addition_count_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    successor_count: int,
+    global_count: int,
+) -> None:
+    room_id = "!planner-retire:example.org"
+    successor_payload = b'{"content":{"body":"successor"},"type":"m.room.message"}'
+    global_payload = b'{"content":{"generation":2},"type":"m.push_rules"}'
+    successor_json = (successor_payload,) * successor_count
+    global_json = (global_payload,) * global_count
+    frame, aggregate, held = _retirement_capacity_planner_case(successor_json)
+    frame = replace(frame, global_account_data_json=global_json)
+    proposal = reduce_staged_frame(
+        _STREAM_ID,
+        frame.frame_id,
+        frame,
+        (aggregate.continuity,),
+    )
+    successor_continuity = RoomContinuity(
+        room_id,
+        1,
+        "leave",
+        None,
+        None,
+        None,
+    )
+    assert len(proposal.room_proposals) == 1
+    room = proposal.room_proposals[0]
+    assert room.before == aggregate.continuity
+    assert room.after == successor_continuity
+    assert room.hydration is None
+    assert room.recovery is None
+    assert room.retirement_epoch == 0
+    assert room.losses == (
+        LossProposal(
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        ),
+    )
+    assert room.release is RecoveryRelease.LOSS_THEN_HELD
+    assert tuple(
+        (
+            descriptor.kind,
+            descriptor.room_id,
+            descriptor.source_json,
+            descriptor.provenance,
+            descriptor.descriptor_key,
+            descriptor.route,
+        )
+        for descriptor in proposal.descriptors
+    ) == (
+        *(
+            (
+                RecordKind.TIMELINE,
+                room_id,
+                successor_payload,
+                TimelineEventProvenance.LIVE,
+                f"frame:{_FRAME_ID}:{index}",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            )
+            for index in range(successor_count)
+        ),
+        *(
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_payload,
+                None,
+                f"frame:{_FRAME_ID}:{successor_count + index}",
+                DescriptorRoute.READY,
+            )
+            for index in range(global_count)
+        ),
+    )
+    old_loss, lifecycle, successors, globals_, capacity_loss = (
+        _expected_retirement_capacity_records(successor_json, global_json)
+    )
+    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
+    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
+    successor_plaintexts = tuple(
+        _expected_event_work_plaintext(record) for record in successors
+    )
+    global_plaintexts = tuple(
+        _expected_event_work_plaintext(record) for record in globals_
+    )
+    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
+    hard = MaterializerLimits()
+    assert hard.max_held_work_count == 10_000
+    pre_capacity_count = 2 + len(successors) + len(globals_)
+    replacement_count = 3 + len(globals_)
+    if case == "pre-capacity-exact":
+        assert pre_capacity_count == hard.max_held_work_count
+        assert replacement_count == 4
+    elif case == "pre-capacity-one-over":
+        assert pre_capacity_count == hard.max_held_work_count + 1
+        assert replacement_count == 4
+    else:
+        assert case == "replacement-one-over"
+        assert pre_capacity_count == hard.max_held_work_count + 1
+        assert replacement_count == hard.max_held_work_count + 1
+    caller_limits = replace(
+        hard,
+        max_held_work_count=1,
+        max_held_work_canonical_bytes=1,
+        max_ready_work_count=1,
+        max_ready_work_canonical_bytes=1,
+        max_total_work_count=1,
+        max_total_work_canonical_bytes=1,
+    )
+
+    if case == "replacement-one-over":
+        planner_module = importlib.import_module("nio.store._sync_journal_plan")
+        real_canonical_work_plaintext = getattr(
+            planner_module,
+            "_canonical_work_plaintext",
+        )
+        encoded_work_ids: list[str] = []
+
+        def observe_canonical_work_plaintext(
+            kind: str,
+            value: EventRecord | LossRecord,
+        ) -> bytes:
+            encoded_work_ids.append(
+                value.record_id if type(value) is EventRecord else value.loss_id
+            )
+            return real_canonical_work_plaintext(kind, value)
+
+        with monkeypatch.context() as guard:
+            guard.setattr(
+                planner_module,
+                "_canonical_work_plaintext",
+                observe_canonical_work_plaintext,
+            )
+            with pytest.raises(
+                ValueError,
+                match="selected frame Work exceeds the hard addition envelope",
+            ):
+                plan_frame_materialization(
+                    stream_id=_STREAM_ID,
+                    frame=frame,
+                    aggregates=(aggregate,),
+                    work=(held,),
+                    revision=2,
+                    limits=caller_limits,
+                )
+        assert capacity_loss.loss_id in encoded_work_ids
+        return
+
+    plan = plan_frame_materialization(
+        stream_id=_STREAM_ID,
+        frame=frame,
+        aggregates=(aggregate,),
+        work=(held,),
+        revision=2,
+        limits=caller_limits,
+    )
+
+    assert plan is not None
+    assert plan.work_releases == (
+        (held.value, _expected_event_work_plaintext(held.value), 1),
+    )
+    if case == "pre-capacity-exact":
+        assert plan.room_values == (
+            RoomAggregateValue(
+                successor_continuity,
+                2 + successor_count,
+                2,
+                None,
+            ),
+        )
+        assert plan.work_inserts == (
+            (old_loss, old_loss_plaintext, 0),
+            (lifecycle, lifecycle_plaintext, 2),
+            *(
+                (record, plaintext, index + 3)
+                for index, (record, plaintext) in enumerate(
+                    zip(successors, successor_plaintexts, strict=True)
+                )
+            ),
+            *(
+                (record, plaintext, successor_count + index + 3)
+                for index, (record, plaintext) in enumerate(
+                    zip(globals_, global_plaintexts, strict=True)
+                )
+            ),
+        )
+    else:
+        assert case == "pre-capacity-one-over"
+        assert plan.room_values == (
+            RoomAggregateValue(successor_continuity, 2, 2, None),
+        )
+        assert plan.work_inserts == (
+            (old_loss, old_loss_plaintext, 0),
+            (lifecycle, lifecycle_plaintext, 2),
+            (capacity_loss, capacity_loss_plaintext, 3),
+            *(
+                (record, plaintext, index + 4)
+                for index, (record, plaintext) in enumerate(
+                    zip(globals_, global_plaintexts, strict=True)
+                )
+            ),
+        )
+    assert plan.crypto_deferred is False
+
+
+@pytest.mark.parametrize(
+    ("room_body_length", "tuned_padding", "excess"),
+    [
+        pytest.param(515_777, 52, 0, id="exact"),
+        pytest.param(515_778, 4, 1, id="one-over"),
+    ],
+)
+def test_materializer_retirement_immutable_addition_byte_boundary(
+    room_body_length: int,
+    tuned_padding: int,
+    excess: int,
+) -> None:
+    room_id = f"!{'r' * room_body_length}:example.org"
+    ordinary_successor = b'{"content":{"body":"successor"},"type":"m.room.message"}'
+    tuned_successor = (
+        b'{"content":{"body":"'
+        + (b"x" * tuned_padding)
+        + b'"},"type":"m.room.message"}'
+    )
+    successor_json = (ordinary_successor,) * 62 + (tuned_successor,)
+    global_json = (b'{"content":{"generation":2},"type":"m.push_rules"}',)
+    frame, aggregate, held = _retirement_capacity_planner_case(
+        successor_json,
+        room_id=room_id,
+    )
+    proposal = reduce_staged_frame(
+        _STREAM_ID,
+        frame.frame_id,
+        frame,
+        (aggregate.continuity,),
+    )
+    assert len(proposal.room_proposals) == 1
+    room = proposal.room_proposals[0]
+    successor_continuity = RoomContinuity(
+        room_id,
+        1,
+        "leave",
+        None,
+        None,
+        None,
+    )
+    assert room.before == aggregate.continuity
+    assert room.after == successor_continuity
+    assert room.hydration is None
+    assert room.recovery is None
+    assert room.retirement_epoch == 0
+    assert room.losses == (
+        LossProposal(
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        ),
+    )
+    assert room.release is RecoveryRelease.LOSS_THEN_HELD
+    assert tuple(
+        (
+            descriptor.kind,
+            descriptor.room_id,
+            descriptor.source_json,
+            descriptor.provenance,
+            descriptor.descriptor_key,
+            descriptor.route,
+        )
+        for descriptor in proposal.descriptors
+    ) == (
+        *(
+            (
+                RecordKind.TIMELINE,
+                room_id,
+                source_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{_FRAME_ID}:{index}",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            )
+            for index, source_json in enumerate(successor_json)
+        ),
+        (
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            None,
+            global_json[0],
+            None,
+            f"frame:{_FRAME_ID}:63",
+            DescriptorRoute.READY,
+        ),
+    )
+    old_loss, lifecycle, successors, globals_, capacity_loss = (
+        _expected_retirement_capacity_records(
+            successor_json,
+            global_json,
+            room_id=room_id,
+        )
+    )
+    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
+    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
+    successor_plaintexts = tuple(
+        _expected_event_work_plaintext(record) for record in successors
+    )
+    global_plaintexts = tuple(
+        _expected_event_work_plaintext(record) for record in globals_
+    )
+    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
+    normal_plaintexts = (
+        old_loss_plaintext,
+        lifecycle_plaintext,
+        *successor_plaintexts,
+        *global_plaintexts,
+    )
+    replacement_plaintexts = (
+        old_loss_plaintext,
+        lifecycle_plaintext,
+        capacity_loss_plaintext,
+        *global_plaintexts,
+    )
+    hard = MaterializerLimits()
+    assert hard.max_record_canonical_bytes == 1 * 1024 * 1024
+    assert hard.max_held_work_canonical_bytes == 32 * 1024 * 1024
+    assert len(normal_plaintexts) == 66
+    assert all(
+        len(plaintext) <= hard.max_record_canonical_bytes
+        for plaintext in normal_plaintexts
+    )
+    assert sum(map(len, normal_plaintexts)) == (
+        hard.max_held_work_canonical_bytes + excess
+    )
+    assert sum(map(len, replacement_plaintexts)) < (hard.max_held_work_canonical_bytes)
+    caller_limits = replace(
+        hard,
+        max_held_work_count=1,
+        max_held_work_canonical_bytes=1,
+        max_ready_work_count=1,
+        max_ready_work_canonical_bytes=1,
+        max_total_work_count=1,
+        max_total_work_canonical_bytes=1,
+    )
+
+    plan = plan_frame_materialization(
+        stream_id=_STREAM_ID,
+        frame=frame,
+        aggregates=(aggregate,),
+        work=(held,),
+        revision=2,
+        limits=caller_limits,
+    )
+
+    assert plan is not None
+    assert plan.work_releases == (
+        (held.value, _expected_event_work_plaintext(held.value), 1),
+    )
+    if excess == 0:
+        assert plan.room_values == (
+            RoomAggregateValue(
+                successor_continuity,
+                65,
+                2,
+                None,
+            ),
+        )
+        assert plan.work_inserts == (
+            (old_loss, old_loss_plaintext, 0),
+            (lifecycle, lifecycle_plaintext, 2),
+            *(
+                (record, plaintext, index + 3)
+                for index, (record, plaintext) in enumerate(
+                    zip(successors, successor_plaintexts, strict=True)
+                )
+            ),
+            (globals_[0], global_plaintexts[0], 66),
+        )
+    else:
+        assert excess == 1
+        assert plan.room_values == (
+            RoomAggregateValue(successor_continuity, 2, 2, None),
+        )
+        assert plan.work_inserts == (
+            (old_loss, old_loss_plaintext, 0),
+            (lifecycle, lifecycle_plaintext, 2),
+            (capacity_loss, capacity_loss_plaintext, 3),
+            (globals_[0], global_plaintexts[0], 4),
+        )
+    assert plan.crypto_deferred is False
+
+
+@pytest.mark.parametrize("excess", [0, 1], ids=("exact", "one-over"))
+def test_materializer_retirement_replacement_obeys_immutable_total_byte_boundary(
+    excess: int,
+) -> None:
+    room_id = "!planner-retire:example.org"
+    successor_json = (
+        b'{"content":{"body":"' + (b"x" * 512) + b'"},"type":"m.room.message"}',
+    )
+    global_json = (b'{"content":{"generation":2},"type":"m.push_rules"}',)
+    frame, aggregate, held = _retirement_capacity_planner_case(successor_json)
+    proposal = reduce_staged_frame(
+        _STREAM_ID,
+        frame.frame_id,
+        frame,
+        (aggregate.continuity,),
+    )
+    assert len(proposal.room_proposals) == 1
+    room = proposal.room_proposals[0]
+    successor_continuity = RoomContinuity(
+        room_id,
+        1,
+        "leave",
+        None,
+        None,
+        None,
+    )
+    assert room.before == aggregate.continuity
+    assert room.after == successor_continuity
+    assert room.hydration is None
+    assert room.recovery is None
+    assert room.retirement_epoch == 0
+    assert room.losses == (
+        LossProposal(
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        ),
+    )
+    assert room.release is RecoveryRelease.LOSS_THEN_HELD
+    assert tuple(
+        (
+            descriptor.kind,
+            descriptor.room_id,
+            descriptor.source_json,
+            descriptor.provenance,
+            descriptor.descriptor_key,
+            descriptor.route,
+        )
+        for descriptor in proposal.descriptors
+    ) == (
+        (
+            RecordKind.TIMELINE,
+            room_id,
+            successor_json[0],
+            TimelineEventProvenance.LIVE,
+            f"frame:{_FRAME_ID}:0",
+            DescriptorRoute.HOLD_FOR_RETIREMENT,
+        ),
+        (
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            None,
+            global_json[0],
+            None,
+            f"frame:{_FRAME_ID}:1",
+            DescriptorRoute.READY,
+        ),
+    )
+    old_loss, lifecycle, successors, globals_, capacity_loss = (
+        _expected_retirement_capacity_records(
+            successor_json,
+            global_json,
+            capacity_reason=LossReason.OVERSIZED_EVENT,
+        )
+    )
+    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
+    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
+    successor_plaintext = _expected_event_work_plaintext(successors[0])
+    global_plaintext = _expected_event_work_plaintext(globals_[0])
+    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
+    replacement_plaintexts = (
+        old_loss_plaintext,
+        lifecycle_plaintext,
+        capacity_loss_plaintext,
+        global_plaintext,
+    )
+    max_record_bytes = max(
+        held.canonical_size,
+        *(map(len, replacement_plaintexts)),
+    )
+    assert len(successor_plaintext) > max_record_bytes
+    hard = MaterializerLimits()
+    assert hard.max_record_canonical_bytes == 1 * 1024 * 1024
+    assert hard.max_total_work_canonical_bytes == 64 * 1024 * 1024
+    exact_ready_bytes = (
+        hard.max_total_work_canonical_bytes
+        - held.canonical_size
+        - sum(map(len, replacement_plaintexts))
+    )
+    ready_sizes: list[int] = []
+    remaining = exact_ready_bytes
+    while remaining:
+        size = min(hard.max_record_canonical_bytes, remaining)
+        ready_sizes.append(size)
+        remaining -= size
+    assert len(ready_sizes) == 64
+    assert ready_sizes[-1] < hard.max_record_canonical_bytes
+    ready_sizes[-1] += excess
+    assert all(1 <= size <= hard.max_record_canonical_bytes for size in ready_sizes)
+    ready = tuple(
+        _planner_ready_work(frame, index, canonical_size=size)
+        for index, size in enumerate(ready_sizes)
+    )
+    work = (held, *ready)
+    assert all(type(item.value) is EventRecord for item in work)
+    work_ids = tuple(
+        item.value.record_id for item in work if type(item.value) is EventRecord
+    )
+    assert len(set(work_ids)) == len(work)
+    assert sum(item.canonical_size for item in work) + sum(
+        map(len, replacement_plaintexts)
+    ) == (hard.max_total_work_canonical_bytes + excess)
+    caller_limits = replace(
+        hard,
+        max_record_canonical_bytes=max_record_bytes,
+        max_held_work_count=1,
+        max_held_work_canonical_bytes=1,
+        max_ready_work_count=1,
+        max_ready_work_canonical_bytes=1,
+        max_total_work_count=1,
+        max_total_work_canonical_bytes=1,
+    )
+
+    plan = plan_frame_materialization(
+        stream_id=_STREAM_ID,
+        frame=frame,
+        aggregates=(aggregate,),
+        work=work,
+        revision=2,
+        limits=caller_limits,
+    )
+
+    if excess:
+        assert plan is None
+        return
+    assert plan is not None
+    assert plan.room_values == (RoomAggregateValue(successor_continuity, 2, 2, None),)
+    assert plan.work_inserts == (
+        (old_loss, old_loss_plaintext, 0),
+        (lifecycle, lifecycle_plaintext, 2),
+        (capacity_loss, capacity_loss_plaintext, 3),
+        (globals_[0], global_plaintext, 4),
+    )
+    assert plan.work_releases == (
+        (held.value, _expected_event_work_plaintext(held.value), 1),
+    )
+    assert successors[0].record_id not in {
+        item.record_id
+        for item, _plaintext, _ordinal in plan.work_inserts
+        if type(item) is EventRecord
+    }
+    assert plan.crypto_deferred is False
 
 
 def test_materializer_terminal_replacement_obeys_hard_addition_count_boundary() -> None:
@@ -3569,9 +4299,10 @@ def _stage_discovery_rooms_frame(
     transport: TransportKind,
     sequence: int,
     *,
-    rooms: tuple[tuple[str, str, str], ...],
+    rooms: tuple[tuple[str, str, str | tuple[str, ...]], ...],
     crypto: bool = False,
     global_tail: bool = False,
+    global_padding_bytes: int = 0,
 ) -> tuple[StagedFrame, SyncFrame]:
     owner = journal.load_owner()
     prior = journal.load_source()
@@ -3586,7 +4317,11 @@ def _stage_discovery_rooms_frame(
         }
 
     global_event = {
-        "content": {"generation": sequence, "index": 0, "padding": ""},
+        "content": {
+            "generation": sequence,
+            "index": 0,
+            "padding": "x" * global_padding_bytes,
+        },
         "type": "m.push_rules",
     }
     presence_event = {
@@ -3596,9 +4331,10 @@ def _stage_discovery_rooms_frame(
     }
     if transport is TransportKind.CLASSIC:
         room_sections: dict[str, dict[str, object]] = {}
-        for room_id, membership, event_body in rooms:
+        for room_id, membership, event_bodies in rooms:
+            bodies = (event_bodies,) if type(event_bodies) is str else event_bodies
             room_sections.setdefault(membership, {})[room_id] = {
-                "timeline": {"events": [room_event(event_body)]}
+                "timeline": {"events": [room_event(body) for body in bodies]}
             }
         response: dict[str, object] = {
             "next_batch": f"s{sequence}",
@@ -3619,16 +4355,17 @@ def _stage_discovery_rooms_frame(
     else:
         assert request.body is not None
         request_body = json.loads(request.body)
+        sliding_rooms: dict[str, object] = {}
+        for room_id, membership, event_bodies in rooms:
+            bodies = (event_bodies,) if type(event_bodies) is str else event_bodies
+            sliding_rooms[room_id] = {
+                "membership": membership,
+                "timeline": [room_event(body) for body in bodies],
+            }
         response = {
             "lists": {RESERVED_ALL_ROOMS_LIST: {"count": len(rooms)}},
             "pos": f"p{sequence}",
-            "rooms": {
-                room_id: {
-                    "membership": membership,
-                    "timeline": [room_event(event_body)],
-                }
-                for room_id, membership, event_body in rooms
-            },
+            "rooms": sliding_rooms,
             "txn_id": request_body["txn_id"],
         }
         extensions: dict[str, object] = {}
@@ -10578,6 +11315,1484 @@ def test_materializer_two_room_sliding_crypto_retirement_preserves_other_h2(
         )
         committed_graph = _materializer_storage_graph(journal)
         assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_retirement_successor_oversize_becomes_epoch_capacity_loss(
+    tmp_path: Path,
+) -> None:
+    room_a = "!a-retire:example.org"
+    room_b = "!b-hydrate:example.org"
+    first_origin = RecordOrigin(TransportKind.SLIDING, 0, 0, 0)
+    selected_origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+    first_a_json = (
+        b'{"content":{"body":"capacity-a-held-0","msgtype":"m.text"},'
+        b'"type":"m.room.message"}',
+        b'{"content":{"body":"capacity-a-held-1","msgtype":"m.text"},'
+        b'"type":"m.room.message"}',
+    )
+    first_b_json = (
+        b'{"content":{"body":"capacity-b-held","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    selected_b_json = (
+        b'{"content":{"body":"capacity-b-h2","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    oversized_a_json = (
+        b'{"content":{"body":"'
+        + (b"x" * 512)
+        + b'","msgtype":"m.text"},"type":"m.room.message"}'
+    )
+    global_json = (
+        b'{"content":{"generation":2,"index":0,"padding":""},' b'"type":"m.push_rules"}'
+    )
+    presence_json = (
+        b'{"content":{"presence":"online"},'
+        b'"sender":"@friend:example.org","type":"m.presence"}'
+    )
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.SLIDING,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        stream_id = journal.load_owner().stream_id
+        first, first_normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            1,
+            rooms=(
+                (
+                    room_a,
+                    "join",
+                    ("capacity-a-held-0", "capacity-a-held-1"),
+                ),
+                (room_b, "join", "capacity-b-held"),
+            ),
+            crypto=True,
+        )
+        assert first_normalized.origin == first_origin
+        assert tuple(segment.room_id for segment in first_normalized.room_segments) == (
+            room_a,
+            room_b,
+        )
+        assert tuple(
+            segment.timeline_json for segment in first_normalized.room_segments
+        ) == (first_a_json, (first_b_json,))
+        first_a_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_a}:0:{first.frame_id}",
+        )
+        first_b_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_b}:0:{first.frame_id}",
+        )
+        first_a_continuity = RoomContinuity(
+            room_a,
+            0,
+            "join",
+            None,
+            None,
+            first_a_hydration_id,
+        )
+        first_b_continuity = RoomContinuity(
+            room_b,
+            0,
+            "join",
+            None,
+            None,
+            first_b_hydration_id,
+        )
+        first_a_hydration = HydrationIntent(first_a_hydration_id, first_origin)
+        first_b_hydration = HydrationIntent(first_b_hydration_id, first_origin)
+        first_proposal = reduce_staged_frame(
+            stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert first_proposal.crypto_deferred is True
+        assert tuple(
+            (room.before, room.after, room.hydration, room.release)
+            for room in first_proposal.room_proposals
+        ) == (
+            (
+                None,
+                first_a_continuity,
+                first_a_hydration,
+                RecoveryRelease.NONE,
+            ),
+            (
+                None,
+                first_b_continuity,
+                first_b_hydration,
+                RecoveryRelease.NONE,
+            ),
+        )
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in first_proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                first_a_json[0],
+                TimelineEventProvenance.HISTORY,
+                f"frame:{first.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                first_a_json[1],
+                TimelineEventProvenance.HISTORY,
+                f"frame:{first.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                first_b_json,
+                TimelineEventProvenance.HISTORY,
+                f"frame:{first.frame_id}:2",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        first_raw_before = _frame_storage_row(journal, first.frame_id)
+        assert first_raw_before is not None
+        assert first_raw_before[6] == 2
+        first_a_aggregate = RoomAggregateValue(
+            first_a_continuity,
+            2,
+            2,
+            first_a_hydration,
+        )
+        first_b_aggregate = RoomAggregateValue(
+            first_b_continuity,
+            1,
+            2,
+            first_b_hydration,
+        )
+        aggregate_rows = _aggregate_rows(journal)
+        assert tuple(row[:3] for row in aggregate_rows) == (
+            (room_a, 2, "hydration"),
+            (room_b, 2, "hydration"),
+        )
+        for row, expected in zip(
+            aggregate_rows,
+            (first_a_aggregate, first_b_aggregate),
+            strict=True,
+        ):
+            plaintext, stored = _decrypt_aggregate(journal, row)
+            assert stored == expected
+            assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+        first_a_held = tuple(
+            EventRecord(
+                str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:{index}")),
+                RecordKind.TIMELINE,
+                RecordOrigin(TransportKind.SLIDING, 0, 0, index),
+                room_a,
+                0,
+                index,
+                None,
+                TimelineEventProvenance.HISTORY,
+                source_json,
+                None,
+            )
+            for index, source_json in enumerate(first_a_json)
+        )
+        first_b_held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:2")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 0, 2),
+            room_b,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_b_json,
+            None,
+        )
+        first_expected_work = tuple(
+            sorted(
+                (
+                    *(
+                        _ExpectedMaterializerWork(
+                            value,
+                            "held",
+                            first.frame_id,
+                            None,
+                            None,
+                            2,
+                        )
+                        for value in first_a_held
+                    ),
+                    _ExpectedMaterializerWork(
+                        first_b_held,
+                        "held",
+                        first.frame_id,
+                        None,
+                        None,
+                        2,
+                    ),
+                ),
+                key=_expected_materializer_work_id,
+            )
+        )
+        first_work = _work_rows(journal)
+        _assert_exact_materializer_work(
+            journal,
+            first_work,
+            first_expected_work,
+            (),
+        )
+
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            2,
+            rooms=(
+                (room_a, "leave", "x" * 512),
+                (room_b, "join", "capacity-b-h2"),
+            ),
+            crypto=True,
+            global_tail=True,
+        )
+        assert normalized.origin == selected_origin
+        assert tuple(segment.room_id for segment in normalized.room_segments) == (
+            room_b,
+            room_a,
+        )
+        assert tuple(segment.timeline_json for segment in normalized.room_segments) == (
+            (selected_b_json,),
+            (oversized_a_json,),
+        )
+        proposal = reduce_staged_frame(
+            stream_id,
+            selected.frame_id,
+            normalized,
+            (first_a_continuity, first_b_continuity),
+        )
+        assert proposal.crypto_deferred is True
+        room_b_proposal, room_a_proposal = proposal.room_proposals
+        assert room_b_proposal.before == first_b_continuity
+        assert room_b_proposal.after == first_b_continuity
+        assert room_b_proposal.hydration == HydrationIntent(
+            first_b_hydration_id,
+            selected_origin,
+        )
+        assert room_b_proposal.retirement_epoch is None
+        assert room_b_proposal.losses == ()
+        assert room_b_proposal.release is RecoveryRelease.NONE
+        room_a_continuity = RoomContinuity(
+            room_a,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert room_a_proposal.before == first_a_continuity
+        assert room_a_proposal.after == room_a_continuity
+        assert room_a_proposal.hydration is None
+        assert room_a_proposal.recovery is None
+        assert room_a_proposal.retirement_epoch == 0
+        assert room_a_proposal.losses == (
+            LossProposal(
+                room_a,
+                0,
+                LossReason.UNVERIFIABLE,
+                LossBoundary(None, None, None, None),
+            ),
+        )
+        assert room_a_proposal.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_b,
+                selected_b_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_HYDRATION,
+            ),
+            (
+                RecordKind.TIMELINE,
+                room_a,
+                oversized_a_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_json,
+                None,
+                f"frame:{selected.frame_id}:2",
+                DescriptorRoute.READY,
+            ),
+            (
+                RecordKind.PRESENCE,
+                None,
+                presence_json,
+                None,
+                f"frame:{selected.frame_id}:3",
+                DescriptorRoute.READY,
+            ),
+        )
+
+        old_loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_a,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        old_loss = replace(
+            old_loss_without_id,
+            loss_id=_loss_id(stream_id, old_loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_a}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            selected_origin,
+            room_a,
+            1,
+            2,
+            None,
+            None,
+            canonical_json(
+                {
+                    "membership": "leave",
+                    "membership_epoch": 1,
+                    "previous_membership_epoch": 0,
+                }
+            ),
+            None,
+        )
+        capacity_loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_a,
+            1,
+            LossReason.OVERSIZED_EVENT,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        capacity_loss = replace(
+            capacity_loss_without_id,
+            loss_id=_loss_id(stream_id, capacity_loss_without_id),
+        )
+        selected_b = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 0),
+            room_b,
+            0,
+            1,
+            None,
+            TimelineEventProvenance.LIVE,
+            selected_b_json,
+            None,
+        )
+        oversized_a = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 1),
+            room_a,
+            1,
+            3,
+            None,
+            TimelineEventProvenance.LIVE,
+            oversized_a_json,
+            None,
+        )
+        global_account_data = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:3")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 3),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        allowed_plaintexts = (
+            _expected_loss_work_plaintext(old_loss),
+            _expected_event_work_plaintext(lifecycle),
+            _expected_loss_work_plaintext(capacity_loss),
+            _expected_event_work_plaintext(selected_b),
+            _expected_event_work_plaintext(global_account_data),
+            _expected_event_work_plaintext(presence),
+        )
+        max_record_bytes = max(map(len, allowed_plaintexts))
+        assert len(_expected_event_work_plaintext(oversized_a)) > max_record_bytes
+
+        old_graph = _materializer_storage_graph(journal)
+        old_owner, old_source, old_frames, old_aggregates, old_work = old_graph
+        assert old_owner.revision == 3
+        assert old_aggregates == aggregate_rows
+        assert old_work == first_work
+        old_frames_by_id = {str(row[0]): row for row in old_frames}
+        assert old_frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_before = old_frames_by_id[str(selected.frame_id)]
+        assert selected_before[6] is None
+        statements.clear()
+        try:
+            result = _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_record_canonical_bytes=max_record_bytes,
+                ),
+            )
+        except JournalIntegrityError as error:
+            if str(error) != "planned Work record exceeds the canonical byte limit":
+                raise AssertionError("unexpected successor oversize RED") from error
+            assert _materializer_storage_graph(journal) == old_graph
+            assert _materializer_dml(statements) == ()
+            raise
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            4,
+        )
+
+        owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+        assert owner == replace(old_owner, revision=4)
+        assert source == old_source
+        expected_a_aggregate = RoomAggregateValue(room_a_continuity, 3, 4, None)
+        expected_b_aggregate = RoomAggregateValue(
+            first_b_continuity,
+            2,
+            4,
+            first_b_hydration,
+        )
+        assert tuple(row[:3] for row in aggregates) == (
+            (room_a, 4, None),
+            (room_b, 4, "hydration"),
+        )
+        for row, expected in zip(
+            aggregates,
+            (expected_a_aggregate, expected_b_aggregate),
+            strict=True,
+        ):
+            plaintext, stored = _decrypt_aggregate(journal, row)
+            assert stored == expected
+            assert plaintext == _rows()._canonical_room_aggregate_plaintext(expected)
+
+        held_expected = tuple(
+            sorted(
+                (
+                    _ExpectedMaterializerWork(
+                        first_b_held,
+                        "held",
+                        first.frame_id,
+                        None,
+                        None,
+                        2,
+                    ),
+                    _ExpectedMaterializerWork(
+                        selected_b,
+                        "held",
+                        selected.frame_id,
+                        None,
+                        None,
+                        4,
+                    ),
+                ),
+                key=_expected_materializer_work_id,
+            )
+        )
+        expected_work = (
+            *held_expected,
+            _ExpectedMaterializerWork(old_loss, "ready", selected.frame_id, 4, 0, 4),
+            _ExpectedMaterializerWork(
+                first_a_held[0],
+                "ready",
+                first.frame_id,
+                4,
+                1,
+                2,
+            ),
+            _ExpectedMaterializerWork(
+                first_a_held[1],
+                "ready",
+                first.frame_id,
+                4,
+                2,
+                2,
+            ),
+            _ExpectedMaterializerWork(
+                lifecycle,
+                "ready",
+                selected.frame_id,
+                4,
+                3,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                capacity_loss,
+                "ready",
+                selected.frame_id,
+                4,
+                4,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                global_account_data,
+                "ready",
+                selected.frame_id,
+                4,
+                5,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                presence,
+                "ready",
+                selected.frame_id,
+                4,
+                6,
+                4,
+            ),
+        )
+        _assert_exact_materializer_work(journal, work, expected_work, old_work)
+        assert oversized_a.record_id not in {str(row[0]) for row in work}
+        assert tuple(row[8] for row in work if row[2] == "ready") == tuple(range(7))
+        work_by_id = {str(row[0]): row for row in work}
+        old_work_by_id = {str(row[0]): row for row in old_work}
+        assert (
+            work_by_id[first_b_held.record_id] == old_work_by_id[first_b_held.record_id]
+        )
+
+        frames_by_id = {str(row[0]): row for row in frames}
+        assert frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_after = frames_by_id[str(selected.frame_id)]
+        assert selected_after[:6] == selected_before[:6]
+        assert selected_after[6] == 4
+        assert selected_after[7] != selected_before[7]
+        assert journal.load_frame(first.frame_id) == first
+        assert journal.load_frame(selected.frame_id) == selected
+        assert (
+            EncryptedRowCodec(
+                "discovery-secret",
+                journal.account_id,
+                owner.stream_id,
+            ).decrypt(
+                "NioIngestFrameDrainHeader",
+                (selected.frame_id,),
+                selected_after[7],
+                hashlib.sha256(b"").digest(),
+                header=_canonical_expected_drain_header(selected_after, 4),
+            )
+            == b""
+        )
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["old-loss", "lifecycle"],
+    ids=("old-loss", "lifecycle"),
+)
+def test_materializer_retirement_mandatory_record_oversize_fails_before_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    statements: list[str] = []
+    case = _prepare_materializer_atomicity_case(
+        tmp_path,
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        statements=statements,
+    )
+    bootstrap = case.bootstrap
+    journal = bootstrap._journal
+    try:
+        room_id = "!unsupported:example.org"
+        origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+        stream_id = journal.load_owner().stream_id
+        old_loss_without_id = LossRecord(
+            "",
+            origin,
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        old_loss = replace(
+            old_loss_without_id,
+            loss_id=_loss_id(stream_id, old_loss_without_id),
+        )
+        capacity_loss_without_id = LossRecord(
+            "",
+            origin,
+            room_id,
+            1,
+            LossReason.EVENT_LIMIT,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        capacity_loss = replace(
+            capacity_loss_without_id,
+            loss_id=_loss_id(stream_id, capacity_loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(case.selected.frame_id, f"lifecycle:{room_id}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            origin,
+            room_id,
+            1,
+            1,
+            None,
+            None,
+            b'{"membership":"leave","membership_epoch":1,'
+            b'"previous_membership_epoch":0}',
+            None,
+        )
+        capacity_loss_bytes = len(_expected_loss_work_plaintext(capacity_loss))
+        old_loss_bytes = len(_expected_loss_work_plaintext(old_loss))
+        lifecycle_bytes = len(_expected_event_work_plaintext(lifecycle))
+        assert capacity_loss_bytes <= old_loss_bytes < lifecycle_bytes
+        assert (capacity_loss_bytes, old_loss_bytes, lifecycle_bytes) == (
+            408,
+            409,
+            475,
+        )
+        limit = old_loss_bytes - 1 if boundary == "old-loss" else lifecycle_bytes - 1
+        if boundary == "lifecycle":
+            assert limit >= old_loss_bytes
+        else:
+            assert boundary == "old-loss"
+
+        proposal = reduce_staged_frame(
+            stream_id,
+            case.selected.frame_id,
+            case.normalized,
+            (_decrypt_aggregate(journal, _aggregate_rows(journal)[0])[1].continuity,),
+        )
+        assert len(proposal.room_proposals) == 1
+        room = proposal.room_proposals[0]
+        assert room.retirement_epoch == 0
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_RETIREMENT,
+            DescriptorRoute.READY,
+        )
+        old_graph = _materializer_storage_graph(journal)
+        raw_before = _frame_storage_row(journal, case.selected.frame_id)
+        assert raw_before is not None
+        assert raw_before[6] is None
+        assert journal.load_frame(case.selected.frame_id) == case.selected
+
+        def reject_writer(_self: object) -> object:
+            raise AssertionError("oversized mandatory record entered journal_write")
+
+        statements.clear()
+        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
+        with pytest.raises(
+            JournalIntegrityError,
+            match="planned Work record exceeds the canonical byte limit",
+        ):
+            _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_record_canonical_bytes=limit,
+                ),
+            )
+
+        assert _materializer_storage_graph(journal) == old_graph
+        assert _frame_storage_row(journal, case.selected.frame_id) == raw_before
+        assert journal.load_frame(case.selected.frame_id) == case.selected
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+def test_materializer_retirement_global_oversize_fails_before_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.SLIDING,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        first, first_normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.SLIDING,
+            1,
+            crypto=True,
+            room_nonempty=True,
+        )
+        first_proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert first_proposal.room_proposals[0].hydration is not None
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        aggregate_row = _aggregate_rows(journal)[0]
+        _, first_aggregate = _decrypt_aggregate(journal, aggregate_row)
+        assert type(first_aggregate) is RoomAggregateValue
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            2,
+            rooms=(("!unsupported:example.org", "leave", "x" * 256),),
+            crypto=True,
+            global_tail=True,
+            global_padding_bytes=512,
+        )
+        room_id = "!unsupported:example.org"
+        origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+        timeline_json = (
+            b'{"content":{"body":"'
+            + (b"x" * 256)
+            + b'","msgtype":"m.text"},"type":"m.room.message"}'
+        )
+        global_json = (
+            b'{"content":{"generation":2,"index":0,"padding":"'
+            + (b"x" * 512)
+            + b'"},"type":"m.push_rules"}'
+        )
+        presence_json = (
+            b'{"content":{"presence":"online"},'
+            b'"sender":"@friend:example.org","type":"m.presence"}'
+        )
+        assert normalized.origin == origin
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            selected.frame_id,
+            normalized,
+            (first_aggregate.continuity,),
+        )
+        room = proposal.room_proposals[0]
+        assert room.retirement_epoch == 0
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_id,
+                timeline_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_json,
+                None,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.READY,
+            ),
+            (
+                RecordKind.PRESENCE,
+                None,
+                presence_json,
+                None,
+                f"frame:{selected.frame_id}:2",
+                DescriptorRoute.READY,
+            ),
+        )
+        old_loss_without_id = LossRecord(
+            "",
+            origin,
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        old_loss = replace(
+            old_loss_without_id,
+            loss_id=_loss_id(journal.load_owner().stream_id, old_loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_id}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            origin,
+            room_id,
+            1,
+            1,
+            None,
+            None,
+            b'{"membership":"leave","membership_epoch":1,'
+            b'"previous_membership_epoch":0}',
+            None,
+        )
+        successor = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.TIMELINE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 0),
+            room_id,
+            1,
+            2,
+            None,
+            TimelineEventProvenance.LIVE,
+            timeline_json,
+            None,
+        )
+        capacity_loss_without_id = LossRecord(
+            "",
+            origin,
+            room_id,
+            1,
+            LossReason.OVERSIZED_EVENT,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        capacity_loss = replace(
+            capacity_loss_without_id,
+            loss_id=_loss_id(
+                journal.load_owner().stream_id,
+                capacity_loss_without_id,
+            ),
+        )
+        oversized_global = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        allowed_sizes = tuple(
+            map(
+                len,
+                (
+                    _expected_loss_work_plaintext(old_loss),
+                    _expected_event_work_plaintext(lifecycle),
+                    _expected_loss_work_plaintext(capacity_loss),
+                    _expected_event_work_plaintext(presence),
+                ),
+            )
+        )
+        max_record_bytes = max(allowed_sizes)
+        assert len(_expected_event_work_plaintext(successor)) > max_record_bytes
+        assert len(_expected_event_work_plaintext(oversized_global)) > max_record_bytes
+
+        old_graph = _materializer_storage_graph(journal)
+        raw_before = _frame_storage_row(journal, selected.frame_id)
+        assert raw_before is not None
+        assert raw_before[6] is None
+        assert journal.load_frame(selected.frame_id) == selected
+
+        def reject_writer(_self: object) -> object:
+            raise AssertionError("oversized global entered journal_write")
+
+        planner_module = importlib.import_module("nio.store._sync_journal_plan")
+        real_canonical_work_plaintext = getattr(
+            planner_module,
+            "_canonical_work_plaintext",
+        )
+        encoded_work_ids: list[str] = []
+
+        def observe_canonical_work_plaintext(
+            kind: str,
+            value: EventRecord | LossRecord,
+        ) -> bytes:
+            encoded_work_ids.append(
+                value.record_id if type(value) is EventRecord else value.loss_id
+            )
+            return real_canonical_work_plaintext(kind, value)
+
+        statements.clear()
+        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
+        with monkeypatch.context() as guard:
+            guard.setattr(
+                planner_module,
+                "_canonical_work_plaintext",
+                observe_canonical_work_plaintext,
+            )
+            with pytest.raises(
+                JournalIntegrityError,
+                match="planned Work record exceeds the canonical byte limit",
+            ):
+                _materialize(
+                    journal,
+                    limits=replace(
+                        MaterializerLimits(),
+                        max_record_canonical_bytes=max_record_bytes,
+                    ),
+                )
+
+        assert successor.record_id in encoded_work_ids
+        assert oversized_global.record_id in encoded_work_ids
+        assert encoded_work_ids.index(successor.record_id) < encoded_work_ids.index(
+            oversized_global.record_id
+        )
+
+        assert _materializer_storage_graph(journal) == old_graph
+        assert _frame_storage_row(journal, selected.frame_id) == raw_before
+        assert journal.load_frame(selected.frame_id) == selected
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize("excess", [0, 1], ids=("exact", "one-over"))
+def test_materializer_retirement_replacement_obeys_immutable_total_count_boundary(
+    tmp_path: Path,
+    excess: int,
+) -> None:
+    room_id = "!retirement-total:example.org"
+    first_origin = RecordOrigin(TransportKind.SLIDING, 0, 0, 0)
+    selected_origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+    first_json = (
+        b'{"content":{"body":"total-old","msgtype":"m.text"},'
+        b'"type":"m.room.message"}'
+    )
+    successor_json = (
+        b'{"content":{"body":"'
+        + (b"x" * 512)
+        + b'","msgtype":"m.text"},"type":"m.room.message"}'
+    )
+    global_json = (
+        b'{"content":{"generation":2,"index":0,"padding":""},' b'"type":"m.push_rules"}'
+    )
+    presence_json = (
+        b'{"content":{"presence":"online"},'
+        b'"sender":"@friend:example.org","type":"m.presence"}'
+    )
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.SLIDING,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        stream_id = journal.load_owner().stream_id
+        first, first_normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            1,
+            rooms=((room_id, "join", "total-old"),),
+            crypto=True,
+        )
+        assert first_normalized.origin == first_origin
+        first_hydration_id = uuid5(
+            stream_id,
+            f"hydrate:{room_id}:0:{first.frame_id}",
+        )
+        first_continuity = RoomContinuity(
+            room_id,
+            0,
+            "join",
+            None,
+            None,
+            first_hydration_id,
+        )
+        assert (
+            reduce_staged_frame(
+                stream_id,
+                first.frame_id,
+                first_normalized,
+                (),
+            )
+            .descriptors[0]
+            .route
+            is DescriptorRoute.HOLD_FOR_HYDRATION
+        )
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+        first_raw_before = _frame_storage_row(journal, first.frame_id)
+        assert first_raw_before is not None
+        first_aggregate_row = _aggregate_rows(journal)[0]
+        _, first_aggregate = _decrypt_aggregate(journal, first_aggregate_row)
+        assert first_aggregate == RoomAggregateValue(
+            first_continuity,
+            1,
+            2,
+            HydrationIntent(first_hydration_id, first_origin),
+        )
+        first_held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:0")),
+            RecordKind.TIMELINE,
+            first_origin,
+            room_id,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_json,
+            None,
+        )
+        first_work = _work_rows(journal)
+        assert len(first_work) == 1
+        assert _decrypt_event_work(journal, first_work[0]) == (
+            _expected_event_work_plaintext(first_held),
+            first_held,
+        )
+
+        selected, normalized = _stage_discovery_rooms_frame(
+            journal,
+            TransportKind.SLIDING,
+            2,
+            rooms=((room_id, "leave", "x" * 512),),
+            crypto=True,
+            global_tail=True,
+        )
+        assert normalized.origin == selected_origin
+        proposal = reduce_staged_frame(
+            stream_id,
+            selected.frame_id,
+            normalized,
+            (first_continuity,),
+        )
+        successor_continuity = RoomContinuity(
+            room_id,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert len(proposal.room_proposals) == 1
+        room = proposal.room_proposals[0]
+        assert room.before == first_continuity
+        assert room.after == successor_continuity
+        assert room.hydration is None
+        assert room.recovery is None
+        assert room.retirement_epoch == 0
+        assert room.losses == (
+            LossProposal(
+                room_id,
+                0,
+                LossReason.UNVERIFIABLE,
+                LossBoundary(None, None, None, None),
+            ),
+        )
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(
+            (
+                descriptor.kind,
+                descriptor.room_id,
+                descriptor.source_json,
+                descriptor.provenance,
+                descriptor.descriptor_key,
+                descriptor.route,
+            )
+            for descriptor in proposal.descriptors
+        ) == (
+            (
+                RecordKind.TIMELINE,
+                room_id,
+                successor_json,
+                TimelineEventProvenance.LIVE,
+                f"frame:{selected.frame_id}:0",
+                DescriptorRoute.HOLD_FOR_RETIREMENT,
+            ),
+            (
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                None,
+                global_json,
+                None,
+                f"frame:{selected.frame_id}:1",
+                DescriptorRoute.READY,
+            ),
+            (
+                RecordKind.PRESENCE,
+                None,
+                presence_json,
+                None,
+                f"frame:{selected.frame_id}:2",
+                DescriptorRoute.READY,
+            ),
+        )
+        old_loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        old_loss = replace(
+            old_loss_without_id,
+            loss_id=_loss_id(stream_id, old_loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_id}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            selected_origin,
+            room_id,
+            1,
+            1,
+            None,
+            None,
+            b'{"membership":"leave","membership_epoch":1,'
+            b'"previous_membership_epoch":0}',
+            None,
+        )
+        successor = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.TIMELINE,
+            selected_origin,
+            room_id,
+            1,
+            2,
+            None,
+            TimelineEventProvenance.LIVE,
+            successor_json,
+            None,
+        )
+        capacity_loss_without_id = LossRecord(
+            "",
+            selected_origin,
+            room_id,
+            1,
+            LossReason.OVERSIZED_EVENT,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        capacity_loss = replace(
+            capacity_loss_without_id,
+            loss_id=_loss_id(stream_id, capacity_loss_without_id),
+        )
+        global_account_data = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        required_plaintexts = (
+            _expected_loss_work_plaintext(old_loss),
+            _expected_event_work_plaintext(first_held),
+            _expected_event_work_plaintext(lifecycle),
+            _expected_loss_work_plaintext(capacity_loss),
+            _expected_event_work_plaintext(global_account_data),
+            _expected_event_work_plaintext(presence),
+        )
+        max_record_bytes = max(map(len, required_plaintexts))
+        assert len(_expected_event_work_plaintext(successor)) > max_record_bytes
+
+        hard = MaterializerLimits()
+        assert hard.max_total_work_count == 20_000
+        replacement_insert_count = 5
+        seed_count = hard.max_total_work_count - 1 - replacement_insert_count + excess
+        assert seed_count == 19_994 + excess
+        seed_work_ids: list[str] = []
+        insert_sql = (
+            "INSERT INTO NioIngestWork("
+            "account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload_ciphertext, payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        with journal._owner.journal_write():
+            for index in range(seed_count):
+                seed = EventRecord(
+                    str(uuid5(first.frame_id, f"retirement-total-seed:{index}")),
+                    RecordKind.GLOBAL_ACCOUNT_DATA,
+                    replace(first_origin, frame_index=index),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    b"{}",
+                    None,
+                )
+                seed_work_ids.append(seed.record_id)
+                inserted = journal._execute(
+                    insert_sql,
+                    _authenticated_event_work_values(
+                        journal,
+                        seed,
+                        frame_id=first.frame_id,
+                        ready_revision=2,
+                        ready_ordinal=index,
+                        created_revision=2,
+                    ),
+                )
+                assert inserted.rowcount == 1
+
+        selected_raw_before = _frame_storage_row(journal, selected.frame_id)
+        assert selected_raw_before is not None
+        assert selected_raw_before[6] is None
+        assert journal.load_frame(selected.frame_id) == selected
+        old_graph = _materializer_storage_graph(journal)
+        assert len(old_graph[4]) + replacement_insert_count == (
+            hard.max_total_work_count + excess
+        )
+        statements.clear()
+        limits = replace(
+            hard,
+            max_record_canonical_bytes=max_record_bytes,
+            max_held_work_count=1,
+            max_held_work_canonical_bytes=1,
+            max_ready_work_count=1,
+            max_ready_work_canonical_bytes=1,
+            max_total_work_count=1,
+            max_total_work_canonical_bytes=1,
+        )
+
+        result = _materialize(journal, limits=limits)
+
+        if excess:
+            assert result == MaterializeResult(
+                MaterializeStatus.AT_CAPACITY,
+                selected.frame_id,
+                None,
+            )
+            assert _materializer_storage_graph(journal) == old_graph
+            assert _frame_storage_row(journal, first.frame_id) == first_raw_before
+            assert _frame_storage_row(journal, selected.frame_id) == selected_raw_before
+            assert _materializer_dml(statements) == ()
+            removed_seed_id = seed_work_ids.pop()
+            with journal._owner.journal_write():
+                removed = journal._execute(
+                    "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",
+                    (journal.account_id, removed_seed_id),
+                )
+                assert removed.rowcount == 1
+            commit_old_graph = _materializer_storage_graph(journal)
+            assert len(commit_old_graph[4]) + replacement_insert_count == (
+                hard.max_total_work_count
+            )
+            statements.clear()
+            result = _materialize(journal, limits=limits)
+        else:
+            commit_old_graph = old_graph
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            4,
+        )
+
+        owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+        old_owner, old_source, _old_frames, _old_aggregates, commit_old_work = (
+            commit_old_graph
+        )
+        assert owner == replace(old_owner, revision=4)
+        assert source == old_source
+        assert len(work) == hard.max_total_work_count
+        assert len(aggregates) == 1
+        aggregate_plaintext, stored_aggregate = _decrypt_aggregate(
+            journal,
+            aggregates[0],
+        )
+        expected_aggregate = RoomAggregateValue(
+            successor_continuity,
+            2,
+            4,
+            None,
+        )
+        assert stored_aggregate == expected_aggregate
+        assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            expected_aggregate
+        )
+        expected_relevant = (
+            _ExpectedMaterializerWork(
+                old_loss,
+                "ready",
+                selected.frame_id,
+                4,
+                0,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                first_held,
+                "ready",
+                first.frame_id,
+                4,
+                1,
+                2,
+            ),
+            _ExpectedMaterializerWork(
+                lifecycle,
+                "ready",
+                selected.frame_id,
+                4,
+                2,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                capacity_loss,
+                "ready",
+                selected.frame_id,
+                4,
+                3,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                global_account_data,
+                "ready",
+                selected.frame_id,
+                4,
+                4,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                presence,
+                "ready",
+                selected.frame_id,
+                4,
+                5,
+                4,
+            ),
+        )
+        relevant_ids = {
+            _expected_materializer_work_id(item) for item in expected_relevant
+        }
+        relevant_rows = tuple(row for row in work if str(row[0]) in relevant_ids)
+        _assert_exact_materializer_work(
+            journal,
+            relevant_rows,
+            expected_relevant,
+            commit_old_work,
+        )
+        assert successor.record_id not in {str(row[0]) for row in work}
+        work_by_id = {str(row[0]): row for row in work}
+        old_work_by_id = {str(row[0]): row for row in commit_old_work}
+        assert set(seed_work_ids) <= work_by_id.keys()
+        assert all(
+            work_by_id[work_id] == old_work_by_id[work_id] for work_id in seed_work_ids
+        )
+        assert tuple(
+            row[8] for row in work if row[7] == 4 and row[2] == "ready"
+        ) == tuple(range(6))
+
+        frames_by_id = {str(row[0]): row for row in frames}
+        assert frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_after = frames_by_id[str(selected.frame_id)]
+        assert selected_after[:6] == selected_raw_before[:6]
+        assert selected_after[6] == 4
+        assert selected_after[7] != selected_raw_before[7]
+        assert journal.load_frame(first.frame_id) == first
+        assert journal.load_frame(selected.frame_id) == selected
+        assert (
+            EncryptedRowCodec(
+                "discovery-secret",
+                journal.account_id,
+                owner.stream_id,
+            ).decrypt(
+                "NioIngestFrameDrainHeader",
+                (selected.frame_id,),
+                selected_after[7],
+                hashlib.sha256(b"").digest(),
+                header=_canonical_expected_drain_header(selected_after, 4),
+            )
+            == b""
+        )
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal, limits=limits) == MaterializeResult(
             MaterializeStatus.IDLE,
             None,
             None,

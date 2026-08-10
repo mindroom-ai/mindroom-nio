@@ -241,6 +241,9 @@ def plan_frame_materialization(
     room_additions = 0
     held_additions = 0
     oversized_room = False
+    oversized_retirement = False
+    retirement_successor_ids: set[str] = set()
+    retirement_sequence: int | None = None
     max_record_bytes = limits.max_record_canonical_bytes
     if retirement is not None:
         before = aggregate_by_room[retirement.after.room_id].continuity
@@ -289,6 +292,7 @@ def plan_frame_materialization(
             _planned_work(lifecycle, ready_ordinal, used_ids, max_record_bytes)
         )
         ready_ordinal += 1
+        retirement_sequence = room_sequences[before.room_id]
     for index, descriptor in enumerate(proposal.descriptors):
         descriptor_room_id = descriptor.room_id
         if descriptor_room_id is None:
@@ -359,10 +363,18 @@ def plan_frame_materialization(
             None,
         )
         planned = _planned_work(value, ordinal, used_ids, None)
+        if retirement_room_id is not None and descriptor_room_id == retirement_room_id:
+            retirement_successor_ids.add(work_id)
         if len(planned[1]) > max_record_bytes:
-            if descriptor_room_id is None or capacity_room_id is None:
+            if (
+                retirement_room_id is not None
+                and descriptor_room_id == retirement_room_id
+            ):
+                oversized_retirement = True
+            elif descriptor_room_id is None or capacity_room_id is None:
                 raise ValueError("planned Work record exceeds the canonical byte limit")
-            oversized_room = True
+            else:
+                oversized_room = True
         inserts.append(planned)
         if descriptor_room_id is not None and retirement is None:
             room_additions += 1
@@ -378,7 +390,26 @@ def plan_frame_materialization(
         or addition_bytes > hard.max_held_work_canonical_bytes
     )
     capacity_reason = None
-    if capacity_room_id is not None and room_additions:
+    if retirement is not None:
+        retained = [
+            item
+            for item in inserts
+            if _work_id(item[0]) not in retirement_successor_ids
+        ]
+        retained_bytes = sum(len(item[1]) for item in retained)
+        if (
+            len(retained) > hard.max_held_work_count
+            or retained_bytes > hard.max_held_work_canonical_bytes
+        ):
+            raise ValueError("selected frame Work exceeds the hard addition envelope")
+        if retirement_successor_ids:
+            if oversized_retirement:
+                capacity_reason = LossReason.OVERSIZED_EVENT
+            elif hard_addition:
+                capacity_reason = LossReason.EVENT_LIMIT
+        if capacity_reason is not None:
+            capacity_room_id = retirement_room_id
+    elif capacity_room_id is not None and room_additions:
         if oversized_room:
             capacity_reason = LossReason.OVERSIZED_EVENT
         elif (
@@ -389,7 +420,38 @@ def plan_frame_materialization(
             )
         ) or hard_addition:
             capacity_reason = LossReason.EVENT_LIMIT
-    if capacity_reason is not None and capacity_room_id is not None:
+    if (
+        retirement is not None
+        and capacity_reason is not None
+        and capacity_room_id is not None
+    ):
+        before = aggregate_by_room[capacity_room_id].continuity
+        loss = LossRecord(
+            "",
+            frame.origin,
+            before.room_id,
+            retirement.after.membership_epoch,
+            capacity_reason,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(loss, loss_id=_loss_id(stream_id, loss))
+        loss_work = _planned_work(loss, 0, used_ids, max_record_bytes)
+        retained.insert(2, loss_work)
+        inserts = []
+        next_ordinal = 0
+        for index, (value, plaintext, ordinal) in enumerate(retained):
+            if ordinal is not None:
+                ordinal = next_ordinal
+                next_ordinal += 1
+                if index == 0:
+                    next_ordinal += len(releases)
+            inserts.append((value, plaintext, ordinal))
+        if retirement_sequence is None:
+            raise ValueError("invalid pending-hydration retirement")
+        room_sequences[before.room_id] = retirement_sequence
+        addition_bytes = sum(len(item[1]) for item in inserts)
+    elif capacity_reason is not None and capacity_room_id is not None:
         before = aggregate_by_room[capacity_room_id].continuity
         loss = LossRecord(
             "",
@@ -462,6 +524,7 @@ def plan_frame_materialization(
             (
                 replace(room.after, hydration_id=None)
                 if capacity_reason is not None
+                and room.after.room_id == capacity_room_id
                 else room.after
             ),
             room_sequences[room.after.room_id],
@@ -469,13 +532,16 @@ def plan_frame_materialization(
             (
                 None
                 if room.after.room_id == retirement_room_id
-                or capacity_reason is not None
+                or (
+                    capacity_reason is not None
+                    and room.after.room_id == capacity_room_id
+                )
                 else pending_hydrations[room.after.room_id]
             ),
         )
         for room in proposal.room_proposals
         if (
-            capacity_reason is not None
+            (capacity_reason is not None and room.after.room_id == capacity_room_id)
             or (stored := aggregate_by_room.get(room.after.room_id)) is None
             or room.after != stored.continuity
             or room_sequences[room.after.room_id] != stored.next_room_sequence
