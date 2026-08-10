@@ -80,9 +80,20 @@ def plan_frame_materialization(
     continuities = tuple(aggregate.continuity for aggregate in aggregates)
     proposal = reduce_staged_frame(stream_id, frame.frame_id, frame, continuities)
     room_plans = {room.after.room_id: room for room in proposal.room_proposals}
-    if (
-        len(room_plans) != len(proposal.room_proposals)
-        or aggregate_by_room.keys() - room_plans.keys()
+    descriptor_rooms = {
+        descriptor.room_id
+        for descriptor in proposal.descriptors
+        if descriptor.room_id is not None
+    }
+    ephemeral_room_id = (
+        next(iter(descriptor_rooms))
+        if not room_plans
+        and len(descriptor_rooms) == 1
+        and descriptor_rooms == aggregate_by_room.keys()
+        else None
+    )
+    if len(room_plans) != len(proposal.room_proposals) or (
+        ephemeral_room_id is None and aggregate_by_room.keys() - room_plans.keys()
     ):
         raise ValueError("selected frame has inconsistent room ownership")
     retirement = None
@@ -151,17 +162,38 @@ def plan_frame_materialization(
             room_sequences[room_id] = aggregate.next_room_sequence
             pending_hydrations[room_id] = pending
 
+    if ephemeral_room_id is not None:
+        aggregate = aggregate_by_room[ephemeral_room_id]
+        pending = aggregate.pending_hydration
+        route = (
+            DescriptorRoute.HOLD_FOR_HYDRATION
+            if pending is not None
+            else DescriptorRoute.READY
+        )
+        if aggregate.continuity.gap is not None or any(
+            descriptor.kind is not RecordKind.EPHEMERAL
+            or descriptor.route is not route
+            or descriptor.provenance is not None
+            for descriptor in proposal.descriptors
+            if descriptor.room_id is not None
+        ):
+            raise ValueError("invalid ephemeral-only room ownership")
+        room_sequences[ephemeral_room_id] = aggregate.next_room_sequence
+        if pending is not None:
+            pending_hydrations[ephemeral_room_id] = pending
+
     candidate = proposal.room_proposals[0] if len(room_plans) == 1 else None
-    capacity_room = (
-        candidate
-        if retirement is None
+    capacity_room_id = ephemeral_room_id
+    if (
+        capacity_room_id is None
+        and retirement is None
         and candidate is not None
         and candidate.before == candidate.after
         and candidate.after.room_id in aggregate_by_room
         and candidate.hydration is not None
         and candidate.hydration.origin == frame.origin
-        else None
-    )
+    ):
+        capacity_room_id = candidate.after.room_id
 
     held_count = 0
     held_bytes = 0
@@ -176,7 +208,9 @@ def plan_frame_materialization(
         held_count += 1
         held_bytes += item.canonical_size
         held_room_id = value.room_id
-        if held_room_id is None or held_room_id not in room_plans:
+        if held_room_id is None or (
+            held_room_id not in room_plans and held_room_id != ephemeral_room_id
+        ):
             continue
         aggregate = aggregate_by_room.get(held_room_id)
         if aggregate is None:
@@ -194,13 +228,16 @@ def plan_frame_materialization(
         if key in seen_sequences:
             raise ValueError("HELD Work does not match its Aggregate")
         seen_sequences.add(key)
-        if retirement is not None or capacity_room is not None:
+        if held_room_id == ephemeral_room_id and held_room_id not in pending_hydrations:
+            raise ValueError("READY ephemeral room has orphan HELD Work")
+        if retirement is not None or held_room_id == capacity_room_id:
             retired_work.append(value)
 
     inserts: list[PlannedWork] = []
     releases: list[tuple[EventRecord, bytes, int]] = []
     ready_ordinal = 0
     room_additions = 0
+    held_additions = 0
     oversized_room = False
     max_record_bytes = limits.max_record_canonical_bytes
     if retirement is not None:
@@ -264,14 +301,20 @@ def plan_frame_materialization(
             ordinal: int | None = ready_ordinal
             ready_ordinal += 1
         else:
-            if (
-                descriptor_room_id not in room_plans
-                or descriptor.route
-                is not (
-                    DescriptorRoute.HOLD_FOR_RETIREMENT
-                    if retirement is not None
+            is_ephemeral_room = descriptor_room_id == ephemeral_room_id
+            route = (
+                DescriptorRoute.HOLD_FOR_RETIREMENT
+                if retirement is not None
+                else (
+                    DescriptorRoute.READY
+                    if is_ephemeral_room
+                    and descriptor_room_id not in pending_hydrations
                     else DescriptorRoute.HOLD_FOR_HYDRATION
                 )
+            )
+            if (
+                (descriptor_room_id not in room_plans and not is_ephemeral_room)
+                or descriptor.route is not route
                 or descriptor.kind
                 not in (
                     RecordKind.STATE,
@@ -285,10 +328,18 @@ def plan_frame_materialization(
                 )
             ):
                 raise ValueError("unsupported room descriptor")
-            epoch = room_plans[descriptor_room_id].after.membership_epoch
+            epoch = (
+                aggregate_by_room[descriptor_room_id].continuity.membership_epoch
+                if is_ephemeral_room
+                else room_plans[descriptor_room_id].after.membership_epoch
+            )
             sequence = room_sequences[descriptor_room_id]
             room_sequences[descriptor_room_id] += 1
-            ordinal = ready_ordinal if retirement is not None else None
+            ordinal = (
+                ready_ordinal
+                if retirement is not None or descriptor.route is DescriptorRoute.READY
+                else None
+            )
             if ordinal is not None:
                 ready_ordinal += 1
         work_id = str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}"))
@@ -306,14 +357,16 @@ def plan_frame_materialization(
         )
         planned = _planned_work(value, ordinal, used_ids, None)
         if len(planned[1]) > max_record_bytes:
-            if descriptor_room_id is None or capacity_room is None:
+            if descriptor_room_id is None or capacity_room_id is None:
                 raise ValueError("planned Work record exceeds the canonical byte limit")
             oversized_room = True
         inserts.append(planned)
         if descriptor_room_id is not None and retirement is None:
             room_additions += 1
-            held_count += 1
-            held_bytes += len(planned[1])
+            if ordinal is None:
+                held_additions += 1
+                held_count += 1
+                held_bytes += len(planned[1])
 
     hard = MaterializerLimits()
     addition_bytes = sum(len(item[1]) for item in inserts)
@@ -322,17 +375,19 @@ def plan_frame_materialization(
         or addition_bytes > hard.max_held_work_canonical_bytes
     )
     capacity_reason = None
-    if capacity_room is not None and room_additions:
+    if capacity_room_id is not None and room_additions:
         if oversized_room:
             capacity_reason = LossReason.OVERSIZED_EVENT
         elif (
-            held_count > limits.max_held_work_count
-            or held_bytes > limits.max_held_work_canonical_bytes
-            or hard_addition
-        ):
+            held_additions
+            and (
+                held_count > limits.max_held_work_count
+                or held_bytes > limits.max_held_work_canonical_bytes
+            )
+        ) or hard_addition:
             capacity_reason = LossReason.EVENT_LIMIT
-    if capacity_reason is not None and capacity_room is not None:
-        before = aggregate_by_room[capacity_room.after.room_id].continuity
+    if capacity_reason is not None and capacity_room_id is not None:
+        before = aggregate_by_room[capacity_room_id].continuity
         loss = LossRecord(
             "",
             frame.origin,
@@ -363,7 +418,7 @@ def plan_frame_materialization(
     if (
         retirement is None
         and capacity_reason is None
-        and room_additions
+        and held_additions
         and (
             held_count > limits.max_held_work_count
             or held_bytes > limits.max_held_work_canonical_bytes
@@ -422,6 +477,22 @@ def plan_frame_materialization(
             or room_sequences[room.after.room_id] != stored.next_room_sequence
         )
     )
+    if ephemeral_room_id is not None:
+        aggregate = aggregate_by_room[ephemeral_room_id]
+        pending = aggregate.pending_hydration
+        if capacity_reason is None or pending is not None:
+            room_values += (
+                RoomAggregateValue(
+                    (
+                        replace(aggregate.continuity, hydration_id=None)
+                        if capacity_reason is not None
+                        else aggregate.continuity
+                    ),
+                    room_sequences[ephemeral_room_id],
+                    revision,
+                    None if capacity_reason is not None else pending,
+                ),
+            )
     return MaterializationPlan(
         room_values,
         tuple(inserts),
