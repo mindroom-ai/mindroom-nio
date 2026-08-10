@@ -475,6 +475,18 @@ def _ms(value: int | float) -> str:
     return f"{value / 1_000_000:.3f}"
 
 
+def _estimate_miss_markdown(size: dict[str, Any]) -> str:
+    miss = size["estimate_misses_over_50_percent"][0]
+    return (
+        "- >50% estimate miss: joined snapshot/validation additions forecast "
+        f"+{miss['forecast_low']}..+{miss['forecast_high']}, "
+        f"actual +{miss['actual']} ({miss['miss_vs_high_percent']:g}% over high); "
+        "deletions are reported separately. The harness had no approved "
+        "sub-estimate; its actual is measured against the combined hard envelope "
+        "only. No runtime or fixture-size estimate was approved."
+    )
+
+
 def _markdown(report: dict[str, Any], raw_path: Path) -> str:
     candidate_snapshot = report["snapshots"]["candidate"]
     lines = [
@@ -557,7 +569,7 @@ def _markdown(report: dict[str, Any], raw_path: Path) -> str:
         f"- Actual deletions credited: {size['actual_deletions']['credited_total']}; newly unlocked surfaces: none.",
         f"- Remaining checkpoint work: +{remaining['simplified_checkpoint_additions_low']}..+{remaining['simplified_checkpoint_additions_high']}; checkpoint final +{remaining['simplified_checkpoint_final_net_low']}..+{remaining['simplified_checkpoint_final_net_high']}.",
         f"- Pre-deletion final: +{remaining['pre_deletion_final_net_low']}..+{remaining['pre_deletion_final_net_high']}; conditional 3,393 mapped deletions are not credited (conditional +{remaining['conditional_final_net_low']}..+{remaining['conditional_final_net_high']}).",
-        "- >50% estimate miss: joined snapshot/validation additions forecast +10..+25, actual +61 (144% over high); deletions are reported separately. The harness had no approved sub-estimate; its actual is measured against the combined hard envelope only. No runtime or fixture-size estimate was approved.",
+        _estimate_miss_markdown(size),
         "",
         "## Fix-round RED/GREEN",
         "",

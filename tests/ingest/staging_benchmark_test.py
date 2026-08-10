@@ -938,3 +938,25 @@ def test_full_corpus_cli_generates_frozen_matrix_gates_and_diagnostics(
     assert report["size_and_forecast"]["cumulative_production_net"] <= 6_240
     assert "Snapshot binding" in markdown.read_text()
     assert report["snapshots"]["candidate"]["snapshot_sha256"] in markdown.read_text()
+
+
+def test_markdown_estimate_miss_uses_raw_size_values() -> None:
+    spec = importlib.util.spec_from_file_location("staging_corpus", CORPUS_RUNNER)
+    assert spec is not None and spec.loader is not None
+    corpus = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(corpus)
+    size = {
+        "estimate_misses_over_50_percent": [
+            {
+                "forecast_low": 7,
+                "forecast_high": 11,
+                "actual": 29,
+                "miss_vs_high_percent": 163.6,
+            }
+        ]
+    }
+
+    text = corpus._estimate_miss_markdown(size)
+
+    assert "forecast +7..+11, actual +29 (163.6% over high)" in text
+    assert "actual +61 (144% over high)" not in text
