@@ -7,6 +7,7 @@ from .membership import _latest_own_membership, _membership_observation
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkRequest, NetworkResult, _frame_id_for_response
 from .source import (
+    MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES,
     ClassicCursor,
     RoomSection,
     RoomSegment,
@@ -19,6 +20,7 @@ from .source import (
     load_json,
     malformed_success_result,
     normalize_source_error,
+    oversized_success_result,
     require_json_event_container,
     require_json_events,
     require_json_object,
@@ -91,6 +93,19 @@ class ClassicSource:
         request: NetworkRequest,
         result: NetworkResult,
     ) -> SourceResult:
+        if (
+            type(request) is NetworkRequest
+            and type(result) is NetworkResult
+            and result.status_code == 200
+            and len(result.body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
+        ):
+            if request.transport is not TransportKind.CLASSIC:
+                raise ValueError("ClassicSource can normalize only classic requests")
+            if request.stream_id != self.stream_id:
+                raise ValueError("classic request stream does not match source stream")
+            validate_network_result_identity(request, result)
+            return oversized_success_result(request, result.body)
+
         self._validate_result_identity(request, result)
         error_result = normalize_source_error(request, result)
         if error_result is not None:
@@ -185,6 +200,8 @@ class ClassicSource:
     def _normalize_frame(
         self, request: NetworkRequest, body: bytes
     ) -> tuple[SyncFrame, bytes]:
+        if len(body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES:
+            raise ValueError("staged source response body exceeds 16 MiB")
         root = load_json(body, "sync response")
         root = require_json_object(root, "sync response")
         next_batch = require_json_string(root.get("next_batch"), "next_batch")

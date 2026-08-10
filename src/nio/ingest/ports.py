@@ -6,6 +6,8 @@ from uuid import UUID, uuid5
 from ._json import canonical_json, load_json
 from .model import TransportKind
 
+MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+
 
 def _require_exact(value: object, expected: type, field_name: str) -> None:
     if type(value) is not expected:
@@ -77,6 +79,8 @@ class StagedSourceResponse:
     def __post_init__(self) -> None:
         _require_exact(self.request, NetworkRequest, "request")
         _require_exact(self.response_body, bytes, "response_body")
+        if len(self.response_body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES:
+            raise ValueError("response_body exceeds 16 MiB")
         _require_exact(self.source_sha256, bytes, "source_sha256")
         if len(self.source_sha256) != 32:
             raise ValueError("source_sha256 must be exactly 32 bytes")

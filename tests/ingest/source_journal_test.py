@@ -41,6 +41,7 @@ from nio.ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal_codec import EncryptedRowCodec
 from nio.store._sync_journal_port import IngestionJournal
+from nio.store._sync_journal_values import MaterializeResult, MaterializerLimits
 from nio.store.sync_journal import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -58,6 +59,7 @@ OWN_USER_ID = "@alice:example.org"
 CRASH_EXIT_CODE = 86
 FRAME_CLASSIFICATION_LIMIT = 257
 LARGE_CIPHERTEXT_PLACEHOLDER_BYTES = 64 * 1024
+EMPTY_SHA256 = hashlib.sha256(b"").digest()
 CLASSIFY_FRAME_IDS_SQL = (
     "SELECT frame_id FROM NioIngestFrame WHERE account_id = ? "
     "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?"
@@ -295,6 +297,54 @@ def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
     )
 
 
+def _frame_drain_header(
+    source_epoch: int,
+    request_id: int,
+    staged_revision: int,
+    payload_sha256: bytes,
+    payload_ciphertext_bytes: int,
+    room_materialized_revision: int | None = None,
+) -> bytes:
+    return _canonical_internal(
+        [
+            source_epoch,
+            request_id,
+            staged_revision,
+            base64.b64encode(payload_sha256).decode("ascii"),
+            payload_ciphertext_bytes,
+            room_materialized_revision,
+        ]
+    )
+
+
+def _seal_frame_drain_header(
+    codec: EncryptedRowCodec,
+    frame_id: UUID,
+    source_epoch: int,
+    request_id: int,
+    staged_revision: int,
+    payload_sha256: bytes,
+    payload_ciphertext_bytes: int,
+    room_materialized_revision: int | None = None,
+) -> bytes:
+    proof, digest = codec.seal(
+        "NioIngestFrameDrainHeader",
+        (frame_id,),
+        b"",
+        header=_frame_drain_header(
+            source_epoch,
+            request_id,
+            staged_revision,
+            payload_sha256,
+            payload_ciphertext_bytes,
+            room_materialized_revision,
+        ),
+    )
+    assert digest == EMPTY_SHA256
+    assert len(proof) == 29
+    return proof
+
+
 def _source_header(source: SourceState) -> bytes:
     return _canonical_internal(
         [
@@ -338,14 +388,27 @@ def _reseal_frame_envelope(
         _canonical_internal(envelope),
         header=header,
     )
+    request = stage.proposal.frame.response.request
+    drain_header_ciphertext = _seal_frame_drain_header(
+        _codec_for(stage),
+        stored_id,
+        request.source_epoch,
+        request.request_id,
+        stage.committed.revision,
+        digest,
+        len(ciphertext),
+        None,
+    )
     with sqlite3.connect(stage.database_path) as connection:
         connection.execute(
             "UPDATE NioIngestFrame SET frame_id = ?, payload_ciphertext = ?, "
-            "payload_sha256 = ? WHERE account_id = ? AND frame_id = ?",
+            "payload_sha256 = ?, drain_header_ciphertext = ? "
+            "WHERE account_id = ? AND frame_id = ?",
             (
                 str(stored_id),
                 ciphertext,
                 digest,
+                drain_header_ciphertext,
                 ACCOUNT_ID,
                 str(original_id),
             ),
@@ -356,11 +419,31 @@ def _reseal_frame_envelope(
 def _decrypted_frame_envelope(stage: _StoredStage) -> dict[str, object]:
     frame = stage.proposal.frame
     row = _stored_row(stage.database_path, frame.frame_id)
-    payload = _codec_for(stage).decrypt(
+    codec = _codec_for(stage)
+    payload_ciphertext = bytes(row["payload_ciphertext"])
+    payload_sha256 = bytes(row["payload_sha256"])
+    assert (
+        codec.decrypt(
+            "NioIngestFrameDrainHeader",
+            (frame.frame_id,),
+            bytes(row["drain_header_ciphertext"]),
+            EMPTY_SHA256,
+            header=_frame_drain_header(
+                row["source_epoch"],
+                row["request_id"],
+                row["staged_revision"],
+                payload_sha256,
+                len(payload_ciphertext),
+                row["room_materialized_revision"],
+            ),
+        )
+        == b""
+    )
+    payload = codec.decrypt(
         "NioIngestFrame",
         (frame.frame_id,),
-        bytes(row["payload_ciphertext"]),
-        bytes(row["payload_sha256"]),
+        payload_ciphertext,
+        payload_sha256,
         header=_frame_header(frame, stage.committed.revision),
     )
     envelope = json.loads(payload)
@@ -454,10 +537,21 @@ EXPECTED_DDL = {
             typeof(staged_revision) = 'integer' AND staged_revision >= 1
         ),
         payload_ciphertext BLOB NOT NULL CHECK (
-            typeof(payload_ciphertext) = 'blob' AND length(payload_ciphertext) >= 29
+            typeof(payload_ciphertext) = 'blob'
+            AND length(payload_ciphertext) >= 29
+            AND length(payload_ciphertext) <= 24 * 1024 * 1024
         ),
         payload_sha256 BLOB NOT NULL CHECK (
             typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+        ),
+        room_materialized_revision INTEGER NULL CHECK (
+            room_materialized_revision IS NULL OR
+            (typeof(room_materialized_revision) = 'integer'
+             AND room_materialized_revision >= 1)
+        ),
+        drain_header_ciphertext BLOB NOT NULL CHECK (
+            typeof(drain_header_ciphertext) = 'blob'
+            AND length(drain_header_ciphertext) = 29
         ),
         PRIMARY KEY (account_id, frame_id))"""),
     ("index", "NioIngestFrame_drain"): _normalized_sql(
@@ -500,14 +594,19 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
     with sqlite3.connect(database_path) as actual, sqlite3.connect(":memory:") as exact:
         for ddl in EXPECTED_DDL.values():
             exact.execute(ddl)
-        for table in ("NioIngestMeta", "NioIngestSourceState", "NioIngestFrame"):
+        for table in (
+            "NioIngestMeta",
+            "NioIngestSourceState",
+            "NioIngestFrame",
+        ):
             for pragma in ("table_info", "foreign_key_list"):
                 assert tuple(actual.execute(f"PRAGMA {pragma}({table})")) == tuple(
                     exact.execute(f"PRAGMA {pragma}({table})")
                 )
-        assert tuple(
-            actual.execute("PRAGMA index_xinfo(NioIngestFrame_drain)")
-        ) == tuple(exact.execute("PRAGMA index_xinfo(NioIngestFrame_drain)"))
+        for index in ("NioIngestFrame_drain",):
+            assert tuple(actual.execute(f"PRAGMA index_xinfo({index})")) == tuple(
+                exact.execute(f"PRAGMA index_xinfo({index})")
+            )
 
 
 _SCHEMA_TEXT_IDENTITIES = (
@@ -572,6 +671,13 @@ _SCHEMA_TEXT_IDENTITIES = (
         ("NioIngestFrame", "payload_sha256", "x" * 32),
         ("NioIngestFrame", "payload_sha256", bytes(31)),
         ("NioIngestFrame", "payload_sha256", bytes(33)),
+        ("NioIngestFrame", "room_materialized_revision", 0),
+        ("NioIngestFrame", "room_materialized_revision", -1),
+        ("NioIngestFrame", "room_materialized_revision", 1.5),
+        ("NioIngestFrame", "room_materialized_revision", "not-an-integer"),
+        ("NioIngestFrame", "drain_header_ciphertext", "x" * 29),
+        ("NioIngestFrame", "drain_header_ciphertext", bytes(28)),
+        ("NioIngestFrame", "drain_header_ciphertext", bytes(30)),
     ),
 )
 def test_exact_schema_rejects_wrong_storage_classes_and_shapes(
@@ -611,9 +717,21 @@ def test_exact_schema_rejects_wrong_storage_classes_and_shapes(
                 "request_id",
                 "payload_ciphertext",
                 "payload_sha256",
+                "room_materialized_revision",
+                "drain_header_ciphertext",
                 "staged_revision",
             ),
-            (ACCOUNT_ID, str(uuid4()), 0, 1, bytes(29), bytes(32), 1),
+            (
+                ACCOUNT_ID,
+                str(uuid4()),
+                0,
+                1,
+                bytes(29),
+                bytes(32),
+                None,
+                bytes(29),
+                1,
+            ),
         ),
     }
     with sqlite3.connect(":memory:") as connection:
@@ -688,6 +806,7 @@ def test_source_only_journal_port_is_exact() -> None:
         "load_frame",
         "list_frames",
         "stage_source_response",
+        "materialize_oldest_frame",
     }
 
     assert tuple(inspect.signature(methods["load_owner"]).parameters) == ("self",)
@@ -718,6 +837,24 @@ def test_source_only_journal_port_is_exact() -> None:
     assert all(
         parameter.default is inspect.Parameter.empty for parameter in stage_parameters
     )
+    materialize_parameters = tuple(
+        inspect.signature(methods["materialize_oldest_frame"]).parameters.values()
+    )
+    assert tuple(parameter.name for parameter in materialize_parameters) == (
+        "self",
+        "expected_revision",
+        "writer_epoch",
+        "limits",
+    )
+    assert materialize_parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for parameter in materialize_parameters[1:]
+    )
+    assert all(
+        parameter.default is inspect.Parameter.empty
+        for parameter in materialize_parameters
+    )
 
     hints = {name: get_type_hints(method) for name, method in methods.items()}
     assert hints == {
@@ -737,6 +874,12 @@ def test_source_only_journal_port_is_exact() -> None:
             "source": SourceState,
             "frame": StagedFrame,
             "return": CommitResult,
+        },
+        "materialize_oldest_frame": {
+            "expected_revision": int,
+            "writer_epoch": UUID,
+            "limits": MaterializerLimits,
+            "return": MaterializeResult,
         },
     }
 
@@ -1291,9 +1434,10 @@ def _mutate_frame_id(
         connection.execute(
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, staged_revision, "
-            "payload_ciphertext, payload_sha256) "
+            "payload_ciphertext, payload_sha256, drain_header_ciphertext) "
             "SELECT account_id, ?, source_epoch, request_id, staged_revision, "
-            "payload_ciphertext, payload_sha256 FROM NioIngestFrame "
+            "payload_ciphertext, payload_sha256, drain_header_ciphertext "
+            "FROM NioIngestFrame "
             "WHERE account_id = ? AND frame_id = ?",
             (alias, ACCOUNT_ID, str(frame_id)),
         )
@@ -1408,20 +1552,32 @@ def test_missing_load_classifies_256_large_rows_without_fetching_payloads(
     tmp_path: Path,
 ) -> None:
     bootstrap = _open(tmp_path)
+    owner = bootstrap._journal.load_owner()
     bootstrap.close()
     database_path = tmp_path / "journal.db"
+    codec = EncryptedRowCodec("secret", ACCOUNT_ID, owner.stream_id)
     with sqlite3.connect(database_path) as connection:
         connection.executemany(
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, staged_revision, "
-            "payload_ciphertext, payload_sha256) "
-            "VALUES (?, ?, 0, ?, 1, zeroblob(?), zeroblob(32))",
+            "payload_ciphertext, payload_sha256, drain_header_ciphertext) "
+            "VALUES (?, ?, 0, ?, 1, zeroblob(?), zeroblob(32), ?)",
             (
                 (
                     ACCOUNT_ID,
-                    str(UUID(int=index + 1)),
+                    str(frame_id := UUID(int=index + 1)),
                     index,
                     LARGE_CIPHERTEXT_PLACEHOLDER_BYTES,
+                    _seal_frame_drain_header(
+                        codec,
+                        frame_id,
+                        0,
+                        index,
+                        1,
+                        bytes(32),
+                        LARGE_CIPHERTEXT_PLACEHOLDER_BYTES,
+                        None,
+                    ),
                 )
                 for index in range(256)
             ),
@@ -1702,10 +1858,20 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
                 payload,
                 header=_frame_header(frame, committed.revision),
             )
+            drain_header_ciphertext = _seal_frame_drain_header(
+                codec,
+                frame.frame_id,
+                frame.response.request.source_epoch,
+                frame.response.request.request_id,
+                committed.revision,
+                digest,
+                len(ciphertext),
+                None,
+            )
             connection.execute(
                 "INSERT INTO NioIngestFrame (account_id, frame_id, source_epoch, "
-                "request_id, staged_revision, payload_ciphertext, payload_sha256) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "request_id, staged_revision, payload_ciphertext, payload_sha256, "
+                "drain_header_ciphertext) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ACCOUNT_ID,
                     str(frame.frame_id),
@@ -1714,6 +1880,7 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
                     committed.revision,
                     ciphertext,
                     digest,
+                    drain_header_ciphertext,
                 ),
             )
 
@@ -1795,11 +1962,31 @@ def test_authenticated_headers_and_frame_envelope_are_exact_and_canonical(
     )
     codec = _codec_for(stage)
     frame_row = _stored_row(stage.database_path, stored.frame_id)
+    payload_ciphertext = bytes(frame_row["payload_ciphertext"])
+    payload_sha256 = bytes(frame_row["payload_sha256"])
+    assert frame_row["room_materialized_revision"] is None
+    assert (
+        codec.decrypt(
+            "NioIngestFrameDrainHeader",
+            (stored.frame_id,),
+            bytes(frame_row["drain_header_ciphertext"]),
+            EMPTY_SHA256,
+            header=_frame_drain_header(
+                frame_row["source_epoch"],
+                frame_row["request_id"],
+                frame_row["staged_revision"],
+                payload_sha256,
+                len(payload_ciphertext),
+                frame_row["room_materialized_revision"],
+            ),
+        )
+        == b""
+    )
     frame_payload = codec.decrypt(
         "NioIngestFrame",
         (stored.frame_id,),
-        bytes(frame_row["payload_ciphertext"]),
-        bytes(frame_row["payload_sha256"]),
+        payload_ciphertext,
+        payload_sha256,
         header=_frame_header(stored, stage.committed.revision),
     )
     assert frame_payload == _canonical_internal(_frame_envelope(stored))
@@ -1830,6 +2017,66 @@ def test_authenticated_headers_and_frame_envelope_are_exact_and_canonical(
         )
         == stage.proposal.successor_source.cursor_json
     )
+
+
+@pytest.mark.parametrize("mutation", ["source_epoch", "state", "proof"])
+def test_drain_header_proof_rejects_order_state_or_proof_mutation_before_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    row = _stored_row(stage.database_path, frame_id)
+    with sqlite3.connect(stage.database_path) as connection:
+        if mutation == "source_epoch":
+            connection.execute(
+                "UPDATE NioIngestFrame SET source_epoch = source_epoch + 1 "
+                "WHERE account_id = ? AND frame_id = ?",
+                (ACCOUNT_ID, str(frame_id)),
+            )
+        elif mutation == "state":
+            connection.execute(
+                "UPDATE NioIngestFrame SET room_materialized_revision = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (stage.committed.revision, ACCOUNT_ID, str(frame_id)),
+            )
+        else:
+            proof = bytearray(row["drain_header_ciphertext"])
+            proof[-1] ^= 1
+            connection.execute(
+                "UPDATE NioIngestFrame SET drain_header_ciphertext = ? "
+                "WHERE account_id = ? AND frame_id = ?",
+                (bytes(proof), ACCOUNT_ID, str(frame_id)),
+            )
+
+    reopened = _open(tmp_path)
+    try:
+        calls: list[str] = []
+        decrypt = reopened._journal._codec.decrypt
+
+        def verify_proof_before_payload(
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            calls.append(table)
+            if table == "NioIngestFrame":
+                raise AssertionError("payload decrypt ran after a bad drain proof")
+            return decrypt(table, primary_key, ciphertext, digest, header)
+
+        monkeypatch.setattr(
+            reopened._journal._codec,
+            "decrypt",
+            verify_proof_before_payload,
+        )
+        with pytest.raises(JournalIntegrityError):
+            reopened._journal.load_frame(frame_id)
+        assert calls == ["NioIngestFrameDrainHeader"]
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize(
@@ -1982,11 +2229,28 @@ def test_authenticated_corruption_fails_selected_row(
         ciphertext, digest = codec.seal(
             "NioIngestFrame", (frame.frame_id,), changed, header=header
         )
+        drain_header_ciphertext = _seal_frame_drain_header(
+            codec,
+            frame.frame_id,
+            frame.response.request.source_epoch,
+            frame.response.request.request_id,
+            stage.committed.revision,
+            digest,
+            len(ciphertext),
+            None,
+        )
         with sqlite3.connect(stage.database_path) as connection:
             connection.execute(
-                "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ? "
+                "UPDATE NioIngestFrame SET payload_ciphertext = ?, payload_sha256 = ?, "
+                "drain_header_ciphertext = ? "
                 "WHERE account_id = ? AND frame_id = ?",
-                (ciphertext, digest, ACCOUNT_ID, str(frame.frame_id)),
+                (
+                    ciphertext,
+                    digest,
+                    drain_header_ciphertext,
+                    ACCOUNT_ID,
+                    str(frame.frame_id),
+                ),
             )
     reopened = _open(tmp_path)
     try:

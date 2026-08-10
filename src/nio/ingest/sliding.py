@@ -14,6 +14,7 @@ from .membership import (
 from .model import RecordOrigin, TransportKind
 from .ports import NetworkRequest, NetworkResult, _frame_id_for_response
 from .source import (
+    MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES,
     RoomSection,
     RoomSegment,
     SourceResult,
@@ -23,6 +24,7 @@ from .source import (
     load_json,
     malformed_success_result,
     normalize_source_error,
+    oversized_success_result,
     require_json_events,
     require_json_strings,
     validate_network_result_identity,
@@ -348,6 +350,19 @@ class SlidingSource:
         request: NetworkRequest,
         result: NetworkResult,
     ) -> SourceResult:
+        if (
+            type(request) is NetworkRequest
+            and type(result) is NetworkResult
+            and result.status_code == 200
+            and len(result.body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
+        ):
+            if request.transport is not TransportKind.SLIDING:
+                raise ValueError("SlidingSource can normalize only sliding requests")
+            if request.stream_id != self.stream_id:
+                raise ValueError("sliding request stream does not match source stream")
+            validate_network_result_identity(request, result)
+            return oversized_success_result(request, result.body)
+
         self._validate_result_identity(request, result)
         error_result = normalize_source_error(request, result)
         if error_result is not None:
@@ -563,6 +578,8 @@ class SlidingSource:
     def _normalize_frame(
         self, request: NetworkRequest, body: bytes
     ) -> tuple[SyncFrame, bytes]:
+        if len(body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES:
+            raise ValueError("staged source response body exceeds 16 MiB")
         root = _object(
             load_json(body, "sliding sync response"), "sliding sync response"
         )

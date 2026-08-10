@@ -7,9 +7,13 @@ from typing import get_args, get_origin
 from uuid import UUID, uuid5
 
 from ..event_provenance import TimelineEventProvenance
-from ._json import canonical_json, load_json
 from .model import LossBoundary, LossReason, RecordKind, RecordOrigin
-from .source import RoomSegment, SyncFrame, _continuity_bounds
+from .source import (
+    RoomSegment,
+    SyncFrame,
+    _continuity_bounds,
+    _normalized_ephemeral_envelopes,
+)
 
 
 def _matches_exact_shape(value: object, shape: object) -> bool:
@@ -465,17 +469,12 @@ def reduce_staged_frame(
             )
         for payload in segment.room_account_data_json:
             append(RecordKind.ROOM_ACCOUNT_DATA, segment.room_id, payload)
-    for payload in frame.ephemeral_json:
-        try:
-            envelope = load_json(payload, "ephemeral envelope")
-            if type(envelope) is not dict or set(envelope) != {"event", "room_id"}:
-                raise ValueError("invalid envelope")
-            event, room_id = envelope["event"], envelope["room_id"]
-            if type(event) is not dict or type(room_id) is not str or not room_id:
-                raise ValueError("invalid envelope")
-        except (TypeError, ValueError) as error:
-            raise ReducerInputError("invalid canonical ephemeral envelope") from error
-        append(RecordKind.EPHEMERAL, room_id, canonical_json(event))
+    try:
+        ephemeral = _normalized_ephemeral_envelopes(frame.ephemeral_json)
+    except (TypeError, ValueError) as error:
+        raise ReducerInputError("invalid canonical ephemeral envelope") from error
+    for room_id, source_json in ephemeral:
+        append(RecordKind.EPHEMERAL, room_id, source_json)
     for payload in frame.global_account_data_json:
         append(RecordKind.GLOBAL_ACCOUNT_DATA, None, payload)
     for payload in frame.presence_json:

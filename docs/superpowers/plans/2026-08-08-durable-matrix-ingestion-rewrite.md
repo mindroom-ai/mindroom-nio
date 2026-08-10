@@ -24,18 +24,18 @@ The plan calls this replacement implementation “v2” when contrasting it with
 
 - Both Classic Sync and Sliding Sync are first-class. Neither may be implemented as a compatibility wrapper around the other.
 - There is one active ingestion source per Matrix account/device/store and one immutable stream binding per MindRoom principal consumer. Classic and Sliding are both first-class choices when that previously unbound consumer and v1 store are created; `NioIngestMeta.transport_kind` is immutable thereafter. v1 never translates continuity or rebinds an existing principal. Exercising the other transport later requires a genuinely new consumer identity/journal (normally a new test principal/account), not merely another Matrix device.
-- The coordinator is the sole logical owner of mutable ingestion state. One serialized crypto worker separately owns all Olm/Megolm objects and performs expensive crypto computation outside a write transaction. One thread-affine physical ingestion-store writer owns the sole SQLite connection used by the journal and v1 E2EE storage. Task 4.5 establishes its synchronous typed transaction seam; Task 7 adds an immutable owner-thread receipt-lookup → worker-prepare → owner-thread commit handshake. Network workers, the crypto worker, callers, and MindRoom exchange only immutable epoch-tagged commands and results.
+- The coordinator is the sole logical owner of mutable ingestion state. One serialized crypto worker separately owns all Olm/Megolm objects and performs expensive crypto computation outside a write transaction. One thread-affine physical ingestion-store writer owns the sole SQLite connection used by the journal and v1 E2EE storage. Task 4.5 establishes its synchronous typed transaction seam; Task 7 adds an immutable owner-thread receipt-lookup → worker-prepare → owner-thread receipt/E2EE-commit-and-raw-delete handshake. Network workers, the crypto worker, callers, and MindRoom exchange only immutable epoch-tagged commands and results.
 - Allow one in-flight primary sync request per account/device. Recovery requests may run concurrently across rooms, one per room, because they return immutable epoch-tagged results.
 - No application callback runs in the coordinator, under a nio lock, or inside a nio database transaction.
 - A state transition becomes visible in memory, publishes a batch, or schedules a follow-up effect only after its journal transaction commits.
 - A transport cursor may advance only when the corresponding immutable raw frame is durable in the nio journal.
-- A frame may be retired only when every record is durably represented in a batch, a generic ready row, or its room's durable recovery lane. A loss is an ordinary ready/lane record, never a second side ledger.
-- A batch may be retired only after MindRoom's admission transaction commits and nio accepts a matching FIFO acknowledgement.
-- No NIO ingestion persistence path may commit once per Matrix event. Its transaction count must scale with durable raw frames, recovery pages, bounded crypto groups, materialized batches, and acknowledgements—not with the number of records inside those units. MindRoom and desktop admission each use one downstream transaction per delivered batch; later application work is outside this ingestion invariant.
-- When ready work is backlogged, the materializer takes deterministic oldest eligible heads across already-durable frames and room lanes until none remains or the next head would exceed configured record/byte capacity, then publishes that batch. When no backlog exists, it publishes available work immediately; it never waits for a future record, and v1 adds no batching timer or artificial latency window.
+- Task 6 deletes a crypto-free raw Frame only after its active durable owner graph commits. For crypto-bearing input it commits an authenticated positive `room_materialized_revision` and retains the raw Frame; Task 7 rechecks receipt/E2EE state, commits it, and deletes that retained raw Frame in the same owner transaction. A loss has one eventual Work owner, never a second side ledger.
+- Task 10 may later retire a batch only after MindRoom's admission transaction commits and nio accepts a matching FIFO acknowledgement; Task 6–8 create no batch or acknowledgement state.
+- No NIO ingestion persistence path may commit once per Matrix event. Its transaction count scales with durable raw frames, bounded crypto groups, aggregate intent/result transitions, and (when Task 10 exists) batches and acknowledgements—not with the number of records inside those units. MindRoom and desktop admission each use one downstream transaction per delivered batch; later application work is outside this ingestion invariant.
+- Once Task 10 introduces delivery, it takes deterministic ready Work heads under configured record/byte capacity and publishes batches without a timer. Task 6–8 never expose ready-work reads or publish batches.
 - Recovery is per room. A stuck room must not stop unrelated rooms, global account data, or another transport frame from making progress.
 - A terminal loss record is ordered before any held live records it releases.
-- Olm/Megolm mutations and their replay receipt commit in the same SQLite transaction. A separate receipt write is not sufficient.
+- Olm/Megolm mutations, their replay receipt, and deletion of the retained Frame commit in the same SQLite transaction. A separate receipt write or later raw delete is not sufficient.
 - Batch IDs and SHA-256 digests are computed from canonical bytes by nio, recomputed when read, and recomputed independently by MindRoom. No caller-supplied fingerprint is trusted.
 - Unknown batch schemas, record kinds, or loss reasons fail closed before MindRoom writes a receipt or nio receives an acknowledgement.
 - The replacement never parses or migrates an old store. Activation provisions a fresh Matrix device and genuinely new SQLite database, then cold-starts a new stream. The old database remains an operator-owned rollback artifact and v2 never opens it.
@@ -43,12 +43,11 @@ The plan calls this replacement implementation “v2” when contrasting it with
 - Keep nio's per-device E2EE database separate from MindRoom's event journal. Do not introduce a distributed transaction.
 - Bind each nio stream to the MindRoom journal's durable generation UUID. A replaced/restored consumer journal must fail closed rather than resume from nio's advanced cursor.
 - Raise `mindroom-nio`'s Python floor to 3.12 before using `StrEnum` or `TaskGroup`; MindRoom already requires 3.12.
-- The current Task 4.5 closure is +5,537 runtime source in nio alone and
-  +6,239 under the formal nio src-plus-scripts accounting rule. The checkpoint
-  is one line below +6,240; the final cross-repository cap remains +6,000 after
-  actual observed deletions. Reforecast after every task or 500 production
-  additions, keep conditional deletions separate from actuals, and stop before
-  the next task if no compliant scope reduction, deletion, or redesign remains.
+- The completed Task 4.5 accounting is +5,537 runtime nio lines and +6,239
+  under its formal nio src-plus-scripts rule. It is historical accounting, not
+  a hard acceptance cap for the active Task 6–8 architecture. Publish exact
+  runtime-source deltas and obtain independent complexity reviews around
+  `+1000` and `+1200`; those are review alarms, not stop conditions or caps.
 - Timed micro-batching, compression, Rust extensions, and speculative SQLite tuning are out of scope until Task 10 measurements identify a concrete bottleneck.
 
 ## Why This Is a Rewrite
@@ -61,19 +60,21 @@ The rewrite removes that topology instead of translating it:
 Matrix HTTP
     │ immutable result tagged with source/request epoch
     ▼
-transport adapter ──► durable raw frame
+transport adapter ──► durable raw Frame
                          │
                          ▼
-                 crypto worker receipt
-                         │
-                         ▼
-source row + affected room lanes ──► immutable FIFO SyncBatch
-                                             │
-                                             ▼
-                              MindRoom one-write admission
-                                             │ commit
-                                             ▼
-                                      nio FIFO ack
+                    Task 6 authenticated proof scan
+                 ├─ plain aggregate route ─► Aggregate recovery/hydration intent
+                 │                              │
+                 │                              ▼
+                 │                    Task 8 aggregate result transitions
+                 │                              │
+                 │                              ▼
+                 │        Task 8-produced loss/release Work (when required) ─┐
+                 │                                                            │
+                 ├─ plain ready-work route ─► ready Event/Loss Work ─────────┼──► Task 10 batch/admission/ack (deferred)
+                 │
+                 └─ crypto-bearing ─► Frame positive hand-off state ─► Task 7 receipt/E2EE commit + raw delete
 ```
 
 The acknowledgement boundary is durable journal admission, not model completion, tool execution, delivery, or an outgoing Matrix response. Holding nio work until semantic completion would create head-of-line blocking across model and network latency without improving recovery correctness.
@@ -89,7 +90,7 @@ The reviews identified eight real gaps in the earlier drafts. This plan resolves
 5. The new stream remains test-only until crypto ordering and every durable/best-effort record class are implemented. MindRoom activation happens later.
 6. MindRoom owns a local loss enum with exhaustive mapping. A future unknown nio value fails closed.
 7. Membership transitions now have one owner and an explicit epoch order: unresolved `E` loss, then lifecycle `E+1`, with stale `E` recovery ignored and genuine `E+1` failure retained.
-8. Persistence cardinality is normative and measured: frames, pages, bounded crypto groups, materialized batches, and acknowledgements create transactions; individual records do not. Backlog coalescing is immediate and limit-driven, never timer-driven.
+8. Persistence cardinality is normative and measured: frames, aggregate intent/result transitions, bounded crypto groups, materialized batches, and acknowledgements create transactions; individual records do not. Backlog coalescing is immediate and limit-driven, never timer-driven.
 
 One review premise is deliberately rejected: this is not a `MatrixStore` v10-to-v11 migration that drops five tables. The new journal has its own version-1 schema in a fresh device database. Supporting or modifying an old store would preserve the wrong boundary, so v2 refuses it entirely.
 
@@ -1328,78 +1329,114 @@ independent of SQLite, callbacks, clocks, and AsyncClient.
 
 ---
 
-## Task 6: Add the First Durable Aggregate and Materializer
+## Task 6: Durable Frame-Owned Materialization
 
-**Scope:** Add only one encrypted per-room aggregate and one encrypted union
-work table: the minimal internal durable outbox, frame retirement, and
-loss/gap/hydration ownership required to consume Task 5 proposals. This task
-does not create lanes, consumer bindings, batches, acknowledgement state, or a
-generic effect platform.
+> **Active Task 6–8 supersession:** This block controls the Task 6–8 work.
+> Earlier unarchived language about marker anti-joins, `crypto_frame` Work,
+> pending-Work recovery/hydration, or a durable `canonical_bytes` column is
+> historical design context, not an active requirement. Explicitly **Archived**
+> sections remain historical as labelled.
 
-- [ ] Commit room transition and its minimal recovery/hydration request row
-  atomically. A crypto-free frame may retire only after all of its derived room
-  work has a durable owner.
-- [ ] Retain every frame containing to-device, device-list, one-time-key-count,
-  or fallback-key crypto input. Task 6 neither interprets nor clears those
-  inputs and does not claim final retirement for that frame. The materializer
-  skips authenticated room-materialized markers so retained crypto frames do
-  not head-of-line block later unmaterialized frames.
-- [ ] Allocate one deterministic global ready order into the internal work
-  table without per-record transactions; retain one durable owner for every
-  loss, intent, and non-dropped frame-derived record.
-- [ ] Enforce ready, held-room, and total-work capacity inside the same owner
-  transaction, with whole-room terminal-loss fate and account-wide fail-stop.
-- [ ] Prove frame-to-room-to-work crash fate, recovery/loss/lifecycle ordering,
-  crypto-marker idempotency, limits, corruption handling, and unrelated-room
-  progress.
-- [ ] Record SQL, writer wait, memory, and actual line changes before Task 7.
+**Active architecture:** `NioIngestFrame` owns the crypto hand-off state as
+`room_materialized_revision NULL | positive integer`. The field is bound into
+the 29-byte `NioIngestFrameDrainHeader` proof AAD together with source epoch,
+request ID, staged revision, payload digest, and payload-ciphertext length.
+Discovery reads the complete unfiltered bounded frame-header/proof set
+(`LIMIT 257`, no SQL `ORDER BY`), authenticates every proof, then filters
+verified `NULL` state and sorts the verified drain tuples in memory. It never
+lets clear state hide a frame. It decrypts only the selected raw payload outside
+the writer and byte-revalidates the full header set plus selected row inside the
+one owner transaction before any business DML.
 
-Gate: a crypto-free frame never retires before all of its derived work has a
-durable owner; a crypto-bearing frame remains staged until Task 7 completes its
-receipt-safe handoff. One blocked room cannot block unrelated eligible rooms
-beyond bounded shared-writer occupancy. Task 6 exposes no ready-work read or
-delivery API.
+`NioIngestRoomAggregate` is the eventual single durable owner of recovery
+(`continuity.gap`) and hydration (`pending_hydration`) intent. Its clear,
+queryable `intent_kind` is re-derived from the authenticated value and is itself
+AAD-bound. `NioIngestWork` is the eventual internal outbox for EventRecord and
+LossRecord only; it has no crypto, recovery, hydration, receipt, or generic
+effect role. It retains authenticated provenance metadata but no durable
+`canonical_bytes`; bounded capacity accounting decrypts/authenticates rows and
+sums plaintext length. Task 6 adds no public read, batch, acknowledgement, or
+effect API.
+
+**Staged Task 6 checkpoints:**
+
+- [ ] **Checkpoint 2 — Frame-only discovery and empty fates:** physical
+  topology remains Meta, SourceState, Frame, and Frame drain index only. Do not
+  introduce Aggregate/Work DDL, value codecs, row writers/decoders, or tests
+  without a live caller. Empty crypto-free frames advance Meta and delete raw;
+  empty crypto-bearing frames advance Meta, set/reseal the positive Frame state,
+  and retain raw. A selected nonempty/reducer-output route rejects before DML
+  and retains raw.
+- [ ] **Checkpoint 3 — first live aggregate/work path:** introduce final
+  Aggregate/Work DDL, preflight, and codecs only with their first live writer
+  and reader. Admit only a fully READY route with no gap, hydration, retirement,
+  loss, or release; validate the whole route before the writer and retain raw
+  with zero DML for every other barrier.
+- [ ] **Checkpoint 4 — barriers and durable transitions:** first enable held
+  work, recovery/hydration intent, retirement/lifecycle, loss, release, and
+  capacity fates. Plan each complete route before DML, preserving the existing
+  recovery/hydration origin for repeated IDs and never leaving a partial
+  aggregate barrier or intent.
+- [ ] Prove frame proof/state corruption, full-set read-to-writer races,
+  deterministic ordering, raw-retention fates, and bounded authenticated
+  capacity scans. Record SQL, writer wait, memory, and exact runtime-source
+  delta at every checkpoint.
+
+Gate: a crypto-free frame retires only after its active durable owners commit;
+a crypto-bearing frame is Frame-flagged and retained for Task 7. One blocked
+route cannot cause partial durable state or hide a later eligible raw frame.
 
 ---
 
-## Task 7: Make Crypto Replay-Safe
+## Task 7: Make Frame-Flagged Crypto Replay-Safe
 
-**Scope:** Add crypto receipt tables and the owner-thread shared Peewee
-transaction that commits Olm/Megolm mutations with replay receipts. Crypto
-preparation remains outside the write-lock hold.
+**Scope:** Task 7 scans the same complete unfiltered authenticated Frame proof
+set, then filters verified non-`NULL` `room_materialized_revision` rows in
+deterministic drain order. It owns the retained raw frame only after the Task 6
+Frame flag commits.
 
-- [ ] Define immutable lookup, prepared transaction, and commit outcome values.
-- [ ] Revalidate receipt hits/misses inside the one owner transaction and
-  fail-stop/discard prepared state on commit failure or cancellation.
-- [ ] Claim the retained crypto-bearing staged-frame inputs, commit their
-  receipt-safe E2EE outcome, and authorize final frame retirement only after
-  the Task 6 room-derived work and Task 7 crypto-derived work both have durable
-  owners.
-- [ ] Prove duplicate Olm/Megolm inputs, crash/restart, and receipt races never
-  reratchet or expose an uncommitted result.
+- [ ] Prepare crypto outside the owner write transaction using immutable input.
+- [ ] Inside one existing owner transaction, recheck the receipt/E2EE state,
+  commit the receipt and E2EE mutation, and delete the retained raw Frame.
+  There is no commit-then-delete gap: a crash leaves either the old graph or the
+  complete new graph, and the receipt recheck makes retry idempotent.
+- [ ] Prove duplicate Olm/Megolm inputs, crash/restart, proof/state corruption,
+  and receipt races never reratchet or expose an uncommitted result.
 
 Gate: no worker-thread SQLite/Peewee access, no second journal-file connection,
-and no crypto result before its durable outcome.
+and no crypto result or raw retirement outside the same durable owner
+transaction.
 
 ---
 
-## Task 8: Execute Recovery and Hydration Effects
+## Task 8: Dispatch Aggregate-Owned Recovery and Hydration Intent
 
-**Scope:** Execute the typed recovery/hydration requests made durable by Task 6
-and reschedule them after retryable result or restart. It owns execution, not
-the Task 5 frame-time proposal grammar or Task 6 durable storage shape. Task 8
-defines the result/outcome grammar at the first point that an executor can
-consume it.
+**Scope:** Task 8 performs a bounded, resumable aggregate scan by
+`(intent_kind, room_id)`. The SQL predicate only narrows candidates: every
+candidate is decrypted/authenticated and must re-derive the same intent kind
+before dispatch or retry state can use it. Recovery remains the aggregate
+continuity gap; hydration retains its original authenticated origin in
+`pending_hydration`.
 
-- [ ] Dispatch only frozen durable requests and return tagged results to the
-  owner.
-- [ ] Commit result handling/idempotency with the owning aggregate and prove
-  dispatch/result/restart crash behavior.
+- [ ] Dispatch only frozen, authenticated aggregate intents and return tagged
+  results to the owner.
+- [ ] Commit result handling/idempotency with the owning aggregate; terminal
+  handling clears the matching barrier and intent atomically with any required
+  loss/release transition.
+- [ ] Prove bounded scan/resume, dispatch/result/restart crash behavior, and
+  repeated recovery/hydration IDs retain the already-persisted original origin.
 - [ ] Keep primary-source reset fencing separate from independently
   membership-bound recovery work.
 
-Gate: recovery and hydration survive restart exactly once at their durable
-owner, without enabling a broad generic effect platform.
+Gate: recovery and hydration survive restart at their aggregate owner without
+pending Work rows or a broad generic effect platform.
+
+### Task 6–8 complexity review
+
+Publish exact runtime-source delta at each checkpoint. Independent complexity
+reviews around `+1000` and `+1200` lines are review alarms, not acceptance caps:
+the structural boundary, crash/authentication invariants, and absence of unused
+production surfaces take precedence over arbitrary line-count pressure.
 
 ---
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from peewee import IntegrityError, SqliteDatabase
@@ -18,18 +18,33 @@ from ..ingest.config import (
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
 from ..ingest.model import TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
+from ..ingest.reducer import reduce_staged_frame
 from ..ingest.sliding import SlidingSource
-from ..ingest.source import renormalize_staged_frame
+from ..ingest.source import (
+    MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES,
+    SyncFrame,
+    renormalize_staged_frame,
+)
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_codec import EncryptedRowCodec
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
     open_journal_database,
 )
-from ._sync_journal_rows import JournalRows
+from ._sync_journal_rows import (
+    JournalRows,
+    _canonical_internal,
+    _frame_drain_header,
+    _frame_envelope,
+)
+from ._sync_journal_values import (
+    MaterializeResult,
+    MaterializerLimits,
+    MaterializeStatus,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 
 class SqliteIngestionJournal(JournalRows):
@@ -170,12 +185,13 @@ class SqliteIngestionJournal(JournalRows):
         except (TypeError, ValueError) as error:
             raise JournalIntegrityError("source staging proposal is invalid") from error
 
-    def _normalized_candidate(
+    def _renormalized_frame(
         self,
         owner: OwnerView,
         frame: StagedFrame,
-    ) -> bytes:
+    ) -> SyncFrame:
         request = frame.response.request
+        adapter: ClassicSource | SlidingSource
         if request.transport is TransportKind.CLASSIC:
             adapter = ClassicSource(
                 owner.stream_id,
@@ -195,7 +211,7 @@ class SqliteIngestionJournal(JournalRows):
                 owner.account_id,
             )
         try:
-            return renormalize_staged_frame(adapter, frame).candidate_cursor_json
+            return renormalize_staged_frame(adapter, frame)
         except (TypeError, ValueError) as error:
             raise JournalIntegrityError(
                 "staged response does not re-normalize"
@@ -227,7 +243,10 @@ class SqliteIngestionJournal(JournalRows):
             raise JournalIntegrityError(
                 "source staging proposal has an invalid successor relation"
             )
-        if proposed.cursor_json != self._normalized_candidate(owner, frame):
+        if (
+            proposed.cursor_json
+            != self._renormalized_frame(owner, frame).candidate_cursor_json
+        ):
             raise JournalIntegrityError(
                 "source staging cursor does not match normalized response"
             )
@@ -259,6 +278,13 @@ class SqliteIngestionJournal(JournalRows):
         if type(writer_epoch) is not UUID:
             raise TypeError("writer_epoch must be UUID")
 
+        proposed, frame = self._reconstruct_stage(source, frame)
+        if (
+            len(_canonical_internal(_frame_envelope(frame))) + 29
+            > MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
+        ):
+            raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
+
         with self._transaction():
             owner, current = self._load_stage_snapshot()
             if owner.revision != expected_revision:
@@ -266,7 +292,6 @@ class SqliteIngestionJournal(JournalRows):
             if owner.writer_epoch != writer_epoch:
                 raise JournalConflictError("journal writer_epoch is stale")
 
-            proposed, frame = self._reconstruct_stage(source, frame)
             replay = self._validate_stage_relationship(
                 owner,
                 current,
@@ -324,6 +349,179 @@ class SqliteIngestionJournal(JournalRows):
             self._transition_hook("frame_insert")
         self._transition_hook("commit")
         return CommitResult(new_revision)
+
+    def materialize_oldest_frame(
+        self,
+        *,
+        expected_revision: int,
+        writer_epoch: UUID,
+        limits: MaterializerLimits,
+    ) -> MaterializeResult:
+        if type(expected_revision) is not int:
+            raise TypeError("expected_revision must be int")
+        if expected_revision < 0:
+            raise ValueError("expected_revision must be nonnegative")
+        if type(writer_epoch) is not UUID:
+            raise TypeError("writer_epoch must be UUID")
+        if type(limits) is not MaterializerLimits:
+            raise TypeError("limits must be MaterializerLimits")
+        MaterializerLimits(
+            limits.max_record_canonical_bytes,
+            limits.max_held_records_per_room,
+            limits.max_held_canonical_bytes_per_room,
+            limits.max_ready_work_count,
+            limits.max_ready_work_canonical_bytes,
+            limits.max_total_work_count,
+            limits.max_total_work_canonical_bytes,
+        )
+
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            if owner.revision != expected_revision:
+                raise JournalConflictError("journal revision is stale")
+            if owner.writer_epoch != writer_epoch:
+                raise JournalConflictError("journal writer_epoch is stale")
+            headers = self._load_authenticated_frame_headers(owner)
+            selected = next(
+                (
+                    header
+                    for header in headers
+                    if header.room_materialized_revision is None
+                ),
+                None,
+            )
+            if selected is None:
+                return MaterializeResult(MaterializeStatus.IDLE, None, None)
+
+            selected_row = self._frame_row(selected.frame_id)
+            selected_mapping = cast("Mapping[str, object]", selected_row)
+            if (
+                self._frame_drain_row_from_full(
+                    selected_mapping,
+                    owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError("selected frame header snapshot changed")
+            selected_snapshot = tuple(selected_row)
+            staged = self._decode_frame_row(
+                selected.frame_id,
+                selected_mapping,
+                owner,
+                drain_header_authenticated=True,
+            )
+            try:
+                normalized = self._renormalized_frame(owner, staged)
+                proposal = reduce_staged_frame(
+                    owner.stream_id,
+                    staged.frame_id,
+                    normalized,
+                    (),
+                )
+            except (TypeError, ValueError) as error:
+                raise JournalIntegrityError(
+                    "selected frame does not reduce from empty room state"
+                ) from error
+            if proposal.room_proposals or proposal.descriptors:
+                raise JournalIntegrityError(
+                    "selected frame requires unsupported materialization state"
+                )
+
+        with self._transaction():
+            write_owner = self._decode_owner_row(
+                cast("Mapping[str, object]", self._meta())
+            )
+            if write_owner.revision != expected_revision:
+                raise JournalConflictError("journal revision is stale")
+            if write_owner.writer_epoch != writer_epoch:
+                raise JournalConflictError("journal writer_epoch is stale")
+            if self._load_authenticated_frame_headers(write_owner) != headers:
+                raise JournalIntegrityError("frame drain snapshot changed")
+            write_selected_row = self._frame_row(selected.frame_id)
+            write_selected_mapping = cast(
+                "Mapping[str, object]",
+                write_selected_row,
+            )
+            if (
+                tuple(write_selected_row) != selected_snapshot
+                or self._frame_drain_row_from_full(
+                    write_selected_mapping,
+                    write_owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError("selected frame snapshot changed")
+
+            new_revision = expected_revision + 1
+            cursor = self._transition_execute(
+                "meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    expected_revision,
+                    str(writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "journal materializer compare-and-swap failed"
+                )
+
+            row_predicate = (
+                write_selected_row["account_id"],
+                write_selected_row["frame_id"],
+                write_selected_row["source_epoch"],
+                write_selected_row["request_id"],
+                write_selected_row["staged_revision"],
+                write_selected_row["payload_ciphertext"],
+                write_selected_row["payload_sha256"],
+                write_selected_row["drain_header_ciphertext"],
+            )
+            snapshot_where = (
+                "account_id = ? AND frame_id = ? AND source_epoch = ? "
+                "AND request_id = ? AND staged_revision = ? "
+                "AND payload_ciphertext = ? AND payload_sha256 = ? "
+                "AND room_materialized_revision IS NULL "
+                "AND drain_header_ciphertext = ?"
+            )
+            if proposal.crypto_deferred:
+                proof = self._codec.encrypt(
+                    "NioIngestFrameDrainHeader",
+                    (selected.frame_id,),
+                    b"",
+                    header=_frame_drain_header(
+                        selected.source_epoch,
+                        selected.request_id,
+                        selected.staged_revision,
+                        selected.payload_sha256,
+                        selected.payload_ciphertext_length,
+                        new_revision,
+                    ),
+                )
+                frame_cursor = self._transition_execute(
+                    "frame_crypto_retain",
+                    "UPDATE NioIngestFrame SET room_materialized_revision = ?, "
+                    "drain_header_ciphertext = ? WHERE " + snapshot_where,
+                    (new_revision, proof, *row_predicate),
+                )
+            else:
+                frame_cursor = self._transition_execute(
+                    "frame_delete",
+                    "DELETE FROM NioIngestFrame WHERE " + snapshot_where,
+                    row_predicate,
+                )
+            if frame_cursor.rowcount != 1:
+                raise JournalIntegrityError("selected frame snapshot update failed")
+        self._transition_hook("commit")
+        return MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            new_revision,
+        )
 
     def close(self) -> None:
         self._owner.close()

@@ -15,6 +15,9 @@ from ._json import (
 from .membership import MembershipObservation
 from .model import RecordOrigin, TransportKind
 from .ports import (
+    MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES as _MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES,
+)
+from .ports import (
     NetworkFailureKind,
     NetworkRequest,
     NetworkResult,
@@ -23,6 +26,9 @@ from .ports import (
     _revalidated_staged_source_response,
 )
 from .state import SourceState, StagedFrame
+
+MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES = _MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
+MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES = 24 * 1024 * 1024
 
 
 def require_json_object(value: Any, field_name: str) -> dict[str, Any]:
@@ -341,6 +347,38 @@ class SyncFrame:
             raise ValueError("a room may appear in only one frame section")
 
 
+def _normalized_ephemeral_envelopes(
+    ephemeral_json: tuple[bytes, ...],
+) -> tuple[tuple[str, bytes], ...]:
+    _require_json_bytes_tuple(ephemeral_json, "ephemeral_json")
+    normalized: list[tuple[str, bytes]] = []
+    for payload in ephemeral_json:
+        try:
+            envelope = load_json(payload, "ephemeral envelope")
+            if type(envelope) is not dict or set(envelope) != {"event", "room_id"}:
+                raise ValueError("ephemeral envelope fields are invalid")
+            event, room_id = envelope["event"], envelope["room_id"]
+            if type(event) is not dict or type(room_id) is not str or not room_id:
+                raise ValueError("ephemeral envelope contents are invalid")
+            if canonical_json({"event": event, "room_id": room_id}) != payload:
+                raise ValueError("ephemeral envelope is not canonical")
+            normalized.append((room_id, canonical_json(event)))
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid canonical ephemeral envelope") from error
+    return tuple(normalized)
+
+
+def _frame_room_ids(frame: SyncFrame) -> tuple[str, ...]:
+    _require_exact(frame, SyncFrame, "frame")
+    room_ids = [segment.room_id for segment in frame.room_segments]
+    seen = set(room_ids)
+    for room_id, _ in _normalized_ephemeral_envelopes(frame.ephemeral_json):
+        if room_id not in seen:
+            room_ids.append(room_id)
+            seen.add(room_id)
+    return tuple(room_ids)
+
+
 def _continuity_bounds(
     frame: SyncFrame,
     segment: RoomSegment,
@@ -612,4 +650,18 @@ def malformed_success_result(
         retry_after_ms=None,
         response_body=canonical_json_or_raw(body),
         detail=str(error),
+    )
+
+
+def oversized_success_result(request: NetworkRequest, body: bytes) -> SourceResult:
+    return SourceResult(
+        kind=SourceResultKind.TERMINAL_ERROR,
+        request=request,
+        frame=None,
+        status_code=200,
+        network_failure=None,
+        error_code=None,
+        retry_after_ms=None,
+        response_body=body,
+        detail="staged source response body exceeds 16 MiB",
     )

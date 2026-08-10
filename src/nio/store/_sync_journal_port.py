@@ -4,6 +4,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
+from ._sync_journal_values import MaterializeResult, MaterializerLimits
 
 
 @runtime_checkable
@@ -26,3 +27,11 @@ class IngestionJournal(Protocol):
         source: SourceState,
         frame: StagedFrame,
     ) -> CommitResult: ...
+
+    def materialize_oldest_frame(
+        self,
+        *,
+        expected_revision: int,
+        writer_epoch: UUID,
+        limits: MaterializerLimits,
+    ) -> MaterializeResult: ...

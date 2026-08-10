@@ -68,10 +68,21 @@ SCHEMA_SQL = (
         typeof(staged_revision) = 'integer' AND staged_revision >= 1
     ),
     payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob' AND length(payload_ciphertext) >= 29
+        typeof(payload_ciphertext) = 'blob'
+        AND length(payload_ciphertext) >= 29
+        AND length(payload_ciphertext) <= 24 * 1024 * 1024
     ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+    ),
+    room_materialized_revision INTEGER NULL CHECK (
+        room_materialized_revision IS NULL OR
+        (typeof(room_materialized_revision) = 'integer'
+         AND room_materialized_revision >= 1)
+    ),
+    drain_header_ciphertext BLOB NOT NULL CHECK (
+        typeof(drain_header_ciphertext) = 'blob'
+        AND length(drain_header_ciphertext) = 29
     ),
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(

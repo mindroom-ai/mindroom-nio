@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, cast
 from uuid import UUID
 
 from ..ingest._json import load_internal_json
@@ -14,6 +15,7 @@ from ..ingest.ports import (
     StagedSourceResponse,
     _revalidated_staged_source_response,
 )
+from ..ingest.source import MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_preflight import _validate_source_cursor
 
@@ -44,6 +46,7 @@ _FRAME_FIELDS = (
 # keeps account identity classification bounded while detecting corrupt overflow.
 _MAX_STAGED_FRAMES = 256
 _FRAME_CLASSIFICATION_LIMIT = _MAX_STAGED_FRAMES + 1
+_EMPTY_SHA256 = hashlib.sha256(b"").digest()
 
 
 def _canonical_internal(value: object) -> bytes:
@@ -182,6 +185,39 @@ def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
             staged_revision,
         ]
     )
+
+
+def _frame_drain_header(
+    source_epoch: int,
+    request_id: int,
+    staged_revision: int,
+    payload_sha256: bytes,
+    payload_ciphertext_length: int,
+    room_materialized_revision: int | None,
+) -> bytes:
+    return _canonical_internal(
+        [
+            source_epoch,
+            request_id,
+            staged_revision,
+            base64.b64encode(payload_sha256).decode("ascii"),
+            payload_ciphertext_length,
+            room_materialized_revision,
+        ]
+    )
+
+
+class _FrameDrainRow(NamedTuple):
+    account_id: str
+    raw_frame_id: str
+    frame_id: UUID
+    source_epoch: int
+    request_id: int
+    staged_revision: int
+    payload_sha256: bytes
+    payload_ciphertext_length: int
+    room_materialized_revision: int | None
+    drain_header_ciphertext: bytes
 
 
 class JournalRows:
@@ -328,7 +364,9 @@ class JournalRows:
         )
 
     @staticmethod
-    def _parse_frame_id(row: Mapping[str, object]) -> tuple[str, UUID]:
+    def _parse_frame_id(
+        row: Mapping[str, object],
+    ) -> tuple[str, UUID]:
         try:
             raw_frame_id = row["frame_id"]
             if type(raw_frame_id) is not str:
@@ -338,37 +376,184 @@ class JournalRows:
             raise JournalIntegrityError("persisted frame_id is invalid") from error
         return raw_frame_id, stored_id
 
+    def _decode_frame_drain_row(
+        self,
+        row: Mapping[str, object],
+        owner: OwnerView,
+        payload_ciphertext_length: object,
+        *,
+        authenticate: bool,
+    ) -> _FrameDrainRow:
+        raw_frame_id, frame_id = self._parse_frame_id(row)
+        try:
+            account_id = row["account_id"]
+            source_epoch = row["source_epoch"]
+            request_id = row["request_id"]
+            staged_revision = row["staged_revision"]
+            payload_sha256 = row["payload_sha256"]
+            room_materialized_revision = row["room_materialized_revision"]
+            drain_header_ciphertext = row["drain_header_ciphertext"]
+            if (
+                type(account_id) is not str
+                or account_id != self.account_id
+                or raw_frame_id != str(frame_id)
+                or type(source_epoch) is not int
+                or source_epoch < 0
+                or type(request_id) is not int
+                or request_id < 0
+                or type(staged_revision) is not int
+                or staged_revision < 1
+                or type(payload_sha256) is not bytes
+                or len(payload_sha256) != 32
+                or type(payload_ciphertext_length) is not int
+                or not 29
+                <= payload_ciphertext_length
+                <= MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
+                or type(drain_header_ciphertext) is not bytes
+                or len(drain_header_ciphertext) != 29
+            ):
+                raise ValueError("frame drain columns are invalid")
+            if room_materialized_revision is not None and (
+                type(room_materialized_revision) is not int
+                or room_materialized_revision < 1
+            ):
+                raise ValueError("frame materialized revision is invalid")
+            drain_row = _FrameDrainRow(
+                account_id,
+                raw_frame_id,
+                frame_id,
+                source_epoch,
+                request_id,
+                staged_revision,
+                payload_sha256,
+                payload_ciphertext_length,
+                room_materialized_revision,
+                drain_header_ciphertext,
+            )
+            if authenticate and (
+                self._codec.decrypt(  # type: ignore[attr-defined]
+                    "NioIngestFrameDrainHeader",
+                    (frame_id,),
+                    drain_header_ciphertext,
+                    _EMPTY_SHA256,
+                    header=_frame_drain_header(
+                        source_epoch,
+                        request_id,
+                        staged_revision,
+                        payload_sha256,
+                        payload_ciphertext_length,
+                        room_materialized_revision,
+                    ),
+                )
+                != b""
+            ):
+                raise ValueError("frame drain header proof is not empty")
+            if room_materialized_revision is not None and not (
+                staged_revision < room_materialized_revision <= owner.revision
+            ):
+                raise ValueError("frame materialized revision is invalid")
+            return drain_row
+        except JournalIntegrityError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise JournalIntegrityError(
+                "persisted frame drain row is invalid"
+            ) from error
+
+    def _load_authenticated_frame_headers(
+        self,
+        owner: OwnerView,
+    ) -> tuple[_FrameDrainRow, ...]:
+        rows = self._execute(  # type: ignore[attr-defined]
+            "SELECT account_id, frame_id, source_epoch, request_id, "
+            "staged_revision, payload_sha256, "
+            "LENGTH(payload_ciphertext) AS payload_ciphertext_length, "
+            "room_materialized_revision, drain_header_ciphertext "
+            "FROM NioIngestFrame WHERE account_id = ? LIMIT ?",
+            (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
+        ).fetchall()
+        if len(rows) > _MAX_STAGED_FRAMES:
+            raise JournalIntegrityError("staged frame count exceeds the 256 frame cap")
+        decoded = tuple(
+            self._decode_frame_drain_row(
+                cast("Mapping[str, object]", row),
+                owner,
+                row["payload_ciphertext_length"],
+                authenticate=True,
+            )
+            for row in rows
+        )
+        if len({row.frame_id for row in decoded}) != len(decoded):
+            raise JournalIntegrityError("frame_id has multiple textual identities")
+        return tuple(
+            sorted(
+                decoded,
+                key=lambda row: (
+                    row.staged_revision,
+                    row.source_epoch,
+                    row.request_id,
+                    row.raw_frame_id,
+                ),
+            )
+        )
+
+    def _frame_drain_row_from_full(
+        self,
+        row: Mapping[str, object],
+        owner: OwnerView,
+        *,
+        authenticate: bool,
+    ) -> _FrameDrainRow:
+        try:
+            payload_ciphertext = row["payload_ciphertext"]
+            if type(payload_ciphertext) is not bytes:
+                raise TypeError("frame payload ciphertext is invalid")
+        except (KeyError, TypeError) as error:
+            raise JournalIntegrityError(
+                "persisted frame drain row is invalid"
+            ) from error
+        return self._decode_frame_drain_row(
+            row,
+            owner,
+            len(payload_ciphertext),
+            authenticate=authenticate,
+        )
+
     def _decode_frame_row(
         self,
         frame_id: UUID,
         row: Mapping[str, object],
         owner: OwnerView,
+        *,
+        drain_header_authenticated: bool = False,
     ) -> StagedFrame:
-        raw_frame_id, stored_id = self._parse_frame_id(row)
-        if raw_frame_id != str(stored_id):
-            raise JournalIntegrityError("persisted frame_id is not canonical")
         try:
-            if stored_id != frame_id or row["account_id"] != self.account_id:
+            drain_row = self._frame_drain_row_from_full(
+                row,
+                owner,
+                authenticate=not drain_header_authenticated,
+            )
+            if drain_row.frame_id != frame_id:
                 raise ValueError("selected frame identity changed")
-            source_epoch = row["source_epoch"]
-            request_id = row["request_id"]
-            staged_revision = row["staged_revision"]
-            if any(
-                type(value) is not int
-                for value in (source_epoch, request_id, staged_revision)
-            ):
-                raise ValueError("frame ordering columns are invalid")
-            header = _canonical_internal([source_epoch, request_id, staged_revision])
+            payload_ciphertext = row["payload_ciphertext"]
+            assert type(payload_ciphertext) is bytes
+            header = _canonical_internal(
+                [
+                    drain_row.source_epoch,
+                    drain_row.request_id,
+                    drain_row.staged_revision,
+                ]
+            )
             payload = self._codec.decrypt(  # type: ignore[attr-defined]
                 "NioIngestFrame",
                 (frame_id,),
-                bytes(row["payload_ciphertext"]),
-                bytes(row["payload_sha256"]),
+                payload_ciphertext,
+                drain_row.payload_sha256,
                 header=header,
             )
             envelope = load_internal_json(payload, "frame authenticated envelope")
             response = _frame_response_from_envelope(envelope)
-            frame = StagedFrame(frame_id, response, staged_revision)
+            frame = StagedFrame(frame_id, response, drain_row.staged_revision)
             if payload != _canonical_internal(_frame_envelope(frame)):
                 raise ValueError("frame authenticated envelope is not canonical")
             request = response.request
@@ -378,8 +563,8 @@ class JournalRows:
             ):
                 raise ValueError("frame request does not match journal owner")
             if (request.source_epoch, request.request_id) != (
-                source_epoch,
-                request_id,
+                drain_row.source_epoch,
+                drain_row.request_id,
             ):
                 raise ValueError("frame columns do not match authenticated metadata")
             return frame
@@ -464,11 +649,27 @@ class JournalRows:
             header=_frame_header(stored, staged_revision),
         )
         request = stored.response.request
+        drain_header_ciphertext, empty_sha256 = self._codec.seal(  # type: ignore[attr-defined]
+            "NioIngestFrameDrainHeader",
+            (stored.frame_id,),
+            b"",
+            header=_frame_drain_header(
+                request.source_epoch,
+                request.request_id,
+                staged_revision,
+                digest,
+                len(ciphertext),
+                None,
+            ),
+        )
+        if empty_sha256 != _EMPTY_SHA256:
+            raise JournalIntegrityError("empty drain header proof digest changed")
         return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
-            "staged_revision, payload_ciphertext, payload_sha256"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "staged_revision, payload_ciphertext, payload_sha256, "
+            "room_materialized_revision, drain_header_ciphertext"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self.account_id,
                 str(stored.frame_id),
@@ -477,5 +678,7 @@ class JournalRows:
                 staged_revision,
                 ciphertext,
                 digest,
+                None,
+                drain_header_ciphertext,
             ),
         )
