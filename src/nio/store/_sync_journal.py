@@ -582,14 +582,16 @@ class SqliteIngestionJournal(JournalRows):
             try:
                 for row in planned_aggregates:
                     if row[1] in existing_aggregate_rooms:
-                        aggregate_cursor = self._execute(
+                        aggregate_cursor = self._transition_execute(
+                            "aggregate_update",
                             "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
                             "intent_kind = ?, payload_ciphertext = ?, "
                             "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
                             (*row[2:], row[0], row[1]),
                         )
                     else:
-                        aggregate_cursor = self._execute(
+                        aggregate_cursor = self._transition_execute(
+                            "aggregate_insert",
                             "INSERT INTO NioIngestRoomAggregate("
                             "account_id, room_id, updated_revision, intent_kind, "
                             "payload_ciphertext, payload_sha256) "
@@ -601,7 +603,8 @@ class SqliteIngestionJournal(JournalRows):
                             "Aggregate write did not affect one row"
                         )
                 for row in planned_rows:
-                    work_cursor = self._execute(
+                    work_cursor = self._transition_execute(
+                        "work_insert",
                         "INSERT INTO NioIngestWork("
                         "account_id, work_id, kind, status, frame_id, room_id, "
                         "membership_epoch, room_sequence, ready_revision, "
@@ -613,7 +616,8 @@ class SqliteIngestionJournal(JournalRows):
                     if work_cursor.rowcount != 1:
                         raise JournalIntegrityError("Work insert did not write a row")
                 for row in planned_releases:
-                    work_cursor = self._execute(
+                    work_cursor = self._transition_execute(
+                        "work_release",
                         "UPDATE NioIngestWork SET status = 'ready', "
                         "ready_revision = ?, ready_ordinal = ?, payload_ciphertext = ? "
                         "WHERE account_id = ? AND work_id = ? AND status = 'held'",
@@ -671,6 +675,7 @@ class SqliteIngestionJournal(JournalRows):
                 )
             if frame_cursor.rowcount != 1:
                 raise JournalIntegrityError("selected frame snapshot update failed")
+            self._transition_hook("before_commit")
         self._transition_hook("commit")
         return MaterializeResult(
             MaterializeStatus.MATERIALIZED,

@@ -5,11 +5,14 @@ import hashlib
 import importlib
 import inspect
 import json
+import multiprocessing
+import os
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, fields, is_dataclass, replace
 from enum import StrEnum
 from operator import itemgetter
 from pathlib import Path
@@ -18,12 +21,14 @@ from typing import NoReturn, get_type_hints
 from uuid import UUID, uuid4, uuid5
 
 import pytest
+from peewee import OperationalError as PeeweeOperationalError
 
 import nio.ingest as ingest
 import nio.ingest.classic as classic_module
 import nio.ingest.ports as ports_module
 import nio.ingest.sliding as sliding_module
 import nio.store as store
+from nio.exceptions import LocalProtocolError
 from nio.ingest import source
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
@@ -75,7 +80,7 @@ from nio.ingest.source import (
     canonical_classic_cursor,
     canonical_json,
 )
-from nio.ingest.state import SourceState, StagedFrame
+from nio.ingest.state import OwnerView, SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal import SqliteIngestionJournal
 from nio.store._sync_journal_codec import EncryptedRowCodec
@@ -88,7 +93,7 @@ from nio.store._sync_journal_values import (
     MaterializeStatus,
     RoomAggregateValue,
 )
-from nio.store.sync_journal import open_ingestion_store
+from nio.store.sync_journal import StoreBootstrap, open_ingestion_store
 from nio.store.sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 _LIMIT_DEFAULTS = (
@@ -3467,6 +3472,7 @@ def _open_discovery_journal(
     transport: TransportKind,
     *,
     statements: list[str] | None = None,
+    sqlite_busy_timeout_ms: int = 2_000,
 ):
     return open_ingestion_store(
         store_path,
@@ -3475,6 +3481,7 @@ def _open_discovery_journal(
         source=_discovery_config(transport),
         pickle_key="discovery-secret",
         database_name="discovery.db",
+        sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
         statement_observer=statements.append if statements is not None else None,
     )
 
@@ -8468,5 +8475,1050 @@ def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml
                 == 257
             )
         assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
+_ATOMICITY_H1_CLASSIC_PLAIN = "h1-classic-plain"
+_ATOMICITY_RETIREMENT_SLIDING_CRYPTO = "retirement-sliding-crypto"
+_MATERIALIZER_CRASH_EXIT_CODE = 87
+
+_MATERIALIZER_ROLLBACK_CASES = (
+    pytest.param(
+        _ATOMICITY_H1_CLASSIC_PLAIN,
+        "aggregate_insert",
+        1,
+        id="h1-aggregate-insert",
+    ),
+    *(
+        pytest.param(
+            _ATOMICITY_H1_CLASSIC_PLAIN,
+            "work_insert",
+            occurrence,
+            id=f"h1-work-insert-{occurrence}",
+        )
+        for occurrence in range(1, 3)
+    ),
+    pytest.param(
+        _ATOMICITY_H1_CLASSIC_PLAIN,
+        "frame_delete",
+        1,
+        id="h1-frame-delete",
+    ),
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "meta_revision_epoch_cas",
+        1,
+        id="retirement-meta-cas",
+    ),
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "aggregate_update",
+        1,
+        id="retirement-aggregate-update",
+    ),
+    *(
+        pytest.param(
+            _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+            "work_insert",
+            occurrence,
+            id=f"retirement-work-insert-{occurrence}",
+        )
+        for occurrence in range(1, 5)
+    ),
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "work_release",
+        1,
+        id="retirement-work-release",
+    ),
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "frame_crypto_retain",
+        1,
+        id="retirement-frame-crypto-retain",
+    ),
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "before_commit",
+        1,
+        id="retirement-before-commit",
+    ),
+)
+_MATERIALIZER_CRASH_CASES = (
+    *_MATERIALIZER_ROLLBACK_CASES,
+    pytest.param(
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+        "commit",
+        1,
+        id="retirement-commit",
+    ),
+)
+
+type _MaterializerStorageGraph = tuple[
+    OwnerView,
+    SourceState,
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[object, ...], ...],
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializerAtomicityCase:
+    bootstrap: StoreBootstrap
+    selected: StagedFrame
+    normalized: SyncFrame
+    first: StagedFrame | None = None
+    first_normalized: SyncFrame | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedMaterializerWork:
+    value: EventRecord | LossRecord
+    status: str
+    frame_id: UUID
+    ready_revision: int | None
+    ready_ordinal: int | None
+    created_revision: int
+
+
+class _InjectedMaterializerFailure(RuntimeError):
+    pass
+
+
+def _materializer_frame_rows(
+    journal: SqliteIngestionJournal,
+) -> tuple[tuple[object, ...], ...]:
+    with journal._owner.read():
+        rows = journal._execute(
+            "SELECT frame_id, source_epoch, request_id, staged_revision, "
+            "payload_ciphertext, payload_sha256, room_materialized_revision, "
+            "drain_header_ciphertext FROM NioIngestFrame "
+            "WHERE account_id = ? "
+            "ORDER BY staged_revision, source_epoch, request_id, frame_id",
+            (journal.account_id,),
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _materializer_storage_graph(
+    journal: SqliteIngestionJournal,
+) -> _MaterializerStorageGraph:
+    return (
+        journal.load_owner(),
+        journal.load_source(),
+        _materializer_frame_rows(journal),
+        _aggregate_rows(journal),
+        _work_rows(journal),
+    )
+
+
+def _assert_materializer_reopened_graph(
+    journal: SqliteIngestionJournal,
+    expected: _MaterializerStorageGraph,
+) -> None:
+    actual = _materializer_storage_graph(journal)
+    assert actual[0] == replace(expected[0], writer_epoch=journal.writer_epoch)
+    assert actual[1:] == expected[1:]
+
+
+def _prepare_materializer_atomicity_case(
+    store_path: Path,
+    scenario: str,
+    *,
+    statements: list[str] | None = None,
+    sqlite_busy_timeout_ms: int = 2_000,
+) -> _MaterializerAtomicityCase:
+    if scenario == _ATOMICITY_H1_CLASSIC_PLAIN:
+        transport = TransportKind.CLASSIC
+        crypto = False
+    elif scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO:
+        transport = TransportKind.SLIDING
+        crypto = True
+    else:
+        raise AssertionError(f"unknown materializer atomicity scenario: {scenario}")
+
+    bootstrap = _open_discovery_journal(
+        store_path,
+        transport,
+        statements=statements,
+        sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
+    )
+    journal = bootstrap._journal
+    try:
+        if scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO:
+            first, first_normalized = _stage_discovery_frame(
+                journal,
+                transport,
+                1,
+                crypto=crypto,
+                room_nonempty=True,
+                global_ready_count=0,
+            )
+            assert _materialize(journal) == MaterializeResult(
+                MaterializeStatus.MATERIALIZED,
+                first.frame_id,
+                2,
+            )
+            selected, normalized = _stage_discovery_frame(
+                journal,
+                transport,
+                2,
+                crypto=crypto,
+                room_nonempty=True,
+                room_membership="leave",
+                global_ready_count=0,
+            )
+        else:
+            first = None
+            first_normalized = None
+            selected, normalized = _stage_discovery_frame(
+                journal,
+                transport,
+                1,
+                crypto=crypto,
+                room_nonempty=True,
+                global_ready_count=0,
+            )
+        return _MaterializerAtomicityCase(
+            bootstrap,
+            selected,
+            normalized,
+            first,
+            first_normalized,
+        )
+    except BaseException:
+        bootstrap.close()
+        raise
+
+
+def _atomicity_h1_expectations(
+    stream_id: UUID,
+    staged: StagedFrame,
+    normalized: SyncFrame,
+    revision: int,
+) -> tuple[RoomAggregateValue, tuple[_ExpectedMaterializerWork, ...]]:
+    assert normalized.frame_id == staged.frame_id
+    assert len(normalized.room_segments) == 1
+    room_id = normalized.room_segments[0].room_id
+    hydration_id = uuid5(
+        stream_id,
+        f"hydrate:{room_id}:0:{staged.frame_id}",
+    )
+    continuity = RoomContinuity(room_id, 0, "join", None, None, hydration_id)
+    hydration = HydrationIntent(hydration_id, normalized.origin)
+    proposal = reduce_staged_frame(stream_id, staged.frame_id, normalized, ())
+    assert len(proposal.room_proposals) == 1
+    room = proposal.room_proposals[0]
+    assert room.before is None
+    assert room.after == continuity
+    assert room.hydration == hydration
+    assert room.recovery is None
+    assert room.retirement_epoch is None
+    assert room.losses == ()
+    assert room.release is RecoveryRelease.NONE
+    assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+        RecordKind.TIMELINE,
+        RecordKind.PRESENCE,
+    )
+    assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+        DescriptorRoute.HOLD_FOR_HYDRATION,
+        DescriptorRoute.READY,
+    )
+
+    expected_work: list[_ExpectedMaterializerWork] = []
+    next_room_sequence = 0
+    next_ready_ordinal = 0
+    for index, descriptor in enumerate(proposal.descriptors):
+        is_room = descriptor.room_id is not None
+        record = EventRecord(
+            str(uuid5(staged.frame_id, f"event:{descriptor.descriptor_key}")),
+            descriptor.kind,
+            replace(normalized.origin, frame_index=index),
+            descriptor.room_id,
+            continuity.membership_epoch if is_room else None,
+            next_room_sequence if is_room else None,
+            None,
+            descriptor.provenance,
+            descriptor.source_json,
+            None,
+        )
+        ready = descriptor.route is DescriptorRoute.READY
+        expected_work.append(
+            _ExpectedMaterializerWork(
+                record,
+                "ready" if ready else "held",
+                staged.frame_id,
+                revision if ready else None,
+                next_ready_ordinal if ready else None,
+                revision,
+            )
+        )
+        if is_room:
+            next_room_sequence += 1
+        else:
+            next_ready_ordinal += 1
+    assert next_room_sequence == 1
+    assert next_ready_ordinal == 1
+    return (
+        RoomAggregateValue(
+            continuity,
+            next_room_sequence,
+            revision,
+            hydration,
+        ),
+        tuple(expected_work),
+    )
+
+
+def _atomicity_retirement_expectations(
+    stream_id: UUID,
+    case: _MaterializerAtomicityCase,
+    revision: int,
+) -> tuple[RoomAggregateValue, tuple[_ExpectedMaterializerWork, ...]]:
+    first = case.first
+    first_normalized = case.first_normalized
+    assert first is not None
+    assert first_normalized is not None
+    first_revision = revision - 2
+    first_aggregate, first_work = _atomicity_h1_expectations(
+        stream_id,
+        first,
+        first_normalized,
+        first_revision,
+    )
+    assert len(first_work) == 2
+    held, prior_ready = first_work
+    assert held.status == "held"
+    assert prior_ready.status == "ready"
+
+    proposal = reduce_staged_frame(
+        stream_id,
+        case.selected.frame_id,
+        case.normalized,
+        (first_aggregate.continuity,),
+    )
+    assert len(proposal.room_proposals) == 1
+    room = proposal.room_proposals[0]
+    before = first_aggregate.continuity
+    after = RoomContinuity(before.room_id, 1, "leave", None, None, None)
+    assert room.before == before
+    assert room.after == after
+    assert room.recovery is None
+    assert room.hydration is None
+    assert room.retirement_epoch == 0
+    assert room.release is RecoveryRelease.LOSS_THEN_HELD
+    assert len(room.losses) == 1
+    assert room.losses[0].reason is LossReason.UNVERIFIABLE
+    assert room.losses[0].boundary == LossBoundary(None, None, None, None)
+    assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+        RecordKind.TIMELINE,
+        RecordKind.PRESENCE,
+    )
+    assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+        DescriptorRoute.HOLD_FOR_RETIREMENT,
+        DescriptorRoute.READY,
+    )
+
+    loss_without_id = LossRecord(
+        "",
+        case.normalized.origin,
+        before.room_id,
+        before.membership_epoch,
+        LossReason.UNVERIFIABLE,
+        LossBoundary(None, None, None, None),
+        b"{}",
+    )
+    loss = replace(
+        loss_without_id,
+        loss_id=_loss_id(stream_id, loss_without_id),
+    )
+    lifecycle = EventRecord(
+        str(
+            uuid5(
+                case.selected.frame_id,
+                f"lifecycle:{before.room_id}:{before.membership_epoch}:1",
+            )
+        ),
+        RecordKind.ROOM_LIFECYCLE,
+        case.normalized.origin,
+        before.room_id,
+        1,
+        first_aggregate.next_room_sequence,
+        None,
+        None,
+        canonical_json(
+            {
+                "membership": "leave",
+                "membership_epoch": 1,
+                "previous_membership_epoch": before.membership_epoch,
+            }
+        ),
+        None,
+    )
+    expected: list[_ExpectedMaterializerWork] = [
+        prior_ready,
+        _ExpectedMaterializerWork(
+            loss,
+            "ready",
+            case.selected.frame_id,
+            revision,
+            0,
+            revision,
+        ),
+        replace(
+            held,
+            status="ready",
+            ready_revision=revision,
+            ready_ordinal=1,
+        ),
+        _ExpectedMaterializerWork(
+            lifecycle,
+            "ready",
+            case.selected.frame_id,
+            revision,
+            2,
+            revision,
+        ),
+    ]
+    next_room_sequence = first_aggregate.next_room_sequence + 1
+    next_ready_ordinal = 3
+    for index, descriptor in enumerate(proposal.descriptors):
+        is_room = descriptor.room_id is not None
+        record = EventRecord(
+            str(
+                uuid5(
+                    case.selected.frame_id,
+                    f"event:{descriptor.descriptor_key}",
+                )
+            ),
+            descriptor.kind,
+            replace(case.normalized.origin, frame_index=index),
+            descriptor.room_id,
+            after.membership_epoch if is_room else None,
+            next_room_sequence if is_room else None,
+            None,
+            descriptor.provenance,
+            descriptor.source_json,
+            None,
+        )
+        expected.append(
+            _ExpectedMaterializerWork(
+                record,
+                "ready",
+                case.selected.frame_id,
+                revision,
+                next_ready_ordinal,
+                revision,
+            )
+        )
+        if is_room:
+            next_room_sequence += 1
+        next_ready_ordinal += 1
+    assert next_room_sequence == 3
+    assert next_ready_ordinal == 5
+    return (
+        RoomAggregateValue(after, next_room_sequence, revision, None),
+        tuple(expected),
+    )
+
+
+def _expected_materializer_work_id(
+    expected: _ExpectedMaterializerWork,
+) -> str:
+    value = expected.value
+    return value.record_id if type(value) is EventRecord else value.loss_id
+
+
+def _assert_exact_materializer_work(
+    journal: SqliteIngestionJournal,
+    rows: tuple[tuple[object, ...], ...],
+    expected: tuple[_ExpectedMaterializerWork, ...],
+    old_rows: tuple[tuple[object, ...], ...],
+) -> None:
+    assert tuple(str(row[0]) for row in rows) == tuple(
+        _expected_materializer_work_id(item) for item in expected
+    )
+    old_by_id = {str(row[0]): row for row in old_rows}
+    for row, item in zip(rows, expected, strict=True):
+        value = item.value
+        work_id = _expected_materializer_work_id(item)
+        kind = "event" if type(value) is EventRecord else "loss"
+        room_sequence = value.room_sequence if type(value) is EventRecord else None
+        assert row[:10] == (
+            work_id,
+            kind,
+            item.status,
+            str(item.frame_id),
+            value.room_id,
+            value.membership_epoch,
+            room_sequence,
+            item.ready_revision,
+            item.ready_ordinal,
+            item.created_revision,
+        )
+        plaintext, stored = _decrypt_work(journal, row)
+        assert stored == value
+        assert plaintext == (
+            _expected_event_work_plaintext(value)
+            if type(value) is EventRecord
+            else _expected_loss_work_plaintext(value)
+        )
+        if work_id in old_by_id:
+            old = old_by_id[work_id]
+            if old[:10] == row[:10]:
+                assert row == old
+            else:
+                assert row[10] != old[10]
+                assert row[11] == old[11]
+
+
+def _assert_materializer_committed_graph(
+    journal: SqliteIngestionJournal,
+    scenario: str,
+    case: _MaterializerAtomicityCase,
+    old_graph: _MaterializerStorageGraph,
+) -> None:
+    old_owner, old_source, old_frames, _old_aggregates, old_work = old_graph
+    owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+    revision = old_owner.revision + 1
+    assert owner == replace(
+        old_owner,
+        revision=revision,
+        writer_epoch=journal.writer_epoch,
+    )
+    assert source == old_source
+    assert len(aggregates) == 1
+
+    if scenario == _ATOMICITY_H1_CLASSIC_PLAIN:
+        assert old_owner.revision == 1
+        expected_aggregate, expected_work = _atomicity_h1_expectations(
+            owner.stream_id,
+            case.selected,
+            case.normalized,
+            revision,
+        )
+        assert frames == ()
+        assert tuple(row[0] for row in old_frames) == (str(case.selected.frame_id),)
+        assert _frame_storage_row(journal, case.selected.frame_id) is None
+        expected_intent = "hydration"
+    else:
+        assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
+        assert old_owner.revision == 3
+        expected_aggregate, expected_work = _atomicity_retirement_expectations(
+            owner.stream_id,
+            case,
+            revision,
+        )
+        first = case.first
+        assert first is not None
+        old_by_id = {str(row[0]): row for row in old_frames}
+        current_by_id = {str(row[0]): row for row in frames}
+        assert set(old_by_id) == {str(first.frame_id), str(case.selected.frame_id)}
+        assert set(current_by_id) == set(old_by_id)
+        assert current_by_id[str(first.frame_id)] == old_by_id[str(first.frame_id)]
+        selected_before = old_by_id[str(case.selected.frame_id)]
+        selected_after = current_by_id[str(case.selected.frame_id)]
+        assert selected_before[6] is None
+        assert selected_after[:6] == selected_before[:6]
+        assert selected_after[6] == revision
+        assert selected_after[7] != selected_before[7]
+        assert journal.load_frame(first.frame_id) == first
+        assert journal.load_frame(case.selected.frame_id) == case.selected
+        assert (
+            EncryptedRowCodec(
+                "discovery-secret",
+                journal.account_id,
+                owner.stream_id,
+            ).decrypt(
+                "NioIngestFrameDrainHeader",
+                (case.selected.frame_id,),
+                selected_after[7],
+                hashlib.sha256(b"").digest(),
+                header=_canonical_expected_drain_header(selected_after, revision),
+            )
+            == b""
+        )
+        expected_intent = None
+
+    assert aggregates[0][:3] == (
+        expected_aggregate.continuity.room_id,
+        revision,
+        expected_intent,
+    )
+    aggregate_plaintext, aggregate = _decrypt_aggregate(journal, aggregates[0])
+    assert aggregate == expected_aggregate
+    assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+        expected_aggregate
+    )
+    _assert_exact_materializer_work(journal, work, expected_work, old_work)
+
+
+def _expected_materializer_hook_labels(scenario: str) -> tuple[str, ...]:
+    # Both live one-room paths have exactly one Aggregate write. A
+    # multi-Aggregate occurrence does not exist at this checkpoint.
+    if scenario == _ATOMICITY_H1_CLASSIC_PLAIN:
+        return (
+            "meta_revision_epoch_cas",
+            "aggregate_insert",
+            "work_insert",
+            "work_insert",
+            "frame_delete",
+            "before_commit",
+            "commit",
+        )
+    assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
+    return (
+        "meta_revision_epoch_cas",
+        "aggregate_update",
+        "work_insert",
+        "work_insert",
+        "work_insert",
+        "work_insert",
+        "work_release",
+        "frame_crypto_retain",
+        "before_commit",
+        "commit",
+    )
+
+
+def _expected_materializer_hook_prefix(
+    scenario: str,
+    boundary: str,
+    occurrence: int,
+) -> tuple[str, ...]:
+    labels = _expected_materializer_hook_labels(scenario)
+    seen = 0
+    for index, label in enumerate(labels):
+        if label == boundary:
+            seen += 1
+            if seen == occurrence:
+                return labels[: index + 1]
+    raise AssertionError(f"missing {boundary}:{occurrence} in {scenario}")
+
+
+def _classified_materializer_trace(events: list[str]) -> tuple[str, ...]:
+    classified: list[str] = []
+    for event in events:
+        if event.startswith("hook:"):
+            classified.append(event)
+            continue
+        sql = " ".join(event.upper().split())
+        if sql == "BEGIN IMMEDIATE":
+            classified.append("transaction:begin_immediate")
+        elif sql == "COMMIT":
+            classified.append("transaction:commit")
+        elif sql.startswith("UPDATE NIOINGESTMETA SET REVISION ="):
+            classified.append("dml:meta_revision_epoch_cas")
+        elif sql.startswith("INSERT INTO NIOINGESTROOMAGGREGATE"):
+            classified.append("dml:aggregate_insert")
+        elif sql.startswith("UPDATE NIOINGESTROOMAGGREGATE SET"):
+            classified.append("dml:aggregate_update")
+        elif sql.startswith("INSERT INTO NIOINGESTWORK"):
+            classified.append("dml:work_insert")
+        elif sql.startswith("UPDATE NIOINGESTWORK SET STATUS = 'READY'"):
+            classified.append("dml:work_release")
+        elif sql.startswith("DELETE FROM NIOINGESTFRAME"):
+            classified.append("dml:frame_delete")
+        elif sql.startswith("UPDATE NIOINGESTFRAME SET ROOM_MATERIALIZED_REVISION ="):
+            classified.append("dml:frame_crypto_retain")
+    return tuple(classified)
+
+
+def _expected_materializer_trace(scenario: str) -> tuple[str, ...]:
+    expected = ["transaction:begin_immediate"]
+    for label in _expected_materializer_hook_labels(scenario):
+        if label == "before_commit":
+            expected.append("hook:before_commit")
+        elif label == "commit":
+            expected.extend(("transaction:commit", "hook:commit"))
+        else:
+            expected.extend((f"dml:{label}", f"hook:{label}"))
+    return tuple(expected)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(_ATOMICITY_H1_CLASSIC_PLAIN, id="h1-insert"),
+        pytest.param(
+            _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
+            id="retirement-update",
+        ),
+    ],
+)
+def test_materializer_success_hook_immediately_follows_each_business_dml(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    events: list[str] = []
+    case = _prepare_materializer_atomicity_case(
+        tmp_path,
+        scenario,
+        statements=events,
+    )
+    bootstrap = case.bootstrap
+    journal = bootstrap._journal
+    try:
+        old_graph = _materializer_storage_graph(journal)
+        events.clear()
+        journal.set_transition_statement_hook(
+            lambda label: events.append(f"hook:{label}")
+        )
+
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            case.selected.frame_id,
+            old_graph[0].revision + 1,
+        )
+
+        assert _classified_materializer_trace(events) == (
+            _expected_materializer_trace(scenario)
+        )
+        _assert_materializer_committed_graph(journal, scenario, case, old_graph)
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "boundary", "occurrence"),
+    _MATERIALIZER_ROLLBACK_CASES,
+)
+def test_materializer_in_process_atomicity_failure_rolls_back_and_retry_commits_once(
+    tmp_path: Path,
+    scenario: str,
+    boundary: str,
+    occurrence: int,
+) -> None:
+    case = _prepare_materializer_atomicity_case(tmp_path, scenario)
+    bootstrap = case.bootstrap
+    selected = case.selected
+    journal = bootstrap._journal
+    try:
+        old_graph = _materializer_storage_graph(journal)
+        observed = 0
+
+        def fail_at_boundary(label: str) -> None:
+            nonlocal observed
+            if label != boundary:
+                return
+            observed += 1
+            if observed == occurrence:
+                raise _InjectedMaterializerFailure(f"{label}:{occurrence}")
+
+        journal.set_transition_statement_hook(fail_at_boundary)
+        with pytest.raises(
+            _InjectedMaterializerFailure,
+            match=rf"^{re.escape(boundary)}:{occurrence}$",
+        ):
+            _materialize(journal)
+
+        assert observed == occurrence
+        assert _materializer_storage_graph(journal) == old_graph
+
+        journal.set_transition_statement_hook(None)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            old_graph[0].revision + 1,
+        )
+        _assert_materializer_committed_graph(journal, scenario, case, old_graph)
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
+def _kill_materializer_at_boundary(
+    store_path: Path,
+    scenario: str,
+    boundary: str,
+    occurrence: int,
+    sequence_path: Path,
+) -> None:
+    transport = (
+        TransportKind.CLASSIC
+        if scenario == _ATOMICITY_H1_CLASSIC_PLAIN
+        else TransportKind.SLIDING
+    )
+    bootstrap = _open_discovery_journal(store_path, transport)
+    journal = bootstrap._journal
+    observed = 0
+
+    def kill_at_boundary(label: str) -> None:
+        nonlocal observed
+        with sequence_path.open("a", encoding="utf-8") as sequence:
+            sequence.write(f"{label}\n")
+            sequence.flush()
+            os.fsync(sequence.fileno())
+        if label == boundary:
+            observed += 1
+            if observed == occurrence:
+                os._exit(_MATERIALIZER_CRASH_EXIT_CODE)
+
+    journal.set_transition_statement_hook(kill_at_boundary)
+    _materialize(journal)
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "boundary", "occurrence"),
+    _MATERIALIZER_CRASH_CASES,
+)
+def test_materializer_crash_boundary_reopens_old_or_complete_new_graph(
+    tmp_path: Path,
+    scenario: str,
+    boundary: str,
+    occurrence: int,
+) -> None:
+    store_path = tmp_path / f"{scenario}-{boundary}-{occurrence}"
+    case = _prepare_materializer_atomicity_case(store_path, scenario)
+    bootstrap = case.bootstrap
+    selected = case.selected
+    old_graph = _materializer_storage_graph(bootstrap._journal)
+    bootstrap.close()
+    sequence_path = store_path / "materializer-hook-sequence.txt"
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_kill_materializer_at_boundary,
+        args=(store_path, scenario, boundary, occurrence, sequence_path),
+    )
+    process.start()
+    process.join(timeout=15)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        pytest.fail("materializer crash-injection child did not exit")
+    observed = tuple(sequence_path.read_text(encoding="utf-8").splitlines())
+    assert (process.exitcode, observed) == (
+        _MATERIALIZER_CRASH_EXIT_CODE,
+        _expected_materializer_hook_prefix(scenario, boundary, occurrence),
+    )
+
+    transport = (
+        TransportKind.CLASSIC
+        if scenario == _ATOMICITY_H1_CLASSIC_PLAIN
+        else TransportKind.SLIDING
+    )
+    reopened = _open_discovery_journal(store_path, transport)
+    journal = reopened._journal
+    try:
+        if boundary == "commit":
+            _assert_materializer_committed_graph(
+                journal,
+                scenario,
+                case,
+                old_graph,
+            )
+            committed_graph = _materializer_storage_graph(journal)
+            assert _materialize(journal) == MaterializeResult(
+                MaterializeStatus.IDLE,
+                None,
+                None,
+            )
+            assert _materializer_storage_graph(journal) == committed_graph
+        else:
+            _assert_materializer_reopened_graph(journal, old_graph)
+            assert _materialize(journal) == MaterializeResult(
+                MaterializeStatus.MATERIALIZED,
+                selected.frame_id,
+                old_graph[0].revision + 1,
+            )
+            _assert_materializer_committed_graph(
+                journal,
+                scenario,
+                case,
+                old_graph,
+            )
+            committed_graph = _materializer_storage_graph(journal)
+            assert _materialize(journal) == MaterializeResult(
+                MaterializeStatus.IDLE,
+                None,
+                None,
+            )
+            assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        reopened.close()
+
+
+def test_materializer_external_write_lock_waits_only_at_writer_and_retry_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+        sqlite_busy_timeout_ms=100,
+    )
+    journal = bootstrap._journal
+    external = sqlite3.connect(
+        bootstrap.database_path,
+        isolation_level=None,
+        timeout=0,
+    )
+    try:
+        selected, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_nonempty=True,
+            global_ready_count=0,
+        )
+        case = _MaterializerAtomicityCase(bootstrap, selected, normalized)
+        old_graph = _materializer_storage_graph(journal)
+        selected_decrypt_scopes: list[str | None] = []
+        real_decrypt = EncryptedRowCodec.decrypt
+
+        def observe_selected_decrypt(
+            codec: EncryptedRowCodec,
+            table: str,
+            primary_key: tuple[str | int | UUID, ...],
+            ciphertext: bytes,
+            digest: bytes,
+            header: bytes = b"",
+        ) -> bytes:
+            if table == "NioIngestFrame" and primary_key == (selected.frame_id,):
+                selected_decrypt_scopes.append(journal._owner._outer_scope)
+            return real_decrypt(
+                codec,
+                table,
+                primary_key,
+                ciphertext,
+                digest,
+                header,
+            )
+
+        monkeypatch.setattr(EncryptedRowCodec, "decrypt", observe_selected_decrypt)
+        external.execute("BEGIN IMMEDIATE")
+        statements.clear()
+        started = time.monotonic()
+        with pytest.raises(
+            (sqlite3.OperationalError, PeeweeOperationalError),
+            match="locked",
+        ):
+            _materialize(journal)
+        elapsed = time.monotonic() - started
+
+        assert 0.075 <= elapsed <= 0.500
+        assert selected_decrypt_scopes == ["read"]
+        assert _materializer_storage_graph(journal) == old_graph
+        assert _materializer_dml(statements) == ()
+
+        external.rollback()
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            old_graph[0].revision + 1,
+        )
+        _assert_materializer_committed_graph(
+            journal,
+            _ATOMICITY_H1_CLASSIC_PLAIN,
+            case,
+            old_graph,
+        )
+    finally:
+        if external.in_transaction:
+            external.rollback()
+        external.close()
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("fence", "error_type"),
+    [
+        pytest.param("revision", JournalConflictError, id="revision"),
+        pytest.param("writer-epoch", LocalProtocolError, id="writer-epoch"),
+    ],
+)
+def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fence: str,
+    error_type: type[BaseException],
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        selected, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_nonempty=True,
+            global_ready_count=0,
+        )
+        case = _MaterializerAtomicityCase(bootstrap, selected, normalized)
+        old_graph = _materializer_storage_graph(journal)
+        old_owner = old_graph[0]
+        raced = False
+        real_journal_write = type(journal._owner).journal_write
+
+        @contextmanager
+        def race_before_writer(owner: object) -> Iterator[None]:
+            nonlocal raced
+            assert owner is journal._owner
+            assert not raced
+            raced = True
+            with sqlite3.connect(journal.database_path) as connection:
+                if fence == "revision":
+                    connection.execute(
+                        "UPDATE NioIngestMeta SET revision = ? WHERE account_id = ?",
+                        (old_owner.revision + 1, journal.account_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE NioIngestMeta SET writer_epoch = ? WHERE account_id = ?",
+                        (str(uuid4()), journal.account_id),
+                    )
+            with real_journal_write(journal._owner):
+                yield
+
+        monkeypatch.setattr(
+            type(journal._owner),
+            "journal_write",
+            race_before_writer,
+        )
+        statements.clear()
+        with pytest.raises(error_type):
+            _materialize(journal)
+        assert raced
+        assert _materializer_dml(statements) == ()
+
+        with sqlite3.connect(journal.database_path) as connection:
+            connection.execute(
+                "UPDATE NioIngestMeta SET revision = ?, writer_epoch = ? "
+                "WHERE account_id = ?",
+                (
+                    old_owner.revision,
+                    str(old_owner.writer_epoch),
+                    journal.account_id,
+                ),
+            )
+        assert _materializer_storage_graph(journal) == old_graph
+
+        monkeypatch.undo()
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            old_owner.revision + 1,
+        )
+        _assert_materializer_committed_graph(
+            journal,
+            _ATOMICITY_H1_CLASSIC_PLAIN,
+            case,
+            old_graph,
+        )
     finally:
         bootstrap.close()
