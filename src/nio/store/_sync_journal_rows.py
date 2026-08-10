@@ -59,8 +59,8 @@ _MAX_STAGED_FRAMES = 256
 _FRAME_CLASSIFICATION_LIMIT = _MAX_STAGED_FRAMES + 1
 _EMPTY_SHA256 = hashlib.sha256(b"").digest()
 _MAX_WORK_PLAINTEXT_BYTES = 1024 * 1024
-_MAX_READY_WORK_COUNT = 2_048
-_MAX_READY_WORK_CANONICAL_BYTES = 16 * 1024 * 1024
+_MAX_HELD_WORK_COUNT = 10_000
+_MAX_HELD_WORK_CANONICAL_BYTES = 32 * 1024 * 1024
 _MAX_TOTAL_WORK_COUNT = 20_000
 _MAX_TOTAL_WORK_CANONICAL_BYTES = 64 * 1024 * 1024
 
@@ -747,8 +747,6 @@ class JournalRows:
 
         storage_rows.sort(key=lambda row: cast("str", row[1]))
         canonical_bytes = 0
-        ready_count = 0
-        ready_bytes = 0
         work: list[AuthenticatedWork] = []
         for row in storage_rows:
             plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
@@ -794,8 +792,6 @@ class JournalRows:
                         or value.provenance is not None
                     ):
                         raise ValueError("READY Work value is invalid")
-                    ready_count += 1
-                    ready_bytes += len(plaintext)
                 elif (
                     (value.room_id, value.membership_epoch, value.room_sequence)
                     != (
@@ -826,11 +822,13 @@ class JournalRows:
                 )
             )
             canonical_bytes += len(plaintext)
+        held = tuple(item for item in work if item.status == "held")
         if (
-            ready_count > _MAX_READY_WORK_COUNT
-            or ready_bytes > _MAX_READY_WORK_CANONICAL_BYTES
+            len(held) > _MAX_HELD_WORK_COUNT
+            or sum(item.canonical_size for item in held)
+            > _MAX_HELD_WORK_CANONICAL_BYTES
         ):
-            raise JournalIntegrityError("READY Work exceeds immutable capacity")
+            raise JournalIntegrityError("HELD Work exceeds immutable capacity")
         if (
             len(storage_rows) > _MAX_TOTAL_WORK_COUNT
             or canonical_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES

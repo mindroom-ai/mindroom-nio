@@ -78,6 +78,7 @@ from nio.ingest.state import SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal import SqliteIngestionJournal
 from nio.store._sync_journal_codec import EncryptedRowCodec
+from nio.store._sync_journal_plan import AuthenticatedWork, plan_frame_materialization
 from nio.store._sync_journal_port import IngestionJournal
 from nio.store._sync_journal_rows import _canonical_internal, _frame_envelope
 from nio.store._sync_journal_values import (
@@ -97,10 +98,19 @@ _LIMIT_DEFAULTS = (
     20_000,
     64 * 1024 * 1024,
 )
+_LIMIT_CEILINGS = (
+    1 * 1024 * 1024,
+    10_000,
+    32 * 1024 * 1024,
+    20_000,
+    64 * 1024 * 1024,
+    20_000,
+    64 * 1024 * 1024,
+)
 _LIMIT_FIELDS = (
     "max_record_canonical_bytes",
-    "max_held_records_per_room",
-    "max_held_canonical_bytes_per_room",
+    "max_held_work_count",
+    "max_held_work_canonical_bytes",
     "max_ready_work_count",
     "max_ready_work_canonical_bytes",
     "max_total_work_count",
@@ -792,31 +802,61 @@ def test_contract_materializer_limits_have_exact_defaults_ceilings_and_strict_ty
 
     limits = values.MaterializerLimits()
     assert tuple(getattr(limits, name) for name in _LIMIT_FIELDS) == _LIMIT_DEFAULTS
-    for field_name in _LIMIT_FIELDS:
-        narrowed = values.MaterializerLimits(**{field_name: 1})
-        assert tuple(getattr(narrowed, name) for name in _LIMIT_FIELDS) == tuple(
-            1 if name == field_name else default
-            for name, default in zip(_LIMIT_FIELDS, _LIMIT_DEFAULTS, strict=True)
-        )
+    for field_name, ceiling in zip(
+        _LIMIT_FIELDS,
+        _LIMIT_CEILINGS,
+        strict=True,
+    ):
+        assert getattr(values.MaterializerLimits(**{field_name: 1}), field_name) == 1
+        at_ceiling = values.MaterializerLimits(**{field_name: ceiling})
+        assert getattr(at_ceiling, field_name) == ceiling
+        with pytest.raises(ValueError, match=r".+"):
+            values.MaterializerLimits(**{field_name: ceiling + 1})
     with pytest.raises(FrozenInstanceError):
         limits.max_total_work_count = 1  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         limits.unknown = 1  # type: ignore[attr-defined]
 
-    for index in range(len(_LIMIT_DEFAULTS)):
-        arguments = list(_LIMIT_DEFAULTS)
-        arguments[index] = True
+    for field_name, default in zip(_LIMIT_FIELDS, _LIMIT_DEFAULTS, strict=True):
         with pytest.raises(TypeError):
-            values.MaterializerLimits(*arguments)
-        arguments[index] = float(_LIMIT_DEFAULTS[index])
+            values.MaterializerLimits(**{field_name: True})
         with pytest.raises(TypeError):
-            values.MaterializerLimits(*arguments)
-        arguments[index] = 0
+            values.MaterializerLimits(**{field_name: float(default)})
         with pytest.raises(ValueError, match=r".+"):
-            values.MaterializerLimits(*arguments)
-        arguments[index] = _LIMIT_DEFAULTS[index] + 1
-        with pytest.raises(ValueError, match=r".+"):
-            values.MaterializerLimits(*arguments)
+            values.MaterializerLimits(**{field_name: 0})
+
+
+def test_materializer_projected_held_count_includes_unrelated_rooms() -> None:
+    frame = _frame(
+        (
+            _ephemeral_envelope(
+                "!segment-a:example.org",
+                {"type": "m.typing"},
+            ),
+        )
+    )
+    existing = EventRecord(
+        str(uuid5(frame.frame_id, "existing-held")),
+        RecordKind.EPHEMERAL,
+        RecordOrigin(TransportKind.CLASSIC, 1, 1, 0),
+        "!unrelated:example.org",
+        0,
+        0,
+        None,
+        None,
+        b'{"type":"m.typing"}',
+        None,
+    )
+
+    with pytest.raises(ValueError, match="HELD Work exceeds.*capacity"):
+        plan_frame_materialization(
+            stream_id=_STREAM_ID,
+            frame=frame,
+            aggregates=(),
+            work=(AuthenticatedWork(existing, "held", 1),),
+            revision=1,
+            limits=replace(MaterializerLimits(), max_held_work_count=1),
+        )
 
 
 def test_contract_materialize_result_enforces_exact_status_fates_and_types() -> None:
@@ -2947,13 +2987,13 @@ def test_materializer_repeated_hydration_preserves_original_intent_and_continuit
             guard.setattr(type(journal._owner), "journal_write", reject_writer)
             with pytest.raises(
                 JournalIntegrityError,
-                match="HELD Work exceeds room capacity",
+                match="HELD Work exceeds global HELD capacity",
             ):
                 _materialize(
                     journal,
                     limits=replace(
                         MaterializerLimits(),
-                        max_held_records_per_room=1,
+                        max_held_work_count=1,
                     ),
                 )
         assert journal.load_owner() == owner_before_capacity
@@ -2968,7 +3008,7 @@ def test_materializer_repeated_hydration_preserves_original_intent_and_continuit
             journal,
             limits=replace(
                 MaterializerLimits(),
-                max_held_records_per_room=2,
+                max_held_work_count=2,
             ),
         ) == MaterializeResult(
             MaterializeStatus.MATERIALIZED,
@@ -3626,6 +3666,123 @@ def test_materializer_global_capacity_catches_partial_plan_or_caller_limited_sca
         bootstrap.close()
 
 
+def test_materializer_held_only_plan_ignores_existing_ready_watermarks(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            global_ready_count=1,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        ready_before = tuple(row for row in _work_rows(journal) if row[2] == "ready")
+        assert len(ready_before) == 2
+
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            room_nonempty=True,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert tuple(item.route for item in proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_HYDRATION,
+        )
+        owner_before = journal.load_owner()
+
+        result = _materialize(
+            journal,
+            limits=replace(
+                MaterializerLimits(),
+                max_ready_work_count=1,
+                max_ready_work_canonical_bytes=1,
+            ),
+        )
+
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            owner_before.revision + 1,
+        )
+        assert tuple(row for row in _work_rows(journal) if row[2] == "ready") == (
+            ready_before
+        )
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("constant_name", "expected", "narrowed"),
+    [
+        ("_MAX_HELD_WORK_COUNT", 10_000, 0),
+        ("_MAX_HELD_WORK_CANONICAL_BYTES", 32 * 1024 * 1024, 1),
+    ],
+    ids=("count", "canonical-bytes"),
+)
+def test_materializer_authenticated_held_inventory_has_one_hard_global_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant_name: str,
+    expected: int,
+    narrowed: int,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path,
+        TransportKind.CLASSIC,
+        statements=statements,
+    )
+    journal = bootstrap._journal
+    try:
+        _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_nonempty=True,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        held_before = tuple(row for row in _work_rows(journal) if row[2] == "held")
+        assert len(held_before) == 1
+
+        staged, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            room_present=True,
+        )
+        owner_before = journal.load_owner()
+        raw_before = _frame_storage_row(journal, staged.frame_id)
+        aggregate_before = _aggregate_rows(journal)
+        work_before = _work_rows(journal)
+        rows_module = _rows()
+        assert getattr(rows_module, constant_name) == expected
+        monkeypatch.setattr(rows_module, constant_name, narrowed)
+        statements.clear()
+
+        with pytest.raises(
+            JournalIntegrityError,
+            match="HELD Work exceeds immutable capacity",
+        ):
+            _materialize(journal)
+
+        assert journal.load_owner() == owner_before
+        assert _frame_storage_row(journal, staged.frame_id) == raw_before
+        assert _aggregate_rows(journal) == aggregate_before
+        assert _work_rows(journal) == work_before
+        assert _materializer_dml(statements) == ()
+    finally:
+        bootstrap.close()
+
+
 @pytest.mark.parametrize(
     ("limit_name", "metric"),
     [
@@ -3710,7 +3867,7 @@ def test_materializer_projected_global_capacity_has_inclusive_caller_boundary(
         bootstrap.close()
 
 
-def test_materializer_existing_inventory_beyond_immutable_ready_bytes_is_corruption(
+def test_materializer_caller_ready_bytes_watermark_is_not_an_integrity_cap(
     tmp_path: Path,
 ) -> None:
     statements: list[str] = []
@@ -3776,8 +3933,11 @@ def test_materializer_existing_inventory_beyond_immutable_ready_bytes_is_corrupt
         work_before = _work_rows(journal)
         statements.clear()
 
-        with pytest.raises(JournalIntegrityError):
-            _materialize(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.AT_CAPACITY,
+            staged.frame_id,
+            None,
+        )
 
         assert journal.load_owner() == owner_before
         assert _frame_storage_row(journal, staged.frame_id) == raw_before
@@ -3787,9 +3947,8 @@ def test_materializer_existing_inventory_beyond_immutable_ready_bytes_is_corrupt
         bootstrap.close()
 
 
-def test_materializer_existing_inventory_beyond_immutable_ready_count_is_corruption(
+def test_materializer_caller_ready_count_watermark_is_not_an_integrity_cap(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     statements: list[str] = []
     bootstrap = _open_discovery_journal(
@@ -3849,12 +4008,11 @@ def test_materializer_existing_inventory_beyond_immutable_ready_count_is_corrupt
         raw_before = _frame_storage_row(journal, staged.frame_id)
         statements.clear()
 
-        def reject_writer(_self: object) -> object:
-            raise AssertionError("immutable ready-count corruption entered writer")
-
-        monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
-        with pytest.raises(JournalIntegrityError):
-            _materialize(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.AT_CAPACITY,
+            staged.frame_id,
+            None,
+        )
 
         assert journal.load_owner() == owner_before
         assert _frame_storage_row(journal, staged.frame_id) == raw_before

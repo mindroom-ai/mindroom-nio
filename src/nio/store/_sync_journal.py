@@ -369,8 +369,8 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("limits must be MaterializerLimits")
         MaterializerLimits(
             limits.max_record_canonical_bytes,
-            limits.max_held_records_per_room,
-            limits.max_held_canonical_bytes_per_room,
+            limits.max_held_work_count,
+            limits.max_held_work_canonical_bytes,
             limits.max_ready_work_count,
             limits.max_ready_work_canonical_bytes,
             limits.max_total_work_count,

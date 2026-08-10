@@ -87,13 +87,15 @@ def plan_frame_materialization(
             room_sequences[room_id] = aggregate.next_room_sequence
             pending_hydrations[room_id] = pending
 
-    room_counts = dict.fromkeys(room_plans, 0)
-    room_bytes = dict.fromkeys(room_plans, 0)
+    held_count = 0
+    held_bytes = 0
     seen_sequences: set[tuple[str, int, int]] = set()
     for item in work:
         value = item.value
         if item.status != "held":
             continue
+        held_count += 1
+        held_bytes += item.canonical_size
         held_room_id = value.room_id
         if held_room_id is None or held_room_id not in room_plans:
             continue
@@ -113,8 +115,6 @@ def plan_frame_materialization(
         if key in seen_sequences:
             raise ValueError("HELD Work does not match its Aggregate")
         seen_sequences.add(key)
-        room_counts[held_room_id] += 1
-        room_bytes[held_room_id] += item.canonical_size
 
     inserts: list[PlannedWork] = []
     planned_ids: set[str] = set()
@@ -174,24 +174,26 @@ def plan_frame_materialization(
         planned_ids.add(work_id)
         inserts.append((value, plaintext, ordinal))
         if descriptor_room_id is not None:
-            room_counts[descriptor_room_id] += 1
-            room_bytes[descriptor_room_id] += len(plaintext)
+            held_count += 1
+            held_bytes += len(plaintext)
 
-    if any(
-        room_counts[room_id] > limits.max_held_records_per_room
-        or room_bytes[room_id] > limits.max_held_canonical_bytes_per_room
-        for room_id in room_plans
+    if (
+        held_count > limits.max_held_work_count
+        or held_bytes > limits.max_held_work_canonical_bytes
     ):
-        raise ValueError("planned HELD Work exceeds room capacity")
+        raise ValueError("planned HELD Work exceeds global HELD capacity")
 
     planned_ready = tuple(item for item in inserts if item[2] is not None)
     existing_ready = tuple(item for item in work if item.status == "ready")
-    if (
+    if planned_ready and (
         len(existing_ready) + len(planned_ready) > limits.max_ready_work_count
         or sum(item.canonical_size for item in existing_ready)
         + sum(len(item[1]) for item in planned_ready)
         > limits.max_ready_work_canonical_bytes
-        or len(work) + len(inserts) > limits.max_total_work_count
+    ):
+        return None
+    if (
+        len(work) + len(inserts) > limits.max_total_work_count
         or sum(item.canonical_size for item in work)
         + sum(len(item[1]) for item in inserts)
         > limits.max_total_work_canonical_bytes

@@ -32,8 +32,8 @@ class MaterializeStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class MaterializerLimits:
     max_record_canonical_bytes: int = 1 * 1024 * 1024
-    max_held_records_per_room: int = 10_000
-    max_held_canonical_bytes_per_room: int = 32 * 1024 * 1024
+    max_held_work_count: int = 10_000
+    max_held_work_canonical_bytes: int = 32 * 1024 * 1024
     max_ready_work_count: int = 2_048
     max_ready_work_canonical_bytes: int = 16 * 1024 * 1024
     max_total_work_count: int = 20_000
@@ -46,8 +46,8 @@ class MaterializerLimits:
                 1 * 1024 * 1024,
                 10_000,
                 32 * 1024 * 1024,
-                2_048,
-                16 * 1024 * 1024,
+                20_000,
+                64 * 1024 * 1024,
                 20_000,
                 64 * 1024 * 1024,
             ),
