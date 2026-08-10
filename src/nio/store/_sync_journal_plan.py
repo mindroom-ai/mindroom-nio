@@ -51,13 +51,13 @@ def _planned_work(
     value: EventRecord | LossRecord,
     ordinal: int | None,
     used_ids: set[str],
-    max_bytes: int,
+    max_bytes: int | None,
 ) -> PlannedWork:
     work_id = _work_id(value)
     plaintext = _canonical_work_plaintext(
         "event" if type(value) is EventRecord else "loss", value
     )
-    if len(plaintext) > max_bytes:
+    if max_bytes is not None and len(plaintext) > max_bytes:
         raise ValueError("planned Work record exceeds the canonical byte limit")
     if work_id in used_ids:
         raise ValueError("planned Work identity collides")
@@ -151,6 +151,18 @@ def plan_frame_materialization(
             room_sequences[room_id] = aggregate.next_room_sequence
             pending_hydrations[room_id] = pending
 
+    candidate = proposal.room_proposals[0] if len(room_plans) == 1 else None
+    capacity_room = (
+        candidate
+        if retirement is None
+        and candidate is not None
+        and candidate.before == candidate.after
+        and candidate.after.room_id in aggregate_by_room
+        and candidate.hydration is not None
+        and candidate.hydration.origin == frame.origin
+        else None
+    )
+
     held_count = 0
     held_bytes = 0
     retired_work: list[EventRecord] = []
@@ -182,12 +194,14 @@ def plan_frame_materialization(
         if key in seen_sequences:
             raise ValueError("HELD Work does not match its Aggregate")
         seen_sequences.add(key)
-        if retirement is not None:
+        if retirement is not None or capacity_room is not None:
             retired_work.append(value)
 
     inserts: list[PlannedWork] = []
     releases: list[tuple[EventRecord, bytes, int]] = []
     ready_ordinal = 0
+    room_additions = 0
+    oversized_room = False
     max_record_bytes = limits.max_record_canonical_bytes
     if retirement is not None:
         before = aggregate_by_room[retirement.after.room_id].continuity
@@ -290,22 +304,80 @@ def plan_frame_materialization(
             descriptor.source_json,
             None,
         )
-        planned = _planned_work(value, ordinal, used_ids, max_record_bytes)
+        planned = _planned_work(value, ordinal, used_ids, None)
+        if len(planned[1]) > max_record_bytes:
+            if descriptor_room_id is None or capacity_room is None:
+                raise ValueError("planned Work record exceeds the canonical byte limit")
+            oversized_room = True
         inserts.append(planned)
         if descriptor_room_id is not None and retirement is None:
+            room_additions += 1
             held_count += 1
             held_bytes += len(planned[1])
 
-    if retirement is None and (
-        held_count > limits.max_held_work_count
-        or held_bytes > limits.max_held_work_canonical_bytes
+    hard = MaterializerLimits()
+    addition_bytes = sum(len(item[1]) for item in inserts)
+    hard_addition = (
+        len(inserts) > hard.max_held_work_count
+        or addition_bytes > hard.max_held_work_canonical_bytes
+    )
+    capacity_reason = None
+    if capacity_room is not None and room_additions:
+        if oversized_room:
+            capacity_reason = LossReason.OVERSIZED_EVENT
+        elif (
+            held_count > limits.max_held_work_count
+            or held_bytes > limits.max_held_work_canonical_bytes
+            or hard_addition
+        ):
+            capacity_reason = LossReason.EVENT_LIMIT
+    if capacity_reason is not None and capacity_room is not None:
+        before = aggregate_by_room[capacity_room.after.room_id].continuity
+        loss = LossRecord(
+            "",
+            frame.origin,
+            before.room_id,
+            before.membership_epoch,
+            capacity_reason,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(loss, loss_id=_loss_id(stream_id, loss))
+        loss_work = _planned_work(loss, 0, used_ids, max_record_bytes)
+        retired_work.sort(key=lambda value: (value.room_sequence or 0, value.record_id))
+        releases = [
+            (value, _canonical_work_plaintext("event", value), ordinal)
+            for ordinal, value in enumerate(retired_work, 1)
+        ]
+        inserts = [loss_work] + [
+            (value, plaintext, index + len(releases) + 1)
+            for index, (value, plaintext, _) in enumerate(
+                item for item in inserts if item[0].room_id is None
+            )
+        ]
+        room_sequences[before.room_id] = aggregate_by_room[
+            before.room_id
+        ].next_room_sequence
+        addition_bytes = sum(len(item[1]) for item in inserts)
+
+    if (
+        retirement is None
+        and capacity_reason is None
+        and room_additions
+        and (
+            held_count > limits.max_held_work_count
+            or held_bytes > limits.max_held_work_canonical_bytes
+        )
     ):
         raise ValueError("planned HELD Work exceeds global HELD capacity")
+    if capacity_reason is None and hard_addition:
+        raise ValueError("selected frame Work exceeds the hard addition envelope")
 
     planned_ready = tuple(item for item in inserts if item[2] is not None)
     existing_ready = tuple(item for item in work if item.status == "ready")
     if (
         retirement is None
+        and capacity_reason is None
         and planned_ready
         and (
             len(existing_ready) + len(planned_ready) > limits.max_ready_work_count
@@ -315,11 +387,10 @@ def plan_frame_materialization(
         )
     ):
         return None
-    addition_bytes = sum(len(item[1]) for item in inserts)
-    capacity = MaterializerLimits() if retirement is not None else limits
-    if retirement is not None and (
-        len(inserts) > capacity.max_held_work_count
-        or addition_bytes > capacity.max_held_work_canonical_bytes
+    capacity = hard if retirement is not None or capacity_reason is not None else limits
+    if capacity_reason is not None and (
+        len(inserts) > hard.max_held_work_count
+        or addition_bytes > hard.max_held_work_canonical_bytes
     ):
         raise ValueError("selected frame Work exceeds the hard addition envelope")
     if len(work) + len(inserts) > capacity.max_total_work_count or (
@@ -330,14 +401,23 @@ def plan_frame_materialization(
 
     room_values = tuple(
         RoomAggregateValue(
-            room.after,
+            (
+                replace(room.after, hydration_id=None)
+                if capacity_reason is not None
+                else room.after
+            ),
             room_sequences[room.after.room_id],
             revision,
-            None if retirement is not None else pending_hydrations[room.after.room_id],
+            (
+                None
+                if retirement is not None or capacity_reason is not None
+                else pending_hydrations[room.after.room_id]
+            ),
         )
         for room in proposal.room_proposals
         if (
-            (stored := aggregate_by_room.get(room.after.room_id)) is None
+            capacity_reason is not None
+            or (stored := aggregate_by_room.get(room.after.room_id)) is None
             or room.after != stored.continuity
             or room_sequences[room.after.room_id] != stored.next_room_sequence
         )
