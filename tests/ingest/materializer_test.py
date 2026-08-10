@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -28,6 +29,7 @@ import nio.ingest.classic as classic_module
 import nio.ingest.ports as ports_module
 import nio.ingest.sliding as sliding_module
 import nio.store as store
+from nio.event_provenance import TimelineEventProvenance
 from nio.exceptions import LocalProtocolError
 from nio.ingest import source
 from nio.ingest.classic import ClassicSource
@@ -56,6 +58,7 @@ from nio.ingest.ports import (
 from nio.ingest.reducer import (
     DescriptorRoute,
     HydrationIntent,
+    LossProposal,
     MembershipBaseline,
     RecoveryGap,
     RecoveryRelease,
@@ -3447,6 +3450,10 @@ def _discovery_body(
     if room_present and not room_nonempty:
         body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
         body["rooms"] = {"!unsupported:example.org": {"membership": room_membership}}
+        if room_ephemeral:
+            extensions["typing"] = {
+                "rooms": {"!unsupported:example.org": ephemeral_event}
+            }
     elif room_nonempty:
         body["lists"] = {RESERVED_ALL_ROOMS_LIST: {"count": 1}}
         body["rooms"] = {
@@ -9055,6 +9062,361 @@ def _assert_materializer_committed_graph(
     _assert_exact_materializer_work(journal, work, expected_work, old_work)
 
 
+def test_materializer_empty_retirement_anchors_lifecycle_before_later_work(
+    tmp_path: Path,
+) -> None:
+    room_id = "!unsupported:example.org"
+    first_origin = RecordOrigin(TransportKind.SLIDING, 0, 0, 0)
+    retirement_origin = RecordOrigin(TransportKind.SLIDING, 0, 1, 0)
+    first_timeline_json = (
+        b'{"content":{"body":"held","msgtype":"m.text"},' b'"type":"m.room.message"}'
+    )
+    ephemeral_json = (
+        b'{"content":{"user_ids":["@friend:example.org"]},' b'"type":"m.typing"}'
+    )
+    global_json = (
+        b'{"content":{"generation":2,"index":0,"padding":""},' b'"type":"m.push_rules"}'
+    )
+    presence_json = (
+        b'{"content":{"presence":"online"},'
+        b'"sender":"@friend:example.org","type":"m.presence"}'
+    )
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.SLIDING)
+    journal = bootstrap._journal
+    try:
+        first, first_normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.SLIDING,
+            1,
+            crypto=True,
+            room_nonempty=True,
+        )
+        first_proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            first.frame_id,
+            first_normalized,
+            (),
+        )
+        assert len(first_proposal.room_proposals) == 1
+        assert len(first_proposal.descriptors) == 1
+        first_room = first_proposal.room_proposals[0]
+        first_descriptor = first_proposal.descriptors[0]
+        expected_hydration_id = uuid5(
+            journal.load_owner().stream_id,
+            f"hydrate:{room_id}:0:{first.frame_id}",
+        )
+        expected_first_continuity = RoomContinuity(
+            room_id,
+            0,
+            "join",
+            None,
+            None,
+            expected_hydration_id,
+        )
+        expected_hydration = HydrationIntent(expected_hydration_id, first_origin)
+        assert first_normalized.origin == first_origin
+        assert first_room.before is None
+        assert first_room.after == expected_first_continuity
+        assert first_room.hydration == expected_hydration
+        assert first_descriptor.kind is RecordKind.TIMELINE
+        assert first_descriptor.room_id == room_id
+        assert first_descriptor.source_json == first_timeline_json
+        assert first_descriptor.provenance is TimelineEventProvenance.HISTORY
+        assert first_descriptor.descriptor_key == f"frame:{first.frame_id}:0"
+        assert first_descriptor.route is DescriptorRoute.HOLD_FOR_HYDRATION
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            first.frame_id,
+            2,
+        )
+
+        aggregate_rows = _aggregate_rows(journal)
+        assert len(aggregate_rows) == 1
+        _, first_aggregate = _decrypt_aggregate(journal, aggregate_rows[0])
+        assert first_aggregate == RoomAggregateValue(
+            expected_first_continuity,
+            1,
+            2,
+            expected_hydration,
+        )
+        first_raw_before = _frame_storage_row(journal, first.frame_id)
+        assert first_raw_before is not None
+        first_work = _work_rows(journal)
+        assert len(first_work) == 1
+        held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:0")),
+            RecordKind.TIMELINE,
+            first_origin,
+            room_id,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            first_timeline_json,
+            None,
+        )
+        assert first_work[0][:10] == (
+            held.record_id,
+            "event",
+            "held",
+            str(first.frame_id),
+            room_id,
+            0,
+            0,
+            None,
+            None,
+            2,
+        )
+        assert _decrypt_event_work(journal, first_work[0]) == (
+            _expected_event_work_plaintext(held),
+            held,
+        )
+
+        selected, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.SLIDING,
+            2,
+            crypto=True,
+            room_present=True,
+            room_ephemeral=True,
+            room_membership="leave",
+            global_ready_count=1,
+        )
+        assert normalized.origin == retirement_origin
+        assert len(normalized.room_segments) == 1
+        segment = normalized.room_segments[0]
+        assert segment.room_id == room_id
+        assert segment.state_json == ()
+        assert segment.timeline_json == ()
+        assert segment.room_account_data_json == ()
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            selected.frame_id,
+            normalized,
+            (first_aggregate.continuity,),
+        )
+        assert len(proposal.room_proposals) == 1
+        room = proposal.room_proposals[0]
+        assert room.before == first_aggregate.continuity
+        expected_continuity = RoomContinuity(
+            room_id,
+            1,
+            "leave",
+            None,
+            None,
+            None,
+        )
+        assert room.after == expected_continuity
+        assert room.retirement_epoch == 0
+        assert room.losses == (
+            LossProposal(
+                room_id,
+                0,
+                LossReason.UNVERIFIABLE,
+                LossBoundary(None, None, None, None),
+            ),
+        )
+        assert room.release is RecoveryRelease.LOSS_THEN_HELD
+        assert tuple(descriptor.kind for descriptor in proposal.descriptors) == (
+            RecordKind.EPHEMERAL,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordKind.PRESENCE,
+        )
+        assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
+            DescriptorRoute.HOLD_FOR_RETIREMENT,
+            DescriptorRoute.READY,
+            DescriptorRoute.READY,
+        )
+        assert tuple(descriptor.room_id for descriptor in proposal.descriptors) == (
+            room_id,
+            None,
+            None,
+        )
+        assert tuple(
+            descriptor.descriptor_key for descriptor in proposal.descriptors
+        ) == (
+            f"frame:{selected.frame_id}:0",
+            f"frame:{selected.frame_id}:1",
+            f"frame:{selected.frame_id}:2",
+        )
+        assert tuple(descriptor.source_json for descriptor in proposal.descriptors) == (
+            ephemeral_json,
+            global_json,
+            presence_json,
+        )
+        assert tuple(descriptor.provenance for descriptor in proposal.descriptors) == (
+            None,
+            None,
+            None,
+        )
+
+        old_graph = _materializer_storage_graph(journal)
+        old_owner, old_source, old_frames, _old_aggregates, old_work = old_graph
+        assert old_owner.revision == 3
+        old_frames_by_id = {str(row[0]): row for row in old_frames}
+        assert old_frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_before = old_frames_by_id[str(selected.frame_id)]
+        assert selected_before[6] is None
+
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            selected.frame_id,
+            4,
+        )
+
+        owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
+        assert owner == replace(old_owner, revision=4)
+        assert source == old_source
+        assert len(aggregates) == 1
+        expected_aggregate = RoomAggregateValue(expected_continuity, 3, 4, None)
+        assert aggregates[0][:3] == (room_id, 4, None)
+        aggregate_plaintext, aggregate = _decrypt_aggregate(journal, aggregates[0])
+        assert aggregate == expected_aggregate
+        assert aggregate_plaintext == _rows()._canonical_room_aggregate_plaintext(
+            expected_aggregate
+        )
+
+        loss_without_id = LossRecord(
+            "",
+            retirement_origin,
+            room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        loss = replace(
+            loss_without_id,
+            loss_id=_loss_id(owner.stream_id, loss_without_id),
+        )
+        lifecycle = EventRecord(
+            str(uuid5(selected.frame_id, f"lifecycle:{room_id}:0:1")),
+            RecordKind.ROOM_LIFECYCLE,
+            retirement_origin,
+            room_id,
+            1,
+            1,
+            None,
+            None,
+            canonical_json(
+                {
+                    "membership": "leave",
+                    "membership_epoch": 1,
+                    "previous_membership_epoch": 0,
+                }
+            ),
+            None,
+        )
+        ephemeral = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:0")),
+            RecordKind.EPHEMERAL,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 0),
+            room_id,
+            1,
+            2,
+            None,
+            None,
+            ephemeral_json,
+            None,
+        )
+        global_account_data = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:1")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_json,
+            None,
+        )
+        presence = EventRecord(
+            str(uuid5(selected.frame_id, f"event:frame:{selected.frame_id}:2")),
+            RecordKind.PRESENCE,
+            RecordOrigin(TransportKind.SLIDING, 0, 1, 2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            presence_json,
+            None,
+        )
+        expected_work = (
+            _ExpectedMaterializerWork(loss, "ready", selected.frame_id, 4, 0, 4),
+            _ExpectedMaterializerWork(held, "ready", first.frame_id, 4, 1, 2),
+            _ExpectedMaterializerWork(
+                lifecycle,
+                "ready",
+                selected.frame_id,
+                4,
+                2,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                ephemeral,
+                "ready",
+                selected.frame_id,
+                4,
+                3,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                global_account_data,
+                "ready",
+                selected.frame_id,
+                4,
+                4,
+                4,
+            ),
+            _ExpectedMaterializerWork(
+                presence,
+                "ready",
+                selected.frame_id,
+                4,
+                5,
+                4,
+            ),
+        )
+        _assert_exact_materializer_work(journal, work, expected_work, old_work)
+        assert tuple(row[8] for row in work) == tuple(range(6))
+        assert tuple(row[6] for row in work[1:4]) == (0, 1, 2)
+
+        frames_by_id = {str(row[0]): row for row in frames}
+        assert frames_by_id[str(first.frame_id)] == first_raw_before
+        selected_after = frames_by_id[str(selected.frame_id)]
+        assert selected_after[:6] == selected_before[:6]
+        assert selected_after[6] == 4
+        assert selected_after[7] != selected_before[7]
+        assert journal.load_frame(first.frame_id) == first
+        assert journal.load_frame(selected.frame_id) == selected
+        assert (
+            EncryptedRowCodec(
+                "discovery-secret",
+                journal.account_id,
+                owner.stream_id,
+            ).decrypt(
+                "NioIngestFrameDrainHeader",
+                (selected.frame_id,),
+                selected_after[7],
+                hashlib.sha256(b"").digest(),
+                header=_canonical_expected_drain_header(selected_after, 4),
+            )
+            == b""
+        )
+
+        committed_graph = _materializer_storage_graph(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.IDLE,
+            None,
+            None,
+        )
+        assert _materializer_storage_graph(journal) == committed_graph
+    finally:
+        bootstrap.close()
+
+
 def _expected_materializer_hook_labels(scenario: str) -> tuple[str, ...]:
     # Both live one-room paths have exactly one Aggregate write. A
     # multi-Aggregate occurrence does not exist at this checkpoint.
@@ -9431,11 +9793,34 @@ def test_materializer_external_write_lock_waits_only_at_writer_and_retry_commits
         bootstrap.close()
 
 
+def _materializer_path_identity(path: Path) -> tuple[int, int]:
+    metadata = path.stat()
+    return metadata.st_dev, metadata.st_ino
+
+
+@contextmanager
+def _replaced_materializer_path_identity(path: Path) -> Iterator[None]:
+    backup = path.with_name(f".{path.name}.materializer-test-backup")
+    assert not backup.exists()
+    os.replace(path, backup)
+    try:
+        if backup.stat().st_size:
+            shutil.copyfile(backup, path)
+        else:
+            path.touch()
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+        os.replace(backup, path)
+
+
 @pytest.mark.parametrize(
     ("fence", "error_type"),
     [
         pytest.param("revision", JournalConflictError, id="revision"),
         pytest.param("writer-epoch", LocalProtocolError, id="writer-epoch"),
+        pytest.param("lock-file", LocalProtocolError, id="lock-file"),
+        pytest.param("database-inode", LocalProtocolError, id="database-inode"),
     ],
 )
 def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
@@ -9462,6 +9847,9 @@ def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
         case = _MaterializerAtomicityCase(bootstrap, selected, normalized)
         old_graph = _materializer_storage_graph(journal)
         old_owner = old_graph[0]
+        lock_path = journal._owner._lock.path
+        old_lock_identity = _materializer_path_identity(lock_path)
+        old_database_identity = _materializer_path_identity(journal.database_path)
         raced = False
         real_journal_write = type(journal._owner).journal_write
 
@@ -9471,6 +9859,12 @@ def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
             assert owner is journal._owner
             assert not raced
             raced = True
+            if fence in {"lock-file", "database-inode"}:
+                path = lock_path if fence == "lock-file" else journal.database_path
+                with _replaced_materializer_path_identity(path):
+                    with real_journal_write(journal._owner):
+                        yield
+                return
             with sqlite3.connect(journal.database_path) as connection:
                 if fence == "revision":
                     connection.execute(
@@ -9495,17 +9889,22 @@ def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
             _materialize(journal)
         assert raced
         assert _materializer_dml(statements) == ()
+        assert _materializer_path_identity(lock_path) == old_lock_identity
+        assert (
+            _materializer_path_identity(journal.database_path) == old_database_identity
+        )
 
-        with sqlite3.connect(journal.database_path) as connection:
-            connection.execute(
-                "UPDATE NioIngestMeta SET revision = ?, writer_epoch = ? "
-                "WHERE account_id = ?",
-                (
-                    old_owner.revision,
-                    str(old_owner.writer_epoch),
-                    journal.account_id,
-                ),
-            )
+        if fence in {"revision", "writer-epoch"}:
+            with sqlite3.connect(journal.database_path) as connection:
+                connection.execute(
+                    "UPDATE NioIngestMeta SET revision = ?, writer_epoch = ? "
+                    "WHERE account_id = ?",
+                    (
+                        old_owner.revision,
+                        str(old_owner.writer_epoch),
+                        journal.account_id,
+                    ),
+                )
         assert _materializer_storage_graph(journal) == old_graph
 
         monkeypatch.undo()
