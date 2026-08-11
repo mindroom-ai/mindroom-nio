@@ -546,3 +546,28 @@ Production accounting is `+297/-0`; tests are `+1,282/-0`. Cumulative
 canary-path production additions after checkpoints 2 and 3 are `+457`, so the
 real executable `IngestionSession` exists before the active `+500` architecture
 review gate as required.
+
+### Hydration-only result handling
+
+Reviewed comparison base: `b6b52374d79308597f947b96531e22bd545446d8`.
+Approved snapshot: `14345602241973c47d1ff48f4955ca21884e682d`.
+
+The production session now consumes one canonically verified pending JOIN
+hydration intent, issues the bounded raw room-state GET without callbacks or a
+database transaction across the await, and atomically installs the verified
+membership baseline while promoting every matching HELD event in stable order.
+Retryable, terminal, cancellation, stale-result, capacity, race, and process-
+death fates preserve either the complete old graph or the complete new graph.
+
+The first review rejected a stale-membership exception and tests that did not
+discriminate the 64 MiB guard or Aggregate/Work snapshot comparisons. The fix
+round added the complete stale-identity matrix, a real 65-row canonical exact/
++1 total boundary, and coherent authenticated Aggregate replacement, Work
+insert, and Work mutation races. Temporary removal of each production guard
+made its focused test fail before the guard was restored.
+
+Independent verification passed 104 hydration/coordinator tests and all 1,176
+ingestion tests. Black, Ruff, targeted mypy, and `git diff --check` passed;
+scoped re-review approved every prior finding. Production accounting is
+`+292/-11`, bringing cumulative canary-path gross additions through checkpoint
+4 to `+749` and leaving `781` lines before the `+1,530` successful-canary gate.
