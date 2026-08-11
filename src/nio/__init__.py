@@ -9,6 +9,7 @@ from .api import (
 from .client import *
 from .event_builders import *
 from .event_provenance import TimelineEventProvenance
+from .ingest.coordinator import *
 from .events import *
 from .exceptions import *
 from .monitors import *

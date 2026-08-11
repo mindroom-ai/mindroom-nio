@@ -4,6 +4,7 @@ import multiprocessing
 import os
 from pathlib import Path
 from typing import Callable
+from uuid import UUID
 
 import pytest
 
@@ -16,6 +17,7 @@ from nio.store.sync_journal_schema import SCHEMA_SQL
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 CRASH_EXIT_CODE = 86
 
 
@@ -51,6 +53,7 @@ def _kill_during_schema(store_path: Path, kill_after: int) -> None:
         source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
         database_name="journal.db",
         schema_statement_hook=_exit_at_statement(kill_after),
     )
@@ -79,10 +82,12 @@ def test_fresh_schema_creation_is_atomic_at_every_statement(
         source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
         database_name="journal.db",
     )
     try:
         assert reopened.schema_version == 1
+        assert reopened._journal.load_owner().consumer_generation == CONSUMER_GENERATION
         assert reopened._journal.load_source() == SourceState(
             0,
             TransportKind.CLASSIC,

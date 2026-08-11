@@ -41,7 +41,6 @@ class RecordKind(StrEnum):
     PRESENCE = "presence"
     TO_DEVICE = "to_device"
     ROOM_LIFECYCLE = "room_lifecycle"
-    DECRYPTION_UPDATE = "decryption_update"
 
 
 class SystemOriginKind(StrEnum):

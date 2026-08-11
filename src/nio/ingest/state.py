@@ -25,6 +25,7 @@ class OwnerView:
     device_id: str
     schema_version: int
     stream_id: UUID
+    consumer_generation: UUID
     transport_kind: TransportKind
     revision: int
     writer_epoch: UUID
@@ -35,6 +36,7 @@ class OwnerView:
         _require_exact(self.device_id, str, "device_id")
         _require_exact(self.schema_version, int, "schema_version")
         _require_exact(self.stream_id, UUID, "stream_id")
+        _require_exact(self.consumer_generation, UUID, "consumer_generation")
         _require_exact(self.transport_kind, TransportKind, "transport_kind")
         _require_nonnegative(self.revision, "revision")
         _require_exact(self.writer_epoch, UUID, "writer_epoch")

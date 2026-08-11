@@ -60,7 +60,6 @@ def test_wire_enums_have_stable_string_values() -> None:
         "PRESENCE": "presence",
         "TO_DEVICE": "to_device",
         "ROOM_LIFECYCLE": "room_lifecycle",
-        "DECRYPTION_UPDATE": "decryption_update",
     }
     assert {member.name: member.value for member in SystemOriginKind} == {
         "FRESH_START": "fresh_start",

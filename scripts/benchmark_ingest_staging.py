@@ -17,17 +17,23 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 CONTROL_COMMIT = "980e53b3a3815592c3bd0dab9e41e2b057e50724"
 MODES = ("legacy_normalization_floor", "classic_legacy_cursor_durability", "candidate")
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "BENCHMARK"
 PICKLE_KEY = "benchmark-secret"
+CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 TRACKED_PATHS = (
+    "src/nio/ingest/source.py",
     "src/nio/ingest/state.py",
     "src/nio/store/_sync_journal.py",
     "src/nio/store/_sync_journal_plan.py",
+    "src/nio/store/_sync_journal_preflight.py",
     "src/nio/store/_sync_journal_rows.py",
+    "src/nio/store/sync_journal.py",
+    "src/nio/store/sync_journal_schema.py",
 )
 SNAPSHOT_PATHS = (
     "scripts/benchmark_ingest_staging.py",
@@ -304,6 +310,7 @@ def _open_journal(path: Path, config, timeout_ms: int, observer=None):
         path,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
         source=config,
         pickle_key=PICKLE_KEY,
         database_name="benchmark.db",

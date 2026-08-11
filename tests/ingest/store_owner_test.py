@@ -10,7 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from peewee import OperationalError as PeeweeOperationalError
@@ -32,6 +32,7 @@ BOB_DEVICE = "BOBDEVICE"
 BOB_CURVE = "T9tOKF+TShsn6mk1zisW2IBsBbTtzDNvw99RBFMJOgI"
 BOB_ONETIME = "6QlQw3mGUveS735k/JDaviuoaih5eEi6S1J65iHjfgU"
 SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 ROOT = Path(__file__).parents[2]
 
 
@@ -40,6 +41,7 @@ def _open(path: Path, statements: list[str] | None = None, *, timeout: int = 2_0
         path,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
         source=SOURCE,
         database_name="journal.db",
         sqlite_busy_timeout_ms=timeout,

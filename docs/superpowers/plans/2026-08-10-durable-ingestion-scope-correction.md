@@ -442,3 +442,75 @@ the full repository at 2,011 passed / 3 skipped. Independent RED and GREEN
 reviews approved the boundary. Production accounting is `+13/-40`, net `-27`;
 tests are `+118/-111`, net `+7`. This consumes 13 of the scope-reduction gross
 addition cap; deletions do not buy headroom.
+
+### Canonical plaintext ingestion rows
+
+Comparison base: `b0e560cf0efc2672f12fed77f8e04c87093c6b5b`
+
+The second scope-reduction sub-checkpoint deletes the ingestion-row AES-GCM
+codec and stores ordered canonical Source, Frame, Aggregate, and Work envelopes
+with exact SHA-256 digests and clear-column equality checks. Frame discovery
+uses a complete global `LIMIT 257` header scan and a digest over the complete
+drain header. Final stored Frame and Work envelopes retain their exact 24 MiB
+and 1 MiB limits, including HELD-to-READY growth. The public `pickle_key`
+surface remains for E2EE.
+
+Tests froze the new topology, canonical bytes, per-field corruption and row-swap
+failures, encrypted-v1 rejection before mutation, exact-limit and one-byte-over
+behavior, capacity accounting, and the existing transaction/crash/race fences.
+Independent final review found that an account-filtered Frame scan could hide a
+corrupt clear `account_id`; two focused RED cases reproduced that through the
+public loader and materializer. The final global bounded scan rejects that row
+through `load_frame`, `list_frames`, and materialization without adding a query
+or changing the six-statement staging fast path.
+
+Final verification passed 301 source-journal tests, 320 materializer tests, 22
+staging-benchmark tests, and the full repository at 2,062 passed / 3 skipped.
+Pre-commit, compileall, and `git diff --check` passed. Independent review found
+no remaining critical, important, or minor issue.
+
+Production accounting from the comparison base is `+271/-402`, net `-131`.
+Cumulative scope-reduction accounting from bound implementation
+`3cc3ca7fe80b1339e01377a42e317d65fa644a12` is `+284/-442`, net `-158`: it
+exactly meets the hard `+284` addition cap and the arithmetic net-reduction envelope,
+but not the `250..415` working net-reduction target. Tests and tooling are
+reported separately at `+4,094/-2,060`, net `+2,034`; the forecast test-line
+reduction did not materialize because the existing AEAD corruption, race, cap,
+and crash matrices were retargeted to the plaintext representation rather than
+removed.
+
+### Pre-HTTP binding and diagnostic crypto fence
+
+Comparison snapshots: nio
+`6ee8b821cd476f609850952a5b6eb73d7e4d2d1b`; MindRoom
+`ae04de40bd20d30741671a19bc97893b3ef052cb`.
+
+MindRoom now owns one inactive per-principal consumer generation and binds the
+exact nio stream with a predicate-owned, idempotent transaction. nio persists
+that canonical generation with its stream/source bootstrap and rejects a
+mismatch before writer-epoch mutation. Exact `m.room.encrypted` timeline input
+is crypto-bearing for both transports and provenance positions. A separate
+diagnostic materializer admits only the Classic one-room hydration shell or one
+plaintext LIVE record; every unsupported route returns stable `BLOCKED` before
+planning or writer entry while retaining the raw Frame.
+
+Independent review found two integrity gaps: a zero-room rejection could mask
+an unrelated corrupt Aggregate, and independent PostgreSQL principals racing
+for one stream could leak a backend uniqueness exception. Focused REDs
+reproduced both. The final implementation authenticates the complete Aggregate
+inventory before diagnostic classification and translates only an exact
+post-rollback unique-stream conflict after confirming the durable owner. A
+first-seen JOIN+LIVE acceptance case and status-specific `BLOCKED` invariant
+were also frozen.
+
+Final verification passed all 1,072 nio ingestion tests and all 442 affected
+MindRoom SQLite/PostgreSQL tests; the latter retained three pre-existing pytest
+marking warnings. Black, Ruff, MindRoom `ty`, and `git diff --check` passed.
+Scoped re-review found every issue addressed with no new critical or important
+breakage.
+
+Production accounting is nio `+105/-9` and MindRoom `+55/-1`, for exactly
+`+160/-10` combined. Tests are `+624/-11`. This consumes 160 of the 500-line
+executable-production-boundary gate from the approved scope-reduction baseline;
+checkpoint 3's `+232..281` forecast reaches `+392..441`, where the real
+`IngestionSession` must exist.

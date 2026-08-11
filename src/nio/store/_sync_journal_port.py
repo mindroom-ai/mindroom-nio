@@ -31,3 +31,10 @@ class IngestionJournal(Protocol):
         *,
         limits: MaterializerLimits,
     ) -> MaterializeResult: ...
+
+    def materialize_oldest_diagnostic_frame(
+        self,
+        *,
+        room_id: str,
+        limits: MaterializerLimits = MaterializerLimits(),
+    ) -> MaterializeResult: ...

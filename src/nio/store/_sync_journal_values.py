@@ -26,6 +26,7 @@ def _require_bounded_positive(
 class MaterializeStatus(StrEnum):
     IDLE = "idle"
     AT_CAPACITY = "at_capacity"
+    BLOCKED = "blocked"
     MATERIALIZED = "materialized"
 
 
@@ -74,9 +75,9 @@ class MaterializeResult:
         if self.status is MaterializeStatus.IDLE:
             if self.frame_id is not None or self.revision is not None:
                 raise ValueError("idle materialization has no frame or revision")
-        elif self.status is MaterializeStatus.AT_CAPACITY:
+        elif self.status in (MaterializeStatus.AT_CAPACITY, MaterializeStatus.BLOCKED):
             if self.frame_id is None or self.revision is not None:
-                raise ValueError("at-capacity materialization has only a frame")
+                raise ValueError(f"{self.status.value.replace('_', '-')} materialization has only a frame")  # fmt: skip
         elif self.frame_id is None or self.revision is None:
             raise ValueError("materialized result requires a frame and revision")
 

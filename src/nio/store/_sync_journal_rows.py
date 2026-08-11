@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 from uuid import UUID
 
 from ..ingest._json import canonical_json, load_internal_json
@@ -19,7 +18,6 @@ from ..ingest.model import (
 from ..ingest.ports import (
     NetworkRequest,
     StagedSourceResponse,
-    _revalidated_staged_source_response,
 )
 from ..ingest.reducer import HydrationIntent, RoomContinuity
 from ..ingest.serialization import (
@@ -28,13 +26,13 @@ from ..ingest.serialization import (
     _origin_to_dict,
     _record_from_dict,
 )
-from ..ingest.source import MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
+from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
     AuthenticatedWork,
     _canonical_work_plaintext,
 )
-from ._sync_journal_preflight import _validate_source_cursor
+from ._sync_journal_preflight import _row, _validate_source_cursor
 from ._sync_journal_values import RoomAggregateValue
 
 if TYPE_CHECKING:
@@ -64,12 +62,12 @@ _FRAME_FIELDS = (
 # keeps account identity classification bounded while detecting corrupt overflow.
 _MAX_STAGED_FRAMES = 256
 _FRAME_CLASSIFICATION_LIMIT = _MAX_STAGED_FRAMES + 1
-_EMPTY_SHA256 = hashlib.sha256(b"").digest()
-_MAX_WORK_PLAINTEXT_BYTES = 1024 * 1024
+_MAX_WORK_PAYLOAD_BYTES = 1024 * 1024
 _MAX_HELD_WORK_COUNT = 10_000
 _MAX_HELD_WORK_CANONICAL_BYTES = 32 * 1024 * 1024
 _MAX_TOTAL_WORK_COUNT = 20_000
 _MAX_TOTAL_WORK_CANONICAL_BYTES = 64 * 1024 * 1024
+_Owner = tuple[str, UUID, TransportKind]
 
 
 def _canonical_internal(value: object) -> bytes:
@@ -93,8 +91,6 @@ def _work_value_from_plaintext(
         raise TypeError("work identity must contain strings")
     if type(plaintext) is not bytes:
         raise TypeError("work plaintext must be bytes")
-    if len(plaintext) > _MAX_WORK_PLAINTEXT_BYTES:
-        raise ValueError("work plaintext exceeds 1 MiB")
     if kind not in ("event", "loss"):
         raise ValueError("unsupported Work kind")
     try:
@@ -325,6 +321,14 @@ def _frame_envelope(frame: StagedFrame) -> dict[str, object]:
     }
 
 
+def _frame_payload(frame: StagedFrame, rev: int, owner: _Owner) -> tuple[bytes, bytes]:
+    value = _canonical_internal(_frame_envelope(frame))
+    stored = _row(owner, "NioIngestFrame", value, header=_frame_header(frame, rev))
+    if len(stored[0]) > MAX_STORED_FRAME_PAYLOAD_BYTES:
+        raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
+    return stored
+
+
 def _frame_response_from_envelope(value: object) -> StagedSourceResponse:
     if type(value) is not dict or tuple(value) != _FRAME_FIELDS:
         raise ValueError("frame authenticated envelope is invalid")
@@ -347,7 +351,6 @@ def _frame_response_from_envelope(value: object) -> StagedSourceResponse:
 def _source_header(source: SourceState) -> bytes:
     return _canonical_internal(
         [
-            source.transport_kind.value,
             source.source_epoch,
             source.next_request_id,
             source.active,
@@ -359,6 +362,7 @@ def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
     request = frame.response.request
     return _canonical_internal(
         [
+            str(frame.frame_id),
             request.source_epoch,
             request.request_id,
             staged_revision,
@@ -366,24 +370,14 @@ def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
     )
 
 
-def _frame_drain_header(
-    source_epoch: int,
-    request_id: int,
-    staged_revision: int,
-    payload_sha256: bytes,
-    payload_ciphertext_length: int,
-    room_materialized_revision: int | None,
+def _frame_drain_sha256(
+    owner: OwnerView,
+    values: tuple[object, ...],
 ) -> bytes:
-    return _canonical_internal(
-        [
-            source_epoch,
-            request_id,
-            staged_revision,
-            base64.b64encode(payload_sha256).decode("ascii"),
-            payload_ciphertext_length,
-            room_materialized_revision,
-        ]
-    )
+    clear = [str(values[0]), *values[1:]]
+    clear[4] = base64.b64encode(cast("bytes", clear[4])).decode()
+    bound = owner.account_id, owner.stream_id, owner.transport_kind
+    return _row(bound, "NioIngestFrameDrainHeader", None, header=tuple(clear))
 
 
 class _FrameDrainRow(NamedTuple):
@@ -394,9 +388,9 @@ class _FrameDrainRow(NamedTuple):
     request_id: int
     staged_revision: int
     payload_sha256: bytes
-    payload_ciphertext_length: int
+    payload_length: int
     room_materialized_revision: int | None
-    drain_header_ciphertext: bytes
+    drain_header_sha256: bytes
 
 
 class _Task3WorkInventory(NamedTuple):
@@ -407,6 +401,9 @@ class _Task3WorkInventory(NamedTuple):
 class JournalRows:
     account_id: str
     device_id: str
+
+    def _payload(self, o: OwnerView, *args: Any, **kwargs: Any) -> Any:
+        return _row((self.account_id, o.stream_id, o.transport_kind), *args, **kwargs)
 
     def _meta(self) -> sqlite3.Row:
         rows = self._execute(  # type: ignore[attr-defined]
@@ -425,6 +422,7 @@ class JournalRows:
                 row["device_id"],
                 row["schema_version"],
                 UUID(row["stream_id"]),
+                UUID(row["consumer_generation"]),
                 TransportKind(cast("str", row["transport_kind"])),
                 row["revision"],
                 UUID(row["writer_epoch"]),
@@ -432,6 +430,8 @@ class JournalRows:
             )
             if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
                 raise ValueError("created_at_ns is invalid")
+            if row["consumer_generation"] != str(owner.consumer_generation):
+                raise ValueError("consumer_generation is not canonical")
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("ingestion owner row is invalid") from error
         if owner.account_id != self.account_id or owner.device_id != self.device_id:
@@ -446,8 +446,8 @@ class JournalRows:
         rows = self._execute(  # type: ignore[attr-defined]
             "SELECT m.*, s.account_id AS joined_source_account_id, "
             "s.source_epoch AS joined_source_epoch, "
-            "s.cursor_ciphertext AS joined_cursor_ciphertext, "
-            "s.cursor_sha256 AS joined_cursor_sha256, "
+            "s.payload AS joined_payload, "
+            "s.payload_sha256 AS joined_payload_sha256, "
             "s.next_request_id AS joined_next_request_id, "
             "s.active AS joined_active FROM NioIngestMeta AS m "
             "CROSS JOIN NioIngestSourceState AS s"
@@ -461,8 +461,8 @@ class JournalRows:
         source_row = {
             "account_id": row["joined_source_account_id"],
             "source_epoch": row["joined_source_epoch"],
-            "cursor_ciphertext": row["joined_cursor_ciphertext"],
-            "cursor_sha256": row["joined_cursor_sha256"],
+            "payload": row["joined_payload"],
+            "payload_sha256": row["joined_payload_sha256"],
             "next_request_id": row["joined_next_request_id"],
             "active": row["joined_active"],
         }
@@ -484,11 +484,11 @@ class JournalRows:
                 row["next_request_id"],
                 bool(active),
             )
-            cursor_json = self._codec.decrypt(  # type: ignore[attr-defined]
+            cursor_json = self._payload(
+                owner,
                 "NioIngestSourceState",
-                (self.account_id,),
-                bytes(row["cursor_ciphertext"]),
-                bytes(row["cursor_sha256"]),
+                row["payload"],
+                row["payload_sha256"],
                 header=_source_header(clear),
             )
             source = SourceState(
@@ -519,28 +519,28 @@ class JournalRows:
                 )
             return self._decode_source_row(rows[0], owner)
 
-    def _write_source(self, source: SourceState) -> sqlite3.Cursor:
+    def _write_source(self, source: SourceState, owner: OwnerView) -> sqlite3.Cursor:
         _validate_source_cursor(source.transport_kind, source.cursor_json)
-        ciphertext, digest = self._codec.seal(  # type: ignore[attr-defined]
+        payload, digest = self._payload(
+            owner,
             "NioIngestSourceState",
-            (self.account_id,),
             source.cursor_json,
             header=_source_header(source),
         )
         return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestSourceState ("
-            "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
+            "account_id, source_epoch, payload, payload_sha256, "
             "next_request_id, active) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account_id) DO UPDATE SET "
             "source_epoch = excluded.source_epoch, "
-            "cursor_ciphertext = excluded.cursor_ciphertext, "
-            "cursor_sha256 = excluded.cursor_sha256, "
+            "payload = excluded.payload, "
+            "payload_sha256 = excluded.payload_sha256, "
             "next_request_id = excluded.next_request_id, "
             "active = excluded.active",
             (
                 self.account_id,
                 source.source_epoch,
-                ciphertext,
+                payload,
                 digest,
                 source.next_request_id,
                 int(source.active),
@@ -564,7 +564,7 @@ class JournalRows:
         self,
         row: Mapping[str, object],
         owner: OwnerView,
-        payload_ciphertext_length: object,
+        payload_length: object,
         *,
         authenticate: bool,
     ) -> _FrameDrainRow:
@@ -576,7 +576,7 @@ class JournalRows:
             staged_revision = row["staged_revision"]
             payload_sha256 = row["payload_sha256"]
             room_materialized_revision = row["room_materialized_revision"]
-            drain_header_ciphertext = row["drain_header_ciphertext"]
+            drain_header_sha256 = row["drain_header_sha256"]
             if (
                 type(account_id) is not str
                 or account_id != self.account_id
@@ -589,12 +589,10 @@ class JournalRows:
                 or staged_revision < 1
                 or type(payload_sha256) is not bytes
                 or len(payload_sha256) != 32
-                or type(payload_ciphertext_length) is not int
-                or not 29
-                <= payload_ciphertext_length
-                <= MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
-                or type(drain_header_ciphertext) is not bytes
-                or len(drain_header_ciphertext) != 29
+                or type(payload_length) is not int
+                or not 0 < payload_length <= MAX_STORED_FRAME_PAYLOAD_BYTES
+                or type(drain_header_sha256) is not bytes
+                or len(drain_header_sha256) != 32
             ):
                 raise ValueError("frame drain columns are invalid")
             if room_materialized_revision is not None and (
@@ -610,26 +608,12 @@ class JournalRows:
                 request_id,
                 staged_revision,
                 payload_sha256,
-                payload_ciphertext_length,
+                payload_length,
                 room_materialized_revision,
-                drain_header_ciphertext,
+                drain_header_sha256,
             )
             if authenticate and (
-                self._codec.decrypt(  # type: ignore[attr-defined]
-                    "NioIngestFrameDrainHeader",
-                    (frame_id,),
-                    drain_header_ciphertext,
-                    _EMPTY_SHA256,
-                    header=_frame_drain_header(
-                        source_epoch,
-                        request_id,
-                        staged_revision,
-                        payload_sha256,
-                        payload_ciphertext_length,
-                        room_materialized_revision,
-                    ),
-                )
-                != b""
+                _frame_drain_sha256(owner, drain_row[2:-1]) != drain_header_sha256
             ):
                 raise ValueError("frame drain header proof is not empty")
             if room_materialized_revision is not None and not (
@@ -651,10 +635,10 @@ class JournalRows:
         rows = self._execute(  # type: ignore[attr-defined]
             "SELECT account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload_sha256, "
-            "LENGTH(payload_ciphertext) AS payload_ciphertext_length, "
-            "room_materialized_revision, drain_header_ciphertext "
-            "FROM NioIngestFrame WHERE account_id = ? LIMIT ?",
-            (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
+            "LENGTH(payload) AS payload_length, "
+            "room_materialized_revision, drain_header_sha256 "
+            "FROM NioIngestFrame LIMIT ?",
+            (_FRAME_CLASSIFICATION_LIMIT,),
         ).fetchall()
         if len(rows) > _MAX_STAGED_FRAMES:
             raise JournalIntegrityError("staged frame count exceeds the 256 frame cap")
@@ -662,7 +646,7 @@ class JournalRows:
             self._decode_frame_drain_row(
                 cast("Mapping[str, object]", row),
                 owner,
-                row["payload_ciphertext_length"],
+                row["payload_length"],
                 authenticate=True,
             )
             for row in rows
@@ -688,12 +672,12 @@ class JournalRows:
         cursor = self._execute(  # type: ignore[attr-defined]
             "SELECT account_id, work_id, kind, status, frame_id, room_id, "
             "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
-            "created_revision, payload_ciphertext, payload_sha256 "
+            "created_revision, payload, payload_sha256 "
             "FROM NioIngestWork WHERE account_id = ? LIMIT 20001",
             (self.account_id,),
         )
         storage_rows: list[tuple[object, ...]] = []
-        framed_payload_bytes = 0
+        payload_bytes = 0
         while (fetched := cursor.fetchone()) is not None:
             row = tuple(fetched)
             try:
@@ -709,7 +693,7 @@ class JournalRows:
                     ready_revision,
                     ready_ordinal,
                     created_revision,
-                    ciphertext,
+                    payload,
                     digest,
                 ) = row
                 if (
@@ -722,8 +706,8 @@ class JournalRows:
                     or status not in ("ready", "held")
                     or type(created_revision) is not int
                     or not 1 <= created_revision <= owner.revision
-                    or type(ciphertext) is not bytes
-                    or not 29 <= len(ciphertext) <= _MAX_WORK_PLAINTEXT_BYTES + 29
+                    or type(payload) is not bytes
+                    or not 0 < len(payload) <= _MAX_WORK_PAYLOAD_BYTES
                     or type(digest) is not bytes
                     or len(digest) != 32
                 ):
@@ -751,10 +735,10 @@ class JournalRows:
             except (AttributeError, TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work row") from error
             storage_rows.append(row)
-            framed_payload_bytes += len(ciphertext) - 29
+            payload_bytes += len(payload)
             if (
                 len(storage_rows) > _MAX_TOTAL_WORK_COUNT
-                or framed_payload_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
+                or payload_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
             ):
                 break
 
@@ -762,14 +746,14 @@ class JournalRows:
         canonical_bytes = 0
         work: list[AuthenticatedWork] = []
         for row in storage_rows:
-            plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
-                "NioIngestWork",
-                (cast("str", row[1]),),
-                cast("bytes", row[11]),
-                cast("bytes", row[12]),
-                header=_canonical_internal(list(row[:11])),
-            )
             try:
+                plaintext = self._payload(
+                    owner,
+                    "NioIngestWork",
+                    row[11],
+                    row[12],
+                    header=_canonical_internal(row[1:11]),
+                )
                 value = _work_value_from_plaintext(
                     owner.stream_id,
                     cast("str", row[1]),
@@ -840,10 +824,10 @@ class JournalRows:
                 AuthenticatedWork(
                     value,
                     cast("Literal['ready', 'held']", row[3]),
-                    len(plaintext),
+                    len(cast("bytes", row[11])),
                 )
             )
-            canonical_bytes += len(plaintext)
+            canonical_bytes += len(cast("bytes", row[11]))
         held = tuple(item for item in work if item.status == "held")
         if (
             len(held) > _MAX_HELD_WORK_COUNT
@@ -865,7 +849,7 @@ class JournalRows:
     ) -> tuple[tuple[object, ...], RoomAggregateValue] | None:
         row = self._execute(  # type: ignore[attr-defined]
             "SELECT account_id, room_id, updated_revision, intent_kind, "
-            "payload_ciphertext, payload_sha256 "
+            "payload, payload_sha256 "
             "FROM NioIngestRoomAggregate WHERE account_id = ? AND room_id = ?",
             (self.account_id, room_id),
         ).fetchone()
@@ -873,23 +857,23 @@ class JournalRows:
             return None
         stored = tuple(row)
         try:
-            account_id, stored_room, revision, kind, ciphertext, digest = stored
+            account_id, stored_room, revision, kind, payload, digest = stored
             if (
                 account_id != self.account_id
                 or stored_room != room_id
                 or type(revision) is not int
                 or not 1 <= revision <= owner.revision
                 or kind not in (None, "hydration")
-                or type(ciphertext) is not bytes
-                or len(ciphertext) < 29
+                or type(payload) is not bytes
+                or not payload
                 or type(digest) is not bytes
                 or len(digest) != 32
             ):
                 raise ValueError("Aggregate columns are invalid")
-            plaintext = self._codec.decrypt(  # type: ignore[attr-defined]
+            plaintext = self._payload(
+                owner,
                 "NioIngestRoomAggregate",
-                (room_id,),
-                ciphertext,
+                payload,
                 digest,
                 header=_canonical_internal([room_id, revision, kind]),
             )
@@ -917,9 +901,9 @@ class JournalRows:
         authenticate: bool,
     ) -> _FrameDrainRow:
         try:
-            payload_ciphertext = row["payload_ciphertext"]
-            if type(payload_ciphertext) is not bytes:
-                raise TypeError("frame payload ciphertext is invalid")
+            payload = row["payload"]
+            if type(payload) is not bytes:
+                raise TypeError("frame payload is invalid")
         except (KeyError, TypeError) as error:
             raise JournalIntegrityError(
                 "persisted frame drain row is invalid"
@@ -927,7 +911,7 @@ class JournalRows:
         return self._decode_frame_drain_row(
             row,
             owner,
-            len(payload_ciphertext),
+            len(payload),
             authenticate=authenticate,
         )
 
@@ -947,27 +931,25 @@ class JournalRows:
             )
             if drain_row.frame_id != frame_id:
                 raise ValueError("selected frame identity changed")
-            payload_ciphertext = row["payload_ciphertext"]
-            assert type(payload_ciphertext) is bytes
-            header = _canonical_internal(
-                [
-                    drain_row.source_epoch,
-                    drain_row.request_id,
-                    drain_row.staged_revision,
-                ]
-            )
-            payload = self._codec.decrypt(  # type: ignore[attr-defined]
+            payload = self._payload(
+                owner,
                 "NioIngestFrame",
-                (frame_id,),
-                payload_ciphertext,
+                row["payload"],
                 drain_row.payload_sha256,
-                header=header,
+                header=_canonical_internal(
+                    [
+                        str(frame_id),
+                        drain_row.source_epoch,
+                        drain_row.request_id,
+                        drain_row.staged_revision,
+                    ]
+                ),
             )
-            envelope = load_internal_json(payload, "frame authenticated envelope")
-            response = _frame_response_from_envelope(envelope)
+            value = load_internal_json(payload, "frame envelope")
+            response = _frame_response_from_envelope(value)
             frame = StagedFrame(frame_id, response, drain_row.staged_revision)
-            if payload != _canonical_internal(_frame_envelope(frame)):
-                raise ValueError("frame authenticated envelope is not canonical")
+            if value != _frame_envelope(frame):
+                raise ValueError("frame envelope is not canonical")
             request = response.request
             if (
                 request.stream_id != owner.stream_id
@@ -978,7 +960,7 @@ class JournalRows:
                 drain_row.source_epoch,
                 drain_row.request_id,
             ):
-                raise ValueError("frame columns do not match authenticated metadata")
+                raise ValueError("frame columns do not match stored metadata")
             return frame
         except JournalIntegrityError:
             raise
@@ -987,8 +969,8 @@ class JournalRows:
 
     def _classify_frame_ids(self) -> frozenset[UUID]:
         rows = self._execute(  # type: ignore[attr-defined]
-            "SELECT frame_id FROM NioIngestFrame WHERE account_id = ? "
-            "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
+            "SELECT CASE account_id WHEN ? THEN frame_id END AS frame_id "
+            "FROM NioIngestFrame LIMIT ?",
             (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
         ).fetchall()
         if len(rows) > _MAX_STAGED_FRAMES:
@@ -1047,50 +1029,38 @@ class JournalRows:
         self,
         frame: StagedFrame,
         staged_revision: int,
+        owner: OwnerView,
+        payload_owner: _Owner,
     ) -> sqlite3.Cursor:
-        stored = StagedFrame(
-            frame.frame_id,
-            _revalidated_staged_source_response(frame.response),
-            staged_revision,
-        )
-        payload = _canonical_internal(_frame_envelope(stored))
-        ciphertext, digest = self._codec.seal(  # type: ignore[attr-defined]
-            "NioIngestFrame",
-            (stored.frame_id,),
-            payload,
-            header=_frame_header(stored, staged_revision),
-        )
-        request = stored.response.request
-        drain_header_ciphertext, empty_sha256 = self._codec.seal(  # type: ignore[attr-defined]
-            "NioIngestFrameDrainHeader",
-            (stored.frame_id,),
-            b"",
-            header=_frame_drain_header(
+        payload, digest = _frame_payload(frame, staged_revision, payload_owner)
+        request = frame.response.request
+        drain_header_sha256 = _frame_drain_sha256(
+            owner,
+            (
+                frame.frame_id,
                 request.source_epoch,
                 request.request_id,
                 staged_revision,
                 digest,
-                len(ciphertext),
+                len(payload),
                 None,
             ),
         )
-        if empty_sha256 != _EMPTY_SHA256:
-            raise JournalIntegrityError("empty drain header proof digest changed")
         return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
-            "staged_revision, payload_ciphertext, payload_sha256, "
-            "room_materialized_revision, drain_header_ciphertext"
+            "staged_revision, payload, payload_sha256, "
+            "room_materialized_revision, drain_header_sha256"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self.account_id,
-                str(stored.frame_id),
+                str(frame.frame_id),
                 request.source_epoch,
                 request.request_id,
                 staged_revision,
-                ciphertext,
+                payload,
                 digest,
                 None,
-                drain_header_ciphertext,
+                drain_header_sha256,
             ),
         )

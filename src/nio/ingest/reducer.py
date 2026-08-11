@@ -7,6 +7,7 @@ from typing import get_args, get_origin
 from uuid import UUID, uuid5
 
 from ..event_provenance import TimelineEventProvenance
+from ._json import canonical_json, load_json
 from .model import LossBoundary, LossReason, RecordKind, RecordOrigin
 from .source import (
     RoomSegment,
@@ -416,6 +417,7 @@ def reduce_staged_frame(
     states = {room.room_id: room for room in rooms}
     plans: dict[str, tuple[RoomProposal, DescriptorRoute]] = {}
     descriptors: list[RecordDescriptor] = []
+    encrypted_timeline = False
 
     for segment in frame.room_segments:
         plan = _plan_room(stream_id, frame, segment, states.get(segment.room_id))
@@ -457,6 +459,13 @@ def reduce_staged_frame(
             append(RecordKind.STATE, segment.room_id, payload)
         history_count = len(segment.timeline_json) - segment.live_event_count
         for index, payload in enumerate(segment.timeline_json):
+            try:
+                event = load_json(payload, "timeline event")
+                if type(event) is not dict or canonical_json(event) != payload:
+                    raise ValueError("timeline event is not a canonical object")
+            except (TypeError, ValueError) as error:
+                raise ReducerInputError("invalid canonical timeline event") from error
+            encrypted_timeline = encrypted_timeline or event.get("type") == "m.room.encrypted"  # fmt: skip
             append(
                 RecordKind.TIMELINE,
                 segment.room_id,
@@ -481,7 +490,8 @@ def reduce_staged_frame(
         append(RecordKind.PRESENCE, None, payload)
     room_proposals = tuple(plans[segment.room_id][0] for segment in frame.room_segments)
     crypto_deferred = (
-        bool(frame.to_device_json)
+        encrypted_timeline
+        or bool(frame.to_device_json)
         or frame.device_list_delta_json != b'{"changed":[],"left":[]}'
         or frame.one_time_key_counts_json != b"{}"
         or frame.unused_fallback_key_types_json not in (b"null", b"[]")

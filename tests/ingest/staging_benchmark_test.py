@@ -47,10 +47,14 @@ FIXTURE_SHA256 = {
 }
 SNAPSHOT_FILES = {
     "scripts/benchmark_ingest_staging.py",
+    "src/nio/ingest/source.py",
     "src/nio/ingest/state.py",
     "src/nio/store/_sync_journal.py",
     "src/nio/store/_sync_journal_plan.py",
+    "src/nio/store/_sync_journal_preflight.py",
     "src/nio/store/_sync_journal_rows.py",
+    "src/nio/store/sync_journal.py",
+    "src/nio/store/sync_journal_schema.py",
     "tests/ingest/staging_benchmark_test.py",
     "tests/ingest/run_staging_benchmark_corpus.py",
     "tests/ingest/source_journal_test.py",

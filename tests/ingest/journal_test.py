@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+from uuid import UUID
 
 from nio.ingest.config import ClassicSourceConfig
 from nio.store import SqliteStore
@@ -8,6 +9,7 @@ from nio.store.sync_journal import open_ingestion_store
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 
 
 def _table_names(path: Path) -> set[str]:
@@ -39,6 +41,7 @@ def test_bootstrap_opens_only_the_matrix_store_e2ee_subset(tmp_path: Path) -> No
         source=CLASSIC_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
         database_name=database_path.name,
     )
 

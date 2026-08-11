@@ -23,11 +23,14 @@ class StoreBootstrap:
         self._journal = journal
         self._store: MatrixStore | None = None
         self._store_revoked = False
+        self._session_claimed = False
 
     @contextmanager
     def _claim_store(self, store: MatrixStore) -> Iterator[None]:
         with self._journal._owner.read():
             pass
+        if self._session_claimed:
+            raise LocalProtocolError("StoreBootstrap belongs to an ingestion session")
         if self._store is not None:
             raise LocalProtocolError("StoreBootstrap can open MatrixStore only once")
         self._store = store
@@ -36,6 +39,14 @@ class StoreBootstrap:
         except BaseException:
             self._store = None
             raise
+
+    def _claim_session(self) -> _SqliteIngestionJournal:
+        with self._journal._owner.read():
+            pass
+        if self._session_claimed or self._store is not None:
+            raise LocalProtocolError("StoreBootstrap already has a store or session")
+        self._session_claimed = True
+        return self._journal
 
     @property
     def database_path(self) -> Path:
@@ -79,6 +90,7 @@ def open_ingestion_store(
     *,
     account_id: str,
     device_id: str,
+    consumer_generation: UUID,
     source: SourceConfig,
     pickle_key: str = "",
     database_name: str = "",
@@ -87,12 +99,15 @@ def open_ingestion_store(
     transition_statement_hook: Callable[[str], None] | None = None,
     schema_statement_hook: Callable[[str], None] | None = None,
 ) -> StoreBootstrap:
+    if type(consumer_generation) is not UUID:
+        raise TypeError("consumer_generation must be UUID")
     source_transport(source)
     database_name = database_name or f"{account_id}_{device_id}.db"
     journal = _SqliteIngestionJournal.open(
         Path(store_path) / database_name,
         account_id=account_id,
         device_id=device_id,
+        consumer_generation=consumer_generation,
         source=source,
         pickle_key=pickle_key,
         sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,

@@ -13,6 +13,9 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     stream_id TEXT NOT NULL CHECK (
         typeof(stream_id) = 'text' AND length(stream_id) > 0
     ),
+    consumer_generation TEXT NOT NULL CHECK (
+        typeof(consumer_generation) = 'text' AND length(consumer_generation) > 0
+    ),
     transport_kind TEXT NOT NULL CHECK (
         typeof(transport_kind) = 'text'
         AND length(transport_kind) > 0
@@ -39,12 +42,7 @@ SCHEMA_SQL = (
     source_epoch INTEGER NOT NULL CHECK (
         typeof(source_epoch) = 'integer' AND source_epoch >= 0
     ),
-    cursor_ciphertext BLOB NOT NULL CHECK (
-        typeof(cursor_ciphertext) = 'blob' AND length(cursor_ciphertext) >= 29
-    ),
-    cursor_sha256 BLOB NOT NULL CHECK (
-        typeof(cursor_sha256) = 'blob' AND length(cursor_sha256) = 32
-    ),
+    payload BLOB NOT NULL CHECK ( typeof(payload) = 'blob' AND length(payload) > 0 ), payload_sha256 BLOB NOT NULL CHECK ( typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32 ),
     next_request_id INTEGER NOT NULL CHECK (
         typeof(next_request_id) = 'integer' AND next_request_id >= 0
     ),
@@ -67,11 +65,7 @@ SCHEMA_SQL = (
     staged_revision INTEGER NOT NULL CHECK (
         typeof(staged_revision) = 'integer' AND staged_revision >= 1
     ),
-    payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob'
-        AND length(payload_ciphertext) >= 29
-        AND length(payload_ciphertext) <= 24 * 1024 * 1024
-    ),
+    payload BLOB NOT NULL CHECK ( typeof(payload) = 'blob' AND length(payload) > 0 AND length(payload) <= 24 * 1024 * 1024 ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
     ),
@@ -80,10 +74,7 @@ SCHEMA_SQL = (
         (typeof(room_materialized_revision) = 'integer'
          AND room_materialized_revision >= 1)
     ),
-    drain_header_ciphertext BLOB NOT NULL CHECK (
-        typeof(drain_header_ciphertext) = 'blob'
-        AND length(drain_header_ciphertext) = 29
-    ),
+    drain_header_sha256 BLOB NOT NULL CHECK ( typeof(drain_header_sha256) = 'blob' AND length(drain_header_sha256) = 32 ),
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
     account_id, staged_revision, source_epoch, request_id, frame_id)""",
@@ -102,10 +93,7 @@ SCHEMA_SQL = (
         (typeof(intent_kind) = 'text'
          AND intent_kind IN ('recovery','hydration'))
     ),
-    payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob'
-        AND length(payload_ciphertext) >= 29
-    ),
+    payload BLOB NOT NULL CHECK ( typeof(payload) = 'blob' AND length(payload) > 0 ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
     ),
@@ -147,11 +135,7 @@ SCHEMA_SQL = (
     created_revision INTEGER NOT NULL CHECK (
         typeof(created_revision) = 'integer' AND created_revision >= 1
     ),
-    payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob'
-        AND length(payload_ciphertext) >= 29
-        AND length(payload_ciphertext) <= 1024 * 1024 + 29
-    ),
+    payload BLOB NOT NULL CHECK ( typeof(payload) = 'blob' AND length(payload) > 0 AND length(payload) <= 1024 * 1024 ),
     payload_sha256 BLOB NOT NULL CHECK (
         typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
     ),

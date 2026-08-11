@@ -1,4 +1,5 @@
 from ..event_provenance import TimelineEventProvenance
+from . import coordinator as _coordinator
 from .errors import BatchIntegrityError
 from .model import (
     BatchRef,
@@ -19,6 +20,7 @@ from .model import (
     TransportKind,
 )
 from .serialization import canonical_batch_payload
+from .coordinator import *
 
 __all__ = (
     "BatchIntegrityError",
@@ -40,4 +42,5 @@ __all__ = (
     "TimelineEventProvenance",
     "TransportKind",
     "canonical_batch_payload",
+    *_coordinator.__all__,
 )

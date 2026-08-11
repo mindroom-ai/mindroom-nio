@@ -387,6 +387,41 @@ def test_crypto_deferred_uses_only_source_certified_empty_controls(changes) -> N
     )
 
 
+@pytest.mark.parametrize("transport", tuple(TransportKind))
+@pytest.mark.parametrize("timeline_index", (0, 1), ids=("history", "live"))
+def test_encrypted_timeline_is_crypto_deferred_for_every_transport_and_position(
+    transport: TransportKind,
+    timeline_index: int,
+) -> None:
+    frame = _mixed_frame()
+    timeline = list(frame.room_segments[0].timeline_json)
+    timeline[timeline_index] = b'{"type":"m.room.encrypted"}'
+    segment = replace(frame.room_segments[0], timeline_json=tuple(timeline))
+    frame = replace(
+        frame,
+        origin=replace(frame.origin, transport=transport),
+        room_segments=(segment,),
+    )
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (_state(),))
+
+    assert proposal.crypto_deferred is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (b"not-json", b"[]", b'{"type": "m.room.encrypted"}'),
+    ids=("invalid-json", "not-object", "noncanonical"),
+)
+def test_invalid_timeline_carrier_fails_reduction(payload: bytes) -> None:
+    frame = _mixed_frame()
+    segment = replace(frame.room_segments[0], timeline_json=(payload,))
+    frame = replace(frame, room_segments=(segment,))
+
+    with pytest.raises(ReducerInputError, match="timeline"):
+        reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (_state(),))
+
+
 def test_membership_first_room_segment_hydrates_without_prior_continuity() -> None:
     frame = _mixed_frame()
 

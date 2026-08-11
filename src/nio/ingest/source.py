@@ -28,7 +28,7 @@ from .ports import (
 from .state import SourceState, StagedFrame
 
 MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES = _MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
-MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES = 24 * 1024 * 1024
+MAX_STORED_FRAME_PAYLOAD_BYTES = 24 * 1024 * 1024
 
 
 def require_json_object(value: Any, field_name: str) -> dict[str, Any]:

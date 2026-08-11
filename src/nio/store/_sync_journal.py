@@ -8,6 +8,8 @@ from uuid import UUID
 
 from peewee import IntegrityError, SqliteDatabase
 
+from ..event_provenance import TimelineEventProvenance
+from ..ingest import reducer as ingest_reducer
 from ..ingest.classic import ClassicSource
 from ..ingest.config import (
     ClassicSourceConfig,
@@ -16,17 +18,16 @@ from ..ingest.config import (
     source_transport,
 )
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
-from ..ingest.model import EventRecord, TransportKind
+from ..ingest.model import EventRecord, RecordKind, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
 from ..ingest.sliding import SlidingSource
 from ..ingest.source import (
-    MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES,
+    RoomSection,
     SyncFrame,
     _frame_room_ids,
     renormalize_staged_frame,
 )
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
-from ._sync_journal_codec import EncryptedRowCodec
 from ._sync_journal_plan import _work_id, plan_frame_materialization
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
@@ -36,8 +37,9 @@ from ._sync_journal_rows import (
     JournalRows,
     _canonical_internal,
     _canonical_room_aggregate_plaintext,
-    _frame_drain_header,
+    _frame_drain_sha256,
     _frame_envelope,
+    _frame_payload,
 )
 from ._sync_journal_values import (
     MaterializeResult,
@@ -47,6 +49,22 @@ from ._sync_journal_values import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+
+# fmt: off
+def _diagnostic_admits(room_id: str, frame: SyncFrame, proposal: ingest_reducer.FrameProposal) -> bool:
+    segments, rooms, descriptors = frame.room_segments, proposal.room_proposals, proposal.descriptors
+    if len(segments) != 1 or len(rooms) != 1:
+        return False
+    segment, room = segments[0], rooms[0]
+    before, after = room.before, room.after
+    if frame.origin.transport is not TransportKind.CLASSIC or proposal.crypto_deferred or segment.room_id != room_id or segment.section is not RoomSection.JOIN or after.room_id != room_id or after.membership != "join" or after.gap is not None or room.recovery is not None or room.retirement_epoch is not None or room.losses or room.release is not ingest_reducer.RecoveryRelease.NONE or before is not None and (before.membership_epoch != after.membership_epoch or before.membership != after.membership):
+        return False
+    if not descriptors:
+        return room.hydration is not None and after.hydration_id is not None
+    descriptor = descriptors[0]
+    return len(descriptors) == 1 and descriptor.kind is RecordKind.TIMELINE and descriptor.room_id == room_id and descriptor.provenance is TimelineEventProvenance.LIVE and descriptor.route in (ingest_reducer.DescriptorRoute.HOLD_FOR_HYDRATION, ingest_reducer.DescriptorRoute.READY)
+# fmt: on
 
 
 class SqliteIngestionJournal(JournalRows):
@@ -71,7 +89,6 @@ class SqliteIngestionJournal(JournalRows):
         self.writer_epoch = writer_epoch
         self._owner = owner
         self._transition_statement_hook = transition_statement_hook
-        self._codec = EncryptedRowCodec(pickle_key, account_id, stream_id)
 
     @classmethod
     def open(
@@ -80,6 +97,7 @@ class SqliteIngestionJournal(JournalRows):
         *,
         account_id: str,
         device_id: str,
+        consumer_generation: UUID,
         source: SourceConfig,
         pickle_key: str = "",
         sqlite_busy_timeout_ms: int = 2_000,
@@ -91,6 +109,8 @@ class SqliteIngestionJournal(JournalRows):
             raise TypeError("account_id must be a nonempty str")
         if type(device_id) is not str or not device_id:
             raise TypeError("device_id must be a nonempty str")
+        if type(consumer_generation) is not UUID:
+            raise TypeError("consumer_generation must be UUID")
         if type(pickle_key) is not str:
             raise TypeError("pickle_key must be str")
         source_transport(source)
@@ -101,7 +121,7 @@ class SqliteIngestionJournal(JournalRows):
             database,
             account_id=account_id,
             device_id=device_id,
-            pickle_key=pickle_key,
+            consumer_generation=consumer_generation,
             source=source,
             sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
             statement_observer=statement_observer,
@@ -272,11 +292,18 @@ class SqliteIngestionJournal(JournalRows):
         frame: StagedFrame,
     ) -> CommitResult:
         proposed, frame = self._reconstruct_stage(source, frame)
-        if (
-            len(_canonical_internal(_frame_envelope(frame))) + 29
-            > MAX_ENCRYPTED_STAGED_FRAME_ENVELOPE_BYTES
-        ):
+        if len(_canonical_internal(_frame_envelope(frame))) > 24 * 1024 * 1024:
             raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
+        request = frame.response.request
+        payload_owner = self.account_id, request.stream_id, request.transport
+        try:
+            _frame_payload(frame, 2**63 - 1, payload_owner)
+        except JournalIntegrityError:
+            with self._read():
+                preflight_owner = self.load_owner()
+                stored = self._load_frame_with_owner(frame.frame_id, preflight_owner)
+                if stored is None or stored.response != frame.response:
+                    _frame_payload(frame, preflight_owner.revision + 1, payload_owner)
 
         with self._transaction():
             owner, current = self._load_stage_snapshot()
@@ -317,6 +344,7 @@ class SqliteIngestionJournal(JournalRows):
                 )
 
             new_revision = read_revision + 1
+            _frame_payload(frame, new_revision, payload_owner)
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
                 "UPDATE NioIngestMeta SET revision = ? "
@@ -331,10 +359,10 @@ class SqliteIngestionJournal(JournalRows):
             if cursor.rowcount != 1:
                 raise JournalConflictError("journal stage compare-and-swap failed")
 
-            self._write_source(proposed)
+            self._write_source(proposed, owner)
             self._transition_hook("source_state_upsert")
             try:
-                self._write_frame(frame, new_revision)
+                self._write_frame(frame, new_revision, owner, payload_owner)
             except (sqlite3.IntegrityError, IntegrityError) as error:
                 raise JournalIntegrityError("staged frame insert collided") from error
             self._transition_hook("frame_insert")
@@ -346,6 +374,16 @@ class SqliteIngestionJournal(JournalRows):
         *,
         limits: MaterializerLimits,
     ) -> MaterializeResult:
+        return self._materialize_oldest_frame(limits, None)
+
+    # fmt: off
+    def materialize_oldest_diagnostic_frame(self, *, room_id: str, limits: MaterializerLimits = MaterializerLimits()) -> MaterializeResult:
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        return self._materialize_oldest_frame(limits, room_id)
+
+    def _materialize_oldest_frame(self, limits: MaterializerLimits, diagnostic_room_id: str | None) -> MaterializeResult:
+        # fmt: on
         if type(limits) is not MaterializerLimits:
             raise TypeError("limits must be MaterializerLimits")
         MaterializerLimits(
@@ -395,6 +433,9 @@ class SqliteIngestionJournal(JournalRows):
             try:
                 normalized = self._renormalized_frame(owner, staged)
                 aggregate_rooms = _frame_room_ids(normalized)
+                if diagnostic_room_id is not None:
+                    for row in self._execute("SELECT room_id FROM NioIngestRoomAggregate WHERE account_id = ?", (self.account_id,)).fetchall():  # fmt: skip
+                        self._load_room_aggregate(owner, cast("str", row[0]))
                 aggregate_snapshot = tuple(
                     (room_id, self._load_room_aggregate(owner, room_id))
                     for room_id in aggregate_rooms
@@ -410,7 +451,8 @@ class SqliteIngestionJournal(JournalRows):
                     if loaded is not None
                 )
                 needs_inventory = bool(
-                    aggregate_rooms
+                    diagnostic_room_id is not None
+                    or aggregate_rooms
                     or normalized.global_account_data_json
                     or normalized.presence_json
                 )
@@ -418,13 +460,20 @@ class SqliteIngestionJournal(JournalRows):
                     self._load_task3_work_inventory(owner) if needs_inventory else None
                 )
                 new_revision = read_revision + 1
+# fmt: off
+                proposal = ingest_reducer.reduce_staged_frame(owner.stream_id, normalized.frame_id, normalized, tuple(a.continuity for a in aggregates))
+                if diagnostic_room_id is not None and not _diagnostic_admits(diagnostic_room_id, normalized, proposal):
+                    return MaterializeResult(MaterializeStatus.BLOCKED, selected.frame_id, None)
+# fmt: on
                 plan = plan_frame_materialization(
+                    account_id=self.account_id,
                     stream_id=owner.stream_id,
                     frame=normalized,
                     aggregates=aggregates,
                     work=inventory.work if inventory is not None else (),
                     revision=new_revision,
                     limits=limits,
+                    proposal=proposal,
                 )
             except (TypeError, ValueError) as error:
                 raise JournalIntegrityError(str(error)) from error
@@ -440,9 +489,9 @@ class SqliteIngestionJournal(JournalRows):
                 room_id = aggregate_value.continuity.room_id
                 intent_kind = "hydration" if aggregate_value.pending_hydration else None
                 plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
-                ciphertext, digest = self._codec.seal(
+                payload, digest = self._payload(
+                    owner,
                     "NioIngestRoomAggregate",
-                    (room_id,),
                     plaintext,
                     header=_canonical_internal([room_id, new_revision, intent_kind]),
                 )
@@ -452,15 +501,15 @@ class SqliteIngestionJournal(JournalRows):
                         room_id,
                         new_revision,
                         intent_kind,
-                        ciphertext,
+                        payload,
                         digest,
                     )
                 )
 
             planned_rows: list[tuple[object, ...]] = []
             for value, plaintext, ordinal in plan.work_inserts:
-                is_event = isinstance(value, EventRecord)
                 work_id = _work_id(value)
+                is_event = isinstance(value, EventRecord)
                 kind = "event" if is_event else "loss"
                 room_sequence = (
                     value.room_sequence if isinstance(value, EventRecord) else None
@@ -478,15 +527,13 @@ class SqliteIngestionJournal(JournalRows):
                     ordinal,
                     new_revision,
                 )
-                ciphertext, digest = self._codec.seal(
+                payload, digest = self._payload(
+                    owner,
                     "NioIngestWork",
-                    (work_id,),
                     plaintext,
-                    header=_canonical_internal([self.account_id, *clear_values]),
+                    header=_canonical_internal(clear_values),
                 )
-                planned_rows.append(
-                    (self.account_id, *clear_values, ciphertext, digest)
-                )
+                planned_rows.append((self.account_id, *clear_values, payload, digest))
 
             stored_rows = inventory.storage_rows if inventory is not None else ()
             storage_by_id = {row[1]: row for row in stored_rows}
@@ -494,14 +541,13 @@ class SqliteIngestionJournal(JournalRows):
             for value, plaintext, ordinal in plan.work_releases:
                 old = storage_by_id[value.record_id]
                 clear = (*old[1:3], "ready", *old[4:8], new_revision, ordinal, old[10])
-                ciphertext = self._codec.encrypt(
+                payload, digest = self._payload(
+                    owner,
                     "NioIngestWork",
-                    (value.record_id,),
                     plaintext,
-                    digest=cast("bytes", old[12]),
-                    header=_canonical_internal([self.account_id, *clear]),
+                    header=_canonical_internal(clear),
                 )
-                planned_releases.append((ordinal, ciphertext, value.record_id))
+                planned_releases.append((ordinal, payload, digest, value.record_id))
 
         with self._transaction():
             write_owner = self._decode_owner_row(
@@ -564,7 +610,7 @@ class SqliteIngestionJournal(JournalRows):
                         aggregate_cursor = self._transition_execute(
                             "aggregate_update",
                             "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
-                            "intent_kind = ?, payload_ciphertext = ?, "
+                            "intent_kind = ?, payload = ?, "
                             "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
                             (*row[2:], row[0], row[1]),
                         )
@@ -573,7 +619,7 @@ class SqliteIngestionJournal(JournalRows):
                             "aggregate_insert",
                             "INSERT INTO NioIngestRoomAggregate("
                             "account_id, room_id, updated_revision, intent_kind, "
-                            "payload_ciphertext, payload_sha256) "
+                            "payload, payload_sha256) "
                             "VALUES (?, ?, ?, ?, ?, ?)",
                             row,
                         )
@@ -587,7 +633,7 @@ class SqliteIngestionJournal(JournalRows):
                         "INSERT INTO NioIngestWork("
                         "account_id, work_id, kind, status, frame_id, room_id, "
                         "membership_epoch, room_sequence, ready_revision, "
-                        "ready_ordinal, created_revision, payload_ciphertext, "
+                        "ready_ordinal, created_revision, payload, "
                         "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
                         "?, ?, ?, ?)",
                         row,
@@ -598,9 +644,10 @@ class SqliteIngestionJournal(JournalRows):
                     work_cursor = self._transition_execute(
                         "work_release",
                         "UPDATE NioIngestWork SET status = 'ready', "
-                        "ready_revision = ?, ready_ordinal = ?, payload_ciphertext = ? "
+                        "ready_revision = ?, ready_ordinal = ?, payload = ?, "
+                        "payload_sha256 = ? "
                         "WHERE account_id = ? AND work_id = ? AND status = 'held'",
-                        (new_revision, row[0], row[1], self.account_id, row[2]),
+                        (new_revision, row[0], row[1], row[2], self.account_id, row[3]),
                     )
                     if work_cursor.rowcount != 1:
                         raise JournalIntegrityError("Work release did not update a row")
@@ -615,35 +662,23 @@ class SqliteIngestionJournal(JournalRows):
                 write_selected_row["source_epoch"],
                 write_selected_row["request_id"],
                 write_selected_row["staged_revision"],
-                write_selected_row["payload_ciphertext"],
+                write_selected_row["payload"],
                 write_selected_row["payload_sha256"],
-                write_selected_row["drain_header_ciphertext"],
+                write_selected_row["drain_header_sha256"],
             )
             snapshot_where = (
                 "account_id = ? AND frame_id = ? AND source_epoch = ? "
                 "AND request_id = ? AND staged_revision = ? "
-                "AND payload_ciphertext = ? AND payload_sha256 = ? "
+                "AND payload = ? AND payload_sha256 = ? "
                 "AND room_materialized_revision IS NULL "
-                "AND drain_header_ciphertext = ?"
+                "AND drain_header_sha256 = ?"
             )
             if plan.crypto_deferred:
-                proof = self._codec.encrypt(
-                    "NioIngestFrameDrainHeader",
-                    (selected.frame_id,),
-                    b"",
-                    header=_frame_drain_header(
-                        selected.source_epoch,
-                        selected.request_id,
-                        selected.staged_revision,
-                        selected.payload_sha256,
-                        selected.payload_ciphertext_length,
-                        new_revision,
-                    ),
-                )
+                proof = _frame_drain_sha256(write_owner, (*selected[2:8], new_revision))
                 frame_cursor = self._transition_execute(
                     "frame_crypto_retain",
                     "UPDATE NioIngestFrame SET room_materialized_revision = ?, "
-                    "drain_header_ciphertext = ? WHERE " + snapshot_where,
+                    "drain_header_sha256 = ? WHERE " + snapshot_where,
                     (new_revision, proof, *row_predicate),
                 )
             else:

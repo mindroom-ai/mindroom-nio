@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -7,7 +8,7 @@ import time
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from peewee import DatabaseError as PeeweeDatabaseError
@@ -15,6 +16,7 @@ from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..exceptions import LocalProtocolError
+from ..ingest._json import load_internal_json
 from ..ingest.config import (
     ClassicSourceConfig,
     SlidingSourceConfig,
@@ -37,7 +39,6 @@ from ..ingest.source import (
 from ..ingest.state import SourceState
 from ._ingestion_store_owner import IngestionStoreOwner
 from ._ingestion_store_owner import StableFileLock as StableFileLock
-from ._sync_journal_codec import EncryptedRowCodec
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
@@ -229,10 +230,50 @@ def _canonical_internal(value: object) -> bytes:
     ).encode("utf-8")
 
 
+_STORED_ROWS = {
+    "NioIngestSourceState": "source source_epoch next_request_id active",
+    "NioIngestFrame": "frame frame_id source_epoch request_id staged_revision",
+    "NioIngestFrameDrainHeader": "frame frame_id source_epoch request_id staged_revision payload_sha256 payload_length room_materialized_revision",
+    "NioIngestRoomAggregate": "aggregate room_id updated_revision intent_kind",
+    "NioIngestWork": "work work_id kind status frame_id room_id membership_epoch room_sequence ready_revision ready_ordinal created_revision",
+}
+
+
+def _row(
+    owner: tuple[str, UUID, TransportKind],
+    table: str,
+    value: Any,
+    digest: object = None,
+    header: bytes | tuple[object, ...] = b"",
+) -> Any:
+    if digest is not None:
+        envelope = load_internal_json(value, "stored payload")
+        payload, value = value, _canonical_internal(dict.get(envelope, "value"))
+    kind, *fields = _STORED_ROWS[table].split()
+    clear = [*header] if isinstance(header, tuple) else load_internal_json(header, kind)
+    prefix = _canonical_internal(
+        {
+            "schema_version": 1,
+            "row_kind": kind,
+            "account_id": owner[0],
+            "stream_id": str(owner[1]),
+            "transport_kind": owner[2].value,
+            **dict(zip(fields, clear, strict=True)),
+        }
+    )
+    if value is None:
+        return hashlib.sha256(prefix).digest()
+    expected = prefix[:-1] + b',"value":' + value + b"}"
+    if digest is None:
+        return expected, hashlib.sha256(expected).digest()
+    if hashlib.sha256(payload).digest() != digest or payload != expected:
+        raise ValueError("stored payload is not canonical")
+    return value
+
+
 def _source_header(source: SourceState) -> bytes:
     return _canonical_internal(
         [
-            source.transport_kind.value,
             source.source_epoch,
             source.next_request_id,
             source.active,
@@ -244,7 +285,7 @@ def _create_fresh(
     connection: SqliteDatabase,
     account_id: str,
     device_id: str,
-    pickle_key: str,
+    consumer_generation: UUID,
     source: SourceConfig,
     writer_epoch: UUID,
     statement_hook: Callable[[str], None] | None,
@@ -258,13 +299,10 @@ def _create_fresh(
         0,
         True,
     )
-    cursor_ciphertext, cursor_sha256 = EncryptedRowCodec(
-        pickle_key,
-        account_id,
-        stream_id,
-    ).seal(
+    owner = account_id, stream_id, transport_kind
+    payload, payload_sha256 = _row(
+        owner,
         "NioIngestSourceState",
-        (account_id,),
         source_state.cursor_json,
         header=_source_header(source_state),
     )
@@ -273,14 +311,15 @@ def _create_fresh(
         statement_hook("create_meta")
     connection.execute_sql(
         "INSERT INTO NioIngestMeta ("
-        "account_id, device_id, schema_version, stream_id, transport_kind, "
+        "account_id, device_id, schema_version, stream_id, consumer_generation, transport_kind, "
         "revision, writer_epoch, next_source_epoch, created_at_ns"
-        ") VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)",
+        ") VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?)",
         (
             account_id,
             device_id,
             SCHEMA_VERSION,
             str(stream_id),
+            str(consumer_generation),
             transport_kind.value,
             str(writer_epoch),
             time.time_ns(),
@@ -294,9 +333,9 @@ def _create_fresh(
             statement_hook(f"schema_{index}")
     connection.execute_sql(
         "INSERT INTO NioIngestSourceState ("
-        "account_id, source_epoch, cursor_ciphertext, cursor_sha256, "
+        "account_id, source_epoch, payload, payload_sha256, "
         "next_request_id, active) VALUES (?, 0, ?, ?, 0, 1)",
-        (account_id, cursor_ciphertext, cursor_sha256),
+        (account_id, payload, payload_sha256),
     )
     if statement_hook is not None:
         statement_hook("insert_source")
@@ -307,7 +346,7 @@ def _inspect_existing(
     connection: SqliteDatabase,
     account_id: str,
     device_id: str,
-    pickle_key: str,
+    consumer_generation: UUID,
     source: SourceConfig,
 ) -> tuple[UUID, str]:
     validate_schema_topology(connection)
@@ -349,9 +388,14 @@ def _inspect_existing(
         raise FreshIngestionRequired("ingestion transport kind does not match source")
     try:
         stream_id = UUID(row["stream_id"])
+        stored_consumer_generation = UUID(row["consumer_generation"])
         UUID(row["writer_epoch"])
     except (AttributeError, TypeError, ValueError) as error:
         raise JournalIntegrityError("ingestion owner UUID is invalid") from error
+    if row["consumer_generation"] != str(stored_consumer_generation):
+        raise JournalIntegrityError("ingestion consumer_generation is not canonical")
+    if stored_consumer_generation != consumer_generation:
+        raise LocalProtocolError("ingestion consumer_generation does not match")
 
     source_rows = connection.execute_sql(
         "SELECT * FROM NioIngestSourceState"
@@ -371,15 +415,11 @@ def _inspect_existing(
         )
         if type(source_row["active"]) is not int or source_row["active"] not in (0, 1):
             raise ValueError("source active column is invalid")
-        cursor_json = EncryptedRowCodec(
-            pickle_key,
-            account_id,
-            stream_id,
-        ).decrypt(
+        cursor_json = _row(
+            (account_id, stream_id, transport_kind),
             "NioIngestSourceState",
-            (account_id,),
-            bytes(source_row["cursor_ciphertext"]),
-            bytes(source_row["cursor_sha256"]),
+            source_row["payload"],
+            source_row["payload_sha256"],
             header=_source_header(state),
         )
         state = SourceState(
@@ -410,12 +450,14 @@ def open_journal_database(
     *,
     account_id: str,
     device_id: str,
-    pickle_key: str,
+    consumer_generation: UUID,
     source: SourceConfig,
     sqlite_busy_timeout_ms: int,
     statement_observer: Callable[[str], None] | None,
     schema_statement_hook: Callable[[str], None] | None,
 ) -> OpenedJournalDatabase:
+    if type(consumer_generation) is not UUID:
+        raise TypeError("consumer_generation must be UUID")
     source_transport(source)
     path = database_path(database)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,7 +473,7 @@ def open_journal_database(
                     connection,
                     account_id,
                     device_id,
-                    pickle_key,
+                    consumer_generation,
                     source,
                     writer_epoch,
                     schema_statement_hook,
@@ -442,7 +484,7 @@ def open_journal_database(
                     connection,
                     account_id,
                     device_id,
-                    pickle_key,
+                    consumer_generation,
                     source,
                 )
             except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
