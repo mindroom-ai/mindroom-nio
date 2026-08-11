@@ -8,7 +8,7 @@
 
 The plan calls this replacement implementation “v2” when contrasting it with the callback architecture; its new wire and journal schemas both start at version 1.
 
-**Tech Stack:** Python 3.12+, `asyncio.TaskGroup`, frozen/slotted dataclasses, `enum.StrEnum`, SQLite/Peewee for the nio-local journal and E2EE state, AES-GCM for staged payloads, MindRoom's existing SQLite/PostgreSQL event-journal abstraction, pytest, Hypothesis where state-machine coverage is valuable, Ruff, pre-commit, and uv.
+**Tech Stack:** Python 3.12+, `asyncio.TaskGroup`, frozen/slotted dataclasses, `enum.StrEnum`, SQLite/Peewee for the nio-local journal and E2EE state, canonical ingestion-row plaintext with SHA-256 accidental-corruption detection, the existing Olm/Megolm cryptographic primitives for Matrix E2EE, MindRoom's existing SQLite/PostgreSQL event-journal abstraction, pytest, Hypothesis where state-machine coverage is valuable, Ruff, pre-commit, and uv.
 
 > **Task 4.5 supersession:** Every pre-Task 1 interface or schema section
 > whose heading is marked **Archived** (including **Archived Frozen Public
@@ -19,6 +19,38 @@ The plan calls this replacement implementation “v2” when contrasting it with
 > particular, no current task may infer that Task 4.5 persisted room lanes,
 > ready/batch rows, recovery/hydration effects, membership delivery, crypto
 > receipts, or attachment state.
+
+## Approved 2026-08-10 Scope Correction
+
+The user-approved
+[durable ingestion scope correction](./2026-08-10-durable-ingestion-scope-correction.md)
+is incorporated into this plan and controls wherever the documents conflict.
+In particular:
+
+- Task 6 closes at `3cc3ca7fe80b1339e01377a42e317d65fa644a12`;
+- caller-supplied global revision/writer-epoch CAS becomes internal owner state,
+  while exact entity snapshots and physical ownership fences remain;
+- ingestion rows use canonical plaintext, SHA-256 accidental-corruption
+  detection, clear-column equality, and a complete bounded Frame-header digest
+  rather than per-row AES-GCM;
+- content binding remains at crypto-receipt and cross-database batch boundaries,
+  without adding generic UUID identity hierarchies;
+- v1 binds one immutable MindRoom consumer generation, permits no in-place
+  rebind, and freezes at most one outstanding batch descriptor over retained
+  Work rather than copying payloads into BatchItem rows;
+- missing Megolm sessions produce a durable fact, and an identical ciphertext
+  replay after key availability may produce one deterministic decryption
+  replacement; key arrival alone performs no scan and v1 adds no
+  pending-decryption table;
+- the next required milestone is the production `IngestionSession` plus an
+  exact-wheel Classic homeserver-to-MindRoom canary; and
+- the correction's per-checkpoint forecasts and `+500`/`+1,530` gross canary
+  gates replace the former global line ceiling.
+
+The detailed task descriptions below remain historical requirements only where
+they do not conflict with that correction. Deferred behavior is fail-closed,
+not silently ignored, and the diagnostic canary is not release/cutover
+authorization.
 
 ## Global Constraints
 
@@ -1258,12 +1290,14 @@ zero sends, zero SQL statements, and zero RSS growth. The worst paired wall
 gate consumed 89.72 percent of its allowed budget. The final repository gate
 was 1,665 passed and 3 skipped.
 
-### Conditional deletion dependencies and hard forecast
+### Historical conditional deletion forecast
 
-The final cross-repository limit remains +6,000 production lines. The remaining
-program is capped at +3,150. Therefore the formal pre-deletion forecast is
-+6,239 + +3,150 = +9,389. The following 3,393 lines are conditional
-whole-file deletions, not present credit. The consumer column is an
+The following was the Task 4.5 deletion inventory under the former `+6,000`
+target. The approved 2026-08-10 correction retires that target and forbids
+counting these deletions as headroom before their production replacements and
+observation gates pass. The old arithmetic was `+6,239 + +3,150 = +9,389`.
+The following 3,393 lines remain useful as a conditional whole-file deletion
+inventory, not present credit. The consumer column is an
 import/symbol scan of live production Python (type-only consumers are labelled);
 tests are not counted as production consumers.
 
@@ -1287,9 +1321,10 @@ whole-file list, not a claim that nio's +5,537 runtime-source figure is
 cross-repository.
 
 Only after the exact replacement and observation gate may a deletion commit
-change the actual count. If all 3,393 conditional lines are actually deleted,
-the conditional final forecast is +5,996. The broader 5,544-line
-whole-file-plus-symbol inventory remains contingency only.
+change the actual count. Under the retired arithmetic, deleting all 3,393 lines
+would have yielded `+5,996`; this is historical context, not an active forecast
+or acceptance gate. The broader 5,544-line whole-file-plus-symbol inventory
+remains contingency only.
 
 The only quantified greater-than-50-percent estimate miss in the simplified
 checkpoint is the joined stage snapshot/validation slice: +62 actual against
@@ -1338,48 +1373,49 @@ independent of SQLite, callbacks, clocks, and AsyncClient.
 > sections remain historical as labelled.
 
 **Active architecture:** `NioIngestFrame` owns the crypto hand-off state as
-`room_materialized_revision NULL | positive integer`. The field is bound into
-the 29-byte `NioIngestFrameDrainHeader` proof AAD together with source epoch,
-request ID, staged revision, payload digest, and payload-ciphertext length.
-Discovery reads the complete unfiltered bounded frame-header/proof set
-(`LIMIT 257`, no SQL `ORDER BY`), authenticates every proof, then filters
-verified `NULL` state and sorts the verified drain tuples in memory. It never
-lets clear state hide a frame. It decrypts only the selected raw payload outside
-the writer and byte-revalidates the full header set plus selected row inside the
-one owner transaction before any business DML.
+`room_materialized_revision NULL | positive integer`. The approved scope
+correction replaces the landed AEAD representation with canonical plaintext,
+payload SHA-256, exact clear-column equality, and a digest over the complete
+drain header: row/schema/account/stream/transport identity, Frame/source
+identity, staged revision, payload digest and length, and materialized revision.
+Discovery reads the complete unfiltered bounded frame-header set (`LIMIT 257`,
+no SQL `ORDER BY`), verifies every header digest, then filters verified `NULL`
+state and sorts the verified drain tuples in memory. It never lets corrupt clear
+state hide a frame. It reads only the selected full raw payload outside the
+writer and byte-revalidates the full header set plus selected row inside the one
+owner transaction before any business DML.
 
 `NioIngestRoomAggregate` is the eventual single durable owner of recovery
 (`continuity.gap`) and hydration (`pending_hydration`) intent. Its clear,
-queryable `intent_kind` is re-derived from the authenticated value and is itself
-AAD-bound. `NioIngestWork` is the eventual internal outbox for EventRecord and
+queryable `intent_kind` is re-derived from canonical bytes and checked for exact
+agreement. `NioIngestWork` is the eventual internal outbox for EventRecord and
 LossRecord only; it has no crypto, recovery, hydration, receipt, or generic
-effect role. It retains authenticated provenance metadata but no durable
-`canonical_bytes`; bounded capacity accounting decrypts/authenticates rows and
-sums plaintext length. Task 6 adds no public read, batch, acknowledgement, or
-effect API.
+effect role. It retains canonical provenance metadata; bounded capacity
+accounting verifies rows and sums canonical byte length. Task 6 adds no public
+read, batch, acknowledgement, or effect API.
 
-**Staged Task 6 checkpoints:**
+**Closed Task 6 checkpoints:**
 
-- [ ] **Checkpoint 2 — Frame-only discovery and empty fates:** physical
+- [x] **Checkpoint 2 — Frame-only discovery and empty fates:** physical
   topology remains Meta, SourceState, Frame, and Frame drain index only. Do not
   introduce Aggregate/Work DDL, value codecs, row writers/decoders, or tests
   without a live caller. Empty crypto-free frames advance Meta and delete raw;
   empty crypto-bearing frames advance Meta, set/reseal the positive Frame state,
   and retain raw. A selected nonempty/reducer-output route rejects before DML
   and retains raw.
-- [ ] **Checkpoint 3 — first naturally reachable global Work path:** introduce
+- [x] **Checkpoint 3 — first naturally reachable global Work path:** introduce
   final Work DDL and accept only room-free READY global-account-data/presence
   records. Do not add Aggregate production code that only a test-seeded room
   could call. Authenticate the complete bounded Work inventory, enforce
   account-wide per-record fail-stop and global ready/total capacity, and retain
   raw with zero DML for every room/barrier route or projected overflow.
-- [ ] **Checkpoint 4 — first Aggregate owner and durable room transitions:**
+- [x] **Checkpoint 4 — first Aggregate owner and durable room transitions:**
   introduce Aggregate DDL/value/codecs with the first real hydration owner,
   then enable room READY/held work, recovery/hydration intent,
   retirement/lifecycle, loss, release, and room capacity fates. Plan each
   complete route before DML, preserving the existing recovery/hydration origin
   for repeated IDs and never leaving a partial aggregate barrier or intent.
-- [ ] Prove frame proof/state corruption, full-set read-to-writer races,
+- [x] Prove frame proof/state corruption, full-set read-to-writer races,
   deterministic ordering, raw-retention fates, and bounded authenticated
   capacity scans. Record SQL, writer wait, memory, and exact runtime-source
   delta at every checkpoint.
@@ -1394,8 +1430,13 @@ frame deliberately remains head-of-line backpressure until its fate changes.
 
 ## Task 7: Make Frame-Flagged Crypto Replay-Safe
 
-**Scope:** Task 7 scans the same complete unfiltered authenticated Frame proof
-set, then filters verified non-`NULL` `room_materialized_revision` rows in
+> **Corrected execution order:** Implement this task only after the diagnostic
+> exact-wheel canary. Before that canary, implement only the correction's
+> crypto-bearing classification and no-delivery fence; retained crypto Frames
+> remain durable and block further source HTTP.
+
+**Scope:** Task 7 scans the same complete unfiltered verified Frame-header set,
+then filters verified non-`NULL` `room_materialized_revision` rows in
 deterministic drain order. It owns the retained raw frame only after the Task 6
 Frame flag commits.
 
@@ -1406,6 +1447,10 @@ Frame flag commits.
   complete new graph, and the receipt recheck makes retry idempotent.
 - [ ] Prove duplicate Olm/Megolm inputs, crash/restart, proof/state corruption,
   and receipt races never reratchet or expose an uncommitted result.
+- [ ] On missing Megolm state, durably emit the failure fact and content-bound
+  receipt. Do not add a pending-ciphertext index or scan on key arrival. If the
+  identical ciphertext is presented again after its key exists, emit one
+  deterministic replacement tied to the original record and clear digest.
 
 Gate: no worker-thread SQLite/Peewee access, no second journal-file connection,
 and no crypto result or raw retirement outside the same durable owner
@@ -1415,14 +1460,18 @@ transaction.
 
 ## Task 8: Dispatch Aggregate-Owned Recovery and Hydration Intent
 
-**Scope:** Task 8 performs a bounded, resumable aggregate scan by
-`(intent_kind, room_id)`. The SQL predicate only narrows candidates: every
-candidate is decrypted/authenticated and must re-derive the same intent kind
-before dispatch or retry state can use it. Recovery remains the aggregate
-continuity gap; hydration retains its original authenticated origin in
-`pending_hydration`.
+> **Corrected execution order:** The hydration-only subset follows the
+> production `IngestionSession` checkpoint and precedes delivery. Recovery
+> breadth remains deferred until a live predecessor makes it reachable.
 
-- [ ] Dispatch only frozen, authenticated aggregate intents and return tagged
+**Scope:** Before the diagnostic canary, Task 8 performs only the naturally live
+hydration scan by `(intent_kind, room_id)`. The SQL predicate only narrows
+candidates: every candidate is canonically decoded, digest-checked, and must
+re-derive the same intent kind before dispatch or retry state can use it.
+Hydration retains its original origin in `pending_hydration`. Recovery breadth
+returns after a live predecessor produces a durable gap.
+
+- [ ] Dispatch only frozen, verified aggregate intents and return tagged
   results to the owner.
 - [ ] Commit result handling/idempotency with the owning aggregate; terminal
   handling clears the matching barrier and intent atomically with any required
@@ -1446,6 +1495,10 @@ production surfaces take precedence over arbitrary line-count pressure.
 
 ## Task 9: Own Uncertain Membership Delivery
 
+> **Corrected execution order:** This task is deferred until after the
+> diagnostic canary. The canary allowlist rejects membership routes before
+> materialization and stops later source HTTP.
+
 **Scope:** Add the membership-operation row and operator-visible resolution
 path only after a coordinator can own dispatch.
 
@@ -1462,14 +1515,20 @@ success or terminal session failure.
 
 ## Task 10: Integrate nio and Freeze End-to-End Budgets
 
-**Scope:** Publish the first integration candidate and measure the now-complete
-nio path. Add consumer binding, bounded SyncBatch materialization from Task 6's
-internal ready work, and FIFO acknowledgement here, where a real consumer
-identity first exists. Add observability only after it cannot alter correctness
-ownership.
+> **Corrected prerequisite:** The production `open_ingestion()` /
+> `IngestionSession` checkpoint and hydration-only Task 8 subset must already be
+> live-called before this delivery task begins.
 
-- [ ] Freeze batch schema/API; commit batch creation and source-work ownership
-  transfer atomically; make FIFO acknowledgement replay-safe.
+**Scope:** Publish the first delivery candidate and measure the implemented nio
+path. Bind the pre-created durable MindRoom consumer generation, freeze at
+most one outstanding descriptor over a deterministic READY Work key range, and
+add FIFO acknowledgement. Included Work remains nio-owned and immutable until
+acknowledgement; no BatchItem payload copy or ownership transfer is required.
+Add observability only after it cannot alter correctness ownership.
+
+- [ ] Freeze the batch schema/API and outstanding key-range descriptor; verify
+  its count, bytes, creation revision, and digest on reconstruction; make FIFO
+  acknowledgement replay-safe.
 - [ ] Record end-to-end transaction, latency,
   memory, backpressure, and one-room-versus-all-room work budgets.
 - [ ] Reforecast actual production changes and deletion dependencies before any
@@ -1560,8 +1619,9 @@ only after their exact replacement checkpoint and observation gate pass.
 - [ ] Recompute actual source and source-plus-script accounting from the fixed
   bases; do not substitute a forecast for a deletion diff.
 
-Gate: the final measured cross-repository net is at or below +6,000 and all
-legacy search invariants are absent from production.
+Gate: all legacy search invariants are absent from production, actual additions
+and deletions are reported against both fixed repository bases, and no deletion
+is credited before its replacement production caller and observation gate pass.
 
 ---
 
@@ -1577,6 +1637,7 @@ legacy search invariants are absent from production.
 
 The rewrite is complete only when the source-only core has grown through the
 named owners above, every enabled bot invariant is covered by the pre-deletion
-gate, desktop has its separate approved migration, actual—not conditional—line
-accounting is at or below +6,000, and the old paths have passed their
+gate, desktop has its separate approved migration, the approved per-checkpoint
+and canary gates have held, actual—not conditional—two-repository accounting is
+published against the fixed bases, and the old paths have passed their
 observation gates before deletion.
