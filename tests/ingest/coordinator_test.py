@@ -174,6 +174,23 @@ def stage_classic(bootstrap, body: dict[str, object]) -> StagedFrame:
     return frame
 
 
+def hydration_state() -> bytes:
+    return canonical_json(
+        [
+            {
+                "content": {"membership": "join"},
+                "event_id": "$member",
+                "state_key": ACCOUNT,
+                "type": "m.room.member",
+            }
+        ]
+    )
+
+
+def stage_pending(bootstrap) -> StagedFrame:
+    return stage_classic(bootstrap, {"next_batch": "s1", "rooms": {"join": {ROOM: {}}}})
+
+
 def test_ingestion_session_is_public() -> None:
     assert hasattr(nio, "open_ingestion")
     assert hasattr(nio, "IngestionSession")
@@ -396,9 +413,397 @@ async def test_run_drains_supported_frame_before_first_http(tmp_path) -> None:
         stream_id=bootstrap.stream_id,
         room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionSourceError):
+    with pytest.raises(nio.IngestionHydrationError):
         await session.run()
     assert client.send_count == 1
+    assert "/rooms/%21diagnostic%3Aexample.org/state" in client.send_calls[0][0][1]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_run_hydrates_fresh_live_room_before_later_sync(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_classic(
+        bootstrap,
+        {"next_batch": "s1", "rooms": {"join": {ROOM: {}}}},
+    )
+    frame = stage_classic(
+        bootstrap,
+        {
+            "next_batch": "s2",
+            "rooms": {
+                "join": {
+                    ROOM: {
+                        "timeline": {
+                            "events": [
+                                {
+                                    "content": {"body": "hello", "msgtype": "m.text"},
+                                    "event_id": "$message",
+                                    "origin_server_ts": 1,
+                                    "sender": ACCOUNT,
+                                    "type": "m.room.message",
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+    )
+    state = canonical_json(
+        [
+            {
+                "content": {"membership": "join"},
+                "event_id": "$member",
+                "state_key": ACCOUNT,
+                "type": "m.room.member",
+            }
+        ]
+    )
+    hydration = FakeResponse(200, state)
+    client = RecordingClient(config=AsyncClientConfig(custom_headers={"X-Test": "yes"}))
+    client.responses.extend([hydration, FakeResponse(401, b"{}")])
+
+    def assert_owned_before_get() -> None:
+        if client.send_count != 1:
+            return
+        assert bootstrap._journal.load_frame(frame.frame_id) is None
+        with bootstrap._journal._owner.read():
+            rows = bootstrap._journal._execute(
+                "SELECT status FROM NioIngestWork"
+            ).fetchall()
+        assert [row[0] for row in rows] == ["held"]
+
+    client.on_send = assert_owned_before_get
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+
+    assert client.send_count == 2
+    assert client.send_calls[0][0][:2] == (
+        "GET",
+        "/_matrix/client/v3/rooms/%21diagnostic%3Aexample.org/state",
+    )
+    assert client.send_calls[0][0][3] == {
+        "Authorization": "Bearer secret-token",
+    }
+    assert hydration.released
+    assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
+    with bootstrap._journal._owner.read():
+        row = bootstrap._journal._execute(
+            "SELECT status, ready_ordinal FROM NioIngestWork"
+        ).fetchone()
+    assert tuple(row) == ("ready", 0)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_protocol_failure_is_focused_and_retains_owner(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_classic(
+        bootstrap,
+        {"next_batch": "s1", "rooms": {"join": {ROOM: {}}}},
+    )
+    response = FakeResponse(200, b"")
+    response.content = OverreadContent()  # type: ignore[assignment]
+    client = RecordingClient()
+    client.responses.append(response)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionHydrationError):
+        await session.run()
+    assert response.released
+    assert len(bootstrap._journal.load_pending_hydrations(limit=2)) == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_payload_disconnect_releases_and_retries(
+    tmp_path, monkeypatch
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    failed = FakeResponse(200, b"")
+    failed.content = FailingContent(ClientPayloadError())  # type: ignore[assignment]
+    client = RecordingClient()
+    client.responses.extend(
+        [failed, FakeResponse(200, hydration_state()), FakeResponse(401, b"{}")]
+    )
+
+    async def no_wait(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+    assert failed.released and client.send_count == 3
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_real_public_send_bypasses_callbacks(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    responses = [FakeResponse(200, hydration_state()), FakeResponse(401, b"{}")]
+    transport = FakeClientSession(responses)
+    client = AsyncClient("https://example.org", ACCOUNT, DEVICE)
+    client.restore_login(ACCOUNT, DEVICE, "secret-token")
+    client.client_session = transport  # type: ignore[assignment]
+
+    async def callback(*args: object) -> None:
+        raise AssertionError("hydration must not invoke callbacks")
+
+    client.add_response_callback(callback)
+    client.add_event_callback(callback, None)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+    assert "/rooms/%21diagnostic%3Aexample.org/state" in transport.calls[0][0][1]
+    assert all(response.released for response in responses)
+    client.client_session = None
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        TimeoutError(),
+        ClientConnectionError(),
+        FakeResponse(408, b"{}"),
+        FakeResponse(429, b"{}"),
+        FakeResponse(503, b"{}"),
+    ],
+    ids=("timeout", "connection", "408", "429", "5xx"),
+)
+@pytest.mark.asyncio
+async def test_hydration_retryable_fates_reload_then_release_before_sync(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, first: FakeResponse | BaseException
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    client = RecordingClient()
+    client.responses.extend(
+        [first, FakeResponse(200, hydration_state()), FakeResponse(401, b"{}")]
+    )
+
+    async def no_wait(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+    paths = [call[0][1] for call in client.send_calls]
+    assert paths[0] == paths[1] and "/state" in paths[0] and "/sync" in paths[2]
+    assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
+    await session.close()
+
+
+@pytest.mark.parametrize("status", (400, 401, 403, 404))
+@pytest.mark.asyncio
+async def test_hydration_terminal_status_is_sticky_without_source_sync(
+    tmp_path, status: int
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    client = RecordingClient()
+    client.responses.append(FakeResponse(status, b"{}"))
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionHydrationError):
+        await session.run()
+    assert client.send_count == 1 and "/state" in client.send_calls[0][0][1]
+    assert len(bootstrap._journal.load_pending_hydrations(limit=2)) == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_held_hydration_get_retains_pending_owner(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    response = FakeResponse(200, b"")
+    content = HoldingContent()
+    response.content = content  # type: ignore[assignment]
+    client = RecordingClient()
+    client.responses.append(response)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    task = asyncio.create_task(session.run())
+    await content.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert response.released
+    assert len(bootstrap._journal.load_pending_hydrations(limit=2)) == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_http_holds_no_sqlite_writer_transaction(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    client = RecordingClient()
+    client.responses.append(FakeResponse(401, b"{}"))
+
+    def take_writer() -> None:
+        connection = sqlite3.connect(bootstrap.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.commit()
+        finally:
+            connection.close()
+
+    client.on_send = take_writer
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionHydrationError):
+        await session.run()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_other_room_pending_hydration_blocks_without_http(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    assert bootstrap._journal.materialize_oldest_diagnostic_frame(room_id=ROOM).revision
+    client = RecordingClient()
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id="!other:example.org",
+    )
+    with pytest.raises(nio.IngestionHydrationError):
+        await session.run()
+    assert client.send_count == 0
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_two_pending_hydrations_block_without_http(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    assert bootstrap._journal.materialize_oldest_diagnostic_frame(room_id=ROOM).revision
+    other = "!other:example.org"
+    stage_classic(
+        bootstrap,
+        {"next_batch": "s2", "rooms": {"join": {other: {}}}},
+    )
+    assert bootstrap._journal.materialize_oldest_diagnostic_frame(
+        room_id=other
+    ).revision
+    client = RecordingClient()
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionHydrationError):
+        await session.run()
+    assert client.send_count == 0
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_hydration_retry_sleep_retains_pending_owner(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    stage_pending(bootstrap)
+    client = RecordingClient()
+    client.responses.append(FakeResponse(429, b"{}"))
+    sleeping = asyncio.Event()
+
+    async def hold_sleep(delay: float) -> None:
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", hold_sleep)
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    task = asyncio.create_task(session.run())
+    await sleeping.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(bootstrap._journal.load_pending_hydrations(limit=2)) == 1
     await session.close()
 
 
@@ -1189,6 +1594,10 @@ async def test_retry_counter_resets_after_successful_frame(
                 200,
                 b'{"next_batch":"s1","rooms":{"join":{"!diagnostic:example.org":{}}}}',
             ),
+            FakeResponse(
+                200,
+                b'[{"content":{"membership":"join"},"event_id":"$member","state_key":"@alice:example.org","type":"m.room.member"}]',
+            ),
             TimeoutError(),
             FakeResponse(403, b"{}"),
         ]
@@ -1211,8 +1620,8 @@ async def test_retry_counter_resets_after_successful_frame(
         await session.run()
     assert sleeps == [0.0, 0.2, 0.0]
     assert client.send_calls[0] == client.send_calls[1] == client.send_calls[2]
-    assert client.send_calls[3] == client.send_calls[4]
-    assert client.send_calls[2] != client.send_calls[3]
+    assert client.send_calls[4] == client.send_calls[5]
+    assert client.send_calls[2] != client.send_calls[3] != client.send_calls[4]
     await session.close()
 
 

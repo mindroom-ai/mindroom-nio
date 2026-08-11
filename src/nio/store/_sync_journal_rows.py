@@ -8,6 +8,7 @@ from uuid import UUID
 
 from ..ingest._json import canonical_json, load_internal_json
 from ..ingest.errors import JournalIntegrityError
+from ..ingest.hydration import PendingHydration
 from ..ingest.model import (
     EventRecord,
     LossRecord,
@@ -19,7 +20,7 @@ from ..ingest.ports import (
     NetworkRequest,
     StagedSourceResponse,
 )
-from ..ingest.reducer import HydrationIntent, RoomContinuity
+from ..ingest.reducer import HydrationIntent, MembershipBaseline, RoomContinuity
 from ..ingest.serialization import (
     _loss_id,
     _origin_from_dict,
@@ -127,12 +128,26 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
         raise TypeError("aggregate value must be RoomAggregateValue")
     hydration = value.pending_hydration
     continuity = value.continuity
-    if continuity.baseline is not None or continuity.gap is not None:
-        raise ValueError("this checkpoint persists no baseline or recovery gap")
+    if continuity.gap is not None:
+        raise ValueError("this checkpoint persists no recovery gap")
+    baseline = continuity.baseline
+    if baseline is not None and (
+        baseline.membership_event_id is None or baseline.window_token is not None
+    ):
+        raise ValueError("unsupported Aggregate baseline")
+    if baseline is not None and hydration is not None:
+        raise ValueError("baseline and pending hydration are mutually exclusive")
     return canonical_json(
         {
             "continuity": {
-                "baseline": None,
+                "baseline": (
+                    {
+                        "membership_event_id": baseline.membership_event_id,
+                        "window_token": None,
+                    }
+                    if baseline is not None
+                    else None
+                ),
                 "gap": None,
                 "hydration_id": str(hydration.hydration_id) if hydration else None,
                 "membership": continuity.membership,
@@ -173,8 +188,20 @@ def _room_aggregate_value_from_plaintext(
             raise ValueError("Aggregate and continuity must be objects")
         aggregate = cast("dict[str, object]", decoded)
         continuity = cast("dict[str, object]", aggregate["continuity"])
-        if continuity["baseline"] is not None or continuity["gap"] is not None:
-            raise ValueError("hydration Aggregate baseline and gap must be null")
+        if continuity["gap"] is not None:
+            raise ValueError("Aggregate gap must be null")
+        baseline_value = continuity["baseline"]
+        baseline = None
+        if baseline_value is not None:
+            if type(baseline_value) is not dict:
+                raise ValueError("Aggregate baseline must be an object")
+            baseline_map = cast("dict[str, object]", baseline_value)
+            baseline = MembershipBaseline(
+                cast("str", baseline_map["membership_event_id"]),
+                cast("str | None", baseline_map["window_token"]),
+            )
+            if not baseline.membership_event_id or baseline.window_token is not None:
+                raise ValueError("unsupported Aggregate baseline")
 
         raw_hydration_id = continuity["hydration_id"]
         hydration_id = (
@@ -186,7 +213,7 @@ def _room_aggregate_value_from_plaintext(
             cast("str", continuity["room_id"]),
             cast("int", continuity["membership_epoch"]),
             cast("str | None", continuity["membership"]),
-            None,
+            baseline,
             None,
             hydration_id,
         )
@@ -892,6 +919,34 @@ class JournalRows:
             raise
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("invalid room Aggregate row") from error
+
+    def load_pending_hydrations(self, *, limit: int) -> tuple[PendingHydration, ...]:
+        if type(limit) is not int:
+            raise TypeError("limit must be int")
+        if not 1 <= limit <= 2:
+            raise ValueError("limit must be between 1 and 2")
+        with self._read():  # type: ignore[attr-defined]
+            owner = self._decode_owner_row(self._meta())
+            rows = self._execute(  # type: ignore[attr-defined]
+                "SELECT account_id, room_id, updated_revision, intent_kind, "
+                "payload, payload_sha256 FROM NioIngestRoomAggregate "
+                "WHERE account_id = ? AND intent_kind = 'hydration' "
+                "ORDER BY room_id LIMIT ?",
+                (self.account_id, limit),
+            ).fetchall()
+            pending: list[PendingHydration] = []
+            for row in rows:
+                room_id = row["room_id"]
+                loaded = self._load_room_aggregate(owner, room_id)
+                if loaded is None or tuple(row) != loaded[0]:
+                    raise JournalIntegrityError("hydration candidate snapshot changed")
+                value = loaded[1]
+                if value.pending_hydration is None:
+                    raise JournalIntegrityError("hydration candidate has no intent")
+                pending.append(
+                    PendingHydration(value.continuity, value.pending_hydration)
+                )
+            return tuple(pending)
 
     def _frame_drain_row_from_full(
         self,

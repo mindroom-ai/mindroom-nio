@@ -28,6 +28,7 @@ CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 TRACKED_PATHS = (
     "src/nio/ingest/source.py",
     "src/nio/ingest/state.py",
+    "src/nio/ingest/hydration.py",
     "src/nio/store/_sync_journal.py",
     "src/nio/store/_sync_journal_plan.py",
     "src/nio/store/_sync_journal_preflight.py",

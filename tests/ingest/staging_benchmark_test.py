@@ -49,6 +49,7 @@ SNAPSHOT_FILES = {
     "scripts/benchmark_ingest_staging.py",
     "src/nio/ingest/source.py",
     "src/nio/ingest/state.py",
+    "src/nio/ingest/hydration.py",
     "src/nio/store/_sync_journal.py",
     "src/nio/store/_sync_journal_plan.py",
     "src/nio/store/_sync_journal_preflight.py",

@@ -135,6 +135,7 @@ def test_public_ingest_exports_only_stable_contract_and_batch_helper() -> None:
         "EventRecord",
         "IngestionBlockedError",
         "IngestionError",
+        "IngestionHydrationError",
         "IngestionSession",
         "IngestionSourceError",
         "LossBoundary",

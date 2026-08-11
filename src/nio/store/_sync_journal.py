@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
@@ -18,6 +19,10 @@ from ..ingest.config import (
     source_transport,
 )
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
+from ..ingest.hydration import (
+    HydrationResult,
+    revalidated_hydration_result,
+)
 from ..ingest.model import EventRecord, RecordKind, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
 from ..ingest.sliding import SlidingSource
@@ -28,7 +33,11 @@ from ..ingest.source import (
     renormalize_staged_frame,
 )
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
-from ._sync_journal_plan import _work_id, plan_frame_materialization
+from ._sync_journal_plan import (
+    _canonical_work_plaintext,
+    _work_id,
+    plan_frame_materialization,
+)
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
     open_journal_database,
@@ -45,10 +54,16 @@ from ._sync_journal_values import (
     MaterializeResult,
     MaterializerLimits,
     MaterializeStatus,
+    RoomAggregateValue,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+
+def _hydration_final_total(storage, releases) -> int:  # type: ignore[no-untyped-def]
+    sizes = {row[1]: len(row[11]) for row in storage}
+    return sum(sizes.values()) + sum(len(row[2]) - sizes[row[0]] for row in releases)
 
 
 # fmt: off
@@ -375,6 +390,62 @@ class SqliteIngestionJournal(JournalRows):
         limits: MaterializerLimits,
     ) -> MaterializeResult:
         return self._materialize_oldest_frame(limits, None)
+
+    # fmt: off
+    def apply_hydration_result(self, *, result: HydrationResult) -> CommitResult | None:
+        with self._read():
+            owner = self._decode_owner_row(self._meta())
+            rebuilt, event_id = revalidated_hydration_result(result, own_user_id=owner.account_id)
+            room_id = rebuilt.pending.continuity.room_id
+            loaded = self._load_room_aggregate(owner, room_id)
+            if loaded is None:
+                return None
+            value = loaded[1]
+            pending = value.pending_hydration
+            if (value.continuity, pending) != (rebuilt.pending.continuity, rebuilt.pending.intent):
+                return None
+            inventory = self._load_task3_work_inventory(owner)
+            selected = sorted(
+                (cast("EventRecord", item.value) for item in inventory.work if item.status == "held" and type(item.value) is EventRecord and item.value.room_id == room_id and item.value.membership_epoch == value.continuity.membership_epoch),
+                key=lambda record: (cast("int", record.room_sequence), record.record_id),
+            )
+            new_revision = owner.revision + 1
+            successor = RoomAggregateValue(replace(value.continuity, baseline=ingest_reducer.MembershipBaseline(event_id, None), hydration_id=None), value.next_room_sequence, new_revision, None)
+            aggregate_plaintext = _canonical_room_aggregate_plaintext(successor)
+            aggregate_payload, aggregate_digest = self._payload(owner, "NioIngestRoomAggregate", aggregate_plaintext, header=_canonical_internal([room_id, new_revision, None]))
+            storage = {row[1]: row for row in inventory.storage_rows}
+            releases: list[tuple[str, int, bytes, bytes]] = []
+            for ordinal, record in enumerate(selected):
+                row = storage[record.record_id]
+                clear = (*row[1:3], "ready", *row[4:8], new_revision, ordinal, row[10])
+                payload, digest = self._payload(owner, "NioIngestWork", _canonical_work_plaintext("event", record), header=_canonical_internal(clear))
+                if len(payload) > 1024 * 1024:
+                    raise ValueError("promoted Work exceeds immutable record capacity")
+                releases.append((record.record_id, ordinal, payload, digest))
+            total_bytes = _hydration_final_total(inventory.storage_rows, releases)
+            if total_bytes > 64 * 1024 * 1024:
+                raise ValueError("promoted Work exceeds immutable total capacity")
+
+        with self._transaction():
+            write_owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            if (write_owner.revision, write_owner.writer_epoch) != (owner.revision, owner.writer_epoch):
+                raise JournalConflictError("hydration owner snapshot changed")
+            if self._load_room_aggregate(write_owner, room_id) != loaded or self._load_task3_work_inventory(write_owner).storage_rows != inventory.storage_rows:
+                raise JournalIntegrityError("hydration ownership snapshot changed")
+            cursor = self._transition_execute("meta_revision_epoch_cas", "UPDATE NioIngestMeta SET revision = ? WHERE account_id = ? AND revision = ? AND writer_epoch = ?", (new_revision, self.account_id, owner.revision, str(owner.writer_epoch)))
+            if cursor.rowcount != 1:
+                raise JournalConflictError("hydration compare-and-swap failed")
+            cursor = self._transition_execute("aggregate_update", "UPDATE NioIngestRoomAggregate SET updated_revision = ?, intent_kind = NULL, payload = ?, payload_sha256 = ? WHERE account_id = ? AND room_id = ?", (new_revision, aggregate_payload, aggregate_digest, self.account_id, room_id))
+            if cursor.rowcount != 1:
+                raise JournalIntegrityError("hydration Aggregate update failed")
+            for work_id, ordinal, payload, digest in releases:
+                cursor = self._transition_execute("work_release", "UPDATE NioIngestWork SET status = 'ready', ready_revision = ?, ready_ordinal = ?, payload = ?, payload_sha256 = ? WHERE account_id = ? AND work_id = ? AND status = 'held'", (new_revision, ordinal, payload, digest, self.account_id, work_id))
+                if cursor.rowcount != 1:
+                    raise JournalIntegrityError("hydration Work release failed")
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+    # fmt: on
 
     # fmt: off
     def materialize_oldest_diagnostic_frame(self, *, room_id: str, limits: MaterializerLimits = MaterializerLimits()) -> MaterializeResult:

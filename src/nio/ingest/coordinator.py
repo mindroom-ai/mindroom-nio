@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from aiohttp import ClientConnectionError, ClientError
+from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
 from ..exceptions import LocalProtocolError
 from ..store._sync_journal_values import MaterializeStatus
 from . import ports
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
+from .hydration import normalize_hydration_response
 from .model import TransportKind
 from .sliding import SlidingSource
 from .source import SourceResultKind, SourceScheduleStatus, plan_source_poll
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 __all__ = (
     "IngestionBlockedError",
     "IngestionError",
+    "IngestionHydrationError",
     "IngestionSession",
     "IngestionSourceError",
     "open_ingestion",
@@ -42,6 +44,12 @@ class IngestionBlockedError(IngestionError):
 
 class IngestionSourceError(IngestionError):
     pass
+
+
+class IngestionHydrationError(IngestionError):
+    def __init__(self, hydration_id: UUID) -> None:
+        self.hydration_id = hydration_id
+        super().__init__(f"room-state hydration failed for {hydration_id}")
 
 
 class IngestionSession:
@@ -102,6 +110,7 @@ class IngestionSession:
 
     async def _run_loop(self) -> None:
         retries = 0
+        hydration_retries = 0
         while self._close_task is None:
             while True:
                 materialized = self._journal.materialize_oldest_diagnostic_frame(
@@ -119,6 +128,38 @@ class IngestionSession:
                     raise IngestionBlockedError(frames[0].frame_id)
                 break
 
+            # fmt: off
+            pending = self._journal.load_pending_hydrations(limit=2)
+            if pending:
+                candidate = pending[0]
+                if len(pending) != 1 or candidate.continuity.room_id != self._room_id:
+                    raise IngestionHydrationError(candidate.intent.hydration_id)
+                prior = self._journal.load_source()
+                owner = self._journal.load_owner()
+                hydration_request = ports.NetworkRequest(owner.stream_id, owner.transport_kind, prior.source_epoch, prior.next_request_id, "GET", f"/_matrix/client/v3/rooms/{quote(self._room_id, safe='')}/state", (), None, self._config.source.timeout_ms, prior.cursor_json)
+                try:
+                    network = await self._request(hydration_request, body_disconnect_retry=True)
+                except (IngestionSourceError, AttributeError, TypeError, ValueError) as error:
+                    raise IngestionHydrationError(candidate.intent.hydration_id) from error
+                retryable = network.failure is not None or network.status_code in (408, 429) or network.status_code is not None and 500 <= network.status_code <= 599
+                if retryable:
+                    hydration_retries += 1
+                    delay = network.retry_after_ms / 1000 if network.retry_after_ms else 0.0
+                    if network.retry_after_ms is None and hydration_retries >= 2:
+                        delay = min(self._client.config.backoff_factor * (2 ** (min(hydration_retries, 1000) - 1)), self._client.config.max_timeout_retry_wait_time)
+                    await asyncio.sleep(delay)
+                    continue
+                if network.status_code != 200:
+                    raise IngestionHydrationError(candidate.intent.hydration_id)
+                try:
+                    hydration_result = normalize_hydration_response(candidate, own_user_id=owner.account_id, response_body=network.body)
+                except (TypeError, ValueError) as error:
+                    raise IngestionHydrationError(candidate.intent.hydration_id) from error
+                self._journal.apply_hydration_result(result=hydration_result)
+                hydration_retries = 0
+                continue
+            hydration_retries = 0
+            # fmt: on
             prior = self._journal.load_source()
             decision = plan_source_poll(
                 self._source,
@@ -188,7 +229,9 @@ class IngestionSession:
             retry_after,
         )
 
-    async def _request(self, request: ports.NetworkRequest) -> ports.NetworkResult:
+    # fmt: off
+    async def _request(self, request: ports.NetworkRequest, *, body_disconnect_retry: bool = False) -> ports.NetworkResult:
+        # fmt: on
         path = request.path
         if request.query:
             path += "?" + urlencode(request.query)
@@ -235,6 +278,10 @@ class IngestionSession:
                 else ports.NetworkFailureKind.TIMEOUT
             )
             return self._network_result(request, None, b"", failure)
+        except ClientPayloadError as error:
+            if body_disconnect_retry:
+                return self._network_result(request, None, b"", ports.NetworkFailureKind.CONNECTION)
+            raise IngestionSourceError("malformed response body") from error
         except ClientError as error:
             raise IngestionSourceError("malformed response body") from error
 

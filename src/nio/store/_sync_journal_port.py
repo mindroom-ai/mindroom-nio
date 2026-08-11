@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
+from ..ingest.hydration import HydrationResult, PendingHydration
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_values import MaterializeResult, MaterializerLimits
 
@@ -38,3 +39,11 @@ class IngestionJournal(Protocol):
         room_id: str,
         limits: MaterializerLimits = MaterializerLimits(),
     ) -> MaterializeResult: ...
+
+    def load_pending_hydrations(
+        self, *, limit: int
+    ) -> tuple[PendingHydration, ...]: ...
+
+    def apply_hydration_result(
+        self, *, result: HydrationResult
+    ) -> CommitResult | None: ...

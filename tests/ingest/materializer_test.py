@@ -3494,6 +3494,8 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
         "stage_source_response",
         "materialize_oldest_frame",
         "materialize_oldest_diagnostic_frame",
+        "load_pending_hydrations",
+        "apply_hydration_result",
     }
     forbidden_concrete_methods = (
         "peek_ready_work",

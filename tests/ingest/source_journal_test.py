@@ -31,6 +31,7 @@ from nio.ingest.errors import (
     FreshIngestionRequired,
     JournalIntegrityError,
 )
+from nio.ingest.hydration import HydrationResult, PendingHydration
 from nio.ingest.model import TransportKind
 from nio.ingest.ports import (
     NetworkRequest,
@@ -1167,6 +1168,8 @@ def test_source_only_journal_port_is_exact() -> None:
         "stage_source_response",
         "materialize_oldest_frame",
         "materialize_oldest_diagnostic_frame",
+        "load_pending_hydrations",
+        "apply_hydration_result",
     }
 
     assert tuple(inspect.signature(methods["load_owner"]).parameters) == ("self",)
@@ -1255,6 +1258,14 @@ def test_source_only_journal_port_is_exact() -> None:
             "room_id": str,
             "limits": MaterializerLimits,
             "return": MaterializeResult,
+        },
+        "load_pending_hydrations": {
+            "limit": int,
+            "return": tuple[PendingHydration, ...],
+        },
+        "apply_hydration_result": {
+            "result": HydrationResult,
+            "return": CommitResult | None,
         },
     }
 
