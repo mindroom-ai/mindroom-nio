@@ -268,18 +268,9 @@ class SqliteIngestionJournal(JournalRows):
     def stage_source_response(
         self,
         *,
-        expected_revision: int,
-        writer_epoch: UUID,
         source: SourceState,
         frame: StagedFrame,
     ) -> CommitResult:
-        if type(expected_revision) is not int:
-            raise TypeError("expected_revision must be int")
-        if expected_revision < 0:
-            raise ValueError("expected_revision must be nonnegative")
-        if type(writer_epoch) is not UUID:
-            raise TypeError("writer_epoch must be UUID")
-
         proposed, frame = self._reconstruct_stage(source, frame)
         if (
             len(_canonical_internal(_frame_envelope(frame))) + 29
@@ -289,10 +280,8 @@ class SqliteIngestionJournal(JournalRows):
 
         with self._transaction():
             owner, current = self._load_stage_snapshot()
-            if owner.revision != expected_revision:
-                raise JournalConflictError("journal revision is stale")
-            if owner.writer_epoch != writer_epoch:
-                raise JournalConflictError("journal writer_epoch is stale")
+            read_revision = owner.revision
+            read_writer_epoch = owner.writer_epoch
 
             replay = self._validate_stage_relationship(
                 owner,
@@ -327,7 +316,7 @@ class SqliteIngestionJournal(JournalRows):
                     "new staged frame requires the current source predecessor"
                 )
 
-            new_revision = owner.revision + 1
+            new_revision = read_revision + 1
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
                 "UPDATE NioIngestMeta SET revision = ? "
@@ -335,8 +324,8 @@ class SqliteIngestionJournal(JournalRows):
                 (
                     new_revision,
                     self.account_id,
-                    expected_revision,
-                    str(writer_epoch),
+                    read_revision,
+                    str(read_writer_epoch),
                 ),
             )
             if cursor.rowcount != 1:
@@ -355,16 +344,8 @@ class SqliteIngestionJournal(JournalRows):
     def materialize_oldest_frame(
         self,
         *,
-        expected_revision: int,
-        writer_epoch: UUID,
         limits: MaterializerLimits,
     ) -> MaterializeResult:
-        if type(expected_revision) is not int:
-            raise TypeError("expected_revision must be int")
-        if expected_revision < 0:
-            raise ValueError("expected_revision must be nonnegative")
-        if type(writer_epoch) is not UUID:
-            raise TypeError("writer_epoch must be UUID")
         if type(limits) is not MaterializerLimits:
             raise TypeError("limits must be MaterializerLimits")
         MaterializerLimits(
@@ -379,10 +360,8 @@ class SqliteIngestionJournal(JournalRows):
 
         with self._read():
             owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
-            if owner.revision != expected_revision:
-                raise JournalConflictError("journal revision is stale")
-            if owner.writer_epoch != writer_epoch:
-                raise JournalConflictError("journal writer_epoch is stale")
+            read_revision = owner.revision
+            read_writer_epoch = owner.writer_epoch
             headers = self._load_authenticated_frame_headers(owner)
             selected = next(
                 (
@@ -438,7 +417,7 @@ class SqliteIngestionJournal(JournalRows):
                 inventory = (
                     self._load_task3_work_inventory(owner) if needs_inventory else None
                 )
-                new_revision = expected_revision + 1
+                new_revision = read_revision + 1
                 plan = plan_frame_materialization(
                     stream_id=owner.stream_id,
                     frame=normalized,
@@ -528,9 +507,9 @@ class SqliteIngestionJournal(JournalRows):
             write_owner = self._decode_owner_row(
                 cast("Mapping[str, object]", self._meta())
             )
-            if write_owner.revision != expected_revision:
+            if write_owner.revision != read_revision:
                 raise JournalConflictError("journal revision is stale")
-            if write_owner.writer_epoch != writer_epoch:
+            if write_owner.writer_epoch != read_writer_epoch:
                 raise JournalConflictError("journal writer_epoch is stale")
             if self._load_authenticated_frame_headers(write_owner) != headers:
                 raise JournalIntegrityError("frame drain snapshot changed")
@@ -570,8 +549,8 @@ class SqliteIngestionJournal(JournalRows):
                 (
                     new_revision,
                     self.account_id,
-                    expected_revision,
-                    str(writer_epoch),
+                    read_revision,
+                    str(read_writer_epoch),
                 ),
             )
             if cursor.rowcount != 1:

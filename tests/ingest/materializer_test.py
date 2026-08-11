@@ -2687,8 +2687,6 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
         parameters = tuple(inspect.signature(method).parameters.values())
         assert tuple(parameter.name for parameter in parameters) == (
             "self",
-            "expected_revision",
-            "writer_epoch",
             "limits",
         )
         assert parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -2700,8 +2698,6 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
             parameter.default is inspect.Parameter.empty for parameter in parameters
         )
         assert get_type_hints(method) == {
-            "expected_revision": int,
-            "writer_epoch": UUID,
             "limits": values.MaterializerLimits,
             "return": values.MaterializeResult,
         }
@@ -3077,8 +3073,6 @@ def test_contract_envelope_bound_rejects_large_request_metadata_before_transacti
                 match="^staged frame envelope exceeds 24 MiB$",
             ):
                 journal.stage_source_response(
-                    expected_revision=owner_before.revision,
-                    writer_epoch=owner_before.writer_epoch,
                     source=proposed_source,
                     frame=frame,
                 )
@@ -3141,8 +3135,6 @@ def test_contract_staged_frame_drain_header_proof_is_authenticated_and_readable(
             source_before.active,
         )
         committed = journal.stage_source_response(
-            expected_revision=owner_before.revision,
-            writer_epoch=owner_before.writer_epoch,
             source=successor,
             frame=staged_frame,
         )
@@ -4286,8 +4278,6 @@ def _stage_discovery_frame(
         prior.active,
     )
     committed = journal.stage_source_response(
-        expected_revision=owner.revision,
-        writer_epoch=owner.writer_epoch,
         source=successor,
         frame=staged,
     )
@@ -4415,8 +4405,6 @@ def _stage_discovery_rooms_frame(
         prior.active,
     )
     committed = journal.stage_source_response(
-        expected_revision=owner.revision,
-        writer_epoch=owner.writer_epoch,
         source=successor,
         frame=staged,
     )
@@ -4490,16 +4478,9 @@ def _canonical_expected_drain_header(
 def _materialize(
     journal: SqliteIngestionJournal,
     *,
-    expected_revision: int | None = None,
-    writer_epoch: UUID | None = None,
     limits: MaterializerLimits | None = None,
 ) -> MaterializeResult:
-    owner = journal.load_owner()
     return journal.materialize_oldest_frame(
-        expected_revision=(
-            owner.revision if expected_revision is None else expected_revision
-        ),
-        writer_epoch=owner.writer_epoch if writer_epoch is None else writer_epoch,
         limits=limits or MaterializerLimits(),
     )
 
@@ -4520,6 +4501,26 @@ def _materializer_dml(statements: list[str]) -> tuple[str, ...]:
             )
         )
     )
+
+
+def test_materializer_public_call_internalizes_owner_cas(tmp_path: Path) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        staged, _ = _stage_discovery_frame(journal, TransportKind.CLASSIC, 1)
+        owner_before = journal.load_owner()
+
+        result = journal.materialize_oldest_frame(limits=MaterializerLimits())
+
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            owner_before.revision + 1,
+        )
+        assert journal.load_owner().revision == owner_before.revision + 1
+        assert _frame_storage_row(journal, staged.frame_id) is None
+    finally:
+        bootstrap.close()
 
 
 def _aggregate_rows(journal: SqliteIngestionJournal) -> tuple[tuple[object, ...], ...]:
@@ -8883,44 +8884,6 @@ def test_materializer_complete_proof_scan_catches_corruption_before_later_dml(
         bootstrap.close()
 
 
-@pytest.mark.parametrize("stale_fence", ["revision", "epoch"])
-def test_materializer_stale_fence_catches_entry_into_business_dml(
-    tmp_path: Path,
-    stale_fence: str,
-) -> None:
-    statements: list[str] = []
-    bootstrap = _open_discovery_journal(
-        tmp_path,
-        TransportKind.CLASSIC,
-        statements=statements,
-    )
-    journal = bootstrap._journal
-    try:
-        staged, _ = _stage_discovery_frame(journal, TransportKind.CLASSIC, 1)
-        owner_before = journal.load_owner()
-        row_before = _frame_storage_row(journal, staged.frame_id)
-        statements.clear()
-
-        with pytest.raises(JournalConflictError):
-            _materialize(
-                journal,
-                expected_revision=(
-                    owner_before.revision - 1
-                    if stale_fence == "revision"
-                    else owner_before.revision
-                ),
-                writer_epoch=(
-                    uuid4() if stale_fence == "epoch" else owner_before.writer_epoch
-                ),
-            )
-
-        assert journal.load_owner() == owner_before
-        assert _frame_storage_row(journal, staged.frame_id) == row_before
-        assert _materializer_dml(statements) == ()
-    finally:
-        bootstrap.close()
-
-
 def _apply_discovery_race(
     journal: SqliteIngestionJournal,
     earlier: StagedFrame,
@@ -9363,7 +9326,7 @@ def test_materializer_exact_max_frame_scan_authenticates_headers_without_raw_bac
             owner_before.revision + 1,
         )
         materialize_queries = tuple(queries)
-        assert len(materialize_queries) == 9
+        assert len(materialize_queries) == 8
         assert _frame_storage_row(journal, selected.frame_id) is None
         assert (
             tuple(_frame_storage_row(journal, frame.frame_id) for frame in frames[:-1])
@@ -9555,8 +9518,6 @@ def test_materializer_accepts_exact_24_mib_encrypted_selected_frame(
             source_state.active,
         )
         staged_result = journal.stage_source_response(
-            expected_revision=owner.revision,
-            writer_epoch=owner.writer_epoch,
             source=proposed_source,
             frame=staged,
         )

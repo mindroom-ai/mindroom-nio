@@ -290,10 +290,8 @@ def _proposal(journal, config, raw: bytes):
 
 
 def _stage(journal, proposal) -> None:
-    owner, _prior, _source, successor, staged, _normalized = proposal
+    _owner, _prior, _source, successor, staged, _normalized = proposal
     journal.stage_source_response(
-        expected_revision=owner.revision,
-        writer_epoch=owner.writer_epoch,
         source=successor,
         frame=staged,
     )

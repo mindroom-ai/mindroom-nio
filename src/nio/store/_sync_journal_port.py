@@ -22,8 +22,6 @@ class IngestionJournal(Protocol):
     def stage_source_response(
         self,
         *,
-        expected_revision: int,
-        writer_epoch: UUID,
         source: SourceState,
         frame: StagedFrame,
     ) -> CommitResult: ...
@@ -31,7 +29,5 @@ class IngestionJournal(Protocol):
     def materialize_oldest_frame(
         self,
         *,
-        expected_revision: int,
-        writer_epoch: UUID,
         limits: MaterializerLimits,
     ) -> MaterializeResult: ...

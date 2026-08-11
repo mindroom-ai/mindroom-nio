@@ -422,3 +422,23 @@ decisions:
 It also selects canonical plaintext plus accidental-corruption detection for
 ingestion rows and replay-triggered decryption replacement without proactive
 key-arrival scanning or a pending-decryption table.
+
+## Checkpoint evidence
+
+### Caller CAS internalization
+
+Comparison base: `9d115d043c14560e5e649e31910b171de910f2d2`
+
+The first scope-reduction sub-checkpoint removes caller-supplied revision and
+writer-epoch tokens while retaining the internal Meta CAS, read-to-writer
+revision/epoch checks, physical owner fences, and exact Frame/Work/Aggregate
+snapshots. Source staging now rejects stale work by its exact source predecessor
+and accepts a still-current result after an unrelated materialization revision.
+
+The tests-only RED failed exactly five cases: two signature mismatches and three
+missing-token calls; fifteen existing ownership/CAS controls remained green.
+GREEN verification passed 280 source-journal tests, 290 materializer tests, and
+the full repository at 2,011 passed / 3 skipped. Independent RED and GREEN
+reviews approved the boundary. Production accounting is `+13/-40`, net `-27`;
+tests are `+118/-111`, net `+7`. This consumes 13 of the scope-reduction gross
+addition cap; deletions do not buy headroom.

@@ -25,7 +25,6 @@ from nio.ingest.config import (
 )
 from nio.ingest.errors import (
     FreshIngestionRequired,
-    JournalConflictError,
     JournalIntegrityError,
 )
 from nio.ingest.model import TransportKind
@@ -220,15 +219,8 @@ def _stage(
     journal: object,
     *,
     proposal: _StageProposal,
-    expected_revision: int | None = None,
-    writer_epoch: UUID | None = None,
 ) -> CommitResult:
-    owner = journal.load_owner()  # type: ignore[attr-defined]
     return journal.stage_source_response(  # type: ignore[attr-defined,no-any-return]
-        expected_revision=(
-            owner.revision if expected_revision is None else expected_revision
-        ),
-        writer_epoch=owner.writer_epoch if writer_epoch is None else writer_epoch,
         source=proposal.successor_source,
         frame=proposal.frame,
     )
@@ -921,6 +913,8 @@ def test_source_only_state_surface_is_exact() -> None:
 
 
 def test_source_only_journal_port_is_exact() -> None:
+    from nio.store._sync_journal import SqliteIngestionJournal
+
     methods = {
         name: value
         for name, value in vars(IngestionJournal).items()
@@ -945,31 +939,33 @@ def test_source_only_journal_port_is_exact() -> None:
         "self",
         "limit",
     )
-    stage_parameters = tuple(
-        inspect.signature(methods["stage_source_response"]).parameters.values()
-    )
-    assert tuple(parameter.name for parameter in stage_parameters) == (
-        "self",
-        "expected_revision",
-        "writer_epoch",
-        "source",
-        "frame",
-    )
-    assert stage_parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert all(
-        parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        for parameter in stage_parameters[1:]
-    )
-    assert all(
-        parameter.default is inspect.Parameter.empty for parameter in stage_parameters
-    )
+    for journal_type in (IngestionJournal, SqliteIngestionJournal):
+        stage_method = journal_type.stage_source_response
+        stage_parameters = tuple(inspect.signature(stage_method).parameters.values())
+        assert tuple(parameter.name for parameter in stage_parameters) == (
+            "self",
+            "source",
+            "frame",
+        )
+        assert stage_parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert all(
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            for parameter in stage_parameters[1:]
+        )
+        assert all(
+            parameter.default is inspect.Parameter.empty
+            for parameter in stage_parameters
+        )
+        assert get_type_hints(stage_method) == {
+            "source": SourceState,
+            "frame": StagedFrame,
+            "return": CommitResult,
+        }
     materialize_parameters = tuple(
         inspect.signature(methods["materialize_oldest_frame"]).parameters.values()
     )
     assert tuple(parameter.name for parameter in materialize_parameters) == (
         "self",
-        "expected_revision",
-        "writer_epoch",
         "limits",
     )
     assert materialize_parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -995,15 +991,11 @@ def test_source_only_journal_port_is_exact() -> None:
             "return": tuple[StagedFrame, ...],
         },
         "stage_source_response": {
-            "expected_revision": int,
-            "writer_epoch": UUID,
             "source": SourceState,
             "frame": StagedFrame,
             "return": CommitResult,
         },
         "materialize_oldest_frame": {
-            "expected_revision": int,
-            "writer_epoch": UUID,
             "limits": MaterializerLimits,
             "return": MaterializeResult,
         },
@@ -1448,7 +1440,7 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
             ),
         )
         statements.clear()
-        repeated = _stage(journal, expected_revision=result.revision, proposal=proposal)
+        repeated = _stage(journal, proposal=proposal)
 
         assert repeated == result
         assert _business_dml(statements) == []
@@ -1470,6 +1462,77 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
         assert journal.load_frame(proposal.frame.frame_id) == replace(
             proposal.frame,
             staged_revision=result.revision,
+        )
+    finally:
+        bootstrap.close()
+
+
+def test_stage_uses_source_predecessor_after_unrelated_revision_advance(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path, CLASSIC_SOURCE)
+    journal = bootstrap._journal
+    try:
+        first = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+        _stage(journal, proposal=first)
+        proposal = _stage_proposal(journal, CLASSIC_SOURCE, 2)
+        source_predecessor = journal.load_source()
+        owner_before_materialize = journal.load_owner()
+
+        materialized = journal.materialize_oldest_frame(
+            limits=MaterializerLimits(),
+        )
+
+        assert materialized.frame_id == first.frame.frame_id
+        assert materialized.revision == owner_before_materialize.revision + 1
+        assert journal.load_owner().revision == materialized.revision
+        assert journal.load_source() == source_predecessor == proposal.prior_source
+
+        committed = journal.stage_source_response(
+            source=proposal.successor_source,
+            frame=proposal.frame,
+        )
+
+        assert committed == CommitResult(materialized.revision + 1)
+        assert journal.load_source() == proposal.successor_source
+        assert journal.load_frame(proposal.frame.frame_id) == replace(
+            proposal.frame,
+            staged_revision=committed.revision,
+        )
+    finally:
+        bootstrap.close()
+
+
+def test_competing_results_for_one_source_predecessor_cannot_both_commit(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, CLASSIC_SOURCE, statements=statements)
+    journal = bootstrap._journal
+    try:
+        accepted = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+        competing = _stage_proposal(journal, CLASSIC_SOURCE, 2)
+        assert accepted.prior_source == competing.prior_source
+        assert accepted.frame.response.request == competing.frame.response.request
+        assert accepted.successor_source != competing.successor_source
+
+        committed = _stage(journal, proposal=accepted)
+        statements.clear()
+
+        with pytest.raises(
+            JournalIntegrityError,
+            match="source staging request does not match current source",
+        ):
+            journal.stage_source_response(
+                source=competing.successor_source,
+                frame=competing.frame,
+            )
+
+        assert _business_dml(statements) == []
+        assert journal.load_owner().revision == committed.revision
+        assert journal.load_source() == accepted.successor_source
+        assert journal.list_frames(256) == (
+            replace(accepted.frame, staged_revision=committed.revision),
         )
     finally:
         bootstrap.close()
@@ -1638,7 +1701,6 @@ def test_collision_probe_uses_account_frame_identity_classification(
         with pytest.raises(JournalIntegrityError, match="frame_id"):
             _stage(
                 reopened._journal,
-                expected_revision=stage.committed.revision,
                 proposal=stage.proposal,
             )
         assert _business_dml(statements) == []
@@ -1771,7 +1833,6 @@ def test_same_frame_id_changed_content_or_revision_fails_before_dml(
         with pytest.raises(JournalIntegrityError):
             _stage(
                 journal,
-                expected_revision=committed.revision,
                 proposal=changed_proposal,
             )
 
@@ -1786,8 +1847,6 @@ def test_same_frame_id_changed_content_or_revision_fails_before_dml(
 @pytest.mark.parametrize(
     ("mutation", "expected_error"),
     (
-        ("expected_revision", JournalConflictError),
-        ("writer_epoch", JournalConflictError),
         ("stream", JournalIntegrityError),
         ("transport", JournalIntegrityError),
         ("source_epoch", JournalIntegrityError),
@@ -1806,14 +1865,7 @@ def test_stage_rejects_owner_source_and_request_relation_drift_before_dml(
     try:
         owner = journal.load_owner()
         proposal = _stage_proposal(journal, CLASSIC_SOURCE, 1)
-        expected_revision = owner.revision
-        writer_epoch = owner.writer_epoch
-
-        if mutation == "expected_revision":
-            expected_revision += 1
-        elif mutation == "writer_epoch":
-            writer_epoch = uuid4()
-        elif mutation == "source_epoch":
+        if mutation == "source_epoch":
             proposal = replace(
                 proposal,
                 successor_source=replace(
@@ -1861,8 +1913,6 @@ def test_stage_rejects_owner_source_and_request_relation_drift_before_dml(
         with pytest.raises(expected_error):
             _stage(
                 journal,
-                expected_revision=expected_revision,
-                writer_epoch=writer_epoch,
                 proposal=proposal,
             )
 
@@ -1920,8 +1970,6 @@ def test_stage_snapshot_preserves_independent_global_cardinality_before_dml(
     statements.clear()
     with pytest.raises(JournalIntegrityError):
         journal.stage_source_response(
-            expected_revision=owner.revision,
-            writer_epoch=owner.writer_epoch,
             source=proposal.successor_source,
             frame=proposal.frame,
         )
@@ -2618,7 +2666,6 @@ def test_reopened_deserialized_frame_renormalizes_exactly_across_config_drift(
     drifted_config: ClassicSourceConfig | SlidingSourceConfig,
 ) -> None:
     bootstrap = _open(tmp_path, source_config)
-    owner = bootstrap._journal.load_owner()
     proposal = _stage_proposal(bootstrap._journal, source_config, 1)
     expected = proposal.normalized_frame
     expected_observations = tuple(
@@ -2626,7 +2673,6 @@ def test_reopened_deserialized_frame_renormalizes_exactly_across_config_drift(
     )
     committed = _stage(
         bootstrap._journal,
-        expected_revision=owner.revision,
         proposal=proposal,
     )
     bootstrap.close()
