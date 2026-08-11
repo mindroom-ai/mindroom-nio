@@ -514,3 +514,35 @@ Production accounting is nio `+105/-9` and MindRoom `+55/-1`, for exactly
 executable-production-boundary gate from the approved scope-reduction baseline;
 checkpoint 3's `+232..281` forecast reaches `+392..441`, where the real
 `IngestionSession` must exist.
+
+### Production `IngestionSession`
+
+Comparison snapshot: `3ba52633f0ad130e74fbab5111f77afbd1bec48a`.
+
+Top-level `nio.open_ingestion()` now validates the complete consumer
+generation/stream pair, authenticated client identity, transport, and
+single-use bootstrap before any source HTTP. `IngestionSession` owns one raw
+public `AsyncClient.send()` attempt, bounded response reads, source retry
+sleeps, exact cursor-plus-Frame staging, and diagnostic Frame-first draining.
+It invokes no response/event callback and holds no nio transaction across an
+await. `BLOCKED`, capacity, retained-IDLE, terminal/reset, malformed, and
+oversized fates all stop later source HTTP while preserving their durable
+owner.
+
+Read-only audit caught retry/release gaps during response-body streaming and a
+malformed reader overrun; focused REDs closed both before review. Independent
+review then found three ownership edges: a session could claim a bootstrap
+after a MatrixStore, custom headers could override the bearer token, and
+concurrent/cancelled close could strand the lifetime lock. The final code
+rejects store/session double claims, refuses case-insensitive custom
+Authorization before bootstrap consumption, and makes every closer shield and
+await one shared cleanup task.
+
+Final verification passed all 1,119 ingestion tests. Black, Ruff, targeted
+coordinator mypy, and `git diff --check` passed. Scoped re-review found every
+issue addressed and no new critical or important breakage.
+
+Production accounting is `+297/-0`; tests are `+1,282/-0`. Cumulative
+canary-path production additions after checkpoints 2 and 3 are `+457`, so the
+real executable `IngestionSession` exists before the active `+500` architecture
+review gate as required.
