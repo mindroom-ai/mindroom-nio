@@ -32,7 +32,7 @@ from nio.ingest.errors import (
     JournalIntegrityError,
 )
 from nio.ingest.hydration import HydrationResult, PendingHydration
-from nio.ingest.model import TransportKind
+from nio.ingest.model import BatchRef, SyncBatch, TransportKind
 from nio.ingest.ports import (
     NetworkRequest,
     NetworkResult,
@@ -450,6 +450,37 @@ EXPECTED_DDL = {
         ),
         created_at_ns INTEGER NOT NULL CHECK (
             typeof(created_at_ns) = 'integer' AND created_at_ns >= 0
+        ),
+        delivery_next_sequence INTEGER NOT NULL CHECK (typeof(delivery_next_sequence) = 'integer' AND delivery_next_sequence BETWEEN 0 AND 9223372036854775807),
+        delivery_acknowledged_sha256 BLOB NULL CHECK (delivery_acknowledged_sha256 IS NULL OR (typeof(delivery_acknowledged_sha256) = 'blob' AND length(delivery_acknowledged_sha256) = 32)),
+        delivery_outstanding_work_id TEXT NULL CHECK (delivery_outstanding_work_id IS NULL OR (typeof(delivery_outstanding_work_id) = 'text' AND length(delivery_outstanding_work_id) > 0)),
+        delivery_outstanding_ready_revision INTEGER NULL CHECK (delivery_outstanding_ready_revision IS NULL OR (typeof(delivery_outstanding_ready_revision) = 'integer' AND delivery_outstanding_ready_revision >= 1)),
+        delivery_outstanding_ready_ordinal INTEGER NULL CHECK (delivery_outstanding_ready_ordinal IS NULL OR (typeof(delivery_outstanding_ready_ordinal) = 'integer' AND delivery_outstanding_ready_ordinal >= 0)),
+        delivery_outstanding_batch_sha256 BLOB NULL CHECK (delivery_outstanding_batch_sha256 IS NULL OR (typeof(delivery_outstanding_batch_sha256) = 'blob' AND length(delivery_outstanding_batch_sha256) = 32)),
+        CHECK (
+            (delivery_outstanding_work_id IS NULL
+             AND delivery_outstanding_ready_revision IS NULL
+             AND delivery_outstanding_ready_ordinal IS NULL
+             AND delivery_outstanding_batch_sha256 IS NULL)
+         OR (delivery_outstanding_work_id IS NOT NULL
+             AND delivery_outstanding_ready_revision IS NOT NULL
+             AND delivery_outstanding_ready_revision <= revision
+             AND delivery_outstanding_ready_ordinal IS NOT NULL
+             AND delivery_outstanding_batch_sha256 IS NOT NULL)
+        ),
+        CHECK (
+            (delivery_next_sequence = 0
+             AND delivery_acknowledged_sha256 IS NULL
+             AND delivery_outstanding_work_id IS NULL)
+         OR (delivery_next_sequence = 1
+             AND delivery_acknowledged_sha256 IS NULL
+             AND delivery_outstanding_work_id IS NOT NULL)
+         OR (delivery_next_sequence >= 1
+             AND delivery_acknowledged_sha256 IS NOT NULL
+             AND delivery_outstanding_work_id IS NULL)
+         OR (delivery_next_sequence >= 2
+             AND delivery_acknowledged_sha256 IS NOT NULL
+             AND delivery_outstanding_work_id IS NOT NULL)
         ))"""),
     ("table", "NioIngestSourceState"): _normalized_sql(
         """CREATE TABLE NioIngestSourceState (
@@ -971,6 +1002,12 @@ def test_exact_schema_rejects_wrong_storage_classes_and_shapes(
                 "writer_epoch",
                 "next_source_epoch",
                 "created_at_ns",
+                "delivery_next_sequence",
+                "delivery_acknowledged_sha256",
+                "delivery_outstanding_work_id",
+                "delivery_outstanding_ready_revision",
+                "delivery_outstanding_ready_ordinal",
+                "delivery_outstanding_batch_sha256",
             ),
             (
                 ACCOUNT_ID,
@@ -983,6 +1020,12 @@ def test_exact_schema_rejects_wrong_storage_classes_and_shapes(
                 str(uuid4()),
                 1,
                 0,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
         ),
         "NioIngestSourceState": (
@@ -1170,6 +1213,8 @@ def test_source_only_journal_port_is_exact() -> None:
         "materialize_oldest_diagnostic_frame",
         "load_pending_hydrations",
         "apply_hydration_result",
+        "next_batch",
+        "acknowledge_batch",
     }
 
     assert tuple(inspect.signature(methods["load_owner"]).parameters) == ("self",)
@@ -1267,6 +1312,12 @@ def test_source_only_journal_port_is_exact() -> None:
             "result": HydrationResult,
             "return": CommitResult | None,
         },
+        "next_batch": {
+            "max_records": int,
+            "max_canonical_bytes": int,
+            "return": SyncBatch | None,
+        },
+        "acknowledge_batch": {"ref": BatchRef, "return": type(None)},
     }
 
 
@@ -2346,12 +2397,16 @@ def test_stage_snapshot_preserves_independent_global_cardinality_before_dml(
         if corruption == "extra_meta":
             row = external.execute(
                 "SELECT device_id, schema_version, stream_id, consumer_generation, transport_kind, "
-                "revision, writer_epoch, next_source_epoch, created_at_ns "
+                "revision, writer_epoch, next_source_epoch, created_at_ns, "
+                "delivery_next_sequence, delivery_acknowledged_sha256, "
+                "delivery_outstanding_work_id, delivery_outstanding_ready_revision, "
+                "delivery_outstanding_ready_ordinal, delivery_outstanding_batch_sha256 "
                 "FROM NioIngestMeta WHERE account_id = ?",
                 (ACCOUNT_ID,),
             ).fetchone()
             external.execute(
-                "INSERT INTO NioIngestMeta VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO NioIngestMeta VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (foreign_account, *row),
             )
         else:

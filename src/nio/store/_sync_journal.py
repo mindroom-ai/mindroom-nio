@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hmac
 import os
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from peewee import IntegrityError, SqliteDatabase
 
 from ..event_provenance import TimelineEventProvenance
+from ..exceptions import LocalProtocolError
+from ..ingest import errors as ingest_errors
 from ..ingest import reducer as ingest_reducer
 from ..ingest.classic import ClassicSource
 from ..ingest.config import (
@@ -23,8 +26,9 @@ from ..ingest.hydration import (
     HydrationResult,
     revalidated_hydration_result,
 )
-from ..ingest.model import EventRecord, RecordKind, TransportKind
+from ..ingest.model import BatchRef, EventRecord, RecordKind, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
+from ..ingest.serialization import batch_from_records, canonical_batch_payload
 from ..ingest.sliding import SlidingSource
 from ..ingest.source import (
     RoomSection,
@@ -40,6 +44,7 @@ from ._sync_journal_plan import (
 )
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
+    _decode_delivery_state,
     open_journal_database,
 )
 from ._sync_journal_rows import (
@@ -49,8 +54,11 @@ from ._sync_journal_rows import (
     _frame_drain_sha256,
     _frame_envelope,
     _frame_payload,
+    _Task3WorkInventory,
 )
 from ._sync_journal_values import (
+    SQLITE_INT_MAX,
+    DeliveryState,
     MaterializeResult,
     MaterializerLimits,
     MaterializeStatus,
@@ -60,10 +68,40 @@ from ._sync_journal_values import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from ..ingest.model import LossRecord, SyncBatch
+
 
 def _hydration_final_total(storage, releases) -> int:  # type: ignore[no-untyped-def]
     sizes = {row[1]: len(row[11]) for row in storage}
     return sum(sizes.values()) + sum(len(row[2]) - sizes[row[0]] for row in releases)
+
+
+type _DeliveryMember = tuple[
+    tuple[int, int, str], tuple[object, ...], EventRecord | LossRecord
+]
+_DELIVERY_COLUMNS = tuple(f"delivery_{name}" for name in DeliveryState._fields)
+_DELIVERY_UPDATE = (
+    "UPDATE NioIngestMeta SET revision = ?, "
+    + ", ".join(f"{name} = ?" for name in _DELIVERY_COLUMNS)
+    + " WHERE account_id = ? AND revision = ? AND writer_epoch = ? AND "
+    + " AND ".join(f"{name} IS ?" for name in _DELIVERY_COLUMNS)
+)
+
+
+def _ready_member(
+    inventory: _Task3WorkInventory, key: tuple[int, int, str] | None = None
+) -> _DeliveryMember | None:
+    members = (
+        cast(
+            "_DeliveryMember",
+            ((row[8], row[9], row[1]), row, work.value),
+        )
+        for row, work in zip(inventory.storage_rows, inventory.work, strict=True)
+        if work.status == "ready"
+    )
+    if key is not None:
+        return next((member for member in members if member[0] == key), None)
+    return min(members, default=None)
 
 
 # fmt: off
@@ -195,6 +233,166 @@ class SqliteIngestionJournal(JournalRows):
         cursor = self._execute(statement, parameters)
         self._transition_hook(label)
         return cursor
+
+    def _delivery_snapshot(self):  # type: ignore[no-untyped-def]
+        row = self._meta()
+        owner = self._decode_owner_row(cast("Mapping[str, object]", row))
+        return (
+            tuple(row),
+            owner,
+            _decode_delivery_state(row, owner),
+            self._load_task3_work_inventory(owner),
+        )
+
+    def _delivery_cas(
+        self,
+        label: str,
+        owner: OwnerView,
+        old: DeliveryState,
+        new: DeliveryState,
+    ) -> None:
+        cursor = self._transition_execute(
+            label,
+            _DELIVERY_UPDATE,
+            (
+                owner.revision + 1,
+                *new,
+                self.account_id,
+                owner.revision,
+                str(owner.writer_epoch),
+                *old,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise JournalConflictError(f"{label} failed")
+
+    def _delivery_writer_snapshot(self, meta, inventory):  # type: ignore[no-untyped-def]
+        try:
+            current = self._delivery_snapshot()
+        except JournalIntegrityError as error:
+            raise JournalConflictError("delivery snapshot changed") from error
+        if current[0] != meta or current[3].storage_rows != inventory.storage_rows:
+            raise JournalConflictError("delivery snapshot changed")
+        return current
+
+    def _replay_batch(
+        self,
+        owner: OwnerView,
+        state: DeliveryState,
+        inventory: _Task3WorkInventory,
+    ) -> tuple[SyncBatch, tuple[object, ...]]:
+        work_id, ready_revision, ordinal, digest = cast(
+            "tuple[str, int, int, bytes]", state[2:]
+        )
+        member = _ready_member(inventory, (ready_revision, ordinal, work_id))
+        if member is None:
+            raise JournalIntegrityError("claimed Work is missing or moved")
+        batch = batch_from_records(
+            account_id=owner.account_id,
+            device_id=owner.device_id,
+            consumer_generation=owner.consumer_generation,
+            stream_id=owner.stream_id,
+            sequence=state.next_sequence - 1,
+            created_revision=ready_revision,
+            records=(member[2],),
+        )
+        if not hmac.compare_digest(batch.ref.sha256, digest):
+            raise JournalIntegrityError("claimed Work does not match batch digest")
+        return batch, member[1]
+
+    def next_batch(
+        self,
+        *,
+        max_records: int = 256,
+        max_canonical_bytes: int = 16 * 1024 * 1024,
+    ) -> SyncBatch | None:
+        if (
+            type(max_records) is not int
+            or not 1 <= max_records <= 256
+            or type(max_canonical_bytes) is not int
+            or not 1 <= max_canonical_bytes <= 16 * 1024 * 1024
+        ):
+            raise LocalProtocolError("delivery limits are invalid")
+        with self._read():
+            meta, owner, state, inventory = self._delivery_snapshot()
+            if state.outstanding_work_id is not None:
+                return self._replay_batch(owner, state, inventory)[0]
+            member = _ready_member(inventory)
+            if member is None:
+                return None
+            if SQLITE_INT_MAX in (owner.revision, state.next_sequence):
+                raise LocalProtocolError("delivery sequence or revision is exhausted")
+            batch = batch_from_records(
+                account_id=owner.account_id,
+                device_id=owner.device_id,
+                consumer_generation=owner.consumer_generation,
+                stream_id=owner.stream_id,
+                sequence=state.next_sequence,
+                created_revision=member[0][0],
+                records=(member[2],),
+            )
+            if len(canonical_batch_payload(batch)) > max_canonical_bytes:
+                raise LocalProtocolError("READY Work exceeds delivery byte limit")
+            successor = DeliveryState(
+                state.next_sequence + 1,
+                state.acknowledged_sha256,
+                member[0][2],
+                member[0][0],
+                member[0][1],
+                batch.ref.sha256,
+            )
+
+        with self._transaction():
+            current = self._delivery_writer_snapshot(meta, inventory)
+            if _ready_member(current[3]) != member:
+                raise JournalConflictError("delivery claim snapshot changed")
+            self._delivery_cas("delivery_claim_meta_cas", owner, state, successor)
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return batch
+
+    def acknowledge_batch(self, ref: BatchRef) -> None:
+        if type(ref) is not BatchRef:
+            raise LocalProtocolError("acknowledgement must be a BatchRef")
+        with self._read():
+            meta, owner, state, inventory = self._delivery_snapshot()
+            outstanding = state.outstanding_work_id is not None
+            if outstanding:
+                batch, storage = self._replay_batch(owner, state, inventory)
+            if ref.stream_id != owner.stream_id:
+                raise LocalProtocolError("acknowledgement stream is invalid")
+            acknowledged = state.acknowledged_sha256
+            acknowledged_sequence = state.next_sequence - (2 if outstanding else 1)
+            if acknowledged is not None and ref.sequence == acknowledged_sequence:
+                name = f"{acknowledged_sequence}:{acknowledged.hex()}"
+                expected = acknowledged, uuid5(owner.stream_id, name)
+                if (ref.sha256, ref.batch_id) != expected:
+                    raise ingest_errors.BatchIntegrityError(
+                        "acknowledged batch changed"
+                    )
+                return
+            if not outstanding or ref.sequence != state.next_sequence - 1:
+                raise LocalProtocolError("acknowledgement is not FIFO")
+            if ref != batch.ref:
+                raise ingest_errors.BatchIntegrityError("outstanding batch changed")
+            if owner.revision == SQLITE_INT_MAX:
+                raise LocalProtocolError("delivery revision is exhausted")
+            successor = DeliveryState(
+                state.next_sequence, ref.sha256, None, None, None, None
+            )
+
+        with self._transaction():
+            self._delivery_writer_snapshot(meta, inventory)
+            cursor = self._transition_execute(
+                "delivery_work_delete",
+                "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",
+                (self.account_id, storage[1]),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError("delivery ack Work delete failed")
+            self._delivery_cas("delivery_ack_meta_cas", owner, state, successor)
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
 
     def _reconstruct_stage(
         self,

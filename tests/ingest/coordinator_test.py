@@ -1063,6 +1063,37 @@ async def test_terminal_error_is_sticky_without_second_http(tmp_path) -> None:
     await session.close()
 
 
+@pytest.mark.asyncio
+async def test_delivery_remains_sync_after_sticky_failure_and_stops_at_close(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    client = RecordingClient()
+    client.responses.append(FakeResponse(403, b"{}"))
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+        room_id=ROOM,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+
+    assert session.next_batch(max_records=1, max_canonical_bytes=1) is None
+    with pytest.raises(LocalProtocolError):
+        session.acknowledge_batch(object())  # type: ignore[arg-type]
+    assert client.send_count == 1
+
+    await session.close()
+    with pytest.raises(LocalProtocolError):
+        session.next_batch()
+    with pytest.raises(LocalProtocolError):
+        session.acknowledge_batch(object())  # type: ignore[arg-type]
+
+
 class HoldingClient(RecordingClient):
     def __init__(self) -> None:
         super().__init__()

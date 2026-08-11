@@ -8,7 +8,6 @@ from uuid import UUID, uuid5
 from .errors import BatchIntegrityError
 from .model import (
     BatchRef,
-    ConsumerBinding,
     EventRecord,
     LossBoundary,
     LossReason,
@@ -231,7 +230,7 @@ def _batch_dict(
     schema_version: int,
     account_id: str,
     device_id: str,
-    consumer: ConsumerBinding,
+    consumer_generation: UUID,
     stream_id: UUID,
     sequence: int,
     created_revision: int,
@@ -244,10 +243,7 @@ def _batch_dict(
         "schema_version": schema_version,
         "account_id": account_id,
         "device_id": device_id,
-        "consumer": {
-            "journal_generation": str(consumer.journal_generation),
-            "consumer_generation": str(consumer.consumer_generation),
-        },
+        "consumer_generation": str(consumer_generation),
         "stream_id": str(stream_id),
         "sequence": sequence,
         "created_revision": created_revision,
@@ -262,7 +258,7 @@ def canonical_batch_payload(batch: SyncBatch) -> bytes:
             schema_version=batch.schema_version,
             account_id=batch.account_id,
             device_id=batch.device_id,
-            consumer=batch.consumer,
+            consumer_generation=batch.consumer_generation,
             stream_id=batch.ref.stream_id,
             sequence=batch.ref.sequence,
             created_revision=batch.created_revision,
@@ -275,7 +271,7 @@ def batch_from_records(
     *,
     account_id: str,
     device_id: str,
-    consumer: ConsumerBinding,
+    consumer_generation: UUID,
     stream_id: UUID,
     sequence: int,
     created_revision: int,
@@ -291,7 +287,7 @@ def batch_from_records(
             schema_version=SCHEMA_VERSION,
             account_id=account_id,
             device_id=device_id,
-            consumer=consumer,
+            consumer_generation=consumer_generation,
             stream_id=stream_id,
             sequence=sequence,
             created_revision=created_revision,
@@ -309,7 +305,7 @@ def batch_from_records(
         SCHEMA_VERSION,
         account_id,
         device_id,
-        consumer,
+        consumer_generation,
         ref,
         created_revision,
         records,
@@ -322,6 +318,12 @@ def _validate_batch(batch: SyncBatch) -> None:
         raise ValueError(f"unsupported schema_version: {batch.schema_version}")
     _require_integer(batch.ref.sequence, "sequence")
     _require_integer(batch.created_revision, "created_revision")
+    if not batch.account_id or not batch.device_id:
+        raise ValueError("batch account_id and device_id must be nonempty")
+    if not 0 <= batch.ref.sequence <= 2**63 - 1:
+        raise ValueError("sequence must fit a nonnegative SQLite integer")
+    if batch.created_revision < 1:
+        raise ValueError("created_revision must be positive")
     if not isinstance(batch.records, tuple):
         raise TypeError("records must be a tuple")
     if not batch.records:
@@ -369,24 +371,24 @@ def _batch_from_payload(payload: bytes) -> SyncBatch:
     schema_version = _integer(root.get("schema_version"), "schema_version")
     if schema_version != SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version: {schema_version}")
-    consumer_value = _dict(root.get("consumer"), "consumer")
-    consumer = ConsumerBinding(
-        UUID(_string(consumer_value.get("journal_generation"), "journal_generation")),
-        UUID(_string(consumer_value.get("consumer_generation"), "consumer_generation")),
-    )
+    consumer_text = _string(root.get("consumer_generation"), "consumer_generation")
+    consumer_generation = UUID(consumer_text)
     records_value = root.get("records")
     if not isinstance(records_value, list):
         raise ValueError("records must be an array")
     records = tuple(_record_from_dict(record) for record in records_value)
-    return batch_from_records(
+    batch = batch_from_records(
         account_id=_string(root.get("account_id"), "account_id"),
         device_id=_string(root.get("device_id"), "device_id"),
-        consumer=consumer,
+        consumer_generation=consumer_generation,
         stream_id=UUID(_string(root.get("stream_id"), "stream_id")),
         sequence=_integer(root.get("sequence"), "sequence"),
         created_revision=_integer(root.get("created_revision"), "created_revision"),
         records=records,
     )
+    if payload != canonical_batch_payload(batch):
+        raise ValueError("batch payload is not canonical")
+    return batch
 
 
 def _room_member_to_dict(member: RoomMemberSnapshot) -> dict[str, object]:

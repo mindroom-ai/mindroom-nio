@@ -1,0 +1,1051 @@
+import hashlib
+import json
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import fields, replace
+from pathlib import Path
+from uuid import UUID, uuid5
+
+import pytest
+
+from nio.event_provenance import TimelineEventProvenance
+from nio.exceptions import LocalProtocolError
+from nio.ingest.config import ClassicSourceConfig
+from nio.ingest.errors import (
+    BatchIntegrityError,
+    FreshIngestionRequired,
+    JournalConflictError,
+    JournalIntegrityError,
+)
+from nio.ingest.model import (
+    BatchRef,
+    EventRecord,
+    RecordKind,
+    RecordOrigin,
+    SyncBatch,
+    TransportKind,
+)
+from nio.ingest.serialization import (
+    _batch_from_payload,
+    batch_from_records,
+    canonical_batch_payload,
+)
+from nio.store import _sync_journal_preflight as preflight
+from nio.store._sync_journal import SqliteIngestionJournal
+from nio.store._sync_journal_plan import _canonical_work_plaintext
+from nio.store._sync_journal_port import IngestionJournal
+from nio.store._sync_journal_rows import _canonical_internal
+from nio.store.sync_journal import open_ingestion_store
+from nio.store.sync_journal_schema import SCHEMA_SQL
+
+ACCOUNT_ID = "@alice:example.org"
+DEVICE_ID = "DEVICE"
+CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
+STREAM_ID = UUID("44444444-4444-4444-8444-444444444444")
+WRITER_EPOCH = UUID("33333333-3333-4333-8333-333333333333")
+WORK_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+DELIVERY_COLUMNS = (
+    "delivery_next_sequence",
+    "delivery_acknowledged_sha256",
+    "delivery_outstanding_work_id",
+    "delivery_outstanding_ready_revision",
+    "delivery_outstanding_ready_ordinal",
+    "delivery_outstanding_batch_sha256",
+)
+TASK4_META_SQL = """CREATE TABLE NioIngestMeta (
+    account_id TEXT PRIMARY KEY CHECK (
+        typeof(account_id) = 'text' AND length(account_id) > 0
+    ),
+    device_id TEXT NOT NULL CHECK (
+        typeof(device_id) = 'text' AND length(device_id) > 0
+    ),
+    schema_version INTEGER NOT NULL CHECK (
+        typeof(schema_version) = 'integer' AND schema_version = 1
+    ),
+    stream_id TEXT NOT NULL CHECK (
+        typeof(stream_id) = 'text' AND length(stream_id) > 0
+    ),
+    consumer_generation TEXT NOT NULL CHECK (
+        typeof(consumer_generation) = 'text' AND length(consumer_generation) > 0
+    ),
+    transport_kind TEXT NOT NULL CHECK (
+        typeof(transport_kind) = 'text'
+        AND length(transport_kind) > 0
+        AND transport_kind IN ('classic', 'sliding')
+    ),
+    revision INTEGER NOT NULL CHECK (
+        typeof(revision) = 'integer' AND revision >= 0
+    ),
+    writer_epoch TEXT NOT NULL CHECK (
+        typeof(writer_epoch) = 'text' AND length(writer_epoch) > 0
+    ),
+    next_source_epoch INTEGER NOT NULL CHECK (
+        typeof(next_source_epoch) = 'integer' AND next_source_epoch >= 1
+    ),
+    created_at_ns INTEGER NOT NULL CHECK (
+        typeof(created_at_ns) = 'integer' AND created_at_ns >= 0
+    ))"""
+GOLDEN = (
+    b'{"schema_version":1,"account_id":"@alice:example.org","device_id":"DEVICE",'
+    b'"consumer_generation":"22222222-2222-4222-8222-222222222222",'
+    b'"stream_id":"44444444-4444-4444-8444-444444444444","sequence":0,'
+    b'"created_revision":1,"records":[{"record_type":"event",'
+    b'"record_id":"00000000-0000-4000-8000-000000000001","kind":"timeline",'
+    b'"origin":{"origin_type":"transport","transport":"classic",'
+    b'"source_epoch":0,"request_id":0,"frame_index":0},'
+    b'"room_id":"!room:example.org","membership_epoch":0,"room_sequence":0,'
+    b'"event_id":null,"provenance":"live","source_json":"e30=",'
+    b'"clear_json":null}]}'
+)
+
+
+def _event() -> EventRecord:
+    return EventRecord(
+        "00000000-0000-4000-8000-000000000001",
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 0, 0, 0),
+        "!room:example.org",
+        0,
+        0,
+        None,
+        TimelineEventProvenance.LIVE,
+        b"{}",
+        None,
+    )
+
+
+def _ready_event(number: int, padding: int = 0) -> EventRecord:
+    return EventRecord(
+        str(UUID(int=number)),
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 0, 0, number),
+        "!room:example.org",
+        0,
+        number,
+        None,
+        TimelineEventProvenance.LIVE,
+        json.dumps({"body": "x" * padding}, separators=(",", ":")).encode(),
+        None,
+    )
+
+
+def _open(tmp_path: Path, **kwargs: object):
+    return open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        source=SOURCE,
+        database_name="journal.db",
+        **kwargs,
+    )
+
+
+def _meta_row(database_path: Path) -> sqlite3.Row:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT * FROM NioIngestMeta LIMIT 2").fetchall()
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _seed_work(
+    journal: SqliteIngestionJournal,
+    record: EventRecord,
+    *,
+    ready_revision: int | None,
+    ready_ordinal: int | None,
+    status: str = "ready",
+) -> tuple[object, ...]:
+    owner = journal.load_owner()
+    created_revision = ready_revision or max(owner.revision, 1)
+    clear = (
+        record.record_id,
+        "event",
+        status,
+        str(UUID(int=10_000 + record.origin.frame_index)),
+        record.room_id,
+        record.membership_epoch,
+        record.room_sequence,
+        ready_revision,
+        ready_ordinal,
+        created_revision,
+    )
+    payload, digest = journal._payload(
+        owner,
+        "NioIngestWork",
+        _canonical_work_plaintext("event", record),
+        header=_canonical_internal(clear),
+    )
+    row = (journal.account_id, *clear, payload, digest)
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestMeta SET revision = ? WHERE account_id = ?",
+            (max(owner.revision, created_revision), journal.account_id),
+        )
+        journal._execute(
+            "INSERT INTO NioIngestWork VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+    return row
+
+
+def _raw_delivery_graph(database_path: Path) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(database_path) as connection:
+        return tuple(
+            tuple(row)
+            for table in ("NioIngestMeta", "NioIngestWork")
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+        )
+
+
+def _delivery_frontier(database_path: Path) -> tuple[object, ...]:
+    row = _meta_row(database_path)
+    return tuple(row[name] for name in DELIVERY_COLUMNS)
+
+
+def _replace_work(
+    journal: SqliteIngestionJournal,
+    old: tuple[object, ...],
+    clear: tuple[object, ...],
+    record: EventRecord,
+) -> tuple[object, ...]:
+    owner = journal.load_owner()
+    payload, digest = journal._payload(
+        owner,
+        "NioIngestWork",
+        _canonical_work_plaintext("event", record),
+        header=_canonical_internal(clear),
+    )
+    row = (journal.account_id, *clear, payload, digest)
+    with journal._owner.journal_write():
+        journal._execute(
+            "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",
+            (journal.account_id, old[1]),
+        )
+        journal._execute(
+            "INSERT INTO NioIngestWork VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+    return row
+
+
+def test_direct_generation_batch_wire_is_canonical_and_strict() -> None:
+    batch = batch_from_records(
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        stream_id=STREAM_ID,
+        sequence=0,
+        created_revision=1,
+        records=(_event(),),
+    )
+    digest = hashlib.sha256(GOLDEN).digest()
+
+    assert tuple(field.name for field in fields(SyncBatch)) == (
+        "schema_version",
+        "account_id",
+        "device_id",
+        "consumer_generation",
+        "ref",
+        "created_revision",
+        "records",
+    )
+    assert canonical_batch_payload(batch) == GOLDEN
+    assert batch.ref == BatchRef(
+        STREAM_ID,
+        0,
+        uuid5(STREAM_ID, f"0:{digest.hex()}"),
+        digest,
+    )
+    assert _batch_from_payload(GOLDEN) == batch
+
+    old_wire = GOLDEN.replace(
+        b'"consumer_generation":"22222222-2222-4222-8222-222222222222",',
+        b'"consumer":{"journal_generation":"11111111-1111-4111-8111-111111111111",'
+        b'"consumer_generation":"22222222-2222-4222-8222-222222222222"},',
+    )
+    with pytest.raises(ValueError):
+        _batch_from_payload(old_wire)
+    braced_stream = GOLDEN.replace(str(STREAM_ID).encode(), f"{{{STREAM_ID}}}".encode())
+    extra_record_field = GOLDEN.replace(
+        b'"clear_json":null}', b'"clear_json":null,"extra":null}'
+    )
+    reordered_record_fields = GOLDEN.replace(
+        b'"record_type":"event","record_id":',
+        b'"record_id":"00000000-0000-4000-8000-000000000001",'
+        b'"record_type":"event","discarded":',
+    ).replace(b'"discarded":"00000000-0000-4000-8000-000000000001",', b"")
+    for noncanonical in (braced_stream, extra_record_field, reordered_record_fields):
+        with pytest.raises(ValueError):
+            _batch_from_payload(noncanonical)
+    with pytest.raises((TypeError, ValueError)):
+        BatchRef(STREAM_ID, -1, STREAM_ID, b"short")
+    with pytest.raises((TypeError, ValueError)):
+        batch_from_records(
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer_generation=CONSUMER_GENERATION,
+            stream_id=STREAM_ID,
+            sequence=2**63,
+            created_revision=1,
+            records=(_event(),),
+        )
+
+
+def test_delivery_port_declares_synchronous_batch_operations() -> None:
+    assert "next_batch" in IngestionJournal.__dict__
+    assert "acknowledge_batch" in IngestionJournal.__dict__
+
+
+def test_fresh_store_persists_exact_typed_delivery_frontier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated = iter((WRITER_EPOCH, STREAM_ID))
+    monkeypatch.setattr(preflight, "uuid4", lambda: next(generated))
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statement_observer=statements.append)
+    owner = bootstrap._journal.load_owner()
+    database_path = bootstrap.database_path
+    bootstrap.close()
+    row = _meta_row(database_path)
+
+    assert tuple(row.keys())[-6:] == DELIVERY_COLUMNS
+    assert tuple(row[name] for name in DELIVERY_COLUMNS) == (
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert owner.revision == 0
+    assert any("SELECT * FROM NioIngestMeta LIMIT 2" in sql for sql in statements)
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "NioIngestDeliveryState" not in tables
+
+
+@pytest.mark.parametrize(
+    ("assignment", "parameters"),
+    (
+        ("delivery_next_sequence = -1", ()),
+        ("delivery_next_sequence = 9223372036854775808", ()),
+        ("delivery_acknowledged_sha256 = ?", (b"a" * 31,)),
+        ("delivery_outstanding_work_id = ''", ()),
+        ("delivery_outstanding_ready_revision = 0", ()),
+        ("delivery_outstanding_ready_ordinal = -1", ()),
+        ("delivery_outstanding_batch_sha256 = ?", (b"b" * 31,)),
+        ("delivery_outstanding_work_id = ?", (WORK_ID,)),
+        ("delivery_next_sequence = 1", ()),
+        (
+            "delivery_next_sequence = 0, delivery_acknowledged_sha256 = ?",
+            (b"a" * 32,),
+        ),
+    ),
+)
+def test_typed_delivery_columns_enforce_exact_constraints_and_frontiers(
+    tmp_path: Path,
+    assignment: str,
+    parameters: tuple[object, ...],
+) -> None:
+    bootstrap = _open(tmp_path)
+    database_path = bootstrap.database_path
+    bootstrap.close()
+
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(f"UPDATE NioIngestMeta SET {assignment}", parameters)
+
+
+def test_task4_topology_is_rejected_before_writer_epoch_mutation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    old_epoch = str(WRITER_EPOCH)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(TASK4_META_SQL)
+        for statement in SCHEMA_SQL:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO NioIngestMeta VALUES (?, ?, 1, ?, ?, 'classic', 0, ?, 1, 0)",
+            (
+                ACCOUNT_ID,
+                DEVICE_ID,
+                str(STREAM_ID),
+                str(CONSUMER_GENERATION),
+                old_epoch,
+            ),
+        )
+
+    with pytest.raises(FreshIngestionRequired):
+        _open(tmp_path)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT writer_epoch FROM NioIngestMeta"
+        ).fetchone() == (old_epoch,)
+
+
+@pytest.mark.parametrize(
+    ("frontier", "assignment", "parameters"),
+    (
+        ("fresh", "delivery_next_sequence = 1.5", ()),
+        ("acknowledged", "delivery_acknowledged_sha256 = 'not-a-blob'", ()),
+        ("claimed", "delivery_outstanding_work_id = ?", (WORK_ID.upper(),)),
+        ("claimed", "delivery_outstanding_ready_revision = 3", ()),
+        ("claimed", "delivery_outstanding_ready_ordinal = 1.5", ()),
+        ("claimed", "delivery_outstanding_batch_sha256 = 'not-a-blob'", ()),
+    ),
+)
+def test_reopen_rejects_constraint_bypassed_typed_state_corruption(
+    tmp_path: Path,
+    frontier: str,
+    assignment: str,
+    parameters: tuple[object, ...],
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    if frontier != "fresh":
+        _seed_work(journal, _ready_event(100), ready_revision=1, ready_ordinal=0)
+        batch = journal.next_batch()
+        assert batch is not None
+        if frontier == "acknowledged":
+            journal.acknowledge_batch(batch.ref)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(f"UPDATE NioIngestMeta SET {assignment}", parameters)
+
+    with pytest.raises(JournalIntegrityError):
+        journal.next_batch()
+    bootstrap.close()
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path)
+
+
+def test_complete_outstanding_frontier_enforces_ready_revision_bound(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(101), ready_revision=1, ready_ordinal=0)
+    assert journal.next_batch() is not None
+    bootstrap.close()
+
+    with sqlite3.connect(bootstrap.database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE NioIngestMeta SET delivery_outstanding_ready_revision = "
+                "revision + 1"
+            )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("schema_type", "stream_text"),
+)
+def test_reopen_rejects_noncanonical_owner_before_delivery_decode(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    bootstrap = _open(tmp_path)
+    database_path = bootstrap.database_path
+    row = dict(_meta_row(database_path))
+    if corruption == "schema_type":
+        row["schema_version"] = 1.0
+        with pytest.raises(JournalIntegrityError):
+            bootstrap._journal._decode_owner_row(row)
+        bootstrap.close()
+        return
+    bootstrap.close()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE NioIngestMeta SET stream_id = ?", (f"{{{row['stream_id']}}}",)
+        )
+
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "operation"),
+    tuple(
+        (field, operation)
+        for field in ("stream_id", "consumer_generation", "writer_epoch")
+        for operation in ("replay", "ack")
+    ),
+)
+def test_live_delivery_rejects_noncanonical_owner_uuid_before_dml(
+    tmp_path: Path,
+    field: str,
+    operation: str,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(102), ready_revision=1, ready_ordinal=0)
+    batch = journal.next_batch()
+    assert batch is not None
+    transitions.clear()
+    row = _meta_row(bootstrap.database_path)
+    decoded_row = dict(row)
+    decoded_row[field] = f"{{{row[field]}}}"
+    with pytest.raises(JournalIntegrityError):
+        journal._decode_owner_row(decoded_row)
+    with sqlite3.connect(bootstrap.database_path) as connection:
+        connection.execute(
+            f"UPDATE NioIngestMeta SET {field} = ?", (f"{{{row[field]}}}",)
+        )
+    corrupted = _raw_delivery_graph(bootstrap.database_path)
+
+    expected_error = (
+        LocalProtocolError if field == "writer_epoch" else JournalIntegrityError
+    )
+    with pytest.raises(expected_error):
+        (
+            journal.next_batch()
+            if operation == "replay"
+            else journal.acknowledge_batch(batch.ref)
+        )
+    assert _raw_delivery_graph(bootstrap.database_path) == corrupted
+    assert transitions == []
+    bootstrap.close()
+
+
+def test_no_ready_work_returns_none_without_writer_or_revision(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+    transitions: list[str] = []
+    bootstrap = _open(
+        tmp_path,
+        statement_observer=statements.append,
+        transition_statement_hook=transitions.append,
+    )
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    _seed_work(
+        journal,
+        _ready_event(1),
+        ready_revision=None,
+        ready_ordinal=None,
+        status="held",
+    )
+    before = _raw_delivery_graph(database_path)
+    statements.clear()
+
+    assert journal.next_batch() is None
+    assert _raw_delivery_graph(database_path) == before
+    assert transitions == []
+    assert not any(
+        sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for sql in statements
+    )
+    assert any("FROM NioIngestWork LIMIT 20001" in sql for sql in statements)
+    bootstrap.close()
+
+
+def test_claims_only_minimum_ready_key_and_replays_identically(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+    transitions: list[str] = []
+    bootstrap = _open(
+        tmp_path,
+        statement_observer=statements.append,
+        transition_statement_hook=transitions.append,
+    )
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    later_revision = _seed_work(
+        journal, _ready_event(1), ready_revision=2, ready_ordinal=0
+    )
+    later_ordinal = _seed_work(
+        journal, _ready_event(2), ready_revision=1, ready_ordinal=1
+    )
+    selected = _seed_work(journal, _ready_event(3), ready_revision=1, ready_ordinal=0)
+    before_work = tuple(row for row in _raw_delivery_graph(database_path)[1:])
+    statements.clear()
+
+    batch = journal.next_batch(max_records=256)
+
+    assert batch is not None
+    assert batch.records == (_ready_event(3),)
+    assert batch.ref.sequence == 0
+    assert batch.created_revision == 1
+    assert _delivery_frontier(database_path) == (
+        1,
+        None,
+        _ready_event(3).record_id,
+        1,
+        0,
+        batch.ref.sha256,
+    )
+    assert tuple(row for row in _raw_delivery_graph(database_path)[1:]) == before_work
+    assert transitions == ["delivery_claim_meta_cas", "before_commit", "commit"]
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert any("FROM NioIngestWork LIMIT 20001" in sql for sql in selects)
+    assert not any("NioIngestWork" in sql and "WHERE" in sql for sql in selects)
+
+    frozen_payload = canonical_batch_payload(batch)
+    frozen_graph = _raw_delivery_graph(database_path)
+    statements.clear()
+    transitions.clear()
+    replay = journal.next_batch(max_records=1, max_canonical_bytes=1)
+    assert replay == batch
+    assert canonical_batch_payload(replay) == frozen_payload
+    assert _raw_delivery_graph(database_path) == frozen_graph
+    assert transitions == []
+    assert not any(
+        sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for sql in statements
+    )
+    assert later_revision != selected != later_ordinal
+
+    bootstrap.close()
+    reopened = _open(tmp_path)
+    assert reopened._journal.next_batch() == batch
+    appended = _seed_work(
+        reopened._journal,
+        _ready_event(4),
+        ready_revision=reopened._journal.load_owner().revision + 1,
+        ready_ordinal=0,
+    )
+    assert reopened._journal.next_batch() == batch
+    reopened._journal.acknowledge_batch(batch.ref)
+    assert appended in _raw_delivery_graph(reopened.database_path)[1:]
+    reopened.close()
+
+
+def test_claim_enforces_exact_caller_limits_before_writer(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    record = _ready_event(5, padding=32)
+    _seed_work(journal, record, ready_revision=1, ready_ordinal=0)
+    owner = journal.load_owner()
+    expected = batch_from_records(
+        account_id=owner.account_id,
+        device_id=owner.device_id,
+        consumer_generation=owner.consumer_generation,
+        stream_id=owner.stream_id,
+        sequence=0,
+        created_revision=1,
+        records=(record,),
+    )
+    exact = len(canonical_batch_payload(expected))
+    before = _raw_delivery_graph(database_path)
+
+    for name, invalid in (
+        ("max_records", 0),
+        ("max_records", 257),
+        ("max_records", True),
+        ("max_canonical_bytes", 0),
+        ("max_canonical_bytes", 16 * 1024 * 1024 + 1),
+        ("max_canonical_bytes", True),
+    ):
+        with pytest.raises(LocalProtocolError):
+            journal.next_batch(**{name: invalid})
+        assert _raw_delivery_graph(database_path) == before
+    with pytest.raises(LocalProtocolError):
+        journal.next_batch(max_canonical_bytes=exact - 1)
+    assert _raw_delivery_graph(database_path) == before
+    assert journal.next_batch(max_canonical_bytes=exact) == expected
+    bootstrap.close()
+
+
+@pytest.mark.parametrize("exhaustion", ("sequence", "revision"))
+def test_claim_refuses_sequence_or_revision_exhaustion_before_dml(
+    tmp_path: Path,
+    exhaustion: str,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    _seed_work(journal, _ready_event(6), ready_revision=1, ready_ordinal=0)
+    with journal._owner.journal_write():
+        if exhaustion == "sequence":
+            journal._execute(
+                "UPDATE NioIngestMeta SET delivery_next_sequence = ?, "
+                "delivery_acknowledged_sha256 = ?",
+                (2**63 - 1, b"a" * 32),
+            )
+        else:
+            journal._execute("UPDATE NioIngestMeta SET revision = ?", (2**63 - 1,))
+    before = _raw_delivery_graph(database_path)
+
+    with pytest.raises(LocalProtocolError):
+        journal.next_batch()
+    assert _raw_delivery_graph(database_path) == before
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("delivery_claim_meta_cas", "before_commit", "commit"),
+)
+def test_claim_failure_exposes_only_unclaimed_or_complete_claim(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    record = _ready_event(7)
+    _seed_work(journal, record, ready_revision=1, ready_ordinal=0)
+    old_frontier = _delivery_frontier(bootstrap.database_path)
+    old_work = _raw_delivery_graph(bootstrap.database_path)[1:]
+
+    def fail(label: str) -> None:
+        if label == boundary:
+            raise RuntimeError(boundary)
+
+    journal.set_transition_statement_hook(fail)
+    with pytest.raises(RuntimeError, match=boundary):
+        journal.next_batch()
+    bootstrap.close()
+    reopened = _open(tmp_path)
+    if boundary == "commit":
+        assert _delivery_frontier(reopened.database_path)[2] == record.record_id
+    else:
+        assert _delivery_frontier(reopened.database_path) == old_frontier
+        assert _raw_delivery_graph(reopened.database_path)[1:] == old_work
+    batch = reopened._journal.next_batch()
+    assert batch is not None and batch.records == (record,)
+    reopened._journal.acknowledge_batch(batch.ref)
+    reopened.close()
+
+
+@pytest.mark.parametrize("operation", ("replay", "ack"))
+@pytest.mark.parametrize("corruption", ("removed", "status", "full_key", "value"))
+def test_claimed_work_corruption_fails_closed_without_delivery_dml(
+    tmp_path: Path,
+    operation: str,
+    corruption: str,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    record = _ready_event(8)
+    stored = _seed_work(journal, record, ready_revision=1, ready_ordinal=0)
+    batch = journal.next_batch()
+    assert batch is not None
+    transitions.clear()
+
+    if corruption == "removed":
+        with journal._owner.journal_write():
+            journal._execute("DELETE FROM NioIngestWork")
+    else:
+        clear = list(stored[1:11])
+        replacement = record
+        if corruption == "status":
+            clear[2], clear[7], clear[8] = "held", None, None
+        elif corruption == "full_key":
+            replacement = replace(record, record_id=str(UUID(int=800)))
+            clear[0], clear[7], clear[8] = (
+                replacement.record_id,
+                journal.load_owner().revision,
+                8,
+            )
+        else:
+            replacement = replace(record, source_json=b'{"body":"changed"}')
+        _replace_work(journal, stored, tuple(clear), replacement)
+    corrupted = _raw_delivery_graph(bootstrap.database_path)
+
+    with pytest.raises(JournalIntegrityError):
+        (
+            journal.next_batch()
+            if operation == "replay"
+            else journal.acknowledge_batch(batch.ref)
+        )
+    assert _raw_delivery_graph(bootstrap.database_path) == corrupted
+    assert transitions == []
+    bootstrap.close()
+
+
+def test_foreign_account_work_is_rejected_by_global_inventory_before_claim(
+    tmp_path: Path,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    stored = _seed_work(journal, _ready_event(9), ready_revision=1, ready_ordinal=0)
+    with sqlite3.connect(bootstrap.database_path) as connection:
+        connection.execute(
+            "INSERT INTO NioIngestWork VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("@mallory:example.org", *stored[1:]),
+        )
+    before = _raw_delivery_graph(bootstrap.database_path)
+
+    with pytest.raises(JournalIntegrityError):
+        journal.next_batch()
+    assert _raw_delivery_graph(bootstrap.database_path) == before
+    assert transitions == []
+    bootstrap.close()
+
+
+@pytest.mark.parametrize("race", ("meta", "state", "inventory", "ready_head"))
+def test_claim_rejects_coherent_writer_entry_snapshot_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(50), ready_revision=2, ready_ordinal=0)
+    real_transaction = journal._transaction
+    raced: tuple[tuple[object, ...], ...] = ()
+
+    @contextmanager
+    def racing_transaction():
+        nonlocal raced
+        if race in ("meta", "state"):
+            owner = journal.load_owner()
+            with journal._owner.journal_write():
+                if race == "meta":
+                    journal._execute(
+                        "UPDATE NioIngestMeta SET revision = ?", (owner.revision + 1,)
+                    )
+                else:
+                    journal._execute(
+                        "UPDATE NioIngestMeta SET revision = ?, "
+                        "delivery_next_sequence = 1, "
+                        "delivery_acknowledged_sha256 = ?",
+                        (owner.revision + 1, b"r" * 32),
+                    )
+        elif race == "inventory":
+            _seed_work(
+                journal,
+                _ready_event(51),
+                ready_revision=None,
+                ready_ordinal=None,
+                status="held",
+            )
+        else:
+            _seed_work(journal, _ready_event(52), ready_revision=1, ready_ordinal=0)
+        raced = _raw_delivery_graph(bootstrap.database_path)
+        with real_transaction():
+            yield
+
+    monkeypatch.setattr(journal, "_transaction", racing_transaction)
+    with pytest.raises(JournalConflictError):
+        journal.next_batch()
+    assert _raw_delivery_graph(bootstrap.database_path) == raced
+    assert transitions == []
+    bootstrap.close()
+
+
+@pytest.mark.parametrize("race", ("meta", "inventory"))
+def test_ack_rejects_coherent_writer_entry_snapshot_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(60), ready_revision=1, ready_ordinal=0)
+    batch = journal.next_batch()
+    assert batch is not None
+    transitions.clear()
+    real_transaction = journal._transaction
+    raced: tuple[tuple[object, ...], ...] = ()
+
+    @contextmanager
+    def racing_transaction():
+        nonlocal raced
+        if race == "meta":
+            revision = journal.load_owner().revision
+            with journal._owner.journal_write():
+                journal._execute(
+                    "UPDATE NioIngestMeta SET revision = ?", (revision + 1,)
+                )
+        else:
+            _seed_work(
+                journal,
+                _ready_event(61),
+                ready_revision=None,
+                ready_ordinal=None,
+                status="held",
+            )
+        raced = _raw_delivery_graph(bootstrap.database_path)
+        with real_transaction():
+            yield
+
+    monkeypatch.setattr(journal, "_transaction", racing_transaction)
+    with pytest.raises(JournalConflictError):
+        journal.acknowledge_batch(batch.ref)
+    assert _raw_delivery_graph(bootstrap.database_path) == raced
+    assert transitions == []
+    bootstrap.close()
+
+
+def test_acknowledgement_enforces_fifo_integrity_and_retains_other_work(
+    tmp_path: Path,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
+    journal = bootstrap._journal
+    database_path = bootstrap.database_path
+    selected = _seed_work(journal, _ready_event(10), ready_revision=1, ready_ordinal=0)
+    later = _seed_work(journal, _ready_event(11), ready_revision=2, ready_ordinal=0)
+    held = _seed_work(
+        journal,
+        _ready_event(12),
+        ready_revision=None,
+        ready_ordinal=None,
+        status="held",
+    )
+    batch = journal.next_batch()
+    assert batch is not None
+    before = _raw_delivery_graph(database_path)
+    transitions.clear()
+
+    with pytest.raises(LocalProtocolError):
+        journal.acknowledge_batch(object())  # type: ignore[arg-type]
+    with pytest.raises(LocalProtocolError):
+        journal.acknowledge_batch(
+            BatchRef(UUID(int=999), 0, batch.ref.batch_id, batch.ref.sha256)
+        )
+    with pytest.raises(LocalProtocolError):
+        journal.acknowledge_batch(
+            BatchRef(batch.ref.stream_id, 1, batch.ref.batch_id, batch.ref.sha256)
+        )
+    with pytest.raises(BatchIntegrityError):
+        journal.acknowledge_batch(
+            BatchRef(batch.ref.stream_id, 0, batch.ref.batch_id, b"z" * 32)
+        )
+    with pytest.raises(BatchIntegrityError):
+        journal.acknowledge_batch(
+            BatchRef(batch.ref.stream_id, 0, UUID(int=998), batch.ref.sha256)
+        )
+    assert _raw_delivery_graph(database_path) == before
+    assert transitions == []
+
+    journal.acknowledge_batch(batch.ref)
+    assert transitions == [
+        "delivery_work_delete",
+        "delivery_ack_meta_cas",
+        "before_commit",
+        "commit",
+    ]
+    graph = _raw_delivery_graph(database_path)
+    assert selected not in graph
+    assert later in graph and held in graph
+    assert _delivery_frontier(database_path) == (
+        1,
+        batch.ref.sha256,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    transitions.clear()
+    acknowledged = _raw_delivery_graph(database_path)
+    journal.acknowledge_batch(batch.ref)
+    assert _raw_delivery_graph(database_path) == acknowledged
+    assert transitions == []
+    bootstrap.close()
+
+
+def test_ack_duplicate_is_immediate_while_next_sequence_is_outstanding(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    first = _ready_event(20)
+    _seed_work(journal, first, ready_revision=1, ready_ordinal=0)
+    batch_zero = journal.next_batch()
+    assert batch_zero is not None
+    journal.acknowledge_batch(batch_zero.ref)
+    bootstrap.close()
+
+    reopened = _open(tmp_path)
+    journal = reopened._journal
+    revision = journal.load_owner().revision + 1
+    _seed_work(journal, _ready_event(21), ready_revision=revision, ready_ordinal=0)
+    batch_one = journal.next_batch()
+    assert batch_one is not None and batch_one.ref.sequence == 1
+    outstanding = _raw_delivery_graph(reopened.database_path)
+    journal.acknowledge_batch(batch_zero.ref)
+    assert _raw_delivery_graph(reopened.database_path) == outstanding
+    journal.acknowledge_batch(batch_one.ref)
+    assert _delivery_frontier(reopened.database_path) == (
+        2,
+        batch_one.ref.sha256,
+        None,
+        None,
+        None,
+        None,
+    )
+    acknowledged = _raw_delivery_graph(reopened.database_path)
+    with pytest.raises(LocalProtocolError):
+        journal.acknowledge_batch(batch_zero.ref)
+    assert _raw_delivery_graph(reopened.database_path) == acknowledged
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("delivery_work_delete", "delivery_ack_meta_cas", "before_commit", "commit"),
+)
+def test_acknowledgement_failure_exposes_only_old_or_complete_new_graph(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(30), ready_revision=1, ready_ordinal=0)
+    batch = journal.next_batch()
+    assert batch is not None
+    old_frontier = _delivery_frontier(bootstrap.database_path)
+    old_work = _raw_delivery_graph(bootstrap.database_path)[1:]
+
+    def fail(label: str) -> None:
+        if label == boundary:
+            raise RuntimeError(boundary)
+
+    journal.set_transition_statement_hook(fail)
+    with pytest.raises(RuntimeError, match=boundary):
+        journal.acknowledge_batch(batch.ref)
+    bootstrap.close()
+    reopened = _open(tmp_path)
+    if boundary == "commit":
+        assert reopened._journal.next_batch() is None
+        reopened._journal.acknowledge_batch(batch.ref)
+    else:
+        assert _delivery_frontier(reopened.database_path) == old_frontier
+        assert _raw_delivery_graph(reopened.database_path)[1:] == old_work
+        assert reopened._journal.next_batch() == batch
+        reopened._journal.acknowledge_batch(batch.ref)
+    assert reopened._journal.next_batch() is None
+    reopened.close()
+
+
+def test_acknowledgement_refuses_revision_exhaustion_before_dml(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    _seed_work(journal, _ready_event(40), ready_revision=1, ready_ordinal=0)
+    batch = journal.next_batch()
+    assert batch is not None
+    with journal._owner.journal_write():
+        journal._execute("UPDATE NioIngestMeta SET revision = ?", (2**63 - 1,))
+    before = _raw_delivery_graph(bootstrap.database_path)
+
+    with pytest.raises(LocalProtocolError):
+        journal.acknowledge_batch(batch.ref)
+    assert _raw_delivery_graph(bootstrap.database_path) == before
+    bootstrap.close()

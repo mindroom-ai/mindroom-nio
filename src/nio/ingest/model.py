@@ -312,6 +312,8 @@ class BatchRef:
         _require_exact(self.sequence, int, "sequence")
         _require_exact(self.batch_id, UUID, "batch_id")
         _require_exact(self.sha256, bytes, "sha256")
+        if not 0 <= self.sequence <= 2**63 - 1 or len(self.sha256) != 32:
+            raise ValueError("batch reference sequence or digest is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +321,7 @@ class SyncBatch:
     schema_version: int
     account_id: str
     device_id: str
-    consumer: ConsumerBinding
+    consumer_generation: UUID
     ref: BatchRef
     created_revision: int
     records: tuple[EventRecord | LossRecord, ...]
@@ -330,7 +332,7 @@ class SyncBatch:
         _require_exact(self.schema_version, int, "schema_version")
         _require_exact(self.account_id, str, "account_id")
         _require_exact(self.device_id, str, "device_id")
-        _require_exact(self.consumer, ConsumerBinding, "consumer")
+        _require_exact(self.consumer_generation, UUID, "consumer_generation")
         _require_exact(self.ref, BatchRef, "ref")
         _require_exact(self.created_revision, int, "created_revision")
         _require_tuple_of(

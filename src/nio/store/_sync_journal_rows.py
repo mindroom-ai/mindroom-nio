@@ -434,7 +434,7 @@ class JournalRows:
 
     def _meta(self) -> sqlite3.Row:
         rows = self._execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestMeta"
+            "SELECT * FROM NioIngestMeta LIMIT 2"
         ).fetchall()
         if len(rows) != 1:
             raise JournalIntegrityError(
@@ -457,8 +457,12 @@ class JournalRows:
             )
             if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
                 raise ValueError("created_at_ns is invalid")
-            if row["consumer_generation"] != str(owner.consumer_generation):
-                raise ValueError("consumer_generation is not canonical")
+            if (row["stream_id"], row["consumer_generation"], row["writer_epoch"]) != (
+                str(owner.stream_id),
+                str(owner.consumer_generation),
+                str(owner.writer_epoch),
+            ):
+                raise ValueError("owner UUID is not canonical")
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("ingestion owner row is invalid") from error
         if owner.account_id != self.account_id or owner.device_id != self.device_id:
@@ -700,8 +704,7 @@ class JournalRows:
             "SELECT account_id, work_id, kind, status, frame_id, room_id, "
             "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
             "created_revision, payload, payload_sha256 "
-            "FROM NioIngestWork WHERE account_id = ? LIMIT 20001",
-            (self.account_id,),
+            "FROM NioIngestWork LIMIT 20001",
         )
         storage_rows: list[tuple[object, ...]] = []
         payload_bytes = 0

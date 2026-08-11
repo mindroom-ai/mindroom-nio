@@ -3496,6 +3496,8 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
         "materialize_oldest_diagnostic_frame",
         "load_pending_hydrations",
         "apply_hydration_result",
+        "next_batch",
+        "acknowledge_batch",
     }
     forbidden_concrete_methods = (
         "peek_ready_work",
@@ -3506,7 +3508,6 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
         "list_batches",
         "load_batch",
         "acknowledge",
-        "acknowledge_batch",
         "acknowledge_work",
     )
     assert not {
@@ -3973,8 +3974,11 @@ def _open_task6_schema() -> sqlite3.Connection:
         connection.execute(
             """INSERT INTO NioIngestMeta(
                 account_id, device_id, schema_version, stream_id, consumer_generation, transport_kind,
-                revision, writer_epoch, next_source_epoch, created_at_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                revision, writer_epoch, next_source_epoch, created_at_ns,
+                delivery_next_sequence, delivery_acknowledged_sha256,
+                delivery_outstanding_work_id, delivery_outstanding_ready_revision,
+                delivery_outstanding_ready_ordinal, delivery_outstanding_batch_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL)""",
             (
                 _SCHEMA_ACCOUNT_ID,
                 "DEVICE",
@@ -8329,9 +8333,8 @@ def test_materializer_global_capacity_catches_partial_plan_or_caller_limited_sca
         if not re.fullmatch(r"SELECT (?:NIOINGESTWORK\.)?\*", projection):
             for column_name, _type, _not_null, _primary_key in _WORK_COLUMNS:
                 assert re.search(rf"\b{column_name.upper()}\b", projection)
-        assert re.search(r"\bWHERE\s+ACCOUNT_ID\s*=\s*\?", predicate)
-        assert " AND " not in predicate
-        assert " OR " not in predicate
+        assert predicate == " LIMIT 20001"
+        assert parameters == ()
         for forbidden in ("KIND", "STATUS", "READY_REVISION", "READY_ORDINAL"):
             assert not re.search(rf"\b{forbidden}\b", predicate)
         assert "LIMIT 20001" in normalized_sql or (

@@ -13,7 +13,7 @@ from . import ports
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
 from .hydration import normalize_hydration_response
-from .model import TransportKind
+from .model import BatchRef, SyncBatch, TransportKind
 from .sliding import SlidingSource
 from .source import SourceResultKind, SourceScheduleStatus, plan_source_poll
 from .state import SourceState, StagedFrame
@@ -72,6 +72,23 @@ class IngestionSession:
         self._close_task: asyncio.Task[None] | None = None
         self._running: asyncio.Task[None] | None = None
         self._terminal: BaseException | None = None
+
+    def next_batch(
+        self,
+        *,
+        max_records: int = 256,
+        max_canonical_bytes: int = 16 * 1024 * 1024,
+    ) -> SyncBatch | None:
+        if self._close_task is not None:
+            raise LocalProtocolError("ingestion session is closed")
+        limits = {"max_records": max_records}
+        limits["max_canonical_bytes"] = max_canonical_bytes
+        return self._journal.next_batch(**limits)
+
+    def acknowledge_batch(self, ref: BatchRef) -> None:
+        if self._close_task is not None:
+            raise LocalProtocolError("ingestion session is closed")
+        self._journal.acknowledge_batch(ref)
 
     async def run(self) -> None:
         if self._close_task is not None:

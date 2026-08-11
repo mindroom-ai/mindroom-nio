@@ -2,9 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from enum import StrEnum
+from typing import NamedTuple
 from uuid import UUID
 
 from ..ingest.reducer import HydrationIntent, RoomContinuity
+
+SQLITE_INT_MAX = 2**63 - 1
+
+
+class DeliveryState(NamedTuple):
+    next_sequence: int
+    acknowledged_sha256: bytes | None
+    outstanding_work_id: str | None
+    outstanding_ready_revision: int | None
+    outstanding_ready_ordinal: int | None
+    outstanding_batch_sha256: bytes | None
 
 
 def _require_exact(value: object, expected: type, field_name: str) -> None:

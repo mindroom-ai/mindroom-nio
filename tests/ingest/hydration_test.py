@@ -540,6 +540,47 @@ def test_hydration_atomically_installs_baseline_and_releases_held_in_sequence_or
         journal.close()
 
 
+def test_hydration_release_hands_real_ready_fifo_to_claim_and_ack(
+    tmp_path: Path,
+) -> None:
+    from nio.ingest.hydration import normalize_hydration_response
+
+    journal = _open_journal(tmp_path / "delivery-handoff.db")
+    try:
+        pending = _seed_pending(journal, next_sequence=1)
+        first_id = "00000000-0000-0000-0000-000000000101"
+        second_id = "00000000-0000-0000-0000-000000000102"
+        _seed_held(journal, first_id, 0)
+        result = normalize_hydration_response(
+            pending,
+            own_user_id=OWN_USER,
+            response_body=canonical_json([_member_event()]),
+        )
+        _grow_pending(journal, pending, 2)
+        _seed_held(journal, second_id, 1)
+        committed = journal.apply_hydration_result(result=result)
+        assert committed is not None
+
+        first = journal.next_batch()
+        assert first is not None
+        assert first.created_revision == committed.revision
+        assert first.ref.sequence == 0
+        assert first.records[0].record_id == first_id
+        assert journal.load_owner().revision == committed.revision + 1
+        journal.acknowledge_batch(first.ref)
+        assert journal.load_owner().revision == committed.revision + 2
+
+        second = journal.next_batch()
+        assert second is not None
+        assert second.created_revision == committed.revision
+        assert second.ref.sequence == 1
+        assert second.records[0].record_id == second_id
+        journal.acknowledge_batch(second.ref)
+        assert journal.next_batch() is None
+    finally:
+        journal.close()
+
+
 @pytest.mark.parametrize(
     "boundary",
     ("meta_revision_epoch_cas", "aggregate_update", "work_release", "before_commit"),

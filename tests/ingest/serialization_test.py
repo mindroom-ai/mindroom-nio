@@ -33,16 +33,13 @@ from nio.ingest.serialization import (
     batch_from_records,
 )
 
-JOURNAL_GENERATION = UUID("11111111-1111-1111-1111-111111111111")
 CONSUMER_GENERATION = UUID("22222222-2222-2222-2222-222222222222")
 OPERATION_ID = UUID("33333333-3333-3333-3333-333333333333")
 STREAM_ID = UUID("44444444-4444-4444-4444-444444444444")
-BINDING = ConsumerBinding(JOURNAL_GENERATION, CONSUMER_GENERATION)
 
 GOLDEN_EVENT_PAYLOAD = (
     b'{"schema_version":1,"account_id":"@alice:\xe4\xbe\x8b.org","device_id":"DEVICE",'
-    b'"consumer":{"journal_generation":"11111111-1111-1111-1111-111111111111",'
-    b'"consumer_generation":"22222222-2222-2222-2222-222222222222"},'
+    b'"consumer_generation":"22222222-2222-2222-2222-222222222222",'
     b'"stream_id":"44444444-4444-4444-4444-444444444444","sequence":7,'
     b'"created_revision":11,"records":[{"record_type":"event","record_id":"$event",'
     b'"kind":"timeline","origin":{"origin_type":"transport","transport":"classic",'
@@ -50,7 +47,7 @@ GOLDEN_EVENT_PAYLOAD = (
     b'"membership_epoch":1,"room_sequence":5,"event_id":"$event","provenance":"live",'
     b'"source_json":"eyJib2R5IjoiY2Fmw6kifQ==","clear_json":null}]}'
 )
-GOLDEN_EVENT_SHA256 = "9ad8f6afc7fc80f6642aa08446d4217d42fc0fb318d4658ba9a8b6d4d8751748"
+GOLDEN_EVENT_SHA256 = "2b713f3e334eff766ba2d0299d64117e756ded54b787a5c60953231b8acb035b"
 GOLDEN_ROOM_SNAPSHOT_PAYLOAD = (
     b'{"room_id":"!room:example.org","membership_epoch":3,'
     b'"own_user_id":"@me:example.org","own_membership":"join","encrypted":true,'
@@ -81,7 +78,7 @@ def make_batch(*records: EventRecord | LossRecord) -> SyncBatch:
     return batch_from_records(
         account_id="@alice:例.org",
         device_id="DEVICE",
-        consumer=BINDING,
+        consumer_generation=CONSUMER_GENERATION,
         stream_id=STREAM_ID,
         sequence=7,
         created_revision=11,
@@ -230,7 +227,7 @@ def test_sync_batch_recomputes_integrity_on_dataclass_replace() -> None:
     batch = make_batch(event_record())
 
     with pytest.raises(BatchIntegrityError, match="sha256"):
-        dataclasses.replace(batch, ref=dataclasses.replace(batch.ref, sha256=b""))
+        dataclasses.replace(batch, ref=dataclasses.replace(batch.ref, sha256=b"x" * 32))
 
 
 def test_batch_ref_digest_requires_exact_immutable_bytes() -> None:
@@ -246,17 +243,16 @@ def test_sync_batch_rejects_zero_records_on_construction_and_decode() -> None:
             1,
             "@alice:example.org",
             "DEVICE",
-            BINDING,
-            BatchRef(STREAM_ID, 1, STREAM_ID, b"digest"),
+            CONSUMER_GENERATION,
+            BatchRef(STREAM_ID, 1, STREAM_ID, b"d" * 32),
             1,
             (),
         )
 
     empty_payload = (
         b'{"schema_version":1,"account_id":"@alice:example.org",'
-        b'"device_id":"DEVICE","consumer":{"journal_generation":'
-        b'"11111111-1111-1111-1111-111111111111","consumer_generation":'
-        b'"22222222-2222-2222-2222-222222222222"},"stream_id":'
+        b'"device_id":"DEVICE","consumer_generation":'
+        b'"22222222-2222-2222-2222-222222222222","stream_id":'
         b'"44444444-4444-4444-4444-444444444444","sequence":1,'
         b'"created_revision":1,"records":[]}'
     )
@@ -270,8 +266,8 @@ def test_sync_batch_records_are_tuple_only() -> None:
             1,
             "@alice:example.org",
             "DEVICE",
-            BINDING,
-            BatchRef(STREAM_ID, 1, STREAM_ID, b"digest"),
+            CONSUMER_GENERATION,
+            BatchRef(STREAM_ID, 1, STREAM_ID, b"d" * 32),
             1,
             [event_record()],  # type: ignore[arg-type]
         )
@@ -293,7 +289,7 @@ def test_batch_identity_fields_reject_floats(
         batch_from_records(
             account_id="@alice:example.org",
             device_id="DEVICE",
-            consumer=BINDING,
+            consumer_generation=CONSUMER_GENERATION,
             stream_id=STREAM_ID,
             sequence=sequence,  # type: ignore[arg-type]
             created_revision=created_revision,  # type: ignore[arg-type]
@@ -307,8 +303,8 @@ def test_sync_batch_rejects_unknown_schema_version_on_construction_and_decode() 
             2,
             "@alice:example.org",
             "DEVICE",
-            BINDING,
-            BatchRef(STREAM_ID, 1, STREAM_ID, b"digest"),
+            CONSUMER_GENERATION,
+            BatchRef(STREAM_ID, 1, STREAM_ID, b"d" * 32),
             1,
             (event_record(),),
         )

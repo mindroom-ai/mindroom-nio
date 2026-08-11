@@ -54,6 +54,7 @@ SNAPSHOT_FILES = {
     "src/nio/store/_sync_journal_plan.py",
     "src/nio/store/_sync_journal_preflight.py",
     "src/nio/store/_sync_journal_rows.py",
+    "src/nio/store/_sync_journal_values.py",
     "src/nio/store/sync_journal.py",
     "src/nio/store/sync_journal_schema.py",
     "tests/ingest/staging_benchmark_test.py",

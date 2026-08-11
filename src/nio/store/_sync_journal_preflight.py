@@ -36,13 +36,14 @@ from ..ingest.source import (
     _classic_cursor_from_json,
     canonical_classic_cursor,
 )
-from ..ingest.state import SourceState
+from ..ingest.state import OwnerView, SourceState
 from ._ingestion_store_owner import IngestionStoreOwner
 from ._ingestion_store_owner import StableFileLock as StableFileLock
+from ._sync_journal_values import SQLITE_INT_MAX, DeliveryState
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 
 _E2EE_TABLES = frozenset(
@@ -271,6 +272,45 @@ def _row(
     return value
 
 
+def _decode_delivery_state(
+    row: Mapping[str, object], owner: OwnerView
+) -> DeliveryState:
+    try:
+        state = DeliveryState(
+            *(row[f"delivery_{name}"] for name in DeliveryState._fields)
+        )
+        sequence, acknowledged, work_id, ready_revision, ordinal, batch_sha256 = state
+        present = work_id is not None
+        digests = acknowledged, batch_sha256
+        if (
+            type(sequence) is not int
+            or not 0 <= sequence <= SQLITE_INT_MAX
+            or any(
+                value is not None and (type(value) is not bytes or len(value) != 32)
+                for value in digests
+            )
+            or any((value is None) == present for value in state[2:])
+            or (sequence == 0 and (acknowledged is not None or present))
+            or (
+                sequence > 0 and acknowledged is None and (sequence != 1 or not present)
+            )
+            or (acknowledged is not None and present and sequence < 2)
+        ):
+            raise ValueError("delivery frontier is invalid")
+        if present and (
+            type(work_id) is not str
+            or work_id != str(UUID(work_id))
+            or type(ready_revision) is not int
+            or not 1 <= ready_revision <= owner.revision
+            or type(ordinal) is not int
+            or not 0 <= ordinal <= SQLITE_INT_MAX
+        ):
+            raise ValueError("delivery outstanding value is invalid")
+        return state
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("persisted delivery state is invalid") from error
+
+
 def _source_header(source: SourceState) -> bytes:
     return _canonical_internal(
         [
@@ -312,8 +352,11 @@ def _create_fresh(
     connection.execute_sql(
         "INSERT INTO NioIngestMeta ("
         "account_id, device_id, schema_version, stream_id, consumer_generation, transport_kind, "
-        "revision, writer_epoch, next_source_epoch, created_at_ns"
-        ") VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?)",
+        "revision, writer_epoch, next_source_epoch, created_at_ns, "
+        "delivery_next_sequence, delivery_acknowledged_sha256, "
+        "delivery_outstanding_work_id, delivery_outstanding_ready_revision, "
+        "delivery_outstanding_ready_ordinal, delivery_outstanding_batch_sha256) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, 0, NULL, NULL, NULL, NULL, NULL)",
         (
             account_id,
             device_id,
@@ -368,7 +411,7 @@ def _inspect_existing(
             raise FreshIngestionRequired(
                 "ingestion-v1 store has an unsupported borrowed schema"
             )
-    rows = connection.execute_sql("SELECT * FROM NioIngestMeta").fetchall()
+    rows = connection.execute_sql("SELECT * FROM NioIngestMeta LIMIT 2").fetchall()
     if len(rows) != 1:
         raise FreshIngestionRequired("ingestion-v1 marker row cardinality is not one")
     row = rows[0]
@@ -376,7 +419,10 @@ def _inspect_existing(
         raise FreshIngestionRequired("ingestion account_id does not match")
     if row["device_id"] != device_id:
         raise FreshIngestionRequired("ingestion device_id does not match")
-    if row["schema_version"] != SCHEMA_VERSION:
+    if (
+        type(row["schema_version"]) is not int
+        or row["schema_version"] != SCHEMA_VERSION
+    ):
         raise FreshIngestionRequired(
             f"unsupported schema_version {row['schema_version']}"
         )
@@ -389,14 +435,29 @@ def _inspect_existing(
     try:
         stream_id = UUID(row["stream_id"])
         stored_consumer_generation = UUID(row["consumer_generation"])
-        UUID(row["writer_epoch"])
+        stored_writer_epoch = UUID(row["writer_epoch"])
     except (AttributeError, TypeError, ValueError) as error:
         raise JournalIntegrityError("ingestion owner UUID is invalid") from error
-    if row["consumer_generation"] != str(stored_consumer_generation):
-        raise JournalIntegrityError("ingestion consumer_generation is not canonical")
+    if (row["stream_id"], row["consumer_generation"], row["writer_epoch"]) != (
+        str(stream_id),
+        str(stored_consumer_generation),
+        str(stored_writer_epoch),
+    ):
+        raise JournalIntegrityError("ingestion owner UUID is not canonical")
     if stored_consumer_generation != consumer_generation:
         raise LocalProtocolError("ingestion consumer_generation does not match")
-
+    owner = OwnerView(
+        account_id,
+        device_id,
+        row["schema_version"],
+        stream_id,
+        stored_consumer_generation,
+        transport_kind,
+        row["revision"],
+        stored_writer_epoch,
+        row["next_source_epoch"],
+    )
+    _decode_delivery_state(row, owner)
     source_rows = connection.execute_sql(
         "SELECT * FROM NioIngestSourceState"
     ).fetchall()

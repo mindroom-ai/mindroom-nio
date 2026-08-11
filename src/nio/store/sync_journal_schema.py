@@ -32,6 +32,37 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     ),
     created_at_ns INTEGER NOT NULL CHECK (
         typeof(created_at_ns) = 'integer' AND created_at_ns >= 0
+    ),
+    delivery_next_sequence INTEGER NOT NULL CHECK (typeof(delivery_next_sequence) = 'integer' AND delivery_next_sequence BETWEEN 0 AND 9223372036854775807),
+    delivery_acknowledged_sha256 BLOB NULL CHECK (delivery_acknowledged_sha256 IS NULL OR (typeof(delivery_acknowledged_sha256) = 'blob' AND length(delivery_acknowledged_sha256) = 32)),
+    delivery_outstanding_work_id TEXT NULL CHECK (delivery_outstanding_work_id IS NULL OR (typeof(delivery_outstanding_work_id) = 'text' AND length(delivery_outstanding_work_id) > 0)),
+    delivery_outstanding_ready_revision INTEGER NULL CHECK (delivery_outstanding_ready_revision IS NULL OR (typeof(delivery_outstanding_ready_revision) = 'integer' AND delivery_outstanding_ready_revision >= 1)),
+    delivery_outstanding_ready_ordinal INTEGER NULL CHECK (delivery_outstanding_ready_ordinal IS NULL OR (typeof(delivery_outstanding_ready_ordinal) = 'integer' AND delivery_outstanding_ready_ordinal >= 0)),
+    delivery_outstanding_batch_sha256 BLOB NULL CHECK (delivery_outstanding_batch_sha256 IS NULL OR (typeof(delivery_outstanding_batch_sha256) = 'blob' AND length(delivery_outstanding_batch_sha256) = 32)),
+    CHECK (
+        (delivery_outstanding_work_id IS NULL
+         AND delivery_outstanding_ready_revision IS NULL
+         AND delivery_outstanding_ready_ordinal IS NULL
+         AND delivery_outstanding_batch_sha256 IS NULL)
+     OR (delivery_outstanding_work_id IS NOT NULL
+         AND delivery_outstanding_ready_revision IS NOT NULL
+         AND delivery_outstanding_ready_revision <= revision
+         AND delivery_outstanding_ready_ordinal IS NOT NULL
+         AND delivery_outstanding_batch_sha256 IS NOT NULL)
+    ),
+    CHECK (
+        (delivery_next_sequence = 0
+         AND delivery_acknowledged_sha256 IS NULL
+         AND delivery_outstanding_work_id IS NULL)
+     OR (delivery_next_sequence = 1
+         AND delivery_acknowledged_sha256 IS NULL
+         AND delivery_outstanding_work_id IS NOT NULL)
+     OR (delivery_next_sequence >= 1
+         AND delivery_acknowledged_sha256 IS NOT NULL
+         AND delivery_outstanding_work_id IS NULL)
+     OR (delivery_next_sequence >= 2
+         AND delivery_acknowledged_sha256 IS NOT NULL
+         AND delivery_outstanding_work_id IS NOT NULL)
     ))"""
 
 SCHEMA_SQL = (
