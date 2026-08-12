@@ -173,12 +173,38 @@ def plan_frame_materialization(
 
     room_sequences: dict[str, int] = {}
     pending_hydrations = {}
+    ready_room_id: str | None = None
     for room_id, room in room_plans.items():
         if room_id == retirement_room_id:
             room_sequences[room_id] = aggregate_by_room[room_id].next_room_sequence
             continue
         if (hydration := room.hydration) is None:
-            raise ValueError("selected frame requires a later room path")
+            aggregate = aggregate_by_room.get(room_id)
+            before = room.before
+            after = room.after
+            if (
+                len(room_plans) != 1
+                or aggregate is None
+                or aggregate.pending_hydration is not None
+                or before != aggregate.continuity
+                or before.baseline is None
+                or after.baseline is None
+                or after.baseline.membership_event_id is None
+                or after == before
+                or after != replace(before, baseline=after.baseline)
+                or before.gap is not None
+                or after.gap is not None
+                or before.hydration_id is not None
+                or after.hydration_id is not None
+                or room.recovery is not None
+                or room.retirement_epoch is not None
+                or room.losses
+                or room.release is not RecoveryRelease.NONE
+            ):
+                raise ValueError("invalid READY room transition")
+            ready_room_id = room_id
+            room_sequences[room_id] = aggregate.next_room_sequence
+            continue
         aggregate = aggregate_by_room.get(room_id)
         if aggregate is None:
             if room.before is not None:
@@ -217,7 +243,7 @@ def plan_frame_materialization(
             pending_hydrations[ephemeral_room_id] = pending
 
     candidate = proposal.room_proposals[0] if len(room_plans) == 1 else None
-    capacity_room_id = ephemeral_room_id
+    capacity_room_id = ready_room_id or ephemeral_room_id
     if (
         capacity_room_id is None
         and retirement is None
@@ -249,6 +275,8 @@ def plan_frame_materialization(
         aggregate = aggregate_by_room.get(held_room_id)
         if aggregate is None:
             raise ValueError("new Aggregate has orphan HELD Work")
+        if held_room_id == ready_room_id:
+            raise ValueError("READY room has orphan HELD Work")
         membership_epoch = value.membership_epoch
         sequence = value.room_sequence
         if (
@@ -343,7 +371,8 @@ def plan_frame_materialization(
                 if descriptor_room_id == retirement_room_id
                 else (
                     DescriptorRoute.READY
-                    if is_ephemeral_room
+                    if descriptor_room_id == ready_room_id
+                    or is_ephemeral_room
                     and descriptor_room_id not in pending_hydrations
                     else DescriptorRoute.HOLD_FOR_HYDRATION
                 )
@@ -573,7 +602,7 @@ def plan_frame_materialization(
                     capacity_reason is not None
                     and room.after.room_id == capacity_room_id
                 )
-                else pending_hydrations[room.after.room_id]
+                else pending_hydrations.get(room.after.room_id)
             ),
         )
         for room in proposal.room_proposals

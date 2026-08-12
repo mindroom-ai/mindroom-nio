@@ -387,6 +387,18 @@ def test_crypto_deferred_uses_only_source_certified_empty_controls(changes) -> N
     )
 
 
+def test_classic_zero_otk_snapshot_remains_globally_crypto_deferred() -> None:
+    frame = replace(
+        _mixed_frame(),
+        origin=RecordOrigin(TransportKind.CLASSIC, 3, 8, 0),
+        one_time_key_counts_json=b'{"signed_curve25519":0}',
+    )
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (_state(),))
+
+    assert proposal.crypto_deferred is True
+
+
 @pytest.mark.parametrize("transport", tuple(TransportKind))
 @pytest.mark.parametrize("timeline_index", (0, 1), ids=("history", "live"))
 def test_encrypted_timeline_is_crypto_deferred_for_every_transport_and_position(

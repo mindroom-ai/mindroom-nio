@@ -131,9 +131,7 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
     if continuity.gap is not None:
         raise ValueError("this checkpoint persists no recovery gap")
     baseline = continuity.baseline
-    if baseline is not None and (
-        baseline.membership_event_id is None or baseline.window_token is not None
-    ):
+    if baseline is not None and baseline.membership_event_id is None:
         raise ValueError("unsupported Aggregate baseline")
     if baseline is not None and hydration is not None:
         raise ValueError("baseline and pending hydration are mutually exclusive")
@@ -143,7 +141,7 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
                 "baseline": (
                     {
                         "membership_event_id": baseline.membership_event_id,
-                        "window_token": None,
+                        "window_token": baseline.window_token,
                     }
                     if baseline is not None
                     else None
@@ -200,7 +198,7 @@ def _room_aggregate_value_from_plaintext(
                 cast("str", baseline_map["membership_event_id"]),
                 cast("str | None", baseline_map["window_token"]),
             )
-            if not baseline.membership_event_id or baseline.window_token is not None:
+            if baseline.membership_event_id is None:
                 raise ValueError("unsupported Aggregate baseline")
 
         raw_hydration_id = continuity["hydration_id"]

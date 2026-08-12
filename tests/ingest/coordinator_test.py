@@ -17,7 +17,7 @@ from nio.ingest.config import (
 )
 from nio.ingest.classic import ClassicSource
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
-from nio.ingest.source import canonical_json
+from nio.ingest.source import ClassicCursor, canonical_classic_cursor, canonical_json
 from nio.ingest.state import SourceState, StagedFrame
 from nio.store import SqliteStore, open_ingestion_store
 from nio.ingest.sliding import SlidingSource
@@ -84,6 +84,27 @@ class FakeResponse:
         self.released = True
 
 
+class SecondRequestHoldingClient(RecordingClient):
+    def __init__(self, response: FakeResponse) -> None:
+        super().__init__()
+        self.responses.append(response)
+        self.second_request_entered = asyncio.Event()
+        self.second_request_cancelled = asyncio.Event()
+
+    async def send(self, *args: object, **kwargs: object) -> FakeResponse:
+        if self.responses:
+            return await super().send(*args, **kwargs)
+        self.send_count += 1
+        self.send_calls.append((args, kwargs))
+        self.second_request_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.second_request_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+
 class FailingContent:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error or ClientConnectionError()
@@ -122,13 +143,30 @@ def classic_config() -> IngestionConfig:
     return IngestionConfig(ClassicSourceConfig(30_000, b"{}"))
 
 
-def open_bootstrap(tmp_path: object, generation: UUID):
+def _blocked_classic_success() -> dict[str, object]:
+    body: dict[str, object] = {
+        "next_batch": "s1",
+        "rooms": {"join": {"!other:example.org": {}}},
+    }
+    assert canonical_json(body) == (
+        b'{"next_batch":"s1","rooms":{"join":{"!other:example.org":{}}}}'
+    )
+    return body
+
+
+def open_bootstrap(
+    tmp_path: object,
+    generation: UUID,
+    *,
+    transition_statement_hook: Callable[[str], None] | None = None,
+):
     return open_ingestion_store(
         tmp_path,
         account_id=ACCOUNT,
         device_id=DEVICE,
         consumer_generation=generation,
         source=classic_config().source,
+        transition_statement_hook=transition_statement_hook,
     )
 
 
@@ -811,7 +849,7 @@ async def test_cancelling_hydration_retry_sleep_retains_pending_owner(
 async def test_run_stops_on_prestaged_blocked_frame_without_http(tmp_path) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
-    frame = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    frame = stage_classic(bootstrap, _blocked_classic_success())
     client = RecordingClient()
     session = nio.open_ingestion(
         client,
@@ -845,13 +883,17 @@ async def test_run_stops_on_prestaged_blocked_frame_without_http(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_success_stages_blocked_frame_before_any_second_http(tmp_path) -> None:
+async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
     generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
+    transitions: list[str] = []
+    bootstrap = open_bootstrap(
+        tmp_path,
+        generation,
+        transition_statement_hook=transitions.append,
+    )
     before = bootstrap._journal.load_source()
-    client = RecordingClient()
     response = FakeResponse(200, b'{"next_batch":"s1","rooms":{}}')
-    client.responses.append(response)
+    client = SecondRequestHoldingClient(response)
     session = nio.open_ingestion(
         client,
         bootstrap,
@@ -860,18 +902,102 @@ async def test_success_stages_blocked_frame_before_any_second_http(tmp_path) -> 
         stream_id=bootstrap.stream_id,
         room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionBlockedError):
-        await session.run()
-
-    after = bootstrap._journal.load_source()
-    frames = bootstrap._journal.list_frames(2)
-    assert after.next_request_id == before.next_request_id + 1
-    assert after.cursor_json != before.cursor_json
-    assert len(frames) == 1
-    assert frames[0].response.response_body == response.content.body
-    assert client.send_count == 1
-    assert response.released
-    await session.close()
+    run_task = asyncio.create_task(session.run())
+    request_task = asyncio.create_task(client.second_request_entered.wait())
+    try:
+        async with asyncio.timeout(5):
+            completed, _ = await asyncio.wait(
+                {run_task, request_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        if run_task in completed:
+            with pytest.raises(nio.IngestionBlockedError):
+                await run_task
+            after = bootstrap._journal.load_source()
+            frames = bootstrap._journal.list_frames(2)
+            assert response.released
+            assert after == SourceState(
+                before.source_epoch,
+                before.transport_kind,
+                canonical_classic_cursor(ClassicCursor("s1")),
+                before.next_request_id + 1,
+                before.active,
+            )
+            assert len(frames) == 1
+            assert frames[0].response.response_body == response.content.body
+            assert client.send_count == 1
+            assert client.send_calls[0] == (
+                (
+                    "GET",
+                    "/_matrix/client/v3/sync?full_state=true&timeout=30000&filter=%7B%7D",
+                    None,
+                    {"Authorization": "Bearer secret-token"},
+                    None,
+                    30.0,
+                ),
+                {},
+            )
+            assert transitions == [
+                "frame_collision_probe",
+                "meta_revision_epoch_cas",
+                "source_state_upsert",
+                "frame_insert",
+                "commit",
+            ]
+            pytest.fail("Task7 empty Classic frame blocked before second HTTP")
+        assert request_task in completed
+        assert not run_task.done()
+        assert response.released
+        assert bootstrap._journal.load_source() == SourceState(
+            before.source_epoch,
+            before.transport_kind,
+            canonical_classic_cursor(ClassicCursor("s1")),
+            before.next_request_id + 1,
+            before.active,
+        )
+        assert bootstrap._journal.list_frames(2) == ()
+        assert transitions == [
+            "frame_collision_probe",
+            "meta_revision_epoch_cas",
+            "source_state_upsert",
+            "frame_insert",
+            "commit",
+            "meta_revision_epoch_cas",
+            "frame_delete",
+            "before_commit",
+            "commit",
+        ]
+        assert client.send_count == 2
+        assert client.send_calls[0] == (
+            (
+                "GET",
+                "/_matrix/client/v3/sync?full_state=true&timeout=30000&filter=%7B%7D",
+                None,
+                {"Authorization": "Bearer secret-token"},
+                None,
+                30.0,
+            ),
+            {},
+        )
+        assert client.send_calls[1] == (
+            (
+                "GET",
+                "/_matrix/client/v3/sync?since=s1&timeout=30000&filter=%7B%7D",
+                None,
+                {"Authorization": "Bearer secret-token"},
+                None,
+                30.0,
+            ),
+            {},
+        )
+    finally:
+        if not request_task.done():
+            request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        await session.close()
+        await asyncio.gather(run_task, return_exceptions=True)
+        await client.close()
+    assert client.second_request_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -976,7 +1102,7 @@ async def test_retry_sleep_replans_exact_unchanged_request(
                 429,
                 b'{"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":7}',
             ),
-            FakeResponse(200, b'{"next_batch":"s1","rooms":{}}'),
+            FakeResponse(200, canonical_json(_blocked_classic_success())),
         ]
     )
     sleeps: list[float] = []
@@ -1015,7 +1141,7 @@ async def test_retry_after_header_is_bounded_and_owned_by_session(
     client.responses.extend(
         [
             FakeResponse(429, b"{}", {"Retry-After": "999"}),
-            FakeResponse(200, b'{"next_batch":"s1","rooms":{}}'),
+            FakeResponse(200, canonical_json(_blocked_classic_success())),
         ]
     )
     sleeps: list[float] = []
@@ -1198,7 +1324,7 @@ async def test_only_retryable_fates_retry_without_durable_mutation(
     before = bootstrap._journal.load_source()
     client = RecordingClient()
     client.responses.extend(
-        [first, FakeResponse(200, b'{"next_batch":"s1","rooms":{}}')]
+        [first, FakeResponse(200, canonical_json(_blocked_classic_success()))]
     )
     sleeps: list[float] = []
 
@@ -1390,7 +1516,7 @@ async def test_body_read_connection_failure_releases_and_retries(
     failed.content = FailingContent()  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.extend(
-        [failed, FakeResponse(200, b'{"next_batch":"s1","rooms":{}}')]
+        [failed, FakeResponse(200, canonical_json(_blocked_classic_success()))]
     )
 
     async def no_wait(delay: float) -> None:

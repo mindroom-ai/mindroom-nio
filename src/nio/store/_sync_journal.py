@@ -107,6 +107,8 @@ def _ready_member(
 # fmt: off
 def _diagnostic_admits(room_id: str, frame: SyncFrame, proposal: ingest_reducer.FrameProposal) -> bool:
     segments, rooms, descriptors = frame.room_segments, proposal.room_proposals, proposal.descriptors
+    if frame.origin.transport is TransportKind.CLASSIC and not segments and not rooms and not descriptors and not proposal.crypto_deferred:
+        return True
     if len(segments) != 1 or len(rooms) != 1:
         return False
     segment, room = segments[0], rooms[0]
@@ -730,7 +732,11 @@ class SqliteIngestionJournal(JournalRows):
                 )
                 new_revision = read_revision + 1
 # fmt: off
-                proposal = ingest_reducer.reduce_staged_frame(owner.stream_id, normalized.frame_id, normalized, tuple(a.continuity for a in aggregates))
+                continuities = tuple(aggregate.continuity for aggregate in aggregates)
+                proposal = ingest_reducer.reduce_staged_frame(owner.stream_id, normalized.frame_id, normalized, continuities)
+                if diagnostic_room_id is not None and normalized.origin.transport is TransportKind.CLASSIC and normalized.one_time_key_counts_json == b'{"signed_curve25519":0}':
+                    without_zero = replace(normalized, one_time_key_counts_json=b"{}")
+                    proposal = replace(proposal, crypto_deferred=ingest_reducer.reduce_staged_frame(owner.stream_id, without_zero.frame_id, without_zero, continuities).crypto_deferred)
                 if diagnostic_room_id is not None and not _diagnostic_admits(diagnostic_room_id, normalized, proposal):
                     return MaterializeResult(MaterializeStatus.BLOCKED, selected.frame_id, None)
 # fmt: on

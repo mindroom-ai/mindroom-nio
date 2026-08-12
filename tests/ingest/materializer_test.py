@@ -57,6 +57,7 @@ from nio.ingest.ports import (
 )
 from nio.ingest.reducer import (
     DescriptorRoute,
+    FrameProposal,
     HydrationIntent,
     LossProposal,
     MembershipBaseline,
@@ -557,6 +558,58 @@ def test_contract_aggregate_plaintext_catches_shape_or_canonical_reencode_drift(
                 intent_kind,
                 expected,
             )
+
+
+def test_contract_aggregate_plaintext_round_trips_nonnull_window_token() -> None:
+    rows = _rows()
+    value = RoomAggregateValue(
+        RoomContinuity(
+            _AGGREGATE_ROOM_ID,
+            2,
+            "join",
+            MembershipBaseline("$member", "s0"),
+            None,
+            None,
+        ),
+        3,
+        7,
+        None,
+    )
+    expected = (
+        b'{"continuity":{"baseline":{"membership_event_id":"$member",'
+        b'"window_token":"s0"},"gap":null,"hydration_id":null,'
+        b'"membership":"join","membership_epoch":2,'
+        b'"room_id":"!aggregate:example.org"},"next_room_sequence":3,'
+        b'"pending_hydration":null,"updated_revision":7}'
+    )
+    assert rows._canonical_room_aggregate_plaintext(value) == expected
+    decoded = rows._room_aggregate_value_from_plaintext(
+        _AGGREGATE_ROOM_ID, 7, None, expected
+    )
+    assert decoded == value
+    assert rows._canonical_room_aggregate_plaintext(decoded) == expected
+    for malformed in (
+        expected.replace(b'"membership_event_id":"$member",', b""),
+        expected.replace(
+            b'"membership_event_id":"$member"', b'"membership_event_id":""'
+        ),
+        expected.replace(
+            b'"membership_event_id":"$member"', b'"membership_event_id":7'
+        ),
+        expected.replace(b'"window_token":"s0"', b'"window_token":7'),
+        expected.replace(b'{"continuity":', b'{ "continuity":', 1),
+    ):
+        with pytest.raises(ValueError):
+            rows._room_aggregate_value_from_plaintext(
+                _AGGREGATE_ROOM_ID, 7, None, malformed
+            )
+    for identity in (
+        ("!other:example.org", 7, None),
+        (_AGGREGATE_ROOM_ID, 8, None),
+        (_AGGREGATE_ROOM_ID, 7, "hydration"),
+    ):
+        with pytest.raises(ValueError):
+            rows._room_aggregate_value_from_plaintext(*identity, expected)
 
 
 def test_contract_null_aggregate_plaintext_is_exact_and_strict() -> None:
@@ -4846,6 +4899,8 @@ def _discovery_body(
     nonempty: bool = False,
     room_present: bool = False,
     room_nonempty: bool = False,
+    room_prev_batch: str | None = None,
+    room_padding_bytes: int = 0,
     room_ephemeral: bool = False,
     room_feature: str | None = None,
     ephemeral_only: bool = False,
@@ -4853,6 +4908,10 @@ def _discovery_body(
     room_membership: str = "join",
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
+    to_device_json: tuple[bytes, ...] = (),
+    device_list_delta_json: bytes = b'{"changed":[],"left":[]}',
+    one_time_key_counts_json: bytes = b"{}",
+    unused_fallback_key_types_json: bytes = b"null",
 ) -> bytes:
     if room_membership not in {"join", "invite", "knock", "leave"}:
         raise ValueError("discovery room membership is invalid")
@@ -4878,8 +4937,11 @@ def _discovery_body(
         if global_ready_count is not None
         else []
     )
+    room_content = {"body": "held", "msgtype": "m.text"}
+    if room_padding_bytes:
+        room_content["padding"] = "x" * room_padding_bytes
     room_event = {
-        "content": {"body": "held", "msgtype": "m.text"},
+        "content": room_content,
         "type": "m.room.message",
     }
     ephemeral_event = {
@@ -4931,8 +4993,11 @@ def _discovery_body(
                 if room_feature == "encrypted"
                 else room_event
             )
+            timeline: dict[str, object] = {"events": [event]}
+            if room_prev_batch is not None:
+                timeline["prev_batch"] = room_prev_batch
             room: dict[str, object] = (
-                {"timeline": {"events": [event]}}
+                {"timeline": timeline}
                 if room_nonempty or room_feature in {"encrypted", "history"}
                 else {}
             )
@@ -4963,6 +5028,18 @@ def _discovery_body(
                     "!unsupported:example.org": room,
                 }
             }
+        if to_device_json:
+            body["to_device"] = {
+                "events": [json.loads(payload) for payload in to_device_json]
+            }
+        if device_list_delta_json != b'{"changed":[],"left":[]}':
+            body["device_lists"] = json.loads(device_list_delta_json)
+        if one_time_key_counts_json != b"{}":
+            body["device_one_time_keys_count"] = json.loads(one_time_key_counts_json)
+        if unused_fallback_key_types_json != b"null":
+            body["device_unused_fallback_key_types"] = json.loads(
+                unused_fallback_key_types_json
+            )
         return canonical_json(body)
 
     assert request.body is not None
@@ -5012,6 +5089,25 @@ def _discovery_body(
     if ephemeral_only:
         extensions["typing"] = {"rooms": {"!unsupported:example.org": ephemeral_event}}
         extensions["receipts"] = {"rooms": {"!unsupported:example.org": receipt_event}}
+    if to_device_json:
+        extensions["to_device"] = {
+            "events": [json.loads(payload) for payload in to_device_json],
+            "next_batch": f"td{sequence}",
+        }
+    if (
+        device_list_delta_json != b'{"changed":[],"left":[]}'
+        or one_time_key_counts_json != b"{}"
+        or unused_fallback_key_types_json != b"null"
+    ):
+        e2ee = {
+            "device_lists": json.loads(device_list_delta_json),
+            "device_one_time_keys_count": json.loads(one_time_key_counts_json),
+        }
+        if unused_fallback_key_types_json != b"null":
+            e2ee["device_unused_fallback_key_types"] = json.loads(
+                unused_fallback_key_types_json
+            )
+        extensions["e2ee"] = e2ee
     if extensions:
         body["extensions"] = extensions
     return canonical_json(body)
@@ -5047,6 +5143,8 @@ def _stage_discovery_frame(
     nonempty: bool = False,
     room_present: bool = False,
     room_nonempty: bool = False,
+    room_prev_batch: str | None = None,
+    room_padding_bytes: int = 0,
     room_ephemeral: bool = False,
     room_feature: str | None = None,
     ephemeral_only: bool = False,
@@ -5055,6 +5153,10 @@ def _stage_discovery_frame(
     global_ready_count: int | None = None,
     padding_bytes: int = 0,
     account_id: str = _DISCOVERY_ACCOUNT_ID,
+    to_device_json: tuple[bytes, ...] = (),
+    device_list_delta_json: bytes = b'{"changed":[],"left":[]}',
+    one_time_key_counts_json: bytes = b"{}",
+    unused_fallback_key_types_json: bytes = b"null",
 ) -> tuple[StagedFrame, SyncFrame]:
     owner = journal.load_owner()
     prior = journal.load_source()
@@ -5068,6 +5170,8 @@ def _stage_discovery_frame(
         nonempty=nonempty,
         room_present=room_present,
         room_nonempty=room_nonempty,
+        room_prev_batch=room_prev_batch,
+        room_padding_bytes=room_padding_bytes,
         room_ephemeral=room_ephemeral,
         room_feature=room_feature,
         ephemeral_only=ephemeral_only,
@@ -5075,6 +5179,10 @@ def _stage_discovery_frame(
         room_membership=room_membership,
         global_ready_count=global_ready_count,
         padding_bytes=padding_bytes,
+        to_device_json=to_device_json,
+        device_list_delta_json=device_list_delta_json,
+        one_time_key_counts_json=one_time_key_counts_json,
+        unused_fallback_key_types_json=unused_fallback_key_types_json,
     )
     normalized = adapter.normalize(
         request,
@@ -5336,6 +5444,296 @@ def _materializer_dml(statements: list[str]) -> tuple[str, ...]:
     )
 
 
+def _delivery_frontier(
+    journal: SqliteIngestionJournal,
+) -> tuple[object, ...]:
+    with journal._owner.read():
+        row = journal._execute(
+            "SELECT delivery_next_sequence, delivery_acknowledged_sha256, "
+            "delivery_outstanding_work_id, delivery_outstanding_ready_revision, "
+            "delivery_outstanding_ready_ordinal, delivery_outstanding_batch_sha256 "
+            "FROM NioIngestMeta WHERE account_id = ?",
+            (journal.account_id,),
+        ).fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+def _apply_discovery_hydration(journal: SqliteIngestionJournal) -> None:
+    from nio.ingest.hydration import normalize_hydration_response
+
+    pending = journal.load_pending_hydrations(limit=2)
+    assert len(pending) == 1
+    result = normalize_hydration_response(
+        pending[0],
+        own_user_id=_DISCOVERY_ACCOUNT_ID,
+        response_body=(
+            b'[{"content":{"membership":"join"},"event_id":"$discovery-member",'
+            b'"state_key":"@discovery:example.org","type":"m.room.member"}]'
+        ),
+    )
+    assert journal.apply_hydration_result(result=result) is not None
+    hydrated = _aggregate_rows(journal)
+    assert len(hydrated) == 1 and hydrated[0][2] is None
+    assert _decode_aggregate(journal, hydrated[0])[1].pending_hydration is None
+    assert _work_rows(journal) == ()
+
+
+def _install_discovery_hydration_baseline(
+    journal: SqliteIngestionJournal,
+) -> None:
+    _stage_discovery_frame(journal, TransportKind.CLASSIC, 1, room_present=True)
+    assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+    _apply_discovery_hydration(journal)
+
+
+def _materialize_classic_exact_zero_otk(
+    journal: SqliteIngestionJournal,
+    sequence: int,
+    *,
+    live: bool,
+) -> StagedFrame:
+    staged, normalized = _stage_discovery_frame(
+        journal,
+        TransportKind.CLASSIC,
+        sequence,
+        room_present=True,
+        room_nonempty=live,
+        room_prev_batch="live-prev" if live else None,
+        one_time_key_counts_json=b'{"signed_curve25519":0}',
+        unused_fallback_key_types_json=b"[]",
+    )
+    assert normalized.one_time_key_counts_json == b'{"signed_curve25519":0}'
+    assert normalized.unused_fallback_key_types_json == b"[]"
+    assert normalized.to_device_json == ()
+    assert normalized.device_list_delta_json == b'{"changed":[],"left":[]}'
+    assert normalized.room_segments[0].timeline_json == (
+        (
+            (
+                b'{"content":{"body":"held","msgtype":"m.text"},'
+                b'"type":"m.room.message"}'
+            ),
+        )
+        if live
+        else ()
+    )
+    assert normalized.room_segments[0].live_event_count == int(live)
+    assert normalized.room_segments[0].timeline_prev_batch == (
+        "live-prev" if live else None
+    )
+    source_after_staging = journal.load_source()
+    frontier_before = _delivery_frontier(journal)
+    owner_before = journal.load_owner()
+
+    result = journal.materialize_oldest_diagnostic_frame(
+        room_id="!unsupported:example.org"
+    )
+
+    assert result == MaterializeResult(
+        MaterializeStatus.MATERIALIZED,
+        staged.frame_id,
+        owner_before.revision + 1,
+    )
+    assert _frame_storage_row(journal, staged.frame_id) is None
+    assert journal.load_source() == source_after_staging
+    assert _delivery_frontier(journal) == frontier_before
+    return staged
+
+
+def test_diagnostic_classic_exact_zero_otk_snapshot_materializes_hydration(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        _materialize_classic_exact_zero_otk(journal, 1, live=False)
+        aggregates = _aggregate_rows(journal)
+        assert len(aggregates) == 1 and aggregates[0][2] == "hydration"
+        assert (
+            _decode_aggregate(journal, aggregates[0])[1].pending_hydration is not None
+        )
+        assert _work_rows(journal) == ()
+        _apply_discovery_hydration(journal)
+    finally:
+        bootstrap.close()
+
+
+def test_diagnostic_classic_exact_zero_otk_snapshot_materializes_live_ready(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
+    journal = bootstrap._journal
+    try:
+        _install_discovery_hydration_baseline(journal)
+        staged = _materialize_classic_exact_zero_otk(journal, 2, live=True)
+        rows = _work_rows(journal)
+        assert len(rows) == 1
+        assert rows[0][1:5] == (
+            "event",
+            "ready",
+            str(staged.frame_id),
+            "!unsupported:example.org",
+        )
+        _plaintext, record = _decode_event_work(journal, rows[0])
+        assert record.kind is RecordKind.TIMELINE
+        assert record.provenance is TimelineEventProvenance.LIVE
+    finally:
+        bootstrap.close()
+
+
+_ZERO_OTK_SHADOW: dict[str, object] = {
+    "transport": TransportKind.CLASSIC,
+    "one_time_key_counts_json": b'{"signed_curve25519":0}',
+    "to_device_json": (),
+    "device_list_delta_json": b'{"changed":[],"left":[]}',
+    "unused_fallback_key_types_json": b"[]",
+    "room_feature": None,
+    "live": False,
+}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        pytest.param(
+            {"one_time_key_counts_json": b'{"signed_curve25519":1}'},
+            id="positive-signed",
+        ),
+        pytest.param(
+            {"one_time_key_counts_json": b'{"curve25519":0}'},
+            id="curve-zero",
+        ),
+        pytest.param(
+            {"one_time_key_counts_json": b'{"com.example.custom":0}'},
+            id="custom-zero",
+        ),
+        pytest.param(
+            {"one_time_key_counts_json": (b'{"curve25519":0,"signed_curve25519":0}')},
+            id="additional-zero-key",
+        ),
+        pytest.param(
+            {
+                "to_device_json": (
+                    b'{"content":{"algorithm":"m.megolm.v1.aes-sha2"},'
+                    b'"type":"m.room_key"}',
+                )
+            },
+            id="to-device",
+        ),
+        pytest.param(
+            {
+                "device_list_delta_json": (
+                    b'{"changed":["@friend:example.org"],"left":[]}'
+                )
+            },
+            id="device-list-changed",
+        ),
+        pytest.param(
+            {
+                "device_list_delta_json": (
+                    b'{"changed":[],"left":["@friend:example.org"]}'
+                )
+            },
+            id="device-list-left",
+        ),
+        pytest.param(
+            {"unused_fallback_key_types_json": b'["signed_curve25519"]'},
+            id="unused-fallback",
+        ),
+        pytest.param({"room_feature": "encrypted"}, id="encrypted-history"),
+        pytest.param(
+            {"room_feature": "encrypted", "live": True},
+            id="encrypted-live",
+        ),
+        pytest.param({"transport": TransportKind.SLIDING}, id="sliding-exact-zero"),
+    ),
+)
+def test_diagnostic_zero_otk_exception_rejects_every_other_crypto_input(
+    tmp_path: Path,
+    overrides: dict[str, object],
+) -> None:
+    shadow = _ZERO_OTK_SHADOW | overrides
+    transport = shadow["transport"]
+    one_time_key_counts_json = shadow["one_time_key_counts_json"]
+    to_device_json = shadow["to_device_json"]
+    device_list_delta_json = shadow["device_list_delta_json"]
+    unused_fallback_key_types_json = shadow["unused_fallback_key_types_json"]
+    room_feature = shadow["room_feature"]
+    live = shadow["live"]
+    assert type(transport) is TransportKind
+    assert type(one_time_key_counts_json) is bytes
+    assert type(to_device_json) is tuple and all(
+        type(payload) is bytes for payload in to_device_json
+    )
+    assert type(device_list_delta_json) is bytes
+    assert type(unused_fallback_key_types_json) is bytes
+    assert room_feature is None or type(room_feature) is str
+    assert type(live) is bool
+    statements: list[str] = []
+    transitions: list[str] = []
+    bootstrap = _open_discovery_journal(tmp_path, transport, statements=statements)
+    journal = bootstrap._journal
+    try:
+        sequence = 1
+        if live:
+            _install_discovery_hydration_baseline(journal)
+            sequence = 2
+        source_before_staging = journal.load_source()
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            transport,
+            sequence,
+            room_present=True,
+            room_nonempty=room_feature is not None,
+            room_feature=room_feature,
+            to_device_json=to_device_json,
+            device_list_delta_json=device_list_delta_json,
+            one_time_key_counts_json=one_time_key_counts_json,
+            unused_fallback_key_types_json=unused_fallback_key_types_json,
+        )
+        assert normalized.origin.transport is transport
+        assert normalized.one_time_key_counts_json == one_time_key_counts_json
+        assert normalized.to_device_json == to_device_json
+        assert normalized.device_list_delta_json == device_list_delta_json
+        assert (
+            normalized.unused_fallback_key_types_json == unused_fallback_key_types_json
+        )
+        if room_feature == "encrypted":
+            assert normalized.room_segments[0].timeline_json == (
+                b'{"content":{"algorithm":"m.megolm.v1.aes-sha2"},"type":"m.room.encrypted"}',
+            )
+            assert normalized.room_segments[0].live_event_count == int(live)
+        source_after_staging = journal.load_source()
+        assert source_after_staging.next_request_id == (
+            source_before_staging.next_request_id + 1
+        )
+        stored_frame = _frame_storage_row(journal, staged.frame_id)
+        assert stored_frame is not None
+        graph = (_materializer_storage_graph(journal), _delivery_frontier(journal))
+        statements.clear()
+        journal.set_transition_statement_hook(transitions.append)
+
+        first = journal.materialize_oldest_diagnostic_frame(
+            room_id="!unsupported:example.org"
+        )
+        second = journal.materialize_oldest_diagnostic_frame(
+            room_id="!unsupported:example.org"
+        )
+
+        expected = MaterializeResult(MaterializeStatus.BLOCKED, staged.frame_id, None)
+        assert first == second == expected
+        assert (
+            _materializer_storage_graph(journal),
+            _delivery_frontier(journal),
+        ) == graph
+        assert _frame_storage_row(journal, staged.frame_id) == stored_frame
+        assert journal.load_source() == source_after_staging
+        assert _materializer_dml(statements) == ()
+        assert transitions == []
+    finally:
+        bootstrap.close()
+
+
 @pytest.mark.parametrize(
     "room_nonempty", (False, True), ids=("empty-hydration", "one-live-event")
 )
@@ -5384,7 +5782,6 @@ def test_diagnostic_materializer_accepts_only_the_minimal_classic_room_shapes(
 @pytest.mark.parametrize(
     "scenario",
     (
-        "zero-room",
         "multiple-rooms",
         "other-room",
         "sliding",
@@ -5441,7 +5838,7 @@ def test_diagnostic_materializer_blocks_stably_without_touching_the_graph(
                 journal,
                 transport,
                 2 if prepared else 1,
-                room_present=scenario != "zero-room",
+                room_present=True,
                 room_nonempty=scenario == "ephemeral",
                 room_ephemeral=scenario == "ephemeral",
                 room_feature={
@@ -5482,8 +5879,16 @@ def test_diagnostic_materializer_blocks_stably_without_touching_the_graph(
         bootstrap.close()
 
 
-def test_diagnostic_zero_room_authenticates_an_unrelated_aggregate_before_blocking(
+@pytest.mark.parametrize(
+    "one_time_key_counts_json",
+    (
+        pytest.param(b"{}", id="omitted-otk"),
+        pytest.param(b'{"signed_curve25519":0}', id="exact-zero-otk"),
+    ),
+)
+def test_diagnostic_materializer_retires_exact_empty_classic_frame_locally(
     tmp_path: Path,
+    one_time_key_counts_json: bytes,
 ) -> None:
     statements: list[str] = []
     transitions: list[str] = []
@@ -5492,14 +5897,201 @@ def test_diagnostic_zero_room_authenticates_an_unrelated_aggregate_before_blocki
     )
     journal = bootstrap._journal
     try:
-        _stage_discovery_frame(journal, TransportKind.CLASSIC, 1, room_present=True)
+        unrelated, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_present=True,
+        )
         assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
-        staged, _ = _stage_discovery_frame(journal, TransportKind.CLASSIC, 2)
-        with journal._transaction():
-            journal._execute(
-                "UPDATE NioIngestRoomAggregate SET payload_sha256 = ? WHERE account_id = ?",
-                (b"x" * 32, journal.account_id),
+
+        owner = journal.load_owner()
+        ready = replace(
+            _event_record(),
+            record_id=str(uuid5(unrelated.frame_id, "exact-empty-unrelated-work")),
+        )
+        _insert_verified_event_work(
+            journal,
+            ready,
+            frame_id=unrelated.frame_id,
+            ready_revision=owner.revision,
+            ready_ordinal=0,
+            created_revision=owner.revision,
+        )
+        outstanding = journal.next_batch()
+        assert outstanding is not None and outstanding.records == (ready,)
+
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+            one_time_key_counts_json=one_time_key_counts_json,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert (
+            staged.response.response_body
+            == {
+                b"{}": b'{"next_batch":"s2"}',
+                b'{"signed_curve25519":0}': (
+                    b'{"device_one_time_keys_count":{"signed_curve25519":0},'
+                    b'"next_batch":"s2"}'
+                ),
+            }[one_time_key_counts_json]
+        )
+        assert normalized.room_segments == ()
+        assert normalized.to_device_json == ()
+        assert normalized.device_list_delta_json == b'{"changed":[],"left":[]}'
+        assert normalized.one_time_key_counts_json == one_time_key_counts_json
+        assert normalized.unused_fallback_key_types_json == b"null"
+        assert proposal.room_proposals == ()
+        assert proposal.descriptors == ()
+        if one_time_key_counts_json == b'{"signed_curve25519":0}':
+            assert proposal.crypto_deferred is True
+            second_reduction = reduce_staged_frame(
+                journal.load_owner().stream_id,
+                staged.frame_id,
+                replace(normalized, one_time_key_counts_json=b"{}"),
+                (),
             )
+            assert second_reduction.crypto_deferred is False
+            proposal = replace(
+                proposal,
+                crypto_deferred=second_reduction.crypto_deferred,
+            )
+        assert proposal.crypto_deferred is False
+
+        owner_before = journal.load_owner()
+        source_after_staging = journal.load_source()
+        aggregates_before = _aggregate_rows(journal)
+        work_before = _work_rows(journal)
+        frontier_before = _delivery_frontier(journal)
+        assert len(aggregates_before) == 1
+        assert len(work_before) == 1 and work_before[0][2] == "ready"
+        assert frontier_before[2] == ready.record_id
+        statements.clear()
+        journal.set_transition_statement_hook(transitions.append)
+
+        result = journal.materialize_oldest_diagnostic_frame(
+            room_id="!target:example.org"
+        )
+
+        if result.status is MaterializeStatus.BLOCKED:
+            assert result == MaterializeResult(
+                MaterializeStatus.BLOCKED,
+                staged.frame_id,
+                None,
+            )
+            assert journal.load_owner() == owner_before
+            assert journal.load_source() == source_after_staging
+            assert _frame_storage_row(journal, staged.frame_id) is not None
+            assert _aggregate_rows(journal) == aggregates_before
+            assert _work_rows(journal) == work_before
+            assert _delivery_frontier(journal) == frontier_before
+            assert _materializer_dml(statements) == ()
+            assert transitions == []
+            pytest.fail("Task7 empty Classic frame did not materialize locally")
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            owner_before.revision + 1,
+        )
+        assert journal.load_owner() == replace(
+            owner_before,
+            revision=owner_before.revision + 1,
+        )
+        assert journal.load_source() == source_after_staging
+        assert _materializer_frame_rows(journal) == ()
+        assert _frame_storage_row(journal, staged.frame_id) is None
+        assert _aggregate_rows(journal) == aggregates_before
+        assert _work_rows(journal) == work_before
+        assert _delivery_frontier(journal) == frontier_before
+        assert _materializer_storage_graph(journal) == (
+            replace(owner_before, revision=owner_before.revision + 1),
+            source_after_staging,
+            (),
+            aggregates_before,
+            work_before,
+        )
+        assert transitions == [
+            "meta_revision_epoch_cas",
+            "frame_delete",
+            "before_commit",
+            "commit",
+        ]
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize("corrupt", ("aggregate", "work"))
+def test_diagnostic_empty_frame_authenticates_unrelated_inventories_before_retiring(
+    tmp_path: Path,
+    corrupt: str,
+) -> None:
+    statements: list[str] = []
+    transitions: list[str] = []
+    bootstrap = _open_discovery_journal(
+        tmp_path, TransportKind.CLASSIC, statements=statements
+    )
+    journal = bootstrap._journal
+    try:
+        unrelated, _ = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            1,
+            room_present=True,
+        )
+        assert _materialize(journal).status is MaterializeStatus.MATERIALIZED
+        owner = journal.load_owner()
+        ready = replace(
+            _event_record(),
+            record_id=str(uuid5(unrelated.frame_id, "empty-auth-unrelated-work")),
+        )
+        _insert_verified_event_work(
+            journal,
+            ready,
+            frame_id=unrelated.frame_id,
+            ready_revision=owner.revision,
+            ready_ordinal=0,
+            created_revision=owner.revision,
+        )
+        outstanding = journal.next_batch()
+        assert outstanding is not None and outstanding.records == (ready,)
+        staged, normalized = _stage_discovery_frame(
+            journal,
+            TransportKind.CLASSIC,
+            2,
+        )
+        proposal = reduce_staged_frame(
+            journal.load_owner().stream_id,
+            staged.frame_id,
+            normalized,
+            (),
+        )
+        assert (
+            normalized.room_segments == ()
+            and proposal.room_proposals == ()
+            and proposal.descriptors == ()
+            and proposal.crypto_deferred is False
+        )
+        with journal._transaction():
+            if corrupt == "aggregate":
+                updated = journal._execute(
+                    "UPDATE NioIngestRoomAggregate SET payload_sha256 = ? "
+                    "WHERE account_id = ?",
+                    (b"x" * 32, journal.account_id),
+                )
+            else:
+                updated = journal._execute(
+                    "UPDATE NioIngestWork SET payload_sha256 = ? "
+                    "WHERE account_id = ? AND work_id = ?",
+                    (b"x" * 32, journal.account_id, ready.record_id),
+                )
+            assert updated.rowcount == 1
         graph = _materializer_storage_graph(journal)
         statements.clear()
         journal.set_transition_statement_hook(transitions.append)
@@ -5508,11 +6100,150 @@ def test_diagnostic_zero_room_authenticates_an_unrelated_aggregate_before_blocki
             journal.materialize_oldest_diagnostic_frame(room_id="!target:example.org")
 
         assert _materializer_storage_graph(journal) == graph
+        assert journal._frame_row(staged.frame_id) is not None
         assert _materializer_dml(statements) == ()
         assert transitions == []
-        assert journal._frame_row(staged.frame_id) is not None
     finally:
         bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ("sliding", "global-presence", "crypto", "any-room"),
+)
+def test_diagnostic_empty_frame_rejects_nonlocal_shape(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    crypto_inputs = (
+        (
+            "positive-signed",
+            {"one_time_key_counts_json": b'{"signed_curve25519":1}'},
+        ),
+        ("curve-zero", {"one_time_key_counts_json": b'{"curve25519":0}'}),
+        (
+            "custom-zero",
+            {"one_time_key_counts_json": b'{"com.example.custom":0}'},
+        ),
+        (
+            "additional-zero-key",
+            {"one_time_key_counts_json": (b'{"curve25519":0,"signed_curve25519":0}')},
+        ),
+        (
+            "to-device",
+            {
+                "to_device_json": (
+                    b'{"content":{"algorithm":"m.megolm.v1.aes-sha2"},'
+                    b'"type":"m.room_key"}',
+                )
+            },
+        ),
+        (
+            "device-list-changed",
+            {
+                "device_list_delta_json": (
+                    b'{"changed":["@friend:example.org"],"left":[]}'
+                )
+            },
+        ),
+        (
+            "device-list-left",
+            {
+                "device_list_delta_json": (
+                    b'{"changed":[],"left":["@friend:example.org"]}'
+                )
+            },
+        ),
+        (
+            "unused-fallback",
+            {"unused_fallback_key_types_json": b'["signed_curve25519"]'},
+        ),
+        ("encrypted-history", {"room_feature": "encrypted"}),
+        (
+            "encrypted-live",
+            {"room_feature": "encrypted", "room_nonempty": True},
+        ),
+    )
+    cases: tuple[tuple[str, TransportKind, dict[str, object]], ...]
+    if scenario == "sliding":
+        cases = (("sliding", TransportKind.SLIDING, {}),)
+    elif scenario == "global-presence":
+        cases = (
+            ("global", TransportKind.CLASSIC, {"nonempty": True}),
+            ("presence", TransportKind.CLASSIC, {"presence_only": True}),
+            (
+                "global-and-presence",
+                TransportKind.CLASSIC,
+                {"global_ready_count": 1},
+            ),
+        )
+    elif scenario == "crypto":
+        cases = tuple(
+            (case_id, TransportKind.CLASSIC, overrides)
+            for case_id, overrides in crypto_inputs
+        )
+    else:
+        cases = (
+            ("one-empty-room", TransportKind.CLASSIC, {"room_present": True}),
+            ("multiple-live-rooms", TransportKind.CLASSIC, {"room_nonempty": True}),
+        )
+
+    for case_id, transport, overrides in cases:
+        statements: list[str] = []
+        transitions: list[str] = []
+        bootstrap = _open_discovery_journal(
+            tmp_path / case_id,
+            transport,
+            statements=statements,
+        )
+        journal = bootstrap._journal
+        try:
+            sequence = 1
+            if case_id == "encrypted-live":
+                _install_discovery_hydration_baseline(journal)
+                sequence = 2
+            if scenario == "any-room" and case_id == "multiple-live-rooms":
+                staged, _ = _stage_discovery_rooms_frame(
+                    journal,
+                    transport,
+                    sequence,
+                    rooms=(
+                        ("!a:example.org", "join", "a"),
+                        ("!b:example.org", "join", "b"),
+                    ),
+                )
+            else:
+                staged, _ = _stage_discovery_frame(
+                    journal,
+                    transport,
+                    sequence,
+                    **overrides,
+                )
+            graph = _materializer_storage_graph(journal)
+            source_after_staging = journal.load_source()
+            statements.clear()
+            journal.set_transition_statement_hook(transitions.append)
+
+            first = journal.materialize_oldest_diagnostic_frame(
+                room_id="!target:example.org"
+            )
+            second = journal.materialize_oldest_diagnostic_frame(
+                room_id="!target:example.org"
+            )
+
+            expected = MaterializeResult(
+                MaterializeStatus.BLOCKED,
+                staged.frame_id,
+                None,
+            )
+            assert first == second == expected
+            assert _materializer_storage_graph(journal) == graph
+            assert journal.load_source() == source_after_staging
+            assert _frame_storage_row(journal, staged.frame_id) is not None
+            assert _materializer_dml(statements) == ()
+            assert transitions == []
+        finally:
+            bootstrap.close()
 
 
 def test_materializer_public_call_internalizes_owner_cas(tmp_path: Path) -> None:
@@ -10092,30 +10823,52 @@ def _apply_discovery_race(
 
 
 @pytest.mark.parametrize(
-    "race",
+    ("race", "scenario"),
     [
-        "earlier-removal",
-        "earlier-header",
-        "earlier-proof",
-        "earlier-valid-flag-change",
-        "selected-row-change",
-        "selected-removal",
+        *(
+            pytest.param(race, "h1-classic-plain", id=race)
+            for race in (
+                "earlier-removal",
+                "earlier-header",
+                "earlier-proof",
+                "earlier-valid-flag-change",
+                "selected-row-change",
+                "selected-removal",
+            )
+        ),
+        pytest.param(
+            "selected-row-change",
+            "post-hydration-classic-ready",
+            id="post_hydration_ready",
+        ),
     ],
 )
 def test_materializer_writer_full_set_revalidation_catches_read_to_write_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     race: str,
+    scenario: str,
 ) -> None:
     statements: list[str] = []
-    bootstrap = _open_discovery_journal(
-        tmp_path,
-        TransportKind.CLASSIC,
-        statements=statements,
+    case = (
+        _prepare_materializer_atomicity_case(tmp_path, scenario, statements=statements)
+        if scenario == _ATOMICITY_POST_HYDRATION_CLASSIC_READY
+        else None
+    )
+    bootstrap = (
+        case.bootstrap
+        if case is not None
+        else _open_discovery_journal(
+            tmp_path, TransportKind.CLASSIC, statements=statements
+        )
     )
     journal = bootstrap._journal
     try:
-        earlier, selected = _stage_retained_then_plain(journal)
+        earlier, selected = (
+            (case.selected, case.selected)
+            if case is not None
+            else _stage_retained_then_plain(journal)
+        )
         owner_before = journal.load_owner()
         selected_prepared = False
         raced = False
@@ -10837,6 +11590,7 @@ def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml
 
 _ATOMICITY_H1_CLASSIC_PLAIN = "h1-classic-plain"
 _ATOMICITY_RETIREMENT_SLIDING_CRYPTO = "retirement-sliding-crypto"
+_ATOMICITY_POST_HYDRATION_CLASSIC_READY = "post-hydration-classic-ready"
 _MATERIALIZER_CRASH_EXIT_CODE = 87
 
 _MATERIALIZER_ROLLBACK_CASES = (
@@ -10900,6 +11654,21 @@ _MATERIALIZER_ROLLBACK_CASES = (
         1,
         id="retirement-before-commit",
     ),
+    *(
+        pytest.param(
+            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+            boundary,
+            1,
+            id=f"post_hydration_ready-{boundary.replace('_', '-')}",
+        )
+        for boundary in (
+            "meta_revision_epoch_cas",
+            "aggregate_update",
+            "work_insert",
+            "frame_delete",
+            "before_commit",
+        )
+    ),
 )
 _MATERIALIZER_CRASH_CASES = (
     *_MATERIALIZER_ROLLBACK_CASES,
@@ -10908,6 +11677,12 @@ _MATERIALIZER_CRASH_CASES = (
         "commit",
         1,
         id="retirement-commit",
+    ),
+    pytest.param(
+        _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+        "commit",
+        1,
+        id="post_hydration_ready-commit",
     ),
 )
 
@@ -10941,6 +11716,16 @@ class _ExpectedMaterializerWork:
 
 class _InjectedMaterializerFailure(RuntimeError):
     pass
+
+
+def _atomicity_transport(scenario: str) -> TransportKind:
+    if scenario in (
+        _ATOMICITY_H1_CLASSIC_PLAIN,
+        _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+    ):
+        return TransportKind.CLASSIC
+    assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
+    return TransportKind.SLIDING
 
 
 def _materializer_frame_rows(
@@ -10985,15 +11770,10 @@ def _prepare_materializer_atomicity_case(
     *,
     statements: list[str] | None = None,
     sqlite_busy_timeout_ms: int = 2_000,
+    room_padding_bytes: int = 0,
 ) -> _MaterializerAtomicityCase:
-    if scenario == _ATOMICITY_H1_CLASSIC_PLAIN:
-        transport = TransportKind.CLASSIC
-        crypto = False
-    elif scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO:
-        transport = TransportKind.SLIDING
-        crypto = True
-    else:
-        raise AssertionError(f"unknown materializer atomicity scenario: {scenario}")
+    transport = _atomicity_transport(scenario)
+    crypto = scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
 
     bootstrap = _open_discovery_journal(
         store_path,
@@ -11003,7 +11783,19 @@ def _prepare_materializer_atomicity_case(
     )
     journal = bootstrap._journal
     try:
-        if scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO:
+        if scenario == _ATOMICITY_POST_HYDRATION_CLASSIC_READY:
+            _install_discovery_hydration_baseline(journal)
+            first = None
+            first_normalized = None
+            selected, normalized = _stage_discovery_frame(
+                journal,
+                transport,
+                2,
+                room_nonempty=True,
+                room_prev_batch="live-prev",
+                room_padding_bytes=room_padding_bytes,
+            )
+        elif scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO:
             first, first_normalized = _stage_discovery_frame(
                 journal,
                 transport,
@@ -11047,6 +11839,25 @@ def _prepare_materializer_atomicity_case(
     except BaseException:
         bootstrap.close()
         raise
+
+
+@contextmanager
+def _post_hydration_ready_case(
+    store_path: Path,
+    *,
+    statements: list[str] | None = None,
+    room_padding_bytes: int = 0,
+) -> Iterator[tuple[_MaterializerAtomicityCase, SqliteIngestionJournal]]:
+    case = _prepare_materializer_atomicity_case(
+        store_path,
+        _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+        statements=statements,
+        room_padding_bytes=room_padding_bytes,
+    )
+    try:
+        yield case, case.bootstrap._journal
+    finally:
+        case.bootstrap.close()
 
 
 def _atomicity_h1_expectations(
@@ -11125,6 +11936,87 @@ def _atomicity_h1_expectations(
             hydration,
         ),
         tuple(expected_work),
+    )
+
+
+def _atomicity_post_hydration_ready_expectations(
+    stream_id: UUID,
+    staged: StagedFrame,
+    normalized: SyncFrame,
+    revision: int,
+) -> tuple[RoomAggregateValue, tuple[_ExpectedMaterializerWork, ...]]:
+    assert normalized.frame_id == staged.frame_id
+    assert len(normalized.room_segments) == 1
+    segment = normalized.room_segments[0]
+    assert segment.timeline_prev_batch is not None
+    before = RoomContinuity(
+        segment.room_id,
+        0,
+        "join",
+        MembershipBaseline("$discovery-member", None),
+        None,
+        None,
+    )
+    after = replace(
+        before,
+        baseline=MembershipBaseline("$discovery-member", segment.timeline_prev_batch),
+    )
+    proposal = reduce_staged_frame(stream_id, staged.frame_id, normalized, (before,))
+    assert len(proposal.room_proposals) == len(proposal.descriptors) == 1
+    room, descriptor = proposal.room_proposals[0], proposal.descriptors[0]
+    assert (
+        room.before,
+        room.after,
+        room.recovery,
+        room.hydration,
+        room.retirement_epoch,
+        room.losses,
+        room.release,
+    ) == (before, after, None, None, None, (), RecoveryRelease.NONE)
+    assert (
+        descriptor.kind,
+        descriptor.room_id,
+        descriptor.provenance,
+        descriptor.route,
+    ) == (
+        RecordKind.TIMELINE,
+        after.room_id,
+        TimelineEventProvenance.LIVE,
+        DescriptorRoute.READY,
+    )
+    record = EventRecord(
+        str(uuid5(staged.frame_id, f"event:{descriptor.descriptor_key}")),
+        descriptor.kind,
+        replace(normalized.origin, frame_index=0),
+        after.room_id,
+        0,
+        0,
+        None,
+        descriptor.provenance,
+        descriptor.source_json,
+        None,
+    )
+    work = _ExpectedMaterializerWork(
+        record, "ready", staged.frame_id, revision, 0, revision
+    )
+    return RoomAggregateValue(after, 1, revision, None), (work,)
+
+
+def _planned_ready_size(
+    journal: SqliteIngestionJournal,
+    case: _MaterializerAtomicityCase,
+    value: EventRecord | LossRecord,
+    revision: int,
+) -> int:
+    return len(
+        _expected_planned_stored_work_payload(
+            account_id=journal.account_id,
+            stream_id=journal.stream_id,
+            frame=case.normalized,
+            value=value,
+            ordinal=0,
+            revision=revision,
+        )
     )
 
 
@@ -11359,6 +12251,23 @@ def _assert_materializer_committed_graph(
         assert tuple(row[0] for row in old_frames) == (str(case.selected.frame_id),)
         assert _frame_storage_row(journal, case.selected.frame_id) is None
         expected_intent = "hydration"
+    elif scenario == _ATOMICITY_POST_HYDRATION_CLASSIC_READY:
+        assert old_owner.revision in (4, 6)
+        expected_aggregate, expected_work = (
+            _atomicity_post_hydration_ready_expectations(
+                owner.stream_id,
+                case.selected,
+                case.normalized,
+                revision,
+            )
+        )
+        assert frames == ()
+        assert tuple(row[0] for row in old_frames) == (str(case.selected.frame_id),)
+        assert _frame_storage_row(journal, case.selected.frame_id) is None
+        expected_intent = None
+        assert work[:-1] == old_work
+        work = work[-1:]
+        old_work = ()
     else:
         assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
         assert old_owner.revision == 3
@@ -11401,6 +12310,450 @@ def _assert_materializer_committed_graph(
         expected_aggregate
     )
     _assert_exact_materializer_work(journal, work, expected_work, old_work)
+
+
+def test_materializer_post_hydration_plain_ready_uses_generic_planner(
+    tmp_path: Path,
+) -> None:
+    from nio.ingest.serialization import canonical_batch_payload
+
+    with _post_hydration_ready_case(tmp_path) as (case, journal):
+        old_graph = _materializer_storage_graph(journal)
+        frontier = _delivery_frontier(journal)
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            case.selected.frame_id,
+            old_graph[0].revision + 1,
+        )
+        _assert_materializer_committed_graph(
+            journal,
+            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+            case,
+            old_graph,
+        )
+        assert _delivery_frontier(journal) == frontier
+        row = _work_rows(journal)[0]
+        record = _decode_event_work(journal, row)[1]
+        batch = journal.next_batch()
+        assert batch is not None and batch.records == (record,)
+        assert (
+            batch.ref.sha256 == hashlib.sha256(canonical_batch_payload(batch)).digest()
+        )
+        journal.acknowledge_batch(batch.ref)
+        assert _work_rows(journal) == ()
+        assert journal.next_batch() is None
+
+
+def _replace_authenticated_aggregate(
+    journal: SqliteIngestionJournal, value: RoomAggregateValue
+) -> None:
+    owner, room_id = journal.load_owner(), value.continuity.room_id
+    intent = "hydration" if value.pending_hydration else None
+    payload, digest = journal._payload(
+        owner,
+        "NioIngestRoomAggregate",
+        _rows()._canonical_room_aggregate_plaintext(value),
+        header=_canonical_internal([room_id, value.updated_revision, intent]),
+    )
+    with journal._owner.journal_write():
+        assert (
+            journal._execute(
+                "INSERT OR REPLACE INTO NioIngestRoomAggregate VALUES(?,?,?,?,?,?)",
+                (
+                    journal.account_id,
+                    room_id,
+                    value.updated_revision,
+                    intent,
+                    payload,
+                    digest,
+                ),
+            ).rowcount
+            == 1
+        )
+
+
+def _malformed_ready_proposal(
+    case: str,
+    proposal: FrameProposal,
+    aggregate: RoomAggregateValue,
+    origin: RecordOrigin,
+) -> FrameProposal:
+    room = proposal.room_proposals[0]
+    before = room.before
+    assert before is not None
+    if case in ("pending-hydration", "missing-before-baseline"):
+        room = replace(
+            room,
+            before=aggregate.continuity,
+            after=replace(
+                aggregate.continuity,
+                baseline=MembershipBaseline("$discovery-member", "live-prev"),
+                hydration_id=None,
+            ),
+        )
+    else:
+        gap = RecoveryGap(
+            uuid5(proposal.frame_id, "malformed-gap"),
+            room.after.room_id,
+            0,
+            origin,
+            "start",
+            "target",
+        )
+        hydration_id = uuid5(proposal.frame_id, "malformed-hydration")
+        loss = LossProposal(
+            room.after.room_id,
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        )
+        overrides: dict[str, dict[str, object]] = {
+            "missing-aggregate": {},
+            "before-mismatch": {"before": replace(before, membership_epoch=1)},
+            "missing-after-baseline": {"after": replace(room.after, baseline=None)},
+            "unchanged-continuity": {"after": before},
+            "nonbaseline-continuity-change": {
+                "after": replace(room.after, membership="leave")
+            },
+            "gap": {"after": replace(room.after, gap=gap)},
+            "recovery": {"recovery": gap},
+            "hydration": {
+                "hydration": HydrationIntent(hydration_id, origin),
+                "after": replace(room.after, hydration_id=hydration_id),
+            },
+            "retirement": {"retirement_epoch": 0},
+            "loss": {"losses": (loss,)},
+            "release": {"release": RecoveryRelease.LOSS_THEN_HELD},
+        }
+        if case in overrides:
+            room = replace(room, **overrides[case])
+        elif case == "second-room":
+            second = "!ready-second:example.org"
+            return replace(
+                proposal,
+                room_proposals=(
+                    room,
+                    replace(
+                        room,
+                        before=replace(before, room_id=second),
+                        after=replace(room.after, room_id=second),
+                    ),
+                ),
+            )
+        elif case == "wrong-descriptor-route":
+            descriptor = replace(
+                proposal.descriptors[0], route=DescriptorRoute.HOLD_FOR_HYDRATION
+            )
+            return replace(proposal, descriptors=(descriptor,))
+        else:
+            raise AssertionError(case)
+    return replace(proposal, room_proposals=(room,))
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing-aggregate",
+        "before-mismatch",
+        "pending-hydration",
+        "missing-before-baseline",
+        "missing-after-baseline",
+        "unchanged-continuity",
+        "nonbaseline-continuity-change",
+        "gap",
+        "hydration",
+        "recovery",
+        "retirement",
+        "loss",
+        "release",
+        "second-room",
+        "wrong-descriptor-route",
+    ),
+)
+def test_materializer_post_hydration_ready_rejects_malformed_proposals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    statements: list[str] = []
+    with _post_hydration_ready_case(tmp_path, statements=statements) as (
+        prepared,
+        journal,
+    ):
+        aggregate = _decode_aggregate(journal, _aggregate_rows(journal)[0])[1]
+        assert type(aggregate) is RoomAggregateValue
+        proposal = reduce_staged_frame(
+            journal.stream_id,
+            prepared.selected.frame_id,
+            prepared.normalized,
+            (aggregate.continuity,),
+        )
+        if case == "missing-aggregate":
+            with journal._owner.journal_write():
+                assert (
+                    journal._execute(
+                        "DELETE FROM NioIngestRoomAggregate WHERE account_id=?",
+                        (journal.account_id,),
+                    ).rowcount
+                    == 1
+                )
+        elif case in ("pending-hydration", "missing-before-baseline"):
+            hydration_id = uuid5(prepared.selected.frame_id, "pending")
+            aggregate = replace(
+                aggregate,
+                continuity=replace(
+                    aggregate.continuity,
+                    baseline=None,
+                    hydration_id=(
+                        hydration_id if case == "pending-hydration" else None
+                    ),
+                ),
+                pending_hydration=(
+                    HydrationIntent(hydration_id, prepared.normalized.origin)
+                    if case == "pending-hydration"
+                    else None
+                ),
+            )
+            _replace_authenticated_aggregate(journal, aggregate)
+        elif case == "second-room":
+            second_room = "!ready-second:example.org"
+            _replace_authenticated_aggregate(
+                journal,
+                replace(
+                    aggregate,
+                    continuity=replace(aggregate.continuity, room_id=second_room),
+                ),
+            )
+            monkeypatch.setattr(
+                "nio.store._sync_journal._frame_room_ids",
+                lambda _frame: (aggregate.continuity.room_id, second_room),
+            )
+        proposal = _malformed_ready_proposal(
+            case, proposal, aggregate, prepared.normalized.origin
+        )
+        proposals = (proposal,)
+        if case == "missing-after-baseline":
+            room = proposal.room_proposals[0]
+            proposals += (
+                replace(
+                    proposal,
+                    room_proposals=(
+                        replace(
+                            room,
+                            after=replace(
+                                room.after,
+                                baseline=MembershipBaseline(None, "live-prev"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        graph = _materializer_storage_graph(journal)
+        for candidate in proposals:
+            statements.clear()
+            monkeypatch.setattr(
+                "nio.store._sync_journal.ingest_reducer.reduce_staged_frame",
+                lambda *_args, proposal=candidate: proposal,
+            )
+            with pytest.raises(JournalIntegrityError):
+                _materialize(journal)
+            assert _materializer_storage_graph(journal) == graph
+            assert _materializer_dml(statements) == ()
+
+
+def test_materializer_post_hydration_ready_rejects_orphan_held_work(
+    tmp_path: Path,
+) -> None:
+    statements: list[str] = []
+    with _post_hydration_ready_case(tmp_path, statements=statements) as (case, journal):
+        aggregate = _decode_aggregate(journal, _aggregate_rows(journal)[0])[1]
+        assert type(aggregate) is RoomAggregateValue
+        aggregate = replace(aggregate, next_room_sequence=1)
+        _replace_authenticated_aggregate(journal, aggregate)
+        held = EventRecord(
+            str(uuid5(case.selected.frame_id, "orphan-held")),
+            RecordKind.TIMELINE,
+            replace(case.normalized.origin, request_id=1),
+            aggregate.continuity.room_id,
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            b"{}",
+            None,
+        )
+        _insert_verified_event_work(
+            journal,
+            held,
+            frame_id=_PLANNER_EXISTING_FRAME_ID,
+            ready_revision=None,
+            ready_ordinal=None,
+            created_revision=1,
+            status="held",
+        )
+        graph = _materializer_storage_graph(journal)
+        statements.clear()
+        with pytest.raises(
+            JournalIntegrityError,
+            match="^READY room has orphan HELD Work$",
+        ):
+            _materialize(journal)
+        assert _materializer_storage_graph(journal) == graph
+        assert _materializer_dml(statements) == ()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "one_over"),
+    tuple(
+        pytest.param(name, over, id=f"{label}-{'one-over' if over else 'exact'}")
+        for name, label in (
+            ("max_ready_work_count", "ready-count"),
+            ("max_ready_work_canonical_bytes", "ready-bytes"),
+            ("max_total_work_count", "total-count"),
+            ("max_total_work_canonical_bytes", "total-bytes"),
+        )
+        for over in (False, True)
+    ),
+)
+def test_materializer_post_hydration_ready_capacity_exact_and_one_over(
+    tmp_path: Path,
+    limit_name: str,
+    one_over: bool,
+) -> None:
+    statements: list[str] = []
+    with _post_hydration_ready_case(tmp_path, statements=statements) as (case, journal):
+        owner = journal.load_owner()
+        _expected_aggregate, expected_work = (
+            _atomicity_post_hydration_ready_expectations(
+                owner.stream_id, case.selected, case.normalized, owner.revision + 1
+            )
+        )
+        incoming = expected_work[0].value
+        assert type(incoming) is EventRecord
+        existing = replace(
+            _event_record(),
+            record_id=str(uuid5(case.selected.frame_id, "capacity-existing")),
+        )
+        _insert_verified_event_work(
+            journal,
+            existing,
+            frame_id=_PLANNER_EXISTING_FRAME_ID,
+            ready_revision=1,
+            ready_ordinal=0,
+            created_revision=1,
+        )
+        existing_row = _work_rows(journal)[0]
+        incoming_bytes = _planned_ready_size(
+            journal, case, incoming, owner.revision + 1
+        )
+        exact = (
+            2
+            if limit_name.endswith("count")
+            else len(bytes(existing_row[10])) + incoming_bytes
+        )
+        limits = replace(MaterializerLimits(), **{limit_name: exact - int(one_over)})
+        graph = _materializer_storage_graph(journal)
+        statements.clear()
+        result = _materialize(journal, limits=limits)
+        if one_over:
+            assert result == MaterializeResult(
+                MaterializeStatus.AT_CAPACITY, case.selected.frame_id, None
+            )
+            assert _materializer_storage_graph(journal) == graph
+            assert _materializer_dml(statements) == ()
+            batch = journal.next_batch()
+            assert batch is not None and batch.records == (existing,)
+            journal.acknowledge_batch(batch.ref)
+            statements.clear()
+            graph = _materializer_storage_graph(journal)
+            assert graph[0].revision == 6 and graph[4] == ()
+            result = _materialize(journal, limits=limits)
+        assert result == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            case.selected.frame_id,
+            graph[0].revision + 1,
+        )
+        rows = _work_rows(journal)
+        assert len(rows) == 1 + int(not one_over)
+        _assert_materializer_committed_graph(
+            journal,
+            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+            case,
+            graph,
+        )
+        committed = _materializer_storage_graph(journal)
+        assert _materialize(journal, limits=limits).status is MaterializeStatus.IDLE
+        assert _materializer_storage_graph(journal) == committed
+
+
+def test_materializer_post_hydration_ready_record_limit_is_atomic(
+    tmp_path: Path,
+) -> None:
+    for one_over in (False, True):
+        statements: list[str] = []
+        with _post_hydration_ready_case(
+            tmp_path / str(int(one_over)),
+            statements=statements,
+            room_padding_bytes=256,
+        ) as (case, journal):
+            owner = journal.load_owner()
+            aggregate, work = _atomicity_post_hydration_ready_expectations(
+                owner.stream_id, case.selected, case.normalized, owner.revision + 1
+            )
+            event = work[0].value
+            assert type(event) is EventRecord
+            event_bytes = _planned_ready_size(journal, case, event, owner.revision + 1)
+            loss = LossRecord(
+                "",
+                case.normalized.origin,
+                event.room_id,
+                0,
+                LossReason.OVERSIZED_EVENT,
+                LossBoundary(None, None, None, None),
+                b"{}",
+            )
+            loss = replace(loss, loss_id=_loss_id(owner.stream_id, loss))
+            assert (
+                _planned_ready_size(journal, case, loss, owner.revision + 1)
+                < event_bytes
+            )
+            statements.clear()
+            result = _materialize(
+                journal,
+                limits=replace(
+                    MaterializerLimits(),
+                    max_record_canonical_bytes=event_bytes - int(one_over),
+                ),
+            )
+            revision = owner.revision + 1
+            assert result == MaterializeResult(
+                MaterializeStatus.MATERIALIZED, case.selected.frame_id, revision
+            )
+            expected = (
+                _ExpectedMaterializerWork(
+                    loss, "ready", case.selected.frame_id, revision, 0, revision
+                )
+                if one_over
+                else work[0]
+            )
+            graph = _materializer_storage_graph(journal)
+            assert graph[2] == () and len(graph[3]) == len(graph[4]) == 1
+            _assert_exact_materializer_work(journal, graph[4], (expected,), ())
+            assert _decode_aggregate(journal, _aggregate_rows(journal)[0])[1] == (
+                replace(aggregate, next_room_sequence=0) if one_over else aggregate
+            )
+            dml = _materializer_dml(statements)
+            assert tuple(
+                sum(table in statement for statement in dml)
+                for table in (
+                    "NioIngestMeta",
+                    "NioIngestRoomAggregate",
+                    "NioIngestWork",
+                    "NioIngestFrame",
+                )
+            ) == (1, 1, 1, 1)
+            assert _materialize(journal).status is MaterializeStatus.IDLE
+            assert _materializer_storage_graph(journal) == graph
 
 
 def test_materializer_empty_retirement_anchors_lifecycle_before_later_work(
@@ -14601,6 +15954,15 @@ def _expected_materializer_hook_labels(scenario: str) -> tuple[str, ...]:
             "before_commit",
             "commit",
         )
+    if scenario == _ATOMICITY_POST_HYDRATION_CLASSIC_READY:
+        return (
+            "meta_revision_epoch_cas",
+            "aggregate_update",
+            "work_insert",
+            "frame_delete",
+            "before_commit",
+            "commit",
+        )
     assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
     return (
         "meta_revision_epoch_cas",
@@ -14678,6 +16040,10 @@ def _expected_materializer_trace(scenario: str) -> tuple[str, ...]:
         pytest.param(
             _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
             id="retirement-update",
+        ),
+        pytest.param(
+            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+            id="post_hydration_classic_ready",
         ),
     ],
 )
@@ -14775,11 +16141,7 @@ def _kill_materializer_at_boundary(
     occurrence: int,
     sequence_path: Path,
 ) -> None:
-    transport = (
-        TransportKind.CLASSIC
-        if scenario == _ATOMICITY_H1_CLASSIC_PLAIN
-        else TransportKind.SLIDING
-    )
+    transport = _atomicity_transport(scenario)
     bootstrap = _open_discovery_journal(store_path, transport)
     journal = bootstrap._journal
     observed = 0
@@ -14834,11 +16196,7 @@ def test_materializer_crash_boundary_reopens_old_or_complete_new_graph(
         _expected_materializer_hook_prefix(scenario, boundary, occurrence),
     )
 
-    transport = (
-        TransportKind.CLASSIC
-        if scenario == _ATOMICITY_H1_CLASSIC_PLAIN
-        else TransportKind.SLIDING
-    )
+    transport = _atomicity_transport(scenario)
     reopened = _open_discovery_journal(store_path, transport)
     journal = reopened._journal
     try:
@@ -14983,12 +16341,32 @@ def _replaced_materializer_path_identity(path: Path) -> Iterator[None]:
 
 
 @pytest.mark.parametrize(
-    ("fence", "error_type"),
+    ("fence", "error_type", "scenario"),
     [
-        pytest.param("revision", JournalConflictError, id="revision"),
-        pytest.param("writer-epoch", LocalProtocolError, id="writer-epoch"),
-        pytest.param("lock-file", LocalProtocolError, id="lock-file"),
-        pytest.param("database-inode", LocalProtocolError, id="database-inode"),
+        pytest.param(
+            "revision", JournalConflictError, _ATOMICITY_H1_CLASSIC_PLAIN, id="revision"
+        ),
+        pytest.param(
+            "writer-epoch",
+            LocalProtocolError,
+            _ATOMICITY_H1_CLASSIC_PLAIN,
+            id="writer-epoch",
+        ),
+        pytest.param(
+            "lock-file", LocalProtocolError, _ATOMICITY_H1_CLASSIC_PLAIN, id="lock-file"
+        ),
+        pytest.param(
+            "database-inode",
+            LocalProtocolError,
+            _ATOMICITY_H1_CLASSIC_PLAIN,
+            id="database-inode",
+        ),
+        pytest.param(
+            "revision",
+            JournalConflictError,
+            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
+            id="post_hydration_ready",
+        ),
     ],
 )
 def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
@@ -14996,23 +16374,16 @@ def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
     monkeypatch: pytest.MonkeyPatch,
     fence: str,
     error_type: type[BaseException],
+    scenario: str,
 ) -> None:
     statements: list[str] = []
-    bootstrap = _open_discovery_journal(
-        tmp_path,
-        TransportKind.CLASSIC,
-        statements=statements,
+    case = _prepare_materializer_atomicity_case(
+        tmp_path, scenario, statements=statements
     )
+    bootstrap = case.bootstrap
     journal = bootstrap._journal
     try:
-        selected, normalized = _stage_discovery_frame(
-            journal,
-            TransportKind.CLASSIC,
-            1,
-            room_nonempty=True,
-            global_ready_count=0,
-        )
-        case = _MaterializerAtomicityCase(bootstrap, selected, normalized)
+        selected = case.selected
         old_graph = _materializer_storage_graph(journal)
         old_owner = old_graph[0]
         lock_path = journal._owner._lock.path
@@ -15083,7 +16454,7 @@ def test_materializer_writer_boundary_fence_race_writes_no_partial_graph(
         )
         _assert_materializer_committed_graph(
             journal,
-            _ATOMICITY_H1_CLASSIC_PLAIN,
+            scenario,
             case,
             old_graph,
         )
