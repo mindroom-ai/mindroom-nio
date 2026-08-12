@@ -571,3 +571,309 @@ ingestion tests. Black, Ruff, targeted mypy, and `git diff --check` passed;
 scoped re-review approved every prior finding. Production accounting is
 `+292/-11`, bringing cumulative canary-path gross additions through checkpoint
 4 to `+749` and leaving `781` lines before the `+1,530` successful-canary gate.
+
+### Typed-Meta one-record delivery
+
+Reviewed comparison base: `e894a8e54311c908577d65671830500e69ac5ccc`.
+Approved synthetic candidate: `c0a259d7297a88939948f4a843a43b3cc5117a47`.
+
+nio now publishes at most one authenticated READY Work record through a
+canonical `SyncBatch`, durably binds its full READY key and batch digest in six
+typed fields on the existing singleton Meta row, replays byte-identically after
+restart, and retires the Work only in the matching FIFO acknowledgement
+transaction. There is no delivery table, copied payload, JSON/base64 delivery
+state, checksum mini-codec, READY-specific query, or `AuthenticatedWork`
+extension.
+
+Two post-review amendments are controlling: the redundant delivery-state
+checksum was removed under the explicit single-field-corruption threat model,
+and each independent typed Meta column/CHECK may occupy one SQL line. The full
+READY key, canonical batch SHA-256, strict typed decoder, global bounded Work
+inventory, and predicate CAS over every delivery field remain.
+
+Fresh independent verification passed all 1,244 ingestion tests, including
+process-death, read-to-writer race, authenticated corruption, hydration-to-
+delivery, session-lifetime, and later-READY replay cases. Black, Ruff, and
+`git diff --check` passed. The required mypy command retains three documented
+findings byte-for-byte present in the comparison base; no false green is
+claimed.
+
+Production/tooling accounting is `+374/-37`, exactly the reviewed working
+target and four additions below the hard stop. Cumulative canary-path additions
+through checkpoint 5 are `749 + 374 = 1,123`; reserving `+300` for MindRoom
+admission and `+90` for the lab canary gives `1,513`, leaving 17 lines below the
+`+1,530` gate. Full evidence is in
+`.superpowers/sdd/2026-08-10-durable-ingestion-scope-correction/task-5-report.md`.
+
+## Task 7 final Option-C local-commit boundary
+
+Task 7 is frozen after exact compatibility 8P, Option-C 10P, Task-0 94P,
+current Task-1 31P, all approved Ruff/ty/Black/diff/count/suppression gates,
+and independent final code/evidence review. Historical Task-1 32P remains
+preserved; the current count is 31 only because the obsolete blocked
+`zero-room` case was replaced by the two exact Option-C positive cases.
+
+The reviewed local nio commit is
+`b313ae284be5dcc7797a7f7de83c70ad80520beb`, direct parent
+`c0a259d7297a88939948f4a843a43b3cc5117a47`, with exact six-path scope and
+`+1660/-118`. Its all-path and production-only binary-patch SHA-256 values are
+`c9c3b236d941e5a697e4499abcd1dbe775ae646cf69b47343740264a78f8d7b8`
+and `243a8a190c9250e0f24b812b7f20b8f72b99f52a64e3ae51694432265540b22b`.
+The reviewed local MindRoom commit is
+`925df7f3cbcc39d4904140efd9d16b93c77238ea`, direct parent
+`0acaea2baf05a4c41cce7497cfcdf4880afc6d04`, with exact four-path scope and
+`+2851/-4`. Its all-path and production-only binary-patch SHA-256 values are
+`ae05c1a43584fc8cab63f3b2d3dbf4964208dffb22d0aec49f0be7e5c6510714`
+and `338071988b3a0d4e706d525bfa38d4fd2174d5a97c1951c3a7784c957c467366`.
+Production is exact combined 314 and cumulative 1720, inside the independently
+approved 315/1721 hard gates. The production suppression inventory remains
+exactly PLC0415 plus PLR0915; Option C added no suppression.
+
+The executable Task-7 brief is the sole source for the next live boundary.
+Its historical 779/a2812 reconstruction is non-rerunnable. Before any new
+Step-5 lab, the active block must validate and remove only the two exact
+orphaned roots `/tmp/nio-task7-deps.sWHOqWfj` and
+`/tmp/nio-task7-dev.KE42WJO8`, prove absence, and reconstruct from the final
+b313/925 commits with all ten exact blobs, both path/numstat sets, all four
+patch digests, exact suppression scopes, clean indexes/locked paths, Python
+3.13.14, combined 314/cumulative 1720, and required wheel version
+`0.0.dev0+g925df7f3cbcc`. No cleanup, build, service, operator, network, push,
+Classic PASS, or Sliding PASS is claimed by this documentation rebind.
+
+## Task 7 Qft ACK-oracle superseding boundary
+
+The final b313/925 boundary subsequently produced exact Qft7s6LI Step-5
+wheels nio `8ff088a91a94851427dd0660a81aaaf9af72aeb1085259c7b56e6bd6e13554e5`
+(324620 bytes) and MindRoom
+`d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`
+(5052699 bytes), with Python 3.13.14, nio 0.39.0, MindRoom
+`0.0.dev0+g925df7f3cbcc`, lock/sync150/precheck/final provenance, and AST PASS.
+The sole Step 6 emitted no evidence/PASS and stopped/cleaned exact
+`ack.pre:AssertionError:unclassified`; it was not rerun and no runtime content
+was inspected.
+
+The executable brief now makes only the minimal operator-oracle correction.
+Non-ACK phases retain exact stable-graph equality. ACK-pre permits only
+same-epoch Source request progress `N >= 0` with exact Meta revision progress
+`2*N`, while requiring empty Frames, exact old Aggregate/Work/delivery and
+MindRoom projections, exact remaining Meta fields, and writer rotation. Fixed
+substages/labels and the pure N=0/1/2 plus negative projection self-test expose
+no values. No generic classifier or traceback parser is added. Independent
+review of the governing freeze is required before one fresh Step 5 and, only
+after it passes, exactly one Step 6; no source/test/commit/service/network/
+push/Classic/Sliding action is authorized by this entry.
+
+## Task 7 CZX durable-idle oracle superseding boundary
+
+After review of the Qft freeze, fresh CZXma3uj Step 5 passed against b313/925
+with nio wheel
+`37bd47ff0936c7ce43ebce4f45fb7ae19a9ee4db477045954128f83a76189fad`
+(324620 bytes), MindRoom wheel
+`d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`
+(5052699 bytes), MindRoom `0.0.dev0+g925df7f3cbcc`, Python 3.13.14,
+lock/sync closure 150, final closure 152, and AST PASS. The sole roughly
+203-second Step 6 progressed beyond ACK, emitted no evidence/PASS, and stopped
+exact `operator-stop:durable-idle-1:AssertionError:unclassified`; no rerun or
+runtime-content read followed. Cleanup proved the lab absent, unit
+not-found/inactive/dead with zero PIDs/list rows and empty control group,
+process references zero, and b313/925 HEADs/indexes unchanged.
+
+The executable brief now uses one neutral empty-Classic-progress oracle at
+ACK-pre, `idle.post`, and both durable-idle comparisons against `settled`.
+It permits only same-epoch nonnegative integer Source request delta `N` plus
+exact Meta revision delta `2*N`, while Frames remain empty and Aggregate,
+Work, delivery, MindRoom, and all other Meta fields remain exact. Writer
+rotation stays separate. Fixed labels/substages expose no values; idle evidence
+reports only the integer request delta and `delivery_stable`, not blanket
+stability. The renamed pure N=0/1/2 and negative self-test retains its exact
+semantics. All other phase equalities remain unchanged. Independent review of
+the five governing artifacts authorizes only one fresh Step 5 and, after PASS,
+one Step 6; no source/test/commit/service/network/push/Classic/Sliding action
+is authorized by this entry.
+
+## Task 7 bLS legacy-application fixed-label boundary
+
+Fresh bLS4F3oJ Step 5 passed b313/925 with nio wheel
+`53082a4255d9b4787ddb2c3cba65848934a75e551693c78f8a53f3dc4e805895`/324620,
+MindRoom wheel `d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`/5052699,
+g925, closure 150→152, both semantic fences bash-n PASS, and AST PASS. The sole
+~4m Step 6 passed durable phases/ACK/idle, emitted no evidence/PASS, and stopped
+exact `operator-stop:legacy-application:AssertionError:unclassified`; no rerun
+or runtime-content read followed. Cleanup was exact green and b313/925
+HEADs/indexes remained unchanged.
+
+Fifteen fixed substages, eight allowlisted labels, and split response/model
+checks before and after idle change diagnostics only. Static closure forbids
+dynamic stages/labels and value emission while retaining exact graph equality,
+all product semantics, combined314, and cumulative1720. Independent review of
+the five artifacts gates one fresh Step 5 and then exactly one Step 6 only.
+
+## Task 7 dEdr application model-oracle fixture boundary
+
+The reviewed inputs were exact SHA-256 design
+`affc08587a71fea0ac27524c40d83545635c751f0f9ff2802b2e0c7004a2904e`,
+brief `2afbaeed2cf9c4a0a00af5428c375e305c470b38d875c84511fb0e6a05c3da0f`,
+report `bd98f7fa420c8b57065b947fd01f452947aa40ef6346b3be7357b802d7602021`,
+progress `fbf188f0b024c1fa8e64b4f7aa750b5dea5e0efe37d2a2df6a2edd88997d1c89`,
+and this tracked plan
+`b9469e75197f22a386ec23880fc669e158cd252e0fedab802dedf10a72d03389`.
+Their prebuild gate and b313/925 reconstruction passed before fresh lab
+`/tmp/mindroom-ingestion-canary.dEdrMnMW`. Step 5 produced exact nio wheel
+`4350e5e5cd33018ec63045154d5434821d3bb6c92666dad454025c13f7dfd6ff`/324620,
+MindRoom wheel `d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`/5052699,
+version `0.0.dev0+g925df7f3cbcc`, closure 150→152, and AST PASS. The sole
+~4.5m Step 6 passed the settled sole direct-response checks, emitted no
+evidence/PASS, and stopped exact `legacy-application.idle-model` /
+`application-idle-model`; it was not rerun. Cleanup proved lab absent, unit
+gone, PIDs0, refs0, registry0, b313/925 HEADs unchanged, and indexes0.
+
+Static RCA establishes a stale aggregate-counter oracle, not a duplicate turn
+or product defect. Default thread mode starts a thread, first automatic
+summary threshold defaults to 1, and the post-response background summary
+uses the default model. Its expected request increments the shared HTTP
+counter after the direct reply is settled while the visible source-response
+count stays one. Existing response-runner summary-scheduling and threshold
+tests suffice; no new product TDD is required.
+
+The active disposable config alone fixes
+`defaults.thread_summary_first_threshold: 100`, preserving thread mode and
+every exact-one foreground, fixed-label, receipt/frontier, and graph assertion.
+Count 2 is neither accepted nor reset; any fresh vocabulary check returns on
+`message_count < 100` before `_generate_summary`. The smallest external source check
+binds the sole literal 100 and all three exact-one expressions without
+expanding the classifier-secrecy AST. Independent five-hash review gates one
+fresh Step 5 and, only after PASS, one Step 6; no source/test/commit/service/
+network/push/Classic/Sliding action is otherwise authorized.
+
+## Task 7 3n8rOwtD threshold-100 PASS-observed capture boundary
+
+The verified inputs were exact SHA-256 design
+`ba17289baf161848254e83086398d3f15607e7ec7cd470bb28581e4aef0c5755`,
+brief `96680ffb43bac83a0a8729c6cfca8e9632ba4e8902bb8a76030a18ab67d3ec6e`,
+report `162481604623e5d74790357260c17d59dbb335b4b7677a37d4c1fadf4c1451a5`,
+progress `ae0adcf20c993da215239de9d06354ae94cf58f37266a16dd8702047f2e5e053`,
+and this tracked plan
+`433b6234312501ac10eebf38030e4b7ee8143f4f76dbe87696cb56e42d474f32`.
+The corrected b313/925 reconstruction passed at exact combined production 314
+and cumulative production 1720 before fresh Step-5 lab
+`/tmp/mindroom-ingestion-canary.3n8rOwtD`. Step 5 recorded the Bun unit as
+`success` and `collected: true`, exact closure 150 to 152, Python 3.13.14,
+installed MindRoom `0.0.dev0+g925df7f3cbcc` and nio `0.39.0`, nio wheel
+`0d5dc60408b2f26fa8a00278a6495cf637e372b6645ed9d1a4a6e48fbcbcc3ad`
+at 324620 bytes, MindRoom wheel
+`d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`
+at 5052699 bytes, and exact `TASK7_OPERATOR_LOG_AST_OK` PASS.
+
+The sole Step 6 exited zero and exactly one PASS marker was observed. The run summary,
+which is not a substitute for the lost exact JSON or reviewed evidence,
+reports final nio
+`b313ae284be5dcc7797a7f7de83c70ad80520beb` over base
+`c0a259d7297a88939948f4a843a43b3cc5117a47` and final MindRoom
+`925df7f3cbcc39d4904140efd9d16b93c77238ea` over base
+`0acaea2baf05a4c41cce7497cfcdf4880afc6d04`, Classic transport, the sole
+source-to-response path, 50 drained one-time keys, every declared phase,
+`application_stable: true`, idle-latch `delivery_stable: true` with
+`source_request_delta: 0`, and durable-idle ordinals 1 and 2 with
+`delivery_stable: true`, `source_request_delta: 1`, and writer rotation true.
+It additionally reports production 314/cumulative 1720, the exact wheels and
+installed versions, Synapse `1.148.0rc1` plus its image digest, and cleanup
+fields `clients`, `model`, `process_group`, `instance`, and `lab` all removed.
+Final content-free checks proved lab absent; unit not-found/inactive/dead with
+zero PIDs, empty control group, and zero list rows; process references zero;
+registry entries zero; final b313/925 HEADs and both indexes unchanged/clean;
+and locked paths clean. No rerun, edit, commit, push, Sliding action, or
+forbidden inspection followed.
+
+Terminal truncation discarded the exact captured `TASK7_EVIDENCE_INPUT` JSON,
+and no `checkpoint-7-canary.json` exists. It must not be reconstructed from
+the summary. The exact verdict is **Classic operator PASS observed /
+evidence-materialization STOP**; qualified Classic diagnostic canary PASS
+remains pending and is not whole-Task-7 PASS.
+
+The minimal lossless-capture amendment changes no operator, fixture, product,
+or assertion semantics. After independent five-hash review, one fresh Step 5
+and then exactly one Step 6 may run. Step 6 must be a dedicated direct
+execution whose outer `functions.exec` begins with exact pragma
+`// @exec: {"yield_time_ms": 10000, "max_output_tokens": 100000}`. The nested
+initial `exec_command` and every `write_stdin` poll must each use
+`max_output_tokens: 100000`; retain every output chunk and concatenate them
+once in arrival order. Require final exit zero, no truncation metadata or
+`original_token_count` beyond returned content, and exactly one complete
+newline-terminated `TASK7_EVIDENCE_INPUT=` line before `apply_patch`
+materializes its verbatim JSON. Missing, partial, duplicate,
+non-newline-terminated, or truncated evidence is STOP with no reconstruction
+or unchanged-run retry. No capture file is authorized; if either 100000-token
+layer is unsupported or direct losslessness cannot be guaranteed before
+execution, STOP for separate review rather than capturing stdout or logs.
+
+The sole designated next phase remains the prewritten Step 12 Sliding gate:
+production MSC4186, one external event and one durable database, real window
+entry/eviction/re-entry with membership proof, fresh connection-scoped `pos`
+after restart, exactly-once source/Frame/Work/receipt/frontier correlation,
+and duplicate-free idle observations. It remains inactive until exact Classic
+evidence materialization and independent review pass, then still requires the
+new separate checkbox brief and design review declared by Step 12 before it is
+executable. Task 8, cutover, release,
+unrelated breadth, push, and full-parity claims remain blocked.
+
+This tracked plan amendment remains an unstaged docs-only worktree change
+because this task authorizes no commit. Pushing existing commit b313 would not
+include it. Before any push, obtain separate authorization and independent
+review for a docs-only nio commit directly atop b313 whose sole tracked diff is
+this plan and whose code/test tree is unchanged. Keep b313 as the code/wheel
+SHA and record the new child separately as the nio push HEAD; never amend b313
+or represent these docs as part of its wheel.
+
+## Task 7 bvTOAy7w qualified Classic diagnostic canary PASS
+
+The independently reviewed recovery inputs were exact SHA-256 design
+`c7097f386e0024d42570651fc7052f9efa6b3791eccac04485deca0606a588b9`,
+brief `f8e1c20899a3a787ad4936fd290e16e626a8c0d8cf0d9d447b78aadb0b669669`,
+report `3822be4897774f824a55c5e8ff3c51460fa1f885e28ffefa9ca3268feeac5e36`,
+progress `6a2e7dc7c66413a1ab56c73e5419b5f51619914baba4645dd0d471586bf5853c`,
+and this tracked plan
+`7a45ed2e302c39ba308d194c159a6a11293727bb302c3e78567a16ffcda57c40`.
+Fresh b313/925 reconstruction passed at combined314/cumulative1720.
+Separately captured Step-5/post-cleanup executor evidence binds lab
+`/tmp/mindroom-ingestion-canary.bvTOAy7w`; it is not inferred from the JSON.
+The JSON independently binds successful/collected Bun unit
+`mindroom-task7-bun-bvTOAy7w.service` and `cleanup.lab: "removed"`; the final
+state gate independently proves that exact lab absent.
+
+Fresh Step 5 produced exact nio wheel
+`b21755d7c16b67e12c1419765244080b280caacea21a470196c94492cd760b4b`
+/324620 and MindRoom wheel
+`d5359971cab62e2b96d6c9cfea781f9fccfc34225944bc073c282cc099c3b98c`
+/5052699, closure150→152, Python3.13.14, installed nio0.39.0 and
+MindRoom`0.0.dev0+g925df7f3cbcc`, and exact AST marker PASS. Dedicated Step 6
+exited0 and the reviewed dual-budget path losslessly captured exactly one
+complete newline-terminated marker.
+
+The exact JSON payload is 24894 bytes/SHA-256
+`9ea59ceaffbe73b3b0a2eed0a116020dba7ee8b78adfafde3272752222073fdd`.
+After independent newline APPROVE, `apply_patch` materialized exactly payload
+plus one LF. Ignored evidence file `checkpoint-7-canary.json` is 24895 bytes/
+SHA-256
+`5a1e2e03778832301c3cf7ede223b1744edb1a656711a79e4778bf8c5f7fb838`,
+with outcome PASS and 11 phases.
+
+Completed Step-7/8 audits bind true b313/925 ancestry over c0a/0aca, Classic
+source/response, OTK50, all eleven ordered phase graphs through ACK, stable
+ten-second application idle, idle-latch delivery stability/delta0, two stable
+ten-second durable idles at delta1 with writer rotation, explicit-host Docker,
+and Synapse1.148.0rc1/image digest
+`sha256:1b32cacbc99b38a83d3370f9843c2211ac3b67eaaaf977ad8de03bb37f2d6cbf`.
+Cleanup is exact JSON clients/model closed plus process-group/instance/lab
+removed. Independent state is exact lab absent, unit not-found/inactive/dead,
+PIDs0, empty group/list0, refs0, registry0, b313/925 HEADs and indexes
+unchanged/clean, and locked paths clean.
+
+This is qualified **Classic diagnostic canary PASS**, not whole-Task-7,
+Sliding PASS, full parity, cutover, or release. Step 10 final independent
+evidence/docs review still blocks staging, commit, and push. This tracked plan
+remains unstaged. A later authorized docs-only nio commit must be a separately
+reviewed direct child of b313 with no code/test changes; b313 remains the
+code/wheel SHA and the child becomes the distinct push HEAD. Sliding remains
+blocked and non-executable pending a new separate checkbox brief, design
+review, and explicit user approval. No commit, push, or Sliding action is
+authorized by this entry.
