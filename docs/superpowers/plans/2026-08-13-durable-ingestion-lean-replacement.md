@@ -18,7 +18,7 @@
 - Never use canary-specific production tables, scope, control room, `probe`, occurrence ledger, rotation ledger, or materializer.
 - Response and cursor commit together.
 - MindRoom application effects, existing event-journal identity, batch receipt, and frontier commit together.
-- Desktop remains on upstream-style `sync_forever()`; it is not connected to the durable batch engine.
+- Desktop remains on upstream-style `sync()`/`sync_forever()` through an internal profile that disables fork-only limited-timeline recovery while retaining tokens, E2EE, callbacks, and headers; it is not connected to the durable batch engine.
 - Legacy fork recovery stays while the public sync internals are restored upstream-style; deletion waits for both MindRoom and desktop zero-use observations, then desktop is regression-tested again.
 - Preserve upstream `secure_delete = "fast"` and its regression from `origin/main`.
 - Final nio net budgets versus `origin/main@6ed2b98`: runtime ≤ +4,500; tests ≤ +15,000; docs/scripts ≤ +1,000.
@@ -26,112 +26,77 @@
 
 ## Task 1: Freeze the lean authority and prune the canary architecture
 
-**Files**
-
-- Add this plan and its design.
-- Revert, as normal commits and in reverse order, all commits after `b32ebf8` that implement or specify the diagnostic Sliding canary.
-- In MindRoom, ordinarily revert `925df7f3c feat: run exact-wheel durable ingestion canary`; it contains latch/trace environment plumbing, exact-agent/one-room production constraints, and its canary-only tests. Retain the admission/conversion core at `0acaea2ba`.
-- Remove nio's remaining schema-v1 canary branch: `_diagnostic_admits`, `materialize_oldest_diagnostic_frame`, the diagnostic journal-port method, and the `room_id` argument/state in `open_ingestion` and `IngestionSession`. The coordinator must call `materialize_oldest_frame()` and hydrate each candidate using `candidate.continuity.room_id`.
-- Remove superseded historical plans/specs and benchmark-only scripts/fixtures after preserving any still-needed acceptance statements here.
-
-**Required commit history**
-
-Do not reset, rebase, amend, or force-push. Create ordinary revert commits for:
-
-```text
-56f5d0b fix: tighten schema-v2 diagnostic ownership
-774b97b feat: add schema-v2 diagnostic topology
-a6ed0c7 fix: validate sliding room ids strictly
-8e1e6e1 feat: persist sliding list evidence
-450387f docs: design durable sliding ingestion canary
-```
-
-Then integrate `origin/main` normally so `secure_delete = "fast"` and its test are present.
-
-In MindRoom, do not reset, amend, rebase, or force-push. Revert `925df7f3c` as an ordinary commit and verify that the resulting production/test tree matches `0acaea2ba` before later lean changes.
-
-**Verification**
-
-```bash
-test "$(git diff --name-only --cached | wc -l)" -eq 0
-git diff --check
-rg -n 'SCHEMA_VERSION = 1' src/nio/store/sync_journal_schema.py
-! rg -n 'DiagnosticIngestionScope|NioIngestListObservation|NioIngestEventReceipt|NioIngestEventOccurrence|NioIngestSourceRotation' src tests
-! test -e src/nio/ingest/diagnostic.py
-! test -e src/nio/store/_sync_journal_diagnostic_rows.py
-! rg -n '_diagnostic_admits|materialize_oldest_diagnostic_frame|diagnostic_room_id' src tests
-rg -n '"secure_delete": "fast"' src/nio/store/database.py
-git -C /work/dev/mindroom diff --exit-code 0acaea2ba HEAD -- \
-  src/mindroom/bot.py src/mindroom/matrix/durable_ingestion.py \
-  tests/test_bot_sync_lifecycle.py tests/test_durable_ingestion_admission.py
-```
-
-Run the existing schema-v1/open/reopen, Classic materialization, and Classic compatibility slices. Record exact commands and results; do not claim full green from a subset.
-
-**Commits:** nio `refactor: remove diagnostic canary architecture`; MindRoom ordinary revert of `925df7f3c`
+**Complete.** The diagnostic/schema-v2 chain was reverted through ordinary
+commits, `origin/main@6ed2b98` was merged normally, MindRoom's canary commit was
+ordinarily reverted, and nio's remaining schema-v1 diagnostic materializer was
+removed at `0b07c510`. Current authority is schema v1/five ingestion tables,
+`secure_delete="fast"`, generic materialization, and no canary production
+types/configuration. Exact revert SHAs, paths, and verification are frozen in
+the progress ledger and Task-1 report; do not replay or squash them.
 
 ## Task 2: Prune documentation, benchmarks, and redundant tests
 
-Task 1 already deletes branch-only documentation and benchmark artifacts that
-are not product verification:
-
-- superseded implementation plans/specifications whose controlling requirements are preserved by the new design;
-- in-repo staging benchmark runner, corpus harness, and generated benchmark-only fixtures;
-- tests that assert only internal helper topology or duplicate a stronger behavior/crash matrix.
-
-Keep:
-
-- the Classic canary evidence and exact materialized evidence file;
-- one concise design, one executable plan, and one final evidence report;
-- behavior-parity fixtures, crash boundaries, public API/callback contracts, and external canary entrypoints.
-
-Task 2 verifies those artifacts stay absent and consolidates only redundant
-tests. Before deleting any test group, map every user-visible behavior it covers
-to a retained or replacement node. Add the replacement first if coverage would
-otherwise disappear.
-
-Measure and record whole-tree runtime/test/docs deltas against pinned
-`6ed2b9817d2bc9de30dc72942f9cb867d829283b`, plus the exact Task-2 range.
-The Task-2 implementation commit must reduce tests and leave both `src/` and
-docs/scripts unchanged from its parent. A review correction to this governing
-paragraph is accounted separately and may not add product documentation,
-benchmarks, or runtime code. Final runtime compliance is enforced after legacy
-deletion.
-
-**Commit:** `test: consolidate durable ingestion assurance`
+**Complete.** `fe8a868`, `bdd5d7c`, and `5709f34` removed 2,435 net test lines
+without production changes and retained stronger behavior/crash/public-API
+coverage. Full verification was 2,056 passed/3 skipped. Exact mappings,
+commands, deltas, and review approval are frozen in the ledger/report.
 
 ## Task 3: Implement the minimal Sliding source reset
 
-Use test-driven development.
+**Complete.** `febbe9a5` implements one authenticated Meta+Source transaction
+for Sliding reopen and exact positioned `M_UNKNOWN_POS`, preserving all other
+durable state and Classic behavior. Full nio verification was 2,088 passed/3
+skipped; exact causal/crash evidence and review are frozen in the ledger/report.
 
-**Production files**
+## Desktop compatibility slice: select the upstream sync profile
 
-- `src/nio/store/_sync_journal_preflight.py`
-- `src/nio/store/_sync_journal.py`
-- `src/nio/ingest/coordinator.py`
-- `src/nio/ingest/sliding.py` only if request construction needs a minimal cursor reload hook
+Implement this MindRoom-only slice before Task 4. It is part of the same linked
+change set and adds no user-visible option.
 
-**Test files**
+Extend the internal `MatrixSyncStorage` construction policy with one exact
+limited-timeline-recovery boolean. The default bot profile remains unchanged
+until durable activation: recovery on, recovery persistence selected by the
+existing field, and sync-token storage selected by the existing field. Define
+one private Desktop profile with limited-timeline recovery off, recovery
+persistence off, and sync-token storage on.
 
-- `tests/ingest/source_journal_test.py`
-- `tests/ingest/coordinator_test.py`
-- `tests/ingest/crash_recovery_test.py`
+Pass that exact profile through every Desktop client-construction path:
 
-First write causal failures for:
+- password login;
+- SSO login-token exchange, including the temporary exchange client and the
+  returned authenticated client;
+- restored login.
 
-1. Existing Sliding reopen atomically rotates writer/source epoch, creates a fresh connection UUID, sets request ID to zero, and clears `pos`.
-2. It preserves to-device `since`, range/page/request configuration, Frames, aggregates, Work, outstanding batch, and ack frontier.
-3. Every injected statement failure leaves all-old state; success leaves all-new state.
-4. Classic reopen remains byte-for-byte behavior-compatible.
-5. Exact current positioned `M_UNKNOWN_POS` performs the same fenced transition.
-6. Stale, positionless, malformed, repeated-cold, or Classic errors are terminal and mutate nothing.
-7. Old Frames drain before new HTTP; coordinator reloads Source state rather than editing a cursor in memory.
+Retain `_MindRoomAsyncClient`, custom headers, SSL, the existing DefaultStore
+and pickle key, `replace_rotated_device_keys`, key upload, `sync()` and
+`sync_forever()`, to-device and response callbacks, room/client projection,
+presence handling, and permanent-authentication errors. Do not introduce a
+Desktop sync loop, durable-ingestion adapter, public setting, or nio change.
 
-Implement one private journal transition using only existing Meta and Source rows. Do not add a table, receipt, diagnostic scope, or public option.
+Write causal tests first. Prove the Desktop profile yields
+`backfill_limited_timelines=False`, `backfill_persist_recovery=False`, and
+`store_sync_tokens=True`; default bot and application-owned profiles retain
+their prior values. Prove password, SSO-token, and restore paths pass the exact
+profile into the real internal client factory, and that Desktop startup sync,
+pairing sync, bridge `sync_forever()`, to-device callbacks, key upload, headers,
+and permanent-auth handling remain behavior-compatible. Run the focused
+Matrix-client/Desktop session, pairing, CLI, identity, Cloudflare-access, and
+to-device suites, then the full MindRoom suite and statics.
 
-Run focused RED/GREEN, the full source-journal/coordinator/crash files, Ruff, type checks, Black, and `git diff --check`.
+**Commit:** `refactor: isolate desktop from sync recovery`
 
-**Commit:** `fix: reset durable sliding source atomically`
+Before Task 4A, also remove Desktop controller-identity lookup's mutating
+`SqliteStore` construction. Read the expected account row through a raw
+query-only SQLite connection, authenticate exact store version, user/device,
+pickle bytes and shared flag, and decode only the Olm account needed for its
+Ed25519 pin. It must not create a table, run a migration, or rewrite an old
+pickle. Prove a real DefaultStore-authored database stays byte/schema/row
+identical and never gains `DeviceTrustState`; malformed/cardinality/version
+cases fail without mutation. This reader is the pre-activation compatibility
+path. Task 5C replaces it with the already-owned live-bot resolver before the
+exclusive durable session becomes the sole engine.
+
+**Commit:** `fix: read desktop identity without store mutation`
 
 ## Task 4: Prove one shared reducer and materializer
 
@@ -158,15 +123,51 @@ in one PR per repository, not phase PRs.
 
 ### Task 4A: exclusive in-place v1 adoption
 
-Adopt an exact populated store-v10 per-device database through
-`open_ingestion_store()` before Olm initialization. Retain schema v1, exactly
-five ingestion tables, and only the authenticated nullable Frame
+Adopt or reopen an exact populated store-v10 per-device database before Olm
+initialization through a non-exported `_open_configured_ingestion_store()`
+entrypoint.
+It requires an explicit source class and owned runtime class. The only approved
+pairings are existing `DefaultStore` source to `SqliteStore` owner, or existing
+`SqliteStore` source to `SqliteStore` owner. A DefaultStore source must have the
+ordinary MatrixStore tables and may legitimately have no `DeviceTrustState` or
+the exact ordinary table with legacy rows: historical v2 upgrade and a pre-fix
+Desktop reader could create it even while DefaultStore sidecars remained
+authoritative. A SqliteStore source must have that table. Reject malformed table
+topology, but the table's presence, absence, emptiness, or contents never infer
+the source class. MindRoom explicitly supplies `DefaultStore`: in the same
+adoption transaction, create the table when absent or replace its rows when
+present, copying each current effective sidecar fact for an exact `DeviceKeys`
+identity. Preserve DefaultStore's existing priority—verified, then blacklisted,
+then ignored—and its parsing behavior; unmatched/stale entries remain inert.
+Preserve all three
+sidecar files byte-for-byte as rollback/legacy artifacts, and never use or
+mutate them from the durable-owned session. Carry `SqliteStore` immutably as the
+validated runtime class on the returned `StoreBootstrap` for Task 4B, without a
+new ingestion table or persisted class marker. Keep the public
+`open_ingestion_store()` signature unchanged; it remains fail-closed for a
+populated unmarked database because it has no private configured-class input.
+Retain schema v1, exactly five ingestion tables, and only the authenticated nullable Frame
 `callbacks_claimed_revision` column. Preserve all MatrixStore, Olm/Megolm,
-token, and inert recovery rows byte-for-byte. Inject every bootstrap failure and
-prove all-old/all-new recovery. Reject partial topology, wrong identity/version
+token, and inert recovery rows byte-for-byte; the sole ordinary-store mutation
+is the explicit DefaultStore-to-SqliteStore trust conversion above. Inject every
+bootstrap failure—including trust-table create, legacy-row delete,
+post-delete/pre-first-insert, every trust insert, and ingestion schema/row
+boundaries—and prove all-old/all-new recovery across both trust conversion and
+ingestion bootstrap. Reject partial/mixed topology, wrong identity/version
 or pickle key, a live legacy-store lease, and repeat adoption before DML.
+Authenticate the exact account pickle without calling a loader that could
+upgrade/rewrite it.
 
-Every filesystem `SqliteStore` created by the candidate must hold an internal
+The same private entrypoint is the only configured-class restart path for an
+already marked database. On every process reopen, the caller explicitly
+supplies `SqliteStore` as the owned runtime class; reauthenticate that topology,
+account/pickle, identity, foreign keys, and all ingestion state before Task-3
+writer/source rotation DML, then return a newly bound `StoreBootstrap` without
+re-running adoption or rereading sidecars. A second live or concurrent adoption
+rejects; a clean marked reopen does not. Test both source-class adoption paths
+and the SqliteStore marked restart.
+
+Every filesystem `MatrixStore` created by the candidate must hold an internal
 shared lifetime sidecar/file-identity lease, while ingestion adoption takes the
 exclusive form of the same cross-process lease and holds it through session
 close. Multiple ordinary same-file stores therefore retain upstream behavior;
@@ -174,6 +175,12 @@ exclusive adoption rejects any live candidate store in any process. The
 privately borrowed ingestion store reuses the exclusive owner and does not take
 a second lease. Release follows the existing database-connection/finalization
 path for ordinary stores and the one ingestion close owner for adopted stores.
+Every ordinary `DefaultStore` trust-sidecar read or write additionally enters
+one shared ownership guard for the whole semantic method—even multi-file trust
+mutations and `load_device_keys`—with per-I/O assertions, including after its
+physical database connection closes. Exclusive adoption therefore cannot
+snapshot a transient partial trust update.
+The durable-owned store is always `SqliteStore` and has no sidecar operations.
 Deployment must stop the old binary before candidate adoption; a dormant
 pre-candidate connection cannot retroactively participate in the new sidecar
 protocol. Cover two ordinary same-file stores, shared/exclusive cross-process
@@ -189,7 +196,8 @@ signature: public session-first remains successful, and a prior direct public
 `StoreBootstrap.open_matrix_store()` continues to make public session claim
 fail without consuming the bootstrap. Add a non-exported
 `_open_owned_ingestion()` factory for MindRoom. It privately creates the one
-borrowed store from the bootstrap's exclusive owner, attaches that exact object
+borrowed `SqliteStore` that Task 4A validated and bound immutably on the
+bootstrap from the bootstrap's exclusive owner, attaches that exact object
 to the client before Olm initialization, and atomically transfers journal/store
 ownership to the session once. Reject a foreign store, second store/session,
 use after transfer, wrong-thread close, and double close. Cancellation and close
@@ -197,6 +205,17 @@ revoke the client and store before closing the shared connection and finally
 releasing the exclusive lease. Add export and `inspect.signature` tests proving
 the public factory/state machine is unchanged and the owned factory/protocol is
 not exported from `nio` or `nio.ingest`.
+
+Task 4B also owns the true new-device branch needed after password or SSO login
+returns credentials but before any sync, key upload, or ordinary store open.
+Under the same exclusive owner, generate one canonical unshared `OlmAccount`
+and atomically create exact `SqliteStore` v10 topology, its one
+StoreVersion/account row, and the five ingestion tables/owner/source rows. The
+borrowed store loads that committed account rather than generating a second
+one. Every injected boundary is all-absent or complete all-new; a committed
+crash reopens through the configured marked path. Cover the fresh SqliteStore
+branch, no-account/no-second-account cases, and prove the temporary login client
+performs no sync, key upload, or store creation.
 
 **Commit:** `refactor: transfer matrix store ownership to ingestion`
 
@@ -216,9 +235,14 @@ compatibility-only records, and prove concurrent admission dispatches once.
 ### Task 4C: callback-free shared compatibility preparation
 
 Parse Classic and private durable Sliding Frames into one private preparation
-contract. Apply no-recovery primitives in upstream order: to-device first,
-timeline Megolm second, then device-list/OTK/fallback and room projection. A
-same-Frame room key must decrypt its later timeline event. Produce stable event
+contract. Preserve the pre-fork callback-free mutation order exactly: token;
+to-device decrypt/mutation; invited/joined room state, timeline (including
+Megolm), ephemeral, and account-data projection; presence/global projection;
+expired-verification mutation; device-list/OTK/fallback handling; then key
+request collection. Callback fanout is a later, separate phase. A same-Frame
+room key must decrypt its later timeline event, and a same-response newly
+projected encrypted room/member plus device-list change must queue that member
+for key query. Produce stable event
 IDs, decrypted `clear_json` or explicit failure, `RoomSnapshot` values, and a
 fully authenticated retained-Frame inputs sufficient for Task 4F to reconstruct
 completion after it has a claimed revision. Do not create `_FrameCompletion` in
@@ -227,7 +251,8 @@ Ordinary public response callbacks remain solely on Desktop's pre-fork sync
 path.
 
 Create `tests/ingest/preparation_test.py` and cover equivalent Classic/Sliding
-output, crypto ordering, explicit failure, and zero callbacks.
+output, both causal crypto-order cases above, explicit failure, and zero
+callbacks.
 
 **Commit:** `refactor: prepare durable frames without callbacks`
 
@@ -235,11 +260,22 @@ output, crypto ordering, explicit failure, and zero callbacks.
 
 In one owner transaction persist crypto writes, clear events, stable IDs,
 aggregates, room snapshots, every `RecordKind` including `TO_DEVICE`, every
-`LossRecord`, Work, and preparation revision. Retain the Frame as completion
-owner. Any failure after in-memory Olm mutation rolls back SQLite, poisons that
-session object, and requires clean reconstruction before replay. Prove literal
-fates for all record kinds, all statement crash boundaries, empty/nonempty Frame
-retention, and equal Classic/Sliding durable graphs.
+`LossRecord`, Work, and preparation revision. In that same transaction, make
+the retained Frame envelope the authenticated durable owner of one canonical,
+ordered outbound-maintenance plan: exact key-upload/query/claim and queued
+to-device request bodies, deterministic domain-separated per-message to-device
+transaction IDs, canonical operation kind plus minimal typed local response-
+apply context, and an explicit pending/settled state for every operation.
+Persist the exact encrypted to-device bodies and the Olm/session mutations that
+produced them together; do not reconstruct ciphertext from an in-memory queue.
+Wire JSON alone is insufficient because dummy and room-key-request subtypes
+have distinct local settlement effects after restart.
+This is canonical Frame payload, not a new table or column. Retain the Frame as
+completion owner. Any failure after in-memory Olm mutation rolls back SQLite,
+poisons that session object, and requires clean reconstruction before replay.
+Prove literal fates for all record kinds, canonical plan/header authentication,
+identical body/transaction-ID replay, all statement crash boundaries,
+empty/nonempty Frame retention, and equal Classic/Sliding durable graphs.
 
 **Commit:** `refactor: materialize all durable record kinds atomically`
 
@@ -276,9 +312,30 @@ Only after Tasks 5A, 4E, and 5B exist, implement
 MAINTAIN_OUTBOUND_CRYPTO -> CLAIM_AND_FANOUT_COMPLETION -> RETIRE ->
 NEXT_SOURCE_HTTP`. After all Frame Work is acked but before claim/retirement,
 run the callback-free upstream key upload, key query, key claim, and queued
-to-device send maintenance in its exact order. Retryable network failure leaves
-the Frame retained; crash/retry uses stable request/transaction identities and
-must not duplicate a semantic send. No next source poll can pass this state.
+to-device send maintenance in its exact persisted order. Replay only the exact
+authenticated pending request body owned by the Frame. Parse each response
+without callbacks, then apply its ordinary MatrixStore/Olm effects and mark that
+operation settled in one owner transaction. That transaction also appends or
+replaces any causally generated follow-up operation in the same authenticated
+Frame plan before commit. Run a fixed loop to quiescence in upstream order;
+notably key-claim may create a dummy to-device send, and successful
+dummy/to-device settlement may create room-key re-requests. Every follow-up
+stores exact body/ciphertext and a deterministic transaction ID before it can be
+sent. Each also stores the authenticated semantic subtype/fields needed to
+reproduce local dummy or room-key-request settlement after restart. Any
+exception or rollback after an
+in-memory crypto mutation poisons the owned session and requires reconstruction
+before replay. Retryable network failure leaves the Frame retained. A queued
+to-device resend uses the identical transaction ID and body, so the server
+deduplicates the semantic send. Key upload/query replay the identical body.
+`/keys/claim` has no Matrix idempotency key: response loss may consume another
+remote one-time key on an identical retry, so do not claim remote at-most-once;
+claim only locally atomic application of one successful response and no
+duplicate downstream event/callback. Auth errors such as `M_UNKNOWN_TOKEN` or
+`M_FORBIDDEN` retain the pending Frame/operation and enter the existing
+permanent-auth shutdown/health path. Retryable HTTP/Matrix errors retain the
+same body with bounded cancellable backoff. No error response settles an
+operation or fans out silently. No next source poll can pass this state.
 
 Define a private non-exported `_FrameCompletion` with authenticated
 `frame_id`, transport, source epoch, request ID, staged revision, and claimed
@@ -294,11 +351,17 @@ second invocation. Empty Frames use the same path. Hydration may run while the
 next source sync is fenced. Ack and close wake the runner without lost wakeups.
 Only malformed, authentication, or conflict states are terminal BLOCKED.
 
-Add causal tests for exact key upload/query/claim/to-device ordering, stable
-retry/crash identity, maintenance-before-claim, authenticated completion
-reconstruction, sink success/raise/cancel/crash after claim, claimed restart
-retirement, and absence of `_FrameCompletion`, `_OwnedIngestionSession`, and the
-owned factory from public exports/signatures.
+Add causal tests for exact key upload/query/claim/to-device ordering; canonical
+Frame-owned bodies and deterministic to-device transaction IDs; response loss
+and restart at every operation; byte-identical to-device ciphertext/ID replay;
+the explicit `/keys/claim` retry limit above; statement failure/rollback while
+applying each maintenance response; maintenance-before-claim; authenticated
+completion reconstruction; claim→dummy and dummy-success→key-rerequest chains
+with rollback/poison/reopen at every append/replace boundary; sink
+success/raise/cancel/crash after claim; per-operation retryable/auth error
+responses and close/cancel during backoff; claimed
+restart retirement; and absence of `_FrameCompletion`,
+`_OwnedIngestionSession`, and the owned factory from public exports/signatures.
 
 **Commit:** `feat: complete durable frames after record settlement`
 
@@ -306,14 +369,36 @@ owned factory from public exports/signatures.
 
 5C wires fresh and restored login through the non-exported
 `_open_owned_ingestion()` factory, exact per-device adoption/lease, client
-attachment, session claim, and private completion sink before Olm
-initialization; poison rebuilds a new client/Olm object. 5D makes
+attachment using the authenticated SqliteStore runtime binding, session claim,
+and private completion sink before Olm initialization; poison rebuilds a new
+client/Olm object. In the same 5C commit, replace Desktop pairing's raw
+read-only fallback with the internal live-bot controller-identity resolver
+before any bot can acquire the exclusive lease. 5D makes
 `Bot.sync_forever()` use the durable
 runner/pump as MindRoom's only candidate engine, while existing
 `matrix_sync.mode` chooses only Classic or Sliding transport. Preserve health,
 first-sync, invites/membership, presence, E2EE/to-device pairing, RTC,
 permanent-auth error, cancellation, and close behavior. Add no environment
-latch, control room, `probe`, YAML engine toggle, or public nio API.
+latch, control room, `probe`, YAML engine toggle, or public nio API. The 5C
+resolver is injected by the command/orchestrator boundary. It
+must resolve the selected target entity through the live bot registry and read
+the exact user ID, device ID, and Ed25519 key from that bot's already-owned
+client/Olm account; it never opens the store. Missing/not-running/mismatched
+targets fail closed. The pre-5C raw read-only compatibility path is removed or
+made unreachable in 5C before exclusive ownership exists. Cover setup and
+confirm when the serving bot is
+or is not the target, target restart/replacement, and absence of any second
+MatrixStore/SQLite open under the exclusive lease.
+
+For password/SSO credentials, prove the temporary no-store/no-sync client's
+HTTP session closes on success, login error, owned-factory failure, and
+cancellation before exclusive construction. The appservice direct-credential
+path creates no temporary MatrixStore or client before the owned factory.
+Bot owns the ingestion session separately from its existing journal handle.
+Shutdown/config reload joins runner and pump, revokes client/store, closes the
+owned session to release the exclusive lease, then closes HTTP; every cleanup
+lane runs despite another's error, and replacement registration/start waits for
+confirmed lease release. Cover startup failure and bot replacement/reload.
 
 **Commits:** `feat: open durable matrix sessions in place`; then
 `feat: activate durable matrix ingestion`
@@ -356,11 +441,11 @@ Build a differential behavior matrix covering at least:
 
 For equivalent normalized input, both transports must produce the same record fates and durable graph. A transport adapter may normalize wire differences; it may not choose a different fate engine.
 
-Add one frame-scope compatibility preparation phase before Work becomes application-visible. The MindRoom AsyncClient must adopt the ingestion-owned MatrixStore so ordinary E2EE rows and the five ingestion tables share one SQLite owner/transaction. Reuse callback-free AsyncClient/Olm primitives in upstream order: to-device first, timeline Megolm next, then device-list/key-count/fallback controls and room-state projection. Persist stable event IDs, decrypted `clear_json`, `RoomSnapshot`, every `RecordKind` including `TO_DEVICE`, aggregates/Work, and the preparation revision atomically. On rollback after Olm memory mutation, poison/close the session and reconstruct it from the rolled-back database; never retry the same object.
+Add one frame-scope compatibility preparation phase before Work becomes application-visible. The MindRoom AsyncClient must adopt the ingestion-owned MatrixStore so ordinary E2EE rows and the five ingestion tables share one SQLite owner/transaction. Preserve the exact pre-fork callback-free mutation order: token; to-device; invited/joined room state, timeline, ephemeral, and account data; presence/global state; expired verifications; device-list/key-count/fallback controls; then key-request collection. This ordering must causally prove both same-Frame room-key decryption and same-response encrypted-room membership before device-list handling; callback fanout remains separate. Persist stable event IDs, decrypted `clear_json`, `RoomSnapshot`, every `RecordKind` including `TO_DEVICE`, aggregates/Work, and the preparation revision atomically. On rollback after Olm memory mutation, poison/close the session and reconstruct it from the rolled-back database; never retry the same object.
 
-Implement ownership through the non-exported owned-session factory, not two independent opens and not a public state-machine reversal. The factory privately creates the borrowed `SqliteStore` from the bootstrap's exclusive owner, accepts only that exact object, transfers journal/store to `_OwnedIngestionSession`, and revokes/closes them once. Existing public `open_ingestion()` remains session-first; direct public store-first continues to reject a later public session. Add causal lifecycle and public signature/export tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Do not weaken the single-process/thread/file-identity/writer-epoch fences.
+Implement ownership through the non-exported owned-session factory, not two independent opens and not a public state-machine reversal. The factory privately creates the borrowed `SqliteStore` from the bootstrap's exclusive owner, consumes the immutable runtime-class binding established by the private configured opener, accepts only that object and authenticated topology, transfers journal/store to `_OwnedIngestionSession`, and revokes/closes them once. Existing public `open_ingestion()` remains session-first; direct public store-first continues to reject a later public session. Add causal lifecycle and public signature/export tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Prove `replace_rotated_device_keys=True` rolls back `DeviceKeys` and `DeviceTrustState` together, and prove durable preparation/maintenance performs no legacy trust-sidecar I/O. Do not weaken the single-process/thread/file-identity/writer-epoch fences. For a true new device, the same factory takes credentials from a temporary no-store/no-sync login client and, under one exclusive owner, atomically creates exact `SqliteStore` v10 topology, one canonical unshared Olm account row, and the five ingestion tables/initial rows before constructing the borrowed store. Crash boundaries are all-absent or complete all-new, and the committed account is loaded rather than regenerated.
 
-Before that lease exists, add an exclusive in-place v1 adoption path for the populated MindRoom per-device database. Authenticate exact account/device/store-v10 ownership and all existing MatrixStore tables; in one bootstrap transaction add only the five v1 ingestion tables/initial rows and leave every existing Olm account pickle, Megolm/session/key row, sync token, and inert historical recovery table byte-identical. Every injected statement failure must reopen as all-old with no ingestion marker; success must reopen as all-new with exactly one marker/source. Reject partial topology, wrong identity, unsupported store version, a simultaneously open client/store, or a second adoption without mutation. Do not create a parallel ingestion database for the same device.
+Before that lease exists, add a non-exported exclusive configured opener for the populated MindRoom per-device database. Its caller must supply the exact source class, and it authenticates exact account/device/store-v10 ownership plus topology against that class. A supplied-Default database may lack `DeviceTrustState` or contain its exact ordinary topology and legacy rows because historical v2 upgrade and a pre-fix Desktop identity reader could create it while sidecars remained authoritative; malformed topology rejects, and presence/content never infers source class. A SqliteStore source requires the table and is adopted without class conversion. A DefaultStore source is converted in that same transaction by creating the table when absent or deleting/replacing its inert rows when present, then copying effective current sidecar facts for exact `DeviceKeys` identities using existing DefaultStore parsing and verified→blacklisted→ignored priority; unmatched stale entries stay inert, and all three source sidecars remain byte-for-byte unchanged. Return immutable `SqliteStore` runtime binding on `StoreBootstrap` for private Task-4B use, but persist no ingestion class marker and leave the public `open_ingestion_store()` signature and populated-unmarked rejection unchanged. The same transaction adds the five v1 ingestion tables/initial rows and otherwise leaves every existing Olm account pickle, Megolm/session/key row, sync token, and inert historical recovery table byte-identical. Every injected statement failure reopens with the exact prior ordinary shape and no ingestion marker; success reopens as complete SqliteStore plus exactly one marker/source. On later marked process reopen, require `SqliteStore`, reauthenticate the entire ordinary and ingestion state before writer/source DML, and return a new binding without adoption or sidecar reads. Reject mixed/partial topology, source-class/topology mismatch, wrong identity/pickle, unsupported store version, a simultaneously open client/store, or a concurrent/re-entrant adoption without mutation. Do not create a parallel ingestion database for the same device.
 
 Keep the Frame after materialization as the completion owner. Add only one authenticated nullable `callbacks_claimed_revision` column to `NioIngestFrame` while retaining schema version 1 and exactly five tables. One-record receipts suppress record callback replay; when the Frame has no Work left, finish ordered outbound crypto maintenance, claim its private transport-neutral `_FrameCompletion` sink before best-effort fanout, then retire it. Empty Frames use the same path. Persist/restore the existing `RoomSnapshot` carrier before incremental delivery. No callback runs in either database transaction.
 
@@ -398,6 +483,10 @@ across all four MindRoom slices; they are not authority to reorder them.
 - `src/mindroom/matrix/journal_ingress.py`
 - `src/mindroom/matrix/client_session.py`
 - `src/mindroom/matrix/users.py`
+- `src/mindroom/commands/handler.py`
+- `src/mindroom/commands/desktop_commands.py`
+- `src/mindroom/desktop/identity.py`
+- `src/mindroom/orchestrator.py` only for the internal live controller-identity resolver
 - the appservice login helper if it independently constructs/restores agent clients
 - the existing sync-certification/checkpoint modules only to remove old-engine dependencies
 
