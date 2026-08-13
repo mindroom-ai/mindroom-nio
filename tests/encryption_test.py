@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from shutil import copyfile
+from uuid import UUID
 
 import pytest
 import vodozemac
@@ -39,8 +40,17 @@ from nio.events import (
     UnknownToDeviceEvent,
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
+from nio.ingest.config import ClassicSourceConfig
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
-from nio.store import DefaultStore, Ed25519Key, Key, KeyStore, SqliteMemoryStore
+from nio.store import (
+    DefaultStore,
+    Ed25519Key,
+    Key,
+    KeyStore,
+    SqliteMemoryStore,
+    SqliteStore,
+)
+import nio.store.sync_journal as bootstrap_api
 
 AliceId = "@alice:example.org"
 Alice_device = "ALDEVICE"
@@ -566,6 +576,130 @@ class TestClass:
         restarted = Olm(AliceId, Alice_device, alice.store)
         device = restarted.device_store[BobId][Bob_device]
         assert device.trust_state == TrustState.blacklisted
+
+    @pytest.mark.parametrize("outcome", ("commit", "rollback"))
+    def test_adopted_rotation_updates_keys_and_trust_atomically(
+        self,
+        monkeypatch,
+        outcome,
+    ):
+        database_name = "journal.db"
+        source_store = DefaultStore(
+            AliceId,
+            Alice_device,
+            self.store_path,
+            PICKLE_KEY,
+            database_name=database_name,
+        )
+        source_olm = Olm(AliceId, Alice_device, source_store)
+
+        def bob_query_response():
+            bob = self._memory_olm(BobId, Bob_device)
+            payload = bob.share_keys()["device_keys"]
+            return KeysQueryResponse.from_dict(
+                {"device_keys": {BobId: {Bob_device: payload}}, "failures": {}}
+            )
+
+        source_olm.handle_response(bob_query_response())
+        old_device = source_olm.device_store[BobId][Bob_device]
+        source_store.verify_device(old_device)
+        source_store.database.close()
+        del source_olm
+
+        sidecar_paths = tuple(
+            Path(self.store_path) / f"{AliceId}_{Alice_device}.{suffix}"
+            for suffix in (
+                "trusted_devices",
+                "blacklisted_devices",
+                "ignored_devices",
+            )
+        )
+        sidecars_before = tuple(
+            path.read_bytes() if path.exists() else None for path in sidecar_paths
+        )
+        bootstrap = bootstrap_api._open_configured_ingestion_store(
+            Path(self.store_path),
+            source_store_class=DefaultStore,
+            owned_store_class=SqliteStore,
+            source=ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}"),
+            account_id=AliceId,
+            device_id=Alice_device,
+            consumer_generation=UUID("22222222-2222-4222-8222-222222222222"),
+            pickle_key=PICKLE_KEY,
+            database_name=database_name,
+        )
+        try:
+            store = bootstrap.open_matrix_store(SqliteStore)
+            alice = Olm(
+                AliceId,
+                Alice_device,
+                store,
+                replace_rotated_device_keys=True,
+            )
+            owner = bootstrap._journal._owner
+
+            def snapshot():
+                with owner.read():
+                    return tuple(
+                        tuple(row)
+                        for row in store.database.execute_sql(
+                            "SELECT d.deleted, d.display_name, k.key_type, k.key, "
+                            "t.state FROM devicekeys AS d "
+                            "JOIN keys AS k ON k.device_id = d.id "
+                            "LEFT JOIN devicetruststate AS t ON t.device_id = d.id "
+                            "WHERE d.user_id = ? AND d.device_id = ? "
+                            "ORDER BY k.key_type",
+                            (BobId, Bob_device),
+                        ).fetchall()
+                    )
+
+            before = snapshot()
+            assert {row[4] for row in before} == {TrustState.verified.value}
+            rotated = bob_query_response()
+            new_keys = rotated.device_keys[BobId][Bob_device]["keys"]
+
+            def forbidden_sidecar_write(_store):
+                raise AssertionError("durable rotation wrote a legacy trust sidecar")
+
+            monkeypatch.setattr(KeyStore, "_save", forbidden_sidecar_write)
+
+            class InjectedFailure(Exception):
+                pass
+
+            if outcome == "rollback":
+                save_device_keys = store.save_device_keys
+
+                def fail_after_key_write(device_keys):
+                    save_device_keys(device_keys)
+                    raise InjectedFailure
+
+                monkeypatch.setattr(store, "save_device_keys", fail_after_key_write)
+
+            if outcome == "rollback":
+                with pytest.raises(InjectedFailure):
+                    with owner.e2ee_write():
+                        alice.handle_response(rotated)
+                assert snapshot() == before
+            else:
+                with owner.e2ee_write():
+                    alice.handle_response(rotated)
+                after = snapshot()
+                assert after != before
+                assert {row[4] for row in after} == {TrustState.unset.value}
+                assert {row[3] for row in after} == {
+                    new_keys[f"curve25519:{Bob_device}"],
+                    new_keys[f"ed25519:{Bob_device}"],
+                }
+
+            assert (
+                tuple(
+                    path.read_bytes() if path.exists() else None
+                    for path in sidecar_paths
+                )
+                == sidecars_before
+            )
+        finally:
+            bootstrap.close()
 
     def test_olm_inbound_session(self, monkeypatch):
         def mocksave(self):

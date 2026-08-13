@@ -3704,7 +3704,8 @@ def _frame_storage_row(
         row = journal._execute(
             "SELECT frame_id, source_epoch, request_id, staged_revision, "
             "payload, payload_sha256, room_materialized_revision, "
-            "drain_header_sha256 FROM NioIngestFrame "
+            "drain_header_sha256, callbacks_claimed_revision "
+            "FROM NioIngestFrame "
             "WHERE account_id = ? AND frame_id = ?",
             (journal.account_id, str(frame_id)),
         ).fetchone()
@@ -3731,6 +3732,7 @@ def _canonical_expected_drain_header(
             "payload_sha256": base64.b64encode(row[5]).decode("ascii"),
             "payload_length": len(row[4]),
             "room_materialized_revision": room_materialized_revision,
+            "callbacks_claimed_revision": row[8],
         }
     )
 
@@ -9291,7 +9293,8 @@ def _materializer_frame_rows(
         rows = journal._execute(
             "SELECT frame_id, source_epoch, request_id, staged_revision, "
             "payload, payload_sha256, room_materialized_revision, "
-            "drain_header_sha256 FROM NioIngestFrame "
+            "drain_header_sha256, callbacks_claimed_revision "
+            "FROM NioIngestFrame "
             "WHERE account_id = ? "
             "ORDER BY staged_revision, source_epoch, request_id, frame_id",
             (journal.account_id,),

@@ -105,6 +105,11 @@ SCHEMA_SQL = (
         (typeof(room_materialized_revision) = 'integer'
          AND room_materialized_revision >= 1)
     ),
+    callbacks_claimed_revision INTEGER NULL CHECK (
+        callbacks_claimed_revision IS NULL OR
+        (typeof(callbacks_claimed_revision) = 'integer'
+         AND callbacks_claimed_revision >= 1)
+    ),
     drain_header_sha256 BLOB NOT NULL CHECK ( typeof(drain_header_sha256) = 'blob' AND length(drain_header_sha256) = 32 ),
     PRIMARY KEY (account_id, frame_id))""",
     """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(

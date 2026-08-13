@@ -48,7 +48,11 @@ from nio.ingest.source import SyncFrame, canonical_json, renormalize_staged_fram
 from nio.ingest.state import CommitResult, SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal_port import IngestionJournal
-from nio.store._sync_journal_values import SQLITE_INT_MAX, MaterializerLimits
+from nio.store._sync_journal_values import (
+    SQLITE_INT_MAX,
+    MaterializerLimits,
+    MaterializeStatus,
+)
 from nio.store.sync_journal import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -636,6 +640,11 @@ EXPECTED_DDL = {
             (typeof(room_materialized_revision) = 'integer'
              AND room_materialized_revision >= 1)
         ),
+        callbacks_claimed_revision INTEGER NULL CHECK (
+            callbacks_claimed_revision IS NULL OR
+            (typeof(callbacks_claimed_revision) = 'integer'
+             AND callbacks_claimed_revision >= 1)
+        ),
         drain_header_sha256 BLOB NOT NULL CHECK (
             typeof(drain_header_sha256) = 'blob'
             AND length(drain_header_sha256) = 32
@@ -1008,6 +1017,125 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
             )
 
 
+def test_v1_frame_callbacks_claimed_revision_is_nullable_checked_and_authenticated(
+    tmp_path: Path,
+) -> None:
+    """A claimed callback revision cannot be omitted from the Frame proof."""
+
+    stage = _stage_one(tmp_path)
+    frame_id = stage.proposal.frame.frame_id
+    with sqlite3.connect(stage.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        columns = tuple(
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(NioIngestFrame)")
+        )
+        assert "callbacks_claimed_revision" in columns
+        row = connection.execute(
+            "SELECT callbacks_claimed_revision FROM NioIngestFrame "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame_id)),
+        ).fetchone()
+        assert row is not None and row[0] is None
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE NioIngestFrame SET callbacks_claimed_revision = 0 "
+                "WHERE account_id = ? AND frame_id = ?",
+                (ACCOUNT_ID, str(frame_id)),
+            )
+
+        updated = connection.execute(
+            "UPDATE NioIngestFrame SET callbacks_claimed_revision = 1 "
+            "WHERE account_id = ? AND frame_id = ?",
+            (ACCOUNT_ID, str(frame_id)),
+        )
+        assert updated.rowcount == 1
+
+    reopened = _open(tmp_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="frame drain"):
+            reopened._journal.load_frame(frame_id)
+    finally:
+        reopened.close()
+
+
+def test_v1_frame_valid_proof_rejects_semantically_impossible_callback_claim(
+    tmp_path: Path,
+) -> None:
+    stage = _stage_one(tmp_path)
+    with sqlite3.connect(stage.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT * FROM NioIngestFrame").fetchone()
+        assert row is not None
+        claim = row["staged_revision"]
+        changed = {**dict(row), "callbacks_claimed_revision": claim}
+        proof = _plaintext_frame_header_sha256(
+            stream_id=stage.stream_id,
+            row=changed,  # type: ignore[arg-type]
+            payload=row["payload"],
+            payload_sha256=row["payload_sha256"],
+        )
+        connection.execute(
+            "UPDATE NioIngestFrame SET callbacks_claimed_revision = ?, "
+            "drain_header_sha256 = ?",
+            (claim, proof),
+        )
+
+    reopened = _open(tmp_path)
+    try:
+        with pytest.raises(JournalIntegrityError, match="frame drain"):
+            reopened._journal.load_frame(stage.proposal.frame.frame_id)
+    finally:
+        reopened.close()
+
+
+def test_v1_authenticated_callback_claim_prevents_rematerialization_writes(
+    tmp_path: Path,
+) -> None:
+    stage = _stage_one(tmp_path)
+    with sqlite3.connect(stage.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT * FROM NioIngestFrame").fetchone()
+        assert row is not None
+        claim = row["staged_revision"] + 1
+        changed = {**dict(row), "callbacks_claimed_revision": claim}
+        proof = _plaintext_frame_header_sha256(
+            stream_id=stage.stream_id,
+            row=changed,  # type: ignore[arg-type]
+            payload=row["payload"],
+            payload_sha256=row["payload_sha256"],
+        )
+        connection.execute("UPDATE NioIngestMeta SET revision = ?", (claim,))
+        connection.execute(
+            "UPDATE NioIngestFrame SET callbacks_claimed_revision = ?, "
+            "drain_header_sha256 = ?",
+            (claim, proof),
+        )
+
+    reopened = _open(tmp_path)
+    try:
+        before = tuple(
+            reopened._journal._execute(
+                "SELECT revision, "
+                "(SELECT COUNT(*) FROM NioIngestRoomAggregate), "
+                "(SELECT COUNT(*) FROM NioIngestWork) FROM NioIngestMeta"
+            ).fetchone()
+        )
+        result = reopened._journal.materialize_oldest_frame(limits=MaterializerLimits())
+        after = tuple(
+            reopened._journal._execute(
+                "SELECT revision, "
+                "(SELECT COUNT(*) FROM NioIngestRoomAggregate), "
+                "(SELECT COUNT(*) FROM NioIngestWork) FROM NioIngestMeta"
+            ).fetchone()
+        )
+        assert result.status is MaterializeStatus.IDLE
+        assert after == before
+    finally:
+        reopened.close()
+
+
 class _PlanningSource:
     def __init__(self, request: NetworkRequest | None) -> None:
         self.request = request
@@ -1295,6 +1423,7 @@ def _assert_read_only_preflight(statements: list[str]) -> None:
         sql
         for sql in statements
         if sql.lstrip().upper().startswith("PRAGMA")
+        and not sql.lstrip().upper().startswith("PRAGMA SECURE_DELETE")
         and ("=" in sql or any(name in sql.upper() for name in write_pragmas))
     ]
 
@@ -3369,6 +3498,7 @@ _PLAINTEXT_FRAME_COLUMNS = (
     "payload",
     "payload_sha256",
     "room_materialized_revision",
+    "callbacks_claimed_revision",
     "drain_header_sha256",
 )
 
@@ -3407,6 +3537,7 @@ def _expected_plaintext_frame_drain_header(
     payload_sha256: bytes,
     payload_length: int,
     room_materialized_revision: int | None,
+    callbacks_claimed_revision: int | None = None,
     account_id: str = ACCOUNT_ID,
     transport_kind: TransportKind = TransportKind.CLASSIC,
 ) -> bytes:
@@ -3424,6 +3555,7 @@ def _expected_plaintext_frame_drain_header(
             "payload_sha256": base64.b64encode(payload_sha256).decode("ascii"),
             "payload_length": payload_length,
             "room_materialized_revision": room_materialized_revision,
+            "callbacks_claimed_revision": callbacks_claimed_revision,
         }
     )
 
@@ -3451,6 +3583,7 @@ def _plaintext_frame_header_sha256(
         payload_sha256=payload_sha256,
         payload_length=len(payload),
         room_materialized_revision=row["room_materialized_revision"],
+        callbacks_claimed_revision=row["callbacks_claimed_revision"],
         account_id=account_id,
         transport_kind=transport_kind,
     )

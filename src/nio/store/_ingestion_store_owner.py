@@ -7,7 +7,9 @@ import stat
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -30,20 +32,130 @@ class _FreshPathWitness:
 
 
 class StableFileLock:
-    def __init__(self, database_path: Path) -> None:
+    """A mode-aware lifetime lease over a stable sidecar and database inode."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        exclusive: bool = True,
+        require_database: bool = False,
+    ) -> None:
         self.owner_pid = os.getpid()
-        self.path = Path(f"{database_path}.ingest.lock")
-        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.database_path = Path(os.path.abspath(database_path))
+        self.exclusive = exclusive
+        self.require_database = require_database
+        self._database_fd = -1
+        canonical_path = Path(os.path.realpath(self.database_path))
+        self.path = Path(f"{canonical_path}.ingest.lock")
+        if require_database:
+            try:
+                self._database_fd = os.open(
+                    self.database_path,
+                    os.O_RDWR
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except OSError as error:
+                raise LocalProtocolError(
+                    "configured adoption requires an existing store"
+                ) from error
+            opened = os.fstat(self._database_fd)
+            if (
+                opened.st_size == 0
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+            ):
+                os.close(self._database_fd)
+                self._database_fd = -1
+                raise LocalProtocolError(
+                    "configured adoption requires a populated singly linked store"
+                )
+            os.set_inheritable(self._database_fd, False)
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._fd = os.open(
+                self.path,
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        except BaseException:
+            if self._database_fd >= 0:
+                os.close(self._database_fd)
+                self._database_fd = -1
+            raise
+        os.set_inheritable(self._fd, False)
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(self._fd, operation | fcntl.LOCK_NB)
         except BlockingIOError as error:
             os.close(self._fd)
             self._fd = -1
+            if self._database_fd >= 0:
+                os.close(self._database_fd)
+                self._database_fd = -1
             raise LocalProtocolError(
-                f"ingestion writer lock is already held for {database_path}"
+                f"store lifetime lease is already held for {database_path}"
             ) from error
         locked = os.fstat(self._fd)
         self.identity = (locked.st_dev, locked.st_ino)
+        self.database_identity: FileIdentity | None = None
+        if self._database_fd >= 0:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            try:
+                fcntl.flock(self._database_fd, operation | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                os.close(self._database_fd)
+                self._database_fd = -1
+                self.close()
+                raise LocalProtocolError(
+                    f"store lifetime lease is already held for {database_path}"
+                ) from error
+            opened = os.fstat(self._database_fd)
+            if require_database and opened.st_nlink != 1:
+                self.close()
+                raise LocalProtocolError(
+                    "configured adoption requires a singly linked database file"
+                )
+            self.database_identity = (opened.st_dev, opened.st_ino)
+            self.assert_identity()
+        elif self.database_path.exists():
+            self.claim_database()
+
+    def claim_database(self) -> None:
+        self.assert_process_owner()
+        if self._fd < 0:
+            raise LocalProtocolError("store lifetime lease is closed")
+        if self._database_fd >= 0:
+            raise LocalProtocolError("database lifetime lease is already claimed")
+        try:
+            descriptor = os.open(
+                self.database_path,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            )
+        except FileNotFoundError as error:
+            raise LocalProtocolError(
+                "store database identity is no longer present"
+            ) from error
+        os.set_inheritable(descriptor, False)
+        operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(descriptor)
+            raise LocalProtocolError(
+                f"store lifetime lease is already held for {self.database_path}"
+            ) from error
+        locked = os.fstat(descriptor)
+        self._database_fd = descriptor
+        self.database_identity = (locked.st_dev, locked.st_ino)
+        try:
+            self.assert_identity()
+        except BaseException:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            self._database_fd = -1
+            self.database_identity = None
+            raise
 
     def assert_process_owner(self) -> None:
         if os.getpid() != self.owner_pid:
@@ -52,7 +164,7 @@ class StableFileLock:
     def assert_identity(self) -> None:
         self.assert_process_owner()
         if self._fd < 0:
-            raise LocalProtocolError("ingestion writer lock is closed")
+            raise LocalProtocolError("store lifetime lease is closed")
         try:
             current = os.stat(self.path)
         except FileNotFoundError as error:
@@ -63,13 +175,52 @@ class StableFileLock:
             raise LocalProtocolError(
                 "ingestion lock file identity changed after lock acquisition"
             )
+        if self._database_fd < 0 or self.database_identity is None:
+            raise LocalProtocolError("database lifetime lease is not claimed")
+        try:
+            database = os.stat(self.database_path)
+        except FileNotFoundError as error:
+            raise LocalProtocolError(
+                "store database identity is no longer present"
+            ) from error
+        descriptor = os.fstat(self._database_fd)
+        if self.require_database and descriptor.st_nlink != 1:
+            raise LocalProtocolError(
+                "configured database acquired an unsupported hard link"
+            )
+        identities = (
+            (database.st_dev, database.st_ino),
+            (descriptor.st_dev, descriptor.st_ino),
+        )
+        if identities != (self.database_identity, self.database_identity):
+            raise LocalProtocolError("store database file identity changed")
 
     def close(self) -> None:
         self.assert_process_owner()
         if self._fd < 0:
             return
+        if self._database_fd >= 0:
+            fcntl.flock(self._database_fd, fcntl.LOCK_UN)
+            os.close(self._database_fd)
+            self._database_fd = -1
         fcntl.flock(self._fd, fcntl.LOCK_UN)
         os.close(self._fd)
+        self._fd = -1
+
+    def __del__(self) -> None:
+        database_fd = getattr(self, "_database_fd", -1)
+        sidecar_fd = getattr(self, "_fd", -1)
+        same_process = os.getpid() == getattr(self, "owner_pid", None)
+        for descriptor in (database_fd, sidecar_fd):
+            if descriptor < 0:
+                continue
+            try:
+                if same_process:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._database_fd = -1
         self._fd = -1
 
     def __enter__(self) -> StableFileLock:
@@ -77,6 +228,229 @@ class StableFileLock:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+# If sqlite refuses a final physical close because cyclic collection ran on a
+# foreign thread, exclusion is safer than unlocking a database that may still
+# have live C-level state. The process closes these descriptors at exit.
+_DEFERRED_LIFETIME_LEASES: list[StableFileLock] = []
+_ACTIVE_LIFETIME_LEASES: dict[int, StableFileLock] = {}
+_DEFERRED_LIFETIME_LEASES_LOCK = threading.Lock()
+
+
+class _LifetimeLeasedCursor(sqlite3.Cursor):
+    """Cursor that rechecks path and inode ownership at every SQLite I/O."""
+
+    def _assert_lifetime_lease(self) -> None:
+        connection = self.connection
+        if not isinstance(connection, _LifetimeLeasedConnection):
+            raise LocalProtocolError("ordinary cursor has no lifetime lease")
+        connection._assert_lifetime_lease()
+
+    def execute(self, sql: str, parameters=()):  # type: ignore[no-untyped-def]
+        self._assert_lifetime_lease()
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters):  # type: ignore[no-untyped-def]
+        self._assert_lifetime_lease()
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql_script: str):
+        self._assert_lifetime_lease()
+        return super().executescript(sql_script)
+
+    def fetchone(self):
+        self._assert_lifetime_lease()
+        return super().fetchone()
+
+    def fetchmany(self, size: int | None = None):
+        self._assert_lifetime_lease()
+        if size is None:
+            return super().fetchmany()
+        return super().fetchmany(size)
+
+    def fetchall(self):
+        self._assert_lifetime_lease()
+        return super().fetchall()
+
+    def __next__(self):
+        self._assert_lifetime_lease()
+        return super().__next__()
+
+
+class _LifetimeLeasedConnection(sqlite3.Connection):
+    """SQLite connection whose kernel lease has the same physical lifetime."""
+
+    def __init__(self, *args, lease: StableFileLock, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        self._lifetime_lease: StableFileLock | None = lease
+        self._lifetime_thread = threading.get_ident()
+        super().__init__(*args, **kwargs)
+        with _DEFERRED_LIFETIME_LEASES_LOCK:
+            _ACTIVE_LIFETIME_LEASES[id(self)] = lease
+
+    def _defer_lifetime_lease(self) -> None:
+        lease = self._lifetime_lease
+        if lease is None:
+            return
+        with _DEFERRED_LIFETIME_LEASES_LOCK:
+            _ACTIVE_LIFETIME_LEASES.pop(id(self), None)
+            _DEFERRED_LIFETIME_LEASES.append(lease)
+        self._lifetime_lease = None
+
+    def _assert_lifetime_lease(self) -> None:
+        lease = self._lifetime_lease
+        if lease is None:
+            raise LocalProtocolError("store lifetime lease is closed")
+        lease.assert_identity()
+
+    def cursor(self, factory=None):  # type: ignore[no-untyped-def]
+        self._assert_lifetime_lease()
+        if factory is not None:
+            raise LocalProtocolError("custom ordinary SQLite cursors are unsupported")
+        return super().cursor(_LifetimeLeasedCursor)
+
+    def execute(self, *args: object, **kwargs: object):
+        self._assert_lifetime_lease()
+        return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args: object, **kwargs: object):
+        self._assert_lifetime_lease()
+        return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args: object, **kwargs: object):
+        self._assert_lifetime_lease()
+        return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self) -> None:
+        self._assert_lifetime_lease()
+        super().commit()
+
+    def rollback(self) -> None:
+        self._assert_lifetime_lease()
+        super().rollback()
+
+    def __enter__(self):
+        self._assert_lifetime_lease()
+        return super().__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ):
+        self._assert_lifetime_lease()
+        return super().__exit__(exc_type, exc_value, traceback)
+
+    def backup(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        self._assert_lifetime_lease()
+        return super().backup(*args, **kwargs)
+
+    def blobopen(self, *args: object, **kwargs: object):
+        self._assert_lifetime_lease()
+        raise LocalProtocolError("ordinary SQLite blob handles are unsupported")
+
+    def serialize(self, *, name: str = "main"):
+        self._assert_lifetime_lease()
+        return super().serialize(name=name)
+
+    def deserialize(self, data, *, name: str = "main"):  # type: ignore[no-untyped-def]
+        self._assert_lifetime_lease()
+        raise LocalProtocolError("ordinary SQLite deserialization is unsupported")
+
+    def iterdump(self, *args: object, **kwargs: object):
+        self._assert_lifetime_lease()
+        raise LocalProtocolError("ordinary SQLite dump iterators are unsupported")
+
+    def close(self) -> None:
+        lease = self._lifetime_lease
+        if lease is None:
+            return
+        super().close()
+        lease.close()
+        with _DEFERRED_LIFETIME_LEASES_LOCK:
+            _ACTIVE_LIFETIME_LEASES.pop(id(self), None)
+        self._lifetime_lease = None
+
+    def __del__(self) -> None:
+        if threading.get_ident() != getattr(self, "_lifetime_thread", None):
+            self._defer_lifetime_lease()
+            return
+        try:
+            self.close()
+        except sqlite3.ProgrammingError:
+            self._defer_lifetime_lease()
+        except (LocalProtocolError, sqlite3.Error):
+            pass
+
+
+class LeasedSqliteDatabase(SqliteDatabase):
+    """Ordinary MatrixStore database with one shared lease per connection."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._lifetime_pid = os.getpid()
+        self._lifetime_identity: FileIdentity | None = None
+        self._lifetime_identity_lock = threading.Lock()
+
+    def _remember_lifetime_identity(self, identity: FileIdentity | None) -> None:
+        if identity is None:
+            raise LocalProtocolError("ordinary database lease has no identity")
+        with self._lifetime_identity_lock:
+            if self._lifetime_identity is None:
+                self._lifetime_identity = identity
+            elif self._lifetime_identity != identity:
+                raise LocalProtocolError("ordinary database file identity changed")
+
+    def _connect(self) -> sqlite3.Connection:
+        if os.getpid() != self._lifetime_pid:
+            raise LocalProtocolError(
+                "ordinary store database belongs to the constructing process"
+            )
+        lease = StableFileLock(Path(self.database), exclusive=False)
+        try:
+            if lease.database_identity is None:
+                if self._lifetime_identity is not None:
+                    raise LocalProtocolError("ordinary database file identity changed")
+                try:
+                    descriptor = os.open(
+                        lease.database_path,
+                        os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                        0o600,
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(descriptor)
+                lease.claim_database()
+            self._remember_lifetime_identity(lease.database_identity)
+            parameters = dict(self.connect_params)
+            parameters["factory"] = partial(_LifetimeLeasedConnection, lease=lease)
+            connection = sqlite3.connect(
+                self.database,
+                timeout=self._timeout,
+                isolation_level=None,
+                **parameters,
+            )
+            try:
+                self._add_conn_hooks(connection)
+                connection._assert_lifetime_lease()
+                marker = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'NioIngestMeta' COLLATE NOCASE"
+                ).fetchone()
+                if marker is not None:
+                    raise LocalProtocolError(
+                        "this database is owned by ingestion v1; direct legacy "
+                        "store access is unsupported"
+                    )
+            except BaseException:
+                connection.close()
+                raise
+            return connection
+        except BaseException:
+            lease.close()
+            raise
 
 
 class IngestionStoreOwner:
@@ -87,11 +461,13 @@ class IngestionStoreOwner:
         path: Path,
         sqlite_busy_timeout_ms: int,
         statement_observer: Callable[[str], None] | None,
+        *,
+        require_nonempty: bool = False,
     ) -> None:
         self.path = path
         self._pid = os.getpid()
         self._thread = threading.get_ident()
-        self._lock = StableFileLock(path)
+        self._lock = StableFileLock(path, require_database=require_nonempty)
         self._state = "bootstrap"
         self._depth = 0
         self._outer_scope: str | None = None
@@ -106,6 +482,10 @@ class IngestionStoreOwner:
                 before = None
             if before is not None and not stat.S_ISREG(before.st_mode):
                 raise LocalProtocolError("ingestion database must be a regular file")
+            if require_nonempty and (before is None or before.st_size == 0):
+                raise LocalProtocolError(
+                    "configured adoption requires a populated regular store"
+                )
             category = (
                 "ABSENT"
                 if before is None
@@ -125,6 +505,8 @@ class IngestionStoreOwner:
                 prior_identity = (claimed.st_dev, claimed.st_ino)
             else:
                 prior_identity = (before.st_dev, before.st_ino)
+            if self._lock.database_identity is None:
+                self._lock.claim_database()
             self._fresh_witness = _FreshPathWitness(category, prior_identity)
 
             self.database = SqliteDatabase(
@@ -302,9 +684,23 @@ class IngestionStoreOwner:
             return
         if self._state not in {"active", "closing", "bootstrap"}:
             raise LocalProtocolError("ingestion store owner cannot close")
-        self._lock.assert_identity()
+        identity_error: BaseException | None = None
+        try:
+            self._lock.assert_identity()
+        except BaseException as error:
+            identity_error = error
         self._state = "closing"
-        if not self.database.is_closed():
-            self.database.close()
-        self._lock.close()
-        self._state = "closed"
+        try:
+            if not self.database.is_closed():
+                self.database.close()
+        except BaseException:
+            # A failed physical close may leave SQLite or a transaction live.
+            # Keep exclusion for a same-owner retry even when the pathname is
+            # stale; releasing here would permit a second writer to overlap it.
+            raise
+        try:
+            self._lock.close()
+        finally:
+            self._state = "closed"
+        if identity_error is not None:
+            raise identity_error

@@ -16,7 +16,9 @@ import hashlib
 import json
 import os
 import sqlite3
-from contextlib import nullcontext
+import threading
+import weakref
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -64,10 +66,7 @@ from . import (
     SyncRecoveryGaps,
     SyncTokens,
 )
-from ._sync_journal_preflight import (
-    StableFileLock,
-    database_has_ingestion_marker,
-)
+from ._ingestion_store_owner import LeasedSqliteDatabase, StableFileLock
 from .log import logger
 
 if TYPE_CHECKING:
@@ -160,6 +159,17 @@ def use_database_atomic(fn):
     return inner
 
 
+def use_default_trust_sidecars(fn):
+    """Hold one shared store lease across a semantic sidecar operation."""
+
+    @wraps(fn)
+    def inner(self, *args, **kwargs):
+        with self._trust_sidecar_guard():
+            return fn(self, *args, **kwargs)
+
+    return inner
+
+
 @dataclass
 class MatrixStore:
     """Storage class for matrix state."""
@@ -206,7 +216,7 @@ class MatrixStore:
             cls.supports_recovery_abandonment_reasons = False
 
     def _create_database(self):
-        return SqliteDatabase(
+        return LeasedSqliteDatabase(
             self.database_path,
             pragmas={
                 "foreign_keys": 1,
@@ -453,17 +463,23 @@ class MatrixStore:
                 self._post_init_ingestion_store(bootstrap)
             return
 
-        with StableFileLock(Path(self.database_path)):
-            if database_has_ingestion_marker(self.database_path):
-                raise LocalProtocolError(
-                    "this database is owned by ingestion v1; direct legacy store "
-                    "construction is unsupported"
-                )
+        try:
             self._post_init_legacy_store()
+        except BaseException:
+            database = getattr(self, "database", None)
+            if database is not None and not database.is_closed():
+                database.close()
+            raise
 
     def _post_init_legacy_store(self) -> None:
         self.database = self._create_database()
         self.database.connect()
+
+        if "NioIngestMeta" in self.database.get_tables():
+            raise LocalProtocolError(
+                "this database is owned by ingestion v1; direct legacy store "
+                "construction is unsupported"
+            )
 
         store_version = self._get_store_version()
 
@@ -1663,19 +1679,124 @@ class DefaultStore(MatrixStore):
     supports_recovery_abandonment_reasons: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
+    ignore_db: KeyStore = field(init=False)
+    _trust_guard_depth: int = field(default=0, init=False, repr=False)
+    _trust_guard_lease: StableFileLock | None = field(
+        default=None, init=False, repr=False
+    )
+    _trust_guard_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    _trust_guard_thread: int | None = field(default=None, init=False, repr=False)
+    _trust_guard_pid: int = field(default=0, init=False, repr=False)
+    _trust_sidecar_coordinated: bool = field(default=False, init=False, repr=False)
+
+    @contextmanager
+    def _trust_sidecar_guard(self):
+        if not self._trust_sidecar_coordinated:
+            yield
+            return
+        if os.getpid() != self._trust_guard_pid:
+            raise LocalProtocolError(
+                "ordinary trust store belongs to the constructing process"
+            )
+        with self._trust_guard_lock:
+            if self._trust_guard_depth:
+                self._assert_trust_sidecar_owner()
+                self._trust_guard_depth += 1
+                try:
+                    yield
+                finally:
+                    self._trust_guard_depth -= 1
+                return
+
+            lease = StableFileLock(Path(self.database_path), exclusive=False)
+            try:
+                if not isinstance(self.database, LeasedSqliteDatabase):
+                    raise LocalProtocolError(
+                        "ordinary trust database has no built-in lease"
+                    )
+                self.database._remember_lifetime_identity(lease.database_identity)
+                lease.assert_identity()
+                uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True)) as connection:
+                    marked = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'NioIngestMeta' COLLATE NOCASE"
+                    ).fetchone()
+                if marked:
+                    raise LocalProtocolError(
+                        "legacy trust sidecars are unavailable after adoption"
+                    )
+            except BaseException:
+                lease.close()
+                raise
+            self._trust_guard_lease = lease
+            self._trust_guard_depth = 1
+            self._trust_guard_thread = threading.get_ident()
+            try:
+                yield
+                self._assert_trust_sidecar_owner()
+            finally:
+                self._trust_guard_depth = 0
+                self._trust_guard_thread = None
+                self._trust_guard_lease = None
+                lease.close()
+
+    def _assert_trust_sidecar_owner(self) -> None:
+        if not self._trust_sidecar_coordinated:
+            return
+        lease = self._trust_guard_lease
+        if not self._trust_guard_depth or lease is None:
+            raise LocalProtocolError("trust sidecar I/O requires shared ownership")
+        if threading.get_ident() != self._trust_guard_thread:
+            raise LocalProtocolError(
+                "trust sidecar ownership belongs to another thread"
+            )
+        lease.assert_identity()
 
     def __post_init__(self):
+        self._trust_guard_pid = os.getpid()
+        self._trust_sidecar_coordinated = (
+            type(self)._create_database is MatrixStore._create_database
+        )
         super().__post_init__()
+        try:
+            with self._trust_sidecar_guard():
+                store_ref = weakref.ref(self)
 
-        trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
-        self.trust_db = KeyStore(os.path.join(self.store_path, trust_file_path))
+                def assert_owner() -> None:
+                    store = store_ref()
+                    if store is None:
+                        raise LocalProtocolError("trust sidecar owner was finalized")
+                    store._assert_trust_sidecar_owner()
 
-        blacklist_file_path = f"{self.user_id}_{self.device_id}.blacklisted_devices"
-        self.blacklist_db = KeyStore(os.path.join(self.store_path, blacklist_file_path))
+                ownership_assertion = (
+                    assert_owner if self._trust_sidecar_coordinated else None
+                )
+                trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
+                self.trust_db = KeyStore(
+                    os.path.join(self.store_path, trust_file_path),
+                    ownership_assertion,
+                )
+                blacklist_file_path = (
+                    f"{self.user_id}_{self.device_id}.blacklisted_devices"
+                )
+                self.blacklist_db = KeyStore(
+                    os.path.join(self.store_path, blacklist_file_path),
+                    ownership_assertion,
+                )
+                ignore_file_path = f"{self.user_id}_{self.device_id}.ignored_devices"
+                self.ignore_db = KeyStore(
+                    os.path.join(self.store_path, ignore_file_path),
+                    ownership_assertion,
+                )
+        except BaseException:
+            if not self.database.is_closed():
+                self.database.close()
+            raise
 
-        ignore_file_path = f"{self.user_id}_{self.device_id}.ignored_devices"
-        self.ignore_db = KeyStore(os.path.join(self.store_path, ignore_file_path))
-
+    @use_default_trust_sidecars
     def blacklist_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.trust_db.remove(key)
@@ -1683,6 +1804,7 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.blacklisted
         return self.blacklist_db.add(key)
 
+    @use_default_trust_sidecars
     def unblacklist_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1692,6 +1814,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def verify_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.blacklist_db.remove(key)
@@ -1699,14 +1822,17 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.verified
         return self.trust_db.add(key)
 
+    @use_default_trust_sidecars
     def is_device_verified(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.trust_db
 
+    @use_default_trust_sidecars
     def is_device_blacklisted(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.blacklist_db
 
+    @use_default_trust_sidecars
     def unverify_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1716,6 +1842,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def ignore_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.blacklist_db.remove(key)
@@ -1723,6 +1850,7 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.ignored
         return self.ignore_db.add(key)
 
+    @use_default_trust_sidecars
     def unignore_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1732,6 +1860,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def ignore_devices(self, devices: list[OlmDevice]) -> None:
         keys = [Key.from_olmdevice(device) for device in devices]
 
@@ -1744,10 +1873,12 @@ class DefaultStore(MatrixStore):
 
         return
 
+    @use_default_trust_sidecars
     def is_device_ignored(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.ignore_db
 
+    @use_default_trust_sidecars
     @use_database
     def load_device_keys(self) -> DeviceStore:
         store = DeviceStore()

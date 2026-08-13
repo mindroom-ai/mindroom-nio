@@ -11,6 +11,7 @@ from uuid import UUID
 
 import pytest
 
+from nio.crypto import OlmAccount, OlmDevice, TrustState
 from nio.event_provenance import TimelineEventProvenance
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
 from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
@@ -18,9 +19,11 @@ from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
 from nio.ingest.source import canonical_json
 from nio.ingest.state import SourceState, StagedFrame
+from nio.store import DefaultStore, SqliteStore
 from nio.store._sync_journal_plan import _canonical_work_plaintext
 from nio.store._sync_journal_rows import _canonical_internal
 from nio.store._sync_journal_values import MaterializerLimits, MaterializeStatus
+import nio.store.sync_journal as bootstrap_api
 from nio.store.sync_journal import open_ingestion_store
 from nio.store.sync_journal_schema import SCHEMA_SQL
 
@@ -37,6 +40,35 @@ SLIDING_SOURCE = SlidingSourceConfig(
 )
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 CRASH_EXIT_CODE = 86
+PICKLE_KEY = "secret"
+_ADOPTION_COMMON_BOUNDARIES = (
+    "before_first_trust_insert",
+    "insert_trust_0",
+    "insert_trust_1",
+    "insert_trust_2",
+    "create_meta",
+    "insert_meta",
+    *(f"schema_{index}" for index in range(len(SCHEMA_SQL))),
+    "insert_source",
+    "foreign_key_check",
+    "before_commit",
+    "commit",
+)
+ADOPTION_BOUNDARIES = (
+    *((False, "create_device_trust_state"),),
+    *((False, boundary) for boundary in _ADOPTION_COMMON_BOUNDARIES),
+    *((True, "delete_legacy_trust"),),
+    *((True, boundary) for boundary in _ADOPTION_COMMON_BOUNDARIES),
+)
+SQLITE_ADOPTION_BOUNDARIES = (
+    "create_meta",
+    "insert_meta",
+    *(f"schema_{index}" for index in range(len(SCHEMA_SQL))),
+    "insert_source",
+    "foreign_key_check",
+    "before_commit",
+    "commit",
+)
 
 
 def _exit_at_statement(kill_after: int) -> Callable[[str], None]:
@@ -74,6 +106,178 @@ def _kill_during_schema(store_path: Path, kill_after: int) -> None:
         consumer_generation=CONSUMER_GENERATION,
         database_name="journal.db",
         schema_statement_hook=_exit_at_statement(kill_after),
+    )
+
+
+def _kill_during_configured_adoption(
+    store_path: Path,
+    boundary: str,
+) -> None:
+    def kill(label: str) -> None:
+        if label == boundary:
+            os._exit(CRASH_EXIT_CODE)
+
+    bootstrap_api._open_configured_ingestion_store(
+        store_path,
+        source_store_class=DefaultStore,
+        owned_store_class=SqliteStore,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+        adoption_statement_hook=kill,
+    )
+
+
+def _kill_during_configured_sqlite_adoption(
+    store_path: Path,
+    boundary: str,
+) -> None:
+    def kill(label: str) -> None:
+        if label == boundary:
+            os._exit(CRASH_EXIT_CODE)
+
+    bootstrap_api._open_configured_ingestion_store(
+        store_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+        adoption_statement_hook=kill,
+    )
+
+
+def _logical_sqlite_graph(database_path: Path) -> tuple[object, ...]:
+    with sqlite3.connect(database_path) as connection:
+        master = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
+            )
+        )
+        tables = tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_list")
+            if row[0] == "main" and not row[1].startswith("sqlite_")
+        )
+        rows = tuple(
+            (
+                table,
+                tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')),
+            )
+            for table in sorted(tables)
+        )
+    return master, rows
+
+
+def _seed_default_adoption_source(
+    store_path: Path,
+    *,
+    legacy_trust: bool,
+) -> tuple[bytes | None, ...]:
+    store = DefaultStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(store_path),
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+    store.save_account(OlmAccount())
+    devices = {
+        state: OlmDevice(
+            "@bob:example.org",
+            state.name.upper(),
+            OlmAccount().identity_keys,
+        )
+        for state in (TrustState.verified, TrustState.blacklisted, TrustState.ignored)
+    }
+    store.save_device_keys(
+        {"@bob:example.org": {device.id: device for device in devices.values()}}
+    )
+    store.verify_device(devices[TrustState.verified])
+    store.blacklist_device(devices[TrustState.blacklisted])
+    store.ignore_device(devices[TrustState.ignored])
+    store.database.close()
+    if legacy_trust:
+        with sqlite3.connect(store_path / "journal.db") as connection:
+            connection.execute(
+                'CREATE TABLE "devicetruststate" ('
+                '"device_id" INTEGER NOT NULL PRIMARY KEY, '
+                '"state" INTEGER NOT NULL, FOREIGN KEY ("device_id") '
+                'REFERENCES "devicekeys" ("id"))'
+            )
+            device_key_id = connection.execute(
+                "SELECT id FROM devicekeys WHERE device_id = 'VERIFIED'"
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO devicetruststate VALUES (?, ?)",
+                (device_key_id, 99),
+            )
+    return tuple(
+        path.read_bytes() if path.exists() else None
+        for path in (
+            store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.trusted_devices",
+            store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.blacklisted_devices",
+            store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.ignored_devices",
+        )
+    )
+
+
+def _seed_sqlite_adoption_source(store_path: Path) -> None:
+    store = SqliteStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(store_path),
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+    store.save_account(OlmAccount())
+    devices = {
+        state: OlmDevice(
+            "@bob:example.org",
+            state.name.upper(),
+            OlmAccount().identity_keys,
+        )
+        for state in (TrustState.verified, TrustState.blacklisted, TrustState.ignored)
+    }
+    store.save_device_keys(
+        {"@bob:example.org": {device.id: device for device in devices.values()}}
+    )
+    store.verify_device(devices[TrustState.verified])
+    store.blacklist_device(devices[TrustState.blacklisted])
+    store.ignore_device(devices[TrustState.ignored])
+    store.database.close()
+
+
+def _ordinary_graph_without_trust_or_ingestion(
+    graph: tuple[object, ...],
+) -> tuple[object, ...]:
+    master, rows = graph
+    return (
+        tuple(
+            entry
+            for entry in master
+            if entry[2] != "devicetruststate" and not entry[2].startswith("NioIngest")
+        ),
+        tuple(
+            entry
+            for entry in rows
+            if entry[0] != "devicetruststate" and not entry[0].startswith("NioIngest")
+        ),
+    )
+
+
+def _graph_without_ingestion(graph: tuple[object, ...]) -> tuple[object, ...]:
+    master, rows = graph
+    return (
+        tuple(entry for entry in master if not entry[2].startswith("NioIngest")),
+        tuple(entry for entry in rows if not entry[0].startswith("NioIngest")),
     )
 
 
@@ -280,6 +484,153 @@ def test_fresh_schema_creation_is_atomic_at_every_statement(
         )
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize(("legacy_trust", "boundary"), ADOPTION_BOUNDARIES)
+def test_configured_adoption_process_death_is_exact_old_or_complete_new_graph(
+    tmp_path: Path,
+    legacy_trust: bool,
+    boundary: str,
+) -> None:
+    topology = "legacy" if legacy_trust else "absent"
+    store_path = tmp_path / f"{topology}-{boundary}"
+    store_path.mkdir()
+    sidecars_before = _seed_default_adoption_source(
+        store_path,
+        legacy_trust=legacy_trust,
+    )
+    database_path = store_path / "journal.db"
+    graph_before = _logical_sqlite_graph(database_path)
+
+    _assert_process_crashed(_kill_during_configured_adoption, store_path, boundary)
+    graph_after = _logical_sqlite_graph(database_path)
+    committed = boundary == "commit"
+    if not committed:
+        assert graph_after == graph_before
+        assert not any(
+            name.startswith("NioIngest") for _kind, name, _table, _sql in graph_after[0]
+        )
+    else:
+        assert _ordinary_graph_without_trust_or_ingestion(
+            graph_after
+        ) == _ordinary_graph_without_trust_or_ingestion(graph_before)
+        names = {
+            name
+            for kind, name, _table, _sql in graph_after[0]
+            if kind == "table" and name.startswith("NioIngest")
+        }
+        assert names == {
+            "NioIngestMeta",
+            "NioIngestSourceState",
+            "NioIngestFrame",
+            "NioIngestRoomAggregate",
+            "NioIngestWork",
+        }
+        assert "devicetruststate" in {
+            name for kind, name, _table, _sql in graph_after[0] if kind == "table"
+        }
+        with sqlite3.connect(database_path) as connection:
+            trust = connection.execute(
+                "SELECT d.device_id, t.state FROM devicetruststate AS t "
+                "JOIN devicekeys AS d ON d.id = t.device_id ORDER BY d.device_id"
+            ).fetchall()
+            assert trust == [
+                ("BLACKLISTED", TrustState.blacklisted.value),
+                ("IGNORED", TrustState.ignored.value),
+                ("VERIFIED", TrustState.verified.value),
+            ]
+            assert connection.execute(
+                "SELECT COUNT(*) FROM NioIngestMeta"
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM NioIngestSourceState"
+            ).fetchone() == (1,)
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert (
+        tuple(
+            path.read_bytes() if path.exists() else None
+            for path in (
+                store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.trusted_devices",
+                store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.blacklisted_devices",
+                store_path / f"{ACCOUNT_ID}_{DEVICE_ID}.ignored_devices",
+            )
+        )
+        == sidecars_before
+    )
+
+    if committed:
+        reopened = bootstrap_api._open_configured_ingestion_store(
+            store_path,
+            source_store_class=SqliteStore,
+            owned_store_class=SqliteStore,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer_generation=CONSUMER_GENERATION,
+            pickle_key=PICKLE_KEY,
+            database_name="journal.db",
+        )
+    else:
+        reopened = bootstrap_api._open_configured_ingestion_store(
+            store_path,
+            source_store_class=DefaultStore,
+            owned_store_class=SqliteStore,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer_generation=CONSUMER_GENERATION,
+            pickle_key=PICKLE_KEY,
+            database_name="journal.db",
+        )
+    reopened.close()
+
+
+@pytest.mark.parametrize("boundary", SQLITE_ADOPTION_BOUNDARIES)
+def test_configured_sqlite_adoption_crash_preserves_exact_populated_graph(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    store_path = tmp_path / boundary
+    store_path.mkdir()
+    _seed_sqlite_adoption_source(store_path)
+    database_path = store_path / "journal.db"
+    graph_before = _logical_sqlite_graph(database_path)
+
+    _assert_process_crashed(
+        _kill_during_configured_sqlite_adoption,
+        store_path,
+        boundary,
+    )
+    graph_after = _logical_sqlite_graph(database_path)
+    if boundary == "commit":
+        assert _graph_without_ingestion(graph_after) == graph_before
+        assert {
+            name
+            for kind, name, _table, _sql in graph_after[0]
+            if kind == "table" and name.startswith("NioIngest")
+        } == {
+            "NioIngestMeta",
+            "NioIngestSourceState",
+            "NioIngestFrame",
+            "NioIngestRoomAggregate",
+            "NioIngestWork",
+        }
+    else:
+        assert graph_after == graph_before
+
+    source_class = SqliteStore
+    reopened = bootstrap_api._open_configured_ingestion_store(
+        store_path,
+        source_store_class=source_class,
+        owned_store_class=SqliteStore,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+    reopened.close()
 
 
 @pytest.mark.parametrize(

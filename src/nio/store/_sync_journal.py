@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from ..ingest.model import LossRecord, SyncBatch
+    from .database import MatrixStore
 
 
 def _hydration_final_total(storage, releases) -> int:  # type: ignore[no-untyped-def]
@@ -98,6 +99,33 @@ def _ready_member(
     if key is not None:
         return next((member for member in members if member[0] == key), None)
     return min(members, default=None)
+
+
+def _renormalized_frame(owner: OwnerView, frame: StagedFrame) -> SyncFrame:
+    request = frame.response.request
+    adapter: ClassicSource | SlidingSource
+    if request.transport is TransportKind.CLASSIC:
+        adapter = ClassicSource(
+            owner.stream_id,
+            ClassicSourceConfig(request.timeout_ms, b"{}"),
+            owner.account_id,
+        )
+    else:
+        adapter = SlidingSource(
+            owner.stream_id,
+            SlidingSourceConfig(
+                request.timeout_ms,
+                "journal-validation",
+                b"{}",
+                b"{}",
+                b"{}",
+            ),
+            owner.account_id,
+        )
+    try:
+        return renormalize_staged_frame(adapter, frame)
+    except (TypeError, ValueError) as error:
+        raise JournalIntegrityError("staged response does not re-normalize") from error
 
 
 class SqliteIngestionJournal(JournalRows):
@@ -137,6 +165,9 @@ class SqliteIngestionJournal(JournalRows):
         statement_observer: Callable[[str], None] | None = None,
         transition_statement_hook: Callable[[str], None] | None = None,
         schema_statement_hook: Callable[[str], None] | None = None,
+        configured_source_store_class: type[MatrixStore] | None = None,
+        configured_store_path: Path | None = None,
+        adoption_statement_hook: Callable[[str], None] | None = None,
     ) -> SqliteIngestionJournal:
         if type(account_id) is not str or not account_id:
             raise TypeError("account_id must be a nonempty str")
@@ -156,10 +187,14 @@ class SqliteIngestionJournal(JournalRows):
             device_id=device_id,
             consumer_generation=consumer_generation,
             source=source,
+            pickle_key=pickle_key,
             sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
             statement_observer=statement_observer,
             transition_statement_hook=transition_statement_hook,
             schema_statement_hook=schema_statement_hook,
+            configured_source_store_class=configured_source_store_class,
+            configured_store_path=configured_store_path,
+            adoption_statement_hook=adoption_statement_hook,
         )
         return cls(
             database_path=opened.path,
@@ -460,32 +495,7 @@ class SqliteIngestionJournal(JournalRows):
         owner: OwnerView,
         frame: StagedFrame,
     ) -> SyncFrame:
-        request = frame.response.request
-        adapter: ClassicSource | SlidingSource
-        if request.transport is TransportKind.CLASSIC:
-            adapter = ClassicSource(
-                owner.stream_id,
-                ClassicSourceConfig(request.timeout_ms, b"{}"),
-                owner.account_id,
-            )
-        else:
-            adapter = SlidingSource(
-                owner.stream_id,
-                SlidingSourceConfig(
-                    request.timeout_ms,
-                    "journal-validation",
-                    b"{}",
-                    b"{}",
-                    b"{}",
-                ),
-                owner.account_id,
-            )
-        try:
-            return renormalize_staged_frame(adapter, frame)
-        except (TypeError, ValueError) as error:
-            raise JournalIntegrityError(
-                "staged response does not re-normalize"
-            ) from error
+        return _renormalized_frame(owner, frame)
 
     def _validate_stage_relationship(
         self,
@@ -705,6 +715,7 @@ class SqliteIngestionJournal(JournalRows):
                     header
                     for header in headers
                     if header.room_materialized_revision is None
+                    and header.callbacks_claimed_revision is None
                 ),
                 None,
             )
@@ -965,10 +976,21 @@ class SqliteIngestionJournal(JournalRows):
                 "AND request_id = ? AND staged_revision = ? "
                 "AND payload = ? AND payload_sha256 = ? "
                 "AND room_materialized_revision IS NULL "
+                "AND callbacks_claimed_revision IS NULL "
                 "AND drain_header_sha256 = ?"
             )
             if plan.crypto_deferred:
-                proof = _frame_drain_sha256(write_owner, (*selected[2:8], new_revision))
+                proof = _frame_drain_sha256(
+                    write_owner,
+                    frame_id=selected.frame_id,
+                    source_epoch=selected.source_epoch,
+                    request_id=selected.request_id,
+                    staged_revision=selected.staged_revision,
+                    payload_sha256=selected.payload_sha256,
+                    payload_length=selected.payload_length,
+                    room_materialized_revision=new_revision,
+                    callbacks_claimed_revision=selected.callbacks_claimed_revision,
+                )
                 frame_cursor = self._transition_execute(
                     "frame_crypto_retain",
                     "UPDATE NioIngestFrame SET room_materialized_revision = ?, "

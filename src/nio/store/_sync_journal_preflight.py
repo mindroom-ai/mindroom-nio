@@ -3,18 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import time
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
 from peewee import DatabaseError as PeeweeDatabaseError
 from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
+from ..crypto import OlmAccount, TrustState
 from ..exceptions import LocalProtocolError
 from ..ingest._json import load_internal_json
 from ..ingest.config import (
@@ -28,7 +31,7 @@ from ..ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
 )
-from ..ingest.model import TransportKind
+from ..ingest.model import RecordOrigin, TransportKind
 from ..ingest.sliding import (
     SlidingCursor,
     SlidingRangeAckMode,
@@ -44,11 +47,31 @@ from ..ingest.source import (
 from ..ingest.state import OwnerView, SourceState
 from ._ingestion_store_owner import IngestionStoreOwner
 from ._ingestion_store_owner import StableFileLock as StableFileLock
-from ._sync_journal_values import SQLITE_INT_MAX, DeliveryState
+from ._sync_journal_values import SQLITE_INT_MAX, DeliveryState, RoomAggregateValue
+from .file_trustdb import Ed25519Key, KeyStore
+from .models import (
+    Accounts,
+    DeviceKeys,
+    DeviceTrustState,
+    EncryptedRooms,
+    ForwardedChains,
+    Keys,
+    MegolmInboundSessions,
+    OlmSessions,
+    OutgoingKeyRequests,
+    PendingTimelineEvents,
+    SlidingWindowTokens,
+    StoreVersion,
+    SyncRecoveryAbandonedRooms,
+    SyncRecoveryGaps,
+    SyncTokens,
+)
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+    from .database import MatrixStore
 
 
 _E2EE_TABLES = frozenset(
@@ -65,6 +88,40 @@ _E2EE_TABLES = frozenset(
         "storeversion",
     }
 )
+
+_ORDINARY_MODELS = (
+    Accounts,
+    OlmSessions,
+    MegolmInboundSessions,
+    ForwardedChains,
+    DeviceKeys,
+    EncryptedRooms,
+    OutgoingKeyRequests,
+    StoreVersion,
+    Keys,
+    SyncTokens,
+    SyncRecoveryGaps,
+    SyncRecoveryAbandonedRooms,
+    PendingTimelineEvents,
+    SlidingWindowTokens,
+)
+_TRUST_SIDECAR_SUFFIXES = (
+    "trusted_devices",
+    "blacklisted_devices",
+    "ignored_devices",
+)
+_DEVICE_TRUST_SQL = (
+    'CREATE TABLE "devicetruststate" ('
+    '"device_id" INTEGER NOT NULL PRIMARY KEY, '
+    '"state" INTEGER NOT NULL, '
+    'FOREIGN KEY ("device_id") REFERENCES "devicekeys" ("id"))'
+)
+_MIGRATED_COLUMN_DEFAULTS = {
+    ("pendingtimelineevents", "admission_accepted"): frozenset({None, "0"}),
+    ("pendingtimelineevents", "provenance"): frozenset({None, "'live'"}),
+    ("pendingtimelineevents", "apply_room_state"): frozenset({None, "1"}),
+    ("syncrecoverygaps", "membership_bound"): frozenset({None, "0"}),
+}
 
 
 def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
@@ -106,6 +163,131 @@ def database_has_ingestion_marker(path: str | os.PathLike[str]) -> bool:
 
 def _normalized_sql(sql: str | None) -> str | None:
     return " ".join(sql.split()) if sql is not None else None
+
+
+def _check_constraints(sql: str | None) -> tuple[str, ...]:
+    """Return normalized CHECK expressions without depending on DDL history."""
+
+    if sql is None:
+        return ()
+    upper = sql.upper()
+    expressions: list[str] = []
+    offset = 0
+    while (start := upper.find("CHECK", offset)) >= 0:
+        cursor = start + len("CHECK")
+        while cursor < len(sql) and sql[cursor].isspace():
+            cursor += 1
+        if cursor >= len(sql) or sql[cursor] != "(":
+            offset = cursor
+            continue
+        depth = 1
+        quote: str | None = None
+        end = cursor + 1
+        while end < len(sql) and depth:
+            character = sql[end]
+            if quote is not None:
+                if character == quote:
+                    if end + 1 < len(sql) and sql[end + 1] == quote:
+                        end += 1
+                    else:
+                        quote = None
+            elif character in {"'", '"'}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            end += 1
+        if depth:
+            raise FreshIngestionRequired("configured ordinary CHECK is malformed")
+        expressions.append(" ".join(sql[cursor + 1 : end - 1].split()).lower())
+        offset = end
+    return tuple(expressions)
+
+
+def _ddl_attributes(sql: str | None) -> tuple[object, ...]:
+    normalized = _normalized_sql(sql)
+    if normalized is None:
+        return ()
+    upper = normalized.upper()
+    return (
+        "AUTOINCREMENT" in upper,
+        "WITHOUT ROWID" in upper,
+        bool(re.search(r"\bSTRICT\s*$", upper)),
+        tuple(re.findall(r"\bCOLLATE\s+([A-Z0-9_]+)", upper)),
+        tuple(re.findall(r"\bON\s+CONFLICT\s+([A-Z]+)", upper)),
+        "DEFERRABLE" in upper,
+        "INITIALLY DEFERRED" in upper,
+    )
+
+
+def _semantic_columns(
+    connection: sqlite3.Connection | SqliteDatabase,
+    table: str,
+) -> tuple[tuple[object, ...], ...]:
+    rows = _pragma_rows(connection, "PRAGMA table_xinfo", table)
+    names = [row[1] for row in rows]
+    if len(names) != len(set(names)):
+        raise FreshIngestionRequired("configured ordinary columns are duplicated")
+    stable: list[tuple[object, ...]] = []
+    migrated: list[tuple[object, ...]] = []
+    for cid, name, kind, not_null, default, primary_key, hidden in rows:
+        name = cast("str", name)
+        allowed = _MIGRATED_COLUMN_DEFAULTS.get((table, name))
+        if allowed is not None:
+            if default not in allowed:
+                raise FreshIngestionRequired(
+                    "configured migrated column default is unsupported"
+                )
+            default = "<ordinary-v10-migrated-default>"
+        semantic = (
+            name,
+            kind,
+            not_null,
+            default,
+            primary_key,
+            hidden,
+        )
+        if allowed is not None:
+            migrated.append((None, *semantic))
+        else:
+            # ALTER-added v10 fields may legally appear after the original
+            # columns, but the original declaration order remains semantic.
+            stable.append((len(stable), *semantic))
+    return (*stable, *sorted(migrated))
+
+
+def _semantic_indexes(
+    connection: sqlite3.Connection | SqliteDatabase,
+    table: str,
+) -> tuple[tuple[object, ...], ...]:
+    indexes: list[tuple[object, ...]] = []
+    for row in _execute(connection, f'PRAGMA index_list("{table}")'):
+        _sequence, name, unique, origin, partial = tuple(row)
+        columns = tuple(
+            (item[2], item[3], item[4], item[5])
+            for item in _pragma_rows(connection, "PRAGMA index_xinfo", name)
+        )
+        indexes.append((name, unique, origin, partial, columns))
+    return tuple(sorted(indexes))
+
+
+def _table_flags(
+    connection: sqlite3.Connection | SqliteDatabase,
+    table: str,
+) -> tuple[object, ...]:
+    rows = tuple(
+        tuple(row)
+        for row in _execute(
+            connection,
+            "SELECT type, ncol, wr, strict FROM pragma_table_list "
+            "WHERE schema = 'main' AND name = ?",
+            (table,),
+        )
+    )
+    if len(rows) != 1:
+        raise FreshIngestionRequired("configured ordinary table flags are invalid")
+    return rows[0]
 
 
 def _pragma_rows(
@@ -188,6 +370,342 @@ def validate_schema_topology(connection: SqliteDatabase) -> None:
         ) from error
 
 
+def _model_contract(
+    models: tuple[type, ...],
+) -> tuple[object, ...]:
+    database = SqliteDatabase(":memory:")
+    database.connect()
+    try:
+        database.execute_sql("PRAGMA foreign_keys = ON")
+        with database.bind_ctx(models):
+            database.create_tables(models)
+            return _capture_named_contract(
+                database,
+                frozenset(cast("Any", model)._meta.table_name for model in models),
+            )
+    finally:
+        database.close()
+
+
+def _capture_named_contract(
+    connection: sqlite3.Connection | SqliteDatabase,
+    table_names: frozenset[str],
+    *,
+    allow_ingestion_objects: bool = False,
+) -> tuple[object, ...]:
+    master_rows = tuple(
+        _execute(
+            connection,
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'view', 'trigger') "
+            "AND name NOT GLOB 'sqlite_*' ORDER BY type, name",
+        )
+    )
+    ingestion_rows = tuple(
+        row
+        for row in master_rows
+        if str(row[1]).startswith("NioIngest") or str(row[2]).startswith("NioIngest")
+    )
+    unexpected = tuple(
+        row
+        for row in master_rows
+        if row[2] not in table_names and row not in ingestion_rows
+    )
+    if ingestion_rows and not allow_ingestion_objects:
+        unexpected += ingestion_rows
+    if unexpected:
+        raise FreshIngestionRequired("configured ordinary topology has extra objects")
+    master = tuple(
+        (
+            row[0],
+            row[1],
+            row[2],
+            _check_constraints(row[3]),
+            _ddl_attributes(row[3]),
+        )
+        for row in master_rows
+        if row not in ingestion_rows
+    )
+    details = tuple(
+        (
+            table,
+            _table_flags(connection, table),
+            _semantic_columns(connection, table),
+            tuple(
+                sorted(
+                    tuple(row)[2:]
+                    for row in _execute(
+                        connection, f'PRAGMA foreign_key_list("{table}")'
+                    )
+                )
+            ),
+            _semantic_indexes(connection, table),
+        )
+        for table in sorted(table_names)
+    )
+    return master, details
+
+
+@cache
+def _ordinary_contract(include_trust: bool) -> tuple[object, ...]:
+    models = (*_ORDINARY_MODELS, *((DeviceTrustState,) if include_trust else ()))
+    return _model_contract(models)
+
+
+def _ordinary_table_names(connection: SqliteDatabase) -> frozenset[str]:
+    return frozenset(
+        row[0]
+        for row in connection.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT GLOB 'sqlite_*' AND name NOT GLOB 'NioIngest*'"
+        )
+    )
+
+
+def _validate_ordinary_topology(
+    connection: SqliteDatabase,
+    *,
+    source_store_class: type[MatrixStore],
+) -> bool:
+    from .database import DefaultStore, SqliteStore
+
+    base_tables = frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
+    trust_table = DeviceTrustState._meta.table_name
+    actual_tables = _ordinary_table_names(connection)
+    if source_store_class is SqliteStore:
+        expected_tables = base_tables | {trust_table}
+        include_trust = True
+    elif source_store_class is DefaultStore:
+        if actual_tables == base_tables:
+            expected_tables = base_tables
+            include_trust = False
+        else:
+            expected_tables = base_tables | {trust_table}
+            include_trust = True
+    else:  # Pair validation should have rejected this before filesystem access.
+        raise LocalProtocolError("configured source store class is unsupported")
+    if actual_tables != expected_tables:
+        raise FreshIngestionRequired("configured ordinary store topology is incomplete")
+    try:
+        actual = _capture_named_contract(
+            connection,
+            actual_tables,
+            allow_ingestion_objects=connection.table_exists("NioIngestMeta"),
+        )
+        expected = _ordinary_contract(include_trust)
+    except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
+        raise FreshIngestionRequired(
+            "configured ordinary store topology is invalid"
+        ) from error
+    if actual != expected:
+        raise FreshIngestionRequired("configured ordinary store topology is malformed")
+    return include_trust
+
+
+def _authenticate_ordinary_store(
+    connection: SqliteDatabase,
+    *,
+    source_store_class: type[MatrixStore],
+    account_id: str,
+    device_id: str,
+    pickle_key: str,
+) -> bool:
+    include_trust = _validate_ordinary_topology(
+        connection,
+        source_store_class=source_store_class,
+    )
+    versions = connection.execute_sql("SELECT version FROM storeversion").fetchall()
+    if len(versions) != 1 or type(versions[0][0]) is not int or versions[0][0] != 10:
+        raise FreshIngestionRequired(
+            "configured ordinary store version is not exact v10"
+        )
+    accounts = connection.execute_sql(
+        "SELECT user_id, device_id, shared, account FROM accounts LIMIT 2"
+    ).fetchall()
+    if len(accounts) != 1:
+        raise FreshIngestionRequired(
+            "configured ordinary account cardinality is not one"
+        )
+    user, device, shared, pickle = tuple(accounts[0])
+    if (user, device) != (account_id, device_id):
+        raise FreshIngestionRequired(
+            "configured ordinary account identity does not match"
+        )
+    if type(shared) is not int or shared not in (0, 1):
+        raise FreshIngestionRequired(
+            "configured ordinary account shared flag is invalid"
+        )
+    if type(pickle) is not bytes or not pickle:
+        raise FreshIngestionRequired("configured ordinary account pickle is invalid")
+    try:
+        OlmAccount.from_pickle(pickle, pickle_key, bool(shared))
+    except Exception as error:
+        raise FreshIngestionRequired(
+            "configured ordinary account pickle is invalid"
+        ) from error
+    from .database import DefaultStore, SqliteStore
+
+    if include_trust and source_store_class is SqliteStore:
+        trust_rows = connection.execute_sql(
+            "SELECT state FROM devicetruststate"
+        ).fetchall()
+        if any(
+            type(row[0]) is not int
+            or row[0] not in {state.value for state in TrustState}
+            for row in trust_rows
+        ):
+            raise FreshIngestionRequired("configured device trust state is invalid")
+    foreign_key_failures = connection.execute_sql("PRAGMA foreign_key_check").fetchall()
+    if source_store_class is DefaultStore:
+        foreign_key_failures = [
+            row for row in foreign_key_failures if row[0] != "devicetruststate"
+        ]
+    if foreign_key_failures:
+        raise FreshIngestionRequired(
+            "configured ordinary store has foreign key violations"
+        )
+    return include_trust
+
+
+def _sidecar_paths(
+    store_path: Path, account_id: str, device_id: str
+) -> tuple[Path, ...]:
+    prefix = store_path / f"{account_id}_{device_id}"
+    return tuple(Path(f"{prefix}.{suffix}") for suffix in _TRUST_SIDECAR_SUFFIXES)
+
+
+def _read_default_trust(
+    connection: SqliteDatabase,
+    paths: tuple[Path, ...],
+) -> tuple[tuple[int, int], ...]:
+    stores = tuple(KeyStore(str(path)) for path in paths)
+    rows = connection.execute_sql(
+        "SELECT d.id, d.user_id, d.device_id, k.key FROM devicekeys AS d "
+        "JOIN keys AS k ON k.device_id = d.id WHERE k.key_type = 'ed25519' "
+        "ORDER BY d.id"
+    ).fetchall()
+    effective: list[tuple[int, int]] = []
+    for raw in rows:
+        row_id, user_id, device_id, fingerprint = tuple(raw)
+        key = Ed25519Key(user_id, device_id, fingerprint)
+        for store, state in zip(
+            stores,
+            (TrustState.verified, TrustState.blacklisted, TrustState.ignored),
+            strict=True,
+        ):
+            if store.check(key):
+                effective.append((row_id, state.value))
+                break
+    return tuple(effective)
+
+
+def _sidecar_snapshot(paths: tuple[Path, ...]) -> tuple[bytes | None, ...]:
+    return tuple(path.read_bytes() if path.exists() else None for path in paths)
+
+
+def _adopt_populated_store(
+    connection: SqliteDatabase,
+    *,
+    path: Path,
+    store_path: Path,
+    source_store_class: type[MatrixStore],
+    account_id: str,
+    device_id: str,
+    pickle_key: str,
+    consumer_generation: UUID,
+    source: SourceConfig,
+    writer_epoch: UUID,
+    statement_hook: Callable[[str], None] | None,
+) -> tuple[UUID, SourceState]:
+    from .database import DefaultStore, SqliteStore
+
+    sidecar_paths = (
+        _sidecar_paths(store_path, account_id, device_id)
+        if source_store_class is DefaultStore
+        else ()
+    )
+    sidecar_before = (
+        _sidecar_snapshot(sidecar_paths) if source_store_class is DefaultStore else ()
+    )
+    include_trust = _authenticate_ordinary_store(
+        connection,
+        source_store_class=source_store_class,
+        account_id=account_id,
+        device_id=device_id,
+        pickle_key=pickle_key,
+    )
+    trust_rows = (
+        _read_default_trust(connection, sidecar_paths)
+        if source_store_class is DefaultStore
+        else ()
+    )
+
+    # The caller holds the exclusive lifetime lease. Recheck the complete
+    # ordinary snapshot after BEGIN IMMEDIATE, immediately before conversion.
+    if (
+        _authenticate_ordinary_store(
+            connection,
+            source_store_class=source_store_class,
+            account_id=account_id,
+            device_id=device_id,
+            pickle_key=pickle_key,
+        )
+        != include_trust
+        or source_store_class is DefaultStore
+        and _sidecar_snapshot(sidecar_paths) != sidecar_before
+    ):
+        raise FreshIngestionRequired(
+            "configured ordinary store changed during adoption"
+        )
+    if source_store_class is DefaultStore:
+        if _read_default_trust(connection, sidecar_paths) != trust_rows:
+            raise FreshIngestionRequired(
+                "configured trust sidecars changed during adoption"
+            )
+        if include_trust:
+            connection.execute_sql("DELETE FROM devicetruststate")
+            if statement_hook is not None:
+                statement_hook("delete_legacy_trust")
+        else:
+            connection.execute_sql(_DEVICE_TRUST_SQL)
+            if statement_hook is not None:
+                statement_hook("create_device_trust_state")
+        if statement_hook is not None:
+            statement_hook("before_first_trust_insert")
+        for index, row in enumerate(trust_rows):
+            connection.execute_sql(
+                "INSERT INTO devicetruststate (device_id, state) VALUES (?, ?)",
+                row,
+            )
+            if statement_hook is not None:
+                statement_hook(f"insert_trust_{index}")
+
+    _authenticate_ordinary_store(
+        connection,
+        source_store_class=SqliteStore,
+        account_id=account_id,
+        device_id=device_id,
+        pickle_key=pickle_key,
+    )
+
+    stream_id, source_state = _create_fresh(
+        connection,
+        account_id,
+        device_id,
+        consumer_generation,
+        source,
+        writer_epoch,
+        statement_hook,
+    )
+    if connection.execute_sql("PRAGMA foreign_key_check").fetchall():
+        raise FreshIngestionRequired("adopted store has foreign key violations")
+    if statement_hook is not None:
+        statement_hook("foreign_key_check")
+    if statement_hook is not None:
+        statement_hook("before_commit")
+    return stream_id, source_state
+
+
 def _validate_source_cursor(
     transport_kind: TransportKind,
     cursor_json: bytes,
@@ -239,7 +757,7 @@ def _canonical_internal(value: object) -> bytes:
 _STORED_ROWS = {
     "NioIngestSourceState": "source source_epoch next_request_id active",
     "NioIngestFrame": "frame frame_id source_epoch request_id staged_revision",
-    "NioIngestFrameDrainHeader": "frame frame_id source_epoch request_id staged_revision payload_sha256 payload_length room_materialized_revision",
+    "NioIngestFrameDrainHeader": "frame frame_id source_epoch request_id staged_revision payload_sha256 payload_length room_materialized_revision callbacks_claimed_revision",
     "NioIngestRoomAggregate": "aggregate room_id updated_revision intent_kind",
     "NioIngestWork": "work work_id kind status frame_id room_id membership_epoch room_sequence ready_revision ready_ordinal created_revision",
 }
@@ -502,7 +1020,14 @@ def _inspect_existing(
         )
     }
     borrowed_tables = {name for name in all_tables if not name.startswith("NioIngest")}
-    if borrowed_tables not in (set(), set(_E2EE_TABLES)):
+    ordinary_tables = {model._meta.table_name for model in _ORDINARY_MODELS}
+    allowed_borrowed: tuple[set[str], ...] = (
+        set(),
+        set(_E2EE_TABLES),
+        ordinary_tables,
+        ordinary_tables | {DeviceTrustState._meta.table_name},
+    )
+    if borrowed_tables not in allowed_borrowed:
         raise FreshIngestionRequired(
             "ingestion-v1 store has unexpected or incomplete borrowed tables"
         )
@@ -599,6 +1124,202 @@ def _inspect_existing(
     return owner, state
 
 
+def _authenticate_full_ingestion_graph(
+    connection: SqliteDatabase,
+    *,
+    account_id: str,
+    device_id: str,
+) -> None:
+    """Authenticate every persisted ingestion row without normal owner scopes."""
+
+    # Imported lazily because the row codec imports the pure preflight helpers.
+    from ..ingest.serialization import batch_from_records
+    from ._sync_journal import _ready_member, _renormalized_frame
+    from ._sync_journal_rows import JournalRows
+
+    class BootstrapRows(JournalRows):
+        def __init__(self) -> None:
+            self.account_id = account_id
+            self.device_id = device_id
+
+        def _execute(self, statement: str, parameters: tuple[object, ...] = ()):
+            return connection.execute_sql(statement, parameters)
+
+    rows = BootstrapRows()
+    meta = rows._meta()
+    owner = rows._decode_owner_row(cast("Mapping[str, object]", meta))
+    source_rows = connection.execute_sql(
+        "SELECT * FROM NioIngestSourceState LIMIT 2"
+    ).fetchall()
+    if len(source_rows) != 1:
+        raise JournalIntegrityError("ingestion source row cardinality is not one")
+    source_state = rows._decode_source_row(
+        cast("Mapping[str, object]", source_rows[0]), owner
+    )
+    if (
+        owner.next_source_epoch > owner.revision + 1
+        or source_state.source_epoch != owner.next_source_epoch - 1
+        or source_state.next_request_id > owner.revision
+    ):
+        raise JournalIntegrityError("persisted Source epoch is outside owner frontier")
+
+    headers = rows._load_authenticated_frame_headers(owner)
+    if len({(header.source_epoch, header.request_id) for header in headers}) != len(
+        headers
+    ) or len({header.staged_revision for header in headers}) != len(headers):
+        raise JournalIntegrityError("persisted Frame ordering identity is duplicated")
+    frame_ids = rows._classify_frame_ids()
+    if frame_ids != {header.frame_id for header in headers}:
+        raise JournalIntegrityError("authenticated Frame inventory changed")
+    normalized_frames = []
+    for header in headers:
+        if (
+            header.staged_revision > owner.revision
+            or header.staged_revision < header.source_epoch + header.request_id + 1
+            or not 0 <= header.source_epoch < owner.next_source_epoch
+            or header.source_epoch == source_state.source_epoch
+            and header.request_id >= source_state.next_request_id
+        ):
+            raise JournalIntegrityError("persisted Frame is outside owner frontier")
+        stored = rows._frame_row(header.frame_id)
+        if (
+            rows._frame_drain_row_from_full(
+                cast("Mapping[str, object]", stored),
+                owner,
+                authenticate=True,
+            )
+            != header
+        ):
+            raise JournalIntegrityError("authenticated Frame header changed")
+        staged = rows._decode_frame_row(
+            header.frame_id,
+            cast("Mapping[str, object]", stored),
+            owner,
+            drain_header_authenticated=True,
+        )
+        normalized_frames.append((header, staged, _renormalized_frame(owner, staged)))
+    if any(
+        (successor[0].source_epoch, successor[0].request_id)
+        <= (previous[0].source_epoch, previous[0].request_id)
+        for previous, successor in zip(normalized_frames, normalized_frames[1:])
+    ):
+        raise JournalIntegrityError("persisted Frame revision order is invalid")
+    by_source = normalized_frames
+    for previous, successor in zip(by_source, by_source[1:]):
+        previous_header, _previous_staged, previous_normalized = previous
+        successor_header, successor_staged, _successor_normalized = successor
+        if (
+            successor_header.source_epoch == previous_header.source_epoch
+            and successor_header.request_id == previous_header.request_id + 1
+            and successor_staged.response.request.request_cursor_json
+            != previous_normalized.candidate_cursor_json
+        ):
+            raise JournalIntegrityError("persisted Frame cursor chain is broken")
+    current = [
+        item for item in by_source if item[0].source_epoch == source_state.source_epoch
+    ]
+    if current and current[-1][0].request_id == source_state.next_request_id - 1:
+        if current[-1][2].candidate_cursor_json != source_state.cursor_json:
+            raise JournalIntegrityError("persisted Frame tail does not match Source")
+
+    inventory = rows._load_task3_work_inventory(owner)
+    headers_by_id = {str(header.frame_id): header for header in headers}
+    aggregate_ids = connection.execute_sql(
+        "SELECT room_id FROM NioIngestRoomAggregate ORDER BY room_id"
+    ).fetchall()
+    if any(type(row[0]) is not str or not row[0] for row in aggregate_ids):
+        raise JournalIntegrityError("persisted Aggregate room identity is invalid")
+    if len({row[0] for row in aggregate_ids}) != len(aggregate_ids):
+        raise JournalIntegrityError("persisted Aggregate identity is duplicated")
+    aggregates: dict[str, RoomAggregateValue] = {}
+    for (room_id,) in aggregate_ids:
+        loaded = rows._load_room_aggregate(owner, room_id)
+        if loaded is None:
+            raise JournalIntegrityError("persisted Aggregate disappeared")
+        aggregates[room_id] = loaded[1]
+        hydration = loaded[1].pending_hydration
+        if (
+            hydration is not None
+            and hydration.origin.source_epoch >= owner.next_source_epoch
+            or hydration is not None
+            and hydration.origin.source_epoch == source_state.source_epoch
+            and hydration.origin.request_id >= source_state.next_request_id
+        ):
+            raise JournalIntegrityError("Aggregate origin exceeds source frontier")
+
+    held_identities: set[tuple[str, int, int]] = set()
+    for storage, authenticated in zip(
+        inventory.storage_rows, inventory.work, strict=True
+    ):
+        origin = authenticated.value.origin
+        if type(origin) is not RecordOrigin:
+            raise JournalIntegrityError("Work origin is not transport-bound")
+        if origin.source_epoch >= owner.next_source_epoch:
+            raise JournalIntegrityError("Work origin exceeds source frontier")
+        if (
+            origin.source_epoch == source_state.source_epoch
+            and origin.request_id >= source_state.next_request_id
+        ):
+            raise JournalIntegrityError("Work request exceeds source frontier")
+        retained = headers_by_id.get(cast("str", storage[4]))
+        if retained is not None and (
+            retained.room_materialized_revision is None
+            or retained.room_materialized_revision != storage[10]
+            or (retained.source_epoch, retained.request_id)
+            != (origin.source_epoch, origin.request_id)
+        ):
+            raise JournalIntegrityError("Work does not match retained Frame")
+        if authenticated.status != "held":
+            continue
+        room_id, membership_epoch, room_sequence = cast(
+            "tuple[str, int, int]", storage[5:8]
+        )
+        identity = (room_id, membership_epoch, room_sequence)
+        if identity in held_identities:
+            raise JournalIntegrityError("HELD Work identity is duplicated")
+        held_identities.add(identity)
+        aggregate = aggregates.get(room_id)
+        if (
+            aggregate is None
+            or aggregate.pending_hydration is None
+            or aggregate.continuity.membership_epoch != membership_epoch
+            or room_sequence >= aggregate.next_room_sequence
+        ):
+            raise JournalIntegrityError("HELD Work does not match Aggregate frontier")
+
+    delivery = _decode_delivery_state(cast("Mapping[str, object]", meta), owner)
+    if delivery.next_sequence > owner.revision or (
+        delivery.outstanding_ready_revision is not None
+        and delivery.outstanding_ready_revision >= owner.revision
+    ):
+        raise JournalIntegrityError("persisted delivery state is invalid")
+    if delivery.outstanding_work_id is not None:
+        work_id, ready_revision, ordinal, digest = cast(
+            "tuple[str, int, int, bytes]", delivery[2:]
+        )
+        member = _ready_member(
+            inventory,
+            (ready_revision, ordinal, work_id),
+        )
+        if member is None:
+            raise JournalIntegrityError("claimed Work is missing or moved")
+        if _ready_member(inventory) != member:
+            raise JournalIntegrityError("claimed Work is not the FIFO READY member")
+        batch = batch_from_records(
+            account_id=owner.account_id,
+            device_id=owner.device_id,
+            consumer_generation=owner.consumer_generation,
+            stream_id=owner.stream_id,
+            sequence=delivery.next_sequence - 1,
+            created_revision=ready_revision,
+            records=(member[2],),
+        )
+        if batch.ref.sha256 != digest:
+            raise JournalIntegrityError("claimed Work does not match batch digest")
+    if connection.execute_sql("PRAGMA foreign_key_check").fetchall():
+        raise FreshIngestionRequired("marked ingestion store has FK violations")
+
+
 @dataclass(frozen=True)
 class OpenedJournalDatabase:
     path: Path
@@ -614,20 +1335,49 @@ def open_journal_database(
     device_id: str,
     consumer_generation: UUID,
     source: SourceConfig,
+    pickle_key: str,
     sqlite_busy_timeout_ms: int,
     statement_observer: Callable[[str], None] | None,
     transition_statement_hook: Callable[[str], None] | None,
     schema_statement_hook: Callable[[str], None] | None,
+    configured_source_store_class: type[MatrixStore] | None = None,
+    configured_store_path: Path | None = None,
+    adoption_statement_hook: Callable[[str], None] | None = None,
 ) -> OpenedJournalDatabase:
     if type(consumer_generation) is not UUID:
         raise TypeError("consumer_generation must be UUID")
     source_transport(source)
     path = database_path(database)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    owner = IngestionStoreOwner(path, sqlite_busy_timeout_ms, statement_observer)
+    if configured_source_store_class is not None:
+        try:
+            configured_stat = path.lstat()
+        except FileNotFoundError:
+            configured_stat = None
+        if (
+            configured_stat is None
+            or not stat.S_ISREG(configured_stat.st_mode)
+            or configured_stat.st_size == 0
+            or configured_stat.st_nlink != 1
+        ):
+            raise FreshIngestionRequired(
+                "configured adoption requires an existing singly linked store"
+            )
+    if configured_source_store_class is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    owner = IngestionStoreOwner(
+        path,
+        sqlite_busy_timeout_ms,
+        statement_observer,
+        require_nonempty=configured_source_store_class is not None,
+    )
     connection = owner.database
     try:
+        connection.execute_sql("PRAGMA secure_delete = FAST")
         if owner.is_fresh:
+            if configured_source_store_class is not None:
+                raise FreshIngestionRequired(
+                    "configured adoption requires a populated v10 store"
+                )
             connection.execute_sql("PRAGMA foreign_keys = ON")
             connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
             writer_epoch = uuid4()
@@ -642,6 +1392,79 @@ def open_journal_database(
                     schema_statement_hook,
                 )
         else:
+            from .database import DefaultStore, SqliteStore
+
+            marked = connection.table_exists("NioIngestMeta")
+            if configured_source_store_class is not None and not marked:
+                if not (
+                    configured_source_store_class is DefaultStore
+                    or configured_source_store_class is SqliteStore
+                ):
+                    raise LocalProtocolError(
+                        "configured source store class is unsupported"
+                    )
+                connection.execute_sql("PRAGMA foreign_keys = ON")
+                connection.execute_sql(
+                    f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}"
+                )
+                connection.execute_sql("PRAGMA secure_delete = FAST")
+                _authenticate_ordinary_store(
+                    connection,
+                    source_store_class=configured_source_store_class,
+                    account_id=account_id,
+                    device_id=device_id,
+                    pickle_key=pickle_key,
+                )
+                writer_epoch = uuid4()
+                with owner.bootstrap_write():
+                    stream_id, _source_state = _adopt_populated_store(
+                        connection,
+                        path=path,
+                        store_path=(
+                            configured_store_path
+                            if configured_store_path is not None
+                            else path.parent
+                        ),
+                        source_store_class=configured_source_store_class,
+                        account_id=account_id,
+                        device_id=device_id,
+                        pickle_key=pickle_key,
+                        consumer_generation=consumer_generation,
+                        source=source,
+                        writer_epoch=writer_epoch,
+                        statement_hook=(
+                            adoption_statement_hook or schema_statement_hook
+                        ),
+                    )
+                hook = adoption_statement_hook or schema_statement_hook
+                if hook is not None:
+                    hook("commit")
+                connection.execute_sql("PRAGMA journal_mode = WAL")
+                connection.execute_sql("PRAGMA synchronous = NORMAL")
+                connection.execute_sql("PRAGMA secure_delete = FAST")
+                owner.activate(account_id, writer_epoch)
+                return OpenedJournalDatabase(path, owner, writer_epoch, stream_id)
+
+            if configured_source_store_class is not None:
+                if configured_source_store_class is not SqliteStore:
+                    raise FreshIngestionRequired(
+                        "marked configured reopen requires exact SqliteStore"
+                    )
+                _authenticate_ordinary_store(
+                    connection,
+                    source_store_class=SqliteStore,
+                    account_id=account_id,
+                    device_id=device_id,
+                    pickle_key=pickle_key,
+                )
+            elif _ordinary_table_names(connection) in (
+                frozenset(model._meta.table_name for model in _ORDINARY_MODELS),
+                frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
+                | {DeviceTrustState._meta.table_name},
+            ):
+                raise FreshIngestionRequired(
+                    "populated marked stores require the private configured opener"
+                )
             try:
                 _inspect_existing(
                     connection,
@@ -650,6 +1473,12 @@ def open_journal_database(
                     consumer_generation,
                     source,
                 )
+                if configured_source_store_class is not None:
+                    _authenticate_full_ingestion_graph(
+                        connection,
+                        account_id=account_id,
+                        device_id=device_id,
+                    )
             except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
                 raise FreshIngestionRequired(
                     "nonempty store without a valid ingestion-v1 marker requires "
@@ -659,6 +1488,19 @@ def open_journal_database(
             connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
             sliding_reopened = False
             with owner.bootstrap_write():
+                if configured_source_store_class is not None:
+                    _authenticate_ordinary_store(
+                        connection,
+                        source_store_class=SqliteStore,
+                        account_id=account_id,
+                        device_id=device_id,
+                        pickle_key=pickle_key,
+                    )
+                    _authenticate_full_ingestion_graph(
+                        connection,
+                        account_id=account_id,
+                        device_id=device_id,
+                    )
                 existing_owner, existing_source = _inspect_existing(
                     connection,
                     account_id,
@@ -696,6 +1538,7 @@ def open_journal_database(
 
         connection.execute_sql("PRAGMA journal_mode = WAL")
         connection.execute_sql("PRAGMA synchronous = NORMAL")
+        connection.execute_sql("PRAGMA secure_delete = FAST")
         owner.activate(account_id, writer_epoch)
         return OpenedJournalDatabase(
             path,

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .._atomic_write import atomic_write
 from ..crypto import OlmDevice
 from ..exceptions import OlmTrustError
 from . import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class Key:
@@ -64,19 +67,30 @@ class Ed25519Key(Key):
 
 
 class KeyStore:
-    def __init__(self, filename: str):
+    def __init__(
+        self,
+        filename: str,
+        ownership_assertion: Callable[[], None] | None = None,
+    ):
         self._entries: list[Key] = []
         self._filename: str = filename
+        self._ownership_assertion = ownership_assertion
 
         self._load(filename)
 
+    def _assert_ownership(self) -> None:
+        if self._ownership_assertion is not None:
+            self._ownership_assertion()
+
     def __iter__(self) -> Iterator[Key]:
+        self._assert_ownership()
         yield from self._entries
 
     def __repr__(self) -> str:
         return f"KeyStore object, file: {self._filename}"
 
     def _load(self, filename: str):
+        self._assert_ownership()
         try:
             with open(filename) as f:
                 for line in f:
@@ -95,6 +109,7 @@ class KeyStore:
             pass
 
     def get_key(self, user_id: str, device_id: str) -> Key | None:
+        self._assert_ownership()
         for entry in self._entries:
             if user_id == entry.user_id and device_id == entry.device_id:
                 return entry
@@ -104,6 +119,7 @@ class KeyStore:
     def _save_store(f):
         @wraps(f)
         def decorated(self, *args, **kwargs):
+            self._assert_ownership()
             ret = f(self, *args, **kwargs)
             self._save()
             return ret
@@ -111,10 +127,12 @@ class KeyStore:
         return decorated
 
     def _save(self):
+        self._assert_ownership()
         with atomic_write(self._filename, overwrite=True) as f:
             for entry in self._entries:
                 line = entry.to_line()
                 f.write(line)
+        self._assert_ownership()
 
     @_save_store  # type: ignore
     def add_many(self, keys: list[Key]):
@@ -160,4 +178,5 @@ class KeyStore:
         return False
 
     def check(self, key: Key) -> bool:
+        self._assert_ownership()
         return key in self._entries

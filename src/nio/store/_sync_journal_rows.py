@@ -397,12 +397,28 @@ def _frame_header(frame: StagedFrame, staged_revision: int) -> bytes:
 
 def _frame_drain_sha256(
     owner: OwnerView,
-    values: tuple[object, ...],
+    *,
+    frame_id: UUID,
+    source_epoch: int,
+    request_id: int,
+    staged_revision: int,
+    payload_sha256: bytes,
+    payload_length: int,
+    room_materialized_revision: int | None,
+    callbacks_claimed_revision: int | None,
 ) -> bytes:
-    clear = [str(values[0]), *values[1:]]
-    clear[4] = base64.b64encode(cast("bytes", clear[4])).decode()
+    clear = (
+        str(frame_id),
+        source_epoch,
+        request_id,
+        staged_revision,
+        base64.b64encode(payload_sha256).decode(),
+        payload_length,
+        room_materialized_revision,
+        callbacks_claimed_revision,
+    )
     bound = owner.account_id, owner.stream_id, owner.transport_kind
-    return _row(bound, "NioIngestFrameDrainHeader", None, header=tuple(clear))
+    return _row(bound, "NioIngestFrameDrainHeader", None, header=clear)
 
 
 class _FrameDrainRow(NamedTuple):
@@ -415,6 +431,7 @@ class _FrameDrainRow(NamedTuple):
     payload_sha256: bytes
     payload_length: int
     room_materialized_revision: int | None
+    callbacks_claimed_revision: int | None
     drain_header_sha256: bytes
 
 
@@ -605,6 +622,7 @@ class JournalRows:
             staged_revision = row["staged_revision"]
             payload_sha256 = row["payload_sha256"]
             room_materialized_revision = row["room_materialized_revision"]
+            callbacks_claimed_revision = row["callbacks_claimed_revision"]
             drain_header_sha256 = row["drain_header_sha256"]
             if (
                 type(account_id) is not str
@@ -629,6 +647,11 @@ class JournalRows:
                 or room_materialized_revision < 1
             ):
                 raise ValueError("frame materialized revision is invalid")
+            if callbacks_claimed_revision is not None and (
+                type(callbacks_claimed_revision) is not int
+                or callbacks_claimed_revision < 1
+            ):
+                raise ValueError("frame callback claim revision is invalid")
             drain_row = _FrameDrainRow(
                 account_id,
                 raw_frame_id,
@@ -639,16 +662,32 @@ class JournalRows:
                 payload_sha256,
                 payload_length,
                 room_materialized_revision,
+                callbacks_claimed_revision,
                 drain_header_sha256,
             )
             if authenticate and (
-                _frame_drain_sha256(owner, drain_row[2:-1]) != drain_header_sha256
+                _frame_drain_sha256(
+                    owner,
+                    frame_id=drain_row.frame_id,
+                    source_epoch=drain_row.source_epoch,
+                    request_id=drain_row.request_id,
+                    staged_revision=drain_row.staged_revision,
+                    payload_sha256=drain_row.payload_sha256,
+                    payload_length=drain_row.payload_length,
+                    room_materialized_revision=drain_row.room_materialized_revision,
+                    callbacks_claimed_revision=drain_row.callbacks_claimed_revision,
+                )
+                != drain_header_sha256
             ):
                 raise ValueError("frame drain header proof is not empty")
             if room_materialized_revision is not None and not (
                 staged_revision < room_materialized_revision <= owner.revision
             ):
                 raise ValueError("frame materialized revision is invalid")
+            if callbacks_claimed_revision is not None and not (
+                staged_revision < callbacks_claimed_revision <= owner.revision
+            ):
+                raise ValueError("frame callback claim revision is invalid")
             return drain_row
         except JournalIntegrityError:
             raise
@@ -665,7 +704,8 @@ class JournalRows:
             "SELECT account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload_sha256, "
             "LENGTH(payload) AS payload_length, "
-            "room_materialized_revision, drain_header_sha256 "
+            "room_materialized_revision, callbacks_claimed_revision, "
+            "drain_header_sha256 "
             "FROM NioIngestFrame LIMIT ?",
             (_FRAME_CLASSIFICATION_LIMIT,),
         ).fetchall()
@@ -1092,22 +1132,22 @@ class JournalRows:
         request = frame.response.request
         drain_header_sha256 = _frame_drain_sha256(
             owner,
-            (
-                frame.frame_id,
-                request.source_epoch,
-                request.request_id,
-                staged_revision,
-                digest,
-                len(payload),
-                None,
-            ),
+            frame_id=frame.frame_id,
+            source_epoch=request.source_epoch,
+            request_id=request.request_id,
+            staged_revision=staged_revision,
+            payload_sha256=digest,
+            payload_length=len(payload),
+            room_materialized_revision=None,
+            callbacks_claimed_revision=None,
         )
         return self._execute(  # type: ignore[attr-defined]
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload, payload_sha256, "
-            "room_materialized_revision, drain_header_sha256"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "room_materialized_revision, callbacks_claimed_revision, "
+            "drain_header_sha256"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self.account_id,
                 str(frame.frame_id),
@@ -1116,6 +1156,7 @@ class JournalRows:
                 staged_revision,
                 payload,
                 digest,
+                None,
                 None,
                 drain_header_sha256,
             ),
