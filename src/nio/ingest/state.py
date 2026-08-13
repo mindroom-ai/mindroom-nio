@@ -45,8 +45,8 @@ class OwnerView:
             raise ValueError("account_id must not be empty")
         if not self.device_id:
             raise ValueError("device_id must not be empty")
-        if self.schema_version != 2:
-            raise ValueError("schema_version must be 2")
+        if self.schema_version != 1:
+            raise ValueError("schema_version must be 1")
         if self.next_source_epoch < 1:
             raise ValueError("next_source_epoch must be positive")
 

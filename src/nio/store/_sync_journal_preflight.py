@@ -23,7 +23,6 @@ from ..ingest.config import (
     SourceConfig,
     source_transport,
 )
-from ..ingest.diagnostic import DiagnosticIngestionScope
 from ..ingest.errors import FreshIngestionRequired, JournalIntegrityError
 from ..ingest.model import TransportKind
 from ..ingest.sliding import (
@@ -31,7 +30,6 @@ from ..ingest.sliding import (
     SlidingRangeAckMode,
     _sliding_cursor_from_json,
     canonical_sliding_cursor,
-    sliding_request_config_sha256,
 )
 from ..ingest.source import (
     ClassicCursor,
@@ -177,11 +175,11 @@ def validate_schema_topology(connection: SqliteDatabase) -> None:
     try:
         if _capture_contract(connection) != _expected_contract():
             raise FreshIngestionRequired(
-                "ingestion-v2 schema topology does not match v2"
+                "ingestion-v1 schema topology does not match v1"
             )
     except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
         raise FreshIngestionRequired(
-            "ingestion-v2 schema topology is invalid"
+            "ingestion-v1 schema topology is invalid"
         ) from error
 
 
@@ -224,31 +222,6 @@ def _cold_source_cursor(source: SourceConfig) -> bytes:
     )
 
 
-def _validate_diagnostic_scope_input(
-    account_id: str,
-    source: SourceConfig,
-    scope: DiagnosticIngestionScope | None,
-) -> None:
-    transport = source_transport(source)
-    if scope is not None and type(scope) is not DiagnosticIngestionScope:
-        raise TypeError("diagnostic_scope must be DiagnosticIngestionScope or None")
-    if transport is TransportKind.CLASSIC:
-        if scope is not None:
-            raise LocalProtocolError("Classic ingestion cannot have a diagnostic scope")
-        return
-    if scope is not None and scope.account_id != account_id:
-        raise LocalProtocolError("diagnostic scope account_id does not match")
-    if type(source) is not SlidingSourceConfig:
-        raise AssertionError("sliding transport requires SlidingSourceConfig")
-    if (
-        scope is not None
-        and scope.request_config_sha256 != sliding_request_config_sha256(source)
-    ):
-        raise LocalProtocolError(
-            "diagnostic scope request configuration does not match source"
-        )
-
-
 def _canonical_internal(value: object) -> bytes:
     return json.dumps(
         value,
@@ -264,11 +237,6 @@ _STORED_ROWS = {
     "NioIngestFrameDrainHeader": "frame frame_id source_epoch request_id staged_revision payload_sha256 payload_length room_materialized_revision",
     "NioIngestRoomAggregate": "aggregate room_id updated_revision intent_kind",
     "NioIngestWork": "work work_id kind status frame_id room_id membership_epoch room_sequence ready_revision ready_ordinal created_revision",
-    "NioIngestDiagnosticScope": "diagnostic_scope delivery_room_id control_room_id list_name range_start range_end request_config_sha256 created_revision",
-    "NioIngestListObservation": "list_observation observation_id frame_id source_epoch request_id list_name transition target_present control_present created_revision",
-    "NioIngestEventReceipt": "event_receipt receipt_id room_id event_id stable_event_sha256 first_frame_id first_source_sha256 work_id fate delivery_sequence delivery_batch_sha256 acknowledged_revision created_revision updated_revision",
-    "NioIngestEventOccurrence": "event_occurrence occurrence_id receipt_id frame_id source_epoch request_id source_sha256 provenance disposition created_revision",
-    "NioIngestSourceRotation": "source_rotation successor_source_epoch successor_request_id reason predecessor_source_epoch predecessor_request_id predecessor_cursor_sha256 predecessor_connection_sha256 predecessor_pos_present successor_cursor_sha256 successor_connection_sha256 successor_pos_present first_successor_request_sha256 first_successor_frame_id first_successor_source_sha256 created_revision",
 }
 
 
@@ -286,7 +254,7 @@ def _row(
     clear = [*header] if isinstance(header, tuple) else load_internal_json(header, kind)
     prefix = _canonical_internal(
         {
-            "schema_version": 2,
+            "schema_version": 1,
             "row_kind": kind,
             "account_id": owner[0],
             "stream_id": str(owner[1]),
@@ -360,7 +328,6 @@ def _create_fresh(
     consumer_generation: UUID,
     source: SourceConfig,
     writer_epoch: UUID,
-    diagnostic_scope: DiagnosticIngestionScope | None,
     statement_hook: Callable[[str], None] | None,
 ) -> tuple[UUID, SourceState]:
     transport_kind = source_transport(source)
@@ -415,29 +382,6 @@ def _create_fresh(
     )
     if statement_hook is not None:
         statement_hook("insert_source")
-    if diagnostic_scope is not None:
-        from ._sync_journal_diagnostic_rows import diagnostic_scope_row
-
-        scope_payload, scope_digest = diagnostic_scope_row(owner, diagnostic_scope)
-        connection.execute_sql(
-            "INSERT INTO NioIngestDiagnosticScope ("
-            "account_id, delivery_room_id, control_room_id, list_name, "
-            "range_start, range_end, request_config_sha256, created_revision, "
-            "payload, payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-            (
-                account_id,
-                diagnostic_scope.delivery_room_id,
-                diagnostic_scope.control_room_id,
-                diagnostic_scope.list_name,
-                diagnostic_scope.range_start,
-                diagnostic_scope.range_end,
-                diagnostic_scope.request_config_sha256,
-                scope_payload,
-                scope_digest,
-            ),
-        )
-        if statement_hook is not None:
-            statement_hook("insert_diagnostic_scope")
     return stream_id, source_state
 
 
@@ -447,7 +391,6 @@ def _inspect_existing(
     device_id: str,
     consumer_generation: UUID,
     source: SourceConfig,
-    diagnostic_scope: DiagnosticIngestionScope | None,
 ) -> tuple[UUID, str]:
     validate_schema_topology(connection)
     all_tables = {
@@ -460,17 +403,17 @@ def _inspect_existing(
     borrowed_tables = {name for name in all_tables if not name.startswith("NioIngest")}
     if borrowed_tables not in (set(), set(_E2EE_TABLES)):
         raise FreshIngestionRequired(
-            "ingestion-v2 store has unexpected or incomplete borrowed tables"
+            "ingestion-v1 store has unexpected or incomplete borrowed tables"
         )
     if borrowed_tables:
         versions = connection.execute_sql("SELECT version FROM storeversion").fetchall()
         if len(versions) != 1 or versions[0][0] != 10:
             raise FreshIngestionRequired(
-                "ingestion-v2 store has an unsupported borrowed schema"
+                "ingestion-v1 store has an unsupported borrowed schema"
             )
     rows = connection.execute_sql("SELECT * FROM NioIngestMeta LIMIT 2").fetchall()
     if len(rows) != 1:
-        raise FreshIngestionRequired("ingestion-v2 marker row cardinality is not one")
+        raise FreshIngestionRequired("ingestion-v1 marker row cardinality is not one")
     row = rows[0]
     if row["account_id"] != account_id:
         raise FreshIngestionRequired("ingestion account_id does not match")
@@ -552,49 +495,6 @@ def _inspect_existing(
     except (TypeError, ValueError) as error:
         raise JournalIntegrityError("persisted source state is invalid") from error
     _validate_source_cursor(transport_kind, state.cursor_json)
-
-    from contextlib import nullcontext
-
-    from ._sync_journal_diagnostic_rows import DiagnosticJournalRows
-    from ._sync_journal_rows import JournalRows
-
-    class _PreflightRows(DiagnosticJournalRows, JournalRows):
-        def __init__(self) -> None:
-            self.account_id = account_id
-            self.device_id = device_id
-
-        def _execute(self, statement: str, parameters: tuple[object, ...] = ()):
-            return connection.execute_sql(statement, parameters)
-
-        @staticmethod
-        def _read():
-            return nullcontext()
-
-    authenticated = _PreflightRows()
-    authenticated_owner = authenticated.load_owner()
-    authenticated_source = authenticated.load_source()
-    if authenticated_owner != owner or authenticated_source != state:
-        raise JournalIntegrityError("preflight owner/source snapshot changed")
-    authenticated.list_frames(256)
-    authenticated._load_task3_work_inventory(owner)
-    aggregate_rows = connection.execute_sql(
-        "SELECT account_id, room_id FROM NioIngestRoomAggregate LIMIT 20001"
-    ).fetchall()
-    if len(aggregate_rows) > 20_000:
-        raise JournalIntegrityError("room Aggregate inventory exceeds its cap")
-    for aggregate_account_id, room_id in aggregate_rows:
-        if (
-            aggregate_account_id != account_id
-            or type(room_id) is not str
-            or not room_id
-        ):
-            raise JournalIntegrityError("room Aggregate identity is invalid")
-        if authenticated._load_room_aggregate(owner, room_id) is None:
-            raise JournalIntegrityError("room Aggregate disappeared during preflight")
-    stored_scope = authenticated._load_diagnostic_scope(owner)
-    authenticated._load_diagnostic_inventory(owner)
-    if stored_scope != diagnostic_scope:
-        raise LocalProtocolError("persisted diagnostic scope does not match")
     return stream_id, row["writer_epoch"]
 
 
@@ -613,7 +513,6 @@ def open_journal_database(
     device_id: str,
     consumer_generation: UUID,
     source: SourceConfig,
-    diagnostic_scope: DiagnosticIngestionScope | None,
     sqlite_busy_timeout_ms: int,
     statement_observer: Callable[[str], None] | None,
     schema_statement_hook: Callable[[str], None] | None,
@@ -621,7 +520,6 @@ def open_journal_database(
     if type(consumer_generation) is not UUID:
         raise TypeError("consumer_generation must be UUID")
     source_transport(source)
-    _validate_diagnostic_scope_input(account_id, source, diagnostic_scope)
     path = database_path(database)
     path.parent.mkdir(parents=True, exist_ok=True)
     owner = IngestionStoreOwner(path, sqlite_busy_timeout_ms, statement_observer)
@@ -639,7 +537,6 @@ def open_journal_database(
                     consumer_generation,
                     source,
                     writer_epoch,
-                    diagnostic_scope,
                     schema_statement_hook,
                 )
         else:
@@ -650,11 +547,10 @@ def open_journal_database(
                     device_id,
                     consumer_generation,
                     source,
-                    diagnostic_scope,
                 )
             except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
                 raise FreshIngestionRequired(
-                    "nonempty store without a valid ingestion-v2 marker requires "
+                    "nonempty store without a valid ingestion-v1 marker requires "
                     "fresh initialization"
                 ) from error
             connection.execute_sql("PRAGMA foreign_keys = ON")

@@ -21,7 +21,6 @@ from ..ingest.config import (
     SourceConfig,
     source_transport,
 )
-from ..ingest.diagnostic import DiagnosticIngestionScope
 from ..ingest.errors import JournalConflictError, JournalIntegrityError
 from ..ingest.hydration import (
     HydrationResult,
@@ -38,7 +37,6 @@ from ..ingest.source import (
     renormalize_staged_frame,
 )
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
-from ._sync_journal_diagnostic_rows import DiagnosticJournalRows
 from ._sync_journal_plan import (
     _canonical_work_plaintext,
     _work_id,
@@ -124,8 +122,8 @@ def _diagnostic_admits(room_id: str, frame: SyncFrame, proposal: ingest_reducer.
 # fmt: on
 
 
-class SqliteIngestionJournal(DiagnosticJournalRows, JournalRows):
-    """Direct-SQLite source-state journal for the version-2 checkpoint."""
+class SqliteIngestionJournal(JournalRows):
+    """Direct-SQLite source-state journal for the version-1 checkpoint."""
 
     def __init__(
         self,
@@ -156,7 +154,6 @@ class SqliteIngestionJournal(DiagnosticJournalRows, JournalRows):
         device_id: str,
         consumer_generation: UUID,
         source: SourceConfig,
-        diagnostic_scope: DiagnosticIngestionScope | None = None,
         pickle_key: str = "",
         sqlite_busy_timeout_ms: int = 2_000,
         statement_observer: Callable[[str], None] | None = None,
@@ -181,7 +178,6 @@ class SqliteIngestionJournal(DiagnosticJournalRows, JournalRows):
             device_id=device_id,
             consumer_generation=consumer_generation,
             source=source,
-            diagnostic_scope=diagnostic_scope,
             sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
             statement_observer=statement_observer,
             schema_statement_hook=schema_statement_hook,

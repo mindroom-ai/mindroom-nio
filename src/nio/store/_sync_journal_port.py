@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from ..ingest.diagnostic import DiagnosticIngestionScope
 from ..ingest.hydration import HydrationResult, PendingHydration
 from ..ingest.model import BatchRef, SyncBatch
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
@@ -15,8 +14,6 @@ class IngestionJournal(Protocol):
     """Source-only durable journal port for ingestion actors and fakes."""
 
     def load_owner(self) -> OwnerView: ...
-
-    def load_diagnostic_scope(self) -> DiagnosticIngestionScope | None: ...
 
     def next_batch(
         self,

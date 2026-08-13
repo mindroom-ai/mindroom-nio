@@ -153,11 +153,6 @@ _TASK6_SCHEMA_OBJECT_ORDER = (
     "NioIngestWork_ready",
     "NioIngestWork_held_release",
     "NioIngestWork_frame_kind",
-    "NioIngestDiagnosticScope",
-    "NioIngestListObservation",
-    "NioIngestEventReceipt",
-    "NioIngestEventOccurrence",
-    "NioIngestSourceRotation",
 )
 _AGGREGATE_COLUMNS = (
     ("account_id", "TEXT", True, 1),
@@ -205,11 +200,6 @@ _TASK6_SCHEMA_OBJECTS = frozenset(
         ("index", "NioIngestWork_ready"),
         ("index", "NioIngestWork_held_release"),
         ("index", "NioIngestWork_frame_kind"),
-        ("table", "NioIngestDiagnosticScope"),
-        ("table", "NioIngestListObservation"),
-        ("table", "NioIngestEventReceipt"),
-        ("table", "NioIngestEventOccurrence"),
-        ("table", "NioIngestSourceRotation"),
     }
 )
 _PRE_TASK4_WORK_ONLY_SCHEMA_OBJECTS = _TASK6_SCHEMA_OBJECTS - {
@@ -773,7 +763,7 @@ def test_materializer_plaintext_aggregate_load_rejects_accidental_corruption(
             digest = hashlib.sha256(payload).digest()
         elif corruption == "semantic":
             envelope = json.loads(payload)
-            envelope["schema_version"] = 3
+            envelope["schema_version"] = 2
             payload = _canonical_internal(envelope)
             digest = hashlib.sha256(payload).digest()
         elif corruption.startswith("context-"):
@@ -945,7 +935,7 @@ def _expected_stored_work_payload(
     )
     return _canonical_internal(
         {
-            "schema_version": 2,
+            "schema_version": 1,
             "row_kind": "work",
             "account_id": account_id,
             "stream_id": str(stream_id),
@@ -3551,7 +3541,6 @@ def test_contract_private_materializer_port_signature_and_no_public_exports() ->
     }
     assert protocol_public_methods == {
         "load_owner",
-        "load_diagnostic_scope",
         "load_source",
         "load_frame",
         "list_frames",
@@ -5145,42 +5134,6 @@ def _open_discovery_journal(
     )
 
 
-def test_classic_v2_store_has_no_diagnostic_scope(tmp_path: Path) -> None:
-    bootstrap = _open_discovery_journal(tmp_path, TransportKind.CLASSIC)
-    try:
-        assert bootstrap.schema_version == 2
-        assert bootstrap._journal.load_diagnostic_scope() is None
-        assert tuple(
-            bootstrap._journal._execute(
-                "SELECT COUNT(*) FROM NioIngestDiagnosticScope"
-            ).fetchone()
-        ) == (0,)
-    finally:
-        bootstrap.close()
-
-    from nio.ingest.diagnostic import DiagnosticIngestionScope
-
-    rejected = tmp_path / "classic-scope-rejected"
-    with pytest.raises(LocalProtocolError, match="Classic.*diagnostic scope"):
-        open_ingestion_store(
-            rejected,
-            account_id=_DISCOVERY_ACCOUNT_ID,
-            device_id=_DISCOVERY_DEVICE_ID,
-            consumer_generation=_CONSUMER_GENERATION,
-            source=_discovery_config(TransportKind.CLASSIC),
-            diagnostic_scope=DiagnosticIngestionScope(
-                _DISCOVERY_ACCOUNT_ID,
-                "!delivery:example.org",
-                "!control:example.org",
-                RESERVED_ALL_ROOMS_LIST,
-                0,
-                0,
-                bytes(32),
-            ),
-        )
-    assert not rejected.exists()
-
-
 def _stage_discovery_frame(
     journal: SqliteIngestionJournal,
     transport: TransportKind,
@@ -5447,7 +5400,7 @@ def _canonical_expected_drain_header(
     owner = journal.load_owner()
     return _canonical_internal(
         {
-            "schema_version": 2,
+            "schema_version": 1,
             "row_kind": "frame",
             "account_id": owner.account_id,
             "stream_id": str(owner.stream_id),
@@ -6466,7 +6419,7 @@ def _sealed_work_values(
     owner = journal.load_owner()
     payload = _canonical_internal(
         {
-            "schema_version": 2,
+            "schema_version": 1,
             "row_kind": "work",
             "account_id": journal.account_id,
             "stream_id": str(owner.stream_id),
@@ -9615,7 +9568,7 @@ def test_materializer_plaintext_inventory_catches_work_row_corruption(
             digest = hashlib.sha256(payload).digest()
         elif corruption == "semantic":
             envelope = json.loads(payload)
-            envelope["schema_version"] = 3
+            envelope["schema_version"] = 2
             payload = _canonical_internal(envelope)
             digest = hashlib.sha256(payload).digest()
         elif corruption.startswith("context-"):
@@ -16520,7 +16473,7 @@ def _expected_plaintext_materializer_envelope(
 
     return json.dumps(
         {
-            "schema_version": 2,
+            "schema_version": 1,
             "row_kind": row_kind,
             "account_id": owner.account_id,
             "stream_id": str(owner.stream_id),

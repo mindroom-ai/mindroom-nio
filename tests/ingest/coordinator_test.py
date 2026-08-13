@@ -336,86 +336,6 @@ def test_open_ingestion_rejects_transport_mismatch_without_consuming_bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_sliding_session_requires_exact_persisted_scope_before_claim(
-    tmp_path,
-) -> None:
-    from dataclasses import replace
-
-    from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import (
-        RESERVED_ALL_ROOMS_LIST,
-        sliding_request_config_sha256,
-    )
-
-    generation = uuid4()
-    source = SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}")
-    config = IngestionConfig(source)
-    scope = DiagnosticIngestionScope(
-        ACCOUNT,
-        ROOM,
-        "!control:example.org",
-        RESERVED_ALL_ROOMS_LIST,
-        0,
-        0,
-        sliding_request_config_sha256(source),
-    )
-    bootstrap = open_ingestion_store(
-        tmp_path,
-        account_id=ACCOUNT,
-        device_id=DEVICE,
-        consumer_generation=generation,
-        source=source,
-        diagnostic_scope=scope,
-    )
-    client = RecordingClient()
-
-    with pytest.raises(LocalProtocolError, match="diagnostic scope"):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=config,
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-            room_id=ROOM,
-            diagnostic_scope=replace(scope, list_name="changed"),
-        )
-
-    with pytest.raises(LocalProtocolError, match="room_id.*diagnostic scope"):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=config,
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-            room_id="!changed:example.org",
-            diagnostic_scope=scope,
-        )
-
-    with pytest.raises(LocalProtocolError, match="request configuration"):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=IngestionConfig(replace(source, timeout_ms=60_000)),
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-            room_id=ROOM,
-            diagnostic_scope=scope,
-        )
-
-    assert client.send_count == 0
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=config,
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-        room_id=ROOM,
-        diagnostic_scope=scope,
-    )
-    await session.close()
-
-
-@pytest.mark.asyncio
 async def test_successful_open_transfers_bootstrap_once(tmp_path) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
@@ -1722,28 +1642,12 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
 ) -> None:
     generation = uuid4()
     config = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
-    from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import (
-        RESERVED_ALL_ROOMS_LIST,
-        sliding_request_config_sha256,
-    )
-
-    scope = DiagnosticIngestionScope(
-        ACCOUNT,
-        ROOM,
-        "!control:example.org",
-        RESERVED_ALL_ROOMS_LIST,
-        0,
-        0,
-        sliding_request_config_sha256(config.source),
-    )
     bootstrap = open_ingestion_store(
         tmp_path,
         account_id=ACCOUNT,
         device_id=DEVICE,
         consumer_generation=generation,
         source=config.source,
-        diagnostic_scope=scope,
     )
     before = bootstrap._journal.load_source()
     client = RecordingClient()
@@ -1755,7 +1659,6 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
         room_id=ROOM,
-        diagnostic_scope=scope,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1903,28 +1806,12 @@ def test_open_ingestion_requires_exact_nonempty_room_id(
 async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> None:
     generation = uuid4()
     config = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
-    from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import (
-        RESERVED_ALL_ROOMS_LIST,
-        sliding_request_config_sha256,
-    )
-
-    scope = DiagnosticIngestionScope(
-        ACCOUNT,
-        ROOM,
-        "!control:example.org",
-        RESERVED_ALL_ROOMS_LIST,
-        0,
-        0,
-        sliding_request_config_sha256(config.source),
-    )
     bootstrap = open_ingestion_store(
         tmp_path,
         account_id=ACCOUNT,
         device_id=DEVICE,
         consumer_generation=generation,
         source=config.source,
-        diagnostic_scope=scope,
     )
     owner = bootstrap._journal.load_owner()
     planned = SlidingSource(
@@ -1942,7 +1829,6 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
         room_id=ROOM,
-        diagnostic_scope=scope,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
