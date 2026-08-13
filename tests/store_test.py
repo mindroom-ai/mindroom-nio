@@ -1149,16 +1149,14 @@ class TestClass:
         ]
         sqlstore.save_recovery(None, set(), [gap], events, None)
         table = PendingTimelineEvents._meta.table_name
-        sqlstore.database.execute_sql(
-            f"""
+        sqlstore.database.execute_sql(f"""
             CREATE TEMP TRIGGER fail_second_accept
             BEFORE UPDATE OF admission_accepted ON "{table}"
             WHEN NEW.event_id = '$two'
             BEGIN
                 SELECT RAISE(ABORT, 'injected acceptance failure');
             END
-            """
-        )
+            """)
 
         with pytest.raises(IntegrityError, match="injected acceptance failure"):
             sqlstore.accept_recovery_events(
@@ -1316,16 +1314,14 @@ class TestClass:
         ]
         sqlstore.save_recovery(None, set(), [gap], events, None)
         table = PendingTimelineEvents._meta.table_name
-        sqlstore.database.execute_sql(
-            f"""
+        sqlstore.database.execute_sql(f"""
             CREATE TEMP TRIGGER fail_second_completion
             BEFORE INSERT ON "{table}"
             WHEN NEW.event_id = '$two' AND NEW.generation = 0
             BEGIN
                 SELECT RAISE(ABORT, 'injected completion failure');
             END
-            """
-        )
+            """)
 
         with pytest.raises(IntegrityError, match="injected completion failure"):
             sqlstore.finish_recovery_events(
