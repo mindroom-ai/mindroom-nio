@@ -169,7 +169,7 @@ class MatrixStore:
             self.database_path,
             pragmas={
                 "foreign_keys": 1,
-                "secure_delete": 1,
+                "secure_delete": "fast",
             },
         )
 
