@@ -9314,10 +9314,60 @@ def _materializer_storage_graph(
 def _assert_materializer_reopened_graph(
     journal: SqliteIngestionJournal,
     expected: _MaterializerStorageGraph,
+    *,
+    sliding_reopens: int = 0,
 ) -> None:
     actual = _materializer_storage_graph(journal)
-    assert actual[0] == replace(expected[0], writer_epoch=journal.writer_epoch)
-    assert actual[1:] == expected[1:]
+    if sliding_reopens:
+        _assert_materializer_sliding_reopen_state(
+            actual[0],
+            actual[1],
+            expected[0],
+            expected[1],
+            sliding_reopens=sliding_reopens,
+            revision_delta=sliding_reopens,
+        )
+    else:
+        assert actual[0] == replace(expected[0], writer_epoch=journal.writer_epoch)
+        assert actual[1] == expected[1]
+    assert actual[2:] == expected[2:]
+
+
+def _assert_materializer_sliding_reopen_state(
+    owner: OwnerView,
+    source_state: SourceState,
+    old_owner: OwnerView,
+    old_source: SourceState,
+    *,
+    sliding_reopens: int,
+    revision_delta: int,
+) -> None:
+    assert sliding_reopens > 0
+    assert owner == replace(
+        old_owner,
+        revision=old_owner.revision + revision_delta,
+        writer_epoch=owner.writer_epoch,
+        next_source_epoch=old_owner.next_source_epoch + sliding_reopens,
+    )
+    assert owner.writer_epoch != old_owner.writer_epoch
+    assert source_state == replace(
+        old_source,
+        source_epoch=old_owner.next_source_epoch + sliding_reopens - 1,
+        cursor_json=source_state.cursor_json,
+        next_request_id=0,
+    )
+    old_cursor = sliding_module._sliding_cursor_from_json(old_source.cursor_json)
+    cursor = sliding_module._sliding_cursor_from_json(source_state.cursor_json)
+    assert cursor == SlidingCursor(
+        pos=None,
+        to_device_since=old_cursor.to_device_since,
+        connection_instance=cursor.connection_instance,
+        connection_name=old_cursor.connection_name,
+        all_rooms_range_end=old_cursor.all_rooms_range_end,
+        all_rooms_page_size=old_cursor.all_rooms_page_size,
+        all_rooms_range_ack_mode=SlidingRangeAckMode.UNKNOWN,
+        all_rooms_coverage_complete=False,
+    )
 
 
 def _prepare_materializer_atomicity_case(
@@ -9580,12 +9630,12 @@ def _atomicity_retirement_expectations(
     stream_id: UUID,
     case: _MaterializerAtomicityCase,
     revision: int,
+    first_revision: int,
 ) -> tuple[RoomAggregateValue, tuple[_ExpectedMaterializerWork, ...]]:
     first = case.first
     first_normalized = case.first_normalized
     assert first is not None
     assert first_normalized is not None
-    first_revision = revision - 2
     first_aggregate, first_work = _atomicity_h1_expectations(
         stream_id,
         first,
@@ -9783,16 +9833,30 @@ def _assert_materializer_committed_graph(
     scenario: str,
     case: _MaterializerAtomicityCase,
     old_graph: _MaterializerStorageGraph,
+    *,
+    sliding_reopens_before: int = 0,
+    sliding_reopens_after: int = 0,
 ) -> None:
-    old_owner, old_source, old_frames, _old_aggregates, old_work = old_graph
+    old_owner, old_source, old_frames, old_aggregates, old_work = old_graph
     owner, source, frames, aggregates, work = _materializer_storage_graph(journal)
-    revision = old_owner.revision + 1
-    assert owner == replace(
-        old_owner,
-        revision=revision,
-        writer_epoch=journal.writer_epoch,
-    )
-    assert source == old_source
+    revision = old_owner.revision + sliding_reopens_before + 1
+    sliding_reopens = sliding_reopens_before + sliding_reopens_after
+    if sliding_reopens:
+        _assert_materializer_sliding_reopen_state(
+            owner,
+            source,
+            old_owner,
+            old_source,
+            sliding_reopens=sliding_reopens,
+            revision_delta=sliding_reopens + 1,
+        )
+    else:
+        assert owner == replace(
+            old_owner,
+            revision=revision,
+            writer_epoch=journal.writer_epoch,
+        )
+        assert source == old_source
     assert len(aggregates) == 1
 
     if scenario == _ATOMICITY_H1_CLASSIC_PLAIN:
@@ -9826,11 +9890,14 @@ def _assert_materializer_committed_graph(
         old_work = ()
     else:
         assert scenario == _ATOMICITY_RETIREMENT_SLIDING_CRYPTO
-        assert old_owner.revision == 3
+        assert len(old_aggregates) == 1
+        first_revision = old_aggregates[0][1]
+        assert type(first_revision) is int
         expected_aggregate, expected_work = _atomicity_retirement_expectations(
             owner.stream_id,
             case,
             revision,
+            first_revision,
         )
         first = case.first
         assert first is not None
@@ -13615,12 +13682,15 @@ def test_materializer_crash_boundary_reopens_old_or_complete_new_graph(
     reopened = _open_discovery_journal(store_path, transport)
     journal = reopened._journal
     try:
+        sliding_reopens = 2 if transport is TransportKind.SLIDING else 0
         if boundary == "commit":
             _assert_materializer_committed_graph(
                 journal,
                 scenario,
                 case,
                 old_graph,
+                sliding_reopens_before=sliding_reopens // 2,
+                sliding_reopens_after=sliding_reopens // 2,
             )
             committed_graph = _materializer_storage_graph(journal)
             assert _materialize(journal) == MaterializeResult(
@@ -13630,17 +13700,22 @@ def test_materializer_crash_boundary_reopens_old_or_complete_new_graph(
             )
             assert _materializer_storage_graph(journal) == committed_graph
         else:
-            _assert_materializer_reopened_graph(journal, old_graph)
+            _assert_materializer_reopened_graph(
+                journal,
+                old_graph,
+                sliding_reopens=sliding_reopens,
+            )
             assert _materialize(journal) == MaterializeResult(
                 MaterializeStatus.MATERIALIZED,
                 selected.frame_id,
-                old_graph[0].revision + 1,
+                old_graph[0].revision + sliding_reopens + 1,
             )
             _assert_materializer_committed_graph(
                 journal,
                 scenario,
                 case,
                 old_graph,
+                sliding_reopens_before=sliding_reopens,
             )
             committed_graph = _materializer_storage_graph(journal)
             assert _materialize(journal) == MaterializeResult(

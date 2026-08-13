@@ -26,9 +26,9 @@ from ..ingest.hydration import (
     revalidated_hydration_result,
 )
 from ..ingest.model import BatchRef, EventRecord, TransportKind
-from ..ingest.ports import _revalidated_staged_source_response
+from ..ingest.ports import NetworkRequest, _revalidated_staged_source_response
 from ..ingest.serialization import batch_from_records, canonical_batch_payload
-from ..ingest.sliding import SlidingSource
+from ..ingest.sliding import SlidingSource, _sliding_cursor_from_json
 from ..ingest.source import SyncFrame, _frame_room_ids, renormalize_staged_frame
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
@@ -39,6 +39,8 @@ from ._sync_journal_plan import (
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
     _decode_delivery_state,
+    _different_uuid,
+    _rotate_sliding_source,
     open_journal_database,
 )
 from ._sync_journal_rows import (
@@ -156,6 +158,7 @@ class SqliteIngestionJournal(JournalRows):
             source=source,
             sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
             statement_observer=statement_observer,
+            transition_statement_hook=transition_statement_hook,
             schema_statement_hook=schema_statement_hook,
         )
         return cls(
@@ -211,6 +214,60 @@ class SqliteIngestionJournal(JournalRows):
         cursor = self._execute(statement, parameters)
         self._transition_hook(label)
         return cursor
+
+    def _reset_sliding_source(
+        self,
+        *,
+        request: NetworkRequest,
+    ) -> CommitResult | None:
+        if type(request) is not NetworkRequest:
+            raise TypeError("request must be NetworkRequest")
+        request = NetworkRequest(
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            request.method,
+            request.path,
+            request.query,
+            request.body,
+            request.timeout_ms,
+            request.request_cursor_json,
+        )
+
+        with self._transaction():
+            owner, source = self._load_stage_snapshot()
+            _decode_delivery_state(
+                cast("Mapping[str, object]", self._meta()),
+                owner,
+            )
+            if (
+                owner.transport_kind is not TransportKind.SLIDING
+                or source.transport_kind is not TransportKind.SLIDING
+                or request.transport is not TransportKind.SLIDING
+                or request.stream_id != owner.stream_id
+                or request.source_epoch != source.source_epoch
+                or request.request_id != source.next_request_id
+                or request.request_cursor_json != source.cursor_json
+            ):
+                return None
+            if _sliding_cursor_from_json(source.cursor_json).pos is None:
+                return None
+
+            old_writer_epoch = owner.writer_epoch
+            new_writer_epoch = _different_uuid(old_writer_epoch)
+            _rotate_sliding_source(
+                self._owner.database,
+                owner=owner,
+                source=source,
+                writer_epoch=new_writer_epoch,
+                transition_hook=self._transition_statement_hook,
+            )
+
+        self._owner._handoff_writer_epoch(old_writer_epoch, new_writer_epoch)
+        self.writer_epoch = new_writer_epoch
+        self._transition_hook("commit")
+        return CommitResult(owner.revision + 1)
 
     def _delivery_snapshot(self):  # type: ignore[no-untyped-def]
         row = self._meta()

@@ -1,5 +1,7 @@
 """On-disk restart and schema kill-point coverage for ingestion v1."""
 
+import hashlib
+import json
 import multiprocessing
 import os
 import sqlite3
@@ -10,17 +12,29 @@ from uuid import UUID
 import pytest
 
 from nio.event_provenance import TimelineEventProvenance
-from nio.ingest.config import ClassicSourceConfig
+from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
 from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
-from nio.ingest.state import SourceState
+from nio.ingest.ports import NetworkResult, StagedSourceResponse
+from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
+from nio.ingest.source import canonical_json
+from nio.ingest.state import SourceState, StagedFrame
 from nio.store._sync_journal_plan import _canonical_work_plaintext
 from nio.store._sync_journal_rows import _canonical_internal
+from nio.store._sync_journal_values import MaterializerLimits, MaterializeStatus
 from nio.store.sync_journal import open_ingestion_store
 from nio.store.sync_journal_schema import SCHEMA_SQL
 
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+SLIDING_SOURCE = SlidingSourceConfig(
+    timeout_ms=30_000,
+    connection_name="worker",
+    lists_json=b"{}",
+    room_subscriptions_json=b"{}",
+    extensions_json=b"{}",
+    all_rooms_page_size=2,
+)
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 CRASH_EXIT_CODE = 86
 
@@ -73,6 +87,100 @@ def _open_delivery(store_path: Path, hook: Callable[[str], None] | None = None):
         database_name="journal.db",
         transition_statement_hook=hook,
     )
+
+
+def _open_sliding(store_path: Path, hook: Callable[[str], None] | None = None):
+    return open_ingestion_store(
+        store_path,
+        source=SLIDING_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        database_name="journal.db",
+        transition_statement_hook=hook,
+    )
+
+
+def _seed_positioned_sliding(bootstrap) -> None:
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    prior = journal.load_source()
+    adapter = SlidingSource(owner.stream_id, SLIDING_SOURCE, owner.account_id)
+    request = adapter.plan_request(prior, prior.next_request_id)
+    assert request is not None and request.body is not None
+    body = canonical_json(
+        {
+            "pos": "p1",
+            "txn_id": json.loads(request.body)["txn_id"],
+            "lists": {RESERVED_ALL_ROOMS_LIST: {"count": 0}},
+            "rooms": {},
+            "extensions": {"to_device": {"events": [], "next_batch": "td1"}},
+        }
+    )
+    normalized = adapter.normalize(
+        request,
+        NetworkResult(
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            200,
+            body,
+            None,
+            None,
+        ),
+    )
+    assert normalized.frame is not None
+    journal.stage_source_response(
+        source=SourceState(
+            prior.source_epoch,
+            prior.transport_kind,
+            normalized.frame.candidate_cursor_json,
+            request.request_id + 1,
+            prior.active,
+        ),
+        frame=StagedFrame(
+            normalized.frame.frame_id,
+            StagedSourceResponse(
+                request,
+                normalized.response_body,
+                normalized.frame.source_sha256,
+            ),
+        ),
+    )
+    assert (
+        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+
+
+def _kill_during_sliding_reopen(store_path: Path, boundary: str) -> None:
+    def kill(label: str) -> None:
+        if label == boundary:
+            os._exit(CRASH_EXIT_CODE)
+
+    _open_sliding(store_path, kill)
+
+
+def _stored_sliding_reset_graph(
+    database_path: Path,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        meta_row = connection.execute("SELECT * FROM NioIngestMeta").fetchone()
+        source_row = connection.execute("SELECT * FROM NioIngestSourceState").fetchone()
+    assert meta_row is not None and source_row is not None
+    meta = dict(meta_row)
+    source = dict(source_row)
+    payload = source["payload"]
+    digest = source["payload_sha256"]
+    assert isinstance(payload, bytes) and isinstance(digest, bytes)
+    assert hashlib.sha256(payload).digest() == digest
+    envelope = json.loads(payload)
+    assert isinstance(envelope, dict)
+    cursor = envelope["value"]
+    assert isinstance(cursor, dict)
+    return meta, source, cursor
 
 
 def _seed_ready(bootstrap) -> EventRecord:
@@ -228,3 +336,61 @@ def test_delivery_process_death_reopens_only_old_or_complete_new_graph(
         reopened._journal.acknowledge_batch(claimed.ref)
     assert reopened._journal.next_batch() is None
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "committed"),
+    (
+        ("sliding_reset_meta_cas", False),
+        ("sliding_reset_source_upsert", False),
+        ("before_commit", False),
+        ("commit", True),
+    ),
+)
+def test_sliding_reopen_process_death_leaves_only_old_or_complete_new_graph(
+    tmp_path: Path,
+    boundary: str,
+    committed: bool,
+) -> None:
+    store_path = tmp_path / f"sliding-reset-{boundary}"
+    bootstrap = _open_sliding(store_path)
+    _seed_positioned_sliding(bootstrap)
+    bootstrap.close()
+    database_path = store_path / "journal.db"
+    meta_before, source_before, cursor_before = _stored_sliding_reset_graph(
+        database_path
+    )
+
+    _assert_process_crashed(
+        _kill_during_sliding_reopen,
+        store_path,
+        boundary,
+    )
+
+    meta_after, source_after, cursor_after = _stored_sliding_reset_graph(database_path)
+    if not committed:
+        assert meta_after == meta_before
+        assert source_after == source_before
+        assert cursor_after == cursor_before
+        return
+
+    writer_after = meta_after["writer_epoch"]
+    assert writer_after != meta_before["writer_epoch"]
+    assert meta_after == {
+        **meta_before,
+        "revision": meta_before["revision"] + 1,  # type: ignore[operator]
+        "writer_epoch": writer_after,
+        "next_source_epoch": meta_before["next_source_epoch"] + 1,  # type: ignore[operator]
+    }
+    assert source_after["account_id"] == source_before["account_id"]
+    assert source_after["source_epoch"] == meta_before["next_source_epoch"]
+    assert source_after["next_request_id"] == 0
+    assert source_after["active"] == source_before["active"]
+    assert cursor_after == {
+        **cursor_before,
+        "pos": None,
+        "connection_instance": cursor_after["connection_instance"],
+        "all_rooms_range_ack_mode": "unknown",
+        "all_rooms_coverage_complete": False,
+    }
+    assert cursor_after["connection_instance"] != cursor_before["connection_instance"]

@@ -224,6 +224,16 @@ class IngestionStoreOwner:
         self._writer_epoch = writer_epoch
         self._state = "active"
 
+    def _handoff_writer_epoch(self, old_epoch: UUID, new_epoch: UUID) -> None:
+        self._assert_identity()
+        if type(old_epoch) is not UUID or type(new_epoch) is not UUID:
+            raise TypeError("writer epochs must be UUID")
+        if self._depth or self.database.transaction_depth():
+            raise LocalProtocolError("writer epoch handoff requires a committed state")
+        if self._writer_epoch != old_epoch or new_epoch == old_epoch:
+            raise LocalProtocolError("writer epoch handoff is invalid")
+        self._writer_epoch = new_epoch
+
     @contextmanager
     def read(self) -> Iterator[None]:
         self._assert_thread()

@@ -23,13 +23,18 @@ from ..ingest.config import (
     SourceConfig,
     source_transport,
 )
-from ..ingest.errors import FreshIngestionRequired, JournalIntegrityError
+from ..ingest.errors import (
+    FreshIngestionRequired,
+    JournalConflictError,
+    JournalIntegrityError,
+)
 from ..ingest.model import TransportKind
 from ..ingest.sliding import (
     SlidingCursor,
     SlidingRangeAckMode,
     _sliding_cursor_from_json,
     canonical_sliding_cursor,
+    reset_sliding_connection,
 )
 from ..ingest.source import (
     ClassicCursor,
@@ -321,6 +326,102 @@ def _source_header(source: SourceState) -> bytes:
     )
 
 
+def _different_uuid(previous: UUID) -> UUID:
+    while (successor := uuid4()) == previous:
+        pass
+    return successor
+
+
+def _rotate_sliding_source(
+    connection: SqliteDatabase,
+    *,
+    owner: OwnerView,
+    source: SourceState,
+    writer_epoch: UUID,
+    transition_hook: Callable[[str], None] | None,
+) -> SourceState:
+    if (
+        owner.transport_kind is not TransportKind.SLIDING
+        or source.transport_kind is not TransportKind.SLIDING
+    ):
+        raise LocalProtocolError("sliding reset requires a Sliding source")
+    if owner.revision == SQLITE_INT_MAX or owner.next_source_epoch == SQLITE_INT_MAX:
+        raise LocalProtocolError("sliding reset revision or source epoch is exhausted")
+    if type(writer_epoch) is not UUID or writer_epoch == owner.writer_epoch:
+        raise LocalProtocolError("sliding reset requires a new writer epoch")
+
+    old_payload, old_digest = _row(
+        (owner.account_id, owner.stream_id, owner.transport_kind),
+        "NioIngestSourceState",
+        source.cursor_json,
+        header=_source_header(source),
+    )
+    old_cursor = _sliding_cursor_from_json(source.cursor_json)
+    reset = reset_sliding_connection(
+        old_cursor,
+        _different_uuid(old_cursor.connection_instance),
+    )
+    successor = SourceState(
+        owner.next_source_epoch,
+        TransportKind.SLIDING,
+        canonical_sliding_cursor(reset.cursor),
+        0,
+        source.active,
+    )
+    new_payload, new_digest = _row(
+        (owner.account_id, owner.stream_id, owner.transport_kind),
+        "NioIngestSourceState",
+        successor.cursor_json,
+        header=_source_header(successor),
+    )
+
+    meta_cursor = connection.execute_sql(
+        "UPDATE NioIngestMeta SET revision = ?, writer_epoch = ?, "
+        "next_source_epoch = ? WHERE account_id = ? AND revision = ? "
+        "AND writer_epoch = ? AND next_source_epoch = ?",
+        (
+            owner.revision + 1,
+            str(writer_epoch),
+            owner.next_source_epoch + 1,
+            owner.account_id,
+            owner.revision,
+            str(owner.writer_epoch),
+            owner.next_source_epoch,
+        ),
+    )
+    if transition_hook is not None:
+        transition_hook("sliding_reset_meta_cas")
+    if meta_cursor.rowcount != 1:
+        raise JournalConflictError("sliding reset Meta compare-and-swap failed")
+
+    source_cursor = connection.execute_sql(
+        "UPDATE NioIngestSourceState SET source_epoch = ?, payload = ?, "
+        "payload_sha256 = ?, next_request_id = ?, active = ? "
+        "WHERE account_id = ? AND source_epoch = ? AND payload = ? "
+        "AND payload_sha256 = ? AND next_request_id = ? AND active = ?",
+        (
+            successor.source_epoch,
+            new_payload,
+            new_digest,
+            successor.next_request_id,
+            int(successor.active),
+            owner.account_id,
+            source.source_epoch,
+            old_payload,
+            old_digest,
+            source.next_request_id,
+            int(source.active),
+        ),
+    )
+    if transition_hook is not None:
+        transition_hook("sliding_reset_source_upsert")
+    if source_cursor.rowcount != 1:
+        raise JournalConflictError("sliding reset Source compare-and-swap failed")
+    if transition_hook is not None:
+        transition_hook("before_commit")
+    return successor
+
+
 def _create_fresh(
     connection: SqliteDatabase,
     account_id: str,
@@ -391,7 +492,7 @@ def _inspect_existing(
     device_id: str,
     consumer_generation: UUID,
     source: SourceConfig,
-) -> tuple[UUID, str]:
+) -> tuple[OwnerView, SourceState]:
     validate_schema_topology(connection)
     all_tables = {
         row[0]
@@ -495,7 +596,7 @@ def _inspect_existing(
     except (TypeError, ValueError) as error:
         raise JournalIntegrityError("persisted source state is invalid") from error
     _validate_source_cursor(transport_kind, state.cursor_json)
-    return stream_id, row["writer_epoch"]
+    return owner, state
 
 
 @dataclass(frozen=True)
@@ -515,6 +616,7 @@ def open_journal_database(
     source: SourceConfig,
     sqlite_busy_timeout_ms: int,
     statement_observer: Callable[[str], None] | None,
+    transition_statement_hook: Callable[[str], None] | None,
     schema_statement_hook: Callable[[str], None] | None,
 ) -> OpenedJournalDatabase:
     if type(consumer_generation) is not UUID:
@@ -541,7 +643,7 @@ def open_journal_database(
                 )
         else:
             try:
-                stream_id, old_epoch = _inspect_existing(
+                _inspect_existing(
                     connection,
                     account_id,
                     device_id,
@@ -555,17 +657,42 @@ def open_journal_database(
                 ) from error
             connection.execute_sql("PRAGMA foreign_keys = ON")
             connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
-            writer_epoch = uuid4()
+            sliding_reopened = False
             with owner.bootstrap_write():
-                cursor = connection.execute_sql(
-                    "UPDATE NioIngestMeta SET writer_epoch = ? "
-                    "WHERE account_id = ? AND writer_epoch = ?",
-                    (str(writer_epoch), account_id, old_epoch),
+                existing_owner, existing_source = _inspect_existing(
+                    connection,
+                    account_id,
+                    device_id,
+                    consumer_generation,
+                    source,
                 )
-                if cursor.rowcount != 1:
-                    raise LocalProtocolError(
-                        "persisted writer_epoch changed during open"
+                stream_id = existing_owner.stream_id
+                writer_epoch = _different_uuid(existing_owner.writer_epoch)
+                if existing_owner.transport_kind is TransportKind.SLIDING:
+                    _rotate_sliding_source(
+                        connection,
+                        owner=existing_owner,
+                        source=existing_source,
+                        writer_epoch=writer_epoch,
+                        transition_hook=transition_statement_hook,
                     )
+                    sliding_reopened = True
+                else:
+                    cursor = connection.execute_sql(
+                        "UPDATE NioIngestMeta SET writer_epoch = ? "
+                        "WHERE account_id = ? AND writer_epoch = ?",
+                        (
+                            str(writer_epoch),
+                            account_id,
+                            str(existing_owner.writer_epoch),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise LocalProtocolError(
+                            "persisted writer_epoch changed during open"
+                        )
+            if sliding_reopened and transition_statement_hook is not None:
+                transition_statement_hook("commit")
 
         connection.execute_sql("PRAGMA journal_mode = WAL")
         connection.execute_sql("PRAGMA synchronous = NORMAL")

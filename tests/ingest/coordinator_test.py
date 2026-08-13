@@ -1,26 +1,32 @@
 import asyncio
+import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
 from aiohttp import ClientConnectionError, ClientPayloadError
 
 import nio
-import nio.ingest
 from nio import AsyncClient, AsyncClientConfig
 from nio.exceptions import LocalProtocolError
+from nio.ingest.classic import ClassicSource
 from nio.ingest.config import (
     ClassicSourceConfig,
     IngestionConfig,
     SlidingSourceConfig,
 )
-from nio.ingest.classic import ClassicSource
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
+from nio.ingest.sliding import (
+    RESERVED_ALL_ROOMS_LIST,
+    SlidingSource,
+    _sliding_cursor_from_json,
+    canonical_sliding_cursor,
+)
 from nio.ingest.source import ClassicCursor, canonical_classic_cursor, canonical_json
 from nio.ingest.state import SourceState, StagedFrame
 from nio.store import SqliteStore, open_ingestion_store
-from nio.ingest.sliding import SlidingSource
 from nio.store._sync_journal_values import (
     MaterializeResult,
     MaterializerLimits,
@@ -143,6 +149,10 @@ def classic_config() -> IngestionConfig:
     return IngestionConfig(ClassicSourceConfig(30_000, b"{}"))
 
 
+def sliding_config() -> IngestionConfig:
+    return IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
+
+
 def _blocked_classic_success() -> dict[str, object]:
     body: dict[str, object] = {
         "next_batch": "s1",
@@ -210,6 +220,99 @@ def stage_classic(bootstrap, body: dict[str, object]) -> StagedFrame:
         frame=frame,
     )
     return frame
+
+
+def _sliding_frame(
+    bootstrap,
+    request,
+    *,
+    pos: str,
+    to_device_since: str,
+) -> tuple[SourceState, StagedFrame]:
+    owner = bootstrap._journal.load_owner()
+    adapter = SlidingSource(owner.stream_id, sliding_config().source, owner.account_id)
+    assert request.body is not None
+    body = canonical_json(
+        {
+            "pos": pos,
+            "txn_id": json.loads(request.body)["txn_id"],
+            "lists": {RESERVED_ALL_ROOMS_LIST: {"count": 0}},
+            "rooms": {},
+            "extensions": {
+                "to_device": {
+                    "events": [],
+                    "next_batch": to_device_since,
+                }
+            },
+        }
+    )
+    normalized = adapter.normalize(
+        request,
+        NetworkResult(
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            200,
+            body,
+            None,
+            None,
+        ),
+    )
+    assert normalized.frame is not None
+    return (
+        SourceState(
+            request.source_epoch,
+            request.transport,
+            normalized.frame.candidate_cursor_json,
+            request.request_id + 1,
+            True,
+        ),
+        StagedFrame(
+            normalized.frame.frame_id,
+            StagedSourceResponse(
+                request,
+                normalized.response_body,
+                normalized.frame.source_sha256,
+            ),
+        ),
+    )
+
+
+def stage_sliding_position(bootstrap, *, sequence: int = 1) -> StagedFrame:
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    prior = journal.load_source()
+    request = SlidingSource(
+        owner.stream_id,
+        sliding_config().source,
+        owner.account_id,
+    ).plan_request(prior, prior.next_request_id)
+    assert request is not None
+    successor, frame = _sliding_frame(
+        bootstrap,
+        request,
+        pos=f"p{sequence}",
+        to_device_since=f"td{sequence}",
+    )
+    journal.stage_source_response(source=successor, frame=frame)
+    return frame
+
+
+def _raw_ingestion_rows(database_path) -> tuple[tuple[object, ...], ...]:
+    tables = (
+        "NioIngestMeta",
+        "NioIngestSourceState",
+        "NioIngestFrame",
+        "NioIngestRoomAggregate",
+        "NioIngestWork",
+    )
+    with sqlite3.connect(database_path) as connection:
+        return tuple(
+            (table, *row)
+            for table in tables
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+        )
 
 
 def hydration_state() -> bytes:
@@ -1566,11 +1669,134 @@ async def test_cancellation_during_body_read_releases_response(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_sliding_reset_required_is_terminal_without_state_change(
+async def test_positioned_unknown_pos_commits_reloads_drains_then_replans(
     tmp_path,
 ) -> None:
     generation = uuid4()
-    config = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
+    config = sliding_config()
+    transitions: list[str] = []
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=config.source,
+        transition_statement_hook=transitions.append,
+    )
+    journal = bootstrap._journal
+    staged = stage_sliding_position(bootstrap)
+    assert (
+        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert journal.list_frames(1) == ()
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    adapter = SlidingSource(
+        owner_before.stream_id, config.source, owner_before.account_id
+    )
+    first_request = adapter.plan_request(source_before, source_before.next_request_id)
+    assert first_request is not None
+    _successor, old_frame = _sliding_frame(
+        bootstrap,
+        first_request,
+        pos="p2",
+        to_device_since="td2",
+    )
+
+    inserted = False
+
+    def inject_old_frame(label: str) -> None:
+        nonlocal inserted
+        transitions.append(label)
+        if label != "sliding_reset_meta_cas" or inserted:
+            return
+        inserted = True
+        write_owner = journal._decode_owner_row(journal._meta())
+        journal._write_frame(
+            old_frame,
+            write_owner.revision,
+            write_owner,
+            (ACCOUNT, write_owner.stream_id, write_owner.transport_kind),
+        )
+
+    journal.set_transition_statement_hook(inject_old_frame)
+    client = RecordingClient()
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=config,
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+    requests = []
+    second_request_entered = asyncio.Event()
+
+    async def request(request, **_kwargs):
+        requests.append(request)
+        if len(requests) == 1:
+            return session._network_result(
+                request,
+                400,
+                b'{"errcode":"M_UNKNOWN_POS"}',
+            )
+        assert journal.list_frames(1) == ()
+        committed_source = journal.load_source()
+        expected = adapter.plan_request(
+            committed_source,
+            committed_source.next_request_id,
+        )
+        assert request == expected
+        second_request_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    session._request = request  # type: ignore[method-assign]
+    transitions.clear()
+    run_task = asyncio.create_task(session.run())
+    try:
+        async with asyncio.timeout(5):
+            await second_request_entered.wait()
+        assert requests[0] == first_request
+        reset_request = requests[1]
+        committed_owner = journal.load_owner()
+        committed_source = journal.load_source()
+        reset_cursor = _sliding_cursor_from_json(committed_source.cursor_json)
+        assert committed_owner.revision == owner_before.revision + 2
+        assert committed_owner.next_source_epoch == owner_before.next_source_epoch + 1
+        assert committed_source.source_epoch == owner_before.next_source_epoch
+        assert committed_source.next_request_id == 0
+        assert reset_cursor.pos is None
+        assert reset_cursor.to_device_since == "td1"
+        assert reset_request.source_epoch == committed_source.source_epoch
+        assert reset_request.request_id == 0
+        assert reset_request.request_cursor_json == committed_source.cursor_json
+        assert reset_request != first_request
+        assert journal.load_frame(staged.frame_id) is None
+        assert journal.load_frame(old_frame.frame_id) is None
+        assert transitions == [
+            "sliding_reset_meta_cas",
+            "sliding_reset_source_upsert",
+            "before_commit",
+            "commit",
+            "meta_revision_epoch_cas",
+            "frame_delete",
+            "before_commit",
+            "commit",
+        ]
+    finally:
+        await session.close()
+        await asyncio.gather(run_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("state", ("positionless", "repeated_cold"))
+@pytest.mark.asyncio
+async def test_cold_unknown_pos_is_terminal_and_byte_identical(
+    tmp_path,
+    state: str,
+) -> None:
+    generation = uuid4()
+    config = sliding_config()
     bootstrap = open_ingestion_store(
         tmp_path,
         account_id=ACCOUNT,
@@ -1578,7 +1804,23 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
         consumer_generation=generation,
         source=config.source,
     )
-    before = bootstrap._journal.load_source()
+    journal = bootstrap._journal
+    if state == "repeated_cold":
+        stage_sliding_position(bootstrap)
+        assert (
+            journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        owner = journal.load_owner()
+        positioned = journal.load_source()
+        request = SlidingSource(
+            owner.stream_id,
+            config.source,
+            owner.account_id,
+        ).plan_request(positioned, positioned.next_request_id)
+        assert request is not None
+        assert journal._reset_sliding_source(request=request) is not None
+    before = _raw_ingestion_rows(bootstrap.database_path)
     client = RecordingClient()
     client.responses.append(FakeResponse(400, b'{"errcode":"M_UNKNOWN_POS"}'))
     session = nio.open_ingestion(
@@ -1591,8 +1833,124 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
     assert client.send_count == 1
-    assert bootstrap._journal.load_source() == before
-    assert bootstrap._journal.list_frames(1) == ()
+    assert _raw_ingestion_rows(bootstrap.database_path) == before
+    await session.close()
+
+
+@pytest.mark.parametrize("mutation", ("source_epoch", "request_id", "cursor"))
+@pytest.mark.asyncio
+async def test_stale_unknown_pos_is_terminal_at_authenticated_state(
+    tmp_path,
+    mutation: str,
+) -> None:
+    generation = uuid4()
+    config = sliding_config()
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=config.source,
+    )
+    journal = bootstrap._journal
+    stage_sliding_position(bootstrap)
+    assert (
+        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    session = nio.open_ingestion(
+        RecordingClient(),
+        bootstrap,
+        config=config,
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+    authenticated: tuple[tuple[object, ...], ...] | None = None
+
+    async def mutate_while_in_flight(request, **_kwargs):
+        nonlocal authenticated
+        with journal._transaction():
+            owner, source = journal._load_stage_snapshot()
+            if mutation == "source_epoch":
+                changed = replace(source, source_epoch=source.source_epoch + 1)
+            elif mutation == "request_id":
+                changed = replace(
+                    source,
+                    next_request_id=source.next_request_id + 1,
+                )
+            else:
+                cursor = _sliding_cursor_from_json(source.cursor_json)
+                changed = replace(
+                    source,
+                    cursor_json=canonical_sliding_cursor(
+                        replace(cursor, pos="foreign")
+                    ),
+                )
+            journal._write_source(changed, owner)
+        authenticated = _raw_ingestion_rows(bootstrap.database_path)
+        return session._network_result(
+            request,
+            400,
+            b'{"errcode":"M_UNKNOWN_POS"}',
+        )
+
+    session._request = mutate_while_in_flight  # type: ignore[method-assign]
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+    assert authenticated is not None
+    assert _raw_ingestion_rows(bootstrap.database_path) == authenticated
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    ("transport", "body"),
+    (
+        ("sliding", b"{"),
+        ("sliding", b'{"errcode":"M_UNKNOWN_TOKEN"}'),
+        ("classic", b'{"errcode":"M_UNKNOWN_POS"}'),
+    ),
+)
+@pytest.mark.asyncio
+async def test_non_reset_errors_are_terminal_and_byte_identical(
+    tmp_path,
+    transport: str,
+    body: bytes,
+) -> None:
+    generation = uuid4()
+    config = sliding_config() if transport == "sliding" else classic_config()
+    bootstrap = open_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=config.source,
+    )
+    if transport == "sliding":
+        stage_sliding_position(bootstrap)
+        assert (
+            bootstrap._journal.materialize_oldest_frame(
+                limits=MaterializerLimits()
+            ).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        assert (
+            _sliding_cursor_from_json(bootstrap._journal.load_source().cursor_json).pos
+            is not None
+        )
+    before = _raw_ingestion_rows(bootstrap.database_path)
+    client = RecordingClient()
+    client.responses.append(FakeResponse(400, body))
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=config,
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+    with pytest.raises(nio.IngestionSourceError):
+        await session.run()
+    assert client.send_count == 1
+    assert _raw_ingestion_rows(bootstrap.database_path) == before
     await session.close()
 
 

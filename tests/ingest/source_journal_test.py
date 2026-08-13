@@ -27,6 +27,7 @@ from nio.ingest.config import (
 )
 from nio.ingest.errors import (
     FreshIngestionRequired,
+    JournalConflictError,
     JournalIntegrityError,
 )
 from nio.ingest.model import TransportKind
@@ -36,12 +37,18 @@ from nio.ingest.ports import (
     StagedSourceResponse,
     _frame_id_for_response,
 )
-from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
+from nio.ingest.sliding import (
+    RESERVED_ALL_ROOMS_LIST,
+    SlidingCursor,
+    SlidingRangeAckMode,
+    SlidingSource,
+    _sliding_cursor_from_json,
+)
 from nio.ingest.source import SyncFrame, canonical_json, renormalize_staged_frame
 from nio.ingest.state import CommitResult, SourceState, StagedFrame
 from nio.store import SqliteStore
 from nio.store._sync_journal_port import IngestionJournal
-from nio.store._sync_journal_values import MaterializerLimits
+from nio.store._sync_journal_values import SQLITE_INT_MAX, MaterializerLimits
 from nio.store.sync_journal import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -179,6 +186,9 @@ def _stage_proposal(
     journal: object,
     source_config: ClassicSourceConfig | SlidingSourceConfig,
     sequence: int,
+    *,
+    to_device_since: str | None = None,
+    global_account_data_sequence: int | None = None,
 ) -> _StageProposal:
     owner = journal.load_owner()  # type: ignore[attr-defined]
     prior_source = journal.load_source()  # type: ignore[attr-defined]
@@ -186,6 +196,28 @@ def _stage_proposal(
     request = adapter.plan_request(prior_source, prior_source.next_request_id)
     assert request is not None
     body = _successful_body(request, sequence)
+    if request.transport is TransportKind.SLIDING and (
+        to_device_since is not None or global_account_data_sequence is not None
+    ):
+        decoded = json.loads(body)
+        extensions: dict[str, object] = {}
+        if to_device_since is not None:
+            extensions["to_device"] = {
+                "events": [],
+                "next_batch": to_device_since,
+            }
+        if global_account_data_sequence is not None:
+            extensions["account_data"] = {
+                "global": [
+                    {
+                        "type": "io.mindroom.test",
+                        "content": {"sequence": global_account_data_sequence},
+                    }
+                ],
+                "rooms": {},
+            }
+        decoded["extensions"] = extensions
+        body = canonical_json(decoded)
     normalized = adapter.normalize(
         request,
         NetworkResult(
@@ -243,6 +275,81 @@ def _business_dml(statements: list[str]) -> list[str]:
             )
         )
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _LogicalInventory:
+    frames: tuple[StagedFrame, ...]
+    aggregates: tuple[tuple[str, object], ...]
+    work: tuple[object, ...]
+    delivery: object
+    outstanding_batch: object
+
+
+def _logical_inventory(journal: object) -> _LogicalInventory:
+    frames = journal.list_frames(256)  # type: ignore[attr-defined]
+    with journal._owner.read():  # type: ignore[attr-defined]
+        owner = journal.load_owner()  # type: ignore[attr-defined]
+        room_ids = tuple(
+            row[0]
+            for row in journal._execute(  # type: ignore[attr-defined]
+                "SELECT room_id FROM NioIngestRoomAggregate "
+                "WHERE account_id = ? ORDER BY room_id",
+                (ACCOUNT_ID,),
+            )
+        )
+        aggregates = tuple(
+            (
+                room_id,
+                journal._load_room_aggregate(owner, room_id)[1],  # type: ignore[attr-defined,index]
+            )
+            for room_id in room_ids
+        )
+        work = journal._load_task3_work_inventory(owner).work  # type: ignore[attr-defined]
+        delivery = journal._delivery_snapshot()[2]  # type: ignore[attr-defined]
+    outstanding_batch = (
+        journal.next_batch()  # type: ignore[attr-defined]
+        if delivery.outstanding_work_id is not None  # type: ignore[attr-defined]
+        else None
+    )
+    return _LogicalInventory(
+        frames,
+        aggregates,
+        work,
+        delivery,
+        outstanding_batch,
+    )
+
+
+def _seed_sliding_reopen_inventory(journal: object) -> None:
+    for sequence in (1, 2):
+        proposal = _stage_proposal(
+            journal,
+            SLIDING_SOURCE,
+            sequence,
+            to_device_since=f"td{sequence}",
+            global_account_data_sequence=sequence,
+        )
+        _stage(journal, proposal=proposal)
+        materialized = journal.materialize_oldest_frame(  # type: ignore[attr-defined]
+            limits=MaterializerLimits()
+        )
+        assert materialized.revision is not None
+        batch = journal.next_batch()  # type: ignore[attr-defined]
+        assert batch is not None
+        if sequence == 1:
+            journal.acknowledge_batch(batch.ref)  # type: ignore[attr-defined]
+
+    retained = _stage_proposal(
+        journal,
+        SLIDING_SOURCE,
+        3,
+        to_device_since="td3",
+    )
+    _stage(journal, proposal=retained)
+    with journal._transaction():  # type: ignore[attr-defined]
+        owner, source = journal._load_stage_snapshot()  # type: ignore[attr-defined]
+        journal._write_source(replace(source, active=False), owner)  # type: ignore[attr-defined]
 
 
 def _frame_for_request(
@@ -1268,6 +1375,374 @@ def test_exact_same_owner_reopen_preserves_identity_and_topology(
         assert not [sql for sql in statements if "CREATE " in sql.upper()]
     finally:
         reopened.close()
+
+
+def test_sliding_reopen_rotates_source_and_preserves_logical_inventory(
+    tmp_path: Path,
+) -> None:
+    first = _open(tmp_path, SLIDING_SOURCE)
+    _seed_sliding_reopen_inventory(first._journal)
+    owner_before = first._journal.load_owner()
+    source_before = first._journal.load_source()
+    cursor_before = _sliding_cursor_from_json(source_before.cursor_json)
+    inventory_before = _logical_inventory(first._journal)
+    first.close()
+
+    transitions: list[str] = []
+    reopened = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        transition_statement_hook=transitions.append,
+    )
+    try:
+        owner_after = reopened._journal.load_owner()
+        source_after = reopened._journal.load_source()
+        cursor_after = _sliding_cursor_from_json(source_after.cursor_json)
+
+        assert owner_after == replace(
+            owner_before,
+            revision=owner_before.revision + 1,
+            writer_epoch=owner_after.writer_epoch,
+            next_source_epoch=owner_before.next_source_epoch + 1,
+        )
+        assert owner_after.writer_epoch != owner_before.writer_epoch
+        assert source_after.source_epoch == owner_before.next_source_epoch
+        assert source_after.next_request_id == 0
+        assert source_after.active is source_before.active is False
+        assert cursor_after == SlidingCursor(
+            pos=None,
+            to_device_since=cursor_before.to_device_since,
+            connection_instance=cursor_after.connection_instance,
+            connection_name=cursor_before.connection_name,
+            all_rooms_range_end=cursor_before.all_rooms_range_end,
+            all_rooms_page_size=cursor_before.all_rooms_page_size,
+            all_rooms_range_ack_mode=SlidingRangeAckMode.UNKNOWN,
+            all_rooms_coverage_complete=False,
+        )
+        assert cursor_after.connection_instance != cursor_before.connection_instance
+        assert _logical_inventory(reopened._journal) == inventory_before
+        assert transitions == [
+            "sliding_reset_meta_cas",
+            "sliding_reset_source_upsert",
+            "before_commit",
+            "commit",
+        ]
+        _assert_exact_ingestion_topology(tmp_path / "journal.db")
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "committed"),
+    (
+        ("sliding_reset_meta_cas", False),
+        ("sliding_reset_source_upsert", False),
+        ("before_commit", False),
+        ("commit", True),
+    ),
+)
+def test_sliding_reopen_statement_boundaries_leave_only_old_or_new_state(
+    tmp_path: Path,
+    boundary: str,
+    committed: bool,
+) -> None:
+    first = _open(tmp_path, SLIDING_SOURCE)
+    proposal = _stage_proposal(
+        first._journal,
+        SLIDING_SOURCE,
+        1,
+        to_device_since="td1",
+    )
+    _stage(first._journal, proposal=proposal)
+    owner_before = first._journal.load_owner()
+    first.close()
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        raw_meta_before = connection.execute("SELECT * FROM NioIngestMeta").fetchone()
+        raw_source_before = connection.execute(
+            "SELECT * FROM NioIngestSourceState"
+        ).fetchone()
+    assert raw_meta_before is not None and raw_source_before is not None
+
+    class InjectedResetFailure(RuntimeError):
+        pass
+
+    observed: list[str] = []
+
+    def fail_at_boundary(label: str) -> None:
+        observed.append(label)
+        if label == boundary:
+            raise InjectedResetFailure(label)
+
+    with pytest.raises(InjectedResetFailure, match=boundary):
+        _open(
+            tmp_path,
+            SLIDING_SOURCE,
+            transition_statement_hook=fail_at_boundary,
+        )
+
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        connection.row_factory = sqlite3.Row
+        meta = connection.execute("SELECT * FROM NioIngestMeta").fetchone()
+        source = connection.execute("SELECT * FROM NioIngestSourceState").fetchone()
+    assert meta is not None and source is not None
+    if not committed:
+        assert tuple(meta) == raw_meta_before
+        assert tuple(source) == raw_source_before
+    else:
+        assert meta["revision"] == owner_before.revision + 1
+        assert meta["writer_epoch"] != str(owner_before.writer_epoch)
+        assert meta["next_source_epoch"] == owner_before.next_source_epoch + 1
+        assert source["source_epoch"] == owner_before.next_source_epoch
+        assert source["next_request_id"] == 0
+        stored_cursor = json.loads(source["payload"])["value"]
+        assert stored_cursor["pos"] is None
+        assert stored_cursor["to_device_since"] == "td1"
+        assert stored_cursor["all_rooms_range_ack_mode"] == "unknown"
+        assert stored_cursor["all_rooms_coverage_complete"] is False
+    assert observed[-1] == boundary
+
+
+def test_exact_positioned_request_resets_live_source_and_rotates_cached_writer(
+    tmp_path: Path,
+) -> None:
+    transitions: list[str] = []
+    bootstrap = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        transition_statement_hook=transitions.append,
+    )
+    journal = bootstrap._journal
+    try:
+        proposal = _stage_proposal(
+            journal,
+            SLIDING_SOURCE,
+            1,
+            to_device_since="td1",
+        )
+        _stage(journal, proposal=proposal)
+        owner_before = journal.load_owner()
+        source_before = journal.load_source()
+        inventory_before = _logical_inventory(journal)
+        request = _source_adapter(
+            owner_before.stream_id,
+            SLIDING_SOURCE,
+        ).plan_request(source_before, source_before.next_request_id)
+        assert request is not None
+        transitions.clear()
+
+        committed = journal._reset_sliding_source(request=request)
+
+        owner_after = journal.load_owner()
+        source_after = journal.load_source()
+        cursor_before = _sliding_cursor_from_json(source_before.cursor_json)
+        cursor_after = _sliding_cursor_from_json(source_after.cursor_json)
+        assert committed == CommitResult(owner_before.revision + 1)
+        assert owner_after == replace(
+            owner_before,
+            revision=owner_before.revision + 1,
+            writer_epoch=owner_after.writer_epoch,
+            next_source_epoch=owner_before.next_source_epoch + 1,
+        )
+        assert owner_after.writer_epoch != owner_before.writer_epoch
+        assert journal.writer_epoch == owner_after.writer_epoch
+        assert source_after.source_epoch == owner_before.next_source_epoch
+        assert source_after.next_request_id == 0
+        assert source_after.active is source_before.active
+        assert cursor_after.connection_instance != cursor_before.connection_instance
+        assert cursor_after.pos is None
+        assert cursor_after.to_device_since == cursor_before.to_device_since
+        assert cursor_after.connection_name == cursor_before.connection_name
+        assert cursor_after.all_rooms_range_end == cursor_before.all_rooms_range_end
+        assert cursor_after.all_rooms_page_size == cursor_before.all_rooms_page_size
+        assert cursor_after.all_rooms_range_ack_mode is SlidingRangeAckMode.UNKNOWN
+        assert cursor_after.all_rooms_coverage_complete is False
+        assert _logical_inventory(journal) == inventory_before
+        assert transitions == [
+            "sliding_reset_meta_cas",
+            "sliding_reset_source_upsert",
+            "before_commit",
+            "commit",
+        ]
+    finally:
+        bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "committed"),
+    (
+        ("sliding_reset_meta_cas", False),
+        ("sliding_reset_source_upsert", False),
+        ("before_commit", False),
+        ("commit", True),
+    ),
+)
+def test_live_reset_hands_cached_writer_over_only_after_commit(
+    tmp_path: Path,
+    boundary: str,
+    committed: bool,
+) -> None:
+    bootstrap = _open(tmp_path, SLIDING_SOURCE)
+    journal = bootstrap._journal
+    proposal = _stage_proposal(journal, SLIDING_SOURCE, 1)
+    _stage(journal, proposal=proposal)
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    request = _source_adapter(
+        owner_before.stream_id,
+        SLIDING_SOURCE,
+    ).plan_request(source_before, source_before.next_request_id)
+    assert request is not None
+
+    class InjectedResetFailure(RuntimeError):
+        pass
+
+    def fail_at_boundary(label: str) -> None:
+        if label == boundary:
+            raise InjectedResetFailure(label)
+
+    journal.set_transition_statement_hook(fail_at_boundary)
+    with pytest.raises(InjectedResetFailure, match=boundary):
+        journal._reset_sliding_source(request=request)
+    journal.set_transition_statement_hook(None)
+
+    owner_after = journal.load_owner()
+    source_after = journal.load_source()
+    if committed:
+        assert owner_after.revision == owner_before.revision + 1
+        assert owner_after.writer_epoch != owner_before.writer_epoch
+        assert source_after.source_epoch == owner_before.next_source_epoch
+        assert source_after.next_request_id == 0
+    else:
+        assert owner_after == owner_before
+        assert source_after == source_before
+    bootstrap.close()
+
+
+def test_live_reset_source_cas_rejects_changed_authenticated_snapshot(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path, SLIDING_SOURCE)
+    journal = bootstrap._journal
+    proposal = _stage_proposal(journal, SLIDING_SOURCE, 1)
+    _stage(journal, proposal=proposal)
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    request = _source_adapter(
+        owner_before.stream_id,
+        SLIDING_SOURCE,
+    ).plan_request(source_before, source_before.next_request_id)
+    assert request is not None
+
+    def change_source_after_meta_cas(label: str) -> None:
+        if label != "sliding_reset_meta_cas":
+            return
+        owner, source = journal._load_stage_snapshot()
+        journal._write_source(
+            replace(source, next_request_id=source.next_request_id + 1),
+            owner,
+        )
+
+    journal.set_transition_statement_hook(change_source_after_meta_cas)
+    with pytest.raises(JournalConflictError, match="Source"):
+        journal._reset_sliding_source(request=request)
+    journal.set_transition_statement_hook(None)
+
+    assert journal.load_owner() == owner_before
+    assert journal.load_source() == source_before
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("source_epoch", "request_id", "cursor", "positionless", "repeated_cold"),
+)
+def test_live_reset_rejects_stale_or_cold_request_without_dml(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, SLIDING_SOURCE, statements=statements)
+    journal = bootstrap._journal
+    if mutation != "positionless":
+        proposal = _stage_proposal(journal, SLIDING_SOURCE, 1)
+        _stage(journal, proposal=proposal)
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    request = _source_adapter(
+        owner_before.stream_id,
+        SLIDING_SOURCE,
+    ).plan_request(source_before, source_before.next_request_id)
+    assert request is not None
+    if mutation == "source_epoch":
+        request = replace(request, source_epoch=request.source_epoch + 1)
+    elif mutation == "request_id":
+        request = replace(request, request_id=request.request_id + 1)
+    elif mutation == "cursor":
+        request = replace(
+            request,
+            request_cursor_json=canonical_json(
+                {
+                    **json.loads(request.request_cursor_json),
+                    "pos": "foreign",
+                }
+            ),
+        )
+    elif mutation == "repeated_cold":
+        assert journal._reset_sliding_source(request=request) is not None
+        owner_before = journal.load_owner()
+        source_before = journal.load_source()
+        request = _source_adapter(
+            owner_before.stream_id,
+            SLIDING_SOURCE,
+        ).plan_request(source_before, source_before.next_request_id)
+        assert request is not None
+
+    statements.clear()
+    assert journal._reset_sliding_source(request=request) is None
+    assert _business_dml(statements) == []
+    assert journal.load_owner() == owner_before
+    assert journal.load_source() == source_before
+    bootstrap.close()
+
+
+@pytest.mark.parametrize("field", ("revision", "next_source_epoch"))
+@pytest.mark.parametrize("operation", ("live", "reopen"))
+def test_sliding_reset_integer_exhaustion_fails_before_dml(
+    tmp_path: Path,
+    field: str,
+    operation: str,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, SLIDING_SOURCE, statements=statements)
+    journal = bootstrap._journal
+    proposal = _stage_proposal(journal, SLIDING_SOURCE, 1)
+    _stage(journal, proposal=proposal)
+    with journal._transaction():
+        journal._execute(
+            f"UPDATE NioIngestMeta SET {field} = ? WHERE account_id = ?",
+            (SQLITE_INT_MAX, ACCOUNT_ID),
+        )
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    request = _source_adapter(
+        owner_before.stream_id,
+        SLIDING_SOURCE,
+    ).plan_request(source_before, source_before.next_request_id)
+    assert request is not None
+    if operation == "reopen":
+        bootstrap.close()
+
+    statements.clear()
+    with pytest.raises(LocalProtocolError, match="exhausted"):
+        if operation == "live":
+            journal._reset_sliding_source(request=request)
+        else:
+            _open(tmp_path, SLIDING_SOURCE, statements=statements)
+    assert _business_dml(statements) == []
+    if operation == "live":
+        assert journal.load_owner() == owner_before
+        assert journal.load_source() == source_before
+        bootstrap.close()
 
 
 def test_consumer_generation_mismatch_is_byte_identical_before_epoch_update(

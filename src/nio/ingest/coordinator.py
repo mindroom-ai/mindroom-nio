@@ -207,6 +207,9 @@ class IngestionSession:
                     )
                 await asyncio.sleep(delay)
                 continue
+            if result.kind is SourceResultKind.RESET_REQUIRED:
+                if self._journal._reset_sliding_source(request=request) is not None:
+                    continue
             if result.kind is not SourceResultKind.FRAME:
                 raise IngestionSourceError(result.detail or result.kind.value)
             retries = 0
