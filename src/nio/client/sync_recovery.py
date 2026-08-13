@@ -8,6 +8,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import pairwise
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
@@ -96,6 +97,20 @@ class _DispatchFinishError(Exception):
     def __init__(self, error: Exception):
         super().__init__(error)
         self.error = error
+
+
+class _BatchCallbackError(_LiveCallbackError):
+    def __init__(
+        self,
+        error: Exception,
+        completed: tuple[tuple[int, _DispatchResult], ...],
+        *,
+        accepted: bool,
+        failed_is_live: bool | None = None,
+    ):
+        super().__init__(error, False, accepted=accepted)
+        self.completed = completed
+        self.failed_is_live = failed_is_live
 
 
 @dataclass(frozen=True)
@@ -194,6 +209,16 @@ class PendingTimelineEvent:
         if self.kind == "account_data":
             return AccountDataEvent.parse_event(source)
         return Event.parse_event(source)
+
+
+DispatchEventBatch = Callable[
+    [
+        tuple[PendingTimelineEvent, ...],
+        tuple[Event | BadEventType, ...],
+        Callable[[], None],
+    ],
+    Awaitable[tuple[_DispatchResult, ...]],
+]
 
 
 @dataclass(frozen=True)
@@ -524,6 +549,127 @@ def _mark_admission_accepted(
             pending.event_id,
         )
     queued[index] = replace(queued[index], admission_accepted=True)
+
+
+def _mark_batch_admission_accepted(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending_events: Sequence[PendingTimelineEvent],
+) -> None:
+    unaccepted = tuple(
+        pending for pending in pending_events if not pending.admission_accepted
+    )
+    if not unaccepted:
+        return
+    queued = state.events[(gap.room_id, gap.generation)]
+    indexes = []
+    for pending in unaccepted:
+        index = next(
+            (
+                index
+                for index, current in enumerate(queued)
+                if current.event_id == pending.event_id and current.kind == pending.kind
+            ),
+            None,
+        )
+        if index is None:
+            raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
+        indexes.append(index)
+    if store:
+        store.accept_recovery_events(
+            [(gap.room_id, gap.generation, pending.event_id) for pending in unaccepted]
+        )
+    for index in indexes:
+        queued[index] = replace(queued[index], admission_accepted=True)
+
+
+def _finish_recovery_event_batch(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending_events: Sequence[PendingTimelineEvent],
+    delivered: Sequence[_DispatchResult],
+) -> None:
+    completed = tuple(
+        CompletedTimelineEvent(
+            was_encrypted=(
+                isinstance(result, MegolmEvent)
+                if result is not None
+                else pending.was_encrypted
+            ),
+            provenance=pending.provenance,
+        )
+        for pending, result in zip(pending_events, delivered, strict=True)
+    )
+    if store:
+        store.finish_recovery_events(
+            [(gap.room_id, gap.generation, pending.event_id) for pending in pending_events],
+            completed,
+        )
+    queued = state.events[(gap.room_id, gap.generation)]
+    for pending, result in zip(pending_events, completed, strict=True):
+        current = next(
+            (
+                item
+                for item in queued
+                if item.event_id == pending.event_id and item.kind == pending.kind
+            ),
+            None,
+        )
+        if current is None:
+            raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
+        queued.remove(current)
+        if not pending.event_id.startswith("~"):
+            record_completed_timeline_event(
+                state,
+                gap.room_id,
+                pending.event_id,
+                result.was_encrypted,
+                result.provenance,
+            )
+
+
+async def _run_batch_dispatch(
+    state: RecoveryState,
+    store: MatrixStore | None,
+    gap: RecoveryGap,
+    pending_events: tuple[PendingTimelineEvent, ...],
+    dispatch_event_batch: DispatchEventBatch,
+    events: tuple[Event | BadEventType, ...],
+) -> _LiveCallbackError | None:
+    error: _BatchCallbackError | None = None
+
+    def mark_admission_accepted() -> None:
+        _mark_batch_admission_accepted(state, store, gap, pending_events)
+
+    try:
+        delivered = await dispatch_event_batch(
+            pending_events,
+            events,
+            mark_admission_accepted,
+        )
+        completed_pairs = tuple(enumerate(delivered))
+    except _BatchCallbackError as dispatch_error:
+        error = dispatch_error
+        completed_pairs = dispatch_error.completed
+
+    if error and error.failed_is_live is False:
+        state.outcomes[gap.room_id] = False
+    if completed_pairs:
+        selected_pending = tuple(pending_events[index] for index, _ in completed_pairs)
+        selected_delivered = tuple(result for _, result in completed_pairs)
+        try:
+            _finish_recovery_event_batch(
+                state,
+                store,
+                gap,
+                selected_pending,
+                selected_delivered,
+            )
+        except Exception as finish_error:
+            raise _DispatchFinishError(finish_error) from finish_error
+    return error
 
 
 async def drain_recovery_dispatches(state: RecoveryState) -> None:
@@ -1625,17 +1771,116 @@ async def _collect_slice(
     return gap
 
 
+async def _drain_timeline_batch(
+    state: RecoveryState,
+    gap: RecoveryGap,
+    pending_events: tuple[PendingTimelineEvent, ...],
+    *,
+    dispatch_event_batch: DispatchEventBatch,
+    store: MatrixStore | None,
+    deadline: float | None,
+) -> bool:
+    parsed: list[Event | BadEventType] = []
+    for pending in pending_events:
+        try:
+            event = pending.parse()
+        except Exception:
+            logger.exception("Discarding corrupt recovered event: %s", pending.event_id)
+            _finish(
+                state,
+                store,
+                gap,
+                pending,
+                pending.was_encrypted,
+                RecoveryAbandonment.CORRUPT_EVENT if gap.target_token else None,
+            )
+            return True
+        if not isinstance(event, Event | BadEventType):
+            raise ValueError("Invalid pending timeline event")
+        parsed.append(event)
+
+    keys = tuple(_dispatch_key(pending) for pending in pending_events)
+    task = next(
+        (
+            current
+            for key in keys
+            if (current := state._active_dispatches.get(key)) is not None
+        ),
+        None,
+    )
+    loop = asyncio.get_running_loop()
+    if task is None:
+        if deadline is not None and deadline <= loop.time():
+            logger.warning("Recovered event callback batch timed out")
+            return False
+        task = loop.create_task(
+            _run_batch_dispatch(
+                state,
+                store,
+                gap,
+                pending_events,
+                dispatch_event_batch,
+                tuple(parsed),
+            )
+        )
+        for key in keys:
+            state._active_dispatches[key] = task
+            task.add_done_callback(partial(_dispatch_finished, state, key))
+    timeout = None if deadline is None else max(0, deadline - loop.time())
+    state._dispatch_waiters[task] = state._dispatch_waiters.get(task, 0) + 1
+    try:
+        done, _ = await asyncio.wait((task,), timeout=timeout)
+    finally:
+        waiters = state._dispatch_waiters.get(task, 0)
+        if waiters <= 1:
+            state._dispatch_waiters.pop(task, None)
+        else:
+            state._dispatch_waiters[task] = waiters - 1
+    if not done:
+        logger.warning("Recovered event callback batch timed out")
+        return False
+    for key in keys:
+        if state._active_dispatches.get(key) is task:
+            state._active_dispatches.pop(key)
+    try:
+        callback_error = task.result()
+    except _DispatchFinishError as error:
+        raise error.error from error
+    if callback_error:
+        raise callback_error.error
+    return True
+
+
 async def _drain_gap(
     state: RecoveryState,
     gap: RecoveryGap,
     *,
     dispatch_event: DispatchEvent,
+    dispatch_event_batch: DispatchEventBatch | None,
     store: MatrixStore | None,
     deadline: float | None,
 ) -> None:
     if gap.cursor_token is not None:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
+    if dispatch_event_batch is not None:
+        pending_batch = tuple(
+            pending
+            for pending in queued
+            if pending.kind == "timeline"
+        )
+        if pending_batch and pending_batch == tuple(queued[: len(pending_batch)]):
+            complete = await _drain_timeline_batch(
+                state,
+                gap,
+                pending_batch,
+                dispatch_event_batch=dispatch_event_batch,
+                store=store,
+                deadline=deadline,
+            )
+            if not complete:
+                return
+            queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
         callback_error: Exception | None = None
         try:
@@ -1727,6 +1972,7 @@ async def pump_recovery(
     options: RecoveryOptions,
     fetch_messages: FetchMessages,
     dispatch_event: DispatchEvent,
+    dispatch_event_batch: DispatchEventBatch | None = None,
     store: MatrixStore | None,
     ready_room_id: str | None = None,
 ) -> None:
@@ -1775,6 +2021,7 @@ async def pump_recovery(
             state,
             gap,
             dispatch_event=dispatch_event,
+            dispatch_event_batch=dispatch_event_batch,
             store=store,
             deadline=None if not gap.target_token else room_deadline,
         )

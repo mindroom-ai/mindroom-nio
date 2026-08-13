@@ -365,7 +365,7 @@ Add one live callback failure case that completes the delivered prefix plus the 
 
 Add one recovered-history callback failure case that completes only the delivered prefix and leaves the failed row plus later rows pending.
 
-Add one case proving that a leading account-data or ephemeral row continues through the individual dispatcher before a later timeline batch.
+Add one case proving that a leading account-data or ephemeral row and the later timeline rows remain ordered on the individual path rather than entering a mixed-kind batch.
 
 The production mutations these tests catch are acknowledging failed history, losing acknowledged live work, and batching non-timeline rows.
 
