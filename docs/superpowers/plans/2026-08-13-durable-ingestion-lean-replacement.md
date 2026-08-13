@@ -137,6 +137,187 @@ Run focused RED/GREEN, the full source-journal/coordinator/crash files, Ruff, ty
 
 Use test-driven development. First capture each causal failure below against the generic path; do not implement production preparation or callback claims before its failing behavior test exists.
 
+Task 4 and Task 5 are one interleaved dependency chain. Execute and review the
+following ordinary commits in this exact order inside the same linked PRs:
+
+```text
+4A in-place adoption
+-> 4B store/session lease transfer
+-> 5A MindRoom receipt/idempotency kernel
+-> 4C callback-free preparation
+-> 4D atomic all-kind materialization and snapshots
+-> 4E receipt-gated compatibility apply/ack
+-> 5B MindRoom all-record adapter and pump
+-> 4F Frame completion state machine
+-> 5C MindRoom durable login/session factory
+-> 5D sole MindRoom engine activation
+```
+
+Do not collapse these into one implementation/review gate. They remain commits
+in one PR per repository, not phase PRs.
+
+### Task 4A: exclusive in-place v1 adoption
+
+Adopt an exact populated store-v10 per-device database through
+`open_ingestion_store()` before Olm initialization. Retain schema v1, exactly
+five ingestion tables, and only the authenticated nullable Frame
+`callbacks_claimed_revision` column. Preserve all MatrixStore, Olm/Megolm,
+token, and inert recovery rows byte-for-byte. Inject every bootstrap failure and
+prove all-old/all-new recovery. Reject partial topology, wrong identity/version
+or pickle key, a live legacy-store lease, and repeat adoption before DML.
+
+Every filesystem `SqliteStore` created by the candidate must hold an internal
+shared lifetime sidecar/file-identity lease, while ingestion adoption takes the
+exclusive form of the same cross-process lease and holds it through session
+close. Multiple ordinary same-file stores therefore retain upstream behavior;
+exclusive adoption rejects any live candidate store in any process. The
+privately borrowed ingestion store reuses the exclusive owner and does not take
+a second lease. Release follows the existing database-connection/finalization
+path for ordinary stores and the one ingestion close owner for adopted stores.
+Deployment must stop the old binary before candidate adoption; a dormant
+pre-candidate connection cannot retroactively participate in the new sidecar
+protocol. Cover two ordinary same-file stores, shared/exclusive cross-process
+rejection, process/thread close, cancellation, and stale-file identity in
+`store_owner_test.py`, `journal_test.py`, and `crash_recovery_test.py`.
+
+**Commit:** `feat: adopt populated matrix stores durably`
+
+### Task 4B: exact store-to-session lease transfer
+
+Preserve the existing public state machine and exact `open_ingestion()`
+signature: public session-first remains successful, and a prior direct public
+`StoreBootstrap.open_matrix_store()` continues to make public session claim
+fail without consuming the bootstrap. Add a non-exported
+`_open_owned_ingestion()` factory for MindRoom. It privately creates the one
+borrowed store from the bootstrap's exclusive owner, attaches that exact object
+to the client before Olm initialization, and atomically transfers journal/store
+ownership to the session once. Reject a foreign store, second store/session,
+use after transfer, wrong-thread close, and double close. Cancellation and close
+revoke the client and store before closing the shared connection and finally
+releasing the exclusive lease. Add export and `inspect.signature` tests proving
+the public factory/state machine is unchanged and the owned factory/protocol is
+not exported from `nio` or `nio.ingest`.
+
+**Commit:** `refactor: transfer matrix store ownership to ingestion`
+
+### Task 5A: MindRoom record receipt and semantic-idempotency kernel
+
+This MindRoom slice executes before Task 4C. Replace the undeployed receipt
+table's mandatory `event_id` foreign key with nonempty `record_id`; add no table
+or migration. Every record gets a receipt. Return separate `receipt_new` and
+`semantic_event_new` facts for fresh semantic events, later-batch matching event
+identity, and exact receipt replay. Compare retained room/thread/kind/sender and
+origin timestamp; conflict rolls back event, projection, receipt, and frontier.
+Define literal transaction dispositions for event, lifecycle, history loss, and
+compatibility-only records, and prove concurrent admission dispatches once.
+
+**Commit:** `fix: deduplicate durable matrix events semantically`
+
+### Task 4C: callback-free shared compatibility preparation
+
+Parse Classic and private durable Sliding Frames into one private preparation
+contract. Apply no-recovery primitives in upstream order: to-device first,
+timeline Megolm second, then device-list/OTK/fallback and room projection. A
+same-Frame room key must decrypt its later timeline event. Produce stable event
+IDs, decrypted `clear_json` or explicit failure, `RoomSnapshot` values, and a
+fully authenticated retained-Frame inputs sufficient for Task 4F to reconstruct
+completion after it has a claimed revision. Do not create `_FrameCompletion` in
+this commit. Run no callbacks and expose no public Sliding response API.
+Ordinary public response callbacks remain solely on Desktop's pre-fork sync
+path.
+
+Create `tests/ingest/preparation_test.py` and cover equivalent Classic/Sliding
+output, crypto ordering, explicit failure, and zero callbacks.
+
+**Commit:** `refactor: prepare durable frames without callbacks`
+
+### Task 4D: atomic all-kind materialization and snapshots
+
+In one owner transaction persist crypto writes, clear events, stable IDs,
+aggregates, room snapshots, every `RecordKind` including `TO_DEVICE`, every
+`LossRecord`, Work, and preparation revision. Retain the Frame as completion
+owner. Any failure after in-memory Olm mutation rolls back SQLite, poisons that
+session object, and requires clean reconstruction before replay. Prove literal
+fates for all record kinds, all statement crash boundaries, empty/nonempty Frame
+retention, and equal Classic/Sliding durable graphs.
+
+**Commit:** `refactor: materialize all durable record kinds atomically`
+
+### Task 4E: snapshot restore and receipt-gated apply/ack
+
+Restore `AsyncClient.rooms` before incremental delivery. Reapply client/room
+state idempotently; publish auxiliary callbacks only when `receipt_new` and
+semantic event callbacks only when `semantic_event_new`. Duplicate receipts run
+no callback and proceed to ack. Callback error/cancellation leaves Work
+replayable; after the committed receipt, replay suppresses callback and acks.
+No callback runs in either database transaction. Add only the underscored
+`session._settle_batch(batch, receipt_new=..., semantic_event_new=...)` method
+to the non-exported owned-session protocol; do not add a non-underscored method
+to the public `IngestionSession` contract. MindRoom obtains that protocol only
+from `_open_owned_ingestion()`.
+
+**Commit:** `feat: settle durable records through compatibility callbacks`
+
+### Task 5B: MindRoom all-record adapter and pump
+
+Accept both origins and map every record/loss to Task 5A's disposition. Timeline
+uses the existing classifier; history/context settles without a turn; lifecycle
+uses membership/departure fences; loss uses room-history recovery; state,
+ephemeral, account data, presence, and to-device are compatibility receipts.
+Call `session._settle_batch()` with the two facts. Keep `max_records=1`; malformed
+or unknown input never acks and no known record can block the FIFO forever.
+
+**Commit:** `feat: consume every durable ingestion record`
+
+### Task 4F: outbound maintenance, Frame completion, and coordinator progress
+
+Only after Tasks 5A, 4E, and 5B exist, implement
+`PREPARE -> HYDRATE_IF_REQUIRED -> WAIT_FOR_RECORD_ACK ->
+MAINTAIN_OUTBOUND_CRYPTO -> CLAIM_AND_FANOUT_COMPLETION -> RETIRE ->
+NEXT_SOURCE_HTTP`. After all Frame Work is acked but before claim/retirement,
+run the callback-free upstream key upload, key query, key claim, and queued
+to-device send maintenance in its exact order. Retryable network failure leaves
+the Frame retained; crash/retry uses stable request/transaction identities and
+must not duplicate a semantic send. No next source poll can pass this state.
+
+Define a private non-exported `_FrameCompletion` with authenticated
+`frame_id`, transport, source epoch, request ID, staged revision, and claimed
+revision, reconstructed only from a fully authenticated retained Frame/owner.
+The non-exported `_OwnedIngestionSession` holds one
+`Callable[[_FrameCompletion], Awaitable[None]] | None` sink installed only by
+MindRoom's private 5C factory; no registration method is added to public
+`IngestionSession` or `open_ingestion()`. Claim completion only after no Work
+references the Frame and outbound maintenance succeeds. Persist the claim
+before invoking the sink outside transactions. Sink raise, cancellation, or
+process death leaves the Frame durably claimed; restart retires it without a
+second invocation. Empty Frames use the same path. Hydration may run while the
+next source sync is fenced. Ack and close wake the runner without lost wakeups.
+Only malformed, authentication, or conflict states are terminal BLOCKED.
+
+Add causal tests for exact key upload/query/claim/to-device ordering, stable
+retry/crash identity, maintenance-before-claim, authenticated completion
+reconstruction, sink success/raise/cancel/crash after claim, claimed restart
+retirement, and absence of `_FrameCompletion`, `_OwnedIngestionSession`, and the
+owned factory from public exports/signatures.
+
+**Commit:** `feat: complete durable frames after record settlement`
+
+### Tasks 5C and 5D: session factory, then sole MindRoom engine
+
+5C wires fresh and restored login through the non-exported
+`_open_owned_ingestion()` factory, exact per-device adoption/lease, client
+attachment, session claim, and private completion sink before Olm
+initialization; poison rebuilds a new client/Olm object. 5D makes
+`Bot.sync_forever()` use the durable
+runner/pump as MindRoom's only candidate engine, while existing
+`matrix_sync.mode` chooses only Classic or Sliding transport. Preserve health,
+first-sync, invites/membership, presence, E2EE/to-device pairing, RTC,
+permanent-auth error, cancellation, and close behavior. Add no environment
+latch, control room, `probe`, YAML engine toggle, or public nio API.
+
+**Commits:** `feat: open durable matrix sessions in place`; then
+`feat: activate durable matrix ingestion`
+
 **Production files**
 
 - `src/nio/client/async_client.py` and `base_client.py` for a reusable no-recovery response-preparation boundary
@@ -170,20 +351,20 @@ Build a differential behavior matrix covering at least:
 - callbacks and response-state projection.
 - same-Frame Olm room-key arrival followed by Megolm timeline decryption;
 - rollback after each crypto/store/Work/marker statement, session poisoning, and clean reopen;
-- Frame completion and one response/completion callback for empty and nonempty Frames;
+- Frame completion and one private `_FrameCompletion` hook for empty and nonempty Frames;
 - `AsyncClient.rooms` restoration from persisted snapshots before incremental response delivery.
 
 For equivalent normalized input, both transports must produce the same record fates and durable graph. A transport adapter may normalize wire differences; it may not choose a different fate engine.
 
 Add one frame-scope compatibility preparation phase before Work becomes application-visible. The MindRoom AsyncClient must adopt the ingestion-owned MatrixStore so ordinary E2EE rows and the five ingestion tables share one SQLite owner/transaction. Reuse callback-free AsyncClient/Olm primitives in upstream order: to-device first, timeline Megolm next, then device-list/key-count/fallback controls and room-state projection. Persist stable event IDs, decrypted `clear_json`, `RoomSnapshot`, every `RecordKind` including `TO_DEVICE`, aggregates/Work, and the preparation revision atomically. On rollback after Olm memory mutation, poison/close the session and reconstruct it from the rolled-back database; never retry the same object.
 
-Implement that ownership as an explicit lease transfer, not two independent opens: `StoreBootstrap.open_matrix_store()` creates the exact borrowed `SqliteStore`; a new session-claim operation accepts only that same leased store, transfers both journal and store to one `IngestionSession`, and revokes/closes them exactly once. It must reject a foreign store, session-before-store, second store/session, use after transfer, and close from the wrong owner. Add causal lifecycle tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Do not weaken the single-process/thread/file-identity/writer-epoch fences.
+Implement ownership through the non-exported owned-session factory, not two independent opens and not a public state-machine reversal. The factory privately creates the borrowed `SqliteStore` from the bootstrap's exclusive owner, accepts only that exact object, transfers journal/store to `_OwnedIngestionSession`, and revokes/closes them once. Existing public `open_ingestion()` remains session-first; direct public store-first continues to reject a later public session. Add causal lifecycle and public signature/export tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Do not weaken the single-process/thread/file-identity/writer-epoch fences.
 
 Before that lease exists, add an exclusive in-place v1 adoption path for the populated MindRoom per-device database. Authenticate exact account/device/store-v10 ownership and all existing MatrixStore tables; in one bootstrap transaction add only the five v1 ingestion tables/initial rows and leave every existing Olm account pickle, Megolm/session/key row, sync token, and inert historical recovery table byte-identical. Every injected statement failure must reopen as all-old with no ingestion marker; success must reopen as all-new with exactly one marker/source. Reject partial topology, wrong identity, unsupported store version, a simultaneously open client/store, or a second adoption without mutation. Do not create a parallel ingestion database for the same device.
 
-Keep the Frame after materialization as the response/completion owner. Add only one authenticated nullable `callbacks_claimed_revision` column to `NioIngestFrame` while retaining schema version 1 and exactly five tables. One-record receipts suppress record callback replay; when the Frame has no Work left, claim its completion callback before best-effort fanout, then retire it. Empty Frames use the same path. Persist/restore the existing `RoomSnapshot` carrier before incremental delivery. Complete outbound device-key maintenance while the retained Frame can still recreate its in-memory request state. No callback runs in either database transaction.
+Keep the Frame after materialization as the completion owner. Add only one authenticated nullable `callbacks_claimed_revision` column to `NioIngestFrame` while retaining schema version 1 and exactly five tables. One-record receipts suppress record callback replay; when the Frame has no Work left, finish ordered outbound crypto maintenance, claim its private transport-neutral `_FrameCompletion` sink before best-effort fanout, then retire it. Empty Frames use the same path. Persist/restore the existing `RoomSnapshot` carrier before incremental delivery. No callback runs in either database transaction.
 
-Replace the current “any remaining Frame is blocked” coordinator branch with an explicit private progress machine: `PREPARE -> HYDRATE_IF_REQUIRED -> WAIT_FOR_RECORD_ACK -> CLAIM_AND_FANOUT_COMPLETION -> RETIRE -> NEXT_SOURCE_HTTP`. A prepared retained Frame yields/wakes the concurrent MindRoom pump instead of raising; first-room HELD Work can complete its hydration HTTP; the next source-sync HTTP remains fenced until every record receipt/ack and Frame completion settles. Only malformed/auth/conflict states are `BLOCKED`. Add causal concurrent runner+pump tests for empty and nonempty Classic/Sliding Frames and first-room hydration, proving the second source poll occurs only after completion and leaves zero Frame/Work; add crash, cancellation, close, and lost-wakeup coverage. Do not add a progress table.
+Replace the current “any remaining Frame is blocked” coordinator branch with the explicit private progress machine bound in Task 4F, including `MAINTAIN_OUTBOUND_CRYPTO`. A prepared retained Frame yields/wakes the concurrent MindRoom pump instead of raising; first-room HELD Work can complete its hydration HTTP; the next source-sync HTTP remains fenced until every record receipt/ack, outbound maintenance, private completion claim, and retirement settles. Only malformed/auth/conflict states are `BLOCKED`. Add causal concurrent runner+pump tests for empty and nonempty Classic/Sliding Frames and first-room hydration, proving the second source poll occurs only after completion and leaves zero Frame/Work; add crash, cancellation, close, and lost-wakeup coverage. Do not add a progress table.
 
 A retained Frame is retry state, not a successful terminal fate. For both transports, successful encrypted, to-device, device-list, OTK, fallback-key, state, account-data, presence, ephemeral, lifecycle, and loss responses must end with zero permanently retained Frames and zero unacknowledgeable Work. Each known input must resolve to exactly one explicit owner: MindRoom event/lifecycle/loss Work or compatibility-owned MatrixStore/callback state. Malformed input remains durably blocked and visible.
 
@@ -191,11 +372,18 @@ Task 1 must already have removed every dedicated diagnostic entrypoint. Preserve
 
 Run both full adapter suites plus the shared reducer/materializer suite and statics.
 
-**Commit:** `refactor: share durable materialization across transports`
+The preceding cross-cutting matrix governs Tasks 4C through 4F. Each subtask runs its
+focused tests and statics before commit; after 4F, run both full adapter suites,
+the shared reducer/materializer/coordinator/delivery/crash suites, and all nio
+statics.
 
-## Task 5: Add MindRoom semantic event idempotency and transport selection
+## Task 5: Complete the interleaved MindRoom slices
 
 Work in `/work/dev/mindroom` with test-driven development.
+
+Task 5A executes after Task 4B; Task 5B after Task 4E; Tasks 5C and 5D after
+Task 4F, as specified above. The following files and acceptance matrix apply
+across all four MindRoom slices; they are not authority to reorder them.
 
 **Production files**
 
@@ -236,7 +424,9 @@ Keep `max_records=1`. Reuse the existing `journal_events` unique identity, immut
 
 Run focused RED/GREEN, full journal/admission/crash suites, statics, and diff checks.
 
-**Commit:** `fix: deduplicate durable matrix events semantically`
+Use the four commit subjects bound in Tasks 5A through 5D above. Run each focused
+RED/GREEN gate before its commit, then the full MindRoom suite and statics after
+5D.
 
 ## Task 6: Restore the pre-fork public sync path and verify compatibility
 
