@@ -65,9 +65,10 @@ from . import (
 from .log import logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Mapping, Sequence
 
     from ..client.sync_recovery import (
+        CompletedTimelineEvent,
         PendingEventKind,
         PendingTimelineEvent,
         RecoveryGap,
@@ -1214,7 +1215,19 @@ class MatrixStore:
         """
         account = self._get_account()
         assert account
-        updated = (
+        updated = self._accept_recovery_event(account, room_id, event_id)
+        if updated != 1:
+            logger.warning(
+                "Pending recovery event already cleared at admission: %s "
+                "(generation %d in %s)",
+                event_id,
+                generation,
+                room_id,
+            )
+
+    @staticmethod
+    def _accept_recovery_event(account, room_id: str, event_id: str) -> int:
+        return (
             PendingTimelineEvents.update(admission_accepted=True)
             .where(
                 PendingTimelineEvents.account == account,
@@ -1224,14 +1237,25 @@ class MatrixStore:
             )
             .execute()
         )
-        if updated != 1:
-            logger.warning(
-                "Pending recovery event already cleared at admission: %s "
-                "(generation %d in %s)",
-                event_id,
-                generation,
-                room_id,
-            )
+
+    @use_database_atomic
+    def accept_recovery_events(
+        self,
+        keys: Sequence[tuple[str, int, str]],
+    ) -> None:
+        """Atomically record admission for an ordered event batch."""
+        account = self._get_account()
+        assert account
+        for room_id, generation, event_id in keys:
+            updated = self._accept_recovery_event(account, room_id, event_id)
+            if updated != 1:
+                logger.warning(
+                    "Pending recovery event already cleared at admission: %s "
+                    "(generation %d in %s)",
+                    event_id,
+                    generation,
+                    room_id,
+                )
 
     @use_database
     def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
@@ -1320,42 +1344,64 @@ class MatrixStore:
             # every such state into the single marker row, where the old
             # fetch/delete/insert sequence raised DoesNotExist or violated
             # the UNIQUE(account_id, room_id, event_id) constraint.
-            pending = PendingTimelineEvents.get_or_none(
-                PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id == room_id,
-                PendingTimelineEvents.event_id == event_id,
+            completed = self._finish_recovery_event(
+                account,
+                room_id,
+                event_id,
+                was_encrypted,
+                TimelineEventProvenance.HISTORY,
             )
-            if event_id.startswith("~"):
-                if pending:
-                    pending.delete_instance()
-                return
-            # The marker mirrors record_completed_timeline_event: the first
-            # completion's provenance sticks, and encryption state combines
-            # with AND so an event once delivered decrypted is never
-            # re-dispatched as pending decryption.
-            already_completed = pending is not None and pending.generation == 0
-            PendingTimelineEvents.replace(
-                account=account,
-                room_id=room_id,
-                generation=0,
-                sequence=0,
-                event_id=event_id,
-                event_payload=b"",
-                is_live=False,
-                was_encrypted=(
-                    bool(pending.was_encrypted) and was_encrypted
-                    if already_completed
-                    else was_encrypted
-                ),
-                was_completed=False,
-                admission_accepted=False,
-                provenance=(
-                    pending.provenance
-                    if pending
-                    else TimelineEventProvenance.HISTORY.value
-                ),
-                apply_room_state=False,
-            ).execute()
+            if completed:
+                self._prune_completed_recovery_events(account, {room_id})
+            return
+        PendingTimelineEvents.delete().where(*event_filter).execute()
+        SyncRecoveryGaps.delete().where(
+            SyncRecoveryGaps.account == account,
+            SyncRecoveryGaps.room_id == room_id,
+            SyncRecoveryGaps.generation == generation,
+        ).execute()
+
+    @staticmethod
+    def _finish_recovery_event(
+        account,
+        room_id: str,
+        event_id: str,
+        was_encrypted: bool,
+        provenance: TimelineEventProvenance,
+    ) -> bool:
+        pending = PendingTimelineEvents.get_or_none(
+            PendingTimelineEvents.account == account,
+            PendingTimelineEvents.room_id == room_id,
+            PendingTimelineEvents.event_id == event_id,
+        )
+        if event_id.startswith("~"):
+            if pending:
+                pending.delete_instance()
+            return False
+        already_completed = pending is not None and pending.generation == 0
+        PendingTimelineEvents.replace(
+            account=account,
+            room_id=room_id,
+            generation=0,
+            sequence=0,
+            event_id=event_id,
+            event_payload=b"",
+            is_live=False,
+            was_encrypted=(
+                bool(pending.was_encrypted) and was_encrypted
+                if already_completed
+                else was_encrypted
+            ),
+            was_completed=False,
+            admission_accepted=False,
+            provenance=pending.provenance if pending else provenance.value,
+            apply_room_state=False,
+        ).execute()
+        return True
+
+    @staticmethod
+    def _prune_completed_recovery_events(account, room_ids: set[str]) -> None:
+        for room_id in room_ids:
             stale = (
                 PendingTimelineEvents.select(PendingTimelineEvents.id)
                 .where(
@@ -1369,13 +1415,33 @@ class MatrixStore:
             PendingTimelineEvents.delete().where(
                 PendingTimelineEvents.id.in_(stale)
             ).execute()
-            return
-        PendingTimelineEvents.delete().where(*event_filter).execute()
-        SyncRecoveryGaps.delete().where(
-            SyncRecoveryGaps.account == account,
-            SyncRecoveryGaps.room_id == room_id,
-            SyncRecoveryGaps.generation == generation,
-        ).execute()
+
+    @use_database_atomic
+    def finish_recovery_events(
+        self,
+        keys: Sequence[tuple[str, int, str]],
+        completed: Sequence[CompletedTimelineEvent],
+    ) -> None:
+        """Atomically replace an ordered event batch with completion markers."""
+        if len(keys) != len(completed):
+            raise ValueError("Recovery completion count does not match its keys")
+        account = self._get_account()
+        assert account
+        touched_rooms = set()
+        for (room_id, _generation, event_id), result in zip(
+            keys,
+            completed,
+            strict=True,
+        ):
+            if self._finish_recovery_event(
+                account,
+                room_id,
+                event_id,
+                result.was_encrypted,
+                result.provenance,
+            ):
+                touched_rooms.add(room_id)
+        self._prune_completed_recovery_events(account, touched_rooms)
 
     @use_database
     def delete_encrypted_room(self, room: str) -> None:
