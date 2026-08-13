@@ -650,6 +650,32 @@ async def test_batch_dispatch_keeps_mixed_kinds_on_individual_path():
     assert not state.gaps
 
 
+def test_batch_completion_validates_memory_before_store_commit():
+    gap = RecoveryGap(ROOM, 1, "", None)
+    existing = pending("$one", 0)
+    missing = pending("$missing", 1)
+    state = RecoveryState(
+        gaps={ROOM: [gap]},
+        events={(ROOM, 1): [existing]},
+    )
+    store = InlineStore()
+
+    with pytest.raises(
+        ValueError,
+        match=r"Pending recovery event disappeared: \$missing",
+    ):
+        sync_recovery._finish_recovery_event_batch(
+            state,
+            store,
+            gap,
+            (existing, missing),
+            (event("$one", 0), event("$missing", 1)),
+        )
+
+    assert store.finished_batches == []
+    assert state.events[(ROOM, 1)] == [existing]
+
+
 @pytest.mark.asyncio
 async def test_callback_crash_replays_only_active_row():
     state = RecoveryState(

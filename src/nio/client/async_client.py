@@ -1078,7 +1078,15 @@ class AsyncClient(Client):
         callback: TimelineBatchAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
     ) -> None:
-        """Set the sole owner of ordered timeline-batch admission."""
+        """Set the sole owner of ordered timeline-batch admission.
+
+        The callback must durably and idempotently accept the ordered entries
+        before returning one disposition per entry. Nio then commits its batch
+        acceptance markers before ordinary callback fanout. A crash during
+        fanout can replay callbacks whose grouped completion did not commit;
+        use the single-event admission API when that wider replay window is
+        unsuitable.
+        """
         if not self.config.backfill_limited_timelines:
             raise LocalProtocolError(
                 "Event admission requires limited-timeline recovery."
@@ -1491,7 +1499,7 @@ class AsyncClient(Client):
         except Exception as error:
             raise _BatchCallbackError(error, (), accepted=False) from error
 
-        delivered = []
+        delivered: list[Event | BadEventType | None] = []
         for index, (pending, item) in enumerate(
             zip(pending_events, prepared, strict=True)
         ):

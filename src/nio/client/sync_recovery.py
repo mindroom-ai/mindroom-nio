@@ -602,16 +602,9 @@ def _finish_recovery_event_batch(
         )
         for pending, result in zip(pending_events, delivered, strict=True)
     )
-    if store:
-        store.finish_recovery_events(
-            [
-                (gap.room_id, gap.generation, pending.event_id)
-                for pending in pending_events
-            ],
-            completed,
-        )
     queued = state.events[(gap.room_id, gap.generation)]
-    for pending, result in zip(pending_events, completed, strict=True):
+    current_events = []
+    for pending in pending_events:
         current = next(
             (
                 item
@@ -622,6 +615,21 @@ def _finish_recovery_event_batch(
         )
         if current is None:
             raise ValueError(f"Pending recovery event disappeared: {pending.event_id}")
+        current_events.append(current)
+    if store:
+        store.finish_recovery_events(
+            [
+                (gap.room_id, gap.generation, pending.event_id)
+                for pending in pending_events
+            ],
+            completed,
+        )
+    for pending, current, result in zip(
+        pending_events,
+        current_events,
+        completed,
+        strict=True,
+    ):
         queued.remove(current)
         if not pending.event_id.startswith("~"):
             record_completed_timeline_event(
