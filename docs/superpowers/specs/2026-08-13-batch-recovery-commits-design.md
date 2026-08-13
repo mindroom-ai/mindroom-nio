@@ -44,6 +44,8 @@ The existing `add_event_admission_callback` path and its event-by-event durabili
 
 When a batch callback is registered, the recovery pump selects the contiguous timeline prefix of one room-local recovery gap.
 
+The pump dispatches that prefix in batches no larger than the configured recovery page size, which prevents an accumulated gap from becoming one unbounded application callback burst.
+
 Parsing, room-state application, decryption, admission, and ordinary fanout retain event order.
 
 nio invokes the application batch admission callback before any ordinary callback in that batch.
@@ -90,7 +92,7 @@ Shared internal helpers should keep the single and batch SQL semantics aligned w
 
 Store tests will prove atomic acceptance, atomic completion, rollback for a missing key, encryption and provenance preservation, synthetic-row deletion, and marker pruning.
 
-Recovery tests will prove that admission commits before fanout, recovered order is unchanged, rejection retries the whole batch, accepted restart rows skip re-admission, partial callback failures settle only the correct prefix, and simultaneous admission owners are rejected.
+Recovery tests will prove that admission commits before fanout, batches remain bounded by recovery page size, recovered order is unchanged, rejection retries the whole batch, accepted restart rows skip re-admission, partial callback failures settle only the correct prefix, and simultaneous admission owners are rejected.
 
 Existing single-event recovery tests must continue to pass unchanged.
 

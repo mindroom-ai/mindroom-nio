@@ -1868,28 +1868,30 @@ async def _drain_gap(
     *,
     dispatch_event: DispatchEvent,
     dispatch_event_batch: DispatchEventBatch | None,
+    batch_limit: int,
     store: MatrixStore | None,
     deadline: float | None,
 ) -> None:
     if gap.cursor_token is not None:
         return
     queued = state.events.get((gap.room_id, gap.generation), ())
-    if dispatch_event_batch is not None:
+    while dispatch_event_batch is not None:
         pending_batch = tuple(
             pending for pending in queued if pending.kind == "timeline"
         )
-        if pending_batch and pending_batch == tuple(queued[: len(pending_batch)]):
-            complete = await _drain_timeline_batch(
-                state,
-                gap,
-                pending_batch,
-                dispatch_event_batch=dispatch_event_batch,
-                store=store,
-                deadline=deadline,
-            )
-            if not complete:
-                return
-            queued = state.events.get((gap.room_id, gap.generation), ())
+        if not pending_batch or pending_batch != tuple(queued[: len(pending_batch)]):
+            break
+        complete = await _drain_timeline_batch(
+            state,
+            gap,
+            pending_batch[:batch_limit],
+            dispatch_event_batch=dispatch_event_batch,
+            store=store,
+            deadline=deadline,
+        )
+        if not complete:
+            return
+        queued = state.events.get((gap.room_id, gap.generation), ())
     for pending in tuple(queued):
         callback_error: Exception | None = None
         try:
@@ -2031,6 +2033,7 @@ async def pump_recovery(
             gap,
             dispatch_event=dispatch_event,
             dispatch_event_batch=dispatch_event_batch,
+            batch_limit=max(1, options.page_size),
             store=store,
             deadline=None if not gap.target_token else room_deadline,
         )

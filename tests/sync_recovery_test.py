@@ -514,6 +514,44 @@ async def test_batch_dispatch_groups_store_transitions():
     assert not state.gaps
 
 
+@pytest.mark.parametrize(
+    ("page_size", "event_count", "expected_batch_sizes"),
+    [(10, 25, [10, 10, 5]), (0, 1, [1])],
+)
+@pytest.mark.asyncio
+async def test_batch_dispatch_is_bounded_by_page_size(
+    page_size, event_count, expected_batch_sizes
+):
+    gap = RecoveryGap(ROOM, 1, "", None)
+    queued = [pending(f"${index}", index) for index in range(event_count)]
+    state = RecoveryState(gaps={ROOM: [gap]}, events={(ROOM, 1): queued})
+    batch_sizes: list[int] = []
+
+    async def reject_individual(*_args):
+        raise AssertionError("timeline rows must use the batch dispatcher")
+
+    async def dispatch_batch(pending_events, events, mark_admission_accepted):
+        batch_sizes.append(len(pending_events))
+        mark_admission_accepted()
+        return events
+
+    async def unused_fetch(*_args):
+        raise AssertionError("closed gap must not fetch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, event_count, page_size, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=reject_individual,
+        dispatch_event_batch=dispatch_batch,
+        store=None,
+    )
+
+    assert batch_sizes == expected_batch_sizes
+    assert not state.gaps
+
+
 @pytest.mark.asyncio
 async def test_batch_dispatch_live_failure_completes_failed_live_event():
     gap = RecoveryGap(ROOM, 1, "", None)
