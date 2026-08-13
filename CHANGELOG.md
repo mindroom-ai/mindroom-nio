@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.40.0
+
+### Performance
+
+- Disk-backed Matrix stores now use SQLite `secure_delete=FAST` instead of
+  `ON`, reducing page-write amplification when recovery state is pruned while
+  keeping transaction durability unchanged. Deleted rows remain unavailable
+  through SQL, but SQLite no longer guarantees that their content is
+  overwritten when doing so would add I/O; deployments requiring forensic
+  erasure of unused database pages should secure the underlying storage or
+  override the database configuration.
+
 ## 0.39.0
 
 ### Breaking Changes
