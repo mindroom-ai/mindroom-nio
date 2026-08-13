@@ -167,14 +167,22 @@ re-running adoption or rereading sidecars. A second live or concurrent adoption
 rejects; a clean marked reopen does not. Test both source-class adoption paths
 and the SqliteStore marked restart.
 
-Every filesystem `MatrixStore` created by the candidate must hold an internal
-shared lifetime sidecar/file-identity lease, while ingestion adoption takes the
-exclusive form of the same cross-process lease and holds it through session
-close. Multiple ordinary same-file stores therefore retain upstream behavior;
-exclusive adoption rejects any live candidate store in any process. The
-privately borrowed ingestion store reuses the exclusive owner and does not take
-a second lease. Release follows the existing database-connection/finalization
+Every exact built-in filesystem `DefaultStore` and `SqliteStore`, plus a
+subclass inheriting the built-in `_create_database()` unchanged, must hold an
+internal shared lifetime sidecar/file-identity lease. Ingestion adoption takes
+the exclusive form and holds it through session close. Multiple participating
+ordinary same-file stores therefore retain upstream behavior; exclusive
+adoption rejects any live participating built-in-factory store in any process.
+The privately borrowed ingestion store reuses the exclusive owner and opens no
+second connection. Release follows the existing database-connection/finalizer
 path for ordinary stores and the one ingestion close owner for adopted stores.
+A subclass overriding `_create_database()` retains its pre-candidate extension
+behavior and public API but is an uncoordinated legacy extension: it is
+ineligible for `_open_configured_ingestion_store()` and must not open, or have a
+live connection to, any path selected for configured ingestion. The private
+opener accepts only exact `DefaultStore`/`SqliteStore` classes before lock, SQL,
+sidecar access, or filesystem mutation. This is an explicit deployment
+precondition, like stopping a pre-candidate binary before adoption.
 Every ordinary `DefaultStore` trust-sidecar read or write additionally enters
 one shared ownership guard for the whole semantic method—even multi-file trust
 mutations and `load_device_keys`—with per-I/O assertions, including after its
