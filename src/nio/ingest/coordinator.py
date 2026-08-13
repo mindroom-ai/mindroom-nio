@@ -8,7 +8,7 @@ from uuid import UUID
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
 from ..exceptions import LocalProtocolError
-from ..store._sync_journal_values import MaterializeStatus
+from ..store._sync_journal_values import MaterializerLimits, MaterializeStatus
 from . import ports
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
@@ -58,12 +58,10 @@ class IngestionSession:
         client: AsyncClient,
         bootstrap: StoreBootstrap,
         config: IngestionConfig,
-        room_id: str,
     ) -> None:
         self._client = client
         self._bootstrap = bootstrap
         self._config = config
-        self._room_id = room_id
         self._journal = bootstrap._claim_session()
         owner = self._journal.load_owner()
         classic = owner.transport_kind is TransportKind.CLASSIC
@@ -130,8 +128,8 @@ class IngestionSession:
         hydration_retries = 0
         while self._close_task is None:
             while True:
-                materialized = self._journal.materialize_oldest_diagnostic_frame(
-                    room_id=self._room_id
+                materialized = self._journal.materialize_oldest_frame(
+                    limits=MaterializerLimits()
                 )
                 if materialized.status is MaterializeStatus.MATERIALIZED:
                     continue
@@ -149,11 +147,14 @@ class IngestionSession:
             pending = self._journal.load_pending_hydrations(limit=2)
             if pending:
                 candidate = pending[0]
-                if len(pending) != 1 or candidate.continuity.room_id != self._room_id:
+                if (
+                    len(pending) == 2
+                    and pending[1].intent.hydration_id == candidate.intent.hydration_id
+                ):
                     raise IngestionHydrationError(candidate.intent.hydration_id)
                 prior = self._journal.load_source()
                 owner = self._journal.load_owner()
-                hydration_request = ports.NetworkRequest(owner.stream_id, owner.transport_kind, prior.source_epoch, prior.next_request_id, "GET", f"/_matrix/client/v3/rooms/{quote(self._room_id, safe='')}/state", (), None, self._config.source.timeout_ms, prior.cursor_json)
+                hydration_request = ports.NetworkRequest(owner.stream_id, owner.transport_kind, prior.source_epoch, prior.next_request_id, "GET", f"/_matrix/client/v3/rooms/{quote(candidate.continuity.room_id, safe='')}/state", (), None, self._config.source.timeout_ms, prior.cursor_json)
                 try:
                     network = await self._request(hydration_request, body_disconnect_retry=True)
                 except (IngestionSourceError, AttributeError, TypeError, ValueError) as error:
@@ -310,7 +311,6 @@ def open_ingestion(
     config: IngestionConfig,
     consumer_generation: UUID,
     stream_id: UUID | None,
-    room_id: str,
 ) -> IngestionSession:
     from ..client.async_client import AsyncClient
     from ..store.sync_journal import StoreBootstrap
@@ -330,9 +330,6 @@ def open_ingestion(
         raise LocalProtocolError("consumer_generation must be UUID")
     if type(stream_id) is not UUID:
         raise LocalProtocolError("stream_id must be a bound UUID")
-    if type(room_id) is not str or not room_id:
-        raise LocalProtocolError("room_id must be a nonempty str")
-
     owner = bootstrap._journal.load_owner()
     if (client.user_id, client.device_id) != (owner.account_id, owner.device_id):
         raise LocalProtocolError("client identity does not match ingestion owner")
@@ -343,4 +340,4 @@ def open_ingestion(
         raise LocalProtocolError("consumer generation/stream binding does not match")
     if source_transport(config.source) is not owner.transport_kind:
         raise LocalProtocolError("source transport does not match ingestion owner")
-    return IngestionSession(client, bootstrap, config, room_id)
+    return IngestionSession(client, bootstrap, config)

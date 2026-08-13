@@ -1210,7 +1210,6 @@ def test_source_only_journal_port_is_exact() -> None:
         "list_frames",
         "stage_source_response",
         "materialize_oldest_frame",
-        "materialize_oldest_diagnostic_frame",
         "load_pending_hydrations",
         "apply_hydration_result",
         "next_batch",
@@ -1265,19 +1264,6 @@ def test_source_only_journal_port_is_exact() -> None:
         parameter.default is inspect.Parameter.empty
         for parameter in materialize_parameters
     )
-    diagnostic_parameters = tuple(
-        inspect.signature(
-            methods["materialize_oldest_diagnostic_frame"]
-        ).parameters.values()
-    )
-    assert tuple(parameter.name for parameter in diagnostic_parameters) == (
-        "self",
-        "room_id",
-        "limits",
-    )
-    assert diagnostic_parameters[1].kind is inspect.Parameter.KEYWORD_ONLY
-    assert diagnostic_parameters[2].default == MaterializerLimits()
-
     hints = {name: get_type_hints(method) for name, method in methods.items()}
     assert hints == {
         "load_owner": {"return": OwnerView},
@@ -1296,11 +1282,6 @@ def test_source_only_journal_port_is_exact() -> None:
             "return": CommitResult,
         },
         "materialize_oldest_frame": {
-            "limits": MaterializerLimits,
-            "return": MaterializeResult,
-        },
-        "materialize_oldest_diagnostic_frame": {
-            "room_id": str,
             "limits": MaterializerLimits,
             "return": MaterializeResult,
         },

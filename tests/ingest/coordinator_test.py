@@ -271,7 +271,6 @@ def test_open_ingestion_rejects_incomplete_or_mismatched_binding(
             config=classic_config(),
             consumer_generation=supplied_generation,
             stream_id=supplied_stream,
-            room_id=ROOM,
         )
 
     assert client.send_count == 0
@@ -306,7 +305,6 @@ def test_open_ingestion_rejects_wrong_or_unauthenticated_client(
             config=classic_config(),
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
-            room_id=ROOM,
         )
 
     assert client.send_count == 0
@@ -328,7 +326,6 @@ def test_open_ingestion_rejects_transport_mismatch_without_consuming_bootstrap(
             config=sliding,
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
-            room_id=ROOM,
         )
 
     assert client.send_count == 0
@@ -346,7 +343,6 @@ async def test_successful_open_transfers_bootstrap_once(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
 
     with pytest.raises(LocalProtocolError):
@@ -356,7 +352,6 @@ async def test_successful_open_transfers_bootstrap_once(tmp_path) -> None:
             config=classic_config(),
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
-            room_id=ROOM,
         )
     with pytest.raises(LocalProtocolError):
         bootstrap.open_matrix_store(SqliteStore)
@@ -382,7 +377,6 @@ def test_store_first_rejects_session_claim_without_consuming_bootstrap(
             config=classic_config(),
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
-            room_id=ROOM,
         )
 
     assert bootstrap._session_claimed is False
@@ -409,7 +403,6 @@ async def test_custom_authorization_rejected_without_consuming_bootstrap(
             config=classic_config(),
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
-            room_id=ROOM,
         )
 
     assert bootstrap._session_claimed is False
@@ -421,7 +414,6 @@ async def test_custom_authorization_rejected_without_consuming_bootstrap(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     await session.close()
 
@@ -449,7 +441,6 @@ async def test_run_drains_supported_frame_before_first_http(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionHydrationError):
         await session.run()
@@ -520,7 +511,6 @@ async def test_run_hydrates_fresh_live_room_before_later_sync(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -563,7 +553,6 @@ async def test_hydration_protocol_failure_is_focused_and_retains_owner(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionHydrationError):
         await session.run()
@@ -596,7 +585,6 @@ async def test_hydration_payload_disconnect_releases_and_retries(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -626,7 +614,6 @@ async def test_hydration_real_public_send_bypasses_callbacks(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -669,7 +656,6 @@ async def test_hydration_retryable_fates_reload_then_release_before_sync(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -695,7 +681,6 @@ async def test_hydration_terminal_status_is_sticky_without_source_sync(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionHydrationError):
         await session.run()
@@ -720,7 +705,6 @@ async def test_cancelling_held_hydration_get_retains_pending_owner(tmp_path) -> 
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await content.entered.wait()
@@ -755,7 +739,6 @@ async def test_hydration_http_holds_no_sqlite_writer_transaction(tmp_path) -> No
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionHydrationError):
         await session.run()
@@ -763,52 +746,46 @@ async def test_hydration_http_holds_no_sqlite_writer_transaction(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_other_room_pending_hydration_blocks_without_http(tmp_path) -> None:
+async def test_pending_hydrations_for_multiple_rooms_are_processed_in_sequence(
+    tmp_path,
+) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
     stage_pending(bootstrap)
-    assert bootstrap._journal.materialize_oldest_diagnostic_frame(room_id=ROOM).revision
-    client = RecordingClient()
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-        room_id="!other:example.org",
-    )
-    with pytest.raises(nio.IngestionHydrationError):
-        await session.run()
-    assert client.send_count == 0
-    await session.close()
-
-
-@pytest.mark.asyncio
-async def test_two_pending_hydrations_block_without_http(tmp_path) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    stage_pending(bootstrap)
-    assert bootstrap._journal.materialize_oldest_diagnostic_frame(room_id=ROOM).revision
+    assert bootstrap._journal.materialize_oldest_frame(
+        limits=MaterializerLimits()
+    ).revision
     other = "!other:example.org"
     stage_classic(
         bootstrap,
         {"next_batch": "s2", "rooms": {"join": {other: {}}}},
     )
-    assert bootstrap._journal.materialize_oldest_diagnostic_frame(
-        room_id=other
+    assert bootstrap._journal.materialize_oldest_frame(
+        limits=MaterializerLimits()
     ).revision
     client = RecordingClient()
+    client.responses.extend(
+        [
+            FakeResponse(200, hydration_state()),
+            FakeResponse(200, hydration_state()),
+            FakeResponse(401, b"{}"),
+        ]
+    )
     session = nio.open_ingestion(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionHydrationError):
+    with pytest.raises(nio.IngestionSourceError):
         await session.run()
-    assert client.send_count == 0
+    assert [call[0][1] for call in client.send_calls] == [
+        "/_matrix/client/v3/rooms/%21diagnostic%3Aexample.org/state",
+        "/_matrix/client/v3/rooms/%21other%3Aexample.org/state",
+        "/_matrix/client/v3/sync?since=s2&timeout=30000&filter=%7B%7D",
+    ]
+    assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
     await session.close()
 
 
@@ -834,7 +811,6 @@ async def test_cancelling_hydration_retry_sleep_retains_pending_owner(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await sleeping.wait()
@@ -843,43 +819,6 @@ async def test_cancelling_hydration_retry_sleep_retains_pending_owner(
         await task
     assert len(bootstrap._journal.load_pending_hydrations(limit=2)) == 1
     await session.close()
-
-
-@pytest.mark.asyncio
-async def test_run_stops_on_prestaged_blocked_frame_without_http(tmp_path) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    frame = stage_classic(bootstrap, _blocked_classic_success())
-    client = RecordingClient()
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-        room_id=ROOM,
-    )
-    with pytest.raises(nio.IngestionBlockedError):
-        await session.run()
-    assert bootstrap._journal.load_frame(frame.frame_id) is not None
-    assert client.send_count == 0
-    await session.close()
-
-    reopened = open_bootstrap(tmp_path, generation)
-    restarted_client = RecordingClient()
-    restarted = nio.open_ingestion(
-        restarted_client,
-        reopened,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=reopened.stream_id,
-        room_id=ROOM,
-    )
-    with pytest.raises(nio.IngestionBlockedError):
-        await restarted.run()
-    assert restarted_client.send_count == 0
-    assert reopened._journal.load_frame(frame.frame_id) is not None
-    await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -900,7 +839,6 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     run_task = asyncio.create_task(session.run())
     request_task = asyncio.create_task(client.second_request_entered.wait())
@@ -1028,7 +966,6 @@ async def test_raw_attempt_uses_public_send_without_callbacks_and_bounds_read(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1080,7 +1017,6 @@ async def test_http_attempt_holds_no_sqlite_writer_transaction(tmp_path) -> None
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1103,6 +1039,7 @@ async def test_retry_sleep_replans_exact_unchanged_request(
                 b'{"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":7}',
             ),
             FakeResponse(200, canonical_json(_blocked_classic_success())),
+            FakeResponse(401, b"{}"),
         ]
     )
     sleeps: list[float] = []
@@ -1117,17 +1054,16 @@ async def test_retry_sleep_replans_exact_unchanged_request(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionBlockedError):
+    with pytest.raises(nio.IngestionHydrationError):
         await session.run()
 
     assert sleeps == [0.007]
-    assert len(client.send_calls) == 2
+    assert len(client.send_calls) == 3
     assert client.send_calls[0] == client.send_calls[1]
     after = bootstrap._journal.load_source()
     assert after.next_request_id == before.next_request_id + 1
-    assert len(bootstrap._journal.list_frames(2)) == 1
+    assert bootstrap._journal.list_frames(2) == ()
     await session.close()
 
 
@@ -1142,6 +1078,7 @@ async def test_retry_after_header_is_bounded_and_owned_by_session(
         [
             FakeResponse(429, b"{}", {"Retry-After": "999"}),
             FakeResponse(200, canonical_json(_blocked_classic_success())),
+            FakeResponse(401, b"{}"),
         ]
     )
     sleeps: list[float] = []
@@ -1156,9 +1093,8 @@ async def test_retry_after_header_is_bounded_and_owned_by_session(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionBlockedError):
+    with pytest.raises(nio.IngestionHydrationError):
         await session.run()
     assert sleeps == [60.0]
     await session.close()
@@ -1176,7 +1112,6 @@ async def test_terminal_error_is_sticky_without_second_http(tmp_path) -> None:
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError) as first:
         await session.run()
@@ -1203,7 +1138,6 @@ async def test_delivery_remains_sync_after_sticky_failure_and_stops_at_close(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1260,7 +1194,6 @@ async def test_close_cancels_runner_and_releases_bootstrap_lock(tmp_path) -> Non
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await client.entered.wait()
@@ -1285,7 +1218,6 @@ async def test_concurrent_close_survives_first_caller_cancellation(tmp_path) -> 
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     runner = asyncio.create_task(session.run())
     await client.entered.wait()
@@ -1324,7 +1256,11 @@ async def test_only_retryable_fates_retry_without_durable_mutation(
     before = bootstrap._journal.load_source()
     client = RecordingClient()
     client.responses.extend(
-        [first, FakeResponse(200, canonical_json(_blocked_classic_success()))]
+        [
+            first,
+            FakeResponse(200, canonical_json(_blocked_classic_success())),
+            FakeResponse(401, b"{}"),
+        ]
     )
     sleeps: list[float] = []
 
@@ -1340,9 +1276,8 @@ async def test_only_retryable_fates_retry_without_durable_mutation(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionBlockedError):
+    with pytest.raises(nio.IngestionHydrationError):
         await session.run()
     assert sleeps == [0.0]
     assert client.send_calls[0] == client.send_calls[1]
@@ -1375,7 +1310,6 @@ async def test_terminal_fates_leave_source_and_frames_unchanged(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1400,7 +1334,6 @@ async def test_cancellation_during_http_leaves_durable_request_unchanged(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await client.entered.wait()
@@ -1434,7 +1367,6 @@ async def test_cancellation_during_retry_sleep_leaves_request_unchanged(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await sleeping.wait()
@@ -1474,7 +1406,6 @@ async def test_idle_with_retained_crypto_frame_blocks_without_http(tmp_path) -> 
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionBlockedError):
         await session.run()
@@ -1496,7 +1427,6 @@ async def test_malformed_transport_state_is_a_sticky_source_error(tmp_path) -> N
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1516,7 +1446,11 @@ async def test_body_read_connection_failure_releases_and_retries(
     failed.content = FailingContent()  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.extend(
-        [failed, FakeResponse(200, canonical_json(_blocked_classic_success()))]
+        [
+            failed,
+            FakeResponse(200, canonical_json(_blocked_classic_success())),
+            FakeResponse(401, b"{}"),
+        ]
     )
 
     async def no_wait(delay: float) -> None:
@@ -1529,12 +1463,11 @@ async def test_body_read_connection_failure_releases_and_retries(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
-    with pytest.raises(nio.IngestionBlockedError):
+    with pytest.raises(nio.IngestionHydrationError):
         await session.run()
     assert failed.released
-    assert client.send_count == 2
+    assert client.send_count == 3
     await session.close()
 
 
@@ -1552,7 +1485,6 @@ async def test_reader_overrun_fails_closed_and_releases_response(tmp_path) -> No
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1577,7 +1509,6 @@ async def test_payload_protocol_failure_is_terminal_and_releases_response(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1600,7 +1531,6 @@ async def test_missing_response_content_is_a_terminal_source_error(tmp_path) -> 
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1624,7 +1554,6 @@ async def test_cancellation_during_body_read_releases_response(tmp_path) -> None
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     task = asyncio.create_task(session.run())
     await content.entered.wait()
@@ -1658,7 +1587,6 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
         config=config,
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1694,7 +1622,6 @@ async def test_429_public_send_does_not_invoke_callbacks(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1715,7 +1642,7 @@ async def test_materializer_at_capacity_is_sticky_without_http(
         return MaterializeResult(MaterializeStatus.AT_CAPACITY, frame_id, None)
 
     monkeypatch.setattr(
-        type(bootstrap._journal), "materialize_oldest_diagnostic_frame", at_capacity
+        type(bootstrap._journal), "materialize_oldest_frame", at_capacity
     )
     client = RecordingClient()
     session = nio.open_ingestion(
@@ -1724,7 +1651,6 @@ async def test_materializer_at_capacity_is_sticky_without_http(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionBlockedError) as first:
         await session.run()
@@ -1771,7 +1697,6 @@ async def test_retry_counter_resets_after_successful_frame(
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
@@ -1780,26 +1705,6 @@ async def test_retry_counter_resets_after_successful_frame(
     assert client.send_calls[4] == client.send_calls[5]
     assert client.send_calls[2] != client.send_calls[3] != client.send_calls[4]
     await session.close()
-
-
-@pytest.mark.parametrize("room_id", ["", 1])
-def test_open_ingestion_requires_exact_nonempty_room_id(
-    tmp_path, room_id: object
-) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = RecordingClient()
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=classic_config(),
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-            room_id=room_id,  # type: ignore[arg-type]
-        )
-    assert client.send_count == 0
-    bootstrap.close()
 
 
 @pytest.mark.asyncio
@@ -1828,7 +1733,6 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
         config=config,
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
-        room_id=ROOM,
     )
     with pytest.raises(nio.IngestionSourceError):
         await session.run()

@@ -10,7 +10,6 @@ from uuid import UUID, uuid5
 
 from peewee import IntegrityError, SqliteDatabase
 
-from ..event_provenance import TimelineEventProvenance
 from ..exceptions import LocalProtocolError
 from ..ingest import errors as ingest_errors
 from ..ingest import reducer as ingest_reducer
@@ -26,16 +25,11 @@ from ..ingest.hydration import (
     HydrationResult,
     revalidated_hydration_result,
 )
-from ..ingest.model import BatchRef, EventRecord, RecordKind, TransportKind
+from ..ingest.model import BatchRef, EventRecord, TransportKind
 from ..ingest.ports import _revalidated_staged_source_response
 from ..ingest.serialization import batch_from_records, canonical_batch_payload
 from ..ingest.sliding import SlidingSource
-from ..ingest.source import (
-    RoomSection,
-    SyncFrame,
-    _frame_room_ids,
-    renormalize_staged_frame,
-)
+from ..ingest.source import SyncFrame, _frame_room_ids, renormalize_staged_frame
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
     _canonical_work_plaintext,
@@ -102,24 +96,6 @@ def _ready_member(
     if key is not None:
         return next((member for member in members if member[0] == key), None)
     return min(members, default=None)
-
-
-# fmt: off
-def _diagnostic_admits(room_id: str, frame: SyncFrame, proposal: ingest_reducer.FrameProposal) -> bool:
-    segments, rooms, descriptors = frame.room_segments, proposal.room_proposals, proposal.descriptors
-    if frame.origin.transport is TransportKind.CLASSIC and not segments and not rooms and not descriptors and not proposal.crypto_deferred:
-        return True
-    if len(segments) != 1 or len(rooms) != 1:
-        return False
-    segment, room = segments[0], rooms[0]
-    before, after = room.before, room.after
-    if frame.origin.transport is not TransportKind.CLASSIC or proposal.crypto_deferred or segment.room_id != room_id or segment.section is not RoomSection.JOIN or after.room_id != room_id or after.membership != "join" or after.gap is not None or room.recovery is not None or room.retirement_epoch is not None or room.losses or room.release is not ingest_reducer.RecoveryRelease.NONE or before is not None and (before.membership_epoch != after.membership_epoch or before.membership != after.membership):
-        return False
-    if not descriptors:
-        return room.hydration is not None and after.hydration_id is not None
-    descriptor = descriptors[0]
-    return len(descriptors) == 1 and descriptor.kind is RecordKind.TIMELINE and descriptor.room_id == room_id and descriptor.provenance is TimelineEventProvenance.LIVE and descriptor.route in (ingest_reducer.DescriptorRoute.HOLD_FOR_HYDRATION, ingest_reducer.DescriptorRoute.READY)
-# fmt: on
 
 
 class SqliteIngestionJournal(JournalRows):
@@ -589,7 +565,7 @@ class SqliteIngestionJournal(JournalRows):
         *,
         limits: MaterializerLimits,
     ) -> MaterializeResult:
-        return self._materialize_oldest_frame(limits, None)
+        return self._materialize_oldest_frame(limits)
 
     # fmt: off
     def apply_hydration_result(self, *, result: HydrationResult) -> CommitResult | None:
@@ -647,14 +623,9 @@ class SqliteIngestionJournal(JournalRows):
         return CommitResult(new_revision)
     # fmt: on
 
-    # fmt: off
-    def materialize_oldest_diagnostic_frame(self, *, room_id: str, limits: MaterializerLimits = MaterializerLimits()) -> MaterializeResult:
-        if type(room_id) is not str or not room_id:
-            raise TypeError("room_id must be a nonempty str")
-        return self._materialize_oldest_frame(limits, room_id)
-
-    def _materialize_oldest_frame(self, limits: MaterializerLimits, diagnostic_room_id: str | None) -> MaterializeResult:
-        # fmt: on
+    def _materialize_oldest_frame(
+        self, limits: MaterializerLimits
+    ) -> MaterializeResult:
         if type(limits) is not MaterializerLimits:
             raise TypeError("limits must be MaterializerLimits")
         MaterializerLimits(
@@ -704,9 +675,6 @@ class SqliteIngestionJournal(JournalRows):
             try:
                 normalized = self._renormalized_frame(owner, staged)
                 aggregate_rooms = _frame_room_ids(normalized)
-                if diagnostic_room_id is not None:
-                    for row in self._execute("SELECT room_id FROM NioIngestRoomAggregate WHERE account_id = ?", (self.account_id,)).fetchall():  # fmt: skip
-                        self._load_room_aggregate(owner, cast("str", row[0]))
                 aggregate_snapshot = tuple(
                     (room_id, self._load_room_aggregate(owner, room_id))
                     for room_id in aggregate_rooms
@@ -722,8 +690,7 @@ class SqliteIngestionJournal(JournalRows):
                     if loaded is not None
                 )
                 needs_inventory = bool(
-                    diagnostic_room_id is not None
-                    or aggregate_rooms
+                    aggregate_rooms
                     or normalized.global_account_data_json
                     or normalized.presence_json
                 )
@@ -731,15 +698,10 @@ class SqliteIngestionJournal(JournalRows):
                     self._load_task3_work_inventory(owner) if needs_inventory else None
                 )
                 new_revision = read_revision + 1
-# fmt: off
                 continuities = tuple(aggregate.continuity for aggregate in aggregates)
-                proposal = ingest_reducer.reduce_staged_frame(owner.stream_id, normalized.frame_id, normalized, continuities)
-                if diagnostic_room_id is not None and normalized.origin.transport is TransportKind.CLASSIC and normalized.one_time_key_counts_json == b'{"signed_curve25519":0}':
-                    without_zero = replace(normalized, one_time_key_counts_json=b"{}")
-                    proposal = replace(proposal, crypto_deferred=ingest_reducer.reduce_staged_frame(owner.stream_id, without_zero.frame_id, without_zero, continuities).crypto_deferred)
-                if diagnostic_room_id is not None and not _diagnostic_admits(diagnostic_room_id, normalized, proposal):
-                    return MaterializeResult(MaterializeStatus.BLOCKED, selected.frame_id, None)
-# fmt: on
+                proposal = ingest_reducer.reduce_staged_frame(
+                    owner.stream_id, normalized.frame_id, normalized, continuities
+                )
                 plan = plan_frame_materialization(
                     account_id=self.account_id,
                     stream_id=owner.stream_id,
