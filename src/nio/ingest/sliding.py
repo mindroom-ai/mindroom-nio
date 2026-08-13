@@ -23,6 +23,7 @@ from .source import (
     SourceResult,
     SourceResultKind,
     SyncFrame,
+    _require_matrix_room_id,
     canonical_json,
     load_json,
     malformed_success_result,
@@ -158,19 +159,6 @@ def canonical_sliding_cursor(cursor: SlidingCursor) -> bytes:
     )
 
 
-def _matrix_room_id(room_id: object, field_name: str) -> str:
-    if (
-        type(room_id) is not str
-        or not room_id.startswith("!")
-        or ":" not in room_id[1:]
-        or not room_id[1:].split(":", 1)[0]
-        or not room_id.split(":", 1)[1]
-        or any(character.isspace() for character in room_id)
-    ):
-        raise ValueError(f"{field_name} must be a Matrix room ID")
-    return room_id
-
-
 def _list_state_from_json(data: bytes) -> dict[str, list[str | None]]:
     value = load_json(data, "sliding list state")
     if type(value) is not dict:
@@ -185,7 +173,7 @@ def _list_state_from_json(data: bytes) -> dict[str, list[str | None]]:
             (
                 None
                 if room_id is None
-                else _matrix_room_id(room_id, "sliding list state room ID")
+                else _require_matrix_room_id(room_id, "sliding list state room ID")
             )
             for room_id in slots
         ]
@@ -348,14 +336,15 @@ def _parse_list_operation(
         range_value = _array(operation["range"], "SYNC range")
         room_ids_value = _array(operation["room_ids"], "SYNC room_ids")
         room_ids = tuple(
-            _matrix_room_id(room_id, "SYNC room ID") for room_id in room_ids_value
+            _require_matrix_room_id(room_id, "SYNC room ID")
+            for room_id in room_ids_value
         )
     elif kind is SlidingListOperationKind.INSERT:
         expected = {"op", "index", "room_id"}
         if set(operation) != expected:
             raise ValueError("INSERT operation has an invalid field set")
         range_value = [operation["index"], operation["index"]]
-        room_ids = (_matrix_room_id(operation["room_id"], "INSERT room ID"),)
+        room_ids = (_require_matrix_room_id(operation["room_id"], "INSERT room ID"),)
     elif kind is SlidingListOperationKind.DELETE:
         expected = {"op", "index"}
         if set(operation) != expected:

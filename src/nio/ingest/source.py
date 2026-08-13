@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from ipaddress import AddressValueError, IPv6Address
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -123,16 +124,73 @@ class SlidingListOperationKind(StrEnum):
     INVALIDATE = "INVALIDATE"
 
 
-def _require_matrix_room_id(value: object, field_name: str) -> None:
+def _valid_matrix_server_name(value: str) -> bool:
+    if value.startswith("["):
+        closing_bracket = value.find("]")
+        if closing_bracket < 0:
+            return False
+        address = value[1:closing_bracket]
+        suffix = value[closing_bracket + 1 :]
+        if suffix and (
+            not suffix.startswith(":")
+            or not 1 <= len(suffix[1:]) <= 5
+            or not suffix[1:].isascii()
+            or not suffix[1:].isdigit()
+        ):
+            return False
+        if not 2 <= len(address) <= 45 or any(
+            character not in "0123456789ABCDEFabcdef:." for character in address
+        ):
+            return False
+        try:
+            IPv6Address(address)
+        except AddressValueError:
+            return False
+        return True
+
+    if value.count(":") > 1:
+        return False
+    hostname, separator, port = value.partition(":")
+    if separator and (
+        not 1 <= len(port) <= 5 or not port.isascii() or not port.isdigit()
+    ):
+        return False
+    if not 1 <= len(hostname) <= 255 or any(
+        not (character.isascii() and (character.isalnum() or character in "-."))
+        for character in hostname
+    ):
+        return False
+    labels = hostname.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or not label[0].isalnum()
+        or not label[-1].isalnum()
+        for label in labels
+    ):
+        return False
+    if len(labels) == 4 and all(label.isdigit() for label in labels):
+        return all(len(label) <= 3 and int(label) <= 255 for label in labels)
+    return True
+
+
+def _require_matrix_room_id(value: object, field_name: str) -> str:
     _require_exact(value, str, field_name)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{field_name} must be a Matrix room ID") from error
+    localpart, separator, server_name = value[1:].partition(":")
     if (
         not value.startswith("!")
-        or ":" not in value[1:]
-        or not value[1:].split(":", 1)[0]
-        or not value.split(":", 1)[1]
-        or any(character.isspace() for character in value)
+        or not localpart
+        or not separator
+        or "\x00" in localpart
     ):
         raise ValueError(f"{field_name} must be a Matrix room ID")
+    if len(encoded) > 255 or not _valid_matrix_server_name(server_name):
+        raise ValueError(f"{field_name} must be a Matrix room ID")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,7 +21,13 @@ from nio.ingest.sliding import (
     sliding_request_config_sha256,
     sliding_membership_observation,
 )
-from nio.ingest.source import RoomSection, SourceResultKind, SyncSource
+from nio.ingest.source import (
+    RoomSection,
+    SlidingListOperation,
+    SlidingListOperationKind,
+    SourceResultKind,
+    SyncSource,
+)
 from nio.ingest.state import SourceState
 
 STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
@@ -362,6 +368,48 @@ def test_sliding_list_operations_fail_closed() -> None:
             noncanonical_request,
             _result(noncanonical_request, _full_sync_list_body(noncanonical_request)),
         )
+
+
+@pytest.mark.parametrize(
+    "room_id",
+    (
+        "!bad\x00:example.org",
+        "!room:",
+        "!room:bad_host",
+        "!room:example.org:123456",
+        "!room:[fe80::1%eth0]",
+        "!" + ("a" * 244) + ":example.org",
+    ),
+    ids=(
+        "embedded-nul",
+        "missing-server",
+        "invalid-dns-server",
+        "invalid-port",
+        "invalid-ipv6-zone",
+        "over-255-utf8-bytes",
+    ),
+)
+def test_sliding_list_operation_rejects_malformed_matrix_room_ids(
+    room_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="Matrix room ID"):
+        SlidingListOperation(
+            SlidingListOperationKind.SYNC,
+            0,
+            0,
+            (room_id,),
+        )
+
+    source = _list_evidence_source()
+    request = source.plan_request(_state(source.initial_cursor(CONNECTION)), 7)
+    assert request is not None
+    body = _full_sync_list_body(request)
+    body["lists"]["probe"]["ops"][0]["room_ids"] = [room_id]  # type: ignore[index]
+
+    normalized = source.normalize(request, _result(request, body))
+
+    assert normalized.status_code == 200
+    assert normalized.kind is SourceResultKind.TERMINAL_ERROR
 
 
 def _success_body(
