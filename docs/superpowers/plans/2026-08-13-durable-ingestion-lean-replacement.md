@@ -205,25 +205,40 @@ signature: public session-first remains successful, and a prior direct public
 fail without consuming the bootstrap. Add a non-exported
 `_open_owned_ingestion()` factory for MindRoom. It privately creates the one
 borrowed `SqliteStore` that Task 4A validated and bound immutably on the
-bootstrap from the bootstrap's exclusive owner, attaches that exact object
-to the client before Olm initialization, and atomically transfers journal/store
-ownership to the session once. Reject a foreign store, second store/session,
-use after transfer, wrong-thread close, and double close. Cancellation and close
-revoke the client and store before closing the shared connection and finally
-releasing the exclusive lease. Add export and `inspect.signature` tests proving
+bootstrap from the bootstrap's exclusive owner, attaches that exact object to
+a storeless client before Olm initialization, and atomically exchanges a
+private exact-object creation capability for the sole journal/store ownership
+token held by a minimal `_OwnedIngestionSession`. Task 4F extends that private
+session with completion behavior; it does not redefine ownership. Never use
+the public store-first claim or reverse `_claim_session()`. Reject a foreign
+store, unbound bootstrap, second store/session, use after transfer,
+wrong-thread close, and sequential double close; concurrent close waiters share
+one cleanup and a physical-close failure remains retryable while exclusion is
+held. Cancellation and close detach client Olm/store, revoke the store, close
+the shared connection, then release the exclusive lease; HTTP remains owned by
+the later MindRoom lifecycle. Add export and `inspect.signature` tests proving
 the public factory/state machine is unchanged and the owned factory/protocol is
 not exported from `nio` or `nio.ingest`.
 
-Task 4B also owns the true new-device branch needed after password or SSO login
-returns credentials but before any sync, key upload, or ordinary store open.
-Under the same exclusive owner, generate one canonical unshared `OlmAccount`
-and atomically create exact `SqliteStore` v10 topology, its one
-StoreVersion/account row, and the five ingestion tables/owner/source rows. The
-borrowed store loads that committed account rather than generating a second
-one. Every injected boundary is all-absent or complete all-new; a committed
-crash reopens through the configured marked path. Cover the fresh SqliteStore
-branch, no-account/no-second-account cases, and prove the temporary login client
-performs no sync, key upload, or store creation.
+Task 4B also owns a non-exported fresh-store preflight used after password or
+SSO returns credentials but before any sync, key upload, or ordinary store
+open. It hardwires exact `SqliteStore` and returns the same immutable
+SqliteStore/pickle-key binding as configured adoption. Under the same exclusive
+owner, generate one canonical native unshared `OlmAccount`, pickle it exactly
+once, direct-insert it, and atomically create exact full `SqliteStore` v10
+topology, its one StoreVersion/account row, and the five ingestion
+tables/owner/source rows.
+The borrowed store loads that committed account rather than generating a
+second one. Before commit, “all absent” means no committed SQLite user objects
+or rows; an owner-created zero-length database and unlocked `.ingest.lock` may
+remain after process death and must be safely retryable. After commit, the graph
+is complete and reopens through
+the configured marked path. Cover the fresh SqliteStore branch,
+no-account/no-second-account cases, and prove nio's private factory performs no
+network, sync, key upload, public `load_store()`, or configured-store
+construction. Task 4B characterizes nio's existing no-store/no-sync login
+prerequisite; Task 5C owns the real temporary login client's construction,
+HTTP lifecycle, and cleanup.
 
 **Commit:** `refactor: transfer matrix store ownership to ingestion`
 
@@ -348,7 +363,8 @@ operation or fans out silently. No next source poll can pass this state.
 Define a private non-exported `_FrameCompletion` with authenticated
 `frame_id`, transport, source epoch, request ID, staged revision, and claimed
 revision, reconstructed only from a fully authenticated retained Frame/owner.
-The non-exported `_OwnedIngestionSession` holds one
+Task 4F extends the minimal non-exported `_OwnedIngestionSession` created by
+Task 4B so it holds one
 `Callable[[_FrameCompletion], Awaitable[None]] | None` sink installed only by
 MindRoom's private 5C factory; no registration method is added to public
 `IngestionSession` or `open_ingestion()`. Claim completion only after no Work
@@ -451,7 +467,7 @@ For equivalent normalized input, both transports must produce the same record fa
 
 Add one frame-scope compatibility preparation phase before Work becomes application-visible. The MindRoom AsyncClient must adopt the ingestion-owned MatrixStore so ordinary E2EE rows and the five ingestion tables share one SQLite owner/transaction. Preserve the exact pre-fork callback-free mutation order: token; to-device; invited/joined room state, timeline, ephemeral, and account data; presence/global state; expired verifications; device-list/key-count/fallback controls; then key-request collection. This ordering must causally prove both same-Frame room-key decryption and same-response encrypted-room membership before device-list handling; callback fanout remains separate. Persist stable event IDs, decrypted `clear_json`, `RoomSnapshot`, every `RecordKind` including `TO_DEVICE`, aggregates/Work, and the preparation revision atomically. On rollback after Olm memory mutation, poison/close the session and reconstruct it from the rolled-back database; never retry the same object.
 
-Implement ownership through the non-exported owned-session factory, not two independent opens and not a public state-machine reversal. The factory privately creates the borrowed `SqliteStore` from the bootstrap's exclusive owner, consumes the immutable runtime-class binding established by the private configured opener, accepts only that object and authenticated topology, transfers journal/store to `_OwnedIngestionSession`, and revokes/closes them once. Existing public `open_ingestion()` remains session-first; direct public store-first continues to reject a later public session. Add causal lifecycle and public signature/export tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Prove `replace_rotated_device_keys=True` rolls back `DeviceKeys` and `DeviceTrustState` together, and prove durable preparation/maintenance performs no legacy trust-sidecar I/O. Do not weaken the single-process/thread/file-identity/writer-epoch fences. For a true new device, the same factory takes credentials from a temporary no-store/no-sync login client and, under one exclusive owner, atomically creates exact `SqliteStore` v10 topology, one canonical unshared Olm account row, and the five ingestion tables/initial rows before constructing the borrowed store. Crash boundaries are all-absent or complete all-new, and the committed account is loaded rather than regenerated.
+Implement ownership through the non-exported owned-session factory, not two independent opens and not a public state-machine reversal. The factory privately creates the borrowed `SqliteStore` from the bootstrap's exclusive owner, consumes the immutable runtime-class binding established by the private configured opener, accepts only that object and authenticated topology, transfers journal/store to the minimal `_OwnedIngestionSession`, and revokes/closes them once; Task 4F later extends that private session. Existing public `open_ingestion()` remains session-first; direct public store-first continues to reject a later public session. Add causal lifecycle and public signature/export tests for successful transfer, cancellation, close ordering, and clean reopen. Prove `replace_rotated_device_keys=True` rolls back `DeviceKeys` and `DeviceTrustState` together, and prove durable preparation/maintenance performs no legacy trust-sidecar I/O. Do not weaken the single-process/thread/file-identity/writer-epoch fences. For a true new device, after credentials are obtained without opening a store, the private fresh-store preflight atomically creates exact full `SqliteStore` v10 topology, one canonical unshared Olm account row, and the five ingestion tables/initial rows under one exclusive owner before constructing the borrowed store. Killed precommit attempts leave no SQLite objects or rows and are retryable; committed state is complete and loads the same account. Task 5C owns the temporary login client's HTTP lifecycle.
 
 Before that lease exists, add a non-exported exclusive configured opener for the populated MindRoom per-device database. Its caller must supply the exact source class, and it authenticates exact account/device/store-v10 ownership plus topology against that class. A supplied-Default database may lack `DeviceTrustState` or contain its exact ordinary topology and legacy rows because historical v2 upgrade and a pre-fix Desktop identity reader could create it while sidecars remained authoritative; malformed topology rejects, and presence/content never infers source class. A SqliteStore source requires the table and is adopted without class conversion. A DefaultStore source is converted in that same transaction by creating the table when absent or deleting/replacing its inert rows when present, then copying effective current sidecar facts for exact `DeviceKeys` identities using existing DefaultStore parsing and verified→blacklisted→ignored priority; unmatched stale entries stay inert, and all three source sidecars remain byte-for-byte unchanged. Return immutable `SqliteStore` runtime binding on `StoreBootstrap` for private Task-4B use, but persist no ingestion class marker and leave the public `open_ingestion_store()` signature and populated-unmarked rejection unchanged. The same transaction adds the five v1 ingestion tables/initial rows and otherwise leaves every existing Olm account pickle, Megolm/session/key row, sync token, and inert historical recovery table byte-identical. Every injected statement failure reopens with the exact prior ordinary shape and no ingestion marker; success reopens as complete SqliteStore plus exactly one marker/source. On later marked process reopen, require `SqliteStore`, reauthenticate the entire ordinary and ingestion state before writer/source DML, and return a new binding without adoption or sidecar reads. Reject mixed/partial topology, source-class/topology mismatch, wrong identity/pickle, unsupported store version, a simultaneously open client/store, or a concurrent/re-entrant adoption without mutation. Do not create a parallel ingestion database for the same device.
 
