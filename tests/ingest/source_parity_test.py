@@ -1,5 +1,5 @@
 import json
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from uuid import UUID
 
 import pytest
@@ -89,6 +89,107 @@ def test_sync_frame_keeps_only_a_digest_while_event_records_keep_source_json() -
     assert record.source_json == source_json
 
 
+def test_sync_frame_carries_frozen_ordered_sliding_list_results() -> None:
+    source = SlidingSource(
+        STREAM_ID,
+        SlidingSourceConfig(
+            30_000,
+            "worker",
+            b'{"probe":{"ranges":[[0,0]]}}',
+            b"{}",
+            b"{}",
+            1,
+        ),
+        OWN_USER_ID,
+    )
+    request = source.plan_request(
+        SourceState(
+            2,
+            TransportKind.SLIDING,
+            canonical_sliding_cursor(source.initial_cursor(CONNECTION)),
+            4,
+            True,
+        ),
+        4,
+    )
+    assert request is not None
+    assert request.body is not None
+    response = {
+        "pos": "p1",
+        "txn_id": json.loads(request.body)["txn_id"],
+        "lists": {
+            "probe": {
+                "count": 1,
+                "ops": [
+                    {
+                        "op": "SYNC",
+                        "range": [0, 0],
+                        "room_ids": ["!target:example.org"],
+                    }
+                ],
+            },
+            RESERVED_LIST: {
+                "count": 1,
+                "ops": [
+                    {
+                        "op": "SYNC",
+                        "range": [0, 0],
+                        "room_ids": ["!control:example.org"],
+                    }
+                ],
+            },
+        },
+    }
+
+    normalized = source.normalize(request, _result(request, response))
+
+    assert normalized.status_code == 200
+    assert normalized.frame is not None
+    frame = normalized.frame
+    assert tuple(field.name for field in fields(SyncFrame)) == (
+        "frame_id",
+        "origin",
+        "request_cursor_json",
+        "candidate_cursor_json",
+        "source_sha256",
+        "to_device_json",
+        "device_list_delta_json",
+        "one_time_key_counts_json",
+        "unused_fallback_key_types_json",
+        "room_segments",
+        "ephemeral_json",
+        "global_account_data_json",
+        "presence_json",
+        "sliding_list_results",
+        "sliding_request_config_sha256",
+    )
+    assert tuple(
+        (
+            result.list_name,
+            result.count,
+            tuple(
+                (
+                    operation.kind.value,
+                    operation.range_start,
+                    operation.range_end,
+                    operation.room_ids,
+                )
+                for operation in result.operations
+            ),
+        )
+        for result in frame.sliding_list_results
+    ) == (
+        (
+            RESERVED_LIST,
+            1,
+            (("SYNC", 0, 0, ("!control:example.org",)),),
+        ),
+        ("probe", 1, (("SYNC", 0, 0, ("!target:example.org",)),)),
+    )
+    with pytest.raises(FrozenInstanceError):
+        frame.sliding_list_results[0].count = 2  # type: ignore[misc]
+
+
 def _membership_observation_pair(
     *,
     classic_section: str,
@@ -170,7 +271,18 @@ def _membership_observation_pair(
     sliding_body = {
         "pos": "p1",
         "txn_id": json.loads(sliding_request.body)["txn_id"],
-        "lists": {RESERVED_LIST: {"count": 1}},
+        "lists": {
+            RESERVED_LIST: {
+                "count": 1,
+                "ops": [
+                    {
+                        "op": "SYNC",
+                        "range": [0, 0],
+                        "room_ids": [ROOM_ID],
+                    }
+                ],
+            }
+        },
         "rooms": {ROOM_ID: room},
     }
     sliding_result = sliding.normalize(
@@ -399,7 +511,18 @@ def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> No
     sliding_body = {
         "pos": "p1",
         "txn_id": txn_id,
-        "lists": {RESERVED_LIST: {"count": 1}},
+        "lists": {
+            RESERVED_LIST: {
+                "count": 1,
+                "ops": [
+                    {
+                        "op": "SYNC",
+                        "range": [0, 0],
+                        "room_ids": [ROOM_ID],
+                    }
+                ],
+            }
+        },
         "rooms": {
             ROOM_ID: {
                 "membership": "join",
@@ -433,6 +556,8 @@ def test_equivalent_classic_and_sliding_payloads_have_equal_record_shape() -> No
     assert sliding_frame is not None
 
     assert _shape(sliding_frame) == _shape(classic_frame)
+    assert classic_frame.sliding_list_results == ()
+    assert classic_frame.sliding_request_config_sha256 is None
     assert sliding_frame.device_list_delta_json == classic_frame.device_list_delta_json
     assert (
         sliding_frame.one_time_key_counts_json == classic_frame.one_time_key_counts_json

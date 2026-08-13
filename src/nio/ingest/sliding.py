@@ -17,6 +17,9 @@ from .source import (
     MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES,
     RoomSection,
     RoomSegment,
+    SlidingListOperation,
+    SlidingListOperationKind,
+    SlidingListResult,
     SourceResult,
     SourceResultKind,
     SyncFrame,
@@ -88,6 +91,7 @@ class SlidingCursor:
     all_rooms_page_size: int
     all_rooms_range_ack_mode: SlidingRangeAckMode
     all_rooms_coverage_complete: bool
+    list_state_json: bytes = b"{}"
 
     def __post_init__(self) -> None:
         _optional_string(self.pos, "pos")
@@ -106,6 +110,8 @@ class SlidingCursor:
             bool,
             "all_rooms_coverage_complete",
         )
+        _require_exact(self.list_state_json, bytes, "list_state_json")
+        _list_state_from_json(self.list_state_json)
         if self.all_rooms_range_end < 0:
             raise ValueError("all_rooms_range_end must be a nonnegative range end")
         if not self.connection_name:
@@ -114,6 +120,8 @@ class SlidingCursor:
             raise ValueError("all_rooms_page_size must be positive")
         if self.pos is None and self.all_rooms_coverage_complete:
             raise ValueError("a cursor without pos cannot have complete coverage")
+        if self.pos is None and self.list_state_json != b"{}":
+            raise ValueError("a cursor without pos must have cold list state")
         if (
             self.pos is None
             and self.all_rooms_range_ack_mode is not SlidingRangeAckMode.UNKNOWN
@@ -145,8 +153,49 @@ def canonical_sliding_cursor(cursor: SlidingCursor) -> bytes:
             "all_rooms_page_size": cursor.all_rooms_page_size,
             "all_rooms_range_ack_mode": cursor.all_rooms_range_ack_mode.value,
             "all_rooms_coverage_complete": cursor.all_rooms_coverage_complete,
+            "list_state_json": cursor.list_state_json.decode("utf-8"),
         }
     )
+
+
+def _matrix_room_id(room_id: object, field_name: str) -> str:
+    if (
+        type(room_id) is not str
+        or not room_id.startswith("!")
+        or ":" not in room_id[1:]
+        or not room_id[1:].split(":", 1)[0]
+        or not room_id.split(":", 1)[1]
+        or any(character.isspace() for character in room_id)
+    ):
+        raise ValueError(f"{field_name} must be a Matrix room ID")
+    return room_id
+
+
+def _list_state_from_json(data: bytes) -> dict[str, list[str | None]]:
+    value = load_json(data, "sliding list state")
+    if type(value) is not dict:
+        raise ValueError("sliding list state must be an object")
+    state: dict[str, list[str | None]] = {}
+    for list_name, slots in value.items():
+        if type(list_name) is not str or not list_name:
+            raise ValueError("sliding list state names must be nonempty strings")
+        if type(slots) is not list:
+            raise ValueError("sliding list state slots must be arrays")
+        normalized = [
+            (
+                None
+                if room_id is None
+                else _matrix_room_id(room_id, "sliding list state room ID")
+            )
+            for room_id in slots
+        ]
+        occupants = [room_id for room_id in normalized if room_id is not None]
+        if len(occupants) != len(set(occupants)):
+            raise ValueError("sliding list state room IDs must be unique")
+        state[list_name] = normalized
+    if canonical_json(state) != data:
+        raise ValueError("sliding list state must be canonical JSON")
+    return state
 
 
 def _sliding_cursor_from_json(data: bytes) -> SlidingCursor:
@@ -160,6 +209,7 @@ def _sliding_cursor_from_json(data: bytes) -> SlidingCursor:
         "all_rooms_page_size",
         "all_rooms_range_ack_mode",
         "all_rooms_coverage_complete",
+        "list_state_json",
     }:
         raise ValueError("sliding cursor has an invalid field set")
     instance = value["connection_instance"]
@@ -179,6 +229,9 @@ def _sliding_cursor_from_json(data: bytes) -> SlidingCursor:
     except ValueError as error:
         raise ValueError("sliding cursor has an unknown range ack mode") from error
     try:
+        list_state_json = value["list_state_json"]
+        if type(list_state_json) is not str:
+            raise ValueError("sliding cursor list_state_json must be a JSON string")
         return SlidingCursor(
             value["pos"],
             value["to_device_since"],
@@ -188,6 +241,7 @@ def _sliding_cursor_from_json(data: bytes) -> SlidingCursor:
             value["all_rooms_page_size"],
             parsed_ack_mode,
             value["all_rooms_coverage_complete"],
+            list_state_json.encode("utf-8"),
         )
     except TypeError as error:
         raise ValueError(str(error)) from error
@@ -211,6 +265,7 @@ def reset_sliding_connection(
             cursor.all_rooms_page_size,
             SlidingRangeAckMode.UNKNOWN,
             False,
+            b"{}",
         ),
         history_uncertain=True,
     )
@@ -236,6 +291,202 @@ _ROOM_SECTION_ORDER = (
     RoomSection.LEAVE,
     RoomSection.UNCHANGED,
 )
+
+
+def _requested_list_ranges(
+    list_name: str,
+    definition: object,
+) -> tuple[tuple[int, int], ...]:
+    value = _object(definition, f"sliding request lists.{list_name}")
+    ranges = _array(value.get("ranges"), f"sliding request lists.{list_name}.ranges")
+    if not ranges:
+        raise ValueError("sliding request lists must request at least one range")
+    normalized: list[tuple[int, int]] = []
+    for item in ranges:
+        pair = _array(item, f"sliding request lists.{list_name}.ranges element")
+        if (
+            len(pair) != 2
+            or type(pair[0]) is not int
+            or type(pair[1]) is not int
+            or not 0 <= pair[0] <= pair[1]
+        ):
+            raise ValueError("sliding request list ranges must be ordered pairs")
+        normalized.append((pair[0], pair[1]))
+    normalized.sort()
+    for previous, current in zip(normalized, normalized[1:], strict=False):
+        if current[0] <= previous[1]:
+            raise ValueError("sliding request list ranges must not overlap")
+    return tuple(normalized)
+
+
+def _operation_within_requested_ranges(
+    operation: SlidingListOperation,
+    ranges: tuple[tuple[int, int], ...],
+) -> bool:
+    return any(
+        start <= operation.range_start <= operation.range_end <= end
+        for start, end in ranges
+    )
+
+
+def _parse_list_operation(
+    list_name: str,
+    value: object,
+) -> SlidingListOperation:
+    operation = _object(value, f"sliding response lists.{list_name}.ops element")
+    kind_value = operation.get("op")
+    if type(kind_value) is not str:
+        raise ValueError("sliding list operation op must be a string")
+    try:
+        kind = SlidingListOperationKind(kind_value)
+    except ValueError as error:
+        raise ValueError("unknown sliding list operation") from error
+    if kind is SlidingListOperationKind.SYNC:
+        expected = {"op", "range", "room_ids"}
+        if set(operation) != expected:
+            raise ValueError("SYNC operation has an invalid field set")
+        range_value = _array(operation["range"], "SYNC range")
+        room_ids_value = _array(operation["room_ids"], "SYNC room_ids")
+        room_ids = tuple(
+            _matrix_room_id(room_id, "SYNC room ID") for room_id in room_ids_value
+        )
+    elif kind is SlidingListOperationKind.INSERT:
+        expected = {"op", "index", "room_id"}
+        if set(operation) != expected:
+            raise ValueError("INSERT operation has an invalid field set")
+        range_value = [operation["index"], operation["index"]]
+        room_ids = (_matrix_room_id(operation["room_id"], "INSERT room ID"),)
+    elif kind is SlidingListOperationKind.DELETE:
+        expected = {"op", "index"}
+        if set(operation) != expected:
+            raise ValueError("DELETE operation has an invalid field set")
+        range_value = [operation["index"], operation["index"]]
+        room_ids = ()
+    else:
+        expected = {"op", "range"}
+        if set(operation) != expected:
+            raise ValueError("INVALIDATE operation has an invalid field set")
+        range_value = _array(operation["range"], "INVALIDATE range")
+        room_ids = ()
+    if (
+        len(range_value) != 2
+        or type(range_value[0]) is not int
+        or type(range_value[1]) is not int
+    ):
+        raise ValueError("sliding list operation range must contain two integers")
+    return SlidingListOperation(kind, range_value[0], range_value[1], room_ids)
+
+
+def _normalize_list_results(
+    request_lists: dict[str, Any],
+    response_lists: dict[str, Any],
+    prior_state: dict[str, list[str | None]],
+) -> tuple[tuple[SlidingListResult, ...], bytes]:
+    if set(response_lists) != set(request_lists):
+        raise ValueError("sliding response lists must exactly match requested lists")
+    if not set(prior_state).issubset(request_lists):
+        raise ValueError("sliding prior list state contains an unrequested list")
+    results: list[SlidingListResult] = []
+    candidate_state: dict[str, list[str | None]] = {}
+    for list_name in sorted(request_lists):
+        ranges = _requested_list_ranges(list_name, request_lists[list_name])
+        bound = max(end for _, end in ranges) + 1
+        prior_slots = prior_state.get(list_name)
+        if prior_slots is not None and len(prior_slots) > bound:
+            raise ValueError("sliding prior list state exceeds its requested bound")
+        slots = list(prior_slots or ())
+        known_extent = len(slots)
+        slots.extend([None] * (bound - len(slots)))
+        if any(
+            room_id is not None
+            and not any(start <= index <= end for start, end in ranges)
+            for index, room_id in enumerate(slots)
+        ):
+            raise ValueError("sliding prior list state occupies an unrequested slot")
+
+        result = _object(
+            response_lists[list_name],
+            f"sliding response lists.{list_name}",
+        )
+        if set(result) != {"count", "ops"}:
+            raise ValueError("sliding list result has an invalid field set")
+        count = result["count"]
+        if type(count) is not int or count < 0:
+            raise ValueError("sliding list count must be a nonnegative integer")
+        operations = tuple(
+            _parse_list_operation(list_name, operation)
+            for operation in _array(
+                result["ops"], f"sliding response lists.{list_name}.ops"
+            )
+        )
+        covered: list[tuple[int, int]] = []
+        for operation in operations:
+            if not _operation_within_requested_ranges(operation, ranges):
+                raise ValueError(
+                    "sliding list operation is outside the requested ranges"
+                )
+            if any(
+                operation.range_start <= end and start <= operation.range_end
+                for start, end in covered
+            ):
+                raise ValueError("sliding list operations must not overlap")
+            covered.append((operation.range_start, operation.range_end))
+            if (
+                operation.kind
+                in {
+                    SlidingListOperationKind.SYNC,
+                    SlidingListOperationKind.INSERT,
+                    SlidingListOperationKind.INVALIDATE,
+                }
+                and operation.range_end >= count
+            ):
+                raise ValueError("sliding list operation contradicts its count")
+            if operation.kind is SlidingListOperationKind.DELETE and (
+                operation.range_start > count
+            ):
+                raise ValueError("sliding list delete contradicts its count")
+
+            start, end = operation.range_start, operation.range_end
+            if operation.kind is SlidingListOperationKind.SYNC:
+                slots[start : end + 1] = operation.room_ids
+                known_extent = max(known_extent, end + 1)
+            else:
+                if prior_slots is None:
+                    raise ValueError(
+                        "non-SYNC operation requires known prior list state"
+                    )
+                if operation.kind is SlidingListOperationKind.INSERT:
+                    if start > known_extent or any(
+                        room_id is None for room_id in slots[start:known_extent]
+                    ):
+                        raise ValueError("INSERT operation touches unknown list state")
+                    slots.insert(start, operation.room_ids[0])
+                    del slots[bound:]
+                    known_extent = min(bound, known_extent + 1)
+                elif operation.kind is SlidingListOperationKind.DELETE:
+                    if start >= known_extent or any(
+                        room_id is None for room_id in slots[start:known_extent]
+                    ):
+                        raise ValueError("DELETE operation touches unknown list state")
+                    slots.pop(start)
+                    slots.append(None)
+                    known_extent -= 1
+                else:
+                    if any(room_id is None for room_id in slots[start : end + 1]):
+                        raise ValueError(
+                            "INVALIDATE operation touches unknown list state"
+                        )
+                    slots[start : end + 1] = [None] * (end - start + 1)
+
+        target_length = min(count, bound)
+        slots = slots[:target_length]
+        slots.extend([None] * (target_length - len(slots)))
+        occupants = [room_id for room_id in slots if room_id is not None]
+        if len(occupants) != len(set(occupants)):
+            raise ValueError("a sliding list cannot contain a duplicate room ID")
+        candidate_state[list_name] = slots
+        results.append(SlidingListResult(list_name, count, operations))
+    return tuple(results), canonical_json(candidate_state)
 
 
 def _section_for_membership(membership: Any) -> RoomSection:
@@ -311,6 +562,7 @@ class SlidingSource:
             self.config.all_rooms_page_size,
             SlidingRangeAckMode.UNKNOWN,
             False,
+            b"{}",
         )
 
     def plan_request(
@@ -575,6 +827,51 @@ class SlidingSource:
                 )
         validate_network_result_identity(request, result)
 
+    @classmethod
+    def _effective_request_template(
+        cls,
+        request: NetworkRequest,
+        cursor: SlidingCursor,
+        body: dict[str, Any],
+    ) -> bytes:
+        if request.timeout_ms < 0:
+            raise ValueError("sliding request timeout must be nonnegative")
+        lists = _object(body.get("lists"), "sliding request lists")
+        reserved = lists.get(RESERVED_ALL_ROOMS_LIST)
+        if reserved != cls._reserved_list(cursor):
+            raise ValueError("sliding request reserved list does not match its cursor")
+        effective_lists: dict[str, Any] = {}
+        for list_name, definition in lists.items():
+            if type(list_name) is not str or not list_name:
+                raise ValueError("sliding request list names must be nonempty strings")
+            if list_name == RESERVED_ALL_ROOMS_LIST:
+                static_reserved = dict(
+                    _object(definition, "sliding request reserved list")
+                )
+                static_reserved.pop("ranges")
+                effective_lists[list_name] = static_reserved
+                continue
+            _requested_list_ranges(list_name, definition)
+            effective_lists[list_name] = definition
+        subscriptions = _object(
+            body.get("room_subscriptions"),
+            "sliding request room_subscriptions",
+        )
+        extensions = dict(_object(body.get("extensions"), "sliding request extensions"))
+        to_device = dict(_object(extensions.get("to_device"), "extensions.to_device"))
+        to_device.pop("since", None)
+        extensions["to_device"] = to_device
+        return canonical_json(
+            {
+                "all_rooms_page_size": cursor.all_rooms_page_size,
+                "connection_name": cursor.connection_name,
+                "extensions": extensions,
+                "lists": effective_lists,
+                "room_subscriptions": subscriptions,
+                "timeout_ms": request.timeout_ms,
+            }
+        )
+
     def _normalize_frame(
         self, request: NetworkRequest, body: bytes
     ) -> tuple[SyncFrame, bytes]:
@@ -605,6 +902,15 @@ class SlidingSource:
             raise ValueError("reserved list count must be a nonnegative integer")
 
         cursor = _sliding_cursor_from_json(request.request_cursor_json)
+        request_lists = _object(request_body.get("lists"), "sliding request lists")
+        sliding_list_results, list_state_json = _normalize_list_results(
+            request_lists,
+            lists,
+            _list_state_from_json(cursor.list_state_json),
+        )
+        request_config_sha256 = hashlib.sha256(
+            self._effective_request_template(request, cursor, request_body)
+        ).digest()
         extensions = _object(root.get("extensions", {}), "extensions")
         if "to_device" not in extensions:
             next_to_device = cursor.to_device_since
@@ -665,6 +971,7 @@ class SlidingSource:
             cursor.all_rooms_page_size,
             next_ack_mode,
             complete,
+            list_state_json,
         )
 
         account_data = _object(
@@ -885,6 +1192,8 @@ class SlidingSource:
                     canonical_json(event) for event in global_account_data
                 ),
                 presence_json=tuple(canonical_json(event) for event in presence),
+                sliding_list_results=sliding_list_results,
+                sliding_request_config_sha256=request_config_sha256,
             ),
             source_json,
         )
@@ -960,3 +1269,30 @@ class SlidingSource:
             for extension_name in ("typing", "receipts")
             if (event := by_extension[extension_name].get(room_id)) is not None
         ]
+
+
+def canonical_sliding_request_config(config: SlidingSourceConfig) -> bytes:
+    _require_exact(config, SlidingSourceConfig, "config")
+    source = SlidingSource(UUID(int=0), config, "@canonical:example.org")
+    cursor = source.initial_cursor(UUID(int=0))
+    request = source.plan_request(
+        SourceState(
+            source_epoch=0,
+            transport_kind=TransportKind.SLIDING,
+            cursor_json=canonical_sliding_cursor(cursor),
+            next_request_id=0,
+            active=True,
+        ),
+        0,
+    )
+    if request is None or request.body is None:
+        raise ValueError("effective sliding config did not produce a request")
+    body = _object(
+        load_json(request.body, "effective sliding request body"),
+        "effective sliding request body",
+    )
+    return source._effective_request_template(request, cursor, body)
+
+
+def sliding_request_config_sha256(config: SlidingSourceConfig) -> bytes:
+    return hashlib.sha256(canonical_sliding_request_config(config)).digest()

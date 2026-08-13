@@ -116,6 +116,102 @@ class RoomSection(StrEnum):
     UNCHANGED = "unchanged"
 
 
+class SlidingListOperationKind(StrEnum):
+    SYNC = "SYNC"
+    INSERT = "INSERT"
+    DELETE = "DELETE"
+    INVALIDATE = "INVALIDATE"
+
+
+def _require_matrix_room_id(value: object, field_name: str) -> None:
+    _require_exact(value, str, field_name)
+    if (
+        not value.startswith("!")
+        or ":" not in value[1:]
+        or not value[1:].split(":", 1)[0]
+        or not value.split(":", 1)[1]
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(f"{field_name} must be a Matrix room ID")
+
+
+@dataclass(frozen=True, slots=True)
+class SlidingListOperation:
+    kind: SlidingListOperationKind
+    range_start: int
+    range_end: int
+    room_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_exact(self.kind, SlidingListOperationKind, "kind")
+        _require_exact(self.range_start, int, "range_start")
+        _require_exact(self.range_end, int, "range_end")
+        _require_exact(self.room_ids, tuple, "room_ids")
+        if not 0 <= self.range_start <= self.range_end <= MATRIX_CANONICAL_INTEGER_MAX:
+            raise ValueError("operation range must be ordered canonical integers")
+        for room_id in self.room_ids:
+            _require_matrix_room_id(room_id, "room_ids element")
+        if len(self.room_ids) != len(set(self.room_ids)):
+            raise ValueError("operation room IDs must be unique")
+        expected_room_count = {
+            SlidingListOperationKind.SYNC: self.range_end - self.range_start + 1,
+            SlidingListOperationKind.INSERT: 1,
+            SlidingListOperationKind.DELETE: 0,
+            SlidingListOperationKind.INVALIDATE: 0,
+        }[self.kind]
+        if len(self.room_ids) != expected_room_count:
+            raise ValueError("operation room IDs do not match its kind and range")
+        if (
+            self.kind
+            in {SlidingListOperationKind.INSERT, SlidingListOperationKind.DELETE}
+            and self.range_start != self.range_end
+        ):
+            raise ValueError("insert and delete operations require one slot")
+
+
+@dataclass(frozen=True, slots=True)
+class SlidingListResult:
+    list_name: str
+    count: int
+    operations: tuple[SlidingListOperation, ...]
+
+    def __post_init__(self) -> None:
+        _require_exact(self.list_name, str, "list_name")
+        _require_exact(self.count, int, "count")
+        _require_exact(self.operations, tuple, "operations")
+        if not self.list_name:
+            raise ValueError("list_name must not be empty")
+        if not 0 <= self.count <= MATRIX_CANONICAL_INTEGER_MAX:
+            raise ValueError("count must be a nonnegative canonical integer")
+        if any(
+            type(operation) is not SlidingListOperation for operation in self.operations
+        ):
+            raise TypeError("operations elements must be SlidingListOperation")
+        covered: list[tuple[int, int]] = []
+        for operation in self.operations:
+            if any(
+                operation.range_start <= end and start <= operation.range_end
+                for start, end in covered
+            ):
+                raise ValueError("list result operations must not overlap")
+            covered.append((operation.range_start, operation.range_end))
+            if (
+                operation.kind
+                in {
+                    SlidingListOperationKind.SYNC,
+                    SlidingListOperationKind.INSERT,
+                    SlidingListOperationKind.INVALIDATE,
+                }
+                and operation.range_end >= self.count
+            ):
+                raise ValueError("list result operation contradicts its count")
+            if (
+                operation.kind is SlidingListOperationKind.DELETE
+                and operation.range_start > self.count
+            ):
+                raise ValueError("list result delete contradicts its count")
+
+
 class SourceResultKind(StrEnum):
     FRAME = "frame"
     RETRYABLE_ERROR = "retryable_error"
@@ -306,6 +402,8 @@ class SyncFrame:
     ephemeral_json: tuple[bytes, ...]
     global_account_data_json: tuple[bytes, ...]
     presence_json: tuple[bytes, ...]
+    sliding_list_results: tuple[SlidingListResult, ...] = ()
+    sliding_request_config_sha256: bytes | None = None
 
     def __post_init__(self) -> None:
         _require_exact(self.frame_id, UUID, "frame_id")
@@ -340,6 +438,32 @@ class SyncFrame:
             "global_account_data_json",
         )
         _require_json_bytes_tuple(self.presence_json, "presence_json")
+        _require_exact(self.sliding_list_results, tuple, "sliding_list_results")
+        if any(
+            type(result) is not SlidingListResult
+            for result in self.sliding_list_results
+        ):
+            raise TypeError("sliding_list_results elements must be SlidingListResult")
+        if self.origin.transport is TransportKind.CLASSIC:
+            if self.sliding_list_results:
+                raise ValueError("Classic frames cannot carry sliding list results")
+            if self.sliding_request_config_sha256 is not None:
+                raise ValueError("Classic frames cannot carry a sliding request digest")
+        else:
+            _require_exact(
+                self.sliding_request_config_sha256,
+                bytes,
+                "sliding_request_config_sha256",
+            )
+            if len(self.sliding_request_config_sha256) != 32:
+                raise ValueError(
+                    "sliding_request_config_sha256 must be exactly 32 bytes"
+                )
+            list_names = tuple(result.list_name for result in self.sliding_list_results)
+            if list_names != tuple(sorted(list_names)) or len(list_names) != len(
+                set(list_names)
+            ):
+                raise ValueError("sliding list results must be uniquely name-sorted")
         if self.origin.frame_index != 0:
             raise ValueError("frame origin frame_index must be zero")
         room_ids = tuple(segment.room_id for segment in self.room_segments)
