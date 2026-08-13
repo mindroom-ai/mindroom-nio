@@ -97,7 +97,7 @@ def _open_matrix_store_from_ingestion(
     pickle_key: str,
 ) -> MatrixStore:
     if store_class is not SqliteStore:
-        raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
+        raise LocalProtocolError("ingestion v2 requires exact SqliteStore")
     return store_class(
         bootstrap._journal.account_id,
         bootstrap._journal.device_id,
@@ -456,7 +456,7 @@ class MatrixStore:
         with StableFileLock(Path(self.database_path)):
             if database_has_ingestion_marker(self.database_path):
                 raise LocalProtocolError(
-                    "this database is owned by ingestion v1; direct legacy store "
+                    "this database is owned by ingestion v2; direct legacy store "
                     "construction is unsupported"
                 )
             self._post_init_legacy_store()
@@ -521,11 +521,11 @@ class MatrixStore:
             if row is None or tuple(row) != (
                 self.user_id,
                 self.device_id,
-                1,
+                2,
                 str(bootstrap._journal.writer_epoch),
             ):
                 raise LocalProtocolError(
-                    "StoreBootstrap no longer matches the ingestion-v1 marker"
+                    "StoreBootstrap no longer matches the ingestion-v2 marker"
                 )
 
             e2ee_models: list[type[Model]] = [
@@ -547,7 +547,7 @@ class MatrixStore:
 
             if present_e2ee and present_e2ee != expected_tables:
                 raise LocalProtocolError(
-                    "ingestion-v1 store has an incomplete E2EE schema"
+                    "ingestion-v2 store has an incomplete E2EE schema"
                 )
 
         with self.database.bind_ctx([StoreVersion, *e2ee_models]):
@@ -561,7 +561,7 @@ class MatrixStore:
                     versions = tuple(StoreVersion.select())
                     if len(versions) != 1 or versions[0].version != self.store_version:
                         raise LocalProtocolError(
-                            "ingestion-v1 store requires the supported E2EE schema"
+                            "ingestion-v2 store requires the supported E2EE schema"
                         )
         self._ingestion_v1_store = True
         self._ingestion_initialized = True

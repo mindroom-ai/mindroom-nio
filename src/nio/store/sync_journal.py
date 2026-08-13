@@ -8,6 +8,7 @@ from uuid import UUID
 
 from ..exceptions import LocalProtocolError
 from ..ingest.config import SourceConfig, source_transport
+from ..ingest.diagnostic import DiagnosticIngestionScope
 from ._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ class StoreBootstrap:
         from .database import SqliteStore, _open_matrix_store_from_ingestion
 
         if store_class is not SqliteStore:
-            raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
+            raise LocalProtocolError("ingestion v2 requires exact SqliteStore")
 
         return _open_matrix_store_from_ingestion(
             self,
@@ -92,6 +93,7 @@ def open_ingestion_store(
     device_id: str,
     consumer_generation: UUID,
     source: SourceConfig,
+    diagnostic_scope: DiagnosticIngestionScope | None = None,
     pickle_key: str = "",
     database_name: str = "",
     sqlite_busy_timeout_ms: int = 2_000,
@@ -109,6 +111,7 @@ def open_ingestion_store(
         device_id=device_id,
         consumer_generation=consumer_generation,
         source=source,
+        diagnostic_scope=diagnostic_scope,
         pickle_key=pickle_key,
         sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
         statement_observer=statement_observer,

