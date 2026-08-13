@@ -75,6 +75,13 @@ def sqlmemorystore():
     return store
 
 
+def test_disk_store_uses_fast_secure_delete(sqlstore):
+    """Recovery-row pruning must not force avoidable page writes."""
+    cursor = sqlstore.database.execute_sql("PRAGMA secure_delete")
+
+    assert cursor.fetchone() == (2,)
+
+
 def seed_v5_recovery_state(sqlstore):
     gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
     completed = PendingTimelineEvent(
