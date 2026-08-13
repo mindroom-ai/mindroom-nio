@@ -15,10 +15,8 @@ from nio.ingest.sliding import (
     SlidingCursor,
     SlidingRangeAckMode,
     SlidingSource,
-    canonical_sliding_request_config,
     canonical_sliding_cursor,
     reset_sliding_connection,
-    sliding_request_config_sha256,
     sliding_membership_observation,
 )
 from nio.ingest.source import RoomSection, SourceResultKind, SyncSource
@@ -112,258 +110,6 @@ def _canonical(value: object) -> bytes:
     ).encode()
 
 
-def _list_evidence_source() -> SlidingSource:
-    return SlidingSource(
-        STREAM_ID,
-        SlidingSourceConfig(
-            timeout_ms=30_000,
-            connection_name="worker",
-            lists_json=b'{"probe":{"ranges":[[0,0]]}}',
-            room_subscriptions_json=b"{}",
-            extensions_json=b"{}",
-            all_rooms_page_size=1,
-        ),
-        own_user_id=OWN_USER_ID,
-    )
-
-
-def _full_sync_list_body(request: NetworkRequest) -> dict[str, object]:
-    return {
-        "pos": "p1",
-        "txn_id": _request_body(request)["txn_id"],
-        "lists": {
-            "probe": {
-                "count": 1,
-                "ops": [
-                    {
-                        "op": "SYNC",
-                        "range": [0, 0],
-                        "room_ids": ["!target:example.org"],
-                    }
-                ],
-            },
-            RESERVED_LIST: {
-                "count": 1,
-                "ops": [
-                    {
-                        "op": "SYNC",
-                        "range": [0, 0],
-                        "room_ids": ["!control:example.org"],
-                    }
-                ],
-            },
-        },
-    }
-
-
-def test_sliding_full_sync_lists_are_normalized_and_advance_cursor_state() -> None:
-    source = _list_evidence_source()
-    assert canonical_sliding_request_config(source.config) == (
-        b'{"all_rooms_page_size":1,"connection_name":"worker","extensions":'
-        b'{"account_data":{"enabled":true,"lists":["__nio_all_rooms_v1"]},'
-        b'"e2ee":{"enabled":true},"receipts":{"enabled":true,"lists":'
-        b'["__nio_all_rooms_v1"]},"to_device":{"enabled":true,"limit":100},'
-        b'"typing":{"enabled":true,"lists":["__nio_all_rooms_v1"]}},'
-        b'"lists":{"__nio_all_rooms_v1":{"required_state":'
-        b'[["m.room.member","*"],["m.room.encryption",""],'
-        b'["m.room.name",""],["m.room.canonical_alias",""],'
-        b'["m.room.topic",""],["m.room.avatar",""],'
-        b'["m.room.join_rules",""],["m.room.create",""],'
-        b'["m.room.guest_access",""],["m.room.power_levels",""]],'
-        b'"sort":["by_recency"],"timeline_limit":1},"probe":'
-        b'{"ranges":[[0,0]]}},"room_subscriptions":{},'
-        b'"timeout_ms":30000}'
-    )
-    assert sliding_request_config_sha256(source.config) == bytes.fromhex(
-        "11071cbfbc9ee9b24a28b04edc24b3320f66ad99baa697d542b57dab03e579c7"
-    )
-    effectively_equal = replace(
-        source.config,
-        extensions_json=(
-            b'{"account_data":{"enabled":false},"e2ee":{"enabled":false},'
-            b'"receipts":{"enabled":false},"to_device":{"enabled":false,'
-            b'"limit":7,"since":"authored"},"typing":{"enabled":false}}'
-        ),
-    )
-    assert sliding_request_config_sha256(effectively_equal) == (
-        sliding_request_config_sha256(source.config)
-    )
-    request = source.plan_request(_state(source.initial_cursor(CONNECTION)), 7)
-    assert request is not None
-
-    normalized = source.normalize(
-        request, _result(request, _full_sync_list_body(request))
-    )
-
-    assert normalized.kind is SourceResultKind.FRAME
-    assert normalized.status_code == 200
-    assert normalized.frame is not None
-    frame = normalized.frame
-    assert tuple(
-        (
-            result.list_name,
-            result.count,
-            tuple(
-                (
-                    operation.kind.value,
-                    operation.range_start,
-                    operation.range_end,
-                    operation.room_ids,
-                )
-                for operation in result.operations
-            ),
-        )
-        for result in frame.sliding_list_results
-    ) == (
-        (
-            RESERVED_LIST,
-            1,
-            (("SYNC", 0, 0, ("!control:example.org",)),),
-        ),
-        ("probe", 1, (("SYNC", 0, 0, ("!target:example.org",)),)),
-    )
-    assert frame.candidate_cursor_json == (
-        b'{"all_rooms_coverage_complete":false,"all_rooms_page_size":1,'
-        b'"all_rooms_range_ack_mode":"txn_echo","all_rooms_range_end":1,'
-        b'"connection_instance":"236f12d0-c282-4594-8654-948a60a73ee9",'
-        b'"connection_name":"worker","list_state_json":'
-        b'"{\\"__nio_all_rooms_v1\\":[\\"!control:example.org\\"],'
-        b'\\"probe\\":[\\"!target:example.org\\"]}","pos":"p1",'
-        b'"to_device_since":null}'
-    )
-    assert frame.sliding_request_config_sha256 == bytes.fromhex(
-        "11071cbfbc9ee9b24a28b04edc24b3320f66ad99baa697d542b57dab03e579c7"
-    )
-
-
-def test_sliding_list_operations_fail_closed() -> None:
-    source = _list_evidence_source()
-    request = source.plan_request(_state(source.initial_cursor(CONNECTION)), 7)
-    assert request is not None
-
-    def assert_terminal(body: dict[str, object]) -> None:
-        normalized = source.normalize(request, _result(request, body))
-        assert normalized.status_code == 200
-        assert normalized.kind is SourceResultKind.TERMINAL_ERROR
-
-    mutations: list[tuple[str, object]] = []
-
-    unknown = _full_sync_list_body(request)
-    unknown["lists"]["probe"]["ops"][0]["op"] = "MOVE"  # type: ignore[index]
-    mutations.append(("unknown-op", unknown))
-
-    wrong_fields = _full_sync_list_body(request)
-    wrong_fields["lists"]["probe"]["ops"][0]["index"] = 0  # type: ignore[index]
-    mutations.append(("wrong-field-set", wrong_fields))
-
-    for case, invalid_range in (
-        ("negative-range", [-1, 0]),
-        ("inverted-range", [1, 0]),
-        ("out-of-request-range", [1, 1]),
-    ):
-        body = _full_sync_list_body(request)
-        body["lists"]["probe"]["ops"][0]["range"] = invalid_range  # type: ignore[index]
-        mutations.append((case, body))
-
-    overlapping = _full_sync_list_body(request)
-    overlapping["lists"]["probe"]["ops"].append(  # type: ignore[index]
-        {
-            "op": "SYNC",
-            "range": [0, 0],
-            "room_ids": ["!other:example.org"],
-        }
-    )
-    mutations.append(("overlapping-operations", overlapping))
-
-    count_mismatch = _full_sync_list_body(request)
-    count_mismatch["lists"]["probe"]["count"] = 0  # type: ignore[index]
-    mutations.append(("room-count-mismatch", count_mismatch))
-
-    malformed_id = _full_sync_list_body(request)
-    malformed_id["lists"]["probe"]["ops"][0]["room_ids"] = ["room"]  # type: ignore[index]
-    mutations.append(("malformed-room-id", malformed_id))
-
-    missing = _full_sync_list_body(request)
-    del missing["lists"]["probe"]  # type: ignore[index]
-    mutations.append(("missing-list", missing))
-
-    extra = _full_sync_list_body(request)
-    extra["lists"]["extra"] = {"count": 0, "ops": []}  # type: ignore[index]
-    mutations.append(("extra-list", extra))
-
-    for op in (
-        {"op": "INSERT", "index": 0, "room_id": "!target:example.org"},
-        {"op": "DELETE", "index": 0},
-        {"op": "INVALIDATE", "range": [0, 0]},
-    ):
-        body = _full_sync_list_body(request)
-        body["lists"]["probe"]["ops"] = [op]  # type: ignore[index]
-        mutations.append((f"cold-{op['op']}", body))
-
-    duplicate_source = SlidingSource(
-        STREAM_ID,
-        replace(source.config, lists_json=b'{"probe":{"ranges":[[0,1]]}}'),
-        OWN_USER_ID,
-    )
-    duplicate_request = duplicate_source.plan_request(
-        _state(duplicate_source.initial_cursor(CONNECTION)), 7
-    )
-    assert duplicate_request is not None
-    duplicate = _full_sync_list_body(duplicate_request)
-    duplicate["lists"]["probe"] = {  # type: ignore[index]
-        "count": 2,
-        "ops": [
-            {
-                "op": "SYNC",
-                "range": [0, 1],
-                "room_ids": ["!same:example.org", "!same:example.org"],
-            }
-        ],
-    }
-    duplicate_normalized = duplicate_source.normalize(
-        duplicate_request,
-        _result(duplicate_request, duplicate),
-    )
-    assert duplicate_normalized.status_code == 200
-    assert duplicate_normalized.kind is SourceResultKind.TERMINAL_ERROR
-
-    for case, body in mutations:
-        assert_terminal(body), case
-
-    duplicate_key_body = (
-        b'{"lists":{"__nio_all_rooms_v1":{"count":1,"ops":'
-        b'[{"op":"SYNC","range":[0,0],"room_ids":'
-        b'["!control:example.org"]}]},"probe":{"count":1,"ops":'
-        b'[{"op":"SYNC","range":[0,0],"room_ids":'
-        b'["!target:example.org"]}]},"probe":{"count":1,"ops":[]}},'
-        b'"pos":"p1","txn_id":"'
-        + str(_request_body(request)["txn_id"]).encode()
-        + b'"}'
-    )
-    duplicate_key_result = NetworkResult(
-        request.stream_id,
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        200,
-        duplicate_key_body,
-        None,
-        None,
-    )
-    duplicate_key_normalized = source.normalize(request, duplicate_key_result)
-    assert duplicate_key_normalized.status_code == 200
-    assert duplicate_key_normalized.kind is SourceResultKind.TERMINAL_ERROR
-
-    cursor = json.loads(request.request_cursor_json)
-    cursor["list_state_json"] = '{ "probe": ["!target:example.org"] }'
-    noncanonical_request = replace(request, request_cursor_json=_canonical(cursor))
-    with pytest.raises(ValueError, match="canonical|field set"):
-        source.normalize(
-            noncanonical_request,
-            _result(noncanonical_request, _full_sync_list_body(noncanonical_request)),
-        )
-
-
 def _success_body(
     request: NetworkRequest,
     *,
@@ -372,39 +118,11 @@ def _success_body(
     txn_id: object | None = None,
     to_device_since: str | None = None,
 ) -> dict[str, object]:
-    request_body = _request_body(request)
-    request_txn = request_body["txn_id"]
-    requested_lists = request_body["lists"]
-    assert isinstance(requested_lists, dict)
-    list_results: dict[str, object] = {}
-    for list_name, definition in requested_lists.items():
-        assert isinstance(definition, dict)
-        ranges = definition["ranges"]
-        assert isinstance(ranges, list)
-        operations: list[dict[str, object]] = []
-        for requested_range in ranges:
-            assert isinstance(requested_range, list)
-            start, requested_end = requested_range
-            assert isinstance(start, int)
-            assert isinstance(requested_end, int)
-            end = min(requested_end, count - 1)
-            if start <= end:
-                safe_name = list_name.replace("_", "x")
-                operations.append(
-                    {
-                        "op": "SYNC",
-                        "range": [start, end],
-                        "room_ids": [
-                            f"!{safe_name}-{index}:example.org"
-                            for index in range(start, end + 1)
-                        ],
-                    }
-                )
-        list_results[list_name] = {"count": count, "ops": operations}
+    request_txn = _request_body(request)["txn_id"]
     body: dict[str, object] = {
         "pos": pos,
         "txn_id": request_txn if txn_id is None else txn_id,
-        "lists": list_results,
+        "lists": {RESERVED_LIST: {"count": count}},
     }
     if to_device_since is not None:
         body["extensions"] = {
@@ -433,7 +151,6 @@ def test_sliding_cursor_is_frozen_slotted_exact_and_canonical() -> None:
             "all_rooms_range_end": 1,
             "connection_instance": str(CONNECTION),
             "connection_name": CONNECTION_NAME,
-            "list_state_json": "{}",
             "pos": None,
             "to_device_since": "td0",
         }
@@ -493,15 +210,7 @@ def test_source_constructs_initial_cursor_without_creating_an_identity(
 
 def test_reset_is_coordinator_seeded_and_preserves_only_independent_state() -> None:
     cursor = SlidingCursor(
-        "p9",
-        "td8",
-        CONNECTION,
-        CONNECTION_NAME,
-        31,
-        2,
-        TXN_ACK,
-        True,
-        b'{"probe":["!room:example.org"]}',
+        "p9", "td8", CONNECTION, CONNECTION_NAME, 31, 2, TXN_ACK, True
     )
 
     transition = reset_sliding_connection(cursor, NEXT_CONNECTION)
@@ -529,7 +238,6 @@ def test_reset_is_coordinator_seeded_and_preserves_only_independent_state() -> N
         2,
         TXN_ACK,
         True,
-        b'{"probe":["!room:example.org"]}',
     )
     with pytest.raises(ValueError, match="new"):
         reset_sliding_connection(cursor, CONNECTION)
@@ -1069,17 +777,6 @@ def test_stale_echo_maps_payload_but_cannot_claim_current_coverage(
         "all_rooms_range_end": 1,
         "connection_instance": str(CONNECTION),
         "connection_name": CONNECTION_NAME,
-        "list_state_json": _canonical(
-            {
-                RESERVED_LIST: [
-                    f"!xxnioxallxroomsxv1-{index}:example.org"
-                    for index in range(min(count, 2))
-                ],
-                "foreground": [
-                    f"!foreground-{index}:example.org" for index in range(count)
-                ],
-            }
-        ).decode(),
         "pos": "p2",
         "to_device_since": "td2",
     }
