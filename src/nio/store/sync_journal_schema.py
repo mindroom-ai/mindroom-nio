@@ -213,15 +213,16 @@ SCHEMA_SQL = (
     ),
     control_room_id TEXT NOT NULL CHECK (
         typeof(control_room_id) = 'text' AND length(control_room_id) > 0
+        AND control_room_id <> delivery_room_id
     ),
     list_name TEXT NOT NULL CHECK (
-        typeof(list_name) = 'text' AND length(list_name) > 0
+        typeof(list_name) = 'text' AND list_name = 'probe'
     ),
     range_start INTEGER NOT NULL CHECK (
-        typeof(range_start) = 'integer' AND range_start >= 0
+        typeof(range_start) = 'integer' AND range_start = 0
     ),
     range_end INTEGER NOT NULL CHECK (
-        typeof(range_end) = 'integer' AND range_end >= range_start
+        typeof(range_end) = 'integer' AND range_end = 0
     ),
     request_config_sha256 BLOB NOT NULL CHECK (
         typeof(request_config_sha256) = 'blob'
@@ -338,18 +339,26 @@ SCHEMA_SQL = (
     UNIQUE (account_id, room_id, event_id),
     UNIQUE (account_id, work_id),
     CHECK (
-        (fate IN ('context','control','self_control','ready')
+        (fate IN ('context','control','self_control')
+         AND work_id IS NULL
+         AND delivery_sequence IS NULL
+         AND delivery_batch_sha256 IS NULL
+         AND acknowledged_revision IS NULL)
+     OR (fate = 'ready'
+         AND work_id IS NOT NULL
          AND delivery_sequence IS NULL
          AND delivery_batch_sha256 IS NULL
          AND acknowledged_revision IS NULL)
      OR (fate = 'outstanding'
+         AND work_id IS NOT NULL
          AND delivery_sequence IS NOT NULL
          AND delivery_batch_sha256 IS NOT NULL
          AND acknowledged_revision IS NULL)
      OR (fate = 'acknowledged'
+         AND work_id IS NOT NULL
          AND delivery_sequence IS NOT NULL
          AND delivery_batch_sha256 IS NOT NULL
-         AND acknowledged_revision IS NOT NULL)
+         AND acknowledged_revision = updated_revision)
     ))""",
     """CREATE TABLE NioIngestEventOccurrence (
     account_id TEXT NOT NULL CHECK (

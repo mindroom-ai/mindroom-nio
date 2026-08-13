@@ -673,6 +673,21 @@ class SqliteIngestionJournal(DiagnosticJournalRows, JournalRows):
 
         with self._read():
             owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            if owner.transport_kind is TransportKind.SLIDING:
+                scope = self._load_diagnostic_scope(owner)
+                if diagnostic_room_id is None:
+                    if scope is not None:
+                        raise LocalProtocolError(
+                            "persisted diagnostic scope requires diagnostic materialization"
+                        )
+                elif scope is None:
+                    raise LocalProtocolError(
+                        "Sliding diagnostic materialization requires a diagnostic scope"
+                    )
+                elif diagnostic_room_id != scope.delivery_room_id:
+                    raise LocalProtocolError(
+                        "diagnostic materialization room_id must equal the delivery room"
+                    )
             read_revision = owner.revision
             read_writer_epoch = owner.writer_epoch
             headers = self._load_authenticated_frame_headers(owner)

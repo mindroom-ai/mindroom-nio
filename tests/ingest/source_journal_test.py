@@ -16,6 +16,7 @@ from typing import get_type_hints
 from uuid import UUID, uuid4
 
 import pytest
+from peewee import IntegrityError as PeeweeIntegrityError
 from peewee import OperationalError as PeeweeOperationalError
 
 import nio.ingest.state as ingest_state
@@ -55,7 +56,7 @@ CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 SLIDING_SOURCE = SlidingSourceConfig(
     timeout_ms=30_000,
     connection_name="worker",
-    lists_json=b"{}",
+    lists_json=b'{"probe":{"ranges":[[0,0]]}}',
     room_subscriptions_json=b"{}",
     extensions_json=b"{}",
     all_rooms_page_size=2,
@@ -136,7 +137,7 @@ def _diagnostic_scope(
     *,
     delivery_room_id: str = "!delivery:example.org",
     control_room_id: str = "!control:example.org",
-    list_name: str = RESERVED_ALL_ROOMS_LIST,
+    list_name: str = "probe",
     range_start: int = 0,
     range_end: int = 0,
     source: SlidingSourceConfig = SLIDING_SOURCE,
@@ -153,6 +154,64 @@ def _diagnostic_scope(
         range_end,
         sliding_request_config_sha256(source),
     )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"delivery_room_id": "not-a-room"},
+        {"control_room_id": "not-a-room"},
+        {"control_room_id": "!delivery:example.org"},
+        {"list_name": RESERVED_ALL_ROOMS_LIST},
+        {"range_start": 1, "range_end": 1},
+        {"range_end": 1},
+    ),
+    ids=(
+        "delivery-room",
+        "control-room",
+        "distinct-rooms",
+        "probe-list",
+        "range-start",
+        "range-end",
+    ),
+)
+def test_diagnostic_scope_is_the_exact_approved_probe_window(
+    overrides: dict[str, object],
+) -> None:
+    from nio.ingest.diagnostic import DiagnosticIngestionScope
+    from nio.ingest.sliding import sliding_request_config_sha256
+
+    values: dict[str, object] = {
+        "account_id": ACCOUNT_ID,
+        "delivery_room_id": "!delivery:example.org",
+        "control_room_id": "!control:example.org",
+        "list_name": "probe",
+        "range_start": 0,
+        "range_end": 0,
+        "request_config_sha256": sliding_request_config_sha256(SLIDING_SOURCE),
+    }
+    values.update(overrides)
+
+    with pytest.raises((TypeError, ValueError)):
+        DiagnosticIngestionScope(**values)
+
+
+@pytest.mark.parametrize(
+    "lists_json",
+    (b"{}", b'{"probe":{"ranges":[[0,1]]}}'),
+    ids=("missing-probe", "wrong-probe-range"),
+)
+def test_fresh_diagnostic_scope_requires_exact_probe_request_window(
+    tmp_path: Path,
+    lists_json: bytes,
+) -> None:
+    source = replace(SLIDING_SOURCE, lists_json=lists_json)
+    scope = _diagnostic_scope(source=source)
+
+    with pytest.raises(LocalProtocolError, match="probe"):
+        _open(tmp_path, source, diagnostic_scope=scope)
+
+    assert not (tmp_path / "journal.db").exists()
 
 
 def _source_adapter(
@@ -196,6 +255,16 @@ def _successful_body(
             "pos": f"p{sequence}",
             "txn_id": request_body["txn_id"],
             "lists": {
+                "probe": {
+                    "count": 1,
+                    "ops": [
+                        {
+                            "op": "SYNC",
+                            "range": [0, 0],
+                            "room_ids": ["!room:example.org"],
+                        }
+                    ],
+                },
                 RESERVED_ALL_ROOMS_LIST: {
                     "count": 1,
                     "ops": [
@@ -205,7 +274,7 @@ def _successful_body(
                             "room_ids": ["!room:example.org"],
                         }
                     ],
-                }
+                },
             },
             "rooms": {
                 "!room:example.org": {
@@ -1799,6 +1868,485 @@ def test_v2_fresh_topology_and_scope_rows_are_exact(tmp_path: Path) -> None:
     ) == (4_096, 4_096, 8_192, 64)
 
 
+def _diagnostic_row_values():
+    from nio.store._sync_journal_diagnostic_rows import (
+        EventOccurrenceValue,
+        EventReceiptValue,
+        ListObservationValue,
+        SourceRotationValue,
+    )
+
+    frame_id = UUID("11111111-1111-4111-8111-111111111111")
+    receipt_id = UUID("22222222-2222-4222-8222-222222222222")
+    return (
+        ListObservationValue(
+            UUID("33333333-3333-4333-8333-333333333333"),
+            frame_id,
+            0,
+            0,
+            "probe",
+            "seed",
+            True,
+            False,
+            1,
+            b'{"proof":"literal"}',
+        ),
+        EventReceiptValue(
+            receipt_id,
+            "!delivery:example.org",
+            "$event",
+            b"e" * 32,
+            frame_id,
+            b"s" * 32,
+            UUID("44444444-4444-4444-8444-444444444444"),
+            "ready",
+            None,
+            None,
+            None,
+            1,
+            1,
+            b'{"proof":"literal"}',
+        ),
+        EventOccurrenceValue(
+            UUID("55555555-5555-4555-8555-555555555555"),
+            receipt_id,
+            frame_id,
+            0,
+            0,
+            b"s" * 32,
+            "live",
+            "application",
+            1,
+            b'{"proof":"literal"}',
+        ),
+        SourceRotationValue(
+            1,
+            0,
+            "reopen",
+            0,
+            4,
+            b"c" * 32,
+            b"d" * 32,
+            True,
+            b"n" * 32,
+            b"m" * 32,
+            False,
+            b"q" * 32,
+            UUID("66666666-6666-4666-8666-666666666666"),
+            b"z" * 32,
+            1,
+            b'{"proof":"literal"}',
+        ),
+    )
+
+
+def test_diagnostic_values_encode_canonical_headers_and_round_trip(
+    tmp_path: Path,
+) -> None:
+    from nio.store._sync_journal_diagnostic_rows import (
+        event_occurrence_row,
+        event_receipt_row,
+        list_observation_row,
+        source_rotation_row,
+    )
+
+    values = _diagnostic_row_values()
+    bootstrap = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        diagnostic_scope=_diagnostic_scope(),
+    )
+    journal = bootstrap._journal
+    owner = journal.load_owner()
+    encoders = (
+        list_observation_row,
+        event_receipt_row,
+        event_occurrence_row,
+        source_rotation_row,
+    )
+    encoded = tuple(encoder(owner, value) for encoder, value in zip(encoders, values))
+    for payload, digest in encoded:
+        assert digest == hashlib.sha256(payload).digest()
+        assert json.loads(payload)["value"] == {"proof": "literal"}
+
+    observation, receipt, occurrence, rotation = values
+    observation_payload, observation_digest = encoded[0]
+    receipt_payload, receipt_digest = encoded[1]
+    occurrence_payload, occurrence_digest = encoded[2]
+    rotation_payload, rotation_digest = encoded[3]
+    with journal._owner.journal_write():
+        journal._execute("UPDATE NioIngestMeta SET revision = 1")
+        journal._execute(
+            "INSERT INTO NioIngestListObservation VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ACCOUNT_ID,
+                str(observation.observation_id),
+                str(observation.frame_id),
+                observation.source_epoch,
+                observation.request_id,
+                observation.list_name,
+                observation.transition,
+                int(observation.target_present),
+                int(observation.control_present),
+                observation.created_revision,
+                observation_payload,
+                observation_digest,
+            ),
+        )
+        journal._execute(
+            "INSERT INTO NioIngestEventReceipt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ACCOUNT_ID,
+                str(receipt.receipt_id),
+                receipt.room_id,
+                receipt.event_id,
+                receipt.stable_event_sha256,
+                str(receipt.first_frame_id),
+                receipt.first_source_sha256,
+                str(receipt.work_id),
+                receipt.fate,
+                receipt.delivery_sequence,
+                receipt.delivery_batch_sha256,
+                receipt.acknowledged_revision,
+                receipt.created_revision,
+                receipt.updated_revision,
+                receipt_payload,
+                receipt_digest,
+            ),
+        )
+        journal._execute(
+            "INSERT INTO NioIngestEventOccurrence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ACCOUNT_ID,
+                str(occurrence.occurrence_id),
+                str(occurrence.receipt_id),
+                str(occurrence.frame_id),
+                occurrence.source_epoch,
+                occurrence.request_id,
+                occurrence.source_sha256,
+                occurrence.provenance,
+                occurrence.disposition,
+                occurrence.created_revision,
+                occurrence_payload,
+                occurrence_digest,
+            ),
+        )
+        journal._execute(
+            "INSERT INTO NioIngestSourceRotation VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ACCOUNT_ID,
+                rotation.successor_source_epoch,
+                rotation.successor_request_id,
+                rotation.reason,
+                rotation.predecessor_source_epoch,
+                rotation.predecessor_request_id,
+                rotation.predecessor_cursor_sha256,
+                rotation.predecessor_connection_sha256,
+                int(rotation.predecessor_pos_present),
+                rotation.successor_cursor_sha256,
+                rotation.successor_connection_sha256,
+                int(rotation.successor_pos_present),
+                rotation.first_successor_request_sha256,
+                str(rotation.first_successor_frame_id),
+                rotation.first_successor_source_sha256,
+                rotation.created_revision,
+                rotation_payload,
+                rotation_digest,
+            ),
+        )
+
+    inventory = journal._load_diagnostic_inventory(journal.load_owner())
+    assert tuple(group[0] for group in inventory) == values
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("index", "changes"),
+    (
+        (0, {"list_name": RESERVED_ALL_ROOMS_LIST}),
+        (0, {"target_present": 1}),
+        (1, {"work_id": None}),
+        (1, {"delivery_sequence": 0}),
+        (1, {"updated_revision": 0}),
+        (2, {"provenance": "other"}),
+        (2, {"source_sha256": b"short"}),
+        (3, {"successor_request_id": 1}),
+        (3, {"successor_pos_present": True}),
+        (3, {"first_successor_frame_id": None}),
+    ),
+)
+def test_diagnostic_values_reject_inconsistent_fields(
+    index: int,
+    changes: dict[str, object],
+) -> None:
+    values = _diagnostic_row_values()
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(values[index], **changes)
+
+
+@pytest.mark.parametrize(
+    ("fate", "work_id", "sequence", "batch", "acknowledged"),
+    (
+        ("context", str(uuid4()), None, None, None),
+        ("ready", None, None, None, None),
+        ("outstanding", None, 0, b"b" * 32, None),
+        ("acknowledged", None, 0, b"b" * 32, 1),
+        ("acknowledged", str(uuid4()), 0, b"b" * 32, 2),
+    ),
+)
+def test_receipt_sql_rejects_fate_work_delivery_inconsistency(
+    tmp_path: Path,
+    fate: str,
+    work_id: str | None,
+    sequence: int | None,
+    batch: bytes | None,
+    acknowledged: int | None,
+) -> None:
+    bootstrap = _open(
+        tmp_path,
+        SLIDING_SOURCE,
+        diagnostic_scope=_diagnostic_scope(),
+    )
+    journal = bootstrap._journal
+    with journal._owner.journal_write():
+        journal._execute("UPDATE NioIngestMeta SET revision = 1")
+        with pytest.raises((sqlite3.IntegrityError, PeeweeIntegrityError)):
+            journal._execute(
+                "INSERT INTO NioIngestEventReceipt VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ACCOUNT_ID,
+                    str(uuid4()),
+                    "!delivery:example.org",
+                    "$event",
+                    b"e" * 32,
+                    str(uuid4()),
+                    b"s" * 32,
+                    work_id,
+                    fate,
+                    sequence,
+                    batch,
+                    acknowledged,
+                    1,
+                    1,
+                    b"{}",
+                    b"d" * 32,
+                ),
+            )
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "cap_name", "table", "row"),
+    (
+        (
+            "_load_list_observations",
+            "MAX_LIST_OBSERVATIONS",
+            "NioIngestListObservation",
+            {
+                "observation_id": "33333333-3333-4333-8333-333333333333",
+                "frame_id": "11111111-1111-4111-8111-111111111111",
+                "source_epoch": 0,
+                "request_id": 0,
+                "list_name": "probe",
+                "transition": "seed",
+                "target_present": 1,
+                "control_present": 0,
+                "created_revision": 1,
+            },
+        ),
+        (
+            "_load_event_receipts",
+            "MAX_EVENT_RECEIPTS",
+            "NioIngestEventReceipt",
+            {
+                "receipt_id": "22222222-2222-4222-8222-222222222222",
+                "room_id": "!delivery:example.org",
+                "event_id": "$event",
+                "stable_event_sha256": b"e" * 32,
+                "first_frame_id": "11111111-1111-4111-8111-111111111111",
+                "first_source_sha256": b"s" * 32,
+                "work_id": "44444444-4444-4444-8444-444444444444",
+                "fate": "ready",
+                "delivery_sequence": None,
+                "delivery_batch_sha256": None,
+                "acknowledged_revision": None,
+                "created_revision": 1,
+                "updated_revision": 1,
+            },
+        ),
+        (
+            "_load_event_occurrences",
+            "MAX_EVENT_OCCURRENCES",
+            "NioIngestEventOccurrence",
+            {
+                "occurrence_id": "55555555-5555-4555-8555-555555555555",
+                "receipt_id": "22222222-2222-4222-8222-222222222222",
+                "frame_id": "11111111-1111-4111-8111-111111111111",
+                "source_epoch": 0,
+                "request_id": 0,
+                "source_sha256": b"s" * 32,
+                "provenance": "live",
+                "disposition": "application",
+                "created_revision": 1,
+            },
+        ),
+        (
+            "_load_source_rotations",
+            "MAX_SOURCE_ROTATIONS",
+            "NioIngestSourceRotation",
+            {
+                "successor_source_epoch": 1,
+                "successor_request_id": 0,
+                "reason": "reopen",
+                "predecessor_source_epoch": 0,
+                "predecessor_request_id": 4,
+                "predecessor_cursor_sha256": b"c" * 32,
+                "predecessor_connection_sha256": b"d" * 32,
+                "predecessor_pos_present": 1,
+                "successor_cursor_sha256": b"n" * 32,
+                "successor_connection_sha256": b"m" * 32,
+                "successor_pos_present": 0,
+                "first_successor_request_sha256": None,
+                "first_successor_frame_id": None,
+                "first_successor_source_sha256": None,
+                "created_revision": 1,
+            },
+        ),
+    ),
+)
+def test_diagnostic_overflow_authenticates_every_returned_row_before_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    loader_name: str,
+    cap_name: str,
+    table: str,
+    row: dict[str, object],
+) -> None:
+    from nio.store import _sync_journal_diagnostic_rows as diagnostic_rows
+    from nio.store._sync_journal_preflight import _canonical_internal, _row
+
+    owner = OwnerView(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        2,
+        UUID("77777777-7777-4777-8777-777777777777"),
+        CONSUMER_GENERATION,
+        TransportKind.SLIDING,
+        1,
+        UUID("88888888-8888-4888-8888-888888888888"),
+        1,
+    )
+    clear = tuple(
+        (
+            base64.b64encode(value).decode("ascii")
+            if type(value) is bytes
+            else (
+                bool(value)
+                if key.endswith("_present")
+                or key in ("target_present", "control_present")
+                else value
+            )
+        )
+        for key, value in row.items()
+    )
+    payload, digest = _row(
+        (owner.account_id, owner.stream_id, owner.transport_kind),
+        table,
+        b'{"proof":"literal"}',
+        header=_canonical_internal(clear),
+    )
+    valid = {
+        "account_id": ACCOUNT_ID,
+        **row,
+        "payload": payload,
+        "payload_sha256": digest,
+    }
+    corrupt = dict(valid)
+    corrupt["account_id"] = "@other:example.org"
+
+    class _Cursor:
+        @staticmethod
+        def fetchall():
+            return [valid, corrupt]
+
+    class _Rows(diagnostic_rows.DiagnosticJournalRows):
+        account_id = ACCOUNT_ID
+
+        @staticmethod
+        def _diagnostic_execute(*_args: object, **_kwargs: object):
+            return _Cursor()
+
+        @staticmethod
+        def _diagnostic_payload(
+            row_owner: OwnerView,
+            row_table: str,
+            stored_payload: bytes,
+            stored_digest: bytes,
+            *,
+            header: bytes,
+        ) -> bytes:
+            return _row(
+                (row_owner.account_id, row_owner.stream_id, row_owner.transport_kind),
+                row_table,
+                stored_payload,
+                stored_digest,
+                header,
+            )
+
+    monkeypatch.setattr(diagnostic_rows, cap_name, 1)
+
+    with pytest.raises(JournalIntegrityError, match="persisted"):
+        getattr(_Rows(), loader_name)(owner)
+
+
+def test_aggregate_overflow_authenticates_every_returned_row_before_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nio.store import _sync_journal_preflight as preflight
+
+    owner = OwnerView(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        2,
+        UUID("77777777-7777-4777-8777-777777777777"),
+        CONSUMER_GENERATION,
+        TransportKind.SLIDING,
+        1,
+        UUID("88888888-8888-4888-8888-888888888888"),
+        1,
+    )
+
+    class _Cursor:
+        @staticmethod
+        def fetchall():
+            return [
+                (ACCOUNT_ID, "!valid:example.org"),
+                (ACCOUNT_ID, "!corrupt:example.org"),
+            ]
+
+    class _Connection:
+        @staticmethod
+        def execute_sql(*_args: object, **_kwargs: object):
+            return _Cursor()
+
+    class _Rows:
+        seen: list[str] = []
+
+        def _load_room_aggregate(self, _owner: OwnerView, room_id: str):
+            self.seen.append(room_id)
+            if room_id == "!corrupt:example.org":
+                raise JournalIntegrityError("persisted Aggregate is invalid")
+            return object()
+
+    monkeypatch.setattr(preflight, "MAX_ROOM_AGGREGATES", 1)
+    rows = _Rows()
+
+    with pytest.raises(JournalIntegrityError, match="persisted Aggregate"):
+        preflight._authenticate_room_aggregate_inventory(_Connection(), rows, owner)
+
+    assert rows.seen == ["!valid:example.org", "!corrupt:example.org"]
+
+
 def test_v1_ingestion_store_requires_fresh_without_mutation(tmp_path: Path) -> None:
     database_path = _create_rejected_path(tmp_path, "encrypted_v1")
     before = database_path.read_bytes()
@@ -1828,6 +2376,95 @@ def test_sliding_scope_mismatch_reopen_is_byte_identical(tmp_path: Path) -> None
             SLIDING_SOURCE,
             diagnostic_scope=replace(scope, control_room_id="!changed:example.org"),
         )
+
+    assert database_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("clear_overrides", "value_overrides"),
+    (
+        (
+            {"control_room_id": "!delivery:example.org"},
+            {"control_room_id": "!delivery:example.org"},
+        ),
+        (
+            {"list_name": RESERVED_ALL_ROOMS_LIST},
+            {"list_name": RESERVED_ALL_ROOMS_LIST},
+        ),
+        ({"range_end": 1}, {"range_end": 1}),
+    ),
+    ids=("same-room", "wrong-list", "wrong-range"),
+)
+def test_authenticated_nonapproved_scope_reopen_is_byte_identical(
+    tmp_path: Path,
+    clear_overrides: dict[str, object],
+    value_overrides: dict[str, object],
+) -> None:
+    from nio.store._sync_journal_preflight import _canonical_internal, _row
+
+    scope = _diagnostic_scope()
+    bootstrap = _open(tmp_path, SLIDING_SOURCE, diagnostic_scope=scope)
+    owner = bootstrap._journal.load_owner()
+    bootstrap.close()
+    database_path = tmp_path / "journal.db"
+    clear: dict[str, object] = {
+        "delivery_room_id": scope.delivery_room_id,
+        "control_room_id": scope.control_room_id,
+        "list_name": scope.list_name,
+        "range_start": scope.range_start,
+        "range_end": scope.range_end,
+        "request_config_sha256": scope.request_config_sha256,
+    }
+    clear.update(clear_overrides)
+    value: dict[str, object] = {
+        "account_id": scope.account_id,
+        "delivery_room_id": scope.delivery_room_id,
+        "control_room_id": scope.control_room_id,
+        "list_name": scope.list_name,
+        "range_start": scope.range_start,
+        "range_end": scope.range_end,
+        "request_config_sha256": base64.b64encode(scope.request_config_sha256).decode(
+            "ascii"
+        ),
+    }
+    value.update(value_overrides)
+    header = (
+        clear["delivery_room_id"],
+        clear["control_room_id"],
+        clear["list_name"],
+        clear["range_start"],
+        clear["range_end"],
+        base64.b64encode(clear["request_config_sha256"]).decode("ascii"),
+        0,
+    )
+    payload, digest = _row(
+        (owner.account_id, owner.stream_id, owner.transport_kind),
+        "NioIngestDiagnosticScope",
+        _canonical_internal(value),
+        header=header,
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE NioIngestDiagnosticScope SET "
+            "delivery_room_id = ?, control_room_id = ?, list_name = ?, "
+            "range_start = ?, range_end = ?, payload = ?, payload_sha256 = ?",
+            (
+                clear["delivery_room_id"],
+                clear["control_room_id"],
+                clear["list_name"],
+                clear["range_start"],
+                clear["range_end"],
+                payload,
+                digest,
+            ),
+        )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = database_path.read_bytes()
+
+    with pytest.raises(JournalIntegrityError, match="diagnostic scope"):
+        _open(tmp_path, SLIDING_SOURCE, diagnostic_scope=scope)
 
     assert database_path.read_bytes() == before
 
@@ -1866,6 +2503,64 @@ def test_diagnostic_inventory_corruption_reopen_is_read_only(tmp_path: Path) -> 
 
     _assert_read_only_preflight(statements)
     assert _writer_epoch(database_path) == epoch_before
+
+
+def test_orphan_diagnostic_occurrence_reopen_is_byte_identical(tmp_path: Path) -> None:
+    from nio.store._sync_journal_preflight import _canonical_internal, _row
+
+    scope = _diagnostic_scope()
+    bootstrap = _open(tmp_path, SLIDING_SOURCE, diagnostic_scope=scope)
+    owner = bootstrap._journal.load_owner()
+    bootstrap.close()
+    database_path = tmp_path / "journal.db"
+    occurrence_id = UUID("55555555-5555-4555-8555-555555555555")
+    receipt_id = UUID("22222222-2222-4222-8222-222222222222")
+    frame_id = UUID("11111111-1111-4111-8111-111111111111")
+    clear = (
+        str(occurrence_id),
+        str(receipt_id),
+        str(frame_id),
+        0,
+        0,
+        base64.b64encode(b"s" * 32).decode("ascii"),
+        "live",
+        "application",
+        1,
+    )
+    payload, digest = _row(
+        (owner.account_id, owner.stream_id, owner.transport_kind),
+        "NioIngestEventOccurrence",
+        b'{"proof":"literal"}',
+        header=_canonical_internal(clear),
+    )
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+        connection.execute("UPDATE NioIngestMeta SET revision = 1")
+        connection.execute(
+            "INSERT INTO NioIngestEventOccurrence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ACCOUNT_ID,
+                str(occurrence_id),
+                str(receipt_id),
+                str(frame_id),
+                0,
+                0,
+                b"s" * 32,
+                "live",
+                "application",
+                1,
+                payload,
+                digest,
+            ),
+        )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = database_path.read_bytes()
+
+    with pytest.raises(JournalIntegrityError, match="foreign key|receipt"):
+        _open(tmp_path, SLIDING_SOURCE, diagnostic_scope=scope)
+
+    assert database_path.read_bytes() == before
 
 
 def _create_rejected_path(tmp_path: Path, case: str) -> Path:

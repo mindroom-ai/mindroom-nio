@@ -436,7 +436,7 @@ class JournalRows:
         ).fetchall()
         if len(rows) != 1:
             raise JournalIntegrityError(
-                "ingestion-v1 marker row cardinality is not one"
+                "ingestion-v2 marker row cardinality is not one"
             )
         return rows[0]
 

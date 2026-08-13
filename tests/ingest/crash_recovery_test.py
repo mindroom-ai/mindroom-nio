@@ -21,23 +21,26 @@ from nio.store.sync_journal_schema import SCHEMA_SQL
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
-SLIDING_SOURCE = SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}")
+SLIDING_SOURCE = SlidingSourceConfig(
+    30_000,
+    "diag",
+    b'{"probe":{"ranges":[[0,0]]}}',
+    b"{}",
+    b"{}",
+)
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 CRASH_EXIT_CODE = 86
 
 
 def _diagnostic_scope():
     from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import (
-        RESERVED_ALL_ROOMS_LIST,
-        sliding_request_config_sha256,
-    )
+    from nio.ingest.sliding import sliding_request_config_sha256
 
     return DiagnosticIngestionScope(
         ACCOUNT_ID,
         "!delivery:example.org",
         "!control:example.org",
-        RESERVED_ALL_ROOMS_LIST,
+        "probe",
         0,
         0,
         sliding_request_config_sha256(SLIDING_SOURCE),
