@@ -72,7 +72,8 @@ Run the existing schema-v1/open/reopen, Classic materialization, and Classic com
 
 ## Task 2: Prune documentation, benchmarks, and redundant tests
 
-Delete branch-only artifacts that are not product verification:
+Task 1 already deletes branch-only documentation and benchmark artifacts that
+are not product verification:
 
 - superseded implementation plans/specifications whose controlling requirements are preserved by the new design;
 - in-repo staging benchmark runner, corpus harness, and generated benchmark-only fixtures;
@@ -84,9 +85,15 @@ Keep:
 - one concise design, one executable plan, and one final evidence report;
 - behavior-parity fixtures, crash boundaries, public API/callback contracts, and external canary entrypoints.
 
-Before deleting any test group, map every user-visible behavior it covers to a retained or replacement node. Add the replacement first if coverage would otherwise disappear.
+Task 2 verifies those artifacts stay absent and consolidates only redundant
+tests. Before deleting any test group, map every user-visible behavior it covers
+to a retained or replacement node. Add the replacement first if coverage would
+otherwise disappear.
 
-Measure and record runtime/test/docs deltas against pinned `6ed2b9817d2bc9de30dc72942f9cb867d829283b`. Task 2 must reduce tests and docs/scripts relative to Task 1 HEAD and must leave `src/` unchanged. Final runtime compliance is enforced after legacy deletion.
+Measure and record whole-tree runtime/test/docs deltas against pinned
+`6ed2b9817d2bc9de30dc72942f9cb867d829283b`, plus the exact Task-2 range.
+Task 2 must reduce tests and must leave both `src/` and docs/scripts unchanged
+from its parent. Final runtime compliance is enforced after legacy deletion.
 
 **Commit:** `test: consolidate durable ingestion assurance`
 

@@ -93,7 +93,6 @@ from nio.store._sync_journal_values import (
     RoomAggregateValue,
 )
 from nio.store.sync_journal import StoreBootstrap, open_ingestion_store
-from nio.store.sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 _FRAME_ID = UUID("12345678-1234-5678-1234-567812345678")
 _STREAM_ID = UUID("96afc18d-22c3-45a6-a7ba-5cb49f28c900")
@@ -101,16 +100,9 @@ _CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 _SOURCE_BODY_LIMIT = 16 * 1024 * 1024
 _FRAME_ENVELOPE_LIMIT = 24 * 1024 * 1024
 _WORK_PAYLOAD_LIMIT = 1 * 1024 * 1024
-_SCHEMA_ACCOUNT_ID = "@schema:example.org"
-_SCHEMA_FRAME_ID = "12345678-1234-5678-1234-567812345678"
 _PLANNER_ACCOUNT_ID = "@planner:example.org"
 _PLANNER_EXISTING_FRAME_ID = UUID("12345678-1234-5678-1234-567812345681")
 _PLANNER_READY_FRAME_ID = UUID("12345678-1234-5678-1234-567812345682")
-_SQLITE_CONSTRAINT_MATCH = (
-    r"CHECK constraint failed|NOT NULL constraint failed|"
-    r"FOREIGN KEY constraint failed|UNIQUE constraint failed"
-)
-
 _AGGREGATE_COLUMNS = (
     ("account_id", "TEXT", True, 1),
     ("room_id", "TEXT", True, 2),
@@ -118,17 +110,6 @@ _AGGREGATE_COLUMNS = (
     ("intent_kind", "TEXT", False, 0),
     ("payload", "BLOB", True, 0),
     ("payload_sha256", "BLOB", True, 0),
-)
-_FRAME_COLUMNS = (
-    ("account_id", "TEXT", True, 1),
-    ("frame_id", "TEXT", True, 2),
-    ("source_epoch", "INTEGER", True, 0),
-    ("request_id", "INTEGER", True, 0),
-    ("staged_revision", "INTEGER", True, 0),
-    ("payload", "BLOB", True, 0),
-    ("payload_sha256", "BLOB", True, 0),
-    ("room_materialized_revision", "INTEGER", False, 0),
-    ("drain_header_sha256", "BLOB", True, 0),
 )
 _WORK_COLUMNS = (
     ("account_id", "TEXT", True, 1),
@@ -144,111 +125,6 @@ _WORK_COLUMNS = (
     ("created_revision", "INTEGER", True, 0),
     ("payload", "BLOB", True, 0),
     ("payload_sha256", "BLOB", True, 0),
-)
-_TASK6_SCHEMA_OBJECTS = frozenset(
-    {
-        ("table", "NioIngestMeta"),
-        ("table", "NioIngestSourceState"),
-        ("table", "NioIngestFrame"),
-        ("table", "NioIngestRoomAggregate"),
-        ("table", "NioIngestWork"),
-        ("index", "NioIngestFrame_drain"),
-        ("index", "NioIngestRoomAggregate_intent"),
-        ("index", "NioIngestWork_ready"),
-        ("index", "NioIngestWork_held_release"),
-        ("index", "NioIngestWork_frame_kind"),
-    }
-)
-
-# Frozen Task2 Frame-only physical schema. This fixture intentionally does not
-# derive from SCHEMA_SQL: a pre-Task3 store must be refused rather than silently
-# treated as a Work-capable owner.
-_PRE_TASK3_FRAME_ONLY_DDL = (
-    """CREATE TABLE NioIngestMeta (
-    account_id TEXT PRIMARY KEY CHECK (
-        typeof(account_id) = 'text' AND length(account_id) > 0
-    ),
-    device_id TEXT NOT NULL CHECK (
-        typeof(device_id) = 'text' AND length(device_id) > 0
-    ),
-    schema_version INTEGER NOT NULL CHECK (
-        typeof(schema_version) = 'integer' AND schema_version = 1
-    ),
-    stream_id TEXT NOT NULL CHECK (
-        typeof(stream_id) = 'text' AND length(stream_id) > 0
-    ),
-    transport_kind TEXT NOT NULL CHECK (
-        typeof(transport_kind) = 'text'
-        AND length(transport_kind) > 0
-        AND transport_kind IN ('classic', 'sliding')
-    ),
-    revision INTEGER NOT NULL CHECK (
-        typeof(revision) = 'integer' AND revision >= 0
-    ),
-    writer_epoch TEXT NOT NULL CHECK (
-        typeof(writer_epoch) = 'text' AND length(writer_epoch) > 0
-    ),
-    next_source_epoch INTEGER NOT NULL CHECK (
-        typeof(next_source_epoch) = 'integer' AND next_source_epoch >= 1
-    ),
-    created_at_ns INTEGER NOT NULL CHECK (
-        typeof(created_at_ns) = 'integer' AND created_at_ns >= 0
-    ))""",
-    """CREATE TABLE NioIngestSourceState (
-    account_id TEXT PRIMARY KEY REFERENCES NioIngestMeta(account_id) CHECK (
-        typeof(account_id) = 'text' AND length(account_id) > 0
-    ),
-    source_epoch INTEGER NOT NULL CHECK (
-        typeof(source_epoch) = 'integer' AND source_epoch >= 0
-    ),
-    cursor_ciphertext BLOB NOT NULL CHECK (
-        typeof(cursor_ciphertext) = 'blob' AND length(cursor_ciphertext) >= 29
-    ),
-    cursor_sha256 BLOB NOT NULL CHECK (
-        typeof(cursor_sha256) = 'blob' AND length(cursor_sha256) = 32
-    ),
-    next_request_id INTEGER NOT NULL CHECK (
-        typeof(next_request_id) = 'integer' AND next_request_id >= 0
-    ),
-    active INTEGER NOT NULL CHECK (
-        typeof(active) = 'integer' AND active IN (0, 1)
-    ))""",
-    """CREATE TABLE NioIngestFrame (
-    account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id) CHECK (
-        typeof(account_id) = 'text' AND length(account_id) > 0
-    ),
-    frame_id TEXT NOT NULL CHECK (
-        typeof(frame_id) = 'text' AND length(frame_id) > 0
-    ),
-    source_epoch INTEGER NOT NULL CHECK (
-        typeof(source_epoch) = 'integer' AND source_epoch >= 0
-    ),
-    request_id INTEGER NOT NULL CHECK (
-        typeof(request_id) = 'integer' AND request_id >= 0
-    ),
-    staged_revision INTEGER NOT NULL CHECK (
-        typeof(staged_revision) = 'integer' AND staged_revision >= 1
-    ),
-    payload_ciphertext BLOB NOT NULL CHECK (
-        typeof(payload_ciphertext) = 'blob'
-        AND length(payload_ciphertext) >= 29
-        AND length(payload_ciphertext) <= 24 * 1024 * 1024
-    ),
-    payload_sha256 BLOB NOT NULL CHECK (
-        typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
-    ),
-    room_materialized_revision INTEGER NULL CHECK (
-        room_materialized_revision IS NULL OR
-        (typeof(room_materialized_revision) = 'integer'
-         AND room_materialized_revision >= 1)
-    ),
-    drain_header_ciphertext BLOB NOT NULL CHECK (
-        typeof(drain_header_ciphertext) = 'blob'
-        AND length(drain_header_ciphertext) = 29
-    ),
-    PRIMARY KEY (account_id, frame_id))""",
-    """CREATE INDEX NioIngestFrame_drain ON NioIngestFrame(
-    account_id, staged_revision, source_epoch, request_id, frame_id)""",
 )
 
 
@@ -3298,139 +3174,6 @@ def test_contract_envelope_bound_rejects_large_request_metadata_before_transacti
         assert journal.list_frames(1) == ()
     finally:
         journal.close()
-
-
-def _table_columns(
-    connection: sqlite3.Connection,
-    table_name: str,
-) -> tuple[tuple[str, str, bool, int], ...]:
-    return tuple(
-        (str(row[1]), str(row[2]), bool(row[3]), int(row[5]))
-        for row in connection.execute(f"PRAGMA table_info('{table_name}')")
-    )
-
-
-def _foreign_keys(
-    connection: sqlite3.Connection,
-    table_name: str,
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        (str(row[2]), str(row[3]), str(row[4]))
-        for row in connection.execute(f"PRAGMA foreign_key_list('{table_name}')")
-    )
-
-
-def _index_columns(
-    connection: sqlite3.Connection,
-    index_name: str,
-) -> tuple[str, ...]:
-    return tuple(
-        str(row[2]) for row in connection.execute(f"PRAGMA index_info('{index_name}')")
-    )
-
-
-def _open_task6_schema() -> sqlite3.Connection:
-    connection = sqlite3.connect(":memory:")
-    try:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(META_TABLE_SQL)
-        for statement in SCHEMA_SQL:
-            connection.execute(statement)
-
-        connection.execute(
-            """INSERT INTO NioIngestMeta(
-                account_id, device_id, schema_version, stream_id, consumer_generation, transport_kind,
-                revision, writer_epoch, next_source_epoch, created_at_ns,
-                delivery_next_sequence, delivery_acknowledged_sha256,
-                delivery_outstanding_work_id, delivery_outstanding_ready_revision,
-                delivery_outstanding_ready_ordinal, delivery_outstanding_batch_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL)""",
-            (
-                _SCHEMA_ACCOUNT_ID,
-                "DEVICE",
-                SCHEMA_VERSION,
-                str(_STREAM_ID),
-                str(_CONSUMER_GENERATION),
-                "classic",
-                0,
-                str(_FRAME_ID),
-                1,
-                0,
-            ),
-        )
-    except BaseException:
-        connection.close()
-        raise
-    return connection
-
-
-def _assert_task6_plaintext_columns(connection: sqlite3.Connection) -> None:
-    assert _table_columns(connection, "NioIngestFrame") == _FRAME_COLUMNS
-    assert _table_columns(connection, "NioIngestRoomAggregate") == _AGGREGATE_COLUMNS
-    assert _table_columns(connection, "NioIngestWork") == _WORK_COLUMNS
-
-
-def _insert_frame(
-    connection: sqlite3.Connection,
-    **overrides: object,
-) -> None:
-    row: dict[str, object] = {
-        "account_id": _SCHEMA_ACCOUNT_ID,
-        "frame_id": _SCHEMA_FRAME_ID,
-        "source_epoch": 0,
-        "request_id": 0,
-        "staged_revision": 1,
-        "payload": b"{}",
-        "payload_sha256": b"d" * 32,
-        "room_materialized_revision": None,
-        "drain_header_sha256": b"h" * 32,
-    }
-    row.update(overrides)
-    column_names = tuple(row)
-    connection.execute(
-        "INSERT INTO NioIngestFrame ("
-        + ", ".join(column_names)
-        + ") VALUES ("
-        + ", ".join("?" for _ in column_names)
-        + ")",
-        tuple(row[column_name] for column_name in column_names),
-    )
-
-
-def _open_task6_bootstrap(
-    store_path: Path,
-    *,
-    database_name: str = "task6-preflight.db",
-    statements: list[str] | None = None,
-    schema_statements: list[str] | None = None,
-):
-    return open_ingestion_store(
-        store_path,
-        account_id=_SCHEMA_ACCOUNT_ID,
-        device_id="DEVICE",
-        consumer_generation=_CONSUMER_GENERATION,
-        source=ClassicSourceConfig(30_000, b"{}"),
-        pickle_key="secret",
-        database_name=database_name,
-        statement_observer=statements.append if statements is not None else None,
-        schema_statement_hook=(
-            schema_statements.append if schema_statements is not None else None
-        ),
-    )
-
-
-def _ingestion_schema_objects(
-    database_path: Path,
-) -> frozenset[tuple[str, str]]:
-    with sqlite3.connect(database_path) as connection:
-        return frozenset(
-            (str(row[0]), str(row[1]))
-            for row in connection.execute(
-                "SELECT type, name FROM sqlite_master "
-                "WHERE type IN ('table', 'index') "
-                "AND name GLOB 'NioIngest*'"
-            )
-        )
 
 
 _DISCOVERY_ACCOUNT_ID = "@discovery:example.org"
