@@ -604,7 +604,10 @@ def _finish_recovery_event_batch(
     )
     if store:
         store.finish_recovery_events(
-            [(gap.room_id, gap.generation, pending.event_id) for pending in pending_events],
+            [
+                (gap.room_id, gap.generation, pending.event_id)
+                for pending in pending_events
+            ],
             completed,
         )
     queued = state.events[(gap.room_id, gap.generation)]
@@ -725,10 +728,10 @@ async def drain_recovery_room_dispatches(
                     state._dispatch_waiters.pop(task, None)
                 else:
                     state._dispatch_waiters[task] = waiters - 1
-        for key, task in selected.items():
-            if state._active_dispatches.get(key) is not task:
-                continue
-            state._active_dispatches.pop(key)
+        for task in tasks:
+            for key, active in tuple(state._active_dispatches.items()):
+                if active is task:
+                    state._active_dispatches.pop(key)
             if task.cancelled():
                 continue
             error = task.exception()
@@ -1865,9 +1868,7 @@ async def _drain_gap(
     queued = state.events.get((gap.room_id, gap.generation), ())
     if dispatch_event_batch is not None:
         pending_batch = tuple(
-            pending
-            for pending in queued
-            if pending.kind == "timeline"
+            pending for pending in queued if pending.kind == "timeline"
         )
         if pending_batch and pending_batch == tuple(queued[: len(pending_batch)]):
             complete = await _drain_timeline_batch(

@@ -503,8 +503,7 @@ async def test_batch_dispatch_groups_store_transitions():
     assert store.accepted_batches == [expected_keys]
     assert [item[0] for item in store.finished_batches] == [expected_keys]
     assert [
-        (item.was_encrypted, item.provenance)
-        for item in store.finished_batches[0][1]
+        (item.was_encrypted, item.provenance) for item in store.finished_batches[0][1]
     ] == [
         (False, TimelineEventProvenance.HISTORY),
         (False, TimelineEventProvenance.HISTORY),
@@ -1481,6 +1480,28 @@ async def test_dispatch_drain_reaches_tasks_registered_while_waiting():
     await drain
 
     assert nested_finished.is_set()
+    assert not state._active_dispatches
+
+
+@pytest.mark.asyncio
+async def test_room_drain_clears_every_failed_batch_alias():
+    state = RecoveryState()
+
+    async def failed_batch():
+        return sync_recovery._LiveCallbackError(
+            RuntimeError("batch callback failed"),
+            False,
+            accepted=False,
+        )
+
+    task = asyncio.create_task(failed_batch())
+    await task
+    for event_id in ("$one", "$two", "$three"):
+        state._active_dispatches[(ROOM, event_id, "timeline")] = task
+
+    with pytest.raises(RuntimeError, match="batch callback failed"):
+        await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
+
     assert not state._active_dispatches
 
 

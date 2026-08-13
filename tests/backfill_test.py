@@ -2755,6 +2755,242 @@ class TestRoomLocalRecovery:
         finally:
             await other.close()
 
+    async def test_batch_admission_commits_before_any_event_fanout(self, client):
+        release = asyncio.Event()
+        started = asyncio.Event()
+        order: list[object] = []
+
+        async def admit(entries):
+            order.append([entry.event.event_id for entry in entries])
+            started.set()
+            await release.wait()
+            order.append("committed")
+            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+
+        async def observe(_room, event):
+            order.append(event.event_id)
+
+        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_callback(observe, RoomMessageText)
+        task = asyncio.create_task(
+            client.receive_response(
+                timeline_response(
+                    "classic",
+                    "s1",
+                    [text_event("$one", 1), text_event("$two", 2)],
+                )
+            )
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        assert order == [["$one", "$two"]]
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.5)
+
+        assert order == [["$one", "$two"], "committed", "$one", "$two"]
+
+    async def test_batch_admission_preserves_recovered_timeline_order(
+        self,
+        client,
+        aioresponse,
+    ):
+        batches: list[list[tuple[str, TimelineEventProvenance]]] = []
+
+        def admit(entries):
+            batches.append(
+                [(entry.event.event_id, entry.provenance) for entry in entries]
+            )
+            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+
+        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap-one", 1), text_event("$gap-two", 2)],
+                "p1",
+            ),
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        assert batches == [
+            [
+                ("$gap-one", TimelineEventProvenance.RECOVERED),
+                ("$gap-two", TimelineEventProvenance.RECOVERED),
+                ("$held", TimelineEventProvenance.LIVE),
+            ]
+        ]
+
+    async def test_batch_admission_rejection_retains_and_retries_whole_batch(
+        self,
+        client,
+        aioresponse,
+    ):
+        attempts: list[list[str]] = []
+        ordinary: list[str] = []
+
+        def admit(entries):
+            attempts.append([entry.event.event_id for entry in entries])
+            if len(attempts) == 1:
+                raise CallbackNotAcceptedError("durable batch admission failed")
+            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+
+        async def observe(_room, event):
+            ordinary.append(event.event_id)
+
+        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_callback(observe, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap-one", 1), text_event("$gap-two", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable batch admission failed",
+        ):
+            await client.receive_response(response)
+
+        assert ordinary == []
+
+        await client.receive_response(response)
+
+        expected = ["$gap-one", "$gap-two", "$held"]
+        assert attempts == [expected, expected]
+        assert ordinary == expected
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            (TimelineAdmissionDisposition.FANOUT,),
+            ("fanout", "fanout"),
+        ],
+    )
+    async def test_batch_admission_validates_dispositions(self, client, result):
+        def admit(_entries):
+            return result
+
+        client.add_event_batch_admission_callback(admit, RoomMessageText)
+
+        with pytest.raises(LocalProtocolError, match="Batch admission"):
+            await client.receive_response(
+                timeline_response(
+                    "classic",
+                    "s1",
+                    [text_event("$one", 1), text_event("$two", 2)],
+                )
+            )
+
+    async def test_batch_admission_skips_durably_accepted_entry(self, client):
+        admissions: list[list[str]] = []
+        ordinary: list[str] = []
+        accepted_marks = 0
+
+        def admit(entries):
+            admissions.append([entry.event.event_id for entry in entries])
+            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+
+        async def observe(_room, event):
+            ordinary.append(event.event_id)
+
+        def mark_admission_accepted():
+            nonlocal accepted_marks
+            accepted_marks += 1
+
+        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_callback(observe, RoomMessageText)
+        pending_events = (
+            replace(
+                PendingTimelineEvent.from_event(
+                    ROOM_A,
+                    1,
+                    0,
+                    text_event("$accepted", 1),
+                    True,
+                ),
+                admission_accepted=True,
+            ),
+            PendingTimelineEvent.from_event(
+                ROOM_A,
+                1,
+                1,
+                text_event("$new", 2),
+                True,
+            ),
+        )
+        assert all(pending_events)
+
+        await client._dispatch_timeline_batch(
+            pending_events,
+            (text_event("$accepted", 1), text_event("$new", 2)),
+            mark_admission_accepted,
+        )
+
+        assert admissions == [["$new"]]
+        assert ordinary == ["$accepted", "$new"]
+        assert accepted_marks == 1
+
+    async def test_batch_admission_non_semantic_still_updates_state_and_fans_out(
+        self,
+        client,
+    ):
+        observations: list[tuple[str, str | None]] = []
+
+        def admit(entries):
+            observations.append(("admit", entries[0].room.name))
+            return (TimelineAdmissionDisposition.NON_SEMANTIC,)
+
+        async def observe(room, _event):
+            observations.append(("ordinary", room.name))
+
+        client.add_event_batch_admission_callback(admit, RoomNameEvent)
+        client.add_event_callback(observe, RoomNameEvent)
+
+        response = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [name_event("$name", 1, "New name")],
+                    limited=False,
+                    prev_batch="p0",
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert observations == [
+            ("admit", "New name"),
+            ("ordinary", "New name"),
+        ]
+        assert client.rooms[ROOM_A].name == "New name"
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_two_argument_admission_callback_remains_supported(
         self,
