@@ -148,19 +148,20 @@ git commit -m "feat: add timeline batch admission contract"
 
 Seed three real pending rows and assert that one call marks all three accepted.
 
-Add a second test containing one missing key and assert that all real rows remain unaccepted after `ValueError`.
+Add a second test containing one stale generation and one already-cleared key, and assert that every remaining real row becomes accepted without raising.
+
+Add a third test with a temporary SQLite trigger that aborts the second update, and assert that the first row's acceptance is rolled back.
 
 ```python
-with pytest.raises(ValueError, match=r"Recovery event disappeared: \$missing"):
-    sqlstore.accept_recovery_events(
-        [
-            (TEST_ROOM, 1, "$one"),
-            (TEST_ROOM, 1, "$missing"),
-            (TEST_ROOM, 1, "$three"),
-        ]
-    )
+sqlstore.accept_recovery_events(
+    [
+        (TEST_ROOM, 99, "$one"),
+        (TEST_ROOM, 1, "$already-cleared"),
+        (TEST_ROOM, 1, "$three"),
+    ]
+)
 
-assert not any(event.admission_accepted for event in sqlstore.load_sync_recovery()[1])
+assert all(event.admission_accepted for event in sqlstore.load_sync_recovery()[1])
 ```
 
 - [ ] **Step 2: Run the acceptance tests and confirm the expected failure**
@@ -171,7 +172,9 @@ Expected: FAIL because `accept_recovery_events` does not exist.
 
 - [ ] **Step 3: Implement atomic batch acceptance**
 
-Use `@use_database_atomic`, resolve the account once, validate every exact row before the first update, then update every row inside the same transaction.
+Use `@use_database_atomic`, resolve the account once, then update every row inside the same transaction.
+
+Match `generation > 0` independently of the passed generation and warn without raising when a row is already gone, exactly as the current single-event method does.
 
 Factor the exact update into a private helper shared with `accept_recovery_event` so both paths use the same predicate.
 
@@ -199,7 +202,9 @@ Expected: PASS.
 
 Assert that one call replaces regular rows with generation-zero markers preserving literal encryption and provenance values.
 
-Add cases for mismatched input lengths, a missing key rolling back all changes, a synthetic `~` row being deleted, and more than 512 completed rows pruning to the newest 512 markers.
+Add cases for mismatched input lengths, a missing key becoming a conservative completion marker, a synthetic `~` row being deleted, and more than 512 completed rows pruning to the newest 512 markers.
+
+Add a temporary SQLite trigger that aborts the second marker insert, and assert that the first pending row remains unchanged after rollback.
 
 ```python
 sqlstore.finish_recovery_events(
@@ -220,7 +225,7 @@ Expected: FAIL because `finish_recovery_events` does not exist.
 
 - [ ] **Step 7: Implement atomic batch completion**
 
-Validate equal lengths and every exact pending row before mutation.
+Validate equal lengths before mutation and resolve existing rows independently of the passed generation.
 
 For each regular event, replace its row with the same generation-zero marker shape used by `finish_recovery`.
 
@@ -344,7 +349,7 @@ def _finish_recovery_event_batch(
             )
 ```
 
-Validate every in-memory target before the store call, perform the atomic store call, and only then mutate in-memory state.
+Resolve every in-memory target before the store call, perform the atomic store call, and only then mutate in-memory state.
 
 Build `CompletedTimelineEvent` values with the same encryption fallback and provenance rules as `_finish`.
 

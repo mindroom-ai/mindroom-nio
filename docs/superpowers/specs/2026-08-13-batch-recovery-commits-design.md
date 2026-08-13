@@ -76,7 +76,9 @@ Batch admission is therefore appropriate for durable, event-ID-idempotent consum
 
 Add atomic `accept_recovery_events` and `finish_recovery_events` store operations.
 
-Each operation validates every addressed row before mutating any row.
+Each operation preserves the single-event path's crashed-iteration behavior by matching a pending event independently of its stale generation and tolerating a row that another iteration already cleared.
+
+The batch transaction still rolls back every mutation when an actual database operation fails.
 
 The batch completion operation preserves encryption status, provenance, synthetic-event deletion, and the existing 512-marker per-room bound.
 
