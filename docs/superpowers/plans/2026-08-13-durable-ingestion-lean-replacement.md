@@ -92,8 +92,11 @@ otherwise disappear.
 
 Measure and record whole-tree runtime/test/docs deltas against pinned
 `6ed2b9817d2bc9de30dc72942f9cb867d829283b`, plus the exact Task-2 range.
-Task 2 must reduce tests and must leave both `src/` and docs/scripts unchanged
-from its parent. Final runtime compliance is enforced after legacy deletion.
+The Task-2 implementation commit must reduce tests and leave both `src/` and
+docs/scripts unchanged from its parent. A review correction to this governing
+paragraph is accounted separately and may not add product documentation,
+benchmarks, or runtime code. Final runtime compliance is enforced after legacy
+deletion.
 
 **Commit:** `test: consolidate durable ingestion assurance`
 
