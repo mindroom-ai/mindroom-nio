@@ -45,6 +45,7 @@ from nio import (
     SlidingSyncRoom,
     SyncResponse,
     Timeline,
+    TimelineAdmissionDisposition,
     TimelineEventProvenance,
     ToDeviceEvent,
     TypingNoticeEvent,
@@ -2716,6 +2717,43 @@ class TestRoomLocalRecovery:
             match="admission callback is already registered",
         ):
             client.add_event_admission_callback(second, RoomMessageText)
+
+    async def test_batch_admission_rejects_simultaneous_admission_owners(
+        self,
+        client,
+    ):
+        def admit_batch(entries):
+            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+
+        async def admit_event(_room, _event, _provenance):
+            pass
+
+        client.add_event_batch_admission_callback(admit_batch, RoomMessageText)
+
+        with pytest.raises(
+            LocalProtocolError,
+            match="admission callback is already registered",
+        ):
+            client.add_event_admission_callback(admit_event, RoomMessageText)
+
+        other = AsyncClient(
+            "https://example.org",
+            OWN_ID,
+            config=AsyncClientConfig(backfill_limited_timelines=True),
+        )
+        try:
+            other.add_event_admission_callback(admit_event, RoomMessageText)
+
+            with pytest.raises(
+                LocalProtocolError,
+                match="admission callback is already registered",
+            ):
+                other.add_event_batch_admission_callback(
+                    admit_batch,
+                    RoomMessageText,
+                )
+        finally:
+            await other.close()
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_two_argument_admission_callback_remains_supported(

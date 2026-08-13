@@ -310,6 +310,10 @@ from .sync_response_ordering import (
     account_data_kind,
     ordered_response_view,
 )
+from .timeline_admission import (
+    TimelineBatchAdmissionCallback,
+    _TimelineBatchAdmission,
+)
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
 
@@ -687,6 +691,7 @@ class AsyncClient(Client):
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
         self.event_admission_callback: ClientCallback | None = None
+        self.event_batch_admission_callback: _TimelineBatchAdmission | None = None
         self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
         )
@@ -1052,12 +1057,37 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Event admission requires limited-timeline recovery."
             )
-        if self.event_admission_callback is not None:
+        if (
+            self.event_admission_callback is not None
+            or self.event_batch_admission_callback is not None
+        ):
             raise LocalProtocolError(
                 "An event admission callback is already registered."
             )
         self.event_admission_callback = ClientCallback(
             _adapt_event_admission_callback(callback),
+            cb_filter,
+        )
+
+    def add_event_batch_admission_callback(
+        self,
+        callback: TimelineBatchAdmissionCallback,
+        cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
+    ) -> None:
+        """Set the sole owner of ordered timeline-batch admission."""
+        if not self.config.backfill_limited_timelines:
+            raise LocalProtocolError(
+                "Event admission requires limited-timeline recovery."
+            )
+        if (
+            self.event_admission_callback is not None
+            or self.event_batch_admission_callback is not None
+        ):
+            raise LocalProtocolError(
+                "An event admission callback is already registered."
+            )
+        self.event_batch_admission_callback = _TimelineBatchAdmission(
+            callback,
             cb_filter,
         )
 
