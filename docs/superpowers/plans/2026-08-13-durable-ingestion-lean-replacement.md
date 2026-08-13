@@ -12,7 +12,7 @@
 
 ## Invariants
 
-- Preserve the current upstream-style sync methods, responses, callbacks, `AsyncClient.rooms`, and desktop behavior.
+- Preserve the exact pre-fork sync methods, responses, callbacks, `AsyncClient.rooms`, and desktop behavior at `69aa99c51f354980bf5306a85b4c7b7d71ff3217`.
 - Return ingestion schema to v1 and exactly five durable tables.
 - Classic and Sliding share Frame normalization, reducer, materializer, Work, batch, and ack.
 - Never use canary-specific production tables, scope, control room, `probe`, occurrence ledger, rotation ledger, or materializer.
@@ -86,7 +86,7 @@ Keep:
 
 Before deleting any test group, map every user-visible behavior it covers to a retained or replacement node. Add the replacement first if coverage would otherwise disappear.
 
-Measure and record runtime/test/docs deltas against pinned `6ed2b9817d2bc9de30dc72942f9cb867d829283b`. Task 2 must reduce all three categories and must not introduce production code.
+Measure and record runtime/test/docs deltas against pinned `6ed2b9817d2bc9de30dc72942f9cb867d829283b`. Task 2 must reduce tests and docs/scripts relative to Task 1 HEAD and must leave `src/` unchanged. Final runtime compliance is enforced after legacy deletion.
 
 **Commit:** `test: consolidate durable ingestion assurance`
 
@@ -125,10 +125,20 @@ Run focused RED/GREEN, the full source-journal/coordinator/crash files, Ruff, ty
 
 ## Task 4: Prove one shared reducer and materializer
 
+Use test-driven development. First capture each causal failure below against the generic path; do not implement production preparation or callback claims before its failing behavior test exists.
+
 **Production files**
 
+- `src/nio/client/async_client.py` and `base_client.py` for a reusable no-recovery response-preparation boundary
+- `src/nio/responses.py` for private durable Sliding parsing without a public AsyncClient Sliding response API
 - `src/nio/ingest/reducer.py`
+- `src/nio/ingest/model.py` and `serialization.py`
+- `src/nio/ingest/coordinator.py`
+- `src/nio/store/sync_journal.py` and `_ingestion_store_owner.py`
+- `src/nio/store/_sync_journal_preflight.py`
+- `src/nio/store/sync_journal_schema.py` and `_sync_journal_rows.py`
 - `src/nio/store/_sync_journal.py`
+- `src/nio/store/_sync_journal_port.py`
 - `src/nio/store/_sync_journal_plan.py`
 - transport adapters only where normalization lacks parity data
 
@@ -148,10 +158,26 @@ Build a differential behavior matrix covering at least:
 - limited history, gaps, eviction, and re-entry;
 - malformed/conflicting records and repeated BLOCKED behavior;
 - callbacks and response-state projection.
+- same-Frame Olm room-key arrival followed by Megolm timeline decryption;
+- rollback after each crypto/store/Work/marker statement, session poisoning, and clean reopen;
+- Frame completion and one response/completion callback for empty and nonempty Frames;
+- `AsyncClient.rooms` restoration from persisted snapshots before incremental response delivery.
 
 For equivalent normalized input, both transports must produce the same record fates and durable graph. A transport adapter may normalize wire differences; it may not choose a different fate engine.
 
-Task 1 must already have removed every dedicated diagnostic entrypoint. Preserve every record-fate invariant: Work, aggregate/loss state, or retained Frame—never silent discard.
+Add one frame-scope compatibility preparation phase before Work becomes application-visible. The MindRoom AsyncClient must adopt the ingestion-owned MatrixStore so ordinary E2EE rows and the five ingestion tables share one SQLite owner/transaction. Reuse callback-free AsyncClient/Olm primitives in upstream order: to-device first, timeline Megolm next, then device-list/key-count/fallback controls and room-state projection. Persist stable event IDs, decrypted `clear_json`, `RoomSnapshot`, every `RecordKind` including `TO_DEVICE`, aggregates/Work, and the preparation revision atomically. On rollback after Olm memory mutation, poison/close the session and reconstruct it from the rolled-back database; never retry the same object.
+
+Implement that ownership as an explicit lease transfer, not two independent opens: `StoreBootstrap.open_matrix_store()` creates the exact borrowed `SqliteStore`; a new session-claim operation accepts only that same leased store, transfers both journal and store to one `IngestionSession`, and revokes/closes them exactly once. It must reject a foreign store, session-before-store, second store/session, use after transfer, and close from the wrong owner. Add causal lifecycle tests for successful transfer, cancellation, preparation rollback/poison, close ordering, and clean reopen. Do not weaken the single-process/thread/file-identity/writer-epoch fences.
+
+Before that lease exists, add an exclusive in-place v1 adoption path for the populated MindRoom per-device database. Authenticate exact account/device/store-v10 ownership and all existing MatrixStore tables; in one bootstrap transaction add only the five v1 ingestion tables/initial rows and leave every existing Olm account pickle, Megolm/session/key row, sync token, and inert historical recovery table byte-identical. Every injected statement failure must reopen as all-old with no ingestion marker; success must reopen as all-new with exactly one marker/source. Reject partial topology, wrong identity, unsupported store version, a simultaneously open client/store, or a second adoption without mutation. Do not create a parallel ingestion database for the same device.
+
+Keep the Frame after materialization as the response/completion owner. Add only one authenticated nullable `callbacks_claimed_revision` column to `NioIngestFrame` while retaining schema version 1 and exactly five tables. One-record receipts suppress record callback replay; when the Frame has no Work left, claim its completion callback before best-effort fanout, then retire it. Empty Frames use the same path. Persist/restore the existing `RoomSnapshot` carrier before incremental delivery. Complete outbound device-key maintenance while the retained Frame can still recreate its in-memory request state. No callback runs in either database transaction.
+
+Replace the current “any remaining Frame is blocked” coordinator branch with an explicit private progress machine: `PREPARE -> HYDRATE_IF_REQUIRED -> WAIT_FOR_RECORD_ACK -> CLAIM_AND_FANOUT_COMPLETION -> RETIRE -> NEXT_SOURCE_HTTP`. A prepared retained Frame yields/wakes the concurrent MindRoom pump instead of raising; first-room HELD Work can complete its hydration HTTP; the next source-sync HTTP remains fenced until every record receipt/ack and Frame completion settles. Only malformed/auth/conflict states are `BLOCKED`. Add causal concurrent runner+pump tests for empty and nonempty Classic/Sliding Frames and first-room hydration, proving the second source poll occurs only after completion and leaves zero Frame/Work; add crash, cancellation, close, and lost-wakeup coverage. Do not add a progress table.
+
+A retained Frame is retry state, not a successful terminal fate. For both transports, successful encrypted, to-device, device-list, OTK, fallback-key, state, account-data, presence, ephemeral, lifecycle, and loss responses must end with zero permanently retained Frames and zero unacknowledgeable Work. Each known input must resolve to exactly one explicit owner: MindRoom event/lifecycle/loss Work or compatibility-owned MatrixStore/callback state. Malformed input remains durably blocked and visible.
+
+Task 1 must already have removed every dedicated diagnostic entrypoint. Preserve every record-fate invariant: successful input has Work or a committed compatibility owner; only malformed, failed, or in-progress input may retain its Frame—never silent discard.
 
 Run both full adapter suites plus the shared reducer/materializer suite and statics.
 
@@ -164,8 +190,18 @@ Work in `/work/dev/mindroom` with test-driven development.
 **Production files**
 
 - `src/mindroom/event_journal/journal.py`
+- `src/mindroom/event_journal/schema.py`
+- `src/mindroom/event_journal/models.py`
+- `src/mindroom/event_journal/store.py`
+- `src/mindroom/event_journal/views.py`
+- `src/mindroom/bot.py`
 - `src/mindroom/matrix/durable_ingestion.py`
-- the smallest existing model/view module needed to bind stable Matrix event identity
+- `src/mindroom/matrix/sync_loop.py`
+- `src/mindroom/matrix/journal_ingress.py`
+- `src/mindroom/matrix/client_session.py`
+- `src/mindroom/matrix/users.py`
+- the appservice login helper if it independently constructs/restores agent clients
+- the existing sync-certification/checkpoint modules only to remove old-engine dependencies
 
 **Tests**
 
@@ -181,28 +217,39 @@ Write causal failures for:
 4. Concurrent attempts cannot dispatch twice.
 5. Classic behavior is unchanged.
 6. Existing `matrix_sync.mode` selects Classic or Sliding for the durable runner without a control room, `probe`, or one-message production scope.
+7. `Bot.sync_forever()` uses the durable runner as the candidate's only MindRoom sync engine; `matrix_sync.mode` selects transport, not engine. Activation is deployment of the reviewed candidate cohort, not a canary environment variable or a new YAML option.
+8. Every nio `RecordKind` and `LossRecord` has one literal disposition: semantic timeline admission, room-lifecycle fencing, room-history loss obligation, or compatibility-owned state/callback settlement. No known record can occupy the FIFO without an acknowledgement path.
+9. Invite/membership, E2EE/to-device, RTC/pairing, response health, first-sync, presence, permanent-auth-error, cancellation, and close behavior remain available through the durable runner and compatibility owner.
+10. Restored-login and fresh-login paths locate/adopt the existing per-device MatrixStore before Olm initialization; its account pickle, inbound/outbound sessions, device keys, and sync-token rows survive adoption and restart byte-for-byte.
 
-Reuse the existing `journal_events` unique identity, immutable clear columns, ingestion-receipt foreign key, and admission transaction. Do not add a table, migration, event-identity database to nio, retain raw settled payload for a second digest, or add a canary-only receipt path.
+Keep `max_records=1`. Reuse the existing `journal_events` unique identity, immutable clear columns, and admission transaction. Correct the unmerged `matrix_ingestion_receipts` definition by replacing its mandatory `event_id` foreign key with nonempty `record_id`. Every EventRecord/LossRecord batch receives a receipt; semantic Matrix events independently bind `journal_events`. Extend `IngestionBatchAdmission` with `record_id`, optional membership/event/projection fields, and return separate `receipt_new`/`semantic_event_new` facts so callbacks and application dispatch are gated correctly. This is an in-PR schema-definition correction, not a deployed migration. Do not add a table, event-identity database to nio, retain raw settled payload for a second digest, or add a canary-only receipt path.
 
 Run focused RED/GREEN, full journal/admission/crash suites, statics, and diff checks.
 
 **Commit:** `fix: deduplicate durable matrix events semantically`
 
-## Task 6: Restore the upstream public sync path and verify compatibility
+## Task 6: Restore the pre-fork public sync path and verify compatibility
 
-Before observation, remove every call from `sync()`, `sync_forever()`, and response handling into fork-only recovery/checkpoint machinery while leaving those modules present for the zero-use gate. Restore the smallest upstream matrix-nio implementation of request, response application, room projection, token persistence, and callback dispatch. Do not route desktop through the durable batch engine.
+Use `69aa99c51f354980bf5306a85b4c7b7d71ff3217` as the exact local upstream boundary. Before observation, remove every normal import, export, registration, and call from `sync()`, `sync_forever()`, response handling, and store opening into fork-only recovery/checkpoint machinery while leaving those source modules present for the zero-use gate. Restore the smallest boundary implementation of request, response application, room projection, token persistence, and callback dispatch. Do not route desktop through the durable batch engine and do not replace unrelated later E2EE/cross-signing/security work with a whole-file checkout.
 
 Use test-driven development against behavior, not deleted helper topology. The retained upstream public contract—not fork-specific recovered/unrecovered response fields or checkpoint outcomes—is authoritative.
 
 Create a retained compatibility matrix for:
 
-- `sync()`, `sync_forever()`, `sliding_sync()`, and `sliding_sync_forever()` signatures and return behavior;
-- event, response, ephemeral, and to-device callback registration, ordering, exceptions, and re-entry;
+- `sync()`, `sync_forever()`, `stop_sync_forever()`, `receive_response()`, `run_response_callbacks()`, `add_response_callback()`, and `close()` signatures and return behavior;
+- `add_event_callback()`, `add_ephemeral_callback()`, `add_global_account_data_callback()`, `add_room_account_data_callback()`, `add_to_device_callback()`, and `add_presence_callback()` signatures, ordering, exceptions, and re-entry;
 - `AsyncClient.rooms` and store projection timing;
+- `synced` set/clear behavior, first-sync-before-auxiliary ordering, callback exception propagation, cancellation, and stop-flag reset;
 - desktop's unchanged `sync_forever()` plus to-device callback path;
 - ordinary sends and error responses.
 
-For the MindRoom runner, run the same behavior fixtures with its durable opt-in off and on. For desktop, compare the retained upstream-style public path before and after fork-recovery deletion; desktop never uses the durable opt-in. Differences require either a bug fix or an explicit design amendment; do not bless them as internal changes.
+Explicitly remove fork-added `AsyncClient.sliding_sync()`, `sliding_sync_forever()`, `SlidingSyncResponse` types, recovery/checkpoint/admission methods, recovery response fields, and their top-level exports from the public compatibility contract. Durable Sliding remains under `nio.ingest`, not `AsyncClient`.
+
+Before removing those nio symbols, require a fail-closed MindRoom source scan proving no production reference remains to `add_event_admission_callback`, `SlidingSyncResponse`, `sliding_sync_forever`, Classic checkpoint acknowledgement/reset methods, recovered/unrecovered response fields, or recovery/token exports. This gate covers `bot.py`, `matrix/sync_loop.py`, `matrix/journal_ingress.py`, `matrix/client_session.py`, and sync certification/checkpoint helpers.
+
+For MindRoom, run the same application-behavior fixtures through the durable runner with Classic and Sliding transport. There is no old-engine/durable-engine product toggle in the candidate. For desktop, compare the retained pre-fork public path before and after fork-recovery source deletion. Differences require either a bug fix or an explicit design amendment; do not bless them as internal changes.
+
+Do not destructively downgrade an existing Matrix store or drop historical recovery tables. Fresh stores create only ordinary active tables; existing higher-version databases may retain inert historical tables, but ordinary open/sync/token/callback operations must neither read nor write recovery state.
 
 For observation, run the candidate under external Python coverage and require zero executed lines in the named fork-recovery modules and the recovery/checkpoint regions of `async_client.py` and `database.py`. Do not add counters, persistence, or evidence hooks to production.
 
@@ -250,14 +297,18 @@ Sliding must demonstrate:
 
 Materialize a concise allowlisted evidence record and independently review it. A canary PASS authorizes activation observation, not release or legacy deletion.
 
+Because Task 4 changes the schema-v1 Frame layout and E2EE ownership after the earlier Classic qualification, rebuild and rerun the full Classic canary against this exact candidate before accepting any Sliding result. The old Classic PASS cannot be rebound to the new column or store ownership.
+
 ## Task 9: Activate, observe, and only then delete fork recovery
 
-Activation remains inside the linked change set and behind the existing MindRoom opt-in. The following thresholds are fixed:
+Activation remains inside the linked change set. The candidate's `Bot.sync_forever()` already owns the durable runner, and deployment selects the observation cohort; no product opt-in or canary-agent environment variable is introduced. The following thresholds are fixed:
 
-1. Enable the MindRoom bot cohort.
-2. Observe for at least 24 continuous hours, 1,000 successful source polls, and three clean process restarts. Require zero duplicate visible effects, zero unexplained event loss, no permanently growing Frame/Work backlog, and external coverage showing zero fork-recovery execution.
+1. Deploy the reviewed candidate to the MindRoom observation cohort.
+2. Observe for one uninterrupted 24-hour interval spanning 1,000 successful source polls and three recorded clean process restarts. Require zero duplicate visible effects, zero unexplained event loss, no permanently growing Frame/Work backlog, and external coverage showing zero fork-recovery execution.
 3. Run desktop on the restored upstream-style `sync_forever()` for at least two hours and 100 successful responses, including one process restart and one real to-device callback. Require no callback/order/authentication failure and external coverage showing zero fork-recovery execution.
 4. Preserve exact run start/end times, candidate hashes, counts, coverage data, and failure totals in the final report.
+
+If either observation fails, do not delete legacy source. Fix the durable path or restore Task 6's old-engine imports/calls inside the linked branches, then rerun all affected verification and the full observation interval; there is no hidden runtime fallback in the candidate.
 
 Only after both observations pass, remove:
 

@@ -15,34 +15,37 @@ The mistake in the superseded design was allowing proof for one live canary to b
 ## Controlling decisions
 
 1. Keep this as one indivisible change set so the complete replacement can be accepted or rejected as one unit. Because nio and MindRoom are separate Git repositories, each has one linked PR; neither is split into phase PRs or proposed independently.
-2. Return the ingestion journal to schema version 1 and its existing five-table topology.
+2. Return the ingestion journal to schema version 1 and exactly five tables. One load-bearing authenticated Frame completion column is allowed; it does not revive schema v2 or add a table, and Classic must be requalified against it.
 3. Remove all canary-specific production state and logic before implementing more behavior.
 4. Keep one transport-neutral Frame/reducer/materializer/Work/batch/ack path for Classic and Sliding.
-5. Preserve matrix-nio's public sync surface and callback behavior. Desktop continues to use the ordinary `sync_forever()` surface unchanged.
+5. Preserve matrix-nio's true pre-fork public sync surface and callback behavior at `69aa99c51f354980bf5306a85b4c7b7d71ff3217`. Desktop continues to use the ordinary `sync_forever()` surface unchanged.
 6. Do not preserve fork-only recovery/checkpoint internals after MindRoom is activated on the durable path and its observation window passes.
 7. The sequence is prune, implement, activate, observe, then delete legacy recovery. The deletion gate cannot move earlier.
 8. Live-canary evidence is external release assurance, never a reason to add production schema or semantics.
 
 ## Compatibility boundary
 
-The following remain source- and behavior-compatible:
+The authoritative compatibility boundary is pre-fork matrix-nio commit `69aa99c51f354980bf5306a85b4c7b7d71ff3217` (`Support room version 12 (#546)`). The following remain source- and behavior-compatible:
 
-- `sync()`, `sync_forever()`, `sliding_sync()`, and `sliding_sync_forever()`;
-- response, event, ephemeral, and to-device callback registration and ordering;
-- response types, `AsyncClient.rooms`, ordinary sends, and desktop/pairing behavior;
+- `AsyncClient.sync()`, `sync_forever()`, `stop_sync_forever()`, `receive_response()`, `run_response_callbacks()`, `add_response_callback()`, and `close()` with their boundary signatures and behavior;
+- `add_event_callback()`, `add_ephemeral_callback()`, `add_global_account_data_callback()`, `add_room_account_data_callback()`, `add_to_device_callback()`, and `add_presence_callback()` with their boundary signatures and sequential ordering;
+- the boundary `SyncResponse` shape, `AsyncClient.rooms`, ordinary sends, and desktop/pairing behavior;
+- ordinary sync-token persistence and the upstream Matrix store/E2EE behavior retained by desktop;
 - upstream matrix-nio behavior used by desktop, including room state, membership, encryption, account data, to-device traffic, responses, and callbacks.
 
 MindRoom uses the durable engine. Desktop does not: it continues to use ordinary upstream-style `sync_forever()` plus to-device callbacks. Callers must not need new configuration or code. Callbacks never run inside a journal transaction.
 
-Fork-added recovery outcomes, checkpoints, and Sliding helpers are deliberately outside that promise. The following are implementation details, not compatibility promises:
+Fork-added recovery outcomes, checkpoints, and AsyncClient Sliding APIs are deliberately outside that promise. `AsyncClient.sliding_sync()`, `sliding_sync_forever()`, their HTTP/API helpers, and the `SlidingSyncResponse` family were added after the fork boundary and are removed from the restored public surface. Durable Sliding remains an ingestion transport adapter; it is not an AsyncClient compatibility API.
+
+The following are implementation details, not compatibility promises:
 
 - `sync_recovery.py` and recovery-abandonment internals;
 - reset-fence and response-ordering helpers;
-- Sliding membership/checkpoint helpers;
+- Sliding membership/checkpoint helpers and fork-only Sliding response types;
 - recovery persistence tables and private store APIs;
 - tests coupled only to those implementations.
 
-They remain temporarily while `sync()` and `sync_forever()` are restored to an upstream-style implementation that no longer calls them. MindRoom then runs the durable engine and desktop runs the restored public surface during separate observation windows. Only after both paths show zero calls into fork recovery are the unreachable internals removed in the same linked change set. Desktop is not migrated to the durable batch engine.
+Their source modules remain temporarily while `sync()` and `sync_forever()` are restored to the boundary implementation and all normal imports, exports, registrations, and calls into those modules are removed. MindRoom then runs the durable engine and desktop runs the restored public surface during separate observation windows. Only after both paths show zero calls into fork recovery are the isolated source modules and implementation-detail tests removed in the same linked change set. Existing databases are never destructively downgraded or stripped of historical tables; the restored store ignores inert recovery tables. Desktop is not migrated to the durable batch engine.
 
 ## Durable core
 
@@ -54,7 +57,7 @@ The ingestion schema remains version 1 with exactly these tables:
 - `NioIngestRoomAggregate`: room continuity, hydration, and recovery state;
 - `NioIngestWork`: READY or HELD event/loss work.
 
-There is no schema migration and no diagnostic topology. Remove:
+There is no ingestion schema-version bump, v1-to-v2 migration, or diagnostic topology. Activation does require one fail-closed v1 adoption transaction for the already-populated per-device MatrixStore: authenticate the existing account/device/store-v10 topology, preserve every Olm/Megolm/key/session/token row and inert historical recovery table, and add the five v1 ingestion tables plus initial owner/source rows all-old or all-new. The unmerged schema-v1 definition may also add one nullable authenticated `NioIngestFrame.callbacks_claimed_revision` column so a completed/empty Frame can claim best-effort callback publication before fanout. Remove:
 
 - diagnostic scope, list-observation, event-receipt, event-occurrence, and source-rotation tables;
 - `DiagnosticIngestionScope` and diagnostic row codecs;
@@ -68,22 +71,33 @@ The schema-v1 Classic canary branch is also scaffolding, not a keeper: remove `_
 
 1. Classic or Sliding validates a response and normalizes it to the same `SyncFrame` contract.
 2. One `IMMEDIATE` transaction authenticates Source state, inserts the canonical Frame, advances the cursor, and advances Meta revision. Both response and cursor commit, or neither does.
-3. The oldest Frame is renormalized and passed to the same pure reducer for both transports.
-4. The same materializer updates room aggregates, inserts READY/HELD Work or loss records, and retires the Frame only after every normalized record has a durable owner.
+3. On fresh login or restored login, MindRoom locates the exact existing per-device store before initializing Olm. `StoreBootstrap` exclusively adopts that file in place, then opens the borrowed `SqliteStore`; one explicit lease transfer gives `IngestionSession` the borrowed store and journal together, preserving the single-process/thread/file-identity/writer-epoch fences and one close owner. A parallel fresh crypto database or second open is forbidden. The five ingestion tables and ordinary E2EE rows therefore share one database owner and transaction boundary. The oldest Frame is then renormalized through one transport-neutral compatibility preparation phase using ordinary no-recovery AsyncClient/Olm primitives: to-device first, timeline Megolm next, then device-list/key-count/fallback handling and room-state projection. It stores decrypted `clear_json`, stable event IDs, `RoomSnapshot`, aggregate/Work changes, and the authenticated preparation revision without running callbacks. On rollback after in-memory Olm mutation, the session is poisoned and reconstructed from the rolled-back database; retrying the same Olm object is forbidden.
+4. The prepared Frame is passed to the same pure reducer and materializer for both transports. Every `RecordKind`, including `TO_DEVICE`, and every loss becomes one-record Work with a stable `record_id`; device-list/OTK/fallback controls complete before preparation is marked. A retained Frame is transient retry or frame-completion state, never a successful steady-state fate. The Frame remains until all of its Work is receipted/acknowledged and its completion callback claim is settled; empty Frames follow the same completion path.
 5. `next_batch()` retains the existing deterministic FIFO selection and compact outstanding descriptor.
-6. MindRoom admits its batch receipt and application/event-journal effects in one transaction.
-7. nio acknowledges only after MindRoom returns admitted or exact duplicate; ack advances the frontier and deletes the acknowledged Work atomically.
-8. Compatibility adapters emit existing response values and callbacks with their existing ordering.
+6. MindRoom admits every record receipt and its applicable event-journal, lifecycle, loss, projection, and frontier effects in one transaction. It returns separate `receipt_new` and `semantic_event_new` facts; a batch need not contain a Matrix event.
+7. Outside both databases, the nio compatibility applier reapplies idempotent room/client state and publishes a record callback only when the receipt is new; semantic timeline/lifecycle dispatch is additionally gated by `semantic_event_new`. Those callbacks are best-effort/at-most-once across process death, matching the existing MindRoom wrappers, and never run inside a transaction.
+8. nio acknowledges only after MindRoom accepts the receipt and callback fanout returns. Ack advances the frontier and deletes Work atomically. When a Frame has no Work left, nio durably claims its one response/completion callback before fanout and then retires it. `AsyncClient.rooms` is restored from persisted `RoomSnapshot` values before incremental delivery.
+
+The coordinator expresses that lifecycle as one private progress state machine, not as a second fate engine:
+
+```text
+PREPARE -> HYDRATE_IF_REQUIRED -> WAIT_FOR_RECORD_ACK
+        -> CLAIM_AND_FANOUT_COMPLETION -> RETIRE -> NEXT_SOURCE_HTTP
+```
+
+`WAIT_FOR_RECORD_ACK` yields to and is woken by the MindRoom pump; a retained prepared Frame is not `BLOCKED`. Hydration may issue its bounded room-state HTTP before record delivery, but the next source-sync HTTP cannot start until the prior Frame's Work, completion claim, and retirement settle. Only malformed/authentication/conflict states are terminal `BLOCKED`. Close/cancellation wakes both sides and leaves the durable Frame/Work replayable.
 
 ### Crash behavior
 
 - Before response/cursor commit: neither advances.
 - After response/cursor commit: the Frame is durable and replays.
 - Before Frame materialization commit: the Frame remains.
-- After materialization commit: Work is durable and the Frame is retired.
+- After preparation/materialization commit: Work and room/crypto state are durable and the Frame remains as the completion owner.
 - Before MindRoom admission commit: the same batch replays.
 - After MindRoom commit but before nio ack: the same batch receipt returns duplicate, then nio acks.
-- A conflicting digest for the same durable identity is an integrity error and advances no frontier.
+- A conflicting digest or retained Matrix-event identity is an integrity error and advances no frontier.
+- A crash during compatibility preparation rolls back its database writes, poisons the mutated client session, and reopens from durable state before replay.
+- A crash after a record receipt but before its best-effort callback can lose that auxiliary callback; claiming after fanout would instead duplicate arbitrary external side effects. Semantic MindRoom application dispatch remains exactly once through the event journal and record receipt.
 
 ## Sliding restart and unknown positions
 
@@ -103,7 +117,7 @@ Old durable Frames and Work drain through the shared path. Normal Sliding respon
 
 ## MindRoom semantic idempotency
 
-The existing batch receipt remains authoritative for exact replay of `(consumer generation, stream, sequence, batch digest)`.
+The existing batch receipt remains authoritative for exact replay of `(consumer generation, stream, sequence, batch digest)`. The receipt schema in the unmerged MindRoom feature branch is corrected in this linked PR: replace its mandatory `event_id` foreign key with a nonempty `record_id`. Every one-record batch has that identity, while semantic Matrix identity remains independently owned by `journal_events`. This changes no deployed schema and adds no table or migration.
 
 Sliding can legitimately redeliver the same Matrix event after a cold connection restart under a different nio batch. MindRoom therefore also applies the semantic identity already present in its event journal, in the same admission transaction:
 
@@ -113,18 +127,27 @@ Sliding can legitimately redeliver the same Matrix event after a cold connection
 - same key and matching headers: advance/record the new batch receipt but do not dispatch another application turn;
 - same key and conflicting retained header: integrity error and full rollback.
 
-The Matrix event ID remains the semantic content identity, as it already is on main; this design does not retain raw settled source merely to recompute a second digest. nio does not gain a second event-receipt or occurrence ledger, and MindRoom gains no new table or migration for this behavior.
+The Matrix event ID remains the semantic content identity, as it already is on main; this design does not retain raw settled source merely to recompute a second digest. nio does not gain a second event-receipt or occurrence ledger, and MindRoom gains no new table or deployed migration for this behavior.
+
+### Complete record fates
+
+- decrypted LIVE/HISTORY `TIMELINE` records use the existing MindRoom event classifier; actionable events dispatch once and context events settle without a turn;
+- `ROOM_LIFECYCLE` records use the existing membership/departure fencing transaction and own a batch receipt without fabricating a journal event;
+- `LossRecord` values update the existing room-history-recovery obligation and own a batch receipt without fabricating an event;
+- `STATE`, `EPHEMERAL`, `ROOM_ACCOUNT_DATA`, `GLOBAL_ACCOUNT_DATA`, `PRESENCE`, and `TO_DEVICE` records receive ordinary batch receipts, are applied by the compatibility owner to ordinary room/crypto state and corresponding registered callbacks, then settle without application dispatch;
+- encrypted timeline inputs are decrypted before Work creation; an undecryptable event becomes the existing explicit decryption-failure application outcome rather than disappearing or retaining the Frame forever;
+- malformed or unknown normalized input fails closed before Work publication while its Frame remains durable; no known `RecordKind` is allowed to become a permanently unacknowledgeable FIFO head.
 
 ## Activation and deletion sequence
 
 1. **Prune now:** revert schema-v2 and all canary-specific production/test code in both repositories, including nio's schema-v1 diagnostic materializer/one-room coordinator and MindRoom's latch/env/one-room exact-wheel runner; remove historical implementation plans and in-repo benchmark/canary scaffolding that are not release artifacts.
 2. **Implement:** complete the minimal Sliding reset, shared materialization, transport selection, and MindRoom semantic-idempotency kernels.
 3. **Verify:** differential parity, crash matrices, public API/callback tests, and external Classic/Sliding canaries.
-4. **Restore and observe both consumers:** opt MindRoom into the durable path and run desktop unchanged on the restored upstream-style `sync_forever()` path. Observe both with external coverage of fork-recovery modules.
-5. **Delete legacy recovery:** only after MindRoom completes 24 continuous hours with at least 1,000 successful polls and three process restarts, and desktop completes a two-hour/100-response soak with a restart and a real to-device callback; both must show zero fork-recovery execution, zero duplicate visible effects, zero unexplained loss, and no permanently growing backlog. Keep the upstream public API and repeat desktop regression/smoke coverage after deletion.
+4. **Restore and observe both consumers:** make the durable runner the candidate's sole MindRoom sync engine; the existing `matrix_sync.mode` selects only Classic or Sliding transport. Deploy that candidate to the observation cohort and run desktop unchanged on the restored upstream-style `sync_forever()` path. Observe both with external coverage of fork-recovery modules. There is no canary-agent environment switch, new YAML field, or second sync-engine opt-in.
+5. **Delete legacy recovery:** only after MindRoom completes one uninterrupted 24-hour observation interval spanning at least 1,000 successful polls and three recorded process restarts, and desktop completes a two-hour/100-response soak with a restart and a real to-device callback; both must show zero fork-recovery execution, zero duplicate visible effects, zero unexplained loss, and no permanently growing backlog. Keep the upstream public API and repeat desktop regression/smoke coverage after deletion.
 6. **Final review:** run complete verification and report exact line budgets and remaining compatibility surface before the linked PRs are proposed for merge.
 
-If observation fails, fix or retain the legacy implementation in this PR; do not delete on forecasted confidence.
+If observation fails, fix the durable path or restore Task 6's old-engine connections inside these linked branches before rerunning verification. The candidate has no hidden runtime fallback, and legacy source deletion is never based on forecasted confidence.
 
 ## Assurance
 
@@ -132,9 +155,11 @@ Required tests:
 
 - exact schema-v1 topology and explicit absence of all diagnostic tables/types/configuration;
 - shared reducer/materializer parity fixtures for Classic and Sliding;
+- frame-scope compatibility parity against the pre-fork AsyncClient response applier, including replay after every MatrixStore write, encrypted timelines, to-device data, device lists, OTK/fallback state, and auxiliary callback ordering;
 - atomic response/cursor and Frame/Work crash boundaries;
 - Sliding reopen and positioned-unknown-pos preservation/fencing;
 - exact batch replay and cross-batch same-event semantic idempotency using the existing journal identity;
+- an explicit receipt/application disposition for every `RecordKind` and `LossRecord`, with no retained Frame or Work backlog after successful ordinary responses;
 - conflicting retained-identity rollback;
 - public method signatures, response values, callback order, callback re-entry, and desktop to-device behavior against the upstream-style implementation;
 - ordinary-room live canaries using released wheels and normal journal/frontier/application outcomes;
@@ -152,9 +177,9 @@ Measured against `origin/main` at `6ed2b9817d2bc9de30dc72942f9cb867d829283b`:
 
 These limits are fixed once. They are not rebound after work lands.
 
-MindRoom is measured from the post-prune `0acaea2ba` boundary: runtime at most **+350** net lines and tests at most **+1,000** net lines. The final candidate must also be net smaller than canary commit `925df7f3c`, which added 271 runtime and 2,580 test lines over that boundary.
+MindRoom is measured from the post-prune `0acaea2ba` boundary: runtime at most **+350** net lines and tests at most **+1,000** net lines. The final candidate must also be net smaller than canary commit `925df7f3c`, whose measured net delta over that boundary is +268 runtime and +2,579 tests.
 
-The post-prune baseline is approximately +8,807 runtime, +33,834 tests, and +4,867 docs/scripts. The measured fork-legacy production deletion pool is about 5,572 lines. Meeting the budget therefore requires real deletion and test consolidation, not credit for planned future work.
+The fixed post-prune baseline at `679e949` is +8,807 runtime, +32,098 tests, and +523 docs/scripts. The measured fork-legacy production deletion pool is about 5,572 lines. Meeting the budget therefore requires real deletion and test consolidation, not credit for planned future work.
 
 Any new persistent table, production module, public option, or transport-specific fate engine requires a parity-critical live producer and consumer plus an explicit design amendment. Canary evidence alone is not justification.
 
@@ -163,7 +188,7 @@ Any new persistent table, production module, public option, or transport-specifi
 - No schema v2 or v1-to-v2 migration.
 - No diagnostic scope, control room, `probe` list, occurrence/receipt/rotation ledger, or canary-specific materializer.
 - No new Matrix feature, protocol dialect, current-MSC4186 conformance claim, UI, YAML field, or default enablement.
-- No removal or semantic change of the upstream-style sync and callback surface.
+- No removal or semantic change of the true pre-fork sync and callback surface; fork-added AsyncClient Sliding and recovery APIs are not part of it.
 - No generalized nio event-dedup database.
 - No deletion of fork recovery before MindRoom activation plus observation; no migration of desktop to the durable batch engine.
 - No merge, release, or cutover claim from a canary alone.
