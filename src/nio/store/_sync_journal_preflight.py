@@ -16,7 +16,7 @@ from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..exceptions import LocalProtocolError
-from ..ingest._json import load_internal_json, load_json
+from ..ingest._json import load_internal_json
 from ..ingest.config import (
     ClassicSourceConfig,
     SlidingSourceConfig,
@@ -62,7 +62,6 @@ _E2EE_TABLES = frozenset(
         "storeversion",
     }
 )
-MAX_ROOM_AGGREGATES = 20_000
 
 
 def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
@@ -241,21 +240,6 @@ def _validate_diagnostic_scope_input(
         raise LocalProtocolError("diagnostic scope account_id does not match")
     if type(source) is not SlidingSourceConfig:
         raise AssertionError("sliding transport requires SlidingSourceConfig")
-    if scope is not None:
-        lists = load_json(source.lists_json, "lists_json")
-        probe = lists.get("probe") if type(lists) is dict else None
-        ranges = probe.get("ranges") if type(probe) is dict else None
-        if (
-            type(ranges) is not list
-            or len(ranges) != 1
-            or type(ranges[0]) is not list
-            or len(ranges[0]) != 2
-            or any(type(bound) is not int for bound in ranges[0])
-            or ranges[0] != [0, 0]
-        ):
-            raise LocalProtocolError(
-                "diagnostic Sliding source requires probe ranges [[0,0]]"
-            )
     if (
         scope is not None
         and scope.request_config_sha256 != sliding_request_config_sha256(source)
@@ -457,28 +441,6 @@ def _create_fresh(
     return stream_id, source_state
 
 
-def _authenticate_room_aggregate_inventory(
-    connection: SqliteDatabase,
-    authenticated: Any,
-    owner: OwnerView,
-) -> None:
-    rows = connection.execute_sql(
-        "SELECT account_id, room_id FROM NioIngestRoomAggregate LIMIT ?",
-        (MAX_ROOM_AGGREGATES + 1,),
-    ).fetchall()
-    for aggregate_account_id, room_id in rows:
-        if (
-            aggregate_account_id != owner.account_id
-            or type(room_id) is not str
-            or not room_id
-        ):
-            raise JournalIntegrityError("room Aggregate identity is invalid")
-        if authenticated._load_room_aggregate(owner, room_id) is None:
-            raise JournalIntegrityError("room Aggregate disappeared during preflight")
-    if len(rows) > MAX_ROOM_AGGREGATES:
-        raise JournalIntegrityError("room Aggregate inventory exceeds its cap")
-
-
 def _inspect_existing(
     connection: SqliteDatabase,
     account_id: str,
@@ -615,11 +577,22 @@ def _inspect_existing(
         raise JournalIntegrityError("preflight owner/source snapshot changed")
     authenticated.list_frames(256)
     authenticated._load_task3_work_inventory(owner)
-    _authenticate_room_aggregate_inventory(connection, authenticated, owner)
+    aggregate_rows = connection.execute_sql(
+        "SELECT account_id, room_id FROM NioIngestRoomAggregate LIMIT 20001"
+    ).fetchall()
+    if len(aggregate_rows) > 20_000:
+        raise JournalIntegrityError("room Aggregate inventory exceeds its cap")
+    for aggregate_account_id, room_id in aggregate_rows:
+        if (
+            aggregate_account_id != account_id
+            or type(room_id) is not str
+            or not room_id
+        ):
+            raise JournalIntegrityError("room Aggregate identity is invalid")
+        if authenticated._load_room_aggregate(owner, room_id) is None:
+            raise JournalIntegrityError("room Aggregate disappeared during preflight")
     stored_scope = authenticated._load_diagnostic_scope(owner)
     authenticated._load_diagnostic_inventory(owner)
-    if connection.execute_sql("PRAGMA foreign_key_check").fetchone() is not None:
-        raise JournalIntegrityError("ingestion foreign key inventory is invalid")
     if stored_scope != diagnostic_scope:
         raise LocalProtocolError("persisted diagnostic scope does not match")
     return stream_id, row["writer_epoch"]

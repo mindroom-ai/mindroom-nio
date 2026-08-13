@@ -342,18 +342,19 @@ async def test_sliding_session_requires_exact_persisted_scope_before_claim(
     from dataclasses import replace
 
     from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import sliding_request_config_sha256
+    from nio.ingest.sliding import (
+        RESERVED_ALL_ROOMS_LIST,
+        sliding_request_config_sha256,
+    )
 
     generation = uuid4()
-    source = SlidingSourceConfig(
-        30_000, "diag", b'{"probe":{"ranges":[[0,0]]}}', b"{}", b"{}"
-    )
+    source = SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}")
     config = IngestionConfig(source)
     scope = DiagnosticIngestionScope(
         ACCOUNT,
         ROOM,
         "!control:example.org",
-        "probe",
+        RESERVED_ALL_ROOMS_LIST,
         0,
         0,
         sliding_request_config_sha256(source),
@@ -376,9 +377,7 @@ async def test_sliding_session_requires_exact_persisted_scope_before_claim(
             consumer_generation=generation,
             stream_id=bootstrap.stream_id,
             room_id=ROOM,
-            diagnostic_scope=replace(
-                scope, control_room_id="!changed-control:example.org"
-            ),
+            diagnostic_scope=replace(scope, list_name="changed"),
         )
 
     with pytest.raises(LocalProtocolError, match="room_id.*diagnostic scope"):
@@ -1722,19 +1721,18 @@ async def test_sliding_reset_required_is_terminal_without_state_change(
     tmp_path,
 ) -> None:
     generation = uuid4()
-    config = IngestionConfig(
-        SlidingSourceConfig(
-            30_000, "diag", b'{"probe":{"ranges":[[0,0]]}}', b"{}", b"{}"
-        )
-    )
+    config = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
     from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import sliding_request_config_sha256
+    from nio.ingest.sliding import (
+        RESERVED_ALL_ROOMS_LIST,
+        sliding_request_config_sha256,
+    )
 
     scope = DiagnosticIngestionScope(
         ACCOUNT,
         ROOM,
         "!control:example.org",
-        "probe",
+        RESERVED_ALL_ROOMS_LIST,
         0,
         0,
         sliding_request_config_sha256(config.source),
@@ -1904,19 +1902,18 @@ def test_open_ingestion_requires_exact_nonempty_room_id(
 @pytest.mark.asyncio
 async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> None:
     generation = uuid4()
-    config = IngestionConfig(
-        SlidingSourceConfig(
-            30_000, "diag", b'{"probe":{"ranges":[[0,0]]}}', b"{}", b"{}"
-        )
-    )
+    config = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
     from nio.ingest.diagnostic import DiagnosticIngestionScope
-    from nio.ingest.sliding import sliding_request_config_sha256
+    from nio.ingest.sliding import (
+        RESERVED_ALL_ROOMS_LIST,
+        sliding_request_config_sha256,
+    )
 
     scope = DiagnosticIngestionScope(
         ACCOUNT,
         ROOM,
         "!control:example.org",
-        "probe",
+        RESERVED_ALL_ROOMS_LIST,
         0,
         0,
         sliding_request_config_sha256(config.source),

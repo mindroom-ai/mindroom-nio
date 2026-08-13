@@ -34,7 +34,6 @@ from nio.exceptions import LocalProtocolError
 from nio.ingest import source
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
-from nio.ingest.diagnostic import DiagnosticIngestionScope
 from nio.ingest.errors import (
     FreshIngestionRequired,
     JournalConflictError,
@@ -4880,10 +4879,6 @@ _DISCOVERY_SLIDING = SlidingSourceConfig(
     b"{}",
     2,
 )
-_DIAGNOSTIC_SLIDING = replace(
-    _DISCOVERY_SLIDING,
-    lists_json=b'{"probe":{"ranges":[[0,0]]}}',
-)
 
 
 def _discovery_config(
@@ -4892,20 +4887,6 @@ def _discovery_config(
     if transport is TransportKind.CLASSIC:
         return _DISCOVERY_CLASSIC
     return _DISCOVERY_SLIDING
-
-
-def _discovery_scope() -> DiagnosticIngestionScope:
-    from nio.ingest.sliding import sliding_request_config_sha256
-
-    return DiagnosticIngestionScope(
-        _DISCOVERY_ACCOUNT_ID,
-        "!delivery:example.org",
-        "!control:example.org",
-        "probe",
-        0,
-        0,
-        sliding_request_config_sha256(_DIAGNOSTIC_SLIDING),
-    )
 
 
 def _discovery_adapter(
@@ -5150,20 +5131,17 @@ def _open_discovery_journal(
     statements: list[str] | None = None,
     sqlite_busy_timeout_ms: int = 2_000,
     account_id: str = _DISCOVERY_ACCOUNT_ID,
-    diagnostic_scope: DiagnosticIngestionScope | None = None,
-    source: ClassicSourceConfig | SlidingSourceConfig | None = None,
 ):
     return open_ingestion_store(
         store_path,
         account_id=account_id,
         device_id=_DISCOVERY_DEVICE_ID,
         consumer_generation=_CONSUMER_GENERATION,
-        source=source or _discovery_config(transport),
+        source=_discovery_config(transport),
         pickle_key="discovery-secret",
         database_name="discovery.db",
         sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
         statement_observer=statements.append if statements is not None else None,
-        diagnostic_scope=diagnostic_scope,
     )
 
 
@@ -5194,70 +5172,13 @@ def test_classic_v2_store_has_no_diagnostic_scope(tmp_path: Path) -> None:
                 _DISCOVERY_ACCOUNT_ID,
                 "!delivery:example.org",
                 "!control:example.org",
-                "probe",
+                RESERVED_ALL_ROOMS_LIST,
                 0,
                 0,
                 bytes(32),
             ),
         )
     assert not rejected.exists()
-
-
-def test_sliding_materializer_entrypoints_enforce_persisted_scope_without_dml(
-    tmp_path: Path,
-) -> None:
-    statements: list[str] = []
-
-    source_only = _open_discovery_journal(
-        tmp_path / "source-only",
-        TransportKind.SLIDING,
-        statements=statements,
-    )
-    statements.clear()
-    with pytest.raises(LocalProtocolError, match="diagnostic scope"):
-        source_only._journal.materialize_oldest_diagnostic_frame(
-            room_id="!delivery:example.org"
-        )
-    assert not [
-        sql
-        for sql in statements
-        if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
-    ]
-    assert (
-        source_only._journal.materialize_oldest_frame(
-            limits=MaterializerLimits()
-        ).status
-        is MaterializeStatus.IDLE
-    )
-    source_only.close()
-
-    scope = _discovery_scope()
-    scoped = _open_discovery_journal(
-        tmp_path / "scoped",
-        TransportKind.SLIDING,
-        statements=statements,
-        diagnostic_scope=scope,
-        source=_DIAGNOSTIC_SLIDING,
-    )
-    statements.clear()
-    with pytest.raises(LocalProtocolError, match="delivery room"):
-        scoped._journal.materialize_oldest_diagnostic_frame(
-            room_id="!wrong:example.org"
-        )
-    with pytest.raises(LocalProtocolError, match="diagnostic scope"):
-        scoped._journal.materialize_oldest_frame(limits=MaterializerLimits())
-    assert not [
-        sql
-        for sql in statements
-        if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
-    ]
-    assert (
-        scoped._journal.materialize_oldest_diagnostic_frame(
-            room_id=scope.delivery_room_id
-        ).status
-        is MaterializeStatus.IDLE
-    )
-    scoped.close()
 
 
 def _stage_discovery_frame(

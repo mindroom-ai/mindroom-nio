@@ -9,7 +9,6 @@ from ..ingest._json import load_internal_json
 from ..ingest.diagnostic import DiagnosticIngestionScope
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import TransportKind
-from ..ingest.source import _require_matrix_room_id
 from ..ingest.state import OwnerView
 from ._sync_journal_preflight import _row
 from ._sync_journal_rows import _canonical_internal
@@ -47,36 +46,6 @@ def _revision(value: object, owner: OwnerView, field_name: str) -> int:
     if type(value) is not int or not 1 <= value <= owner.revision:
         raise ValueError(f"{field_name} is outside the authenticated revision")
     return value
-
-
-def _positive_revision(value: object, field_name: str) -> int:
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{field_name} must be a positive int")
-    return value
-
-
-def _nonnegative(value: object, field_name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{field_name} must be a nonnegative int")
-    return value
-
-
-def _exact_uuid(value: object, field_name: str) -> UUID:
-    if type(value) is not UUID:
-        raise TypeError(f"{field_name} must be UUID")
-    return value
-
-
-def _nonempty(value: object, field_name: str) -> str:
-    if type(value) is not str or not value:
-        raise TypeError(f"{field_name} must be a nonempty str")
-    return value
-
-
-def _payload_json(value: object, field_name: str) -> bytes:
-    if type(value) is not bytes:
-        raise TypeError(f"{field_name} must be bytes")
-    return _canonical_value(value, field_name)
 
 
 def _canonical_value(payload: bytes, label: str) -> bytes:
@@ -142,22 +111,6 @@ class ListObservationValue:
     created_revision: int
     payload_json: bytes
 
-    def __post_init__(self) -> None:
-        _exact_uuid(self.observation_id, "observation_id")
-        _exact_uuid(self.frame_id, "frame_id")
-        _nonnegative(self.source_epoch, "source_epoch")
-        _nonnegative(self.request_id, "request_id")
-        if self.list_name != "probe":
-            raise ValueError("list_name must be probe")
-        if self.transition not in ("seed", "enter", "evict", "reenter", "replace"):
-            raise ValueError("transition is invalid")
-        if type(self.target_present) is not bool:
-            raise TypeError("target_present must be bool")
-        if type(self.control_present) is not bool:
-            raise TypeError("control_present must be bool")
-        _positive_revision(self.created_revision, "created_revision")
-        _payload_json(self.payload_json, "list observation payload")
-
 
 @dataclass(frozen=True, slots=True)
 class EventReceiptValue:
@@ -178,54 +131,6 @@ class EventReceiptValue:
     updated_revision: int
     payload_json: bytes
 
-    def __post_init__(self) -> None:
-        _exact_uuid(self.receipt_id, "receipt_id")
-        _require_matrix_room_id(self.room_id, "room_id")
-        _nonempty(self.event_id, "event_id")
-        _digest(self.stable_event_sha256, "stable_event_sha256")
-        _exact_uuid(self.first_frame_id, "first_frame_id")
-        _digest(self.first_source_sha256, "first_source_sha256")
-        if self.work_id is not None:
-            _exact_uuid(self.work_id, "work_id")
-        if self.fate not in (
-            "context",
-            "control",
-            "self_control",
-            "ready",
-            "outstanding",
-            "acknowledged",
-        ):
-            raise ValueError("fate is invalid")
-        created = _positive_revision(self.created_revision, "created_revision")
-        updated = _positive_revision(self.updated_revision, "updated_revision")
-        if updated < created:
-            raise ValueError("updated_revision must not precede created_revision")
-        delivery = (
-            self.delivery_sequence,
-            self.delivery_batch_sha256,
-            self.acknowledged_revision,
-        )
-        if self.fate in ("context", "control", "self_control"):
-            if self.work_id is not None or any(value is not None for value in delivery):
-                raise ValueError("non-Work receipt fate cannot bind Work or delivery")
-        elif self.fate == "ready":
-            if self.work_id is None or any(value is not None for value in delivery):
-                raise ValueError("ready receipt requires only Work identity")
-        else:
-            if self.work_id is None:
-                raise ValueError("delivered receipt requires Work identity")
-            _nonnegative(self.delivery_sequence, "delivery_sequence")
-            _digest(self.delivery_batch_sha256, "delivery_batch_sha256")
-            if self.fate == "outstanding":
-                if self.acknowledged_revision is not None:
-                    raise ValueError("outstanding receipt cannot be acknowledged")
-            elif (
-                _positive_revision(self.acknowledged_revision, "acknowledged_revision")
-                != updated
-            ):
-                raise ValueError("acknowledged_revision must equal updated_revision")
-        _payload_json(self.payload_json, "event receipt payload")
-
 
 @dataclass(frozen=True, slots=True)
 class EventOccurrenceValue:
@@ -241,26 +146,6 @@ class EventOccurrenceValue:
     ]
     created_revision: int
     payload_json: bytes
-
-    def __post_init__(self) -> None:
-        _exact_uuid(self.occurrence_id, "occurrence_id")
-        _exact_uuid(self.receipt_id, "receipt_id")
-        _exact_uuid(self.frame_id, "frame_id")
-        _nonnegative(self.source_epoch, "source_epoch")
-        _nonnegative(self.request_id, "request_id")
-        _digest(self.source_sha256, "source_sha256")
-        if self.provenance not in ("live", "history"):
-            raise ValueError("provenance is invalid")
-        if self.disposition not in (
-            "application",
-            "context",
-            "control",
-            "self_control",
-            "duplicate",
-        ):
-            raise ValueError("disposition is invalid")
-        _positive_revision(self.created_revision, "created_revision")
-        _payload_json(self.payload_json, "event occurrence payload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,185 +166,6 @@ class SourceRotationValue:
     first_successor_source_sha256: bytes | None
     created_revision: int
     payload_json: bytes
-
-    def __post_init__(self) -> None:
-        successor_epoch = _nonnegative(
-            self.successor_source_epoch, "successor_source_epoch"
-        )
-        if successor_epoch < 1:
-            raise ValueError("successor_source_epoch must be positive")
-        if type(self.successor_request_id) is not int or self.successor_request_id != 0:
-            raise ValueError("successor_request_id must be exactly 0")
-        if self.reason not in ("reopen", "unknown_pos"):
-            raise ValueError("reason is invalid")
-        predecessor_epoch = _nonnegative(
-            self.predecessor_source_epoch, "predecessor_source_epoch"
-        )
-        if predecessor_epoch >= successor_epoch:
-            raise ValueError("predecessor_source_epoch must precede successor")
-        _nonnegative(self.predecessor_request_id, "predecessor_request_id")
-        _digest(self.predecessor_cursor_sha256, "predecessor_cursor_sha256")
-        _digest(self.predecessor_connection_sha256, "predecessor_connection_sha256")
-        if type(self.predecessor_pos_present) is not bool:
-            raise TypeError("predecessor_pos_present must be bool")
-        _digest(self.successor_cursor_sha256, "successor_cursor_sha256")
-        _digest(self.successor_connection_sha256, "successor_connection_sha256")
-        if type(self.successor_pos_present) is not bool:
-            raise TypeError("successor_pos_present must be bool")
-        if self.successor_pos_present:
-            raise ValueError("successor_pos_present must be false")
-        bindings = (
-            self.first_successor_request_sha256,
-            self.first_successor_frame_id,
-            self.first_successor_source_sha256,
-        )
-        if not (
-            all(value is None for value in bindings)
-            or all(value is not None for value in bindings)
-        ):
-            raise ValueError("first successor bindings must be all-null or all-present")
-        if self.first_successor_request_sha256 is not None:
-            _digest(
-                self.first_successor_request_sha256,
-                "first_successor_request_sha256",
-            )
-            _exact_uuid(self.first_successor_frame_id, "first_successor_frame_id")
-            _digest(
-                self.first_successor_source_sha256,
-                "first_successor_source_sha256",
-            )
-        _positive_revision(self.created_revision, "created_revision")
-        _payload_json(self.payload_json, "source rotation payload")
-
-
-def _owner_tuple(
-    owner: OwnerView | tuple[str, UUID, TransportKind],
-) -> tuple[str, UUID, TransportKind]:
-    if isinstance(owner, OwnerView):
-        return owner.account_id, owner.stream_id, owner.transport_kind
-    return owner
-
-
-def list_observation_row(
-    owner: OwnerView | tuple[str, UUID, TransportKind],
-    value: ListObservationValue,
-) -> tuple[bytes, bytes]:
-    if type(value) is not ListObservationValue:
-        raise TypeError("value must be ListObservationValue")
-    return _row(
-        _owner_tuple(owner),
-        "NioIngestListObservation",
-        value.payload_json,
-        header=(
-            str(value.observation_id),
-            str(value.frame_id),
-            value.source_epoch,
-            value.request_id,
-            value.list_name,
-            value.transition,
-            value.target_present,
-            value.control_present,
-            value.created_revision,
-        ),
-    )
-
-
-def event_receipt_row(
-    owner: OwnerView | tuple[str, UUID, TransportKind],
-    value: EventReceiptValue,
-) -> tuple[bytes, bytes]:
-    if type(value) is not EventReceiptValue:
-        raise TypeError("value must be EventReceiptValue")
-    return _row(
-        _owner_tuple(owner),
-        "NioIngestEventReceipt",
-        value.payload_json,
-        header=(
-            str(value.receipt_id),
-            value.room_id,
-            value.event_id,
-            _b64(value.stable_event_sha256),
-            str(value.first_frame_id),
-            _b64(value.first_source_sha256),
-            None if value.work_id is None else str(value.work_id),
-            value.fate,
-            value.delivery_sequence,
-            (
-                None
-                if value.delivery_batch_sha256 is None
-                else _b64(value.delivery_batch_sha256)
-            ),
-            value.acknowledged_revision,
-            value.created_revision,
-            value.updated_revision,
-        ),
-    )
-
-
-def event_occurrence_row(
-    owner: OwnerView | tuple[str, UUID, TransportKind],
-    value: EventOccurrenceValue,
-) -> tuple[bytes, bytes]:
-    if type(value) is not EventOccurrenceValue:
-        raise TypeError("value must be EventOccurrenceValue")
-    return _row(
-        _owner_tuple(owner),
-        "NioIngestEventOccurrence",
-        value.payload_json,
-        header=(
-            str(value.occurrence_id),
-            str(value.receipt_id),
-            str(value.frame_id),
-            value.source_epoch,
-            value.request_id,
-            _b64(value.source_sha256),
-            value.provenance,
-            value.disposition,
-            value.created_revision,
-        ),
-    )
-
-
-def source_rotation_row(
-    owner: OwnerView | tuple[str, UUID, TransportKind],
-    value: SourceRotationValue,
-) -> tuple[bytes, bytes]:
-    if type(value) is not SourceRotationValue:
-        raise TypeError("value must be SourceRotationValue")
-    return _row(
-        _owner_tuple(owner),
-        "NioIngestSourceRotation",
-        value.payload_json,
-        header=(
-            value.successor_source_epoch,
-            value.successor_request_id,
-            value.reason,
-            value.predecessor_source_epoch,
-            value.predecessor_request_id,
-            _b64(value.predecessor_cursor_sha256),
-            _b64(value.predecessor_connection_sha256),
-            value.predecessor_pos_present,
-            _b64(value.successor_cursor_sha256),
-            _b64(value.successor_connection_sha256),
-            value.successor_pos_present,
-            (
-                None
-                if value.first_successor_request_sha256 is None
-                else _b64(value.first_successor_request_sha256)
-            ),
-            (
-                None
-                if value.first_successor_frame_id is None
-                else str(value.first_successor_frame_id)
-            ),
-            (
-                None
-                if value.first_successor_source_sha256 is None
-                else _b64(value.first_successor_source_sha256)
-            ),
-            value.created_revision,
-        ),
-    )
 
 
 class DiagnosticInventory(NamedTuple):
@@ -540,6 +246,8 @@ class DiagnosticJournalRows:
             "SELECT * FROM NioIngestListObservation " "ORDER BY observation_id LIMIT ?",
             (MAX_LIST_OBSERVATIONS + 1,),
         ).fetchall()
+        if len(rows) > MAX_LIST_OBSERVATIONS:
+            raise JournalIntegrityError("list observation inventory exceeds its cap")
         values: list[ListObservationValue] = []
         for row in rows:
             try:
@@ -605,8 +313,6 @@ class DiagnosticJournalRows:
                 raise JournalIntegrityError(
                     "persisted list observation is invalid"
                 ) from error
-        if len(rows) > MAX_LIST_OBSERVATIONS:
-            raise JournalIntegrityError("list observation inventory exceeds its cap")
         return tuple(values)
 
     def _load_event_receipts(self, owner: OwnerView) -> tuple[EventReceiptValue, ...]:
@@ -614,6 +320,8 @@ class DiagnosticJournalRows:
             "SELECT * FROM NioIngestEventReceipt ORDER BY receipt_id LIMIT ?",
             (MAX_EVENT_RECEIPTS + 1,),
         ).fetchall()
+        if len(rows) > MAX_EVENT_RECEIPTS:
+            raise JournalIntegrityError("event receipt inventory exceeds its cap")
         values: list[EventReceiptValue] = []
         for row in rows:
             try:
@@ -709,8 +417,6 @@ class DiagnosticJournalRows:
                 raise JournalIntegrityError(
                     "persisted event receipt is invalid"
                 ) from error
-        if len(rows) > MAX_EVENT_RECEIPTS:
-            raise JournalIntegrityError("event receipt inventory exceeds its cap")
         return tuple(values)
 
     def _load_event_occurrences(
@@ -720,6 +426,8 @@ class DiagnosticJournalRows:
             "SELECT * FROM NioIngestEventOccurrence ORDER BY occurrence_id LIMIT ?",
             (MAX_EVENT_OCCURRENCES + 1,),
         ).fetchall()
+        if len(rows) > MAX_EVENT_OCCURRENCES:
+            raise JournalIntegrityError("event occurrence inventory exceeds its cap")
         values: list[EventOccurrenceValue] = []
         for row in rows:
             try:
@@ -789,8 +497,6 @@ class DiagnosticJournalRows:
                 raise JournalIntegrityError(
                     "persisted event occurrence is invalid"
                 ) from error
-        if len(rows) > MAX_EVENT_OCCURRENCES:
-            raise JournalIntegrityError("event occurrence inventory exceeds its cap")
         return tuple(values)
 
     def _load_source_rotations(
@@ -801,6 +507,8 @@ class DiagnosticJournalRows:
             "ORDER BY successor_source_epoch, successor_request_id LIMIT ?",
             (MAX_SOURCE_ROTATIONS + 1,),
         ).fetchall()
+        if len(rows) > MAX_SOURCE_ROTATIONS:
+            raise JournalIntegrityError("source rotation inventory exceeds its cap")
         values: list[SourceRotationValue] = []
         for row in rows:
             try:
@@ -911,8 +619,6 @@ class DiagnosticJournalRows:
                 raise JournalIntegrityError(
                     "persisted source rotation is invalid"
                 ) from error
-        if len(rows) > MAX_SOURCE_ROTATIONS:
-            raise JournalIntegrityError("source rotation inventory exceeds its cap")
         return tuple(values)
 
     def _load_diagnostic_inventory(self, owner: OwnerView) -> DiagnosticInventory:
