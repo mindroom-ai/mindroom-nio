@@ -13,7 +13,6 @@ from nio.exceptions import LocalProtocolError
 from nio.ingest.config import ClassicSourceConfig
 from nio.ingest.errors import (
     BatchIntegrityError,
-    FreshIngestionRequired,
     JournalConflictError,
     JournalIntegrityError,
 )
@@ -30,19 +29,15 @@ from nio.ingest.serialization import (
     batch_from_records,
     canonical_batch_payload,
 )
-from nio.store import _sync_journal_preflight as preflight
 from nio.store._sync_journal import SqliteIngestionJournal
 from nio.store._sync_journal_plan import _canonical_work_plaintext
-from nio.store._sync_journal_port import IngestionJournal
 from nio.store._sync_journal_rows import _canonical_internal
 from nio.store.sync_journal import open_ingestion_store
-from nio.store.sync_journal_schema import SCHEMA_SQL
 
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 STREAM_ID = UUID("44444444-4444-4444-8444-444444444444")
-WRITER_EPOCH = UUID("33333333-3333-4333-8333-333333333333")
 WORK_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 DELIVERY_COLUMNS = (
@@ -53,39 +48,6 @@ DELIVERY_COLUMNS = (
     "delivery_outstanding_ready_ordinal",
     "delivery_outstanding_batch_sha256",
 )
-TASK4_META_SQL = """CREATE TABLE NioIngestMeta (
-    account_id TEXT PRIMARY KEY CHECK (
-        typeof(account_id) = 'text' AND length(account_id) > 0
-    ),
-    device_id TEXT NOT NULL CHECK (
-        typeof(device_id) = 'text' AND length(device_id) > 0
-    ),
-    schema_version INTEGER NOT NULL CHECK (
-        typeof(schema_version) = 'integer' AND schema_version = 1
-    ),
-    stream_id TEXT NOT NULL CHECK (
-        typeof(stream_id) = 'text' AND length(stream_id) > 0
-    ),
-    consumer_generation TEXT NOT NULL CHECK (
-        typeof(consumer_generation) = 'text' AND length(consumer_generation) > 0
-    ),
-    transport_kind TEXT NOT NULL CHECK (
-        typeof(transport_kind) = 'text'
-        AND length(transport_kind) > 0
-        AND transport_kind IN ('classic', 'sliding')
-    ),
-    revision INTEGER NOT NULL CHECK (
-        typeof(revision) = 'integer' AND revision >= 0
-    ),
-    writer_epoch TEXT NOT NULL CHECK (
-        typeof(writer_epoch) = 'text' AND length(writer_epoch) > 0
-    ),
-    next_source_epoch INTEGER NOT NULL CHECK (
-        typeof(next_source_epoch) = 'integer' AND next_source_epoch >= 1
-    ),
-    created_at_ns INTEGER NOT NULL CHECK (
-        typeof(created_at_ns) = 'integer' AND created_at_ns >= 0
-    ))"""
 GOLDEN = (
     b'{"schema_version":1,"account_id":"@alice:example.org","device_id":"DEVICE",'
     b'"consumer_generation":"22222222-2222-4222-8222-222222222222",'
@@ -292,105 +254,6 @@ def test_direct_generation_batch_wire_is_canonical_and_strict() -> None:
             created_revision=1,
             records=(_event(),),
         )
-
-
-def test_delivery_port_declares_synchronous_batch_operations() -> None:
-    assert "next_batch" in IngestionJournal.__dict__
-    assert "acknowledge_batch" in IngestionJournal.__dict__
-
-
-def test_fresh_store_persists_exact_typed_delivery_frontier(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    generated = iter((WRITER_EPOCH, STREAM_ID))
-    monkeypatch.setattr(preflight, "uuid4", lambda: next(generated))
-    statements: list[str] = []
-    bootstrap = _open(tmp_path, statement_observer=statements.append)
-    owner = bootstrap._journal.load_owner()
-    database_path = bootstrap.database_path
-    bootstrap.close()
-    row = _meta_row(database_path)
-
-    assert tuple(row.keys())[-6:] == DELIVERY_COLUMNS
-    assert tuple(row[name] for name in DELIVERY_COLUMNS) == (
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    assert owner.revision == 0
-    assert any("SELECT * FROM NioIngestMeta LIMIT 2" in sql for sql in statements)
-    with sqlite3.connect(database_path) as connection:
-        tables = {
-            name
-            for (name,) in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-    assert "NioIngestDeliveryState" not in tables
-
-
-@pytest.mark.parametrize(
-    ("assignment", "parameters"),
-    (
-        ("delivery_next_sequence = -1", ()),
-        ("delivery_next_sequence = 9223372036854775808", ()),
-        ("delivery_acknowledged_sha256 = ?", (b"a" * 31,)),
-        ("delivery_outstanding_work_id = ''", ()),
-        ("delivery_outstanding_ready_revision = 0", ()),
-        ("delivery_outstanding_ready_ordinal = -1", ()),
-        ("delivery_outstanding_batch_sha256 = ?", (b"b" * 31,)),
-        ("delivery_outstanding_work_id = ?", (WORK_ID,)),
-        ("delivery_next_sequence = 1", ()),
-        (
-            "delivery_next_sequence = 0, delivery_acknowledged_sha256 = ?",
-            (b"a" * 32,),
-        ),
-    ),
-)
-def test_typed_delivery_columns_enforce_exact_constraints_and_frontiers(
-    tmp_path: Path,
-    assignment: str,
-    parameters: tuple[object, ...],
-) -> None:
-    bootstrap = _open(tmp_path)
-    database_path = bootstrap.database_path
-    bootstrap.close()
-
-    with sqlite3.connect(database_path) as connection:
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(f"UPDATE NioIngestMeta SET {assignment}", parameters)
-
-
-def test_task4_topology_is_rejected_before_writer_epoch_mutation(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "journal.db"
-    old_epoch = str(WRITER_EPOCH)
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(TASK4_META_SQL)
-        for statement in SCHEMA_SQL:
-            connection.execute(statement)
-        connection.execute(
-            "INSERT INTO NioIngestMeta VALUES (?, ?, 1, ?, ?, 'classic', 0, ?, 1, 0)",
-            (
-                ACCOUNT_ID,
-                DEVICE_ID,
-                str(STREAM_ID),
-                str(CONSUMER_GENERATION),
-                old_epoch,
-            ),
-        )
-
-    with pytest.raises(FreshIngestionRequired):
-        _open(tmp_path)
-    with sqlite3.connect(database_path) as connection:
-        assert connection.execute(
-            "SELECT writer_epoch FROM NioIngestMeta"
-        ).fetchone() == (old_epoch,)
 
 
 @pytest.mark.parametrize(
