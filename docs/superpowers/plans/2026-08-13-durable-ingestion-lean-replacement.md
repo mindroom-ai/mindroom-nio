@@ -252,6 +252,16 @@ identity, and exact receipt replay. Compare retained room/thread/kind/sender and
 origin timestamp; conflict rolls back event, projection, receipt, and frontier.
 Define literal transaction dispositions for event, lifecycle, history loss, and
 compatibility-only records, and prove concurrent admission dispatches once.
+Keep MindRoom's existing tenure epoch: a departure advances it; only a durably
+admitted `LOCAL` transition into join clears the fence without advancing, and
+process restart never re-arms a room by itself. Lifecycle input carries exact
+previous and current memberships and epochs; disagreement rolls back the whole
+admission.
+nio epoch numbers are relative transition proofs, not MindRoom's absolute
+counter. Lifecycle also names exact local/reported provenance. Only a `LOCAL`
+join re-arms MindRoom; a `REPORTED` join never changes its fence. While fenced,
+turn-backed/loss Work cannot recreate application state; a suppressed semantic
+event retains only its settled immutable identity so it cannot resurrect.
 
 **Commit:** `fix: deduplicate durable matrix events semantically`
 
@@ -265,17 +275,20 @@ expired-verification mutation; device-list/OTK/fallback handling; then key
 request collection. Callback fanout is a later, separate phase. A same-Frame
 room key must decrypt its later timeline event, and a same-response newly
 projected encrypted room/member plus device-list change must queue that member
-for key query. Produce stable event
-IDs, decrypted `clear_json` or explicit failure, `RoomSnapshot` values, and a
-fully authenticated retained-Frame inputs sufficient for Task 4F to reconstruct
-completion after it has a claimed revision. Do not create `_FrameCompletion` in
-this commit. Run no callbacks and expose no public Sliding response API.
+for key query. Preserve every own-membership transition in its source order,
+including multiple transitions in one Frame; preparation must not collapse
+them into only the final `RoomSnapshot` claim. Produce stable event IDs,
+decrypted `clear_json` or explicit failure, `RoomSnapshot` values, the ordered
+transition sequence, and fully authenticated retained-Frame inputs sufficient
+for Task 4F to reconstruct completion after it has a claimed revision. Do not
+create `_FrameCompletion` in this commit. Run no callbacks and expose no public
+Sliding response API.
 Ordinary public response callbacks remain solely on Desktop's pre-fork sync
 path.
 
 Create `tests/ingest/preparation_test.py` and cover equivalent Classic/Sliding
-output, both causal crypto-order cases above, explicit failure, and zero
-callbacks.
+output, both causal crypto-order cases above, a same-Frame multi-transition
+sequence, explicit failure, and zero callbacks.
 
 **Commit:** `refactor: prepare durable frames without callbacks`
 
@@ -299,6 +312,11 @@ poisons that session object, and requires clean reconstruction before replay.
 Prove literal fates for all record kinds, canonical plan/header authentication,
 identical body/transaction-ID replay, all statement crash boundaries,
 empty/nonempty Frame retention, and equal Classic/Sliding durable graphs.
+Emit every ordered membership transition rather than only its final claim;
+advance the tenure epoch only for a joined-to-nonjoined departure.
+Provide the same private durable transition path for MindRoom-local membership
+changes so queued Work and lifecycle fences share one order. Give each logical
+local transition one stable operation identity and make retries reuse it.
 
 **Commit:** `refactor: materialize all durable record kinds atomically`
 
@@ -372,8 +390,12 @@ references the Frame and outbound maintenance succeeds. Persist the claim
 before invoking the sink outside transactions. Sink raise, cancellation, or
 process death leaves the Frame durably claimed; restart retires it without a
 second invocation. Empty Frames use the same path. Hydration may run while the
-next source sync is fenced. Ack and close wake the runner without lost wakeups.
-Only malformed, authentication, or conflict states are terminal BLOCKED.
+next source sync is fenced. The same coordinator owns pending local membership
+intents: a stable local intent enters this progress machine before the Matrix
+operation, restart resumes it, and no source HTTP begins until its ordered
+lifecycle Work has been admitted, acknowledged, and the intent retired. Ack,
+local-intent publication, and close wake the runner without lost wakeups. Only
+malformed, authentication, or conflict states are terminal BLOCKED.
 
 Add causal tests for exact key upload/query/claim/to-device ordering; canonical
 Frame-owned bodies and deterministic to-device transaction IDs; response loss
@@ -394,7 +416,7 @@ restart retirement; and absence of `_FrameCompletion`,
 5C wires fresh and restored login through the non-exported
 `_open_owned_ingestion()` factory, exact per-device adoption/lease, client
 attachment using the authenticated SqliteStore runtime binding, session claim,
-and private completion sink before Olm initialization; poison rebuilds a new
+and private completion sink before Olm/source work; poison rebuilds a new
 client/Olm object. In the same 5C commit, replace Desktop pairing's raw
 read-only fallback with the internal live-bot controller-identity resolver
 before any bot can acquire the exclusive lease. 5D makes
@@ -413,6 +435,12 @@ made unreachable in 5C before exclusive ownership exists. Cover setup and
 confirm when the serving bot is
 or is not the target, target restart/replacement, and absence of any second
 MatrixStore/SQLite open under the exclusive lease.
+Local departure/rejoin awaits the private durable lifecycle path with `LOCAL`
+provenance; it does not mutate MindRoom outside nio's ordered Work FIFO.
+Persist or derive its durable desired-state intent before the Matrix operation,
+serialize it against source ingestion, and publish its Work before another
+source request may start. Restart reconciles an unfinished intent; ordinary
+startup never fabricates a new transition for an already-recorded membership.
 
 For password/SSO credentials, prove the temporary no-store/no-sync client's
 HTTP session closes on success, login error, owned-factory failure, and
