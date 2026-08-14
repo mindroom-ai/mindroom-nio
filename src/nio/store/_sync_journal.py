@@ -653,8 +653,8 @@ class SqliteIngestionJournal(JournalRows):
                 return None
             inventory = self._load_task3_work_inventory(owner)
             selected = sorted(
-                (cast("EventRecord", item.value) for item in inventory.work if item.status == "held" and type(item.value) is EventRecord and item.value.room_id == room_id and item.value.membership_epoch == value.continuity.membership_epoch),
-                key=lambda record: (cast("int", record.room_sequence), record.record_id),
+                (item for item in inventory.work if item.status == "held" and type(item.value) is EventRecord and item.value.room_id == room_id and item.value.membership_epoch == value.continuity.membership_epoch),
+                key=lambda item: (cast("int", cast("EventRecord", item.value).room_sequence), cast("EventRecord", item.value).record_id),
             )
             new_revision = owner.revision + 1
             successor = RoomAggregateValue(replace(value.continuity, baseline=ingest_reducer.MembershipBaseline(event_id, None), hydration_id=None), value.next_room_sequence, new_revision, None)
@@ -662,10 +662,12 @@ class SqliteIngestionJournal(JournalRows):
             aggregate_payload, aggregate_digest = self._payload(owner, "NioIngestRoomAggregate", aggregate_plaintext, header=_canonical_internal([room_id, new_revision, None]))
             storage = {row[1]: row for row in inventory.storage_rows}
             releases: list[tuple[str, int, bytes, bytes]] = []
-            for ordinal, record in enumerate(selected):
+            for ordinal, item in enumerate(selected):
+                record = cast("EventRecord", item.value)
                 row = storage[record.record_id]
                 clear = (*row[1:3], "ready", *row[4:8], new_revision, ordinal, row[10])
-                payload, digest = self._payload(owner, "NioIngestWork", _canonical_work_plaintext("event", record), header=_canonical_internal(clear))
+                plaintext = item.plaintext or _canonical_work_plaintext("event", record)
+                payload, digest = self._payload(owner, "NioIngestWork", plaintext, header=_canonical_internal(clear))
                 if len(payload) > 1024 * 1024:
                     raise ValueError("promoted Work exceeds immutable record capacity")
                 releases.append((record.record_id, ordinal, payload, digest))
@@ -848,6 +850,8 @@ class SqliteIngestionJournal(JournalRows):
             storage_by_id = {row[1]: row for row in stored_rows}
             planned_releases: list[tuple[object, ...]] = []
             for value, plaintext, ordinal in plan.work_releases:
+                if type(value) is not EventRecord:
+                    raise ValueError("released Work must be an event")
                 old = storage_by_id[value.record_id]
                 clear = (*old[1:3], "ready", *old[4:8], new_revision, ordinal, old[10])
                 payload, digest = self._payload(

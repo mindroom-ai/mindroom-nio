@@ -31,7 +31,11 @@ from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
     AuthenticatedWork,
-    _canonical_work_plaintext,
+    _prepared_metadata_from_plaintext,
+    _PreparedWorkMetadata,
+)
+from ._sync_journal_plan import (
+    _canonical_work_plaintext as _canonical_work_plaintext,
 )
 from ._sync_journal_preflight import _row, _validate_source_cursor
 from ._sync_journal_values import RoomAggregateValue
@@ -80,12 +84,17 @@ def _canonical_internal(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _work_value_from_plaintext(
+class _DecodedWork(NamedTuple):
+    value: EventRecord | LossRecord
+    metadata: _PreparedWorkMetadata | None
+
+
+def _decode_work_plaintext(
     stream_id: UUID,
     work_id: str,
     kind: str,
     plaintext: bytes,
-) -> EventRecord | LossRecord:
+) -> _DecodedWork:
     if type(stream_id) is not UUID:
         raise TypeError("stream_id must be UUID")
     if type(work_id) is not str or type(kind) is not str:
@@ -99,19 +108,28 @@ def _work_value_from_plaintext(
         if type(wrapper) is not dict or wrapper.get("kind") != kind:
             raise ValueError("work wrapper kind is invalid")
         value = _record_from_dict(wrapper.get("value"), exact=False)
+        metadata = _prepared_metadata_from_plaintext(value, plaintext)
         identity = value.record_id if isinstance(value, EventRecord) else value.loss_id
         if (
             type(value) not in (EventRecord, LossRecord)
             or work_id != str(UUID(work_id))
             or identity != work_id
-            or plaintext != _canonical_work_plaintext(kind, value)
             or type(value) is LossRecord
             and _loss_id(stream_id, value) != work_id
         ):
             raise ValueError("work plaintext is not canonical")
-        return value
+        return _DecodedWork(value, metadata)
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("Work plaintext is invalid") from error
+
+
+def _work_value_from_plaintext(
+    stream_id: UUID,
+    work_id: str,
+    kind: str,
+    plaintext: bytes,
+) -> EventRecord | LossRecord:
+    return _decode_work_plaintext(stream_id, work_id, kind, plaintext).value
 
 
 def _aggregate_uuid(value: object, label: str) -> UUID:
@@ -822,12 +840,13 @@ class JournalRows:
                     row[12],
                     header=_canonical_internal(row[1:11]),
                 )
-                value = _work_value_from_plaintext(
+                decoded = _decode_work_plaintext(
                     owner.stream_id,
                     cast("str", row[1]),
                     cast("str", row[2]),
                     plaintext,
                 )
+                value = decoded.value
                 origin = value.origin
                 if (
                     type(origin) is not RecordOrigin
@@ -858,7 +877,9 @@ class JournalRows:
                         RecordKind.EPHEMERAL,
                         RecordKind.ROOM_ACCOUNT_DATA,
                     )
-                    if value.event_id is not None or value.clear_json is not None:
+                    if decoded.metadata is None and (
+                        value.event_id is not None or value.clear_json is not None
+                    ):
                         raise ValueError("Work event value is invalid")
                     if row[3] == "held":
                         valid = value.kind in room_kinds and room_value == tuple(
@@ -868,6 +889,11 @@ class JournalRows:
                         valid = value.kind in (
                             RecordKind.GLOBAL_ACCOUNT_DATA,
                             RecordKind.PRESENCE,
+                            *(
+                                (RecordKind.TO_DEVICE,)
+                                if decoded.metadata is not None
+                                else ()
+                            ),
                         ) and room_value == (None, None, None)
                     else:
                         valid = (
@@ -893,6 +919,10 @@ class JournalRows:
                     value,
                     cast("Literal['ready', 'held']", row[3]),
                     len(cast("bytes", row[11])),
+                    decoded.metadata,
+                    plaintext,
+                    UUID(cast("str", row[4])),
+                    cast("int", row[10]),
                 )
             )
             canonical_bytes += len(cast("bytes", row[11]))
