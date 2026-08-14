@@ -13,6 +13,7 @@ from peewee import IntegrityError, SqliteDatabase
 from ..exceptions import LocalProtocolError
 from ..ingest import errors as ingest_errors
 from ..ingest import reducer as ingest_reducer
+from ..ingest._json import load_json
 from ..ingest.classic import ClassicSource
 from ..ingest.config import (
     ClassicSourceConfig,
@@ -25,7 +26,18 @@ from ..ingest.hydration import (
     HydrationResult,
     revalidated_hydration_result,
 )
-from ..ingest.model import BatchRef, EventRecord, TransportKind
+from ..ingest.model import (
+    BatchRef,
+    EventRecord,
+    RecordKind,
+    SystemOrigin,
+    SystemOriginKind,
+    TransportKind,
+    _local_membership_record_id,
+    _local_membership_source_json,
+    _local_membership_transition_epoch,
+    _PreparedIngestionFrame,
+)
 from ..ingest.ports import NetworkRequest, _revalidated_staged_source_response
 from ..ingest.serialization import batch_from_records, canonical_batch_payload
 from ..ingest.sliding import SlidingSource, _sliding_cursor_from_json
@@ -35,6 +47,7 @@ from ._sync_journal_plan import (
     _canonical_work_plaintext,
     _work_id,
     plan_frame_materialization,
+    plan_prepared_frame_materialization,
 )
 from ._sync_journal_preflight import (
     IngestionStoreOwner,
@@ -44,12 +57,18 @@ from ._sync_journal_preflight import (
     open_journal_database,
 )
 from ._sync_journal_rows import (
+    _MAX_TOTAL_WORK_CANONICAL_BYTES,
+    _MAX_TOTAL_WORK_COUNT,
+    _MAX_WORK_PAYLOAD_BYTES,
     JournalRows,
     _canonical_internal,
     _canonical_room_aggregate_plaintext,
     _frame_drain_sha256,
     _frame_envelope,
     _frame_payload,
+    _FrameDrainRow,
+    _OutboundMaintenance,
+    _prepared_frame_payload,
     _Task3WorkInventory,
 )
 from ._sync_journal_values import (
@@ -582,14 +601,40 @@ class SqliteIngestionJournal(JournalRows):
             frame_ids = self._classify_frame_ids()
             self._transition_hook("frame_collision_probe")
             if frame.frame_id in frame_ids:
-                stored = self._decode_frame_row(
+                stored_row = self._frame_row(frame.frame_id)
+                stored = self._decode_frame_state(
                     frame.frame_id,
-                    self._frame_row(frame.frame_id),
+                    cast("Mapping[str, object]", stored_row),
                     owner,
                 )
-                if stored.response != frame.response or frame.staged_revision not in (
+                if type(stored) is StagedFrame:
+                    staged_stored = cast("StagedFrame", stored)
+                    stored_revision = staged_stored.staged_revision
+                    same_contents = staged_stored.response == frame.response
+                else:
+                    normalized = self._renormalized_frame(owner, frame)
+                    candidate = load_json(
+                        normalized.candidate_cursor_json,
+                        "replayed candidate cursor",
+                    )
+                    compatibility_token = (
+                        candidate.get("next_batch")
+                        if owner.transport_kind is TransportKind.CLASSIC
+                        and type(candidate) is dict
+                        else None
+                    )
+                    stored_revision = stored_row["staged_revision"]
+                    same_contents = (
+                        stored.request_cursor_json
+                        == frame.response.request.request_cursor_json
+                        and stored.candidate_cursor_json
+                        == normalized.candidate_cursor_json
+                        and stored.source_sha256 == frame.response.source_sha256
+                        and stored.compatibility_token == compatibility_token
+                    )
+                if not same_contents or frame.staged_revision not in (
                     0,
-                    stored.staged_revision,
+                    stored_revision,
                 ):
                     raise JournalIntegrityError(
                         "frame_id collides with different authenticated contents"
@@ -598,7 +643,20 @@ class SqliteIngestionJournal(JournalRows):
                     raise JournalIntegrityError(
                         "existing frame does not match the current source successor"
                     )
-                return CommitResult(stored.staged_revision)
+                return CommitResult(stored_revision)
+
+            inventory = self._load_task3_work_inventory(owner)
+            if any(
+                item.frame_id == frame.frame_id
+                and type(item.value) is EventRecord
+                and type(item.value.origin) is SystemOrigin
+                and item.value.origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+                and item.value.origin.operation_id == frame.frame_id
+                for item in inventory.work
+            ):
+                raise JournalConflictError(
+                    "staged Frame collides with a local membership operation"
+                )
 
             if replay or frame.staged_revision != 0:
                 raise JournalIntegrityError(
@@ -638,10 +696,676 @@ class SqliteIngestionJournal(JournalRows):
     ) -> MaterializeResult:
         return self._materialize_oldest_frame(limits)
 
+    def _publish_local_membership_transition(
+        self,
+        *,
+        operation_id: UUID,
+        room_id: str,
+        previous_membership: str,
+        previous_epoch: int,
+        current_membership: str,
+    ) -> CommitResult:
+        if type(operation_id) is not UUID:
+            raise TypeError("operation_id must be UUID")
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        current_epoch = _local_membership_transition_epoch(
+            previous_membership,
+            previous_epoch,
+            current_membership,
+        )
+        record_id = _local_membership_record_id(operation_id)
+        source_json = _local_membership_source_json(
+            previous_membership,
+            previous_epoch,
+            current_membership,
+        )
+
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if operation_id in {header.frame_id for header in headers}:
+                raise JournalConflictError(
+                    "local membership operation collides with a Frame"
+                )
+            inventory = self._load_task3_work_inventory(owner)
+            operation_work = tuple(
+                item
+                for item in inventory.work
+                if item.frame_id == operation_id
+                or type(item.value) is EventRecord
+                and item.value.record_id == record_id
+            )
+            if operation_work:
+                if len(operation_work) != 1:
+                    raise JournalConflictError(
+                        "local membership operation identity collides"
+                    )
+                item = operation_work[0]
+                value = item.value
+                if (
+                    type(value) is not EventRecord
+                    or value
+                    != EventRecord(
+                        record_id,
+                        RecordKind.ROOM_LIFECYCLE,
+                        SystemOrigin(
+                            SystemOriginKind.MEMBERSHIP_CHANGE,
+                            operation_id,
+                        ),
+                        room_id,
+                        current_epoch,
+                        value.room_sequence,
+                        None,
+                        None,
+                        source_json,
+                        None,
+                    )
+                    or item.status != "ready"
+                    or item.frame_id != operation_id
+                    or item.created_revision is None
+                    or item.metadata is not None
+                ):
+                    raise JournalConflictError(
+                        "local membership operation identity collides"
+                    )
+                return CommitResult(item.created_revision)
+
+            loaded = self._load_room_aggregate(owner, room_id)
+            if loaded is None:
+                if (previous_membership, previous_epoch, current_membership) != (
+                    "leave",
+                    0,
+                    "join",
+                ):
+                    raise JournalConflictError(
+                        "local membership transition requires an Aggregate"
+                    )
+                stored_aggregate = None
+                continuity = ingest_reducer.RoomContinuity(
+                    room_id,
+                    0,
+                    "leave",
+                    None,
+                    None,
+                    None,
+                )
+                next_room_sequence = 0
+                pending_hydration = None
+                snapshot = None
+            else:
+                stored_aggregate, aggregate = loaded
+                continuity = aggregate.continuity
+                next_room_sequence = aggregate.next_room_sequence
+                pending_hydration = aggregate.pending_hydration
+                snapshot = aggregate.room_snapshot
+            if (
+                continuity.gap is not None
+                or continuity.hydration_id is not None
+                or pending_hydration is not None
+                or any(
+                    item.status == "held"
+                    and type(item.value) is EventRecord
+                    and item.value.room_id == room_id
+                    for item in inventory.work
+                )
+            ):
+                raise JournalConflictError(
+                    "local membership transition is blocked by a room barrier"
+                )
+            if (
+                continuity.membership != previous_membership
+                or continuity.membership_epoch != previous_epoch
+            ):
+                raise JournalConflictError(
+                    "local membership transition does not match current state"
+                )
+            if (
+                owner.revision == SQLITE_INT_MAX
+                or next_room_sequence == SQLITE_INT_MAX
+                or current_epoch > SQLITE_INT_MAX
+            ):
+                raise LocalProtocolError(
+                    "local membership revision or sequence is exhausted"
+                )
+
+            new_revision = owner.revision + 1
+            room_sequence = next_room_sequence
+            if snapshot is not None:
+                snapshot = replace(
+                    snapshot,
+                    membership_epoch=current_epoch,
+                    own_membership=current_membership,
+                )
+            successor = RoomAggregateValue(
+                replace(
+                    continuity,
+                    membership_epoch=current_epoch,
+                    membership=current_membership,
+                    baseline=None,
+                    gap=None,
+                    hydration_id=None,
+                ),
+                room_sequence + 1,
+                new_revision,
+                None,
+                snapshot,
+            )
+            aggregate_plaintext = _canonical_room_aggregate_plaintext(successor)
+            aggregate_payload, aggregate_digest = self._payload(
+                owner,
+                "NioIngestRoomAggregate",
+                aggregate_plaintext,
+                header=_canonical_internal([room_id, new_revision, None]),
+            )
+
+            event = EventRecord(
+                record_id,
+                RecordKind.ROOM_LIFECYCLE,
+                SystemOrigin(
+                    SystemOriginKind.MEMBERSHIP_CHANGE,
+                    operation_id,
+                ),
+                room_id,
+                current_epoch,
+                room_sequence,
+                None,
+                None,
+                source_json,
+                None,
+            )
+            plaintext = _canonical_work_plaintext("event", event)
+            clear = (
+                record_id,
+                "event",
+                "ready",
+                str(operation_id),
+                room_id,
+                current_epoch,
+                room_sequence,
+                new_revision,
+                0,
+                new_revision,
+            )
+            work_payload, work_digest = self._payload(
+                owner,
+                "NioIngestWork",
+                plaintext,
+                header=_canonical_internal(clear),
+            )
+            if (
+                len(work_payload) > _MAX_WORK_PAYLOAD_BYTES
+                or len(inventory.storage_rows) >= _MAX_TOTAL_WORK_COUNT
+                or sum(len(cast("bytes", row[11])) for row in inventory.storage_rows)
+                + len(work_payload)
+                > _MAX_TOTAL_WORK_CANONICAL_BYTES
+            ):
+                raise LocalProtocolError(
+                    "local membership Work exceeds immutable capacity"
+                )
+
+            cursor = self._transition_execute(
+                "meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError("local membership compare-and-swap failed")
+            if stored_aggregate is None:
+                try:
+                    cursor = self._transition_execute(
+                        "aggregate_insert",
+                        "INSERT INTO NioIngestRoomAggregate("
+                        "account_id, room_id, updated_revision, intent_kind, "
+                        "payload, payload_sha256) VALUES (?, ?, ?, NULL, ?, ?)",
+                        (
+                            self.account_id,
+                            room_id,
+                            new_revision,
+                            aggregate_payload,
+                            aggregate_digest,
+                        ),
+                    )
+                except (sqlite3.IntegrityError, IntegrityError) as error:
+                    raise JournalConflictError(
+                        "local membership Aggregate insert collided"
+                    ) from error
+            else:
+                cursor = self._transition_execute(
+                    "aggregate_update",
+                    "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
+                    "intent_kind = NULL, payload = ?, payload_sha256 = ? "
+                    "WHERE account_id = ? AND room_id = ? AND updated_revision = ? "
+                    "AND intent_kind IS ?",
+                    (
+                        new_revision,
+                        aggregate_payload,
+                        aggregate_digest,
+                        self.account_id,
+                        room_id,
+                        stored_aggregate[2],
+                        stored_aggregate[3],
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "local membership Aggregate snapshot changed"
+                )
+            try:
+                cursor = self._transition_execute(
+                    "work_insert",
+                    "INSERT INTO NioIngestWork("
+                    "account_id, work_id, kind, status, frame_id, room_id, "
+                    "membership_epoch, room_sequence, ready_revision, "
+                    "ready_ordinal, created_revision, payload, payload_sha256) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self.account_id,
+                        *clear,
+                        work_payload,
+                        work_digest,
+                    ),
+                )
+            except (sqlite3.IntegrityError, IntegrityError) as error:
+                raise JournalIntegrityError(
+                    "local membership Work insert collided"
+                ) from error
+            if cursor.rowcount != 1:
+                raise JournalIntegrityError(
+                    "local membership Work insert did not write a row"
+                )
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+
+    def _authenticate_blocking_frame(
+        self,
+        owner: OwnerView,
+        selected: _FrameDrainRow,
+    ) -> None:
+        row = cast("Mapping[str, object]", self._frame_row(selected.frame_id))
+        if (
+            self._frame_drain_row_from_full(
+                row,
+                owner,
+                authenticate=False,
+            )
+            != selected
+        ):
+            raise JournalIntegrityError("blocked frame header snapshot changed")
+        self._decode_frame_state(
+            selected.frame_id,
+            row,
+            owner,
+            drain_header_authenticated=True,
+        )
+
+    def _prepare_and_materialize_oldest_frame(
+        self,
+        *,
+        prepare: Callable[
+            [SyncFrame, int, tuple[ingest_reducer.RoomContinuity, ...]],
+            _PreparedIngestionFrame,
+        ],
+        freeze_outbound: Callable[
+            [SyncFrame, _PreparedIngestionFrame], _OutboundMaintenance
+        ],
+        limits: MaterializerLimits,
+    ) -> MaterializeResult:
+        if not callable(prepare) or not callable(freeze_outbound):
+            raise TypeError("owned materialization callbacks must be callable")
+        if type(limits) is not MaterializerLimits:
+            raise TypeError("limits must be MaterializerLimits")
+        MaterializerLimits(
+            limits.max_record_canonical_bytes,
+            limits.max_held_work_count,
+            limits.max_held_work_canonical_bytes,
+            limits.max_ready_work_count,
+            limits.max_ready_work_canonical_bytes,
+            limits.max_total_work_count,
+            limits.max_total_work_canonical_bytes,
+        )
+
+        with self._read():
+            read_owner = self._decode_owner_row(
+                cast("Mapping[str, object]", self._meta())
+            )
+            read_headers = self._load_authenticated_frame_headers(read_owner)
+            if not read_headers:
+                return MaterializeResult(MaterializeStatus.IDLE, None, None)
+            read_oldest = read_headers[0]
+            if (
+                read_oldest.room_materialized_revision is not None
+                or read_oldest.callbacks_claimed_revision is not None
+            ):
+                self._authenticate_blocking_frame(read_owner, read_oldest)
+                return MaterializeResult(
+                    MaterializeStatus.BLOCKED,
+                    read_oldest.frame_id,
+                    None,
+                )
+
+        result: MaterializeResult
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            selected = headers[0] if headers else None
+            if selected is None:
+                result = MaterializeResult(MaterializeStatus.IDLE, None, None)
+            elif (
+                selected.room_materialized_revision is not None
+                or selected.callbacks_claimed_revision is not None
+            ):
+                self._authenticate_blocking_frame(owner, selected)
+                result = MaterializeResult(
+                    MaterializeStatus.BLOCKED,
+                    selected.frame_id,
+                    None,
+                )
+            else:
+                selected_row = self._frame_row(selected.frame_id)
+                selected_mapping = cast("Mapping[str, object]", selected_row)
+                if (
+                    self._frame_drain_row_from_full(
+                        selected_mapping,
+                        owner,
+                        authenticate=False,
+                    )
+                    != selected
+                ):
+                    raise JournalIntegrityError(
+                        "selected frame header snapshot changed"
+                    )
+                staged = self._decode_frame_row(
+                    selected.frame_id,
+                    selected_mapping,
+                    owner,
+                    drain_header_authenticated=True,
+                )
+                normalized = self._renormalized_frame(owner, staged)
+                aggregate_rooms = _frame_room_ids(normalized)
+                aggregate_snapshot = tuple(
+                    (room_id, self._load_room_aggregate(owner, room_id))
+                    for room_id in aggregate_rooms
+                )
+                existing_aggregate_rooms = {
+                    room_id
+                    for room_id, loaded in aggregate_snapshot
+                    if loaded is not None
+                }
+                aggregates = tuple(
+                    loaded[1]
+                    for _room_id, loaded in aggregate_snapshot
+                    if loaded is not None
+                )
+                inventory = self._load_task3_work_inventory(owner)
+                new_revision = owner.revision + 1
+                continuities = tuple(aggregate.continuity for aggregate in aggregates)
+                try:
+                    prepared = prepare(
+                        normalized,
+                        selected.staged_revision,
+                        continuities,
+                    )
+                    if type(prepared) is not _PreparedIngestionFrame:
+                        raise TypeError("owned preparation returned an invalid carrier")
+                    if prepared.staged_revision != selected.staged_revision:
+                        raise ValueError(
+                            "prepared staged revision does not match selected Frame"
+                        )
+                    plan = plan_prepared_frame_materialization(
+                        account_id=self.account_id,
+                        stream_id=owner.stream_id,
+                        frame=normalized,
+                        prepared=prepared,
+                        aggregates=aggregates,
+                        work=inventory.work,
+                        revision=new_revision,
+                        limits=limits,
+                    )
+                    if plan is None:
+                        raise ValueError("prepared frame is at capacity")
+                    outbound = freeze_outbound(normalized, prepared)
+                    if type(outbound) is not _OutboundMaintenance:
+                        raise TypeError("outbound freezer returned an invalid plan")
+                except JournalIntegrityError:
+                    raise
+                except (TypeError, ValueError) as error:
+                    raise JournalIntegrityError(str(error)) from error
+
+                planned_aggregates: list[tuple[object, ...]] = []
+                for aggregate_value in plan.room_values:
+                    room_id = aggregate_value.continuity.room_id
+                    intent_kind = (
+                        "hydration" if aggregate_value.pending_hydration else None
+                    )
+                    plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
+                    payload, digest = self._payload(
+                        owner,
+                        "NioIngestRoomAggregate",
+                        plaintext,
+                        header=_canonical_internal(
+                            [room_id, new_revision, intent_kind]
+                        ),
+                    )
+                    planned_aggregates.append(
+                        (
+                            self.account_id,
+                            room_id,
+                            new_revision,
+                            intent_kind,
+                            payload,
+                            digest,
+                        )
+                    )
+
+                planned_rows: list[tuple[object, ...]] = []
+                for value, plaintext, ordinal in plan.work_inserts:
+                    work_id = _work_id(value)
+                    is_event = isinstance(value, EventRecord)
+                    kind = "event" if is_event else "loss"
+                    room_sequence = (
+                        cast("EventRecord", value).room_sequence if is_event else None
+                    )
+                    status = "held" if ordinal is None else "ready"
+                    clear_values = (
+                        work_id,
+                        kind,
+                        status,
+                        str(staged.frame_id),
+                        value.room_id,
+                        value.membership_epoch,
+                        room_sequence,
+                        None if ordinal is None else new_revision,
+                        ordinal,
+                        new_revision,
+                    )
+                    payload, digest = self._payload(
+                        owner,
+                        "NioIngestWork",
+                        plaintext,
+                        header=_canonical_internal(clear_values),
+                    )
+                    planned_rows.append(
+                        (self.account_id, *clear_values, payload, digest)
+                    )
+
+                storage_by_id = {row[1]: row for row in inventory.storage_rows}
+                planned_releases: list[tuple[object, ...]] = []
+                for value, plaintext, ordinal in plan.work_releases:
+                    if type(value) is not EventRecord:
+                        raise JournalIntegrityError("released Work must be an event")
+                    old = storage_by_id[value.record_id]
+                    clear = (
+                        *old[1:3],
+                        "ready",
+                        *old[4:8],
+                        new_revision,
+                        ordinal,
+                        old[10],
+                    )
+                    payload, digest = self._payload(
+                        owner,
+                        "NioIngestWork",
+                        plaintext,
+                        header=_canonical_internal(clear),
+                    )
+                    planned_releases.append((ordinal, payload, digest, value.record_id))
+
+                prepared_payload, prepared_digest = _prepared_frame_payload(
+                    owner=(
+                        self.account_id,
+                        owner.stream_id,
+                        owner.transport_kind,
+                    ),
+                    frame_id=selected.frame_id,
+                    source_epoch=selected.source_epoch,
+                    request_id=selected.request_id,
+                    staged_revision=selected.staged_revision,
+                    request_cursor_json=prepared.request_cursor_json,
+                    candidate_cursor_json=prepared.candidate_cursor_json,
+                    source_sha256=prepared.source_sha256,
+                    compatibility_token=prepared.compatibility_token,
+                    outbound_maintenance=outbound,
+                )
+
+                cursor = self._transition_execute(
+                    "meta_revision_epoch_cas",
+                    "UPDATE NioIngestMeta SET revision = ? "
+                    "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                    (
+                        new_revision,
+                        self.account_id,
+                        owner.revision,
+                        str(owner.writer_epoch),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise JournalConflictError(
+                        "owned materializer compare-and-swap failed"
+                    )
+
+                try:
+                    for row in planned_aggregates:
+                        if row[1] in existing_aggregate_rooms:
+                            aggregate_cursor = self._transition_execute(
+                                "aggregate_update",
+                                "UPDATE NioIngestRoomAggregate SET "
+                                "updated_revision = ?, intent_kind = ?, payload = ?, "
+                                "payload_sha256 = ? WHERE account_id = ? "
+                                "AND room_id = ?",
+                                (*row[2:], row[0], row[1]),
+                            )
+                        else:
+                            aggregate_cursor = self._transition_execute(
+                                "aggregate_insert",
+                                "INSERT INTO NioIngestRoomAggregate("
+                                "account_id, room_id, updated_revision, intent_kind, "
+                                "payload, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+                                row,
+                            )
+                        if aggregate_cursor.rowcount != 1:
+                            raise JournalIntegrityError(
+                                "Aggregate write did not affect one row"
+                            )
+                    for row in planned_rows:
+                        work_cursor = self._transition_execute(
+                            "work_insert",
+                            "INSERT INTO NioIngestWork("
+                            "account_id, work_id, kind, status, frame_id, room_id, "
+                            "membership_epoch, room_sequence, ready_revision, "
+                            "ready_ordinal, created_revision, payload, "
+                            "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                            "?, ?, ?, ?)",
+                            row,
+                        )
+                        if work_cursor.rowcount != 1:
+                            raise JournalIntegrityError(
+                                "Work insert did not write a row"
+                            )
+                    for row in planned_releases:
+                        work_cursor = self._transition_execute(
+                            "work_release",
+                            "UPDATE NioIngestWork SET status = 'ready', "
+                            "ready_revision = ?, ready_ordinal = ?, payload = ?, "
+                            "payload_sha256 = ? WHERE account_id = ? AND "
+                            "work_id = ? AND status = 'held'",
+                            (
+                                new_revision,
+                                row[0],
+                                row[1],
+                                row[2],
+                                self.account_id,
+                                row[3],
+                            ),
+                        )
+                        if work_cursor.rowcount != 1:
+                            raise JournalIntegrityError(
+                                "Work release did not update a row"
+                            )
+                except (sqlite3.IntegrityError, IntegrityError) as error:
+                    raise JournalIntegrityError(
+                        "planned materialization collided"
+                    ) from error
+
+                proof = _frame_drain_sha256(
+                    owner,
+                    frame_id=selected.frame_id,
+                    source_epoch=selected.source_epoch,
+                    request_id=selected.request_id,
+                    staged_revision=selected.staged_revision,
+                    payload_sha256=prepared_digest,
+                    payload_length=len(prepared_payload),
+                    room_materialized_revision=new_revision,
+                    callbacks_claimed_revision=None,
+                )
+                frame_cursor = self._transition_execute(
+                    "frame_prepared_retain",
+                    "UPDATE NioIngestFrame SET payload = ?, payload_sha256 = ?, "
+                    "room_materialized_revision = ?, drain_header_sha256 = ? "
+                    "WHERE account_id = ? AND frame_id = ? AND source_epoch = ? "
+                    "AND request_id = ? AND staged_revision = ? AND payload = ? "
+                    "AND payload_sha256 = ? AND room_materialized_revision IS NULL "
+                    "AND callbacks_claimed_revision IS NULL "
+                    "AND drain_header_sha256 = ?",
+                    (
+                        prepared_payload,
+                        prepared_digest,
+                        new_revision,
+                        proof,
+                        selected_row["account_id"],
+                        selected_row["frame_id"],
+                        selected_row["source_epoch"],
+                        selected_row["request_id"],
+                        selected_row["staged_revision"],
+                        selected_row["payload"],
+                        selected_row["payload_sha256"],
+                        selected_row["drain_header_sha256"],
+                    ),
+                )
+                if frame_cursor.rowcount != 1:
+                    raise JournalIntegrityError("selected frame prepared update failed")
+                self._transition_hook("before_commit")
+                result = MaterializeResult(
+                    MaterializeStatus.MATERIALIZED,
+                    selected.frame_id,
+                    new_revision,
+                )
+        self._transition_hook("commit")
+        return result
+
     # fmt: off
     def apply_hydration_result(self, *, result: HydrationResult) -> CommitResult | None:
         with self._read():
-            owner = self._decode_owner_row(self._meta())
+            owner = self._decode_owner_row(
+                cast("Mapping[str, object]", self._meta())
+            )
             rebuilt, event_id = revalidated_hydration_result(result, own_user_id=owner.account_id)
             room_id = rebuilt.pending.continuity.room_id
             loaded = self._load_room_aggregate(owner, room_id)
@@ -657,7 +1381,7 @@ class SqliteIngestionJournal(JournalRows):
                 key=lambda item: (cast("int", cast("EventRecord", item.value).room_sequence), cast("EventRecord", item.value).record_id),
             )
             new_revision = owner.revision + 1
-            successor = RoomAggregateValue(replace(value.continuity, baseline=ingest_reducer.MembershipBaseline(event_id, None), hydration_id=None), value.next_room_sequence, new_revision, None)
+            successor = RoomAggregateValue(replace(value.continuity, baseline=ingest_reducer.MembershipBaseline(event_id, None), hydration_id=None), value.next_room_sequence, new_revision, None, value.room_snapshot)
             aggregate_plaintext = _canonical_room_aggregate_plaintext(successor)
             aggregate_payload, aggregate_digest = self._payload(owner, "NioIngestRoomAggregate", aggregate_plaintext, header=_canonical_internal([room_id, new_revision, None]))
             storage = {row[1]: row for row in inventory.storage_rows}

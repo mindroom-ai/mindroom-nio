@@ -3,22 +3,45 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from hashlib import sha256
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlencode
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
 from ..exceptions import LocalProtocolError
-from ..store._sync_journal_values import MaterializerLimits, MaterializeStatus
+from ..store._sync_journal_rows import (
+    _encoded_bytes,
+    _OutboundMaintenance,
+    _OutboundOperation,
+    _validate_outbound_maintenance,
+)
+from ..store._sync_journal_values import (
+    MaterializeResult,
+    MaterializerLimits,
+    MaterializeStatus,
+)
 from . import ports
+from ._json import canonical_json, load_json
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
 from .hydration import normalize_hydration_response
-from .model import BatchRef, SyncBatch, TransportKind
+from .model import (
+    BatchRef,
+    SyncBatch,
+    TransportKind,
+    _PreparedCryptoDelta,
+    _PreparedIngestionFrame,
+    _PreparedMegolmRerequest,
+    _PreparedQueuedToDeviceMessage,
+    _PreparedWaitingKeyRequest,
+    _QueuedToDeviceSubtype,
+)
+from .reducer import RoomContinuity, _validate_prepared_crypto_delta
 from .sliding import SlidingSource
-from .source import SourceResultKind, SourceScheduleStatus, plan_source_poll
-from .state import SourceState, StagedFrame
+from .source import SourceResultKind, SourceScheduleStatus, SyncFrame, plan_source_poll
+from .state import CommitResult, SourceState, StagedFrame
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -58,6 +81,171 @@ class IngestionHydrationError(IngestionError):
         super().__init__(f"room-state hydration failed for {hydration_id}")
 
 
+def _encoded_prepared_source(source_json: bytes) -> str:
+    encoded = _encoded_bytes(source_json)
+    assert encoded is not None
+    return encoded
+
+
+def _rerequest_context(
+    event: _PreparedMegolmRerequest,
+) -> dict[str, object]:
+    return {
+        "source_json": _encoded_prepared_source(event.source_json),
+        "room_id": event.room_id,
+        "event_id": event.event_id,
+        "sender_user_id": event.sender_user_id,
+        "sender_device_id": event.sender_device_id,
+        "sender_key": event.sender_key,
+        "session_id": event.session_id,
+        "algorithm": event.algorithm,
+    }
+
+
+def _waiting_request_context(
+    request: _PreparedWaitingKeyRequest,
+) -> dict[str, object]:
+    return {
+        "source_json": _encoded_prepared_source(request.source_json),
+        "sender_user_id": request.sender_user_id,
+        "requesting_device_id": request.requesting_device_id,
+        "request_id": request.request_id,
+        "room_id": request.room_id,
+        "sender_key": request.sender_key,
+        "session_id": request.session_id,
+        "algorithm": request.algorithm,
+    }
+
+
+def _key_claim_context(delta: _PreparedCryptoDelta) -> dict[str, object]:
+    return {
+        "claims": [
+            {
+                "user_id": claim.user_id,
+                "device_id": claim.device_id,
+                "was_wedged": claim.was_wedged,
+                "was_waiting": claim.was_waiting,
+                "waiting_key_requests": [
+                    _waiting_request_context(request)
+                    for request in claim.waiting_key_requests
+                ],
+                "rerequest_events": [
+                    _rerequest_context(event) for event in claim.rerequest_events
+                ],
+            }
+            for claim in delta.key_claims
+        ]
+    }
+
+
+def _queued_to_device_context(
+    message: _PreparedQueuedToDeviceMessage,
+) -> dict[str, object]:
+    if message.subtype is _QueuedToDeviceSubtype.GENERIC:
+        return {"subtype": "generic"}
+    if message.subtype is _QueuedToDeviceSubtype.DUMMY:
+        return {
+            "subtype": "dummy",
+            "rerequest_events": [
+                _rerequest_context(event) for event in message.rerequest_events
+            ],
+        }
+    if message.subtype is _QueuedToDeviceSubtype.ROOM_KEY_REQUEST:
+        return {
+            "subtype": "room_key_request",
+            "request_id": message.request_id,
+            "session_id": message.session_id,
+            "room_id": message.room_id,
+            "algorithm": message.algorithm,
+        }
+    raise ValueError("queued to-device subtype is invalid")
+
+
+def _initial_outbound_maintenance(
+    *,
+    frame_id: UUID,
+    delta: _PreparedCryptoDelta,
+    upload_body: bytes | None,
+) -> _OutboundMaintenance:
+    operations: list[_OutboundOperation] = []
+    if upload_body is not None:
+        operations.append(
+            _OutboundOperation(
+                "key_upload",
+                "pending",
+                upload_body,
+                None,
+                None,
+                None,
+            )
+        )
+    if delta.users_for_key_query:
+        operations.append(
+            _OutboundOperation(
+                "key_query",
+                "pending",
+                canonical_json(
+                    {
+                        "device_keys": {
+                            user_id: [] for user_id in delta.users_for_key_query
+                        }
+                    }
+                ),
+                None,
+                None,
+                None,
+            )
+        )
+    if delta.key_claims:
+        claim_targets: dict[str, dict[str, str]] = {}
+        for claim in delta.key_claims:
+            claim_targets.setdefault(claim.user_id, {})[
+                claim.device_id
+            ] = "signed_curve25519"
+        operations.append(
+            _OutboundOperation(
+                "key_claim",
+                "pending",
+                canonical_json({"one_time_keys": claim_targets}),
+                None,
+                None,
+                _key_claim_context(delta),
+            )
+        )
+    for message in delta.queued_to_device_messages:
+        content = load_json(message.content_json, "queued to-device content")
+        if type(content) is not dict or canonical_json(content) != message.content_json:
+            raise ValueError("queued to-device content is not canonical")
+        body_json = canonical_json(
+            {
+                "messages": {
+                    message.recipient_user_id: {message.recipient_device_id: content}
+                }
+            }
+        )
+        operation_index = len(operations)
+        operations.append(
+            _OutboundOperation(
+                "to_device",
+                "pending",
+                body_json,
+                str(
+                    uuid5(
+                        frame_id,
+                        "nio.ingest.outbound-maintenance.v1:"
+                        f"to-device:{operation_index}:"
+                        f"{sha256(body_json).hexdigest()}",
+                    )
+                ),
+                message.event_type,
+                _queued_to_device_context(message),
+            )
+        )
+    maintenance = _OutboundMaintenance(tuple(operations))
+    _validate_outbound_maintenance(maintenance, frame_id=frame_id)
+    return maintenance
+
+
 class IngestionSession:
     def __init__(
         self,
@@ -83,6 +271,7 @@ class IngestionSession:
         max_records: int = 256,
         max_canonical_bytes: int = 16 * 1024 * 1024,
     ) -> SyncBatch | None:
+        self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
             raise LocalProtocolError("ingestion session is closed")
         limits = {"max_records": max_records}
@@ -90,11 +279,18 @@ class IngestionSession:
         return self._journal.next_batch(**limits)
 
     def acknowledge_batch(self, ref: BatchRef) -> None:
+        self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
             raise LocalProtocolError("ingestion session is closed")
         self._journal.acknowledge_batch(ref)
 
+    def _materialize_oldest_frame(
+        self, *, limits: MaterializerLimits
+    ) -> MaterializeResult:
+        return self._journal.materialize_oldest_frame(limits=limits)
+
     async def run(self) -> None:
+        self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
             raise LocalProtocolError("ingestion session is closed")
         if self._terminal is not None:
@@ -134,7 +330,7 @@ class IngestionSession:
         hydration_retries = 0
         while self._close_task is None:
             while True:
-                materialized = self._journal.materialize_oldest_frame(
+                materialized = self._materialize_oldest_frame(
                     limits=MaterializerLimits()
                 )
                 if materialized.status is MaterializeStatus.MATERIALIZED:
@@ -371,6 +567,147 @@ class _OwnedIngestionSession(IngestionSession):
         self._revoked = False
         self._closed = False
 
+    def _materialize_oldest_frame(
+        self, *, limits: MaterializerLimits
+    ) -> MaterializeResult:
+        self._client._assert_ingestion_not_poisoned()
+        store = self._owned_store
+        preparation_started = False
+
+        def prepare(
+            frame: SyncFrame,
+            staged_revision: int,
+            prior_continuities: tuple[RoomContinuity, ...],
+        ) -> _PreparedIngestionFrame:
+            nonlocal preparation_started
+            preparation_started = True
+            prepared = self._client._prepare_ingestion_frame(
+                frame,
+                staged_revision,
+                prior_continuities,
+            )
+            if self._client.next_batch:
+                store.save_sync_token(self._client.next_batch)
+            store.save_encrypted_rooms(self._client.encrypted_rooms)
+            return prepared
+
+        def freeze_outbound(
+            frame: SyncFrame,
+            prepared: _PreparedIngestionFrame,
+        ) -> _OutboundMaintenance:
+            # Import at the runtime boundary: crypto imports store, which imports
+            # ingestion while the client modules are still initializing.
+            from ..client.base_client import (
+                _prepared_crypto_delta_snapshot,
+                _prepared_frame_encrypted_room_ids,
+            )
+
+            olm = self._client.olm
+            if olm is None:
+                raise LocalProtocolError("owned materialization requires Olm")
+            delta = prepared.crypto_delta
+            encrypted_room_ids = delta.encrypted_room_ids
+            source_encrypted_room_ids = _prepared_frame_encrypted_room_ids(
+                frame,
+                set(self._client.rooms) | set(self._client.invited_rooms),
+            )
+            if encrypted_room_ids != source_encrypted_room_ids:
+                raise ValueError(
+                    "prepared crypto delta disagrees with source encryption"
+                )
+            segment_room_ids = {segment.room_id for segment in frame.room_segments}
+            if (
+                type(encrypted_room_ids) is not tuple
+                or tuple(sorted(encrypted_room_ids)) != encrypted_room_ids
+                or len(encrypted_room_ids) != len(set(encrypted_room_ids))
+                or any(
+                    type(room_id) is not str or not room_id
+                    for room_id in encrypted_room_ids
+                )
+                or not set(encrypted_room_ids) <= segment_room_ids
+                or not set(encrypted_room_ids) <= self._client.encrypted_rooms
+            ):
+                raise ValueError("prepared encrypted-room IDs are invalid")
+            key_counts = load_json(
+                frame.one_time_key_counts_json,
+                "one-time-key counts",
+            )
+            if (
+                type(key_counts) is not dict
+                or canonical_json(key_counts) != frame.one_time_key_counts_json
+            ):
+                raise ValueError("one-time-key counts are invalid")
+            live_uploaded_count = olm.uploaded_key_count
+            prepared_uploaded_count = delta.uploaded_key_count
+            if (
+                live_uploaded_count is not None
+                and (type(live_uploaded_count) is not int or live_uploaded_count < 0)
+                or prepared_uploaded_count is not None
+                and (
+                    type(prepared_uploaded_count) is not int
+                    or prepared_uploaded_count < 0
+                )
+                or live_uploaded_count != prepared_uploaded_count
+            ):
+                raise ValueError("prepared uploaded key count is invalid")
+            signed_curve_count = key_counts.get("signed_curve25519")
+            if signed_curve_count is not None and (
+                type(signed_curve_count) is not int
+                or signed_curve_count < 0
+                or live_uploaded_count != signed_curve_count
+                or prepared_uploaded_count != signed_curve_count
+            ):
+                raise ValueError("prepared uploaded key count disagrees with source")
+            recaptured = _prepared_crypto_delta_snapshot(
+                frame,
+                olm,
+                encrypted_room_ids,
+            )
+            _validate_prepared_crypto_delta(recaptured)
+            if recaptured != delta:
+                raise ValueError("prepared crypto delta disagrees with live state")
+
+            upload_body: bytes | None = None
+            if olm.should_upload_keys:
+                upload_body = canonical_json(olm.share_keys())
+                olm.save_account()
+            return _initial_outbound_maintenance(
+                frame_id=prepared.frame_id,
+                delta=delta,
+                upload_body=upload_body,
+            )
+
+        try:
+            return self._journal._prepare_and_materialize_oldest_frame(
+                prepare=prepare,
+                freeze_outbound=freeze_outbound,
+                limits=limits,
+            )
+        except BaseException:
+            if preparation_started:
+                self._client._poison_ingestion()
+            raise
+
+    def _publish_local_membership_transition(
+        self,
+        *,
+        operation_id: UUID,
+        room_id: str,
+        previous_membership: str,
+        previous_epoch: int,
+        current_membership: str,
+    ) -> CommitResult:
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        return self._journal._publish_local_membership_transition(
+            operation_id=operation_id,
+            room_id=room_id,
+            previous_membership=previous_membership,
+            previous_epoch=previous_epoch,
+            current_membership=current_membership,
+        )
+
     async def close(self) -> None:
         self._lease._prepare_close()
         if self._closed:
@@ -406,6 +743,7 @@ class _OwnedIngestionSession(IngestionSession):
 
 
 def _validate_owned_client_is_pristine(client: AsyncClient) -> None:
+    client._assert_ingestion_not_poisoned()
     fence = client._sync_reset_fence
     recovery = client._recovery
     if recovery is None:
@@ -479,6 +817,7 @@ def _open_owned_ingestion(
 
     if not isinstance(client, AsyncClient):
         raise LocalProtocolError("ingestion requires an AsyncClient")
+    client._assert_ingestion_not_poisoned()
     authenticated = all(
         type(value) is str and bool(value)
         for value in (client.access_token, client.user_id, client.device_id)

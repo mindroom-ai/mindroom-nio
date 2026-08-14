@@ -75,14 +75,14 @@ from nio.ingest.reducer import (
     HydrationIntent,
     LossProposal,
     MembershipBaseline,
+    PreparedRecordStep,
+    PreparedRecoveryStep,
+    PreparedTransitionStep,
     RecoveryGap,
     RecoveryRelease,
     ReducerInputError,
     RoomContinuity,
     RoomProposal,
-    PreparedRecordStep,
-    PreparedRecoveryStep,
-    PreparedTransitionStep,
     reduce_prepared_frame,
     reduce_staged_frame,
 )
@@ -2069,6 +2069,640 @@ def test_prepared_reduction_accepts_populated_structural_carriers() -> None:
     )
 
     assert reduction.crypto_deferred is True
+
+
+_OUTBOUND_CODEC_FRAME_ID = UUID("2ad46b4e-a042-4ba3-9ff8-e33e1b544bfd")
+
+
+def _outbound_codec_bytes(value: object) -> bytes:
+    return canonical_json(value)
+
+
+def _outbound_codec_b64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def _outbound_codec_transaction_id(index: int, body_json: bytes) -> str:
+    return str(
+        uuid5(
+            _OUTBOUND_CODEC_FRAME_ID,
+            "nio.ingest.outbound-maintenance.v1:"
+            f"to-device:{index}:{hashlib.sha256(body_json).hexdigest()}",
+        )
+    )
+
+
+def _full_outbound_codec_case() -> tuple[object, dict[str, object]]:
+    algorithm = "m.megolm.v1.aes-sha2"
+    claim_user = "@claim:example.org"
+    claim_device = "CLAIM"
+    claim_room = "!claim:example.org"
+    claim_session = "claim-session"
+    waiting_source = _outbound_codec_bytes(
+        {
+            "content": {
+                "action": "request",
+                "body": {
+                    "algorithm": algorithm,
+                    "room_id": claim_room,
+                    "sender_key": "claim-sender-key",
+                    "session_id": claim_session,
+                },
+                "request_id": "waiting-request",
+                "requesting_device_id": claim_device,
+                "org.example.extra": True,
+            },
+            "sender": claim_user,
+            "type": "m.room_key_request",
+            "unsigned": {"age": 1},
+        }
+    )
+    claim_rerequest_source = _outbound_codec_bytes(
+        {
+            "content": {
+                "algorithm": algorithm,
+                "device_id": claim_device,
+                "sender_key": "claim-sender-key",
+                "session_id": claim_session,
+                "ciphertext": {"preserved": True},
+            },
+            "event_id": "$claim-event",
+            "origin_server_ts": 1,
+            "sender": claim_user,
+            "type": "m.room.encrypted",
+        }
+    )
+    claim_rerequest = {
+        "source_json": _outbound_codec_b64(claim_rerequest_source),
+        "room_id": claim_room,
+        "event_id": "$claim-event",
+        "sender_user_id": claim_user,
+        "sender_device_id": claim_device,
+        "sender_key": "claim-sender-key",
+        "session_id": claim_session,
+        "algorithm": algorithm,
+    }
+    claim_context = {
+        "claims": [
+            {
+                "user_id": claim_user,
+                "device_id": claim_device,
+                "was_wedged": True,
+                "was_waiting": True,
+                "waiting_key_requests": [
+                    {
+                        "source_json": _outbound_codec_b64(waiting_source),
+                        "sender_user_id": claim_user,
+                        "requesting_device_id": claim_device,
+                        "request_id": "waiting-request",
+                        "room_id": claim_room,
+                        "sender_key": "claim-sender-key",
+                        "session_id": claim_session,
+                        "algorithm": algorithm,
+                    }
+                ],
+                "rerequest_events": [claim_rerequest],
+            }
+        ]
+    }
+
+    dummy_user = "@dummy:example.org"
+    dummy_device = "DUMMY"
+    dummy_room = "!dummy:example.org"
+    dummy_rerequest_source = _outbound_codec_bytes(
+        {
+            "content": {
+                "algorithm": algorithm,
+                "device_id": dummy_device,
+                "sender_key": "dummy-sender-key",
+                "session_id": "dummy-session",
+            },
+            "event_id": "$dummy-event",
+            "room_id": dummy_room,
+            "sender": dummy_user,
+            "type": "m.room.encrypted",
+        }
+    )
+    dummy_context = {
+        "subtype": "dummy",
+        "rerequest_events": [
+            {
+                "source_json": _outbound_codec_b64(dummy_rerequest_source),
+                "room_id": dummy_room,
+                "event_id": "$dummy-event",
+                "sender_user_id": dummy_user,
+                "sender_device_id": dummy_device,
+                "sender_key": "dummy-sender-key",
+                "session_id": "dummy-session",
+                "algorithm": algorithm,
+            }
+        ],
+    }
+    room_key_user = "@room-key:example.org"
+    room_key_device = "ROOMKEY"
+    room_key_content = {
+        "action": "request",
+        "body": {
+            "algorithm": algorithm,
+            "room_id": "!room-key:example.org",
+            "sender_key": "room-key-sender-key",
+            "session_id": "room-key-session",
+        },
+        "request_id": "room-key-request",
+        "requesting_device_id": "OWNER",
+    }
+
+    bodies = (
+        _outbound_codec_bytes(
+            {
+                "device_keys": {
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                    "device_id": "OWNER",
+                    "keys": {"curve25519:OWNER": "curve-key"},
+                    "user_id": "@owner:example.org",
+                },
+                "fallback_keys": {
+                    "signed_curve25519:fallback": {"key": "fallback-key"}
+                },
+                "one_time_keys": {"signed_curve25519:otk": {"key": "one-time-key"}},
+            }
+        ),
+        _outbound_codec_bytes(
+            {
+                "device_keys": {
+                    "@query-a:example.org": [],
+                    "@query-b:example.org": [],
+                }
+            }
+        ),
+        _outbound_codec_bytes(
+            {"one_time_keys": {claim_user: {claim_device: "signed_curve25519"}}}
+        ),
+        _outbound_codec_bytes(
+            {"messages": {"@generic:example.org": {"GENERIC": {"value": "generic"}}}}
+        ),
+        _outbound_codec_bytes(
+            {
+                "messages": {
+                    dummy_user: {
+                        dummy_device: {
+                            "algorithm": "m.olm.v1.curve25519-aes-sha2",
+                            "ciphertext": {
+                                "dummy-curve-key": {
+                                    "body": "dummy-ciphertext",
+                                    "type": 0,
+                                }
+                            },
+                            "sender_key": "owner-curve-key",
+                        }
+                    }
+                }
+            }
+        ),
+        _outbound_codec_bytes(
+            {"messages": {room_key_user: {room_key_device: room_key_content}}}
+        ),
+    )
+    contexts: tuple[object | None, ...] = (
+        None,
+        None,
+        claim_context,
+        {"subtype": "generic"},
+        dummy_context,
+        {
+            "subtype": "room_key_request",
+            "request_id": "room-key-request",
+            "session_id": "room-key-session",
+            "room_id": "!room-key:example.org",
+            "algorithm": algorithm,
+        },
+    )
+    kinds = (
+        "key_upload",
+        "key_query",
+        "key_claim",
+        "to_device",
+        "to_device",
+        "to_device",
+    )
+    event_types = (
+        None,
+        None,
+        None,
+        "org.example.generic",
+        "m.room.encrypted",
+        "m.room_key_request",
+    )
+    operations = tuple(
+        journal_rows_module._OutboundOperation(
+            kind,
+            "pending",
+            body,
+            (
+                None
+                if kind != "to_device"
+                else _outbound_codec_transaction_id(index, body)
+            ),
+            event_types[index],
+            contexts[index],
+        )
+        for index, (kind, body) in enumerate(zip(kinds, bodies, strict=True))
+    )
+    expected_operations = [
+        {
+            "kind": operation.kind,
+            "state": "pending",
+            "body_json": _outbound_codec_b64(operation.body_json),
+            "transaction_id": operation.transaction_id,
+            "event_type": operation.event_type,
+            "context": operation.context,
+        }
+        for operation in operations
+    ]
+    return (
+        journal_rows_module._OutboundMaintenance(operations),
+        {"version": 1, "operations": expected_operations},
+    )
+
+
+def test_outbound_maintenance_codec_round_trips_full_frozen_plan() -> None:
+    maintenance, expected = _full_outbound_codec_case()
+
+    encoded = journal_rows_module._outbound_maintenance_to_dict(
+        maintenance,
+        frame_id=_OUTBOUND_CODEC_FRAME_ID,
+    )
+
+    assert encoded == expected
+    assert tuple(encoded) == ("version", "operations")
+    assert tuple(operation["kind"] for operation in encoded["operations"]) == (
+        "key_upload",
+        "key_query",
+        "key_claim",
+        "to_device",
+        "to_device",
+        "to_device",
+    )
+    assert all(
+        tuple(operation)
+        == (
+            "kind",
+            "state",
+            "body_json",
+            "transaction_id",
+            "event_type",
+            "context",
+        )
+        for operation in encoded["operations"]
+    )
+    claim_context = encoded["operations"][2]["context"]
+    assert tuple(claim_context) == ("claims",)
+    claim = claim_context["claims"][0]
+    assert tuple(claim) == (
+        "user_id",
+        "device_id",
+        "was_wedged",
+        "was_waiting",
+        "waiting_key_requests",
+        "rerequest_events",
+    )
+    assert tuple(claim["waiting_key_requests"][0]) == (
+        "source_json",
+        "sender_user_id",
+        "requesting_device_id",
+        "request_id",
+        "room_id",
+        "sender_key",
+        "session_id",
+        "algorithm",
+    )
+    assert tuple(claim["rerequest_events"][0]) == (
+        "source_json",
+        "room_id",
+        "event_id",
+        "sender_user_id",
+        "sender_device_id",
+        "sender_key",
+        "session_id",
+        "algorithm",
+    )
+    assert tuple(encoded["operations"][3]["context"]) == ("subtype",)
+    assert tuple(encoded["operations"][4]["context"]) == (
+        "subtype",
+        "rerequest_events",
+    )
+    assert tuple(encoded["operations"][5]["context"]) == (
+        "subtype",
+        "request_id",
+        "session_id",
+        "room_id",
+        "algorithm",
+    )
+    assert (
+        journal_rows_module._outbound_maintenance_from_dict(
+            encoded,
+            frame_id=_OUTBOUND_CODEC_FRAME_ID,
+        )
+        == maintenance
+    )
+
+    settled_prefix = journal_rows_module._OutboundMaintenance(
+        tuple(
+            (
+                operation._replace(state="settled", context=None)
+                if index < 3
+                else operation
+            )
+            for index, operation in enumerate(maintenance.operations)
+        )
+    )
+    settled_encoded = journal_rows_module._outbound_maintenance_to_dict(
+        settled_prefix,
+        frame_id=_OUTBOUND_CODEC_FRAME_ID,
+    )
+    assert tuple(operation["state"] for operation in settled_encoded["operations"]) == (
+        "settled",
+        "settled",
+        "settled",
+        "pending",
+        "pending",
+        "pending",
+    )
+    assert (
+        journal_rows_module._outbound_maintenance_from_dict(
+            settled_encoded,
+            frame_id=_OUTBOUND_CODEC_FRAME_ID,
+        )
+        == settled_prefix
+    )
+
+    all_settled = journal_rows_module._OutboundMaintenance(
+        tuple(
+            operation._replace(state="settled", context=None)
+            for operation in maintenance.operations
+        )
+    )
+    all_settled_encoded = journal_rows_module._outbound_maintenance_to_dict(
+        all_settled,
+        frame_id=_OUTBOUND_CODEC_FRAME_ID,
+    )
+    assert (
+        journal_rows_module._outbound_maintenance_from_dict(
+            all_settled_encoded,
+            frame_id=_OUTBOUND_CODEC_FRAME_ID,
+        )
+        == all_settled
+    )
+
+    empty = journal_rows_module._OutboundMaintenance(())
+    assert (
+        journal_rows_module._outbound_maintenance_from_dict(
+            journal_rows_module._outbound_maintenance_to_dict(
+                empty,
+                frame_id=_OUTBOUND_CODEC_FRAME_ID,
+            ),
+            frame_id=_OUTBOUND_CODEC_FRAME_ID,
+        )
+        == empty
+    )
+
+    with pytest.raises(ValueError):
+        journal_rows_module._outbound_maintenance_from_dict(
+            encoded,
+            frame_id=UUID("5ba72364-44f0-4938-b647-8b5b19c72570"),
+        )
+
+
+def _refresh_outbound_codec_transaction_ids(operations: list[object]) -> None:
+    for index, operation in enumerate(operations):
+        if operation["kind"] != "to_device":
+            continue
+        body_json = base64.b64decode(operation["body_json"], validate=True)
+        operation["transaction_id"] = _outbound_codec_transaction_id(index, body_json)
+
+
+def _mutated_outbound_codec_value(mutation: str) -> dict[str, object]:
+    _, expected = _full_outbound_codec_case()
+    value = json.loads(json.dumps(expected))
+    operations = value["operations"]
+    assert type(operations) is list
+
+    if mutation == "kind_reorder":
+        operations[0], operations[1] = operations[1], operations[0]
+    elif mutation == "duplicate_singleton":
+        operations.insert(2, dict(operations[1]))
+        _refresh_outbound_codec_transaction_ids(operations)
+    elif mutation == "state_order":
+        operations[1]["state"] = "settled"
+    elif mutation == "invalid_state":
+        operations[0]["state"] = "failed"
+    elif mutation == "upload_unknown":
+        operations[0]["body_json"] = _outbound_codec_b64(
+            _outbound_codec_bytes({"unknown": {}})
+        )
+    elif mutation == "upload_empty":
+        operations[0]["body_json"] = _outbound_codec_b64(_outbound_codec_bytes({}))
+    elif mutation in {
+        "upload_missing_one_time_keys",
+        "upload_empty_one_time_keys",
+        "upload_empty_fallback_keys",
+    }:
+        operation = operations[0]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        if mutation == "upload_missing_one_time_keys":
+            del body["one_time_keys"]
+        elif mutation == "upload_empty_one_time_keys":
+            body["one_time_keys"] = {}
+        else:
+            body["fallback_keys"] = {}
+        operation["body_json"] = _outbound_codec_b64(_outbound_codec_bytes(body))
+    elif mutation == "query_body":
+        operations[1]["body_json"] = _outbound_codec_b64(
+            _outbound_codec_bytes(
+                {"device_keys": {"@query-a:example.org": ["QUERY-A"]}}
+            )
+        )
+    elif mutation == "non_to_device_transaction":
+        operations[1]["transaction_id"] = "12345678-1234-5678-9234-567812345678"
+    elif mutation == "non_to_device_event_type":
+        operations[1]["event_type"] = "m.invalid"
+    elif mutation == "claim_target":
+        claim = operations[2]
+        body = {"one_time_keys": {"@other:example.org": {"OTHER": "signed_curve25519"}}}
+        claim["body_json"] = _outbound_codec_b64(_outbound_codec_bytes(body))
+    elif mutation == "claim_key_type":
+        claim = operations[2]
+        body = {"one_time_keys": {"@claim:example.org": {"CLAIM": "curve25519"}}}
+        claim["body_json"] = _outbound_codec_b64(_outbound_codec_bytes(body))
+    elif mutation == "duplicate_claim":
+        claim_context = operations[2]["context"]
+        claim_context["claims"].append(dict(claim_context["claims"][0]))
+    elif mutation == "duplicate_waiting":
+        claim_context = operations[2]["context"]
+        waiting = claim_context["claims"][0]["waiting_key_requests"]
+        waiting.append(dict(waiting[0]))
+    elif mutation == "claim_without_reason":
+        claim_context = operations[2]["context"]
+        claim = claim_context["claims"][0]
+        claim["was_wedged"] = False
+        claim["was_waiting"] = False
+        claim["waiting_key_requests"] = []
+        claim["rerequest_events"] = []
+    elif mutation == "rerequests_without_wedge":
+        claim_context = operations[2]["context"]
+        claim_context["claims"][0]["was_wedged"] = False
+    elif mutation == "waiting_source":
+        claim_context = operations[2]["context"]
+        claim_context["claims"][0]["waiting_key_requests"][0][
+            "request_id"
+        ] = "other-request"
+    elif mutation == "rerequest_source":
+        claim_context = operations[2]["context"]
+        claim_context["claims"][0]["rerequest_events"][0][
+            "sender_key"
+        ] = "other-sender-key"
+    elif mutation == "claim_key_order":
+        claim_context = operations[2]["context"]
+        claim = claim_context["claims"][0]
+        claim_context["claims"][0] = dict(reversed(tuple(claim.items())))
+    elif mutation == "waiting_key_order":
+        claim_context = operations[2]["context"]
+        waiting = claim_context["claims"][0]["waiting_key_requests"][0]
+        claim_context["claims"][0]["waiting_key_requests"][0] = dict(
+            reversed(tuple(waiting.items()))
+        )
+    elif mutation == "rerequest_key_order":
+        claim_context = operations[2]["context"]
+        rerequest = claim_context["claims"][0]["rerequest_events"][0]
+        claim_context["claims"][0]["rerequest_events"][0] = dict(
+            reversed(tuple(rerequest.items()))
+        )
+    elif mutation == "context_missing_key":
+        claim_context = operations[2]["context"]
+        del claim_context["claims"][0]["waiting_key_requests"][0]["algorithm"]
+    elif mutation == "context_extra_key":
+        claim_context = operations[2]["context"]
+        claim_context["claims"][0]["waiting_key_requests"][0]["extra"] = None
+    elif mutation == "duplicate_rerequest_owner":
+        claim_context = operations[2]["context"]
+        dummy_context = operations[4]["context"]
+        dummy_context["rerequest_events"] = [
+            dict(claim_context["claims"][0]["rerequest_events"][0])
+        ]
+        operation = operations[4]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        content = body["messages"]["@dummy:example.org"]["DUMMY"]
+        body["messages"] = {"@claim:example.org": {"CLAIM": content}}
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(4, body_json)
+    elif mutation == "claim_rerequests_with_empty_first_dummy":
+        dummy_context = operations[4]["context"]
+        dummy_context["rerequest_events"] = []
+        operation = operations[4]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        content = body["messages"]["@dummy:example.org"]["DUMMY"]
+        body["messages"] = {"@claim:example.org": {"CLAIM": content}}
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(4, body_json)
+    elif mutation == "to_device_transaction":
+        operations[3]["transaction_id"] = "12345678-1234-5678-9234-567812345678"
+    elif mutation == "to_device_two_recipients":
+        operation = operations[3]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        body["messages"]["@other:example.org"] = {"OTHER": {"value": "other"}}
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(3, body_json)
+    elif mutation == "to_device_two_devices":
+        operation = operations[3]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        body["messages"]["@generic:example.org"]["OTHER"] = {"value": "other"}
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(3, body_json)
+    elif mutation == "to_device_recipient":
+        operation = operations[4]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        target = body["messages"].pop("@dummy:example.org")
+        body["messages"]["@other:example.org"] = target
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(4, body_json)
+    elif mutation == "to_device_content":
+        operation = operations[5]
+        body = json.loads(base64.b64decode(operation["body_json"], validate=True))
+        content = body["messages"]["@room-key:example.org"]["ROOMKEY"]
+        content["body"]["session_id"] = "other-session"
+        body_json = _outbound_codec_bytes(body)
+        operation["body_json"] = _outbound_codec_b64(body_json)
+        operation["transaction_id"] = _outbound_codec_transaction_id(5, body_json)
+    elif mutation == "to_device_event_type":
+        operations[5]["event_type"] = "m.room.encrypted"
+    elif mutation == "dummy_event_type":
+        operations[4]["event_type"] = "org.example.generic"
+    elif mutation == "room_key_context":
+        operations[5]["context"]["algorithm"] = "m.megolm.v2"
+    elif mutation == "settled_context":
+        for operation in operations:
+            operation["state"] = "settled"
+            if operation is not operations[3]:
+                operation["context"] = None
+    else:
+        raise AssertionError(f"unknown outbound mutation: {mutation}")
+    return value
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "kind_reorder",
+        "duplicate_singleton",
+        "state_order",
+        "invalid_state",
+        "upload_unknown",
+        "upload_empty",
+        "upload_missing_one_time_keys",
+        "upload_empty_one_time_keys",
+        "upload_empty_fallback_keys",
+        "query_body",
+        "non_to_device_transaction",
+        "non_to_device_event_type",
+        "claim_target",
+        "claim_key_type",
+        "duplicate_claim",
+        "duplicate_waiting",
+        "claim_without_reason",
+        "rerequests_without_wedge",
+        "waiting_source",
+        "rerequest_source",
+        "claim_key_order",
+        "waiting_key_order",
+        "rerequest_key_order",
+        "context_missing_key",
+        "context_extra_key",
+        "duplicate_rerequest_owner",
+        "claim_rerequests_with_empty_first_dummy",
+        "to_device_transaction",
+        "to_device_two_recipients",
+        "to_device_two_devices",
+        "to_device_recipient",
+        "to_device_content",
+        "to_device_event_type",
+        "dummy_event_type",
+        "room_key_context",
+        "settled_context",
+    ),
+)
+def test_outbound_maintenance_codec_rejects_semantic_mutation(
+    mutation: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        journal_rows_module._outbound_maintenance_from_dict(
+            _mutated_outbound_codec_value(mutation),
+            frame_id=_OUTBOUND_CODEC_FRAME_ID,
+        )
 
 
 def test_prepared_reduction_rejects_section_without_membership_claim() -> None:

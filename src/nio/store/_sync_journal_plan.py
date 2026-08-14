@@ -13,6 +13,7 @@ from ..ingest.model import (
     LossReason,
     LossRecord,
     RecordKind,
+    RoomSnapshot,
     _CallbackRoute,
     _DecryptedToDeviceKind,
     _DecryptionDisposition,
@@ -910,6 +911,11 @@ def plan_frame_materialization(
                 )
                 else pending_hydrations.get(room.after.room_id)
             ),
+            (
+                aggregate_by_room[room.after.room_id].room_snapshot
+                if room.after.room_id in aggregate_by_room
+                else None
+            ),
         )
         for room in proposal.room_proposals
         if (
@@ -933,6 +939,7 @@ def plan_frame_materialization(
                     room_sequences[ephemeral_room_id],
                     revision,
                     None if capacity_reason is not None else pending,
+                    aggregate.room_snapshot,
                 ),
             )
     return MaterializationPlan(
@@ -1004,6 +1011,19 @@ def plan_prepared_frame_materialization(
     }
     if len(room_result_by_id) != len(proposal.room_results):
         raise ValueError("prepared reduction has duplicate room results")
+    snapshot_by_room = {
+        snapshot.room_id: snapshot for snapshot in prepared.room_snapshots
+    }
+    if len(snapshot_by_room) != len(prepared.room_snapshots):
+        raise ValueError("prepared room snapshots must have unique room IDs")
+    for room_id, snapshot in snapshot_by_room.items():
+        result = room_result_by_id.get(room_id)
+        if result is None or (
+            snapshot.own_user_id != account_id
+            or snapshot.membership_epoch != result.after.membership_epoch
+            or snapshot.own_membership != result.after.membership
+        ):
+            raise ValueError("prepared room snapshot does not match final continuity")
     room_sequences: dict[str, int] = {}
     pending_hydrations: dict[str, HydrationIntent | None] = {}
     for room_id, result in room_result_by_id.items():
@@ -1773,19 +1793,29 @@ def plan_prepared_frame_materialization(
             raise ValueError("mandatory Work exceeds the immutable total envelope")
         return None
 
-    room_values = tuple(
-        RoomAggregateValue(
-            result.after,
-            room_sequences[room_id],
-            revision,
-            pending_hydrations[room_id],
-        )
-        for room_id, result in room_result_by_id.items()
-        if (stored := aggregate_by_room.get(room_id)) is None
-        or result.after != stored.continuity
-        or room_sequences[room_id] != stored.next_room_sequence
-        or pending_hydrations[room_id] != stored.pending_hydration
-    )
+    room_values_list: list[RoomAggregateValue] = []
+    for room_id, result in room_result_by_id.items():
+        stored = aggregate_by_room.get(room_id)
+        room_snapshot: RoomSnapshot | None = snapshot_by_room.get(room_id)
+        if room_snapshot is None and stored is not None:
+            room_snapshot = stored.room_snapshot
+        if (
+            stored is None
+            or result.after != stored.continuity
+            or room_sequences[room_id] != stored.next_room_sequence
+            or pending_hydrations[room_id] != stored.pending_hydration
+            or room_snapshot != stored.room_snapshot
+        ):
+            room_values_list.append(
+                RoomAggregateValue(
+                    result.after,
+                    room_sequences[room_id],
+                    revision,
+                    pending_hydrations[room_id],
+                    room_snapshot,
+                )
+            )
+    room_values = tuple(room_values_list)
     return MaterializationPlan(
         room_values,
         tuple(inserts),

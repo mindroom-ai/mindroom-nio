@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import NamedTuple
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from ..event_provenance import TimelineEventProvenance
+from ._json import canonical_json, load_internal_json
 
 
 def _require_exact(value: object, expected: type, field_name: str) -> None:
@@ -163,11 +164,125 @@ class SystemOrigin:
         _require_exact(self.operation_id, UUID, "operation_id")
 
 
+_LOCAL_MEMBERSHIPS = frozenset({"invite", "join", "knock", "leave", "ban"})
+_LOCAL_MEMBERSHIP_SOURCE_FIELDS = (
+    "event_id",
+    "membership",
+    "membership_epoch",
+    "membership_provenance",
+    "previous_membership",
+    "previous_membership_epoch",
+    "source_kind",
+    "source_record_id",
+    "timeline_provenance",
+)
+_LOCAL_ROOM_LIFECYCLE_DOMAIN = "nio:room-lifecycle:v1"
+
+
+class _LocalMembershipEvidence(NamedTuple):
+    previous_membership: str
+    previous_epoch: int
+    current_membership: str
+    current_epoch: int
+
+
+def _local_membership_transition_epoch(
+    previous_membership: str,
+    previous_epoch: int,
+    current_membership: str,
+) -> int:
+    _require_exact(previous_membership, str, "previous_membership")
+    _require_exact(previous_epoch, int, "previous_epoch")
+    _require_exact(current_membership, str, "current_membership")
+    if (
+        previous_membership not in _LOCAL_MEMBERSHIPS
+        or current_membership not in {"join", "leave"}
+        or previous_membership == current_membership
+        or previous_epoch < 0
+    ):
+        raise ValueError("local membership transition is invalid")
+    return previous_epoch + int(
+        previous_membership == "join" and current_membership != "join"
+    )
+
+
+def _local_membership_record_id(operation_id: UUID) -> str:
+    _require_exact(operation_id, UUID, "operation_id")
+    return str(uuid5(operation_id, _LOCAL_ROOM_LIFECYCLE_DOMAIN))
+
+
+def _local_membership_source_json(
+    previous_membership: str,
+    previous_epoch: int,
+    current_membership: str,
+) -> bytes:
+    membership_epoch = _local_membership_transition_epoch(
+        previous_membership,
+        previous_epoch,
+        current_membership,
+    )
+    return canonical_json(
+        {
+            "event_id": None,
+            "membership": current_membership,
+            "membership_epoch": membership_epoch,
+            "membership_provenance": "local",
+            "previous_membership": previous_membership,
+            "previous_membership_epoch": previous_epoch,
+            "source_kind": "local",
+            "source_record_id": None,
+            "timeline_provenance": None,
+        }
+    )
+
+
+def _local_membership_evidence(source_json: bytes) -> _LocalMembershipEvidence:
+    source = load_internal_json(
+        source_json,
+        "local membership lifecycle source",
+    )
+    if type(source) is not dict or tuple(source) != _LOCAL_MEMBERSHIP_SOURCE_FIELDS:
+        raise ValueError("local membership lifecycle source is invalid")
+    previous_membership = source["previous_membership"]
+    previous_epoch = source["previous_membership_epoch"]
+    current_membership = source["membership"]
+    if (
+        type(previous_membership) is not str
+        or type(previous_epoch) is not int
+        or type(current_membership) is not str
+    ):
+        raise ValueError("local membership lifecycle source is invalid")
+    current_epoch = _local_membership_transition_epoch(
+        previous_membership,
+        previous_epoch,
+        current_membership,
+    )
+    expected = {
+        "event_id": None,
+        "membership": current_membership,
+        "membership_epoch": current_epoch,
+        "membership_provenance": "local",
+        "previous_membership": previous_membership,
+        "previous_membership_epoch": previous_epoch,
+        "source_kind": "local",
+        "source_record_id": None,
+        "timeline_provenance": None,
+    }
+    if source != expected or source_json != canonical_json(expected):
+        raise ValueError("local membership lifecycle source is invalid")
+    return _LocalMembershipEvidence(
+        previous_membership,
+        previous_epoch,
+        current_membership,
+        current_epoch,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EventRecord:
     record_id: str
     kind: RecordKind
-    origin: RecordOrigin
+    origin: RecordOrigin | SystemOrigin
     room_id: str | None
     membership_epoch: int | None
     room_sequence: int | None
@@ -179,7 +294,12 @@ class EventRecord:
     def __post_init__(self) -> None:
         _require_exact(self.record_id, str, "record_id")
         _require_exact(self.kind, RecordKind, "kind")
-        if type(self.origin) is not RecordOrigin:
+        if type(self.origin) not in (RecordOrigin, SystemOrigin):
+            raise TypeError("EventRecord origin must be a RecordOrigin")
+        if type(self.origin) is SystemOrigin and (
+            self.kind is not RecordKind.ROOM_LIFECYCLE
+            or self.origin.kind is not SystemOriginKind.MEMBERSHIP_CHANGE
+        ):
             raise TypeError("EventRecord origin must be a RecordOrigin")
         _require_optional_exact(self.room_id, str, "room_id")
         _require_optional_exact(self.membership_epoch, int, "membership_epoch")
@@ -192,6 +312,27 @@ class EventRecord:
         )
         _require_exact(self.source_json, bytes, "source_json")
         _require_optional_exact(self.clear_json, bytes, "clear_json")
+        if type(self.origin) is SystemOrigin:
+            self._validate_local_membership_lifecycle()
+
+    def _validate_local_membership_lifecycle(self) -> None:
+        origin = self.origin
+        assert type(origin) is SystemOrigin
+        if (
+            not self.room_id
+            or self.membership_epoch is None
+            or self.membership_epoch < 0
+            or self.room_sequence is None
+            or self.room_sequence < 0
+            or self.event_id is not None
+            or self.provenance is not None
+            or self.clear_json is not None
+            or self.record_id != _local_membership_record_id(origin.operation_id)
+        ):
+            raise ValueError("local membership lifecycle EventRecord is invalid")
+        evidence = _local_membership_evidence(self.source_json)
+        if self.membership_epoch != evidence.current_epoch:
+            raise ValueError("local membership lifecycle source is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +584,12 @@ class LossRecord:
         _require_exact(self.loss_id, str, "loss_id")
         if type(self.origin) not in (RecordOrigin, SystemOrigin):
             raise TypeError("origin must be RecordOrigin or SystemOrigin")
+        if type(self.origin) is SystemOrigin and (
+            self.origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+        ):
+            raise ValueError(
+                "membership-change SystemOrigin is reserved for lifecycle events"
+            )
         _require_exact(self.room_id, str, "room_id")
         _require_exact(self.membership_epoch, int, "membership_epoch")
         _require_exact(self.reason, LossReason, "reason")

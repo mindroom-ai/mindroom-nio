@@ -9,7 +9,6 @@ import nio.ingest as ingest
 from nio.ingest import (
     BatchIntegrityError,
     BatchRef,
-    ConsumerBinding,
     EventRecord,
     LossBoundary,
     LossReason,
@@ -360,6 +359,29 @@ def test_transport_and_system_loss_origins_round_trip() -> None:
     assert isinstance(decoded.records[1].origin, SystemOrigin)
 
 
+def test_local_membership_lifecycle_event_round_trips() -> None:
+    record = EventRecord(
+        str(uuid5(OPERATION_ID, "nio:room-lifecycle:v1")),
+        RecordKind.ROOM_LIFECYCLE,
+        SystemOrigin(SystemOriginKind.MEMBERSHIP_CHANGE, OPERATION_ID),
+        "!local:example.org",
+        1,
+        4,
+        None,
+        None,
+        (
+            b'{"event_id":null,"membership":"leave","membership_epoch":1,'
+            b'"membership_provenance":"local","previous_membership":"join",'
+            b'"previous_membership_epoch":0,"source_kind":"local",'
+            b'"source_record_id":null,"timeline_provenance":null}'
+        ),
+        None,
+    )
+    payload = canonical_batch_payload(make_batch(record))
+
+    assert _batch_from_payload(payload) == make_batch(record)
+
+
 @pytest.mark.parametrize("wire_value", ("consumer_reset", "source_rebind"))
 def test_retained_system_loss_origin_values_round_trip(wire_value: str) -> None:
     kind = SystemOriginKind(wire_value)
@@ -385,6 +407,48 @@ def test_retained_system_loss_origin_values_round_trip(wire_value: str) -> None:
 
     assert f'"kind":"{wire_value}"'.encode() in payload
     assert _batch_from_payload(payload) == batch
+
+
+def test_decode_rejects_membership_change_system_loss_origin() -> None:
+    origin = SystemOrigin(SystemOriginKind.FRESH_START, OPERATION_ID)
+    boundary = LossBoundary(None, None, None, None)
+    loss = LossRecord(
+        loss_id(
+            origin,
+            "!system:example.org",
+            0,
+            LossReason.BASELINE_LOST,
+            boundary,
+        ),
+        origin,
+        "!system:example.org",
+        0,
+        LossReason.BASELINE_LOST,
+        boundary,
+        b"{}",
+    )
+    root = json.loads(canonical_batch_payload(make_batch(loss)))
+    record = root["records"][0]
+    membership_origin = SystemOrigin(
+        SystemOriginKind.MEMBERSHIP_CHANGE,
+        OPERATION_ID,
+    )
+    record["origin"]["kind"] = "membership_change"
+    record["loss_id"] = loss_id(
+        membership_origin,
+        "!system:example.org",
+        0,
+        LossReason.BASELINE_LOST,
+        boundary,
+    )
+    payload = json.dumps(
+        root,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(ValueError, match="membership"):
+        _batch_from_payload(payload)
 
 
 def test_system_loss_rejects_kind_or_operation_inconsistent_with_loss_id() -> None:

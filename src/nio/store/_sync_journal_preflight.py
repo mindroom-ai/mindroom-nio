@@ -31,7 +31,16 @@ from ..ingest.errors import (
     JournalConflictError,
     JournalIntegrityError,
 )
-from ..ingest.model import RecordOrigin, TransportKind
+from ..ingest.model import (
+    EventRecord,
+    RecordKind,
+    RecordOrigin,
+    SystemOrigin,
+    SystemOriginKind,
+    TransportKind,
+    _local_membership_evidence,
+    _LocalMembershipEvidence,
+)
 from ..ingest.sliding import (
     SlidingCursor,
     SlidingRangeAckMode,
@@ -44,7 +53,7 @@ from ..ingest.source import (
     _classic_cursor_from_json,
     canonical_classic_cursor,
 )
-from ..ingest.state import OwnerView, SourceState
+from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._ingestion_store_owner import IngestionStoreOwner
 from ._ingestion_store_owner import StableFileLock as StableFileLock
 from ._sync_journal_values import SQLITE_INT_MAX, DeliveryState, RoomAggregateValue
@@ -1267,7 +1276,7 @@ def _authenticate_full_ingestion_graph(
     frame_ids = rows._classify_frame_ids()
     if frame_ids != {header.frame_id for header in headers}:
         raise JournalIntegrityError("authenticated Frame inventory changed")
-    normalized_frames = []
+    authenticated_frames = []
     for header in headers:
         if (
             header.staged_revision > owner.revision
@@ -1287,35 +1296,44 @@ def _authenticate_full_ingestion_graph(
             != header
         ):
             raise JournalIntegrityError("authenticated Frame header changed")
-        staged = rows._decode_frame_row(
+        state = rows._decode_frame_state(
             header.frame_id,
             cast("Mapping[str, object]", stored),
             owner,
             drain_header_authenticated=True,
         )
-        normalized_frames.append((header, staged, _renormalized_frame(owner, staged)))
+        if type(state) is StagedFrame:
+            staged_state = cast("StagedFrame", state)
+            normalized = _renormalized_frame(owner, staged_state)
+            request_cursor = staged_state.response.request.request_cursor_json
+            candidate_cursor = normalized.candidate_cursor_json
+        else:
+            request_cursor = state.request_cursor_json
+            candidate_cursor = state.candidate_cursor_json
+        authenticated_frames.append((header, request_cursor, candidate_cursor))
     if any(
         (successor[0].source_epoch, successor[0].request_id)
         <= (previous[0].source_epoch, previous[0].request_id)
-        for previous, successor in zip(normalized_frames, normalized_frames[1:])
+        for previous, successor in zip(authenticated_frames, authenticated_frames[1:])
     ):
         raise JournalIntegrityError("persisted Frame revision order is invalid")
-    by_source = normalized_frames
+    by_source = authenticated_frames
     for previous, successor in zip(by_source, by_source[1:]):
-        previous_header, _previous_staged, previous_normalized = previous
-        successor_header, successor_staged, _successor_normalized = successor
+        previous_header, _previous_request_cursor, previous_candidate_cursor = previous
+        successor_header, successor_request_cursor, _successor_candidate_cursor = (
+            successor
+        )
         if (
             successor_header.source_epoch == previous_header.source_epoch
             and successor_header.request_id == previous_header.request_id + 1
-            and successor_staged.response.request.request_cursor_json
-            != previous_normalized.candidate_cursor_json
+            and successor_request_cursor != previous_candidate_cursor
         ):
             raise JournalIntegrityError("persisted Frame cursor chain is broken")
     current = [
         item for item in by_source if item[0].source_epoch == source_state.source_epoch
     ]
     if current and current[-1][0].request_id == source_state.next_request_id - 1:
-        if current[-1][2].candidate_cursor_json != source_state.cursor_json:
+        if current[-1][2] != source_state.cursor_json:
             raise JournalIntegrityError("persisted Frame tail does not match Source")
 
     inventory = rows._load_task3_work_inventory(owner)
@@ -1344,10 +1362,75 @@ def _authenticate_full_ingestion_graph(
             raise JournalIntegrityError("Aggregate origin exceeds source frontier")
 
     held_identities: set[tuple[str, int, int]] = set()
+    local_work_by_room: dict[
+        str,
+        list[tuple[int, int, int, _LocalMembershipEvidence]],
+    ] = {}
     for storage, authenticated in zip(
         inventory.storage_rows, inventory.work, strict=True
     ):
         origin = authenticated.value.origin
+        if type(origin) is SystemOrigin:
+            if (
+                type(authenticated.value) is not EventRecord
+                or origin.kind is not SystemOriginKind.MEMBERSHIP_CHANGE
+                or authenticated.value.kind is not RecordKind.ROOM_LIFECYCLE
+                or authenticated.status != "ready"
+                or authenticated.metadata is not None
+                or storage[4] != str(origin.operation_id)
+                or storage[4] in headers_by_id
+            ):
+                raise JournalIntegrityError("local Work origin is invalid")
+            value = authenticated.value
+            room_id = cast("str", value.room_id)
+            aggregate = aggregates.get(room_id)
+            if aggregate is None:
+                raise JournalIntegrityError("local Work requires Aggregate")
+            room_sequence = cast("int", value.room_sequence)
+            membership_epoch = cast("int", value.membership_epoch)
+            created_revision = cast("int", storage[10])
+            if room_sequence >= aggregate.next_room_sequence:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate sequence frontier"
+                )
+            if membership_epoch > aggregate.continuity.membership_epoch:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate epoch frontier"
+                )
+            if created_revision > aggregate.updated_revision:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate revision frontier"
+                )
+            try:
+                evidence = _local_membership_evidence(value.source_json)
+            except (TypeError, ValueError) as error:
+                raise JournalIntegrityError(
+                    "local Work membership evidence is invalid"
+                ) from error
+            if aggregate.updated_revision == created_revision:
+                continuity = aggregate.continuity
+                snapshot = aggregate.room_snapshot
+                if (
+                    continuity.membership != evidence.current_membership
+                    or continuity.membership_epoch != membership_epoch
+                    or aggregate.next_room_sequence != room_sequence + 1
+                    or continuity.baseline is not None
+                    or continuity.gap is not None
+                    or continuity.hydration_id is not None
+                    or aggregate.pending_hydration is not None
+                    or snapshot is not None
+                    and (
+                        snapshot.membership_epoch != membership_epoch
+                        or snapshot.own_membership != evidence.current_membership
+                    )
+                ):
+                    raise JournalIntegrityError(
+                        "local Work does not match Aggregate state"
+                    )
+            local_work_by_room.setdefault(room_id, []).append(
+                (created_revision, room_sequence, membership_epoch, evidence)
+            )
+            continue
         if type(origin) is not RecordOrigin:
             raise JournalIntegrityError("Work origin is not transport-bound")
         if origin.source_epoch >= owner.next_source_epoch:
@@ -1382,6 +1465,34 @@ def _authenticate_full_ingestion_graph(
             or room_sequence >= aggregate.next_room_sequence
         ):
             raise JournalIntegrityError("HELD Work does not match Aggregate frontier")
+
+    for local_work in local_work_by_room.values():
+        ordered = sorted(local_work)
+        for previous_local, current_local in zip(
+            ordered,
+            ordered[1:],
+            strict=False,
+        ):
+            if current_local[0] <= previous_local[0]:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate revision frontier"
+                )
+            if current_local[1] <= previous_local[1]:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate sequence frontier"
+                )
+            if current_local[2] < previous_local[2]:
+                raise JournalIntegrityError(
+                    "local Work exceeds Aggregate epoch frontier"
+                )
+            previous_evidence = previous_local[3]
+            current_evidence = current_local[3]
+            if current_local[1] == previous_local[1] + 1 and (
+                current_evidence.previous_membership
+                != previous_evidence.current_membership
+                or current_evidence.previous_epoch != previous_evidence.current_epoch
+            ):
+                raise JournalIntegrityError("local Work membership chain is invalid")
 
     delivery = _decode_delivery_state(cast("Mapping[str, object]", meta), owner)
     if delivery.next_sequence > owner.revision or (

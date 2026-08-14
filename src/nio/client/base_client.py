@@ -79,6 +79,7 @@ from ..ingest.model import (
 from ..ingest.reducer import RoomContinuity
 from ..ingest.source import (
     RoomSection,
+    RoomSegment,
     SyncFrame,
     _normalized_ephemeral_envelopes,
 )
@@ -170,6 +171,12 @@ def _require_parsed_ingestion_event(
 
 
 _ParsedIngestionEvent = tuple[bytes, dict[Any, Any], Any]
+_ParsedIngestionRoomSegment = tuple[
+    RoomSegment,
+    tuple[_ParsedIngestionEvent, ...],
+    tuple[_ParsedIngestionEvent, ...],
+    tuple[_ParsedIngestionEvent, ...],
+]
 
 
 def _parse_ingestion_events(
@@ -187,6 +194,62 @@ def _parse_ingestion_events(
             parser(deepcopy(raw)),
         )
         for payload in payloads
+    )
+
+
+def _parse_ingestion_room_segment(
+    segment: RoomSegment,
+) -> _ParsedIngestionRoomSegment:
+    state_parser = (
+        InviteEvent.parse_event
+        if segment.section in {RoomSection.INVITE, RoomSection.KNOCK}
+        else Event.parse_event
+    )
+    return (
+        segment,
+        _parse_ingestion_events(segment.state_json, "state event", state_parser),
+        _parse_ingestion_events(
+            segment.timeline_json,
+            "timeline event",
+            Event.parse_event,
+        ),
+        _parse_ingestion_events(
+            segment.room_account_data_json,
+            "room account-data event",
+            AccountDataEvent.parse_event,
+        ),
+    )
+
+
+def _encrypted_room_ids_from_parsed_segments(
+    parsed_segments: tuple[_ParsedIngestionRoomSegment, ...],
+    live_room_ids: set[str],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                segment.room_id
+                for segment, state, timeline, _account_data in parsed_segments
+                if segment.room_id in live_room_ids
+                and any(
+                    isinstance(event, RoomEncryptionEvent)
+                    for _payload, _raw, event in (*state, *timeline)
+                )
+            }
+        )
+    )
+
+
+def _prepared_frame_encrypted_room_ids(
+    frame: SyncFrame,
+    live_room_ids: set[str],
+) -> tuple[str, ...]:
+    """Rebuild the frame-local encryption effect from authenticated source."""
+    return _encrypted_room_ids_from_parsed_segments(
+        tuple(
+            _parse_ingestion_room_segment(segment) for segment in frame.room_segments
+        ),
+        live_room_ids,
     )
 
 
@@ -332,6 +395,129 @@ def _prepared_queued_to_device_message(
         request_context[2],
         request_context[3],
         rerequest_events,
+    )
+
+
+def _prepared_crypto_delta_snapshot(
+    frame: SyncFrame,
+    olm: Olm,
+    encrypted_room_ids: tuple[str, ...],
+) -> _PreparedCryptoDelta:
+    """Freeze the Task4C-local crypto state without consuming any of it."""
+    key_claim_map = (
+        olm.get_users_for_key_claiming()
+        if olm.wedged_devices or olm.key_request_devices_no_session
+        else {}
+    )
+    if not isinstance(key_claim_map, dict):
+        raise TypeError("key-claim map must be a dict")
+    wedged_targets = {
+        (device.user_id, device.device_id) for device in olm.wedged_devices
+    }
+    waiting_targets = {
+        (device.user_id, device.device_id)
+        for device in olm.key_request_devices_no_session
+    }
+    first_dummy_targets = {
+        (message.recipient, message.recipient_device)
+        for message in olm.outgoing_to_device_messages
+        if isinstance(message, DummyMessage)
+    }
+    rerequest_buckets: dict[
+        tuple[str, str],
+        tuple[_PreparedMegolmRerequest, ...],
+    ] = {}
+    for target, queued_events in olm.key_re_requests_events.items():
+        prepared_events: list[_PreparedMegolmRerequest] = []
+        seen_sessions: set[str] = set()
+        for event in queued_events:
+            if type(event) is not MegolmEvent:
+                raise TypeError("Megolm rerequest event is invalid")
+            if event.session_id in seen_sessions:
+                continue
+            prepared_event = _prepared_megolm_rerequest(event)
+            if (
+                prepared_event.sender_user_id,
+                prepared_event.sender_device_id,
+            ) != target:
+                raise ValueError("Megolm rerequest disagrees with bucket target")
+            seen_sessions.add(prepared_event.session_id)
+            prepared_events.append(prepared_event)
+        rerequest_buckets[target] = tuple(prepared_events)
+
+    key_claims: list[_PreparedKeyClaim] = []
+    for user_id in sorted(key_claim_map):
+        device_ids = key_claim_map[user_id]
+        for device_id in sorted(set(device_ids)):
+            target = (user_id, device_id)
+            waiting = olm.key_requests_waiting_for_session.get(target, {})
+            waiting_requests: list[_PreparedWaitingKeyRequest] = []
+            for request_id, event in waiting.items():
+                if type(request_id) is not str or type(event) is not RoomKeyRequest:
+                    raise TypeError("waiting room-key request is invalid")
+                prepared_request = _prepared_waiting_key_request(event)
+                if (request_id, user_id, device_id) != (
+                    prepared_request.request_id,
+                    prepared_request.sender_user_id,
+                    prepared_request.requesting_device_id,
+                ):
+                    raise ValueError(
+                        "waiting room-key request disagrees with claim target"
+                    )
+                waiting_requests.append(prepared_request)
+            key_claims.append(
+                _PreparedKeyClaim(
+                    user_id,
+                    device_id,
+                    target in wedged_targets,
+                    target in waiting_targets,
+                    tuple(waiting_requests),
+                    (
+                        ()
+                        if target in first_dummy_targets
+                        else rerequest_buckets.get(target, ())
+                    ),
+                )
+            )
+    owned_waiting_targets = {
+        (claim.user_id, claim.device_id) for claim in key_claims if claim.was_waiting
+    }
+    if any(
+        requests and target not in owned_waiting_targets
+        for target, requests in olm.key_requests_waiting_for_session.items()
+    ):
+        raise ValueError("waiting room-key-request bucket has no claim owner")
+
+    bound_dummy_targets: set[tuple[str, str]] = set()
+    queued_to_device_messages: list[_PreparedQueuedToDeviceMessage] = []
+    for message in olm.outgoing_to_device_messages:
+        rerequest_events: tuple[_PreparedMegolmRerequest, ...] = ()
+        if isinstance(message, DummyMessage):
+            target = (message.recipient, message.recipient_device)
+            if target not in bound_dummy_targets:
+                bound_dummy_targets.add(target)
+                rerequest_events = rerequest_buckets.get(target, ())
+        queued_to_device_messages.append(
+            _prepared_queued_to_device_message(message, rerequest_events)
+        )
+    owned_rerequest_targets = bound_dummy_targets | {
+        (claim.user_id, claim.device_id)
+        for claim in key_claims
+        if claim.rerequest_events
+    }
+    if any(
+        events and target not in owned_rerequest_targets
+        for target, events in rerequest_buckets.items()
+    ):
+        raise ValueError("Megolm rerequest bucket has no claim or dummy owner")
+    return _PreparedCryptoDelta(
+        encrypted_room_ids,
+        tuple(sorted(olm.users_for_key_query)),
+        olm.uploaded_key_count,
+        frame.one_time_key_counts_json,
+        frame.unused_fallback_key_types_json,
+        tuple(key_claims),
+        tuple(queued_to_device_messages),
     )
 
 
@@ -572,6 +758,7 @@ class Client:
         self.olm: Olm | None = None
         self.store: MatrixStore | None = None
         self._ingestion_store_snapshot: _IngestionStoreSnapshot | None = None
+        self._ingestion_poisoned = False
         self.config = config or ClientConfig()
 
         self.user_id = ""
@@ -760,8 +947,18 @@ class Client:
             if self.config.store_sync_tokens:
                 self.loaded_sync_token = self.store.load_sync_token()
 
+    def _assert_ingestion_not_poisoned(self) -> None:
+        if self._ingestion_poisoned:
+            raise LocalProtocolError(
+                "owned ingestion session is poisoned; reopen with a fresh client"
+            )
+
+    def _poison_ingestion(self) -> None:
+        self._ingestion_poisoned = True
+
     def _attach_ingestion_store(self, store: MatrixStore) -> None:
         """Attach one exact borrowed SqliteStore before constructing Olm."""
+        self._assert_ingestion_not_poisoned()
         if type(store) is not SqliteStore:
             raise LocalProtocolError("owned ingestion requires exact SqliteStore")
         if (
@@ -1100,6 +1297,7 @@ class Client:
         prior_continuities: tuple[RoomContinuity, ...],
     ) -> _PreparedIngestionFrame:
         """Apply one owned durable Frame without invoking callbacks."""
+        self._assert_ingestion_not_poisoned()
         store = self.store
         olm = self.olm
         if (
@@ -1171,29 +1369,9 @@ class Client:
             "to-device event",
             ToDeviceEvent.parse_event,
         )
-        parsed_segments = []
-        for segment in frame.room_segments:
-            state_parser = (
-                InviteEvent.parse_event
-                if segment.section in {RoomSection.INVITE, RoomSection.KNOCK}
-                else Event.parse_event
-            )
-            parsed_segments.append(
-                (
-                    segment,
-                    _parse_ingestion_events(
-                        segment.state_json, "state event", state_parser
-                    ),
-                    _parse_ingestion_events(
-                        segment.timeline_json, "timeline event", Event.parse_event
-                    ),
-                    _parse_ingestion_events(
-                        segment.room_account_data_json,
-                        "room account-data event",
-                        AccountDataEvent.parse_event,
-                    ),
-                )
-            )
+        parsed_segments = tuple(
+            _parse_ingestion_room_segment(segment) for segment in frame.room_segments
+        )
 
         ephemeral_by_room: dict[str, list[_ParsedIngestionEvent]] = defaultdict(list)
         for room_id, payload in _normalized_ephemeral_envelopes(frame.ephemeral_json):
@@ -1657,114 +1835,12 @@ class Client:
             _PreparationPhase.COLLECTED_KEY_REQUEST,
         )
 
-        key_claim_map = (
-            olm.get_users_for_key_claiming()
-            if olm.wedged_devices or olm.key_request_devices_no_session
-            else {}
-        )
-        if not isinstance(key_claim_map, dict):
-            raise TypeError("key-claim map must be a dict")
-        wedged_targets = {
-            (device.user_id, device.device_id) for device in olm.wedged_devices
-        }
-        waiting_targets = {
-            (device.user_id, device.device_id)
-            for device in olm.key_request_devices_no_session
-        }
-        first_dummy_targets = {
-            (message.recipient, message.recipient_device)
-            for message in olm.outgoing_to_device_messages
-            if isinstance(message, DummyMessage)
-        }
-        rerequest_buckets: dict[
-            tuple[str, str],
-            tuple[_PreparedMegolmRerequest, ...],
-        ] = {}
-        for target, queued_events in olm.key_re_requests_events.items():
-            prepared_events: list[_PreparedMegolmRerequest] = []
-            seen_sessions: set[str] = set()
-            for event in queued_events:
-                if type(event) is not MegolmEvent:
-                    raise TypeError("Megolm rerequest event is invalid")
-                if event.session_id in seen_sessions:
-                    continue
-                prepared_event = _prepared_megolm_rerequest(event)
-                if (
-                    prepared_event.sender_user_id,
-                    prepared_event.sender_device_id,
-                ) != target:
-                    raise ValueError("Megolm rerequest disagrees with bucket target")
-                seen_sessions.add(prepared_event.session_id)
-                prepared_events.append(prepared_event)
-            rerequest_buckets[target] = tuple(prepared_events)
-
-        key_claims: list[_PreparedKeyClaim] = []
-        for user_id in sorted(key_claim_map):
-            device_ids = key_claim_map[user_id]
-            for device_id in sorted(set(device_ids)):
-                target = (user_id, device_id)
-                waiting = olm.key_requests_waiting_for_session.get(target, {})
-                waiting_requests: list[_PreparedWaitingKeyRequest] = []
-                for request_id, event in waiting.items():
-                    if type(request_id) is not str or type(event) is not RoomKeyRequest:
-                        raise TypeError("waiting room-key request is invalid")
-                    prepared_request = _prepared_waiting_key_request(event)
-                    if (request_id, user_id, device_id) != (
-                        prepared_request.request_id,
-                        prepared_request.sender_user_id,
-                        prepared_request.requesting_device_id,
-                    ):
-                        raise ValueError(
-                            "waiting room-key request disagrees with claim target"
-                        )
-                    waiting_requests.append(prepared_request)
-                key_claims.append(
-                    _PreparedKeyClaim(
-                        user_id,
-                        device_id,
-                        target in wedged_targets,
-                        target in waiting_targets,
-                        tuple(waiting_requests),
-                        (
-                            ()
-                            if target in first_dummy_targets
-                            else rerequest_buckets.get(target, ())
-                        ),
-                    )
-                )
-        owned_waiting_targets = {
-            (claim.user_id, claim.device_id)
-            for claim in key_claims
-            if claim.was_waiting
-        }
-        if any(
-            requests and target not in owned_waiting_targets
-            for target, requests in olm.key_requests_waiting_for_session.items()
+        frozen_encrypted_room_ids = tuple(sorted(encrypted_room_ids))
+        if frozen_encrypted_room_ids != _encrypted_room_ids_from_parsed_segments(
+            parsed_segments,
+            set(self.rooms) | set(self.invited_rooms),
         ):
-            raise ValueError("waiting room-key-request bucket has no claim owner")
-
-        bound_dummy_targets: set[tuple[str, str]] = set()
-        queued_to_device_messages: list[_PreparedQueuedToDeviceMessage] = []
-        for message in olm.outgoing_to_device_messages:
-            rerequest_events: tuple[_PreparedMegolmRerequest, ...] = ()
-            if isinstance(message, DummyMessage):
-                target = (message.recipient, message.recipient_device)
-                if target not in bound_dummy_targets:
-                    bound_dummy_targets.add(target)
-                    rerequest_events = rerequest_buckets.get(target, ())
-            queued_to_device_messages.append(
-                _prepared_queued_to_device_message(message, rerequest_events)
-            )
-        owned_rerequest_targets = bound_dummy_targets | {
-            (claim.user_id, claim.device_id)
-            for claim in key_claims
-            if claim.rerequest_events
-        }
-        if any(
-            events and target not in owned_rerequest_targets
-            for target, events in rerequest_buckets.items()
-        ):
-            raise ValueError("Megolm rerequest bucket has no claim or dummy owner")
+            raise ValueError("frame-local encrypted-room effect is inconsistent")
         return _PreparedIngestionFrame(
             frame.frame_id,
             frame.origin.transport,
@@ -1778,14 +1854,10 @@ class Client:
             tuple(records),
             tuple(transitions),
             tuple(snapshots),
-            _PreparedCryptoDelta(
-                tuple(sorted(encrypted_room_ids)),
-                tuple(sorted(olm.users_for_key_query)),
-                olm.uploaded_key_count,
-                frame.one_time_key_counts_json,
-                frame.unused_fallback_key_types_json,
-                tuple(key_claims),
-                tuple(queued_to_device_messages),
+            _prepared_crypto_delta_snapshot(
+                frame,
+                olm,
+                frozen_encrypted_room_ids,
             ),
         )
 

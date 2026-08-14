@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 from uuid import UUID
@@ -19,7 +20,7 @@ from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKin
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
 from nio.ingest.source import canonical_json
-from nio.ingest.state import SourceState, StagedFrame
+from nio.ingest.state import CommitResult, SourceState, StagedFrame
 from nio.store import DefaultStore, SqliteStore
 from nio.store._sync_journal_plan import _canonical_work_plaintext
 from nio.store._sync_journal_rows import _canonical_internal
@@ -364,6 +365,69 @@ def _open_sliding(store_path: Path, hook: Callable[[str], None] | None = None):
         database_name="journal.db",
         transition_statement_hook=hook,
     )
+
+
+def _open_configured_local(store_path: Path):
+    return bootstrap_api._open_configured_ingestion_store(
+        store_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+
+
+def _graph_without_writer_epoch(graph: tuple[object, ...]) -> tuple[object, ...]:
+    master, rows = graph
+    return (
+        master,
+        tuple(
+            (
+                (
+                    table,
+                    tuple(
+                        row[:7] + ("<writer-epoch>",) + row[8:] for row in table_rows
+                    ),
+                )
+                if table == "NioIngestMeta"
+                else (table, table_rows)
+            )
+            for table, table_rows in rows
+        ),
+    )
+
+
+def _kill_during_local_membership_publication(
+    store_path: Path,
+    path: str,
+    boundary: str,
+    operation_id: UUID,
+    sequence_path: Path,
+) -> None:
+    bootstrap = _open_configured_local(store_path)
+    journal = bootstrap._journal
+
+    def kill(label: str) -> None:
+        with sequence_path.open("a", encoding="utf-8") as sequence:
+            sequence.write(f"{label}\n")
+            sequence.flush()
+            os.fsync(sequence.fileno())
+        if label == boundary:
+            os._exit(CRASH_EXIT_CODE)
+
+    journal.set_transition_statement_hook(kill)
+    journal._publish_local_membership_transition(
+        operation_id=operation_id,
+        room_id="!local:example.org",
+        previous_membership="leave" if path == "insert" else "join",
+        previous_epoch=0,
+        current_membership="join" if path == "insert" else "leave",
+    )
+    bootstrap.close()
 
 
 def _seed_positioned_sliding(bootstrap) -> None:
@@ -823,6 +887,203 @@ def test_delivery_process_death_reopens_only_old_or_complete_new_graph(
         reopened._journal.acknowledge_batch(claimed.ref)
     assert reopened._journal.next_batch() is None
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "boundary"),
+    (
+        ("insert", "aggregate_insert"),
+        ("insert", "commit"),
+        ("update", "aggregate_update"),
+        ("update", "commit"),
+    ),
+)
+def test_local_membership_process_death_retries_only_old_or_complete_new_graph(
+    tmp_path: Path,
+    path: str,
+    boundary: str,
+) -> None:
+    store_path = tmp_path / f"local-{path}-{boundary}"
+    bootstrap = _open_fresh_store(store_path)
+    journal = bootstrap._journal
+    if path == "update":
+        journal._publish_local_membership_transition(
+            operation_id=UUID("00000000-0000-4000-8000-000000000001"),
+            room_id="!local:example.org",
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        while batch := journal.next_batch():
+            journal.acknowledge_batch(batch.ref)
+    else:
+        assert path == "insert"
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    assert journal.list_frames(1) == ()
+    bootstrap.close()
+
+    database_path = store_path / "journal.db"
+    graph_before = _logical_sqlite_graph(database_path)
+    operation_id = UUID(
+        "00000000-0000-4000-8000-000000000010"
+        if path == "insert"
+        else "00000000-0000-4000-8000-000000000020"
+    )
+    sequence_path = store_path / "local-publication-hook-sequence.txt"
+    _assert_process_crashed(
+        _kill_during_local_membership_publication,
+        store_path,
+        path,
+        boundary,
+        operation_id,
+        sequence_path,
+    )
+    expected_labels = (
+        "meta_revision_epoch_cas",
+        f"aggregate_{path}",
+        "work_insert",
+        "before_commit",
+        "commit",
+    )
+    assert tuple(sequence_path.read_text(encoding="utf-8").splitlines()) == (
+        expected_labels[: expected_labels.index(boundary) + 1]
+    )
+
+    graph_after = _logical_sqlite_graph(database_path)
+    if boundary == "commit":
+        assert _graph_without_writer_epoch(graph_after) != (
+            _graph_without_writer_epoch(graph_before)
+        )
+    else:
+        assert _graph_without_writer_epoch(graph_after) == (
+            _graph_without_writer_epoch(graph_before)
+        )
+
+    reopened = _open_configured_local(store_path)
+    try:
+        reopened_journal = reopened._journal
+        reopened_owner = reopened_journal.load_owner()
+        expected_revision = owner_before.revision + int(boundary == "commit")
+        assert replace(
+            reopened_owner,
+            writer_epoch=owner_before.writer_epoch,
+        ) == replace(owner_before, revision=expected_revision)
+        assert reopened_journal.load_source() == source_before
+        assert reopened_journal.list_frames(1) == ()
+        with reopened_journal._owner.read():
+            loaded_before_retry = reopened_journal._load_room_aggregate(
+                reopened_owner,
+                "!local:example.org",
+            )
+            inventory_before_retry = reopened_journal._load_task3_work_inventory(
+                reopened_owner
+            )
+        operation_before_retry = tuple(
+            item
+            for item in inventory_before_retry.work
+            if item.frame_id == operation_id
+        )
+        if boundary == "commit":
+            assert loaded_before_retry is not None
+            assert len(operation_before_retry) == 1
+            committed = CommitResult(owner_before.revision + 1)
+            retry_graph = _logical_sqlite_graph(database_path)
+            statements: list[str] = []
+            reopened_journal._owner.database.connection().set_trace_callback(
+                statements.append
+            )
+            assert (
+                reopened_journal._publish_local_membership_transition(
+                    operation_id=operation_id,
+                    room_id="!local:example.org",
+                    previous_membership="leave" if path == "insert" else "join",
+                    previous_epoch=0,
+                    current_membership="join" if path == "insert" else "leave",
+                )
+                == committed
+            )
+            reopened_journal._owner.database.connection().set_trace_callback(None)
+            assert not any(
+                statement.lstrip()
+                .upper()
+                .startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+                for statement in statements
+            )
+            assert _logical_sqlite_graph(database_path) == retry_graph
+        else:
+            assert operation_before_retry == ()
+            if path == "insert":
+                assert loaded_before_retry is None
+            else:
+                assert loaded_before_retry is not None
+                assert loaded_before_retry[1].continuity.membership == "join"
+                assert loaded_before_retry[1].continuity.membership_epoch == 0
+                assert loaded_before_retry[1].next_room_sequence == 1
+            committed = reopened_journal._publish_local_membership_transition(
+                operation_id=operation_id,
+                room_id="!local:example.org",
+                previous_membership="leave" if path == "insert" else "join",
+                previous_epoch=0,
+                current_membership="join" if path == "insert" else "leave",
+            )
+            assert committed == CommitResult(owner_before.revision + 1)
+
+        final_owner = reopened_journal.load_owner()
+        assert replace(
+            final_owner,
+            writer_epoch=owner_before.writer_epoch,
+        ) == replace(owner_before, revision=committed.revision)
+        with reopened_journal._owner.read():
+            aggregate = reopened_journal._load_room_aggregate(
+                final_owner,
+                "!local:example.org",
+            )
+            inventory = reopened_journal._load_task3_work_inventory(final_owner)
+        assert aggregate is not None
+        current_membership = "join" if path == "insert" else "leave"
+        current_epoch = 0 if path == "insert" else 1
+        room_sequence = 0 if path == "insert" else 1
+        assert aggregate[1].continuity.membership == current_membership
+        assert aggregate[1].continuity.membership_epoch == current_epoch
+        assert aggregate[1].continuity.baseline is None
+        assert aggregate[1].continuity.gap is None
+        assert aggregate[1].continuity.hydration_id is None
+        assert aggregate[1].pending_hydration is None
+        assert aggregate[1].room_snapshot is None
+        assert aggregate[1].next_room_sequence == room_sequence + 1
+        assert aggregate[1].updated_revision == committed.revision
+        assert len(inventory.work) == 1
+        assert len(inventory.storage_rows) == 1
+        operation_work = tuple(
+            item for item in inventory.work if item.frame_id == operation_id
+        )
+        assert len(operation_work) == 1
+        work = operation_work[0]
+        storage = next(
+            row for row in inventory.storage_rows if row[1] == work.value.record_id
+        )
+        assert storage[3:11] == (
+            "ready",
+            str(operation_id),
+            "!local:example.org",
+            current_epoch,
+            room_sequence,
+            committed.revision,
+            0,
+            committed.revision,
+        )
+        assert tuple(
+            row[0]
+            for row in reopened_journal._owner.database.connection().execute(
+                "SELECT room_id FROM NioIngestRoomAggregate ORDER BY room_id"
+            )
+        ) == ("!local:example.org",)
+        assert reopened_journal.load_source() == source_before
+        assert reopened_journal.list_frames(1) == ()
+    finally:
+        reopened._journal._owner.database.connection().set_trace_callback(None)
+        reopened.close()
 
 
 @pytest.mark.parametrize(

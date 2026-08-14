@@ -3,10 +3,11 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
-from ..ingest._json import canonical_json, load_internal_json
+from ..ingest._json import canonical_json, load_internal_json, load_json
 from ..ingest.errors import JournalIntegrityError
 from ..ingest.hydration import PendingHydration
 from ..ingest.model import (
@@ -14,6 +15,8 @@ from ..ingest.model import (
     LossRecord,
     RecordKind,
     RecordOrigin,
+    SystemOrigin,
+    SystemOriginKind,
     TransportKind,
 )
 from ..ingest.ports import (
@@ -22,10 +25,13 @@ from ..ingest.ports import (
 )
 from ..ingest.reducer import HydrationIntent, MembershipBaseline, RoomContinuity
 from ..ingest.serialization import (
+    _ROOM_SNAPSHOT_FIELDS,
     _loss_id,
     _origin_from_dict,
     _origin_to_dict,
     _record_from_dict,
+    _room_snapshot_from_dict,
+    _room_snapshot_to_dict,
 )
 from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
@@ -63,6 +69,61 @@ _FRAME_FIELDS = (
     "response_body",
     "source_sha256",
 )
+_PREPARED_FRAME_FIELDS = (
+    "prepared_version",
+    "request_cursor_json",
+    "candidate_cursor_json",
+    "source_sha256",
+    "compatibility_token",
+    "outbound_maintenance",
+)
+_OUTBOUND_MAINTENANCE_FIELDS = ("version", "operations")
+_OUTBOUND_OPERATION_FIELDS = (
+    "kind",
+    "state",
+    "body_json",
+    "transaction_id",
+    "event_type",
+    "context",
+)
+_OUTBOUND_CLAIM_CONTEXT_FIELDS = ("claims",)
+_OUTBOUND_CLAIM_FIELDS = (
+    "user_id",
+    "device_id",
+    "was_wedged",
+    "was_waiting",
+    "waiting_key_requests",
+    "rerequest_events",
+)
+_OUTBOUND_WAITING_FIELDS = (
+    "source_json",
+    "sender_user_id",
+    "requesting_device_id",
+    "request_id",
+    "room_id",
+    "sender_key",
+    "session_id",
+    "algorithm",
+)
+_OUTBOUND_REREQUEST_FIELDS = (
+    "source_json",
+    "room_id",
+    "event_id",
+    "sender_user_id",
+    "sender_device_id",
+    "sender_key",
+    "session_id",
+    "algorithm",
+)
+_OUTBOUND_GENERIC_CONTEXT_FIELDS = ("subtype",)
+_OUTBOUND_DUMMY_CONTEXT_FIELDS = ("subtype", "rerequest_events")
+_OUTBOUND_ROOM_KEY_CONTEXT_FIELDS = (
+    "subtype",
+    "request_id",
+    "session_id",
+    "room_id",
+    "algorithm",
+)
 # IngestionConfig caps the staged backlog at 256 frames. Reading one extra row
 # keeps account identity classification bounded while detecting corrupt overflow.
 _MAX_STAGED_FRAMES = 256
@@ -87,6 +148,27 @@ def _canonical_internal(value: object) -> bytes:
 class _DecodedWork(NamedTuple):
     value: EventRecord | LossRecord
     metadata: _PreparedWorkMetadata | None
+
+
+class _OutboundOperation(NamedTuple):
+    kind: str
+    state: str
+    body_json: bytes
+    transaction_id: str | None
+    event_type: str | None
+    context: object | None
+
+
+class _OutboundMaintenance(NamedTuple):
+    operations: tuple[_OutboundOperation, ...]
+
+
+class _PreparedFrameState(NamedTuple):
+    request_cursor_json: bytes
+    candidate_cursor_json: bytes
+    source_sha256: bytes
+    compatibility_token: str | None
+    outbound_maintenance: _OutboundMaintenance
 
 
 def _decode_work_plaintext(
@@ -153,35 +235,36 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
         raise ValueError("unsupported Aggregate baseline")
     if baseline is not None and hydration is not None:
         raise ValueError("baseline and pending hydration are mutually exclusive")
-    return canonical_json(
-        {
-            "continuity": {
-                "baseline": (
-                    {
-                        "membership_event_id": baseline.membership_event_id,
-                        "window_token": baseline.window_token,
-                    }
-                    if baseline is not None
-                    else None
-                ),
-                "gap": None,
-                "hydration_id": str(hydration.hydration_id) if hydration else None,
-                "membership": continuity.membership,
-                "membership_epoch": continuity.membership_epoch,
-                "room_id": continuity.room_id,
-            },
-            "next_room_sequence": value.next_room_sequence,
-            "pending_hydration": (
+    payload: dict[str, object] = {
+        "continuity": {
+            "baseline": (
                 {
-                    "hydration_id": str(hydration.hydration_id),
-                    "origin": _origin_to_dict(hydration.origin),
+                    "membership_event_id": baseline.membership_event_id,
+                    "window_token": baseline.window_token,
                 }
-                if hydration is not None
+                if baseline is not None
                 else None
             ),
-            "updated_revision": value.updated_revision,
-        }
-    )
+            "gap": None,
+            "hydration_id": str(hydration.hydration_id) if hydration else None,
+            "membership": continuity.membership,
+            "membership_epoch": continuity.membership_epoch,
+            "room_id": continuity.room_id,
+        },
+        "next_room_sequence": value.next_room_sequence,
+        "pending_hydration": (
+            {
+                "hydration_id": str(hydration.hydration_id),
+                "origin": _origin_to_dict(hydration.origin),
+            }
+            if hydration is not None
+            else None
+        ),
+        "updated_revision": value.updated_revision,
+    }
+    if value.room_snapshot is not None:
+        payload["room_snapshot"] = _room_snapshot_to_dict(value.room_snapshot)
+    return canonical_json(payload)
 
 
 def _room_aggregate_value_from_plaintext(
@@ -203,6 +286,22 @@ def _room_aggregate_value_from_plaintext(
         if type(decoded) is not dict or type(decoded.get("continuity")) is not dict:
             raise ValueError("Aggregate and continuity must be objects")
         aggregate = cast("dict[str, object]", decoded)
+        fields = tuple(aggregate)
+        legacy_fields = (
+            "continuity",
+            "next_room_sequence",
+            "pending_hydration",
+            "updated_revision",
+        )
+        extended_fields = (
+            "continuity",
+            "next_room_sequence",
+            "pending_hydration",
+            "room_snapshot",
+            "updated_revision",
+        )
+        if fields not in (legacy_fields, extended_fields):
+            raise ValueError("Aggregate fields are not canonical")
         continuity = cast("dict[str, object]", aggregate["continuity"])
         if continuity["gap"] is not None:
             raise ValueError("Aggregate gap must be null")
@@ -259,11 +358,27 @@ def _room_aggregate_value_from_plaintext(
                 pending_origin,
             )
 
+        snapshot_value = aggregate.get("room_snapshot")
+        if fields == extended_fields:
+            if type(snapshot_value) is not dict:
+                raise ValueError("Aggregate room snapshot must be an object")
+            snapshot_map = cast("dict[str, object]", snapshot_value)
+            if set(snapshot_map) != set(_ROOM_SNAPSHOT_FIELDS):
+                raise ValueError("Aggregate room snapshot fields are invalid")
+            room_snapshot = _room_snapshot_from_dict(
+                {name: snapshot_map[name] for name in _ROOM_SNAPSHOT_FIELDS}
+            )
+            if room_snapshot.room_id != room_id:
+                raise ValueError("Aggregate room snapshot does not match its row")
+        else:
+            room_snapshot = None
+
         value = RoomAggregateValue(
             state,
             cast("int", aggregate["next_room_sequence"]),
             cast("int", aggregate["updated_revision"]),
             pending,
+            room_snapshot,
         )
         if (
             value.continuity.room_id != room_id
@@ -369,6 +484,676 @@ def _frame_payload(frame: StagedFrame, rev: int, owner: _Owner) -> tuple[bytes, 
     stored = _row(owner, "NioIngestFrame", value, header=_frame_header(frame, rev))
     if len(stored[0]) > MAX_STORED_FRAME_PAYLOAD_BYTES:
         raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
+    return stored
+
+
+def _outbound_exact_dict(
+    value: object,
+    fields: tuple[str, ...],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict or tuple(value) != fields:
+        raise ValueError(f"{label} fields are invalid")
+    return cast("dict[str, object]", value)
+
+
+def _outbound_exact_list(value: object, label: str) -> list[object]:
+    if type(value) is not list:
+        raise ValueError(f"{label} must be an array")
+    return cast("list[object]", value)
+
+
+def _outbound_nonempty_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{label} must be a nonempty string")
+    return value
+
+
+def _outbound_context_source(value: object, label: str) -> dict[str, object]:
+    source_json = _decoded_bytes(value, f"{label} source")
+    if source_json is None or value != _encoded_bytes(source_json):
+        raise ValueError(f"{label} source encoding is invalid")
+    source = load_json(source_json, f"{label} source")
+    if type(source) is not dict or source_json != canonical_json(source):
+        raise ValueError(f"{label} source is not a canonical object")
+    return cast("dict[str, object]", source)
+
+
+def _outbound_event_fields(
+    value: object,
+    *,
+    event_type: str,
+    sender: str,
+    label: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    source = _outbound_context_source(value, label)
+    content = source.get("content")
+    if (
+        source.get("type") != event_type
+        or source.get("sender") != sender
+        or type(content) is not dict
+    ):
+        raise ValueError(f"{label} source fields disagree")
+    return source, cast("dict[str, object]", content)
+
+
+def _outbound_rerequests(
+    value: object,
+    *,
+    target: tuple[str, str],
+    label: str,
+) -> tuple[tuple[str, str, str], ...]:
+    entries = _outbound_exact_list(value, label)
+    identities: list[tuple[str, str, str]] = []
+    for entry_value in entries:
+        entry = _outbound_exact_dict(
+            entry_value,
+            _OUTBOUND_REREQUEST_FIELDS,
+            f"{label} entry",
+        )
+        values = {
+            name: _outbound_nonempty_string(entry[name], f"{label} {name}")
+            for name in _OUTBOUND_REREQUEST_FIELDS[1:]
+        }
+        if (values["sender_user_id"], values["sender_device_id"]) != target:
+            raise ValueError(f"{label} target disagrees")
+        source, content = _outbound_event_fields(
+            entry["source_json"],
+            event_type="m.room.encrypted",
+            sender=values["sender_user_id"],
+            label=label,
+        )
+        if (
+            source.get("event_id") != values["event_id"]
+            or "room_id" in source
+            and source.get("room_id") != values["room_id"]
+            or content.get("device_id") != values["sender_device_id"]
+            or content.get("sender_key") != values["sender_key"]
+            or content.get("session_id") != values["session_id"]
+            or content.get("algorithm") != values["algorithm"]
+        ):
+            raise ValueError(f"{label} source fields disagree")
+        identities.append((target[0], target[1], values["session_id"]))
+    if len(identities) != len(set(identities)):
+        raise ValueError(f"{label} entries are duplicated")
+    return tuple(identities)
+
+
+def _outbound_waiting_requests(
+    value: object,
+    *,
+    target: tuple[str, str],
+) -> None:
+    entries = _outbound_exact_list(value, "waiting key requests")
+    request_ids: list[str] = []
+    for entry_value in entries:
+        entry = _outbound_exact_dict(
+            entry_value,
+            _OUTBOUND_WAITING_FIELDS,
+            "waiting key request",
+        )
+        values = {
+            name: _outbound_nonempty_string(
+                entry[name],
+                f"waiting key request {name}",
+            )
+            for name in _OUTBOUND_WAITING_FIELDS[1:]
+        }
+        if (values["sender_user_id"], values["requesting_device_id"]) != target:
+            raise ValueError("waiting key request target disagrees")
+        _, content = _outbound_event_fields(
+            entry["source_json"],
+            event_type="m.room_key_request",
+            sender=values["sender_user_id"],
+            label="waiting key request",
+        )
+        body = content.get("body")
+        if (
+            content.get("action") != "request"
+            or content.get("requesting_device_id") != values["requesting_device_id"]
+            or content.get("request_id") != values["request_id"]
+            or type(body) is not dict
+        ):
+            raise ValueError("waiting key request source fields disagree")
+        body_fields = cast("dict[str, object]", body)
+        if any(
+            body_fields.get(name) != values[name]
+            for name in ("room_id", "sender_key", "session_id", "algorithm")
+        ):
+            raise ValueError("waiting key request body fields disagree")
+        request_ids.append(values["request_id"])
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError("waiting key requests are duplicated")
+
+
+def _outbound_upload_body(body: dict[str, object]) -> None:
+    allowed = {"device_keys", "fallback_keys", "one_time_keys"}
+    if (
+        "one_time_keys" not in body
+        or not set(body) <= allowed
+        or any(type(value) is not dict or not value for value in body.values())
+    ):
+        raise ValueError("key-upload body is invalid")
+
+
+def _outbound_query_body(body: dict[str, object]) -> None:
+    if tuple(body) != ("device_keys",):
+        raise ValueError("key-query body fields are invalid")
+    users = body["device_keys"]
+    if type(users) is not dict or not users:
+        raise ValueError("key-query targets are invalid")
+    if any(
+        type(user_id) is not str
+        or not user_id
+        or type(device_ids) is not list
+        or device_ids
+        for user_id, device_ids in users.items()
+    ):
+        raise ValueError("key-query targets are invalid")
+
+
+def _outbound_claim_targets(
+    body: dict[str, object],
+) -> tuple[tuple[str, str], ...]:
+    if tuple(body) != ("one_time_keys",):
+        raise ValueError("key-claim body fields are invalid")
+    users = body["one_time_keys"]
+    if type(users) is not dict or not users:
+        raise ValueError("key-claim targets are invalid")
+    targets: list[tuple[str, str]] = []
+    for user_id, devices in users.items():
+        user = _outbound_nonempty_string(user_id, "claim user ID")
+        if type(devices) is not dict or not devices:
+            raise ValueError("key-claim devices are invalid")
+        for device_id, key_type in devices.items():
+            device = _outbound_nonempty_string(device_id, "claim device ID")
+            if type(key_type) is not str or key_type != "signed_curve25519":
+                raise ValueError("key-claim key type is invalid")
+            targets.append((user, device))
+    return tuple(targets)
+
+
+def _outbound_claim_context(
+    value: object,
+    *,
+    body_targets: tuple[tuple[str, str], ...],
+    rerequest_owners: set[tuple[str, str]],
+) -> None:
+    context = _outbound_exact_dict(
+        value,
+        _OUTBOUND_CLAIM_CONTEXT_FIELDS,
+        "key-claim context",
+    )
+    claims = _outbound_exact_list(context["claims"], "key claims")
+    targets: list[tuple[str, str]] = []
+    for claim_value in claims:
+        claim = _outbound_exact_dict(
+            claim_value,
+            _OUTBOUND_CLAIM_FIELDS,
+            "key claim",
+        )
+        target = (
+            _outbound_nonempty_string(claim["user_id"], "claim user ID"),
+            _outbound_nonempty_string(claim["device_id"], "claim device ID"),
+        )
+        if (
+            type(claim["was_wedged"]) is not bool
+            or type(claim["was_waiting"]) is not bool
+        ):
+            raise ValueError("key-claim flags are invalid")
+        if claim["was_wedged"] is not True and claim["was_waiting"] is not True:
+            raise ValueError("key claim has no preparation reason")
+        _outbound_waiting_requests(
+            claim["waiting_key_requests"],
+            target=target,
+        )
+        waiting = cast("list[object]", claim["waiting_key_requests"])
+        if waiting and claim["was_waiting"] is not True:
+            raise ValueError("waiting key requests lack a waiting claim")
+        rerequests = _outbound_rerequests(
+            claim["rerequest_events"],
+            target=target,
+            label="claim rerequest",
+        )
+        if rerequests and claim["was_wedged"] is not True:
+            raise ValueError("claim rerequests lack a wedged target")
+        if rerequests:
+            if target in rerequest_owners:
+                raise ValueError("rerequest target has multiple owners")
+            rerequest_owners.add(target)
+        targets.append(target)
+    if (
+        tuple(targets) != body_targets
+        or targets != sorted(targets)
+        or len(targets) != len(set(targets))
+    ):
+        raise ValueError("key-claim context targets disagree with body")
+
+
+def _outbound_to_device_body(
+    body: dict[str, object],
+) -> tuple[str, str, dict[str, object]]:
+    if tuple(body) != ("messages",):
+        raise ValueError("to-device body fields are invalid")
+    messages = body["messages"]
+    if type(messages) is not dict or len(messages) != 1:
+        raise ValueError("to-device body must have one recipient")
+    recipient, devices = next(iter(messages.items()))
+    recipient_id = _outbound_nonempty_string(recipient, "to-device recipient")
+    if type(devices) is not dict or len(devices) != 1:
+        raise ValueError("to-device body must have one device")
+    device, content = next(iter(devices.items()))
+    device_id = _outbound_nonempty_string(device, "to-device device")
+    if type(content) is not dict:
+        raise ValueError("to-device content must be an object")
+    return recipient_id, device_id, cast("dict[str, object]", content)
+
+
+def _outbound_dummy_content(content: dict[str, object]) -> None:
+    if tuple(content) != ("algorithm", "ciphertext", "sender_key"):
+        raise ValueError("dummy ciphertext fields are invalid")
+    _outbound_nonempty_string(content["algorithm"], "dummy algorithm")
+    _outbound_nonempty_string(content["sender_key"], "dummy sender key")
+    ciphertext = content["ciphertext"]
+    if type(ciphertext) is not dict or not ciphertext:
+        raise ValueError("dummy ciphertext is invalid")
+    for curve_key, message_value in ciphertext.items():
+        _outbound_nonempty_string(curve_key, "dummy recipient key")
+        message = _outbound_exact_dict(
+            message_value,
+            ("body", "type"),
+            "dummy ciphertext",
+        )
+        _outbound_nonempty_string(message["body"], "dummy ciphertext body")
+        if type(message["type"]) is not int or message["type"] not in (0, 1):
+            raise ValueError("dummy ciphertext type is invalid")
+
+
+def _outbound_room_key_context(
+    value: object,
+    *,
+    event_type: str,
+    content: dict[str, object],
+) -> None:
+    context = _outbound_exact_dict(
+        value,
+        _OUTBOUND_ROOM_KEY_CONTEXT_FIELDS,
+        "room-key-request context",
+    )
+    if context["subtype"] != "room_key_request" or event_type != "m.room_key_request":
+        raise ValueError("room-key-request type is invalid")
+    values = {
+        name: _outbound_nonempty_string(
+            context[name],
+            f"room-key-request {name}",
+        )
+        for name in _OUTBOUND_ROOM_KEY_CONTEXT_FIELDS[1:]
+    }
+    body = content.get("body")
+    if (
+        tuple(content) != ("action", "body", "request_id", "requesting_device_id")
+        or content.get("action") != "request"
+        or content.get("request_id") != values["request_id"]
+        or type(content.get("requesting_device_id")) is not str
+        or not content["requesting_device_id"]
+        or type(body) is not dict
+    ):
+        raise ValueError("room-key-request content is invalid")
+    body_fields = cast("dict[str, object]", body)
+    if (
+        tuple(body_fields) != ("algorithm", "room_id", "sender_key", "session_id")
+        or body_fields.get("algorithm") != values["algorithm"]
+        or body_fields.get("room_id") != values["room_id"]
+        or body_fields.get("session_id") != values["session_id"]
+        or type(body_fields.get("sender_key")) is not str
+        or not body_fields["sender_key"]
+    ):
+        raise ValueError("room-key-request body is invalid")
+
+
+def _outbound_to_device_context(
+    operation: _OutboundOperation,
+    *,
+    recipient: str,
+    device: str,
+    content: dict[str, object],
+    rerequest_owners: set[tuple[str, str]],
+    dummy_targets: set[tuple[str, str]],
+) -> None:
+    event_type = _outbound_nonempty_string(
+        operation.event_type,
+        "to-device event type",
+    )
+    context = operation.context
+    if type(context) is not dict:
+        raise ValueError("pending to-device context must be an object")
+    subtype = context.get("subtype")
+    target = (recipient, device)
+    if subtype == "generic":
+        _outbound_exact_dict(
+            context,
+            _OUTBOUND_GENERIC_CONTEXT_FIELDS,
+            "generic to-device context",
+        )
+        return
+    if subtype == "dummy":
+        context = _outbound_exact_dict(
+            context,
+            _OUTBOUND_DUMMY_CONTEXT_FIELDS,
+            "dummy to-device context",
+        )
+        if event_type != "m.room.encrypted":
+            raise ValueError("dummy to-device event type is invalid")
+        _outbound_dummy_content(content)
+        rerequests = _outbound_rerequests(
+            context["rerequest_events"],
+            target=target,
+            label="dummy rerequest",
+        )
+        first_dummy = target not in dummy_targets
+        dummy_targets.add(target)
+        if first_dummy and target in rerequest_owners:
+            raise ValueError("claim rerequests conflict with first dummy owner")
+        if rerequests and not first_dummy:
+            raise ValueError("rerequest target has multiple owners")
+        if rerequests:
+            rerequest_owners.add(target)
+        return
+    if subtype == "room_key_request":
+        _outbound_room_key_context(
+            context,
+            event_type=event_type,
+            content=content,
+        )
+        return
+    raise ValueError("to-device context subtype is invalid")
+
+
+def _validate_outbound_maintenance(
+    maintenance: _OutboundMaintenance,
+    *,
+    frame_id: UUID,
+) -> None:
+    if type(frame_id) is not UUID:
+        raise TypeError("frame_id must be UUID")
+    if (
+        type(maintenance) is not _OutboundMaintenance
+        or type(maintenance.operations) is not tuple
+    ):
+        raise TypeError("outbound maintenance plan is invalid")
+    ranks = {"key_upload": 0, "key_query": 1, "key_claim": 2, "to_device": 3}
+    prior_rank = -1
+    singleton_kinds: set[str] = set()
+    pending_seen = False
+    rerequest_owners: set[tuple[str, str]] = set()
+    dummy_targets: set[tuple[str, str]] = set()
+    for index, operation in enumerate(maintenance.operations):
+        if (
+            type(operation) is not _OutboundOperation
+            or type(operation.kind) is not str
+            or operation.kind not in ranks
+            or type(operation.state) is not str
+            or operation.state not in {"pending", "settled"}
+            or type(operation.body_json) is not bytes
+            or operation.transaction_id is not None
+            and type(operation.transaction_id) is not str
+            or operation.event_type is not None
+            and type(operation.event_type) is not str
+        ):
+            raise TypeError("outbound maintenance operation is invalid")
+        rank = ranks[operation.kind]
+        if rank < prior_rank:
+            raise ValueError("outbound maintenance operation order is invalid")
+        prior_rank = rank
+        if operation.kind != "to_device":
+            if operation.kind in singleton_kinds:
+                raise ValueError("outbound maintenance singleton is duplicated")
+            singleton_kinds.add(operation.kind)
+        if operation.state == "pending":
+            pending_seen = True
+        elif pending_seen:
+            raise ValueError("outbound maintenance states are not a settled prefix")
+        if operation.state == "settled" and operation.context is not None:
+            raise ValueError("settled operation context must be null")
+
+        body_value = load_json(operation.body_json, "outbound operation body")
+        if type(body_value) is not dict or operation.body_json != canonical_json(
+            body_value
+        ):
+            raise ValueError("outbound operation body is not canonical")
+        body = cast("dict[str, object]", body_value)
+        if operation.kind != "to_device":
+            if operation.transaction_id is not None or operation.event_type is not None:
+                raise ValueError("non-to-device operation has transport identity")
+            if operation.kind in {"key_upload", "key_query"} and (
+                operation.context is not None
+            ):
+                raise ValueError("upload/query operation context must be null")
+
+        if operation.kind == "key_upload":
+            _outbound_upload_body(body)
+        elif operation.kind == "key_query":
+            _outbound_query_body(body)
+        elif operation.kind == "key_claim":
+            claim_targets = _outbound_claim_targets(body)
+            if operation.state == "pending":
+                _outbound_claim_context(
+                    operation.context,
+                    body_targets=claim_targets,
+                    rerequest_owners=rerequest_owners,
+                )
+        else:
+            recipient, device, content = _outbound_to_device_body(body)
+            expected_transaction_id = str(
+                uuid5(
+                    frame_id,
+                    "nio.ingest.outbound-maintenance.v1:"
+                    f"to-device:{index}:{sha256(operation.body_json).hexdigest()}",
+                )
+            )
+            if operation.transaction_id != expected_transaction_id:
+                raise ValueError("to-device transaction ID is invalid")
+            _outbound_nonempty_string(
+                operation.event_type,
+                "to-device event type",
+            )
+            if operation.state == "pending":
+                _outbound_to_device_context(
+                    operation,
+                    recipient=recipient,
+                    device=device,
+                    content=content,
+                    rerequest_owners=rerequest_owners,
+                    dummy_targets=dummy_targets,
+                )
+
+
+def _outbound_maintenance_to_dict(
+    maintenance: _OutboundMaintenance,
+    *,
+    frame_id: UUID,
+) -> dict[str, object]:
+    _validate_outbound_maintenance(maintenance, frame_id=frame_id)
+    return {
+        "version": 1,
+        "operations": [
+            {
+                "kind": operation.kind,
+                "state": operation.state,
+                "body_json": _encoded_bytes(operation.body_json),
+                "transaction_id": operation.transaction_id,
+                "event_type": operation.event_type,
+                "context": operation.context,
+            }
+            for operation in maintenance.operations
+        ],
+    }
+
+
+def _outbound_maintenance_from_dict(
+    value: object,
+    *,
+    frame_id: UUID,
+) -> _OutboundMaintenance:
+    envelope = _outbound_exact_dict(
+        value,
+        _OUTBOUND_MAINTENANCE_FIELDS,
+        "outbound maintenance",
+    )
+    if type(envelope["version"]) is not int or envelope["version"] != 1:
+        raise ValueError("outbound maintenance version is invalid")
+    operation_values = _outbound_exact_list(
+        envelope["operations"],
+        "outbound maintenance operations",
+    )
+    operations: list[_OutboundOperation] = []
+    for operation_value in operation_values:
+        operation = _outbound_exact_dict(
+            operation_value,
+            _OUTBOUND_OPERATION_FIELDS,
+            "outbound operation",
+        )
+        body = _decoded_bytes(operation["body_json"], "operation body")
+        if body is None:
+            raise ValueError("outbound operation body is invalid")
+        kind = operation["kind"]
+        state = operation["state"]
+        transaction_id = operation["transaction_id"]
+        event_type = operation["event_type"]
+        if type(kind) is not str or type(state) is not str:
+            raise ValueError("outbound operation identity is invalid")
+        if transaction_id is not None and type(transaction_id) is not str:
+            raise ValueError("outbound transaction ID is invalid")
+        if event_type is not None and type(event_type) is not str:
+            raise ValueError("outbound event type is invalid")
+        operations.append(
+            _OutboundOperation(
+                kind,
+                state,
+                body,
+                transaction_id,
+                event_type,
+                operation["context"],
+            )
+        )
+    maintenance = _OutboundMaintenance(tuple(operations))
+    if value != _outbound_maintenance_to_dict(maintenance, frame_id=frame_id):
+        raise ValueError("outbound maintenance is not canonical")
+    return maintenance
+
+
+def _prepared_frame_envelope(
+    state: _PreparedFrameState,
+    *,
+    frame_id: UUID,
+) -> dict[str, object]:
+    if type(state) is not _PreparedFrameState:
+        raise TypeError("prepared frame state is invalid")
+    return {
+        "prepared_version": 1,
+        "request_cursor_json": _encoded_bytes(state.request_cursor_json),
+        "candidate_cursor_json": _encoded_bytes(state.candidate_cursor_json),
+        "source_sha256": _encoded_bytes(state.source_sha256),
+        "compatibility_token": state.compatibility_token,
+        "outbound_maintenance": _outbound_maintenance_to_dict(
+            state.outbound_maintenance,
+            frame_id=frame_id,
+        ),
+    }
+
+
+def _prepared_frame_state_from_envelope(
+    value: object,
+    *,
+    owner: OwnerView,
+    frame_id: UUID,
+    source_epoch: int,
+    request_id: int,
+) -> _PreparedFrameState:
+    if type(value) is not dict or tuple(value) != _PREPARED_FRAME_FIELDS:
+        raise ValueError("prepared frame fields are invalid")
+    if type(value["prepared_version"]) is not int or value["prepared_version"] != 1:
+        raise ValueError("prepared frame version is invalid")
+    request_cursor = _decoded_bytes(value["request_cursor_json"], "request cursor")
+    candidate_cursor = _decoded_bytes(
+        value["candidate_cursor_json"], "candidate cursor"
+    )
+    source_sha256 = _decoded_bytes(value["source_sha256"], "source digest")
+    assert request_cursor is not None
+    assert candidate_cursor is not None
+    assert source_sha256 is not None
+    compatibility_token = value["compatibility_token"]
+    if compatibility_token is not None and type(compatibility_token) is not str:
+        raise ValueError("prepared compatibility token is invalid")
+    if len(source_sha256) != 32 or frame_id != uuid5(
+        owner.stream_id,
+        f"{source_epoch}:{request_id}:{source_sha256.hex()}",
+    ):
+        raise ValueError("prepared frame source identity is invalid")
+    _validate_source_cursor(owner.transport_kind, request_cursor)
+    _validate_source_cursor(owner.transport_kind, candidate_cursor)
+    candidate_value = load_json(candidate_cursor, "prepared candidate cursor")
+    if owner.transport_kind is TransportKind.CLASSIC:
+        if (
+            type(candidate_value) is not dict
+            or tuple(candidate_value) != ("next_batch",)
+            or type(candidate_value["next_batch"]) is not str
+            or not candidate_value["next_batch"]
+            or compatibility_token != candidate_value["next_batch"]
+        ):
+            raise ValueError("prepared Classic compatibility token is invalid")
+    elif compatibility_token is not None:
+        raise ValueError("prepared Sliding compatibility token must be null")
+    state = _PreparedFrameState(
+        request_cursor,
+        candidate_cursor,
+        source_sha256,
+        compatibility_token,
+        _outbound_maintenance_from_dict(
+            value["outbound_maintenance"],
+            frame_id=frame_id,
+        ),
+    )
+    if value != _prepared_frame_envelope(state, frame_id=frame_id):
+        raise ValueError("prepared frame envelope is not canonical")
+    return state
+
+
+def _prepared_frame_payload(
+    *,
+    owner: _Owner,
+    frame_id: UUID,
+    source_epoch: int,
+    request_id: int,
+    staged_revision: int,
+    request_cursor_json: bytes,
+    candidate_cursor_json: bytes,
+    source_sha256: bytes,
+    compatibility_token: str | None,
+    outbound_maintenance: _OutboundMaintenance,
+) -> tuple[bytes, bytes]:
+    value = _canonical_internal(
+        _prepared_frame_envelope(
+            _PreparedFrameState(
+                request_cursor_json,
+                candidate_cursor_json,
+                source_sha256,
+                compatibility_token,
+                outbound_maintenance,
+            ),
+            frame_id=frame_id,
+        )
+    )
+    stored = _row(
+        owner,
+        "NioIngestFrame",
+        value,
+        header=_canonical_internal(
+            [str(frame_id), source_epoch, request_id, staged_revision]
+        ),
+    )
+    if len(stored[0]) > MAX_STORED_FRAME_PAYLOAD_BYTES:
+        raise JournalIntegrityError("prepared frame envelope exceeds 24 MiB")
     return stored
 
 
@@ -481,11 +1266,11 @@ class JournalRows:
                 row["account_id"],
                 row["device_id"],
                 row["schema_version"],
-                UUID(row["stream_id"]),
-                UUID(row["consumer_generation"]),
+                UUID(cast("str", row["stream_id"])),
+                UUID(cast("str", row["consumer_generation"])),
                 TransportKind(cast("str", row["transport_kind"])),
                 row["revision"],
-                UUID(row["writer_epoch"]),
+                UUID(cast("str", row["writer_epoch"])),
                 row["next_source_epoch"],
             )
             if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
@@ -504,7 +1289,7 @@ class JournalRows:
 
     def load_owner(self) -> OwnerView:
         with self._read():  # type: ignore[attr-defined]
-            return self._decode_owner_row(self._meta())
+            return self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
 
     def _load_stage_snapshot(self) -> tuple[OwnerView, SourceState]:
         rows = self._execute(  # type: ignore[attr-defined]
@@ -832,6 +1617,7 @@ class JournalRows:
         canonical_bytes = 0
         work: list[AuthenticatedWork] = []
         for row in storage_rows:
+            local_header_invalid = False
             try:
                 plaintext = self._payload(
                     owner,
@@ -848,12 +1634,31 @@ class JournalRows:
                 )
                 value = decoded.value
                 origin = value.origin
-                if (
-                    type(origin) is not RecordOrigin
-                    or origin.transport is not owner.transport_kind
-                    or min(origin.source_epoch, origin.request_id, origin.frame_index)
-                    < 0
-                ):
+                if type(origin) is RecordOrigin:
+                    valid_origin = (
+                        origin.transport is owner.transport_kind
+                        and min(
+                            origin.source_epoch,
+                            origin.request_id,
+                            origin.frame_index,
+                        )
+                        >= 0
+                    )
+                elif type(origin) is SystemOrigin:
+                    valid_origin = (
+                        type(value) is EventRecord
+                        and origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+                        and value.kind is RecordKind.ROOM_LIFECYCLE
+                        and row[3] == "ready"
+                        and row[4] == str(origin.operation_id)
+                        and decoded.metadata is None
+                    )
+                    local_header_invalid = valid_origin and (
+                        row[8] != row[10] or row[9] != 0
+                    )
+                else:
+                    valid_origin = False
+                if not valid_origin:
                     raise ValueError("Work origin is invalid")
                 if type(value) is LossRecord:
                     if (
@@ -914,6 +1719,8 @@ class JournalRows:
                     raise ValueError("unsupported Work value")
             except (TypeError, ValueError) as error:
                 raise JournalIntegrityError("invalid Work value") from error
+            if local_header_invalid:
+                raise JournalIntegrityError("local READY Work header is invalid")
             work.append(
                 AuthenticatedWork(
                     value,
@@ -981,6 +1788,12 @@ class JournalRows:
                 kind,
                 plaintext,
             )
+            if value.room_snapshot is not None and (
+                value.room_snapshot.own_user_id != owner.account_id
+            ):
+                raise JournalIntegrityError(
+                    "Aggregate snapshot owner does not match journal"
+                )
             if value.pending_hydration is not None and (
                 value.pending_hydration.origin.transport is not owner.transport_kind
             ):
@@ -997,7 +1810,7 @@ class JournalRows:
         if not 1 <= limit <= 2:
             raise ValueError("limit must be between 1 and 2")
         with self._read():  # type: ignore[attr-defined]
-            owner = self._decode_owner_row(self._meta())
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
             rows = self._execute(  # type: ignore[attr-defined]
                 "SELECT account_id, room_id, updated_revision, intent_kind, "
                 "payload, payload_sha256 FROM NioIngestRoomAggregate "
@@ -1041,14 +1854,14 @@ class JournalRows:
             authenticate=authenticate,
         )
 
-    def _decode_frame_row(
+    def _decode_frame_state(
         self,
         frame_id: UUID,
         row: Mapping[str, object],
         owner: OwnerView,
         *,
         drain_header_authenticated: bool = False,
-    ) -> StagedFrame:
+    ) -> StagedFrame | _PreparedFrameState:
         try:
             drain_row = self._frame_drain_row_from_full(
                 row,
@@ -1072,26 +1885,54 @@ class JournalRows:
                 ),
             )
             value = load_internal_json(payload, "frame envelope")
-            response = _frame_response_from_envelope(value)
-            frame = StagedFrame(frame_id, response, drain_row.staged_revision)
-            if value != _frame_envelope(frame):
-                raise ValueError("frame envelope is not canonical")
-            request = response.request
-            if (
-                request.stream_id != owner.stream_id
-                or request.transport is not owner.transport_kind
-            ):
-                raise ValueError("frame request does not match journal owner")
-            if (request.source_epoch, request.request_id) != (
-                drain_row.source_epoch,
-                drain_row.request_id,
-            ):
-                raise ValueError("frame columns do not match stored metadata")
-            return frame
+            if type(value) is dict and tuple(value) == _FRAME_FIELDS:
+                response = _frame_response_from_envelope(value)
+                frame = StagedFrame(frame_id, response, drain_row.staged_revision)
+                if value != _frame_envelope(frame):
+                    raise ValueError("frame envelope is not canonical")
+                request = response.request
+                if (
+                    request.stream_id != owner.stream_id
+                    or request.transport is not owner.transport_kind
+                ):
+                    raise ValueError("frame request does not match journal owner")
+                if (request.source_epoch, request.request_id) != (
+                    drain_row.source_epoch,
+                    drain_row.request_id,
+                ):
+                    raise ValueError("frame columns do not match stored metadata")
+                return frame
+            if drain_row.room_materialized_revision is None:
+                raise ValueError("prepared frame has no materialized revision")
+            return _prepared_frame_state_from_envelope(
+                value,
+                owner=owner,
+                frame_id=frame_id,
+                source_epoch=drain_row.source_epoch,
+                request_id=drain_row.request_id,
+            )
         except JournalIntegrityError:
             raise
         except (AttributeError, KeyError, TypeError, ValueError) as error:
-            raise JournalIntegrityError("persisted staged frame is invalid") from error
+            raise JournalIntegrityError("persisted Frame is invalid") from error
+
+    def _decode_frame_row(
+        self,
+        frame_id: UUID,
+        row: Mapping[str, object],
+        owner: OwnerView,
+        *,
+        drain_header_authenticated: bool = False,
+    ) -> StagedFrame:
+        value = self._decode_frame_state(
+            frame_id,
+            row,
+            owner,
+            drain_header_authenticated=drain_header_authenticated,
+        )
+        if type(value) is not StagedFrame:
+            raise JournalIntegrityError("persisted Frame is not staged")
+        return value
 
     def _classify_frame_ids(self) -> frozenset[UUID]:
         rows = self._execute(  # type: ignore[attr-defined]
@@ -1127,7 +1968,26 @@ class JournalRows:
     ) -> StagedFrame | None:
         if frame_id not in self._classify_frame_ids():
             return None
-        return self._decode_frame_row(frame_id, self._frame_row(frame_id), owner)
+        value = self._decode_frame_state(
+            frame_id,
+            cast("Mapping[str, object]", self._frame_row(frame_id)),
+            owner,
+        )
+        return value if type(value) is StagedFrame else None
+
+    def _load_prepared_frame_with_owner(
+        self,
+        frame_id: UUID,
+        owner: OwnerView,
+    ) -> _PreparedFrameState | None:
+        if frame_id not in self._classify_frame_ids():
+            return None
+        value = self._decode_frame_state(
+            frame_id,
+            cast("Mapping[str, object]", self._frame_row(frame_id)),
+            owner,
+        )
+        return value if type(value) is _PreparedFrameState else None
 
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         if type(frame_id) is not UUID:
@@ -1143,13 +2003,17 @@ class JournalRows:
             self._classify_frame_ids()
             rows = self._execute(  # type: ignore[attr-defined]
                 "SELECT * FROM NioIngestFrame WHERE account_id = ? "
-                "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?",
-                (self.account_id, limit),
+                "ORDER BY staged_revision, source_epoch, request_id, frame_id "
+                "LIMIT ?",
+                (self.account_id, _MAX_STAGED_FRAMES),
             ).fetchall()
-            return tuple(
-                self._decode_frame_row(self._parse_frame_id(row)[1], row, owner)
+            values = tuple(
+                self._decode_frame_state(self._parse_frame_id(row)[1], row, owner)
                 for row in rows
             )
+            return tuple(value for value in values if type(value) is StagedFrame)[
+                :limit
+            ]
 
     def _write_frame(
         self,

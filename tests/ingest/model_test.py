@@ -452,6 +452,19 @@ def test_event_record_rejects_system_origin() -> None:
         )
 
 
+def test_loss_record_rejects_membership_change_system_origin() -> None:
+    with pytest.raises(ValueError, match="membership"):
+        LossRecord(
+            "loss-id",
+            SystemOrigin(SystemOriginKind.MEMBERSHIP_CHANGE, OPERATION_ID),
+            "!room:example.org",
+            0,
+            LossReason.BASELINE_LOST,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+
+
 def test_room_loss_requires_membership_epoch() -> None:
     with pytest.raises(ValueError, match="membership_epoch"):
         LossRecord(

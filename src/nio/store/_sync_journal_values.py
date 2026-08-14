@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import NamedTuple
 from uuid import UUID
 
+from ..ingest.model import RoomSnapshot
 from ..ingest.reducer import HydrationIntent, RoomContinuity
 
 SQLITE_INT_MAX = 2**63 - 1
@@ -100,6 +101,7 @@ class RoomAggregateValue:
     next_room_sequence: int
     updated_revision: int
     pending_hydration: HydrationIntent | None
+    room_snapshot: RoomSnapshot | None = None
 
     def __post_init__(self) -> None:
         _require_exact(self.continuity, RoomContinuity, "continuity")
@@ -111,6 +113,8 @@ class RoomAggregateValue:
                 HydrationIntent,
                 "pending_hydration",
             )
+        if self.room_snapshot is not None:
+            _require_exact(self.room_snapshot, RoomSnapshot, "room_snapshot")
         if self.next_room_sequence < 0:
             raise ValueError("next_room_sequence must be nonnegative")
         if self.updated_revision < 1:

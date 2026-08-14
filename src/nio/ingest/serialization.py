@@ -2,7 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid5
 
 from .errors import BatchIntegrityError
@@ -184,9 +184,7 @@ def _record_from_dict(value: object, *, exact: bool = True) -> EventRecord | Los
     record = _dict(value, "record")
     record_type = record.get("record_type")
     if record_type == "event":
-        origin = cast(
-            "RecordOrigin", _origin_from_dict(record.get("origin"), exact=exact)
-        )
+        origin = _origin_from_dict(record.get("origin"), exact=exact)
         return EventRecord(
             _string(record.get("record_id"), "record_id"),
             RecordKind(_string(record.get("kind"), "kind")),
