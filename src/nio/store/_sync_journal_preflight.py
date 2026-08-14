@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
 from peewee import DatabaseError as PeeweeDatabaseError
-from peewee import SqliteDatabase
+from peewee import SqliteDatabase, sort_models
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import OlmAccount, TrustState
@@ -1004,6 +1004,102 @@ def _create_fresh(
     return stream_id, source_state
 
 
+def _fresh_user_objects(connection: SqliteDatabase) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        connection.execute_sql(
+            "SELECT type, name, tbl_name FROM sqlite_master " "ORDER BY type, name"
+        ).fetchall()
+    )
+
+
+def _create_fresh_owned_store(
+    connection: SqliteDatabase,
+    *,
+    account_id: str,
+    device_id: str,
+    consumer_generation: UUID,
+    source: SourceConfig,
+    pickle_key: str,
+    writer_epoch: UUID,
+    statement_hook: Callable[[str], None] | None,
+) -> tuple[UUID, SourceState]:
+    if _fresh_user_objects(connection):
+        raise FreshIngestionRequired(
+            "fresh owned ingestion requires an empty SQLite user graph"
+        )
+
+    account = OlmAccount()
+    if account.shared:
+        raise LocalProtocolError("fresh Olm account must be unshared")
+    if statement_hook is not None:
+        statement_hook("account_generated")
+    pickled = account.pickle(pickle_key)
+    if statement_hook is not None:
+        statement_hook("account_pickled")
+
+    models = tuple(sort_models((*_ORDINARY_MODELS, DeviceTrustState)))
+    with connection.bind_ctx(models):
+        for model in models:
+            model.create_table(safe=False)
+            if statement_hook is not None:
+                statement_hook(f"ordinary_schema_{model._meta.table_name}")
+
+    connection.execute_sql(
+        "INSERT INTO storeversion(version) VALUES (?)",
+        (10,),
+    )
+    if statement_hook is not None:
+        statement_hook("insert_store_version")
+    connection.execute_sql(
+        "INSERT INTO accounts(account, user_id, device_id, shared) "
+        "VALUES (?, ?, ?, 0)",
+        (pickled, account_id, device_id),
+    )
+    if statement_hook is not None:
+        statement_hook("insert_account")
+
+    stream_id, source_state = _create_fresh(
+        connection,
+        account_id,
+        device_id,
+        consumer_generation,
+        source,
+        writer_epoch,
+        statement_hook,
+    )
+    _authenticate_ordinary_store(
+        connection,
+        source_store_class=_exact_sqlite_store_class(),
+        account_id=account_id,
+        device_id=device_id,
+        pickle_key=pickle_key,
+    )
+    _inspect_existing(
+        connection,
+        account_id,
+        device_id,
+        consumer_generation,
+        source,
+    )
+    _authenticate_full_ingestion_graph(
+        connection,
+        account_id=account_id,
+        device_id=device_id,
+    )
+    if connection.execute_sql("PRAGMA foreign_key_check").fetchall():
+        raise FreshIngestionRequired("fresh owned store has foreign key violations")
+    if statement_hook is not None:
+        statement_hook("foreign_key_check")
+        statement_hook("before_commit")
+    return stream_id, source_state
+
+
+def _exact_sqlite_store_class() -> type[MatrixStore]:
+    from .database import SqliteStore
+
+    return SqliteStore
+
+
 def _inspect_existing(
     connection: SqliteDatabase,
     account_id: str,
@@ -1343,10 +1439,16 @@ def open_journal_database(
     configured_source_store_class: type[MatrixStore] | None = None,
     configured_store_path: Path | None = None,
     adoption_statement_hook: Callable[[str], None] | None = None,
+    fresh_store: bool = False,
+    fresh_store_statement_hook: Callable[[str], None] | None = None,
 ) -> OpenedJournalDatabase:
     if type(consumer_generation) is not UUID:
         raise TypeError("consumer_generation must be UUID")
     source_transport(source)
+    if type(fresh_store) is not bool:
+        raise TypeError("fresh_store must be bool")
+    if fresh_store and configured_source_store_class is not None:
+        raise LocalProtocolError("fresh and configured ingestion modes conflict")
     path = database_path(database)
     if configured_source_store_class is not None:
         try:
@@ -1369,10 +1471,37 @@ def open_journal_database(
         sqlite_busy_timeout_ms,
         statement_observer,
         require_nonempty=configured_source_store_class is not None,
+        require_regular_path=(configured_source_store_class is not None or fresh_store),
     )
     connection = owner.database
     try:
         connection.execute_sql("PRAGMA secure_delete = FAST")
+        if fresh_store:
+            if _fresh_user_objects(connection):
+                raise FreshIngestionRequired(
+                    "fresh owned ingestion requires an empty SQLite user graph"
+                )
+            connection.execute_sql("PRAGMA foreign_keys = ON")
+            connection.execute_sql(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms}")
+            writer_epoch = uuid4()
+            with owner.bootstrap_write():
+                stream_id, _source_state = _create_fresh_owned_store(
+                    connection,
+                    account_id=account_id,
+                    device_id=device_id,
+                    consumer_generation=consumer_generation,
+                    source=source,
+                    pickle_key=pickle_key,
+                    writer_epoch=writer_epoch,
+                    statement_hook=fresh_store_statement_hook,
+                )
+            if fresh_store_statement_hook is not None:
+                fresh_store_statement_hook("commit")
+            connection.execute_sql("PRAGMA journal_mode = WAL")
+            connection.execute_sql("PRAGMA synchronous = NORMAL")
+            connection.execute_sql("PRAGMA secure_delete = FAST")
+            owner.activate(account_id, writer_epoch)
+            return OpenedJournalDatabase(path, owner, writer_epoch, stream_id)
         if owner.is_fresh:
             if configured_source_store_class is not None:
                 raise FreshIngestionRequired(

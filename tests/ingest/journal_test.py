@@ -36,6 +36,34 @@ CLASSIC_SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 PICKLE_KEY = "secret"
 BOB_ID = "@bob:example.org"
+FRESH_BOUNDARIES = (
+    "account_generated",
+    "account_pickled",
+    "ordinary_schema_accounts",
+    "ordinary_schema_devicekeys",
+    "ordinary_schema_devicetruststate",
+    "ordinary_schema_encryptedrooms",
+    "ordinary_schema_megolminboundsessions",
+    "ordinary_schema_forwardedchains",
+    "ordinary_schema_keys",
+    "ordinary_schema_olmsessions",
+    "ordinary_schema_outgoingkeyrequests",
+    "ordinary_schema_pendingtimelineevents",
+    "ordinary_schema_slidingwindowtokens",
+    "ordinary_schema_storeversion",
+    "ordinary_schema_syncrecoveryabandonedrooms",
+    "ordinary_schema_syncrecoverygaps",
+    "ordinary_schema_synctokens",
+    "insert_store_version",
+    "insert_account",
+    "create_meta",
+    "insert_meta",
+    *(f"schema_{index}" for index in range(9)),
+    "insert_source",
+    "foreign_key_check",
+    "before_commit",
+    "commit",
+)
 
 
 def _seed_populated_store(
@@ -94,6 +122,235 @@ def _table_names(path: Path) -> set[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+
+
+def _fresh_open(tmp_path: Path, **kwargs: object):
+    return bootstrap_api._open_fresh_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        source=CLASSIC_SOURCE,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+        **kwargs,
+    )
+
+
+def test_fresh_owned_store_bootstrap_is_one_atomic_full_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "journal.db"
+    pickle_calls: list[tuple[dict[str, str], bool, str, bytes]] = []
+    real_pickle = OlmAccount.pickle
+    boundaries: list[str] = []
+
+    def recording_pickle(account: OlmAccount, pickle_key: str = "") -> bytes:
+        pickled = real_pickle(account, pickle_key)
+        pickle_calls.append(
+            (dict(account.identity_keys), account.shared, pickle_key, pickled)
+        )
+        return pickled
+
+    monkeypatch.setattr(OlmAccount, "pickle", recording_pickle)
+    bootstrap = _fresh_open(tmp_path, fresh_statement_hook=boundaries.append)
+
+    assert _table_names(database_path) == {
+        "accounts",
+        "devicekeys",
+        "devicetruststate",
+        "encryptedrooms",
+        "forwardedchains",
+        "keys",
+        "megolminboundsessions",
+        "olmsessions",
+        "outgoingkeyrequests",
+        "pendingtimelineevents",
+        "slidingwindowtokens",
+        "storeversion",
+        "syncrecoveryabandonedrooms",
+        "syncrecoverygaps",
+        "synctokens",
+        "NioIngestMeta",
+        "NioIngestSourceState",
+        "NioIngestFrame",
+        "NioIngestRoomAggregate",
+        "NioIngestWork",
+    }
+    assert len(pickle_calls) == 1
+    identity_keys, shared, used_key, pickled = pickle_calls[0]
+    assert shared is False
+    assert used_key == PICKLE_KEY
+    with bootstrap._journal._owner.read():
+        connection = bootstrap._journal._owner.database
+        assert [
+            tuple(row)
+            for row in connection.execute_sql(
+                "SELECT version FROM storeversion"
+            ).fetchall()
+        ] == [(10,)]
+        assert [
+            tuple(row)
+            for row in connection.execute_sql(
+                "SELECT user_id, device_id, shared, account FROM accounts"
+            ).fetchall()
+        ] == [(ACCOUNT_ID, DEVICE_ID, 0, pickled)]
+        assert connection.execute_sql("PRAGMA foreign_key_check").fetchall() == []
+    restored = OlmAccount.from_pickle(pickled, PICKLE_KEY, False)
+    assert restored.identity_keys == identity_keys
+    assert not tuple(tmp_path.glob(f"{ACCOUNT_ID}_{DEVICE_ID}.*_devices"))
+    assert tuple(boundaries) == FRESH_BOUNDARIES
+    bootstrap.close()
+
+
+def test_fresh_private_signature_and_exports_are_exact() -> None:
+    import nio
+    from nio import ingest
+    import nio.store as store_package
+
+    parameters = inspect.signature(bootstrap_api._open_fresh_ingestion_store).parameters
+    assert tuple(parameters) == (
+        "store_path",
+        "account_id",
+        "device_id",
+        "consumer_generation",
+        "source",
+        "pickle_key",
+        "database_name",
+        "sqlite_busy_timeout_ms",
+        "statement_observer",
+        "transition_statement_hook",
+        "fresh_statement_hook",
+    )
+    assert parameters["fresh_statement_hook"].default is None
+    assert not hasattr(nio, "_open_fresh_ingestion_store")
+    assert not hasattr(ingest, "_open_fresh_ingestion_store")
+    assert not hasattr(store_package, "_open_fresh_ingestion_store")
+
+
+@pytest.mark.parametrize("residue", ["zero_length", "sqlite_header"])
+def test_fresh_owned_store_retries_empty_database_residue(
+    tmp_path: Path,
+    residue: str,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    if residue == "zero_length":
+        database_path.touch()
+    else:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("VACUUM")
+        assert database_path.stat().st_size > 0
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT * FROM sqlite_master").fetchall() == []
+
+    bootstrap = _fresh_open(tmp_path)
+    assert len(_table_names(database_path)) == 20
+    bootstrap.close()
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    (
+        ("CREATE TABLE stray(value INTEGER)",),
+        ("CREATE VIEW stray AS SELECT 1 AS value",),
+        (
+            "CREATE TABLE stray(value INTEGER)",
+            "CREATE INDEX stray_index ON stray(value)",
+        ),
+        (
+            "CREATE TABLE stray(value INTEGER)",
+            "CREATE TRIGGER stray_trigger AFTER INSERT ON stray BEGIN "
+            "UPDATE stray SET value = value; END",
+        ),
+        (
+            "CREATE TABLE transient(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "DROP TABLE transient",
+        ),
+    ),
+)
+def test_fresh_owned_store_rejects_any_committed_object_before_generation_or_dml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ddl: tuple[str, ...],
+) -> None:
+    database_path = tmp_path / "journal.db"
+    with sqlite3.connect(database_path) as connection:
+        for statement in ddl:
+            connection.execute(statement)
+    with sqlite3.connect(database_path) as connection:
+        before = tuple(connection.execute("SELECT * FROM sqlite_master ORDER BY name"))
+    generations = 0
+    real_init = OlmAccount.__init__
+
+    def counting_init(self, account=None):
+        nonlocal generations
+        if account is None:
+            generations += 1
+        real_init(self, account)
+
+    monkeypatch.setattr(OlmAccount, "__init__", counting_init)
+    statements: list[str] = []
+    with pytest.raises(FreshIngestionRequired, match="empty SQLite"):
+        _fresh_open(tmp_path, statement_observer=statements.append)
+    with sqlite3.connect(database_path) as connection:
+        after = tuple(connection.execute("SELECT * FROM sqlite_master ORDER BY name"))
+    assert after == before
+    assert generations == 0
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
+
+
+@pytest.mark.parametrize("boundary", FRESH_BOUNDARIES)
+def test_fresh_owned_store_hook_failure_is_all_absent_or_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    generations = 0
+    real_init = OlmAccount.__init__
+
+    def counting_init(self, account=None):
+        nonlocal generations
+        if account is None:
+            generations += 1
+        real_init(self, account)
+
+    def fail_at_boundary(label: str) -> None:
+        if label == boundary:
+            raise RuntimeError(f"injected at {label}")
+
+    monkeypatch.setattr(OlmAccount, "__init__", counting_init)
+    with pytest.raises(RuntimeError, match=f"injected at {boundary}"):
+        _fresh_open(tmp_path, fresh_statement_hook=fail_at_boundary)
+
+    with sqlite3.connect(database_path) as connection:
+        master = tuple(connection.execute("SELECT * FROM sqlite_master"))
+    if boundary != "commit":
+        assert master == ()
+        retried = _fresh_open(tmp_path)
+        assert len(_table_names(database_path)) == 20
+        retried.close()
+        return
+
+    assert len(_table_names(database_path)) == 20
+    with sqlite3.connect(database_path) as connection:
+        account_before = connection.execute(
+            "SELECT account, shared FROM accounts"
+        ).fetchone()
+    assert account_before is not None and account_before[1] == 0
+    with pytest.raises(FreshIngestionRequired, match="empty SQLite"):
+        _fresh_open(tmp_path)
+    assert generations == 1
+    reopened = _configured_open(tmp_path, SqliteStore)
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            connection.execute("SELECT account, shared FROM accounts").fetchone()
+            == account_before
+        )
+    reopened.close()
 
 
 def _logical_graph(path: Path) -> tuple[object, ...]:

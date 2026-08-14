@@ -168,6 +168,8 @@ class SqliteIngestionJournal(JournalRows):
         configured_source_store_class: type[MatrixStore] | None = None,
         configured_store_path: Path | None = None,
         adoption_statement_hook: Callable[[str], None] | None = None,
+        fresh_store: bool = False,
+        fresh_store_statement_hook: Callable[[str], None] | None = None,
     ) -> SqliteIngestionJournal:
         if type(account_id) is not str or not account_id:
             raise TypeError("account_id must be a nonempty str")
@@ -195,6 +197,8 @@ class SqliteIngestionJournal(JournalRows):
             configured_source_store_class=configured_source_store_class,
             configured_store_path=configured_store_path,
             adoption_statement_hook=adoption_statement_hook,
+            fresh_store=fresh_store,
+            fresh_store_statement_hook=fresh_store_statement_hook,
         )
         return cls(
             database_path=opened.path,

@@ -1219,6 +1219,100 @@ def test_borrowed_exact_store_does_not_create_connect_or_close(
         bootstrap.close()
 
 
+def test_fresh_owned_store_rejects_hard_link_added_after_open(tmp_path: Path) -> None:
+    bootstrap = bootstrap_api._open_fresh_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        source=SOURCE,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    alias = tmp_path / "late-hardlink.db"
+    os.link(bootstrap.database_path, alias)
+    try:
+        with pytest.raises(LocalProtocolError, match="hard link"):
+            store.load_account()
+    finally:
+        alias.unlink()
+        bootstrap.close()
+
+
+def test_fresh_owned_store_rejects_canonical_path_retargeted_to_symlink(
+    tmp_path: Path,
+) -> None:
+    bootstrap = bootstrap_api._open_fresh_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        source=SOURCE,
+        database_name="journal.db",
+    )
+    store = bootstrap.open_matrix_store(SqliteStore)
+    database_path = bootstrap.database_path
+    alias = tmp_path / "retarget.db"
+    os.link(database_path, alias)
+    database_path.unlink()
+    database_path.symlink_to(alias.name)
+    try:
+        with pytest.raises(LocalProtocolError, match="regular database path"):
+            store.load_account()
+    finally:
+        database_path.unlink()
+        os.link(alias, database_path)
+        alias.unlink()
+        bootstrap.close()
+
+
+def test_fresh_owned_store_rejects_hard_link_racing_owner_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "journal.db"
+    alias = tmp_path / "claim-race.db"
+    database_path.touch()
+    real_open = bootstrap_api._SqliteIngestionJournal.open
+
+    def raced_open(cls, database, **kwargs):
+        os.link(database_path, alias)
+        return real_open(database, **kwargs)
+
+    monkeypatch.setattr(
+        bootstrap_api._SqliteIngestionJournal,
+        "open",
+        classmethod(raced_open),
+    )
+    with pytest.raises(LocalProtocolError, match="singly linked"):
+        bootstrap_api._open_fresh_ingestion_store(
+            tmp_path,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer_generation=CONSUMER_GENERATION,
+            source=SOURCE,
+            database_name=database_path.name,
+        )
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT * FROM sqlite_master").fetchall() == []
+
+    alias.unlink()
+    monkeypatch.setattr(
+        bootstrap_api._SqliteIngestionJournal,
+        "open",
+        real_open,
+    )
+    retry = bootstrap_api._open_fresh_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        source=SOURCE,
+        database_name=database_path.name,
+    )
+    retry.close()
+
+
 def _mutation_case(store, name: str):
     account = OlmAccount()
     if name == "account":
@@ -1605,7 +1699,8 @@ def test_reentrant_close_waits_for_owner_scope_to_exit(tmp_path: Path) -> None:
 
 EXPECTED_METHOD_SCOPES = {
     **{("MatrixStore", name): "read" for name in """
-            _get_account load_device_keys load_encrypted_rooms
+            _get_account _load_persisted_sessions
+            _load_persisted_inbound_group_sessions load_device_keys load_encrypted_rooms
             load_outgoing_key_requests load_sync_token
             load_sync_recovery has_real_recovery_gap load_sliding_window_tokens
         """.split()},

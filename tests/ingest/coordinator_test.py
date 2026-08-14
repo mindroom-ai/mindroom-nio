@@ -1,8 +1,11 @@
 import asyncio
+import inspect
 import json
 import sqlite3
+import threading
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -10,6 +13,7 @@ from aiohttp import ClientConnectionError, ClientPayloadError
 
 import nio
 from nio import AsyncClient, AsyncClientConfig
+from nio.crypto import OlmAccount
 from nio.exceptions import LocalProtocolError
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import (
@@ -26,7 +30,7 @@ from nio.ingest.sliding import (
 )
 from nio.ingest.source import ClassicCursor, canonical_classic_cursor, canonical_json
 from nio.ingest.state import SourceState, StagedFrame
-from nio.store import SqliteStore, open_ingestion_store
+from nio.store import DefaultStore, SqliteStore, open_ingestion_store
 from nio.store._sync_journal_values import (
     MaterializeResult,
     MaterializerLimits,
@@ -177,6 +181,86 @@ def open_bootstrap(
         consumer_generation=generation,
         source=classic_config().source,
         transition_statement_hook=transition_statement_hook,
+    )
+
+
+def open_owned_bootstrap(
+    tmp_path,
+    generation: UUID,
+    *,
+    source=None,
+    pickle_key: str = "owned-secret",
+    database_name: str = "owned.db",
+):
+    source = source or classic_config().source
+    seed = SqliteStore(
+        ACCOUNT,
+        DEVICE,
+        str(tmp_path),
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+    account = OlmAccount()
+    seed.save_account(account)
+    seed.database.close()
+    import nio.store.sync_journal as bootstrap_api
+
+    bootstrap = bootstrap_api._open_configured_ingestion_store(
+        tmp_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=source,
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+    return bootstrap, account
+
+
+def owned_client(
+    tmp_path,
+    *,
+    pickle_key: str = "owned-secret",
+    database_name: str = "owned.db",
+    client_type=RecordingClient,
+):
+    client = client_type()
+    client.store_path = str(tmp_path)
+    client.config = AsyncClientConfig(
+        store=SqliteStore,
+        pickle_key=pickle_key,
+        store_name=database_name,
+    )
+    return client
+
+
+def open_owned_session(client, bootstrap, generation: UUID, config=None):
+    from nio.ingest import coordinator
+
+    return coordinator._open_owned_ingestion(
+        client,
+        bootstrap,
+        config=config or classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+
+
+def reopen_owned_bootstrap(tmp_path, generation: UUID):
+    import nio.store.sync_journal as bootstrap_api
+
+    return bootstrap_api._open_configured_ingestion_store(
+        tmp_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=classic_config().source,
+        pickle_key="owned-secret",
+        database_name="owned.db",
     )
 
 
@@ -486,6 +570,741 @@ def test_store_first_rejects_session_claim_without_consuming_bootstrap(
     assert store.load_account() is None
     assert client.send_count == 0
     bootstrap.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_factory_attaches_exact_store_before_olm_initialization(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nio.client import base_client as base_client_module
+
+    generation = uuid4()
+    bootstrap, account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    real_from_persisted_account = (
+        base_client_module.Olm._from_persisted_account.__func__
+    )
+    real_load_account = SqliteStore._load_persisted_account
+    initialized_with: list[object] = []
+    load_count = 0
+
+    def observing_from_persisted_account(cls, user_id, device_id, store, **kwargs):
+        assert client.store is store
+        assert client.olm is None
+        initialized_with.append(store)
+        return real_from_persisted_account(cls, user_id, device_id, store, **kwargs)
+
+    def counting_load(store):
+        nonlocal load_count
+        load_count += 1
+        return real_load_account(store)
+
+    def forbidden_save(*args, **kwargs):
+        raise AssertionError("owned Olm initialization saved an account")
+
+    monkeypatch.setattr(
+        base_client_module.Olm,
+        "_from_persisted_account",
+        classmethod(observing_from_persisted_account),
+    )
+    monkeypatch.setattr(SqliteStore, "_load_persisted_account", counting_load)
+    monkeypatch.setattr(
+        SqliteStore,
+        "load_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("owned Olm initialization used public account loading")
+        ),
+    )
+    monkeypatch.setattr(SqliteStore, "save_account", forbidden_save)
+    session = open_owned_session(client, bootstrap, generation)
+
+    assert initialized_with == [client.store]
+    assert load_count == 1
+    assert client.store is not None
+    assert client.olm is not None
+    assert client.olm.account.identity_keys == account.identity_keys
+    assert client.store.database is bootstrap._journal._owner.database
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "fixture_account", "pickle_query"),
+    (
+        (
+            "example_DEVICEID.libolm_account_pickle_v4.db",
+            "example",
+            "SELECT account FROM accounts",
+        ),
+        (
+            "example_DEVICEID.libolm_session_pickle_v1.db",
+            "example",
+            "SELECT session FROM olmsessions",
+        ),
+        (
+            "@example:localhost_DEVICEID.libolm_inbound_group_session_pickle_v1.db",
+            "@example:localhost",
+            "SELECT session FROM megolminboundsessions",
+        ),
+    ),
+)
+def test_owned_attach_late_failure_preserves_legacy_pickle_bytes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_name: str,
+    fixture_account: str,
+    pickle_query: str,
+) -> None:
+    import nio.store.sync_journal as bootstrap_api
+
+    generation = uuid4()
+    pickle_key = "DEFAULT_KEY"
+    database_name = "legacy-owned.db"
+    fixture = Path(__file__).parents[1] / "data/encryption" / fixture_name
+    with sqlite3.connect(fixture) as connection:
+        account_pickle = connection.execute("SELECT account FROM accounts").fetchone()[
+            0
+        ]
+        legacy_pickle = connection.execute(pickle_query).fetchone()[0]
+
+    seed = SqliteStore(
+        fixture_account,
+        "DEVICEID",
+        str(tmp_path),
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+    seed.save_account(OlmAccount())
+    seed.database.execute_sql("UPDATE accounts SET account = ?", (account_pickle,))
+    with sqlite3.connect(fixture) as source:
+        if "olmsessions" in pickle_query:
+            row = source.execute(
+                "SELECT session_id, creation_time, last_usage_date, sender_key, session "
+                "FROM olmsessions"
+            ).fetchone()
+            seed.database.execute_sql(
+                "INSERT INTO olmsessions(session_id, creation_time, last_usage_date, "
+                "sender_key, account_id, session) VALUES (?, ?, ?, ?, 1, ?)",
+                tuple(row),
+            )
+        elif "megolminboundsessions" in pickle_query:
+            columns = "session_id, fp_key, sender_key, room_id, session, account_id"
+            row = source.execute(
+                f"SELECT {columns} FROM megolminboundsessions"
+            ).fetchone()
+            seed.database.execute_sql(
+                f"INSERT INTO megolminboundsessions({columns}) VALUES (?, ?, ?, ?, ?, 1)",
+                tuple(row[:5]),
+            )
+    seed.database.close()
+    bootstrap = bootstrap_api._open_configured_ingestion_store(
+        tmp_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        account_id=fixture_account,
+        device_id="DEVICEID",
+        consumer_generation=generation,
+        source=classic_config().source,
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+    client = RecordingClient(
+        fixture_account,
+        "DEVICEID",
+        config=AsyncClientConfig(
+            store=SqliteStore,
+            pickle_key=pickle_key,
+            store_name=database_name,
+        ),
+    )
+    client.store_path = str(tmp_path)
+
+    def late_failure(_store):
+        raise RuntimeError("late owned attach failure")
+
+    monkeypatch.setattr(SqliteStore, "load_encrypted_rooms", late_failure)
+    with pytest.raises(RuntimeError, match="late owned attach failure"):
+        open_owned_session(client, bootstrap, generation)
+
+    with sqlite3.connect(tmp_path / database_name) as connection:
+        persisted = connection.execute(pickle_query).fetchone()[0]
+    assert persisted == legacy_pickle
+    assert client.store is None and client.olm is None
+
+    reopened = bootstrap_api._open_configured_ingestion_store(
+        tmp_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        account_id=fixture_account,
+        device_id="DEVICEID",
+        consumer_generation=generation,
+        source=classic_config().source,
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+    reopened.close()
+
+
+@pytest.mark.parametrize("config", [classic_config(), sliding_config()])
+@pytest.mark.asyncio
+async def test_fresh_and_marked_owned_paths_load_one_account_without_store_or_io_fallback(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: IngestionConfig,
+) -> None:
+    import nio.store.sync_journal as bootstrap_api
+
+    generation = uuid4()
+    database_name = "fresh-owned.db"
+    pickle_key = "fresh-owned-secret"
+    real_init = OlmAccount.__init__
+    real_pickle = OlmAccount.pickle
+    native_generations = 0
+    pickle_calls = 0
+
+    def counting_init(self, account=None):
+        nonlocal native_generations
+        if account is None:
+            native_generations += 1
+        real_init(self, account)
+
+    def counting_pickle(self, key: str = "") -> bytes:
+        nonlocal pickle_calls
+        pickle_calls += 1
+        return real_pickle(self, key)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("owned path used a legacy store/network fallback")
+
+    monkeypatch.setattr(OlmAccount, "__init__", counting_init)
+    monkeypatch.setattr(OlmAccount, "pickle", counting_pickle)
+    monkeypatch.setattr(SqliteStore, "save_account", forbidden)
+    monkeypatch.setattr(SqliteStore, "_create_database", forbidden)
+    bootstrap = bootstrap_api._open_fresh_ingestion_store(
+        tmp_path,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
+        consumer_generation=generation,
+        source=config.source,
+        pickle_key=pickle_key,
+        database_name=database_name,
+    )
+
+    identities: list[dict[str, str]] = []
+    for candidate_bootstrap in (bootstrap, None):
+        if candidate_bootstrap is None:
+            candidate_bootstrap = bootstrap_api._open_configured_ingestion_store(
+                tmp_path,
+                source_store_class=SqliteStore,
+                owned_store_class=SqliteStore,
+                account_id=ACCOUNT,
+                device_id=DEVICE,
+                consumer_generation=generation,
+                source=config.source,
+                pickle_key=pickle_key,
+                database_name=database_name,
+            )
+        client = owned_client(
+            tmp_path,
+            pickle_key=pickle_key,
+            database_name=database_name,
+        )
+        monkeypatch.setattr(client, "load_store", forbidden)
+        monkeypatch.setattr(client, "sync", forbidden)
+        monkeypatch.setattr(client, "keys_upload", forbidden)
+        session = open_owned_session(client, candidate_bootstrap, generation, config)
+        assert client.store is not None and client.olm is not None
+        identities.append(dict(client.olm.account.identity_keys))
+        assert client.send_count == 0
+        await session.close()
+
+    assert identities == [identities[0], identities[0]]
+    assert native_generations == 1
+    assert pickle_calls == 1
+
+
+@pytest.mark.parametrize("require_persisted", [False, True])
+def test_olm_public_and_owned_missing_account_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+    require_persisted: bool,
+) -> None:
+    from nio.crypto import Olm
+    from nio.crypto import olm_machine
+    from nio.store import SqliteMemoryStore
+
+    assert tuple(inspect.signature(Olm).parameters) == (
+        "user_id",
+        "device_id",
+        "store",
+        "replace_rotated_device_keys",
+    )
+    store = SqliteMemoryStore(ACCOUNT, DEVICE)
+    real_save = store.save_account
+    loads = 0
+    saves = 0
+
+    def missing_account():
+        nonlocal loads
+        loads += 1
+        return None
+
+    def counting_save(account):
+        nonlocal saves
+        saves += 1
+        return real_save(account)
+
+    monkeypatch.setattr(store, "load_account", missing_account)
+    monkeypatch.setattr(store, "save_account", counting_save)
+    if require_persisted:
+        monkeypatch.setattr(store, "_load_persisted_account", missing_account)
+        monkeypatch.setattr(
+            olm_machine,
+            "OlmAccount",
+            lambda: pytest.fail("owned constructor generated an account"),
+        )
+        with pytest.raises(LocalProtocolError, match="committed Olm account"):
+            Olm._from_persisted_account(ACCOUNT, DEVICE, store)
+        assert saves == 0
+    else:
+        assert Olm(ACCOUNT, DEVICE, store).account.identity_keys
+        assert saves == 1
+    assert loads == 1
+
+
+def test_owned_factories_and_protocol_remain_private_with_public_signature() -> None:
+    from nio import ingest
+    from nio.ingest import coordinator
+    import nio.store as store_package
+    import nio.store.sync_journal as bootstrap_api
+
+    signature = inspect.signature(nio.open_ingestion)
+    assert tuple(signature.parameters) == (
+        "client",
+        "bootstrap",
+        "config",
+        "consumer_generation",
+        "stream_id",
+    )
+    assert signature.parameters["config"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        signature.parameters["consumer_generation"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert signature.parameters["stream_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert tuple(inspect.signature(coordinator._open_owned_ingestion).parameters) == (
+        "client",
+        "bootstrap",
+        "config",
+        "consumer_generation",
+        "stream_id",
+    )
+    assert not hasattr(nio, "_open_owned_ingestion")
+    assert not hasattr(nio, "_OwnedIngestionSession")
+    assert "_open_owned_ingestion" not in ingest.__all__
+    assert "_OwnedIngestionSession" not in ingest.__all__
+    assert "_open_owned_ingestion" not in coordinator.__all__
+    namespace: dict[str, object] = {}
+    exec("from nio.ingest import *", namespace)
+    assert "_open_owned_ingestion" not in namespace
+    assert "_OwnedIngestionSession" not in namespace
+    assert hasattr(bootstrap_api, "_open_fresh_ingestion_store")
+    assert not hasattr(store_package, "_open_fresh_ingestion_store")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        "pre_store",
+        "pre_olm",
+        "wrong_store_class",
+        "wrong_pickle_key",
+        "wrong_path",
+        "encryption_disabled",
+        "dirty_sync",
+        "client_session",
+        "classic_request_lock",
+        "to_device_request_lock",
+        "to_device_transport",
+        "sliding_request_lock",
+        "wrong_identity",
+        "missing_auth",
+        "custom_authorization",
+        "wrong_source",
+        "wrong_timeout",
+        "wrong_generation",
+        "wrong_stream",
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_factory_rejects_invalid_client_without_consuming_bootstrap(
+    tmp_path, invalid: str
+) -> None:
+    from nio.ingest import coordinator
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    supplied_config = classic_config()
+    supplied_generation = generation
+    supplied_stream = bootstrap.stream_id
+    if invalid == "pre_store":
+        client.store = object()  # type: ignore[assignment]
+    elif invalid == "pre_olm":
+        client.olm = object()  # type: ignore[assignment]
+    elif invalid == "wrong_store_class":
+        client.config = replace(client.config, store=DefaultStore)
+    elif invalid == "wrong_pickle_key":
+        client.config = replace(client.config, pickle_key="wrong")
+    elif invalid == "wrong_path":
+        client.store_path = str(tmp_path / "foreign")
+    elif invalid == "encryption_disabled":
+        client.config = replace(client.config, encryption_enabled=False)
+    elif invalid == "dirty_sync":
+        client.next_batch = "already-synced"
+    elif invalid == "client_session":
+        client.client_session = object()  # type: ignore[assignment]
+    elif invalid == "classic_request_lock":
+        await client._sync_generation.classic_request_lock.acquire()
+    elif invalid == "to_device_request_lock":
+        await client._sync_generation.to_device_request_lock.acquire()
+    elif invalid == "to_device_transport":
+        client._sync_generation.to_device_transport = "classic"
+    elif invalid == "sliding_request_lock":
+        client._sync_generation.sliding_request_locks[None] = object()  # type: ignore[assignment]
+    elif invalid == "wrong_identity":
+        client.user_id = "@mallory:example.org"
+    elif invalid == "missing_auth":
+        client.access_token = ""
+    elif invalid == "custom_authorization":
+        client.config = replace(
+            client.config,
+            custom_headers={"aUtHoRiZaTiOn": "Bearer attacker"},
+        )
+    elif invalid == "wrong_source":
+        supplied_config = IngestionConfig(ClassicSourceConfig(30_000, b'{"x":1}'))
+    elif invalid == "wrong_timeout":
+        supplied_config = IngestionConfig(
+            classic_config().source,
+            sqlite_busy_timeout_ms=1_999,
+        )
+    elif invalid == "wrong_generation":
+        supplied_generation = uuid4()
+    else:
+        supplied_stream = uuid4()
+
+    with pytest.raises(LocalProtocolError):
+        coordinator._open_owned_ingestion(
+            client,
+            bootstrap,
+            config=supplied_config,
+            consumer_generation=supplied_generation,
+            stream_id=supplied_stream,
+        )
+
+    if invalid == "classic_request_lock":
+        client._sync_generation.classic_request_lock.release()
+    elif invalid == "to_device_request_lock":
+        client._sync_generation.to_device_request_lock.release()
+
+    replacement = owned_client(tmp_path)
+    session = open_owned_session(replacement, bootstrap, generation)
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "account_missing",
+        "load_account",
+        "load_sessions",
+        "load_inbound_group_sessions",
+        "load_device_keys",
+        "load_outgoing_key_requests",
+        "load_encrypted_rooms",
+        "load_sync_token",
+        "load_sync_recovery",
+        "load_sliding_window_tokens",
+        "session_construction",
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_factory_post_creation_failure_restores_tombstones_and_reopens(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    from nio.ingest import coordinator
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(
+        client.config,
+        store_sync_tokens=True,
+        backfill_limited_timelines=True,
+    )
+    previous = (
+        client.store,
+        client.olm,
+        client.encrypted_rooms,
+        client.loaded_sync_token,
+        client._recovery,
+        client._sliding_room_prev_batch,
+    )
+    revoked: list[SqliteStore] = []
+    real_revoke = SqliteStore._revoke_ingestion_lease
+
+    def record_revoke(store: SqliteStore) -> None:
+        revoked.append(store)
+        real_revoke(store)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"injected {fault}")
+
+    def forbid_save(*args, **kwargs):
+        raise AssertionError("owned attach saved an Olm account")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqliteStore, "_revoke_ingestion_lease", record_revoke)
+        patch.setattr(SqliteStore, "save_account", forbid_save)
+        if fault == "account_missing":
+            patch.setattr(
+                SqliteStore,
+                "_load_persisted_account",
+                lambda _store: None,
+            )
+        elif fault == "load_account":
+            patch.setattr(SqliteStore, "_load_persisted_account", fail)
+        elif fault == "load_sessions":
+            patch.setattr(SqliteStore, "_load_persisted_sessions", fail)
+        elif fault == "load_inbound_group_sessions":
+            patch.setattr(
+                SqliteStore,
+                "_load_persisted_inbound_group_sessions",
+                fail,
+            )
+        elif fault == "session_construction":
+            patch.setattr(coordinator, "_OwnedIngestionSession", fail)
+        else:
+            patch.setattr(SqliteStore, fault, fail)
+        expected = LocalProtocolError if fault == "account_missing" else RuntimeError
+        with pytest.raises(expected):
+            open_owned_session(client, bootstrap, generation)
+
+    restored = (
+        client.store,
+        client.olm,
+        client.encrypted_rooms,
+        client.loaded_sync_token,
+        client._recovery,
+        client._sliding_room_prev_batch,
+    )
+    assert all(current is original for current, original in zip(restored, previous))
+    assert len(revoked) == 1
+    with pytest.raises(LocalProtocolError, match="revoked"):
+        revoked[0].load_account()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_unbound_bootstrap_rejects_owned_factory_without_consumption(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    client = owned_client(
+        tmp_path,
+        pickle_key="",
+        database_name=f"{ACCOUNT}_{DEVICE}.db",
+    )
+    with pytest.raises(LocalProtocolError, match="bound bootstrap"):
+        open_owned_session(client, bootstrap, generation)
+    public_client = RecordingClient()
+    public_session = nio.open_ingestion(
+        public_client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+    await public_session.close()
+
+
+def test_owned_candidate_rejects_foreign_store_and_tombstones(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    candidate = bootstrap._open_owned_store_candidate()
+    store = candidate._store_for_attachment()
+
+    with pytest.raises(LocalProtocolError, match="foreign"):
+        candidate._prepare_transfer(object())  # type: ignore[arg-type]
+
+    assert candidate._store_for_attachment() is store
+    candidate._tombstone()
+    with pytest.raises(LocalProtocolError, match="revoked"):
+        store.load_account()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_is_sole_token_detaches_revokes_and_leaves_http(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    http_owner = object()
+    session = open_owned_session(client, bootstrap, generation)
+    client.client_session = http_owner  # type: ignore[assignment]
+    saved_store = client.store
+    saved_olm = client.olm
+    assert saved_store is not None and saved_olm is not None
+
+    with pytest.raises(LocalProtocolError, match="close token"):
+        bootstrap.close()
+    first, second = asyncio.create_task(session.close()), asyncio.create_task(
+        session.close()
+    )
+    await asyncio.gather(first, second)
+
+    assert client.store is None
+    assert client.olm is None
+    assert client.client_session is http_owner
+    assert saved_olm.store is saved_store
+    with pytest.raises(LocalProtocolError, match="revoked"):
+        saved_store.load_account()
+    with pytest.raises(LocalProtocolError, match="already closed"):
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_physical_failure_is_retryable_with_exclusion(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nio.store.sync_journal as bootstrap_api
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    owner = bootstrap._journal._owner
+    real_close = owner.database.close
+    failures = 0
+
+    def fail_once() -> bool:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise RuntimeError("physical close failed")
+        return real_close()
+
+    monkeypatch.setattr(owner.database, "close", fail_once)
+    with pytest.raises(RuntimeError, match="physical close failed"):
+        await session.close()
+    assert client.store is None and client.olm is None
+    with pytest.raises(LocalProtocolError, match="already held"):
+        bootstrap_api._open_configured_ingestion_store(
+            tmp_path,
+            source_store_class=SqliteStore,
+            owned_store_class=SqliteStore,
+            account_id=ACCOUNT,
+            device_id=DEVICE,
+            consumer_generation=generation,
+            source=classic_config().source,
+            pickle_key="owned-secret",
+            database_name="owned.db",
+        )
+
+    await session.close()
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_lock_release_failure_is_retryable_with_exclusion(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    owner = bootstrap._journal._owner
+    real_close = owner._lock.close
+    failures = 0
+
+    def fail_once() -> None:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise RuntimeError("lock release failed")
+        real_close()
+
+    monkeypatch.setattr(owner._lock, "close", fail_once)
+    with pytest.raises(RuntimeError, match="lock release failed"):
+        await session.close()
+    with pytest.raises(LocalProtocolError, match="already held"):
+        reopen_owned_bootstrap(tmp_path, generation)
+
+    await session.close()
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_wrong_thread_is_preflight_only_and_main_thread_recovers(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    saved_store = client.store
+    saved_olm = client.olm
+    errors: list[BaseException] = []
+
+    def close_from_foreign_thread() -> None:
+        try:
+            asyncio.run(session.close())
+        except BaseException as error:  # noqa: BLE001 - exact error asserted below
+            errors.append(error)
+
+    thread = threading.Thread(target=close_from_foreign_thread)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], LocalProtocolError)
+    assert client.store is saved_store and client.olm is saved_olm
+    assert saved_store is not None and saved_store.load_account() is not None
+
+    await session.close()
+    assert client.store is None and client.olm is None
+
+
+@pytest.mark.asyncio
+async def test_owned_close_caller_cancellation_drains_shared_runner_cleanup(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path, client_type=SlowCancellationClient)
+    session = open_owned_session(client, bootstrap, generation)
+    runner = asyncio.create_task(session.run())
+    await client.entered.wait()
+    first = asyncio.create_task(session.close())
+    await client.cancelling.wait()
+    second = asyncio.create_task(session.close())
+    first.cancel()
+    await asyncio.sleep(0)
+    assert not first.done() and not second.done()
+    client.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+
+    assert runner.cancelled()
+    assert client.store is None and client.olm is None
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    reopened.close()
 
 
 @pytest.mark.parametrize("header", ["Authorization", "aUtHoRiZaTiOn"])

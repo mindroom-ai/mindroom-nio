@@ -14,6 +14,7 @@ import pytest
 from nio.crypto import OlmAccount, OlmDevice, TrustState
 from nio.event_provenance import TimelineEventProvenance
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
+from nio.ingest.errors import FreshIngestionRequired
 from nio.ingest.model import EventRecord, RecordKind, RecordOrigin, TransportKind
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.sliding import RESERVED_ALL_ROOMS_LIST, SlidingSource
@@ -64,6 +65,42 @@ SQLITE_ADOPTION_BOUNDARIES = (
     "create_meta",
     "insert_meta",
     *(f"schema_{index}" for index in range(len(SCHEMA_SQL))),
+    "insert_source",
+    "foreign_key_check",
+    "before_commit",
+    "commit",
+)
+FRESH_STORE_BOUNDARIES = (
+    "account_generated",
+    "account_pickled",
+    "ordinary_schema_accounts",
+    "ordinary_schema_devicekeys",
+    "ordinary_schema_devicetruststate",
+    "ordinary_schema_encryptedrooms",
+    "ordinary_schema_megolminboundsessions",
+    "ordinary_schema_forwardedchains",
+    "ordinary_schema_keys",
+    "ordinary_schema_olmsessions",
+    "ordinary_schema_outgoingkeyrequests",
+    "ordinary_schema_pendingtimelineevents",
+    "ordinary_schema_slidingwindowtokens",
+    "ordinary_schema_storeversion",
+    "ordinary_schema_syncrecoveryabandonedrooms",
+    "ordinary_schema_syncrecoverygaps",
+    "ordinary_schema_synctokens",
+    "insert_store_version",
+    "insert_account",
+    "create_meta",
+    "insert_meta",
+    "schema_0",
+    "schema_1",
+    "schema_2",
+    "schema_3",
+    "schema_4",
+    "schema_5",
+    "schema_6",
+    "schema_7",
+    "schema_8",
     "insert_source",
     "foreign_key_check",
     "before_commit",
@@ -151,6 +188,30 @@ def _kill_during_configured_sqlite_adoption(
         database_name="journal.db",
         adoption_statement_hook=kill,
     )
+
+
+def _open_fresh_store(
+    store_path: Path,
+    hook: Callable[[str], None] | None = None,
+):
+    return bootstrap_api._open_fresh_ingestion_store(
+        store_path,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+        fresh_statement_hook=hook,
+    )
+
+
+def _kill_during_fresh_store_creation(store_path: Path, boundary: str) -> None:
+    def kill(label: str) -> None:
+        if label == boundary:
+            os._exit(CRASH_EXIT_CODE)
+
+    _open_fresh_store(store_path, kill)
 
 
 def _logical_sqlite_graph(database_path: Path) -> tuple[object, ...]:
@@ -484,6 +545,81 @@ def test_fresh_schema_creation_is_atomic_at_every_statement(
         )
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("boundary", FRESH_STORE_BOUNDARIES)
+def test_fresh_owned_store_process_death_is_empty_or_complete_and_reopenable(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    store_path = tmp_path / boundary
+    database_path = store_path / "journal.db"
+    _assert_process_crashed(_kill_during_fresh_store_creation, store_path, boundary)
+
+    graph = _logical_sqlite_graph(database_path)
+    if boundary != "commit":
+        assert graph == ((), ())
+        retried = _open_fresh_store(store_path)
+        try:
+            assert retried._owned_store_class is SqliteStore
+        finally:
+            retried.close()
+        assert retried._journal._owner.database.is_closed()
+        return
+
+    master, rows = graph
+    table_names = {name for kind, name, _table, _sql in master if kind == "table"}
+    assert len(table_names) == 20
+    assert {
+        "NioIngestMeta",
+        "NioIngestSourceState",
+        "NioIngestFrame",
+        "NioIngestRoomAggregate",
+        "NioIngestWork",
+    } <= table_names
+    assert {table: len(table_rows) for table, table_rows in rows if table_rows} == {
+        "accounts": 1,
+        "storeversion": 1,
+        "NioIngestMeta": 1,
+        "NioIngestSourceState": 1,
+    }
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version FROM storeversion").fetchall() == [
+            (10,)
+        ]
+        account_rows = connection.execute(
+            "SELECT account, user_id, device_id, shared FROM accounts"
+        ).fetchall()
+        assert len(account_rows) == 1
+        raw_pickle = account_rows[0][0]
+        assert isinstance(raw_pickle, bytes)
+        assert account_rows[0][1:] == (ACCOUNT_ID, DEVICE_ID, 0)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    generated: list[str] = []
+    with pytest.raises(FreshIngestionRequired, match="empty SQLite user graph"):
+        _open_fresh_store(store_path, generated.append)
+    assert generated == []
+
+    reopened = bootstrap_api._open_configured_ingestion_store(
+        store_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        source=CLASSIC_SOURCE,
+        account_id=ACCOUNT_ID,
+        device_id=DEVICE_ID,
+        consumer_generation=CONSUMER_GENERATION,
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+    try:
+        assert reopened._owned_store_class is SqliteStore
+    finally:
+        reopened.close()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT account FROM accounts").fetchall() == [
+            (raw_pickle,)
+        ]
 
 
 @pytest.mark.parametrize(("legacy_trust", "boundary"), ADOPTION_BOUNDARIES)

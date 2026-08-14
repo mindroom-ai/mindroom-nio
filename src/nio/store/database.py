@@ -78,7 +78,7 @@ if TYPE_CHECKING:
         RecoveryGap,
     )
     from ._ingestion_store_owner import IngestionStoreOwner
-    from .sync_journal import StoreBootstrap
+    from .sync_journal import StoreBootstrap, _OwnedStoreCandidate
 
 
 _RECOVERY_PAYLOAD_VERSION = 1
@@ -104,6 +104,24 @@ def _open_matrix_store_from_ingestion(
         pickle_key=pickle_key,
         database_name=bootstrap.database_path.name,
         _ingestion_bootstrap=bootstrap,
+    )
+
+
+def _open_matrix_store_from_owned_candidate(
+    candidate: _OwnedStoreCandidate,
+    store_class: type[MatrixStore],
+    pickle_key: str,
+) -> MatrixStore:
+    if store_class is not SqliteStore:
+        raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
+    journal = candidate._journal
+    return store_class(
+        journal.account_id,
+        journal.device_id,
+        str(candidate.database_path.parent),
+        pickle_key=pickle_key,
+        database_name=candidate.database_path.name,
+        _ingestion_bootstrap=candidate,
     )
 
 
@@ -201,7 +219,9 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
-    _ingestion_bootstrap: StoreBootstrap | None = field(default=None, repr=False)
+    _ingestion_bootstrap: StoreBootstrap | _OwnedStoreCandidate | None = field(
+        default=None, repr=False
+    )
     _ingestion_owner: IngestionStoreOwner | None = field(
         default=None, init=False, repr=False
     )
@@ -513,7 +533,9 @@ class MatrixStore:
             self.database.create_tables(self.models)
         self._repair_v10_recovery_abandonments()
 
-    def _post_init_ingestion_store(self, bootstrap: StoreBootstrap) -> None:
+    def _post_init_ingestion_store(
+        self, bootstrap: StoreBootstrap | _OwnedStoreCandidate
+    ) -> None:
         if self._ingestion_initialized:
             raise LocalProtocolError("borrowed ingestion store is already initialized")
         owner = self._ingestion_owner
@@ -603,6 +625,17 @@ class MatrixStore:
         except DoesNotExist:
             return None
 
+    def _load_persisted_account(self) -> OlmAccount | None:
+        """Load an existing account without upgrading or writing its pickle."""
+        account = self._get_account()
+        if not account:
+            return None
+        return OlmAccount.from_pickle(
+            account.account,
+            self.pickle_key,
+            account.shared,
+        )
+
     def load_account(self) -> OlmAccount | None:
         """Load the Olm account from the database.
 
@@ -611,14 +644,9 @@ class MatrixStore:
                 current device_id.
 
         """
-        account = self._get_account()
-
-        if not account:
+        olm_account = self._load_persisted_account()
+        if olm_account is None:
             return None
-
-        olm_account = OlmAccount.from_pickle(
-            account.account, self.pickle_key, account.shared
-        )
 
         # upgrade account pickle in database to vodozemac format
         if olm_account.upgrade_pickle:
@@ -651,6 +679,18 @@ class MatrixStore:
             (Accounts.user_id == self.user_id) & (Accounts.device_id == self.device_id)
         ).execute()
 
+    @use_database
+    def _load_persisted_sessions(self) -> SessionStore:
+        """Decode persisted Olm sessions without upgrading their pickles."""
+        session_store = SessionStore()
+        account = self._get_account()
+        if not account:
+            return session_store
+        for s in account.olm_sessions:
+            session = Session.from_pickle(s.session, s.creation_time, self.pickle_key)
+            session_store.add(s.sender_key, session)
+        return session_store
+
     @use_database_atomic
     def load_sessions(self) -> SessionStore:
         """Load all Olm sessions from the database.
@@ -659,21 +699,14 @@ class MatrixStore:
             ``SessionStore`` object, containing all the loaded sessions.
 
         """
-        session_store = SessionStore()
+        session_store = self._load_persisted_sessions()
 
-        account = self._get_account()
-
-        if not account:
-            return session_store
-
-        for s in account.olm_sessions:
-            session = Session.from_pickle(s.session, s.creation_time, self.pickle_key)
-            session_store.add(s.sender_key, session)
-
-            # upgrade session pickles in database to vodozemac format
-            if session.upgrade_pickle:
-                session.upgrade_pickle = False
-                self.save_session(s.sender_key, session)
+        for sender_key, sessions in session_store.items():
+            for session in sessions:
+                # upgrade session pickles in database to vodozemac format
+                if session.upgrade_pickle:
+                    session.upgrade_pickle = False
+                    self.save_session(sender_key, session)
 
         return session_store
 
@@ -698,21 +731,13 @@ class MatrixStore:
             last_usage_date=session.use_time,
         ).execute()
 
-    @use_database_atomic
-    def load_inbound_group_sessions(self) -> GroupSessionStore:
-        """Load all Olm sessions from the database.
-
-        Returns:
-            ``GroupSessionStore`` object, containing all the loaded sessions.
-
-        """
+    @use_database
+    def _load_persisted_inbound_group_sessions(self) -> GroupSessionStore:
+        """Decode persisted inbound sessions without upgrading their pickles."""
         store = GroupSessionStore()
-
         account = self._get_account()
-
         if not account:
             return store
-
         for s in account.inbound_group_sessions:
             session = InboundGroupSession.from_pickle(
                 s.session,
@@ -723,7 +748,19 @@ class MatrixStore:
                 [chain.sender_key for chain in s.forwarded_chains],
             )
             store.add(session)
+        return store
 
+    @use_database_atomic
+    def load_inbound_group_sessions(self) -> GroupSessionStore:
+        """Load all Olm sessions from the database.
+
+        Returns:
+            ``GroupSessionStore`` object, containing all the loaded sessions.
+
+        """
+        store = self._load_persisted_inbound_group_sessions()
+
+        for session in store:
             # upgrade session pickles in database to vodozemac format
             if session.upgrade_pickle:
                 session.upgrade_pickle = False

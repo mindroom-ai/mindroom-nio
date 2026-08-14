@@ -40,11 +40,13 @@ class StableFileLock:
         *,
         exclusive: bool = True,
         require_database: bool = False,
+        require_regular_path: bool = False,
     ) -> None:
         self.owner_pid = os.getpid()
         self.database_path = Path(os.path.abspath(database_path))
         self.exclusive = exclusive
         self.require_database = require_database
+        self.require_regular_path = require_regular_path
         self._database_fd = -1
         canonical_path = Path(os.path.realpath(self.database_path))
         self.path = Path(f"{canonical_path}.ingest.lock")
@@ -99,6 +101,7 @@ class StableFileLock:
         locked = os.fstat(self._fd)
         self.identity = (locked.st_dev, locked.st_ino)
         self.database_identity: FileIdentity | None = None
+        self._database_link_count: int | None = None
         if self._database_fd >= 0:
             operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
             try:
@@ -111,12 +114,13 @@ class StableFileLock:
                     f"store lifetime lease is already held for {database_path}"
                 ) from error
             opened = os.fstat(self._database_fd)
-            if require_database and opened.st_nlink != 1:
+            if (require_database or require_regular_path) and opened.st_nlink != 1:
                 self.close()
                 raise LocalProtocolError(
-                    "configured adoption requires a singly linked database file"
+                    "owned ingestion requires a singly linked database file"
                 )
             self.database_identity = (opened.st_dev, opened.st_ino)
+            self._database_link_count = opened.st_nlink
             self.assert_identity()
         elif self.database_path.exists():
             self.claim_database()
@@ -130,11 +134,19 @@ class StableFileLock:
         try:
             descriptor = os.open(
                 self.database_path,
-                os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | (getattr(os, "O_NOFOLLOW", 0) if self.require_regular_path else 0),
             )
         except FileNotFoundError as error:
             raise LocalProtocolError(
                 "store database identity is no longer present"
+            ) from error
+        except OSError as error:
+            if not self.require_regular_path:
+                raise
+            raise LocalProtocolError(
+                "owned ingestion requires a regular database path"
             ) from error
         os.set_inheritable(descriptor, False)
         operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
@@ -146,8 +158,15 @@ class StableFileLock:
                 f"store lifetime lease is already held for {self.database_path}"
             ) from error
         locked = os.fstat(descriptor)
+        if self.require_regular_path and locked.st_nlink != 1:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            raise LocalProtocolError(
+                "owned ingestion requires a singly linked database file"
+            )
         self._database_fd = descriptor
         self.database_identity = (locked.st_dev, locked.st_ino)
+        self._database_link_count = locked.st_nlink
         try:
             self.assert_identity()
         except BaseException:
@@ -155,6 +174,7 @@ class StableFileLock:
             os.close(descriptor)
             self._database_fd = -1
             self.database_identity = None
+            self._database_link_count = None
             raise
 
     def assert_process_owner(self) -> None:
@@ -178,15 +198,23 @@ class StableFileLock:
         if self._database_fd < 0 or self.database_identity is None:
             raise LocalProtocolError("database lifetime lease is not claimed")
         try:
-            database = os.stat(self.database_path)
+            database = (
+                os.lstat(self.database_path)
+                if self.require_regular_path
+                else os.stat(self.database_path)
+            )
         except FileNotFoundError as error:
             raise LocalProtocolError(
                 "store database identity is no longer present"
             ) from error
         descriptor = os.fstat(self._database_fd)
-        if self.require_database and descriptor.st_nlink != 1:
+        if self.require_regular_path and (
+            not stat.S_ISREG(database.st_mode)
+            or database.st_nlink != 1
+            or descriptor.st_nlink != 1
+        ):
             raise LocalProtocolError(
-                "configured database acquired an unsupported hard link"
+                "owned ingestion regular database path acquired a hard link"
             )
         identities = (
             (database.st_dev, database.st_ino),
@@ -194,6 +222,16 @@ class StableFileLock:
         )
         if identities != (self.database_identity, self.database_identity):
             raise LocalProtocolError("store database file identity changed")
+        if (
+            self._database_link_count is None
+            or database.st_nlink != self._database_link_count
+            or descriptor.st_nlink != self._database_link_count
+        ):
+            raise LocalProtocolError("store database hard link count changed")
+        if self.require_database and descriptor.st_nlink != 1:
+            raise LocalProtocolError(
+                "configured database acquired an unsupported hard link"
+            )
 
     def close(self) -> None:
         self.assert_process_owner()
@@ -203,6 +241,7 @@ class StableFileLock:
             fcntl.flock(self._database_fd, fcntl.LOCK_UN)
             os.close(self._database_fd)
             self._database_fd = -1
+            self._database_link_count = None
         fcntl.flock(self._fd, fcntl.LOCK_UN)
         os.close(self._fd)
         self._fd = -1
@@ -463,11 +502,16 @@ class IngestionStoreOwner:
         statement_observer: Callable[[str], None] | None,
         *,
         require_nonempty: bool = False,
+        require_regular_path: bool = False,
     ) -> None:
         self.path = path
         self._pid = os.getpid()
         self._thread = threading.get_ident()
-        self._lock = StableFileLock(path, require_database=require_nonempty)
+        self._lock = StableFileLock(
+            path,
+            require_database=require_nonempty,
+            require_regular_path=require_regular_path,
+        )
         self._state = "bootstrap"
         self._depth = 0
         self._outer_scope: str | None = None
@@ -698,9 +742,7 @@ class IngestionStoreOwner:
             # Keep exclusion for a same-owner retry even when the pathname is
             # stale; releasing here would permit a second writer to overlap it.
             raise
-        try:
-            self._lock.close()
-        finally:
-            self._state = "closed"
+        self._lock.close()
+        self._state = "closed"
         if identity_error is not None:
             raise identity_error

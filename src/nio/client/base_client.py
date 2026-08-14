@@ -24,6 +24,7 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    cast,
 )
 
 from ..crypto import ENCRYPTION_ENABLED, DeviceStore, OutgoingKeyRequest
@@ -70,7 +71,7 @@ from ..rooms import MatrixInvitedRoom, MatrixRoom
 
 if ENCRYPTION_ENABLED:
     from ..crypto import Olm
-    from ..store import DefaultStore, MatrixStore, SqliteMemoryStore
+    from ..store import DefaultStore, MatrixStore, SqliteMemoryStore, SqliteStore
 if TYPE_CHECKING:
     from ..crypto import OlmDevice, Sas
 
@@ -78,6 +79,16 @@ if TYPE_CHECKING:
 from ..event_builders import ToDeviceMessage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _IngestionStoreSnapshot:
+    store: MatrixStore | None
+    olm: Olm | None
+    encrypted_rooms: set[str]
+    loaded_sync_token: str | None
+    recovery: object | None
+    sliding_tokens: object | None
 
 
 def logged_in(func):
@@ -258,6 +269,7 @@ class Client:
         self.store_path = store_path
         self.olm: Olm | None = None
         self.store: MatrixStore | None = None
+        self._ingestion_store_snapshot: _IngestionStoreSnapshot | None = None
         self.config = config or ClientConfig()
 
         self.user_id = ""
@@ -445,6 +457,100 @@ class Client:
 
             if self.config.store_sync_tokens:
                 self.loaded_sync_token = self.store.load_sync_token()
+
+    def _attach_ingestion_store(self, store: MatrixStore) -> None:
+        """Attach one exact borrowed SqliteStore before constructing Olm."""
+        if type(store) is not SqliteStore:
+            raise LocalProtocolError("owned ingestion requires exact SqliteStore")
+        if (
+            self.store is not None
+            or self.olm is not None
+            or self._ingestion_store_snapshot is not None
+        ):
+            raise LocalProtocolError("client already has a Matrix store or Olm account")
+        if not self.config.encryption_enabled:
+            raise LocalProtocolError("owned ingestion requires encryption")
+        device_id = self.device_id
+        if type(device_id) is not str:
+            raise LocalProtocolError("owned ingestion requires a bound device id")
+        if (store.user_id, store.device_id) != (self.user_id, self.device_id):
+            raise LocalProtocolError("borrowed store identity does not match client")
+
+        previous_store = self.store
+        previous_olm = self.olm
+        previous_encrypted_rooms = self.encrypted_rooms
+        previous_loaded_sync_token = self.loaded_sync_token
+        previous_recovery = getattr(self, "_recovery", None)
+        previous_sliding_tokens = getattr(self, "_sliding_room_prev_batch", None)
+        snapshot = _IngestionStoreSnapshot(
+            previous_store,
+            previous_olm,
+            previous_encrypted_rooms,
+            previous_loaded_sync_token,
+            previous_recovery,
+            previous_sliding_tokens,
+        )
+        try:
+            self.store = store
+            olm = Olm._from_persisted_account(
+                self.user_id,
+                device_id,
+                store,
+                replace_rotated_device_keys=self.config.replace_rotated_device_keys,
+            )
+            encrypted_rooms = store.load_encrypted_rooms()
+            loaded_sync_token = previous_loaded_sync_token
+            if self.config.store_sync_tokens:
+                loaded_sync_token = store.load_sync_token()
+            recovery = previous_recovery
+            sliding_tokens = previous_sliding_tokens
+            recovery_enabled = getattr(self, "_recovery_persistence_enabled", False)
+            if recovery_enabled:
+                from .sync_recovery import RecoveryState, load_recovery_state
+
+                recovery = RecoveryState(
+                    max_held_events=self.config.backfill_max_events  # type: ignore[attr-defined]
+                )
+                load_recovery_state(recovery, *store.load_sync_recovery())
+                sliding_tokens = dict(store.load_sliding_window_tokens())
+            self.olm = olm
+            self.encrypted_rooms = encrypted_rooms
+            self.loaded_sync_token = loaded_sync_token
+            if previous_recovery is not None:
+                setattr(self, "_recovery", recovery)
+            if previous_sliding_tokens is not None:
+                setattr(self, "_sliding_room_prev_batch", sliding_tokens)
+            self._ingestion_store_snapshot = snapshot
+        except BaseException:
+            self.olm = previous_olm
+            self.store = previous_store
+            self.encrypted_rooms = previous_encrypted_rooms
+            self.loaded_sync_token = previous_loaded_sync_token
+            if previous_recovery is not None:
+                setattr(self, "_recovery", previous_recovery)
+            if previous_sliding_tokens is not None:
+                setattr(self, "_sliding_room_prev_batch", previous_sliding_tokens)
+            raise
+
+    def _detach_ingestion_store(self, store: MatrixStore) -> None:
+        """Detach the exact borrowed store without touching client HTTP state."""
+        snapshot = self._ingestion_store_snapshot
+        if (
+            snapshot is None
+            or self.store is not store
+            or self.olm is None
+            or self.olm.store is not store
+        ):
+            raise LocalProtocolError("client no longer owns the borrowed store")
+        self.olm = None
+        self.store = None
+        self.encrypted_rooms = snapshot.encrypted_rooms
+        self.loaded_sync_token = cast(Any, snapshot.loaded_sync_token)
+        if snapshot.recovery is not None:
+            setattr(self, "_recovery", snapshot.recovery)
+        if snapshot.sliding_tokens is not None:
+            setattr(self, "_sliding_room_prev_batch", snapshot.sliding_tokens)
+        self._ingestion_store_snapshot = None
 
     def restore_login(
         self,
