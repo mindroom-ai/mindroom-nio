@@ -19,31 +19,69 @@ import inspect
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
     cast,
 )
+from uuid import uuid5
 
 from ..crypto import ENCRYPTION_ENABLED, DeviceStore, OutgoingKeyRequest
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEvent,
     BadEventType,
+    DummyEvent,
     EphemeralEvent,
     Event,
+    ForwardedRoomKeyEvent,
+    InviteEvent,
+    KeyVerificationCancel,
     MegolmEvent,
     PresenceEvent,
     RoomEncryptionEvent,
+    RoomKeyEvent,
     RoomKeyRequest,
     RoomKeyRequestCancellation,
     RoomMemberEvent,
     ToDeviceEvent,
     UnknownBadEvent,
+    UnknownToDeviceEvent,
 )
 from ..exceptions import EncryptionError, LocalProtocolError, MembersSyncError
+from ..ingest._json import canonical_json as _canonical_ingestion_json
+from ..ingest._json import load_json as _load_ingestion_json
+from ..ingest.model import (
+    RecordKind,
+    RoomMemberSnapshot,
+    RoomSnapshot,
+    TransportKind,
+    _CallbackRoute,
+    _DecryptedToDeviceKind,
+    _DecryptionDisposition,
+    _MembershipProvenance,
+    _MembershipSourceKind,
+    _PreparationPhase,
+    _PreparedCryptoDelta,
+    _PreparedIngestionFrame,
+    _PreparedIngestionRecord,
+    _PreparedKeyClaim,
+    _PreparedMegolmRerequest,
+    _PreparedMembershipTransition,
+    _PreparedQueuedToDeviceMessage,
+    _PreparedWaitingKeyRequest,
+    _QueuedToDeviceSubtype,
+)
+from ..ingest.reducer import RoomContinuity
+from ..ingest.source import (
+    RoomSection,
+    SyncFrame,
+    _normalized_ephemeral_envelopes,
+)
 from ..responses import (
     ErrorResponse,
     JoinedMembersResponse,
@@ -76,9 +114,273 @@ if TYPE_CHECKING:
     from ..crypto import OlmDevice, Sas
 
 
-from ..event_builders import ToDeviceMessage
+from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 
 logger = logging.getLogger(__name__)
+
+_DECRYPTED_TO_DEVICE_KINDS = {
+    RoomKeyEvent: _DecryptedToDeviceKind.ROOM_KEY,
+    ForwardedRoomKeyEvent: _DecryptedToDeviceKind.FORWARDED_ROOM_KEY,
+    DummyEvent: _DecryptedToDeviceKind.DUMMY,
+    UnknownToDeviceEvent: _DecryptedToDeviceKind.UNKNOWN,
+    BadEvent: _DecryptedToDeviceKind.BAD,
+    UnknownBadEvent: _DecryptedToDeviceKind.UNKNOWN_BAD,
+}
+
+
+def _canonical_ingestion_object(payload: bytes, field_name: str) -> dict[Any, Any]:
+    value = _load_ingestion_json(payload, field_name)
+    if type(value) is not dict or _canonical_ingestion_json(value) != payload:
+        raise ValueError(f"{field_name} must be a canonical JSON object")
+    return value
+
+
+def _matrix_event_id(value: dict[Any, Any]) -> str | None:
+    event_id = value.get("event_id")
+    return event_id if type(event_id) is str and event_id else None
+
+
+def _require_ingestion_event_type(
+    value: dict[Any, Any],
+    field_name: str,
+) -> dict[Any, Any]:
+    if type(value.get("type")) is not str or not value["type"]:
+        raise ValueError(f"{field_name} type must be nonempty")
+    return value
+
+
+def _nonempty_string_list(value: object) -> bool:
+    return type(value) is list and all(type(item) is str and item for item in value)
+
+
+def _has_fields(value: object, **expected: object) -> bool:
+    return type(value) is dict and all(
+        value.get(name) == expected_value for name, expected_value in expected.items()
+    )
+
+
+def _require_parsed_ingestion_event(
+    event: object,
+    expected: type,
+    field_name: str,
+) -> object:
+    if type(event) is not expected:
+        raise ValueError(f"{field_name} is invalid")
+    return event
+
+
+_ParsedIngestionEvent = tuple[bytes, dict[Any, Any], Any]
+
+
+def _parse_ingestion_events(
+    payloads: tuple[bytes, ...],
+    field_name: str,
+    parser: Callable[[dict[Any, Any]], object],
+) -> tuple[_ParsedIngestionEvent, ...]:
+    return tuple(
+        (
+            payload,
+            raw := _require_ingestion_event_type(
+                _canonical_ingestion_object(payload, field_name),
+                field_name,
+            ),
+            parser(deepcopy(raw)),
+        )
+        for payload in payloads
+    )
+
+
+def _prepared_waiting_key_request(
+    event: RoomKeyRequest,
+) -> _PreparedWaitingKeyRequest:
+    if type(event.source) is not dict:
+        raise TypeError("waiting room-key-request source must be a dict")
+    source_json = _canonical_ingestion_json(event.source)
+    raw = _canonical_ingestion_object(source_json, "waiting room-key request")
+    content = raw.get("content")
+    body = content.get("body") if type(content) is dict else None
+    if (
+        not _has_fields(raw, type="m.room_key_request", sender=event.sender)
+        or not _has_fields(
+            content,
+            action="request",
+            requesting_device_id=event.requesting_device_id,
+            request_id=event.request_id,
+        )
+        or not _has_fields(
+            body,
+            room_id=event.room_id,
+            sender_key=event.sender_key,
+            session_id=event.session_id,
+            algorithm=event.algorithm,
+        )
+    ):
+        raise ValueError("waiting room-key-request fields disagree with source")
+    return _PreparedWaitingKeyRequest(
+        source_json,
+        *(
+            getattr(event, name)
+            for name in (
+                "sender",
+                "requesting_device_id",
+                "request_id",
+                "room_id",
+                "sender_key",
+                "session_id",
+                "algorithm",
+            )
+        ),
+    )
+
+
+def _prepared_megolm_rerequest(
+    event: MegolmEvent,
+) -> _PreparedMegolmRerequest:
+    if type(event.source) is not dict:
+        raise TypeError("Megolm rerequest source must be a dict")
+    source_json = _canonical_ingestion_json(event.source)
+    raw = _canonical_ingestion_object(source_json, "Megolm rerequest event")
+    content = raw.get("content")
+    if (
+        not _has_fields(
+            raw,
+            type="m.room.encrypted",
+            event_id=event.event_id,
+            sender=event.sender,
+        )
+        or ("room_id" in raw and raw.get("room_id") != event.room_id)
+        or not _has_fields(
+            content,
+            device_id=event.device_id,
+            sender_key=event.sender_key,
+            session_id=event.session_id,
+            algorithm=event.algorithm,
+        )
+        or type(event.room_id) is not str
+        or not event.room_id
+    ):
+        raise ValueError("Megolm rerequest fields disagree with source")
+    return _PreparedMegolmRerequest(
+        source_json,
+        *(
+            getattr(event, name)
+            for name in (
+                "room_id",
+                "event_id",
+                "sender",
+                "device_id",
+                "sender_key",
+                "session_id",
+                "algorithm",
+            )
+        ),
+    )
+
+
+def _prepared_queued_to_device_message(
+    message: ToDeviceMessage,
+    rerequest_events: tuple[_PreparedMegolmRerequest, ...],
+) -> _PreparedQueuedToDeviceMessage:
+    for field_name, value in (
+        ("event type", message.type),
+        ("recipient user ID", message.recipient),
+        ("recipient device ID", message.recipient_device),
+    ):
+        if type(value) is not str or not value:
+            raise ValueError(f"queued to-device {field_name} must be nonempty")
+    if type(message.content) is not dict:
+        raise TypeError("queued to-device content must be a dict")
+
+    request_context: tuple[str | None, str | None, str | None, str | None]
+    if isinstance(message, DummyMessage):
+        subtype = _QueuedToDeviceSubtype.DUMMY
+        request_context = (None, None, None, None)
+    elif isinstance(message, RoomKeyRequestMessage):
+        subtype = _QueuedToDeviceSubtype.ROOM_KEY_REQUEST
+        request_context = (
+            message.request_id,
+            message.session_id,
+            message.room_id,
+            message.algorithm,
+        )
+        body = message.content.get("body")
+        if not _has_fields(
+            message.content,
+            action="request",
+            request_id=message.request_id,
+        ) or not _has_fields(
+            body,
+            session_id=message.session_id,
+            room_id=message.room_id,
+            algorithm=message.algorithm,
+        ):
+            raise ValueError("queued room-key-request context disagrees with content")
+    elif type(message) is ToDeviceMessage:
+        subtype = _QueuedToDeviceSubtype.GENERIC
+        request_context = (None, None, None, None)
+    else:
+        raise TypeError("queued to-device message subtype is unsupported")
+
+    return _PreparedQueuedToDeviceMessage(
+        subtype,
+        message.type,
+        message.recipient,
+        message.recipient_device,
+        _canonical_ingestion_json(message.content),
+        request_context[0],
+        request_context[1],
+        request_context[2],
+        request_context[3],
+        rerequest_events,
+    )
+
+
+def _room_snapshot(
+    room: MatrixRoom,
+    membership_epoch: int,
+    own_membership: str | None,
+) -> RoomSnapshot:
+    defaults = room.power_levels.defaults
+    members = tuple(
+        RoomMemberSnapshot(
+            user.user_id,
+            "invite" if user.invited else "join",
+            user.display_name,
+            user.avatar_url,
+            user.power_level,
+        )
+        for user in sorted(room.users.values(), key=lambda value: value.user_id)
+    )
+    return RoomSnapshot(
+        room.room_id,
+        membership_epoch,
+        room.own_user_id,
+        own_membership,
+        room.encrypted,
+        room.name,
+        room.canonical_alias,
+        room.topic,
+        room.room_avatar_url,
+        room.join_rule,
+        room.room_version,
+        room.guest_access,
+        _canonical_ingestion_json(
+            {
+                "ban": defaults.ban,
+                "creators": room.power_levels.creators,
+                "events": room.power_levels.events,
+                "events_default": defaults.events_default,
+                "invite": defaults.invite,
+                "kick": defaults.kick,
+                "notifications": defaults.notifications,
+                "redact": defaults.redact,
+                "state_default": defaults.state_default,
+                "users": room.power_levels.users,
+                "users_default": defaults.users_default,
+            }
+        ),
+        members,
+    )
 
 
 @dataclass(frozen=True)
@@ -791,9 +1093,705 @@ class Client:
         assert self.olm
         return self.olm.decrypt_megolm_event(event)
 
+    def _prepare_ingestion_frame(
+        self,
+        frame: SyncFrame,
+        staged_revision: int,
+        prior_continuities: tuple[RoomContinuity, ...],
+    ) -> _PreparedIngestionFrame:
+        """Apply one owned durable Frame without invoking callbacks."""
+        store = self.store
+        olm = self.olm
+        if (
+            self._ingestion_store_snapshot is None
+            or type(store) is not SqliteStore
+            or olm is None
+            or type(olm) is not Olm
+            or olm.store is not store
+        ):
+            raise LocalProtocolError(
+                "ingestion preparation requires the exact attached store and Olm"
+            )
+        if type(frame) is not SyncFrame:
+            raise TypeError("frame must be SyncFrame")
+        if type(staged_revision) is not int or staged_revision < 1:
+            raise ValueError("staged_revision must be a positive integer")
+        if type(prior_continuities) is not tuple or any(
+            type(value) is not RoomContinuity for value in prior_continuities
+        ):
+            raise TypeError("prior_continuities must contain RoomContinuity values")
+        prior_by_room = {value.room_id: value for value in prior_continuities}
+        if len(prior_by_room) != len(prior_continuities):
+            raise ValueError("prior_continuities must have unique room IDs")
+
+        _canonical_ingestion_object(frame.request_cursor_json, "request cursor")
+        candidate_cursor = _canonical_ingestion_object(
+            frame.candidate_cursor_json, "candidate cursor"
+        )
+        if frame.origin.transport is TransportKind.CLASSIC:
+            if set(candidate_cursor) != {"next_batch"}:
+                raise ValueError("Classic candidate cursor is invalid")
+            compatibility_token = candidate_cursor["next_batch"]
+            if type(compatibility_token) is not str or not compatibility_token:
+                raise ValueError("Classic candidate token must be nonempty")
+        else:
+            compatibility_token = None
+
+        device_list_delta = _canonical_ingestion_object(
+            frame.device_list_delta_json, "device-list delta"
+        )
+        if set(device_list_delta) != {"changed", "left"} or not all(
+            _nonempty_string_list(value) for value in device_list_delta.values()
+        ):
+            raise ValueError("device-list delta is invalid")
+        key_counts = _canonical_ingestion_object(
+            frame.one_time_key_counts_json, "one-time-key counts"
+        )
+        if any(
+            type(algorithm) is not str
+            or not algorithm
+            or type(count) is not int
+            or count < 0
+            for algorithm, count in key_counts.items()
+        ):
+            raise ValueError("one-time-key counts are invalid")
+        fallback = _load_ingestion_json(
+            frame.unused_fallback_key_types_json,
+            "unused fallback key types",
+        )
+        if _canonical_ingestion_json(
+            fallback
+        ) != frame.unused_fallback_key_types_json or (
+            fallback is not None and not _nonempty_string_list(fallback)
+        ):
+            raise ValueError("unused fallback key types are invalid")
+
+        parsed_to_device = _parse_ingestion_events(
+            frame.to_device_json,
+            "to-device event",
+            ToDeviceEvent.parse_event,
+        )
+        parsed_segments = []
+        for segment in frame.room_segments:
+            state_parser = (
+                InviteEvent.parse_event
+                if segment.section in {RoomSection.INVITE, RoomSection.KNOCK}
+                else Event.parse_event
+            )
+            parsed_segments.append(
+                (
+                    segment,
+                    _parse_ingestion_events(
+                        segment.state_json, "state event", state_parser
+                    ),
+                    _parse_ingestion_events(
+                        segment.timeline_json, "timeline event", Event.parse_event
+                    ),
+                    _parse_ingestion_events(
+                        segment.room_account_data_json,
+                        "room account-data event",
+                        AccountDataEvent.parse_event,
+                    ),
+                )
+            )
+
+        ephemeral_by_room: dict[str, list[_ParsedIngestionEvent]] = defaultdict(list)
+        for room_id, payload in _normalized_ephemeral_envelopes(frame.ephemeral_json):
+            value = _require_ingestion_event_type(
+                _canonical_ingestion_object(payload, "ephemeral event"),
+                "ephemeral event",
+            )
+            ephemeral_by_room[room_id].append(
+                (payload, value, EphemeralEvent.parse_event(deepcopy(value)))
+            )
+        parsed_presence = _parse_ingestion_events(
+            frame.presence_json,
+            "presence event",
+            lambda value: _require_parsed_ingestion_event(
+                PresenceEvent.from_dict(value), PresenceEvent, "presence event"
+            ),
+        )
+        parsed_global_account_data = _parse_ingestion_events(
+            frame.global_account_data_json,
+            "global account-data event",
+            AccountDataEvent.parse_event,
+        )
+
+        if compatibility_token is not None:
+            self.next_batch = compatibility_token
+
+        records: list[_PreparedIngestionRecord] = []
+        transitions: list[_PreparedMembershipTransition] = []
+        snapshots: list[RoomSnapshot] = []
+        encrypted_room_ids: set[str] = set()
+        record_phase_indexes: dict[_PreparationPhase, int] = defaultdict(int)
+
+        def pending_record_id(phase: _PreparationPhase) -> str:
+            return str(
+                uuid5(
+                    frame.frame_id,
+                    f"record:{phase.value}:{record_phase_indexes[phase]}",
+                )
+            )
+
+        def append_record(
+            kind: RecordKind,
+            payload: bytes,
+            raw: dict[Any, Any],
+            room_id: str | None = None,
+            provenance: TimelineEventProvenance | None = None,
+            callback_route: _CallbackRoute | None = None,
+            clear_json: bytes | None = None,
+            decryption: _DecryptionDisposition = _DecryptionDisposition.NONE,
+            decryption_verified: bool | None = None,
+            decrypted_to_device_kind: _DecryptedToDeviceKind | None = None,
+            phase: _PreparationPhase = _PreparationPhase.SOURCE,
+            explicit_event_type: str | None = None,
+        ) -> _PreparedIngestionRecord:
+            if (
+                decryption_verified is not None
+                and type(decryption_verified) is not bool
+            ):
+                raise TypeError("decryption_verified must be bool or None")
+            if (decrypted_to_device_kind is not None) != (
+                kind is RecordKind.TO_DEVICE
+                and decryption is _DecryptionDisposition.DECRYPTED
+            ):
+                raise ValueError("decrypted to-device kind disagrees with disposition")
+            index = len(records)
+            record_id = pending_record_id(phase)
+            record_phase_indexes[phase] += 1
+            effective_raw = (
+                _canonical_ingestion_object(clear_json, "clear event")
+                if clear_json is not None
+                else raw
+            )
+            visible_event_type = effective_raw.get("type")
+            effective_event_type = explicit_event_type or visible_event_type
+            if type(effective_event_type) is not str or not effective_event_type:
+                raise ValueError("effective event type is unavailable")
+            if (
+                visible_event_type is not None
+                and visible_event_type != effective_event_type
+            ):
+                raise ValueError("effective event type disagrees with event JSON")
+            record = _PreparedIngestionRecord(
+                record_id,
+                kind,
+                replace(frame.origin, frame_index=index),
+                phase,
+                effective_event_type,
+                room_id,
+                _matrix_event_id(raw),
+                provenance,
+                payload,
+                clear_json,
+                decryption,
+                decryption_verified,
+                decrypted_to_device_kind,
+                callback_route,
+            )
+            records.append(record)
+            return record
+
+        def append_synthetic_to_device_records(
+            events: object,
+            phase: _PreparationPhase,
+        ) -> None:
+            if type(events) is not list:
+                raise TypeError(f"{phase} outputs must be a list")
+            for event in events:
+                if not isinstance(event, ToDeviceEvent):
+                    raise TypeError(f"{phase} outputs must be to-device events")
+                if type(event.source) is not dict:
+                    raise TypeError(f"{phase} event source must be a dict")
+                payload = _canonical_ingestion_json(event.source)
+                raw = _canonical_ingestion_object(payload, f"{phase.value} event")
+                source_event_type = raw.get("type")
+                if source_event_type is None and isinstance(
+                    event,
+                    KeyVerificationCancel,
+                ):
+                    source_event_type = "m.key.verification.cancel"
+                append_record(
+                    RecordKind.TO_DEVICE,
+                    payload,
+                    raw,
+                    callback_route=_CallbackRoute.TO_DEVICE,
+                    phase=phase,
+                    explicit_event_type=source_event_type,
+                )
+
+        for payload, raw, event in parsed_to_device:
+            decrypted_event = (
+                self._handle_decrypt_to_device(event)
+                if isinstance(event, ToDeviceEvent)
+                else None
+            )
+            effective_event = decrypted_event if decrypted_event is not None else event
+            if decrypted_event is not None:
+                decrypted_source = getattr(decrypted_event, "source", None)
+                if type(decrypted_source) is not dict:
+                    raise TypeError("decrypted to-device event source must be a dict")
+                clear_json = _canonical_ingestion_json(decrypted_source)
+            else:
+                clear_json = None
+            callback_route = (
+                None
+                if effective_event is None
+                or isinstance(
+                    effective_event, (RoomKeyRequest, RoomKeyRequestCancellation)
+                )
+                else _CallbackRoute.TO_DEVICE
+            )
+            disposition = (
+                _DecryptionDisposition.DECRYPTED
+                if clear_json is not None
+                else _DecryptionDisposition.NONE
+            )
+            if decrypted_event is None:
+                decrypted_to_device_kind = None
+            else:
+                try:
+                    decrypted_to_device_kind = _DECRYPTED_TO_DEVICE_KINDS[
+                        type(decrypted_event)
+                    ]
+                except KeyError as error:
+                    raise TypeError(
+                        "unsupported decrypted to-device event type"
+                    ) from error
+            append_record(
+                RecordKind.TO_DEVICE,
+                payload,
+                raw,
+                callback_route=callback_route,
+                clear_json=clear_json,
+                decryption=disposition,
+                decrypted_to_device_kind=decrypted_to_device_kind,
+            )
+
+        continuities = {
+            room_id: (continuity.membership_epoch, continuity.membership)
+            for room_id, continuity in prior_by_room.items()
+        }
+        for segment_value, state, timeline, account_data in parsed_segments:
+            segment = segment_value
+            segment_frame_index = len(records)
+            continuities.setdefault(segment.room_id, (0, None))
+            has_parseable_own_member = False
+
+            room: MatrixRoom | None
+            if segment.section in {RoomSection.INVITE, RoomSection.KNOCK}:
+                room = self._get_invited_room(segment.room_id)
+            elif segment.section is RoomSection.JOIN:
+                if segment.room_id in self.invited_rooms:
+                    del self.invited_rooms[segment.room_id]
+                room = self.rooms.setdefault(
+                    segment.room_id,
+                    MatrixRoom(
+                        segment.room_id,
+                        self.user_id,
+                        segment.room_id in self.encrypted_rooms,
+                    ),
+                )
+            else:
+                room = self.rooms.get(segment.room_id) or self.invited_rooms.get(
+                    segment.room_id
+                )
+            callback_room = (
+                segment.section in {RoomSection.JOIN, RoomSection.UNCHANGED}
+                and segment.room_id in self.rooms
+            )
+
+            def append_transition(
+                current: str,
+                source_kind: _MembershipSourceKind,
+                frame_index: int,
+                event_id: str | None = None,
+                source_record_id: str | None = None,
+                timeline_provenance: TimelineEventProvenance | None = None,
+                source_json: bytes | None = None,
+            ) -> None:
+                previous_epoch, previous = continuities[segment.room_id]
+                if current == previous:
+                    return
+                current_epoch = previous_epoch + int(
+                    previous == "join" and current != "join"
+                )
+                transitions.append(
+                    _PreparedMembershipTransition(
+                        str(
+                            uuid5(
+                                frame.frame_id, f"record:transition:{len(transitions)}"
+                            )
+                        ),
+                        source_record_id,
+                        segment.room_id,
+                        event_id,
+                        previous,
+                        current,
+                        previous_epoch,
+                        current_epoch,
+                        source_kind,
+                        timeline_provenance,
+                        _MembershipProvenance.REPORTED,
+                        replace(frame.origin, frame_index=frame_index),
+                        source_json,
+                    )
+                )
+                continuities[segment.room_id] = (current_epoch, current)
+
+            def capture_transition(
+                payload: bytes,
+                raw: dict[Any, Any],
+                next_record_id: str,
+                source_kind: _MembershipSourceKind,
+                timeline_provenance: TimelineEventProvenance | None,
+            ) -> None:
+                nonlocal has_parseable_own_member
+                if (
+                    raw.get("type") != "m.room.member"
+                    or raw.get("state_key") != self.user_id
+                    or type(raw.get("content")) is not dict
+                    or type(raw["content"].get("membership")) is not str
+                    or not raw["content"]["membership"]
+                ):
+                    return
+                has_parseable_own_member = True
+                append_transition(
+                    raw["content"]["membership"],
+                    source_kind,
+                    len(records),
+                    _matrix_event_id(raw),
+                    next_record_id,
+                    timeline_provenance,
+                    payload,
+                )
+
+            for payload, raw, event in state:
+                capture_transition(
+                    payload,
+                    raw,
+                    pending_record_id(_PreparationPhase.SOURCE),
+                    _MembershipSourceKind.STATE,
+                    None,
+                )
+                if room is not None and isinstance(event, InviteEvent):
+                    cast(MatrixInvitedRoom, room).handle_event(cast(Event, event))
+                elif room is not None and isinstance(event, RoomMemberEvent):
+                    if room.handle_membership(event):
+                        self._invalidate_session_for_member_event(segment.room_id)
+                elif room is not None and isinstance(event, RoomEncryptionEvent):
+                    encrypted_room_ids.add(segment.room_id)
+                    room.handle_event(event)
+                elif room is not None and isinstance(event, Event):
+                    room.handle_event(event)
+                append_record(
+                    RecordKind.STATE,
+                    payload,
+                    raw,
+                    segment.room_id,
+                    callback_route=(
+                        _CallbackRoute.EVENT
+                        if segment.section is RoomSection.INVITE and event
+                        else None
+                    ),
+                )
+
+            history_count = len(timeline) - segment.live_event_count
+            for timeline_index, (payload, raw, event) in enumerate(timeline):
+                timeline_provenance = (
+                    TimelineEventProvenance.HISTORY
+                    if timeline_index < history_count
+                    else TimelineEventProvenance.LIVE
+                )
+                decrypted_room_event = None
+                if room is not None and isinstance(event, (Event, BadEventType)):
+                    decrypted_room_event = self._handle_timeline_event(
+                        event,
+                        segment.room_id,
+                        room,
+                        encrypted_room_ids,
+                    )
+                clear_json = (
+                    _canonical_ingestion_json(decrypted_room_event.source)
+                    if isinstance(decrypted_room_event, (Event, BadEventType))
+                    else None
+                )
+                effective_raw = (
+                    _canonical_ingestion_object(
+                        clear_json,
+                        "decrypted timeline event",
+                    )
+                    if clear_json is not None
+                    else raw
+                )
+                capture_transition(
+                    clear_json if clear_json is not None else payload,
+                    effective_raw,
+                    pending_record_id(_PreparationPhase.SOURCE),
+                    _MembershipSourceKind.TIMELINE,
+                    timeline_provenance,
+                )
+                append_record(
+                    RecordKind.TIMELINE,
+                    payload,
+                    raw,
+                    segment.room_id,
+                    timeline_provenance,
+                    _CallbackRoute.EVENT if callback_room else None,
+                    clear_json,
+                    (
+                        _DecryptionDisposition.DECRYPTED
+                        if clear_json is not None
+                        else (
+                            _DecryptionDisposition.MEGOLM_FAILED
+                            if isinstance(event, MegolmEvent)
+                            else _DecryptionDisposition.NONE
+                        )
+                    ),
+                    (
+                        getattr(decrypted_room_event, "verified", None)
+                        if isinstance(decrypted_room_event, (Event, BadEventType))
+                        else None
+                    ),
+                )
+
+            for payload, raw, event in ephemeral_by_room.pop(segment.room_id, []):
+                if room is not None and isinstance(event, EphemeralEvent):
+                    room.handle_ephemeral_event(event)
+                append_record(
+                    RecordKind.EPHEMERAL,
+                    payload,
+                    raw,
+                    segment.room_id,
+                    callback_route=(
+                        _CallbackRoute.EPHEMERAL if callback_room and event else None
+                    ),
+                )
+            for payload, raw, event in account_data:
+                if room is not None and isinstance(
+                    event, (AccountDataEvent, BadEventType)
+                ):
+                    room.handle_account_data(event)
+                append_record(
+                    RecordKind.ROOM_ACCOUNT_DATA,
+                    payload,
+                    raw,
+                    segment.room_id,
+                    callback_route=(
+                        _CallbackRoute.ROOM_ACCOUNT_DATA if callback_room else None
+                    ),
+                )
+            section_membership = segment.membership_observation.room_membership
+            if not has_parseable_own_member and section_membership is not None:
+                append_transition(
+                    section_membership,
+                    _MembershipSourceKind.SECTION,
+                    segment_frame_index,
+                )
+            if room is not None and room.encrypted:
+                olm.update_tracked_users(room)
+            if room is not None:
+                snapshots.append(_room_snapshot(room, *continuities[segment.room_id]))
+
+        for room_id, events in ephemeral_by_room.items():
+            room = self.rooms.get(room_id) or self.invited_rooms.get(room_id)
+            for payload, raw, event in events:
+                if room is not None and isinstance(event, EphemeralEvent):
+                    room.handle_ephemeral_event(event)
+                append_record(
+                    RecordKind.EPHEMERAL,
+                    payload,
+                    raw,
+                    room_id,
+                    callback_route=(
+                        _CallbackRoute.EPHEMERAL
+                        if room_id in self.rooms and event
+                        else None
+                    ),
+                )
+
+        self.encrypted_rooms.update(encrypted_room_ids)
+        for payload, raw, event in parsed_presence:
+            for room in self.rooms.values():
+                user = room.users.get(event.user_id)
+                if user is None:
+                    continue
+                user.presence = event.presence
+                user.last_active_ago = event.last_active_ago
+                user.currently_active = event.currently_active
+                user.status_msg = event.status_msg
+            append_record(
+                RecordKind.PRESENCE,
+                payload,
+                raw,
+                callback_route=_CallbackRoute.PRESENCE,
+            )
+        for payload, raw, _event in parsed_global_account_data:
+            append_record(
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                payload,
+                raw,
+                callback_route=_CallbackRoute.GLOBAL_ACCOUNT_DATA,
+            )
+
+        append_synthetic_to_device_records(
+            olm.clear_verifications(),
+            _PreparationPhase.EXPIRED_VERIFICATION,
+        )
+
+        signed_curve_count = key_counts.get("signed_curve25519")
+        if signed_curve_count is not None:
+            olm.uploaded_key_count = signed_curve_count
+        changed_user_ids = {
+            user_id
+            for user_id in (*device_list_delta["changed"], *device_list_delta["left"])
+            if any(
+                room.encrypted and user_id in room.users for room in self.rooms.values()
+            )
+        }
+        olm.add_changed_users(changed_user_ids)
+        append_synthetic_to_device_records(
+            olm.collect_key_requests(),
+            _PreparationPhase.COLLECTED_KEY_REQUEST,
+        )
+
+        key_claim_map = (
+            olm.get_users_for_key_claiming()
+            if olm.wedged_devices or olm.key_request_devices_no_session
+            else {}
+        )
+        if not isinstance(key_claim_map, dict):
+            raise TypeError("key-claim map must be a dict")
+        wedged_targets = {
+            (device.user_id, device.device_id) for device in olm.wedged_devices
+        }
+        waiting_targets = {
+            (device.user_id, device.device_id)
+            for device in olm.key_request_devices_no_session
+        }
+        first_dummy_targets = {
+            (message.recipient, message.recipient_device)
+            for message in olm.outgoing_to_device_messages
+            if isinstance(message, DummyMessage)
+        }
+        rerequest_buckets: dict[
+            tuple[str, str],
+            tuple[_PreparedMegolmRerequest, ...],
+        ] = {}
+        for target, queued_events in olm.key_re_requests_events.items():
+            prepared_events: list[_PreparedMegolmRerequest] = []
+            seen_sessions: set[str] = set()
+            for event in queued_events:
+                if type(event) is not MegolmEvent:
+                    raise TypeError("Megolm rerequest event is invalid")
+                if event.session_id in seen_sessions:
+                    continue
+                prepared_event = _prepared_megolm_rerequest(event)
+                if (
+                    prepared_event.sender_user_id,
+                    prepared_event.sender_device_id,
+                ) != target:
+                    raise ValueError("Megolm rerequest disagrees with bucket target")
+                seen_sessions.add(prepared_event.session_id)
+                prepared_events.append(prepared_event)
+            rerequest_buckets[target] = tuple(prepared_events)
+
+        key_claims: list[_PreparedKeyClaim] = []
+        for user_id in sorted(key_claim_map):
+            device_ids = key_claim_map[user_id]
+            for device_id in sorted(set(device_ids)):
+                target = (user_id, device_id)
+                waiting = olm.key_requests_waiting_for_session.get(target, {})
+                waiting_requests: list[_PreparedWaitingKeyRequest] = []
+                for request_id, event in waiting.items():
+                    if type(request_id) is not str or type(event) is not RoomKeyRequest:
+                        raise TypeError("waiting room-key request is invalid")
+                    prepared_request = _prepared_waiting_key_request(event)
+                    if (request_id, user_id, device_id) != (
+                        prepared_request.request_id,
+                        prepared_request.sender_user_id,
+                        prepared_request.requesting_device_id,
+                    ):
+                        raise ValueError(
+                            "waiting room-key request disagrees with claim target"
+                        )
+                    waiting_requests.append(prepared_request)
+                key_claims.append(
+                    _PreparedKeyClaim(
+                        user_id,
+                        device_id,
+                        target in wedged_targets,
+                        target in waiting_targets,
+                        tuple(waiting_requests),
+                        (
+                            ()
+                            if target in first_dummy_targets
+                            else rerequest_buckets.get(target, ())
+                        ),
+                    )
+                )
+        owned_waiting_targets = {
+            (claim.user_id, claim.device_id)
+            for claim in key_claims
+            if claim.was_waiting
+        }
+        if any(
+            requests and target not in owned_waiting_targets
+            for target, requests in olm.key_requests_waiting_for_session.items()
+        ):
+            raise ValueError("waiting room-key-request bucket has no claim owner")
+
+        bound_dummy_targets: set[tuple[str, str]] = set()
+        queued_to_device_messages: list[_PreparedQueuedToDeviceMessage] = []
+        for message in olm.outgoing_to_device_messages:
+            rerequest_events: tuple[_PreparedMegolmRerequest, ...] = ()
+            if isinstance(message, DummyMessage):
+                target = (message.recipient, message.recipient_device)
+                if target not in bound_dummy_targets:
+                    bound_dummy_targets.add(target)
+                    rerequest_events = rerequest_buckets.get(target, ())
+            queued_to_device_messages.append(
+                _prepared_queued_to_device_message(message, rerequest_events)
+            )
+        owned_rerequest_targets = bound_dummy_targets | {
+            (claim.user_id, claim.device_id)
+            for claim in key_claims
+            if claim.rerequest_events
+        }
+        if any(
+            events and target not in owned_rerequest_targets
+            for target, events in rerequest_buckets.items()
+        ):
+            raise ValueError("Megolm rerequest bucket has no claim or dummy owner")
+        return _PreparedIngestionFrame(
+            frame.frame_id,
+            frame.origin.transport,
+            frame.origin.source_epoch,
+            frame.origin.request_id,
+            staged_revision,
+            frame.request_cursor_json,
+            frame.candidate_cursor_json,
+            frame.source_sha256,
+            compatibility_token,
+            tuple(records),
+            tuple(transitions),
+            tuple(snapshots),
+            _PreparedCryptoDelta(
+                tuple(sorted(encrypted_room_ids)),
+                tuple(sorted(olm.users_for_key_query)),
+                olm.uploaded_key_count,
+                frame.one_time_key_counts_json,
+                frame.unused_fallback_key_types_json,
+                tuple(key_claims),
+                tuple(queued_to_device_messages),
+            ),
+        )
+
     def _handle_decrypt_to_device(
         self, to_device_event: ToDeviceEvent
-    ) -> ToDeviceEvent | None:
+    ) -> ToDeviceEvent | BadEventType | None:
         if self.olm:
             return self.olm.handle_to_device_event(to_device_event)
 
@@ -816,8 +1814,10 @@ class Client:
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                decrypted_to_device.append((index, decrypted_event))
-                to_device_event = decrypted_event
+                decrypted_to_device.append(
+                    (index, cast(ToDeviceEvent, decrypted_event))
+                )
+                to_device_event = cast(ToDeviceEvent, decrypted_event)
 
             # Do not pass room key request events to our user here. We don't
             # want to notify them about requests that get automatically handled

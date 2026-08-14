@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import NamedTuple
 from uuid import UUID
 
 from ..event_provenance import TimelineEventProvenance
@@ -64,6 +65,52 @@ class RoomHydrationStatus(StrEnum):
     PENDING = "pending"
     READY = "ready"
     UNAVAILABLE = "unavailable"
+
+
+class _CallbackRoute(StrEnum):
+    EVENT = "event"
+    EPHEMERAL = "ephemeral"
+    ROOM_ACCOUNT_DATA = "room_account_data"
+    GLOBAL_ACCOUNT_DATA = "global_account_data"
+    PRESENCE = "presence"
+    TO_DEVICE = "to_device"
+
+
+class _DecryptionDisposition(StrEnum):
+    NONE = "none"
+    DECRYPTED = "decrypted"
+    MEGOLM_FAILED = "megolm_failed"
+
+
+class _DecryptedToDeviceKind(StrEnum):
+    ROOM_KEY = "room_key"
+    FORWARDED_ROOM_KEY = "forwarded_room_key"
+    DUMMY = "dummy"
+    UNKNOWN = "unknown"
+    BAD = "bad"
+    UNKNOWN_BAD = "unknown_bad"
+
+
+class _MembershipSourceKind(StrEnum):
+    STATE = "state"
+    TIMELINE = "timeline"
+    SECTION = "section"
+
+
+class _MembershipProvenance(StrEnum):
+    REPORTED = "reported"
+
+
+class _PreparationPhase(StrEnum):
+    SOURCE = "source"
+    EXPIRED_VERIFICATION = "expired_verification"
+    COLLECTED_KEY_REQUEST = "collected_key_request"
+
+
+class _QueuedToDeviceSubtype(StrEnum):
+    GENERIC = "generic"
+    DUMMY = "dummy"
+    ROOM_KEY_REQUEST = "room_key_request"
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +304,109 @@ class RoomSnapshot:
         if len(shown_names) == 1:
             return shown_names[0]
         return f"{', '.join(shown_names[:-1])} and {shown_names[-1]}"
+
+
+class _PreparedIngestionRecord(NamedTuple):
+    record_id: str
+    kind: RecordKind
+    origin: RecordOrigin
+    preparation_phase: _PreparationPhase
+    effective_event_type: str
+    room_id: str | None
+    event_id: str | None
+    provenance: TimelineEventProvenance | None
+    source_json: bytes
+    clear_json: bytes | None
+    decryption: _DecryptionDisposition
+    decryption_verified: bool | None
+    decrypted_to_device_kind: _DecryptedToDeviceKind | None
+    callback_route: _CallbackRoute | None
+
+
+class _PreparedMembershipTransition(NamedTuple):
+    transition_id: str
+    source_record_id: str | None
+    room_id: str
+    event_id: str | None
+    previous_membership: str | None
+    current_membership: str
+    previous_epoch: int
+    current_epoch: int
+    source_kind: _MembershipSourceKind
+    timeline_provenance: TimelineEventProvenance | None
+    membership_provenance: _MembershipProvenance
+    origin: RecordOrigin
+    source_json: bytes | None
+
+
+class _PreparedWaitingKeyRequest(NamedTuple):
+    source_json: bytes
+    sender_user_id: str
+    requesting_device_id: str
+    request_id: str
+    room_id: str
+    sender_key: str
+    session_id: str
+    algorithm: str
+
+
+class _PreparedMegolmRerequest(NamedTuple):
+    source_json: bytes
+    room_id: str
+    event_id: str
+    sender_user_id: str
+    sender_device_id: str
+    sender_key: str
+    session_id: str
+    algorithm: str
+
+
+class _PreparedKeyClaim(NamedTuple):
+    user_id: str
+    device_id: str
+    was_wedged: bool
+    was_waiting: bool
+    waiting_key_requests: tuple[_PreparedWaitingKeyRequest, ...]
+    rerequest_events: tuple[_PreparedMegolmRerequest, ...]
+
+
+class _PreparedQueuedToDeviceMessage(NamedTuple):
+    subtype: _QueuedToDeviceSubtype
+    event_type: str
+    recipient_user_id: str
+    recipient_device_id: str
+    content_json: bytes
+    request_id: str | None
+    session_id: str | None
+    room_id: str | None
+    algorithm: str | None
+    rerequest_events: tuple[_PreparedMegolmRerequest, ...]
+
+
+class _PreparedCryptoDelta(NamedTuple):
+    encrypted_room_ids: tuple[str, ...]
+    users_for_key_query: tuple[str, ...]
+    uploaded_key_count: int | None
+    one_time_key_counts_json: bytes
+    unused_fallback_key_types_json: bytes
+    key_claims: tuple[_PreparedKeyClaim, ...]
+    queued_to_device_messages: tuple[_PreparedQueuedToDeviceMessage, ...]
+
+
+class _PreparedIngestionFrame(NamedTuple):
+    frame_id: UUID
+    transport: TransportKind
+    source_epoch: int
+    request_id: int
+    staged_revision: int
+    request_cursor_json: bytes
+    candidate_cursor_json: bytes
+    source_sha256: bytes
+    compatibility_token: str | None
+    records: tuple[_PreparedIngestionRecord, ...]
+    membership_transitions: tuple[_PreparedMembershipTransition, ...]
+    room_snapshots: tuple[RoomSnapshot, ...]
+    crypto_delta: _PreparedCryptoDelta
 
 
 @dataclass(frozen=True, slots=True)
