@@ -57,7 +57,7 @@ action**.
 | Repository | Branch | Required HEAD | State |
 | --- | --- | --- | --- |
 | `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | docs checkpoint whose parent is `be24cf315c27250d3c2b95a5862278420ee8d270` | Tasks 1–4E committed; no tracked changes expected |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc` | Desktop slices and Task 5A committed; no current tracked changes |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc` | Desktop slices and Task 5A committed; Task 5B analysis started with no tracked code/test changes at this checkpoint |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -104,7 +104,8 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4D pure prepared planner | Complete | nio `96ff99bf36135e7eef66355953a9c1b4c8c9b2e8` |
 | Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
 | Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
-| Tasks 5B, 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
+| Task 5B MindRoom all-record adapter/pump | In progress | Started from MindRoom `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc`; first causal RED is the next code action |
+| Tasks 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
 
 ### Task 4E completed and committed
 
@@ -553,6 +554,48 @@ preserve the dirty worktree, and continue from the first unchecked item.”
       update repository HEAD/state/hash instructions and commit this living
       documentation checkpoint separately.
 
+Task 5B is the current slice. Continue it in this order:
+
+- [x] Re-read the complete MindRoom `AGENTS.md`, the controlling Task 5B
+      description, Task 5A admission contract, and the committed nio owned
+      settlement contract before editing.
+- [x] Locate the existing MindRoom sync lifecycle, Task 5A admission seam, and
+      shutdown/reload ownership; record the smallest focused adapter/pump seam
+      in this handoff.
+- [ ] Add the first real `max_records=1` causal RED at that owning seam. It must
+      prove Task 5A returns separate exact `receipt_new` and
+      `semantic_event_new` facts and that MindRoom passes those facts to
+      `session._settle_batch()` without separately acknowledging the batch.
+- [ ] Extend the RED matrix to every durable disposition: actionable/context
+      timeline, lifecycle/departure fencing, loss/history recovery, and the
+      six compatibility-receipt families. Malformed/unknown values must remain
+      outstanding and no known value may wedge the FIFO.
+- [ ] Implement the smallest all-record adapter and one-record pump, preserving
+      the existing MindRoom event-journal transaction as application authority
+      and nio settlement as callback/ack authority.
+- [ ] Prove cancellation, restart/replay, callback failure, duplicate receipt,
+      and orderly stop/reload behavior before the ordinary Task 5B commit
+      `feat: consume every durable ingestion record`.
+- [ ] Run the exact, focused, full MindRoom, formatting, lint, type, import-
+      graph, Tach (if its boundary changes), and diff gates; independently
+      review the completed slice, update this handoff, and commit only GREEN.
+
+The Task 5B owning seam is
+`/work/dev/mindroom/src/mindroom/matrix/durable_ingestion.py`, with focused
+tests in `tests/test_durable_ingestion_admission.py`. At the clean Task 5A
+boundary, `validate_ingestion_batch()` accepts only one Classic LIVE TIMELINE
+`EventRecord`, and `consume_one_ingestion_batch()` admits it then directly
+calls public `session.acknowledge_batch()`. Task 5B must replace that last step
+with the non-exported owned-session `_settle_batch()` call and extend the same
+validator/admission seam to both `RecordOrigin` and `SystemOrigin`, every
+`RecordKind`, and `LossRecord`. Use a local structural private-session Protocol;
+do not widen nio's public `IngestionSession` contract. The eventual pump loops
+this one-record function and wakes MindRoom semantic dispatch after admission,
+but it is not wired into `bot.py`, `orchestrator.py`, or the live sync lifecycle
+until Tasks 5C/5D provide the owned factory and sole-engine activation. Task 5B
+owns pump cancellation/stop behavior in isolation; Task 4F later supplies the
+runner/pump wake and Frame-progress state machine.
+
 After the decrypted pair, complete Task 4E in this order:
 
 1. [x] `MEGOLM_FAILED` reconstruction without decrypt/wedge/key-request replay;
@@ -991,11 +1034,10 @@ local transition one stable operation identity and make retries reuse it.
 
 ### Task 4E: snapshot restore and receipt-gated apply/ack
 
-**In progress, uncommitted.** The exact completed behavior, dirty-worktree
-boundary, current decrypted-event RED, and immediate next steps are recorded in
-the live restart handoff at the top of this plan. Do not begin Task 5B until the
-complete Task 4E disposition matrix is green, independently reviewed, and
-committed.
+**Complete.** Implemented, independently reviewed, fully verified, and
+committed in nio as `be24cf315c27250d3c2b95a5862278420ee8d270`. The exact
+behavior, verification evidence, and restart boundary are recorded in the live
+handoff at the top of this plan.
 
 Restore `AsyncClient.rooms` before incremental delivery. Reapply client/room
 state idempotently; publish auxiliary callbacks only when `receipt_new` and
@@ -1011,6 +1053,10 @@ from `_open_owned_ingestion()`.
 **Commit:** `feat: settle durable records through compatibility callbacks`
 
 ### Task 5B: MindRoom all-record adapter and pump
+
+**In progress, uncommitted.** Work starts from clean MindRoom commit
+`da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc`. The live handoff above is the
+authoritative checkpoint and checklist.
 
 Accept both origins and map every record/loss to Task 5A's disposition. Timeline
 uses the existing classifier; history/context settles without a turn; lifecycle
