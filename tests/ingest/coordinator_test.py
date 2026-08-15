@@ -3371,6 +3371,120 @@ async def test_owned_local_membership_success_waits_for_work_ack_before_source(
 
 
 @pytest.mark.asyncio
+async def test_owned_local_command_reconciles_when_lifecycle_reaches_target(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    stale_operation = uuid4()
+    transition: asyncio.Task[bool] | None = None
+    waiting: asyncio.Task[bool] | None = None
+    leave: asyncio.Task[bool] | None = None
+    try:
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=stale_operation,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        await asyncio.sleep(0)
+        assert transition.done() is False
+
+        winning_operation, _commit, _aggregate, winning_work = (
+            _publish_fresh_local_join(session)
+        )
+        assert winning_operation != stale_operation
+        waiting = asyncio.create_task(session._advance_local_membership_intent())
+        await asyncio.sleep(0)
+        assert waiting.done() is False
+
+        winning_batch = session.next_batch()
+        assert winning_batch is not None
+        assert winning_batch.records == (winning_work.value,)
+        await session._settle_batch(
+            winning_batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert await asyncio.wait_for(waiting, timeout=1) is True
+        assert transition.done() is False
+
+        graph_at_target = tuple(connection.iterdump())
+        statements: list[str] = []
+        requests: list[object] = []
+
+        async def forbid_request(request, **kwargs: object) -> NetworkResult:
+            requests.append((request, kwargs))
+            raise AssertionError("fulfilled local membership command reached HTTP")
+
+        session._request = forbid_request  # type: ignore[method-assign]
+        connection.set_trace_callback(statements.append)
+        assert await session._advance_local_membership_intent() is True
+        connection.set_trace_callback(None)
+        assert await asyncio.wait_for(transition, timeout=1) is True
+        assert requests == []
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+            for statement in statements
+        )
+        assert tuple(connection.iterdump()) == graph_at_target
+        assert session._journal._load_pending_local_membership_intents(limit=2) == ()
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert loaded is not None
+        assert loaded[1].continuity.membership == "join"
+        assert loaded[1].continuity.membership_epoch == 0
+        assert loaded[1].pending_local_membership is None
+        assert inventory.work == ()
+        assert session._terminal is None
+
+        leave_requests: list[object] = []
+
+        async def leave_success(request, **kwargs: object) -> NetworkResult:
+            assert request.path == nio.Api.room_leave("secret-token", ROOM)[1]
+            assert kwargs == {"body_disconnect_retry": True}
+            leave_requests.append(request)
+            return session._network_result(request, 200, canonical_json({}))
+
+        session._request = leave_success  # type: ignore[method-assign]
+        leave = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=uuid4(),
+                room_id=ROOM,
+                previous_membership="join",
+                previous_epoch=0,
+                current_membership="leave",
+            )
+        )
+        await asyncio.sleep(0)
+        assert await session._advance_local_membership_intent() is True
+        assert await asyncio.wait_for(leave, timeout=1) is True
+        assert len(leave_requests) == 1
+    finally:
+        connection.set_trace_callback(None)
+        await asyncio.sleep(0)
+        for task in (transition, waiting, leave):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (transition, waiting, leave) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
     tmp_path,
 ) -> None:

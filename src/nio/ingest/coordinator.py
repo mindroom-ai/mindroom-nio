@@ -1581,6 +1581,12 @@ class _OwnedIngestionSession(IngestionSession):
                 self._local_membership_command = None
                 raise
             pending = self._journal._load_pending_local_membership_intents(limit=2)
+            if not pending:
+                if not command.completion.done():
+                    command.completion.set_result(True)
+                self._local_membership_command = None
+                self._signal_progress()
+                return True
         if len(pending) != 1:
             raise JournalIntegrityError("multiple local membership intents are pending")
         candidate = pending[0]

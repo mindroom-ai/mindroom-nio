@@ -861,6 +861,8 @@ class SqliteIngestionJournal(JournalRows):
                     raise JournalConflictError(
                         "local membership intent is blocked by a room barrier"
                     )
+                if continuity.membership == current_membership:
+                    return CommitResult(aggregate.updated_revision)
             if (
                 continuity.membership != previous_membership
                 or continuity.membership_epoch != previous_epoch
