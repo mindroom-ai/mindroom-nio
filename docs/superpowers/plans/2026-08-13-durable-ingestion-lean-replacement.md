@@ -56,8 +56,8 @@ action**.
 
 | Repository | Branch | Required HEAD | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Descendant of Task 5B start commit `7c79c33df7d9a0538086b3d7b32bd575ef9ee441` | Tasks 1–4E committed and Task 5B restart state recorded; no tracked changes expected |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc` | Task 5B in progress with the exact four-file dirty checkpoint recorded below |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Descendant of Task 5B validation checkpoint `efb5b461e7d1c2573c0c14403f9c5ea6b6f7b83c` | Tasks 1–4E committed, Task 5B completed in MindRoom, and its restart state recorded here; no tracked changes expected after this documentation commit |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `3a8094759d23b3740119893419cd7eff8b0c785b` | Task 5B committed; no tracked changes expected |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -104,7 +104,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4D pure prepared planner | Complete | nio `96ff99bf36135e7eef66355953a9c1b4c8c9b2e8` |
 | Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
 | Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
-| Task 5B MindRoom all-record adapter/pump | In progress | Adapter, strict all-record validation, lifecycle facts, and the isolated pump are GREEN at dirty patch `87e657a0...`; full-repository verification/review is next |
+| Task 5B MindRoom all-record adapter/pump | Complete | MindRoom `3a8094759d23b3740119893419cd7eff8b0c785b`; owning 319-test file, full repository suite, and all pre-commit hooks GREEN |
 | Tasks 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
 
 ### Task 4E completed and committed
@@ -182,7 +182,7 @@ src/nio/ingest/coordinator.py:1648   _open_owned_ingestion
 
 Line numbers are navigation aids only; names and behavior are authoritative.
 
-### Latest completed slice and current stop boundary
+### Task 4E detailed completion record (historical)
 
 The latest test-only slice is:
 
@@ -426,11 +426,10 @@ coordinator 229 passed. Black, production Ruff `--no-fix`, isolated
 coordinator+reducer mypy, `py_compile`, and diff-check are green.
 
 Task4E's final review, consolidation decision, budget measurement, full suite,
-static gates, and ordinary implementation commit are complete. The exact
-restart boundary is Task5B in `/work/dev/mindroom`: wire the committed nio
-private `_settle_batch(batch, receipt_new, semantic_event_new)` adapter to the
-already committed Task5A receipt/idempotency kernel, without separately calling
-`acknowledge_batch` and without weakening Task4E callback-before-ack behavior.
+static gates, and ordinary implementation commit are complete. At that
+historical checkpoint the next boundary was Task5B in `/work/dev/mindroom`.
+Task5B is now complete at the commit recorded above; the current restart
+boundary is Task4F, not this historical Task4E checklist.
 
 That final review is now complete with no P0–P2 blocker. No mechanical
 Task4E-only consolidation was applied: the only clear duplication is a crypto
@@ -465,11 +464,10 @@ The required reconstruction contract is already fixed:
   authenticated verification bit, outer Megolm `sender_key`/`session_id`, and
   the record `room_id`; never invoke Olm or a live timeline handler.
 
-### Immediate next action
+### Task 4E completed execution checklist (historical)
 
-A fresh session can be started with: “Read the controlling design and the live
-restart handoff in this plan, verify the recorded branches/HEADs/patch hash,
-preserve the dirty worktree, and continue from the first unchecked item.”
+This checklist records how Task4E was completed. It is not the current restart
+point; all items remain checked as historical evidence.
 
 - [x] Add only the five test hardenings listed above.
 - [x] Run the exact node and confirm the same two sole unsupported-record REDs.
@@ -554,7 +552,7 @@ preserve the dirty worktree, and continue from the first unchecked item.”
       update repository HEAD/state/hash instructions and commit this living
       documentation checkpoint separately.
 
-Task 5B is the current slice. Continue it in this order:
+Task 5B is complete. Its execution checklist is retained here as evidence:
 
 - [x] Re-read the complete MindRoom `AGENTS.md`, the controlling Task 5B
       description, Task 5A admission contract, and the committed nio owned
@@ -576,7 +574,7 @@ Task 5B is the current slice. Continue it in this order:
 - [x] Prove cancellation, restart/replay, callback failure, duplicate receipt,
       and orderly stop/reload behavior before the ordinary Task 5B commit
       `feat: consume every durable ingestion record`.
-- [ ] Run the exact, focused, full MindRoom, formatting, lint, type, import-
+- [x] Run the exact, focused, full MindRoom, formatting, lint, type, import-
       graph, Tach (if its boundary changes), and diff gates; independently
       review the completed slice, update this handoff, and commit only GREEN.
 
@@ -585,32 +583,35 @@ The Task 5B owning seam is
 tests in `tests/test_durable_ingestion_admission.py`. At the clean Task 5A
 boundary, `validate_ingestion_batch()` accepts only one Classic LIVE TIMELINE
 `EventRecord`, and `consume_one_ingestion_batch()` admits it then directly
-calls public `session.acknowledge_batch()`. Task 5B must replace that last step
-with the non-exported owned-session `_settle_batch()` call and extend the same
-validator/admission seam to both `RecordOrigin` and `SystemOrigin`, every
-`RecordKind`, and `LossRecord`. Use a local structural private-session Protocol;
-do not widen nio's public `IngestionSession` contract. The eventual pump loops
-this one-record function and wakes MindRoom semantic dispatch after admission,
-but it is not wired into `bot.py`, `orchestrator.py`, or the live sync lifecycle
-until Tasks 5C/5D provide the owned factory and sole-engine activation. Task 5B
-owns pump cancellation/stop behavior in isolation; Task 4F later supplies the
-runner/pump wake and Frame-progress state machine.
+called public `session.acknowledge_batch()`. Task 5B replaced that last step
+with the non-exported owned-session `_settle_batch()` call and extended the
+same validator/admission seam to both `RecordOrigin` and `SystemOrigin`, every
+`RecordKind`, and `LossRecord`. It uses a local structural private-session
+Protocol without widening nio's public `IngestionSession` contract. The pump
+loops this one-record function and wakes MindRoom semantic dispatch after
+admission, but it is not wired into `bot.py`, `orchestrator.py`, or the live
+sync lifecycle until Tasks 5C/5D provide the owned factory and sole-engine
+activation. Task 5B owns pump cancellation/stop behavior in isolation; Task 4F
+supplies the runner/pump wake and Frame-progress state machine.
 
-The current Task 5B dirty checkpoint is GREEN at MindRoom HEAD
-`da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc`. Its exact tracked files are:
+Task 5B is committed at MindRoom
+`3a8094759d23b3740119893419cd7eff8b0c785b`. Its implementation commit contains
+exactly:
 
 ```text
 src/mindroom/event_journal/journal.py
+src/mindroom/matrix/client_session.py
 src/mindroom/matrix/durable_ingestion.py
 src/mindroom/matrix/journal_ingress.py
 tests/test_durable_ingestion_admission.py
 ```
 
-The binary patch over `src tests` has SHA-256
-`87e657a024cc3bffd03d12bcc52579c28d5525e0af0b819acaab3a8003959b56`.
-The first RED proved current MindRoom called public `acknowledge_batch()` after
-admission; the private-owned fake made that a hard tripwire. The adapter now
-uses a local structural owned-session Protocol and awaits
+Immediately before commit, the exact binary patch over `src tests` had SHA-256
+`56de0e7e5dea4c5930411d644e01d0ef2bbdc20dd254b4f0bc1d0ab63102d8b1`.
+On restart verify the clean commit, not that former dirty-patch hash. The first
+RED proved current MindRoom called public `acknowledge_batch()` after admission;
+the private-owned fake made that a hard tripwire. The adapter now uses a local
+structural owned-session Protocol and awaits
 `session._settle_batch(batch, receipt_new=..., semantic_event_new=...)` for all
 three exact fact pairs. Existing cancellation, admission error, malformed fact,
 settlement error, and duplicate replay tests were migrated to that authority;
@@ -625,37 +626,47 @@ at epoch zero; Task 5A now accepts that exact case, while LOCAL transitions
 remain string-to-string with current membership restricted to `join|leave`.
 Reported lifecycle evidence is bound to Task 4C's exact section/state/timeline
 source correlations, and non-timeline compatibility event IDs are bound to the
-canonical source. Lifecycle commits its receipt and fencing effects without claiming a semantic Matrix
-event: its first-admission facts are exactly `receipt_new=True` and
+canonical source. Lifecycle commits its receipt and fencing effects without
+claiming a semantic Matrix event: its first-admission facts are exactly
+`receipt_new=True` and
 `semantic_event_new=False`. The isolated `run_ingestion_pump()` drains only
 `max_records=1`, passes every fact pair to owned settlement, wakes MindRoom
 dispatch only for semantic work, waits on an injected non-polling wake boundary
 when idle, and propagates cancellation.
 
-Fresh checkpoint evidence on 2026-08-14 is 319 passed in the complete owning
-`tests/test_durable_ingestion_admission.py` file across SQLite and Postgres.
+Final evidence on 2026-08-14 is 319 collected/passing cases in the complete
+owning `tests/test_durable_ingestion_admission.py` file across SQLite and
+Postgres, plus an exit-zero full MindRoom suite on the exact committed bytes.
+The direct full pre-commit run also passed every configured hook: whitespace,
+EOF/docstring/YAML checks, Ruff check/format, ty, vulture, documentation/model
+regeneration, extras, Tach, privacy, `pyproject-fmt`, Prettier, ESLint, Bun lock,
+and TypeScript type checking. Exact-file Ruff format/check, ty, compileall, and
+`git diff --check` were rerun after the suite and were GREEN.
+
 Because the released `mindroom-nio` wheel does not yet contain this unmerged
-ingestion surface, run linked tests with:
+ingestion surface, install the linked checkout editable before MindRoom tests.
+Do not use a repository-wide `PYTHONPATH`: sandbox-worker subprocesses inherit
+it and then fail to import their isolated MindRoom environment.
 
 ```bash
 cd /work/dev/mindroom
-PYTHONPATH=/work/dev/mindroom-nio/src \
-  .venv/bin/python -m pytest -q -n 0 \
+uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
+.venv/bin/python -m pytest -q -n 0 \
   tests/test_durable_ingestion_admission.py
 ```
 
-Immediate next: run full MindRoom verification and a complete production/diff
-review. The current adapter tests prove invalid lifecycle, compatibility, and
-loss evidence never reaches admission/settlement; pump admission/settlement
-failures propagate without idle wait or semantic wake. Do not wire the pump
-into `bot.py` or `orchestrator.py` before Tasks 5C/5D.
+Immediate next: execute Task 4F in `/work/dev/mindroom-nio`, beginning with its
+first causal progress-machine RED. Re-read the Task 4F section and current nio
+owned-session/coordinator implementation before editing. Task 5B deliberately
+does not wire the pump into `bot.py` or `orchestrator.py`; Tasks 5C/5D own that
+activation after Task 4F exists.
 
-At this checkpoint the uncommitted Task 5B slice is exactly +350 net runtime
-lines and +899 net test lines versus MindRoom HEAD `da6ac44e4`. The complete
-branch versus the fixed post-prune `0acaea2ba` baseline is +768 runtime and
-+1,889 tests. This is an intermediate state, not a budget pass: Tasks 6 and 9
-must perform the planned old-engine deletion and test consolidation before the
-fixed final +350/+1,000 limits can be claimed.
+The committed Task 5B slice is +331 net runtime lines and +914 net test lines
+versus MindRoom parent `da6ac44e4`. The complete branch versus the fixed
+post-prune `0acaea2ba` baseline is +749 runtime and +1,904 tests. This is an
+intermediate state, not a budget pass: Tasks 6 and 9 must perform the planned
+old-engine deletion and test consolidation before the fixed final +350/+1,000
+limits can be claimed.
 
 After the decrypted pair, complete Task 4E in this order:
 
@@ -670,6 +681,32 @@ After the decrypted pair, complete Task 4E in this order:
    RecordKind/Loss disposition matrix;
 7. [x] full Task 4E verification, review, consolidation, budget check, and the
    ordinary commit `feat: settle durable records through compatibility callbacks`.
+
+### Immediate next action
+
+A fresh session can be started with: “Read the controlling design and the live
+restart handoff in this plan, verify the recorded branches and clean HEADs,
+preserve unrelated untracked files, and start Task4F from its first causal RED.”
+
+Task4F is the current slice. Continue it in this order:
+
+- [ ] Re-read the controlling Task4F design/plan sections and inspect the
+      current retained prepared-Frame, owned runner, Work ack, outbound-plan,
+      local-intent, close, poison, and wake seams before editing.
+- [ ] Freeze the smallest private progress-machine carrier/API boundary. Keep
+      it non-exported; do not add a public `IngestionSession` method, a sixth
+      table, or live MindRoom wiring.
+- [ ] Add the first real causal RED for a retained prepared Frame whose Work is
+      fully acknowledged: it must progress into exact persisted outbound
+      maintenance rather than remain generically BLOCKED, and the next source
+      HTTP must remain fenced.
+- [ ] Review that RED for authenticated ownership, FIFO, crash/restart,
+      transaction, cancellation, poison, and no-next-source false greens.
+- [ ] Implement only the first exact progress transition, run focused GREEN and
+      static gates, then continue the Task4F maintenance/claim/retire matrix one
+      behavior slice at a time under the Way of working below.
+- [ ] Keep the living handoff updated after each reviewed GREEN, with exact
+      HEAD/dirty hash, tests, blockers, and the next unchecked item.
 
 ### Way of working
 
@@ -720,22 +757,25 @@ Run these before editing after a new session:
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
-git merge-base --is-ancestor 7c79c33df7d9a0538086b3d7b32bd575ef9ee441 HEAD
+git merge-base --is-ancestor efb5b461e7d1c2573c0c14403f9c5ea6b6f7b83c HEAD
 test -z "$(git status --short --untracked-files=no)"
 git status --short
 git diff --check
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
-test "$(git rev-parse HEAD)" = da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc
+test "$(git rev-parse HEAD)" = 3a8094759d23b3740119893419cd7eff8b0c785b
+test -z "$(git status --short --untracked-files=no)"
 git status --short
-test "$(git diff --binary -- src tests | sha256sum | cut -d' ' -f1)" = \
-  87e657a024cc3bffd03d12bcc52579c28d5525e0af0b819acaab3a8003959b56
-PYTHONPATH=/work/dev/mindroom-nio/src \
-  .venv/bin/python -m pytest -q -n 0 \
+uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
+.venv/bin/python -m pytest -q -n 0 \
   tests/test_durable_ingestion_admission.py
 # expected: 319 passed
 ```
+
+To reproduce the final Task 5B full gate, use the same editable installation
+and run `.venv/bin/python -m pytest -q` without a global `PYTHONPATH`, followed
+by `.venv/bin/pre-commit run --all-files`.
 
 The current non-RED nio regression baseline is:
 
@@ -762,6 +802,36 @@ uv run mypy src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
 python -m py_compile src/nio/client/base_client.py \
   src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
   src/nio/store/_sync_journal.py
+git diff --check
+```
+
+The completed Task 5B MindRoom static gate is:
+
+```bash
+cd /work/dev/mindroom
+.venv/bin/ruff format --check \
+  src/mindroom/event_journal/journal.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/durable_ingestion.py \
+  src/mindroom/matrix/journal_ingress.py \
+  tests/test_durable_ingestion_admission.py
+.venv/bin/ruff check --no-fix \
+  src/mindroom/event_journal/journal.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/durable_ingestion.py \
+  src/mindroom/matrix/journal_ingress.py
+.venv/bin/ty check \
+  src/mindroom/event_journal/journal.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/durable_ingestion.py \
+  src/mindroom/matrix/journal_ingress.py \
+  tests/test_durable_ingestion_admission.py
+.venv/bin/python -m compileall -q \
+  src/mindroom/event_journal/journal.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/durable_ingestion.py \
+  src/mindroom/matrix/journal_ingress.py \
+  tests/test_durable_ingestion_admission.py
 git diff --check
 ```
 
@@ -1123,9 +1193,9 @@ from `_open_owned_ingestion()`.
 
 ### Task 5B: MindRoom all-record adapter and pump
 
-**In progress, uncommitted.** Work starts from clean MindRoom commit
-`da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc`. The live handoff above is the
-authoritative checkpoint and checklist.
+**Complete.** Implemented in MindRoom commit
+`3a8094759d23b3740119893419cd7eff8b0c785b`. The live handoff above records the
+exact verification, linked-checkout requirement, budget state, and next task.
 
 Accept both origins and map every record/loss to Task 5A's disposition. Timeline
 uses the existing classifier; history/context settles without a turn; lifecycle

@@ -2,13 +2,15 @@
 
 **Status:** controlling design, approved 2026-08-13
 
-**Implementation checkpoint (2026-08-14):** Tasks 1–4E and MindRoom Task 5A
-are committed; Task 4E is nio `be24cf315c27250d3c2b95a5862278420ee8d270`.
+**Implementation checkpoint (2026-08-14):** Tasks 1–4E and MindRoom Tasks 5A
+and 5B are committed. Task 4E is nio
+`be24cf315c27250d3c2b95a5862278420ee8d270`; Task 5B is MindRoom
+`3a8094759d23b3740119893419cd7eff8b0c785b`. Task 4F is the current boundary.
 The exact repository boundary, completed settlement slices, verification commands, and
 restart protocol are maintained in
 `docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md`.
 That live handoff records execution state; this document remains the semantic
-authority. The current Task 4E checkpoint includes callback-free reconstruction
+authority. The completed Task 4E checkpoint includes callback-free reconstruction
 of authenticated decrypted room-key and timeline Work without re-entering Olm,
 session stores, MatrixStore crypto loads, preparation, or live sync handlers;
 failed-Megolm Work is likewise reconstructed without a second decrypt, wedge
@@ -22,8 +24,11 @@ real-Task4C producer, phase-specific reconstruction, callback, and ack path.
 The remaining decrypted to-device kind matrix now reconstructs five exact
 classes without crypto replay. Authenticated malformed-semantic failures and
 the final all-kind disposition audit are green, including exact collected
-request types before callback. Task4E is complete; Task5B's MindRoom adapter
-from Task5A admission facts to nio `_settle_batch` is the current boundary.
+request types before callback. Task5B now converts every exact durable record
+or loss into Task5A admission, passes the two exact admission facts to nio
+`_settle_batch`, and supplies an isolated one-record nonpolling pump. It is not
+wired to the live bot/orchestrator lifecycle; Tasks 5C/5D own that activation
+after Task4F supplies completion progress.
 First-seen hydration is JOIN-only; invite, knock, leave, ban, or unknown
 membership cannot persist a hydration intent that the hydration protocol could
 never service.
