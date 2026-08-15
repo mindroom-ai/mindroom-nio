@@ -56,7 +56,7 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 second-fix feature `9624ccffe164a4b20ba8a397fbfb634693deb4c2`; parent docs blocker `bc015263202b770d96f217411eb070656b449a33` and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Invite/knock predecessor bridge is committed after 2,319-test full-suite and configured-hook GREEN; this living ledger is the only intended tracked edit, and Classic remains RED until an exact rebuilt wheel passes |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 second-fix feature `9624ccffe164a4b20ba8a397fbfb634693deb4c2`; parent docs blocker `bc015263202b770d96f217411eb070656b449a33` and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Invite/knock predecessor bridge is committed and its exact wheel exposed the mixed-auth join defect. Before the next commit, the only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; all are fully verified but Classic remains RED until the replacement exact wheel passes |
 | `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | packaging commit `6f415e41f` over Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Durable features and packaging fix are committed; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | First fix `1c6bd92...` is externally insufficient. Exact diagnostics found binary `leave/0` authority versus authenticated `invite/0`; Fable-approved invite/knock bridge `9624ccf...` is committed after 2,319 passed and hook GREEN. Exact-wheel rebuild/install and fresh-volume Classic rerun are next |
+| Task 8 | In progress | First fix `1c6bd92...` was externally insufficient. Exact diagnostics found binary `leave/0` authority versus authenticated `invite/0`; Fable-approved invite/knock bridge `9624ccf...` is committed, verified, and installed as an exact wheel. Its fresh-volume Classic rerun remains RED: every owned join reaches Synapse but receives HTTP 401 while the same bot's `/sync` authenticates. Diagnose the join-token divergence before any new code or Sliding run |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -1889,6 +1889,62 @@ Runtime source inspection confirms the installed helper contains the exact
 `{"invite", "knock"}` bridge. This is wheel build/install/import PASS only.
 Restore the operator harness to its ordinary 90-second, no-diagnostic launch,
 reset only the disposable Task 8 Synapse volumes, and rerun Classic next.
+
+That ordinary fresh-volume Classic rerun is still RED. The exact candidate no
+longer terminates on `JournalConflictError`; instead the general bot receives
+the real invite, reaches the local join path, and logs `Failed to join room`
+roughly every 30 seconds while the 90-second application oracle remains
+unsatisfied. The harness preserved the complete failed run at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-classic-1786800492`. Do not call
+`9624ccf...` the Classic fix or proceed to Sliding. The next action is another
+systematic boundary trace over that preserved log/database and Synapse request
+evidence: determine whether the join HTTP is absent, timing out, rejected, or
+succeeds without durable reconciliation before proposing any code change.
+
+That boundary trace has now resolved the HTTP fate precisely. Synapse access
+logs show the general bot's ordinary `/sync` calls authenticating as
+`@mindroom_general_fuzzb4d70a43:task8.local`, while each owned
+`POST /_matrix/client/v3/join/!boCgHGLBAyAfaBHRsk:task8.local` is received with
+an `access_token` parameter but classified as unauthenticated (`{None}`) and
+returns `401` at `13:26:41.913`, `13:27:11.926`, `13:27:41.938`, and
+`13:28:11.950`. The first rejection is immediate; later attempts follow the
+30-second sync cadence. The predecessor bridge therefore did its intended job
+and exposed a separate token/request defect. The access token preserved in
+`mindroom_data/matrix_state.yaml` remains valid against the same disposable
+Synapse: both Bearer-header and query-parameter `/account/whoami` requests
+return `200` for the exact general account. The next diagnostic must compare
+that stored-token digest with the live owned client's token, query path, and
+Authorization header at the `_request` boundary without printing the secret.
+Do not change the bridge, label Classic PASS, or run Sliding until this
+divergence is causally explained and an ordinary fresh-volume Classic run
+passes.
+
+The divergence is now causally explained. `_OwnedIngestionSession._request()`
+always supplies `Authorization: Bearer <client.access_token>`, but
+`_advance_local_membership_intent()` built join/leave paths through
+`Api.join()` / `Api.room_leave()`, which also embed `access_token` in the query
+string. A read-only `/account/whoami` probe against the disposable Synapse
+confirmed either method alone returns `200`, while the same valid token in
+both places returns exact `401 {"errcode":"M_MISSING_TOKEN","error":"Mixing
+Authorization headers and access_token query parameters."}`. This precisely
+matches the canary's unauthenticated join records; no stale-token hypothesis is
+needed.
+
+Strict TDD now covers both operations in
+`test_owned_local_membership_http_uses_only_bearer_authentication`. Before the
+production edit, both join and leave executed real `RecordingClient.send()`
+and failed solely because their paths still contained `?access_token=...`.
+The bounded production correction constructs the already-standard Matrix
+join/leave endpoint path without query authentication and leaves the common
+Bearer request layer unchanged. The exact new node is `2 passed`, and the
+broader local-membership/prejoin selector is `54 passed / 237 deselected`.
+Existing mocked membership paths were updated to the same bearer-only
+contract. After Black normalization, the complete coordinator plus
+source-journal regression is `560 passed in 86.59s`; targeted Ruff and mypy
+are clean. The complete nio suite is also GREEN at `2,321 passed, 3 skipped, 5
+pre-existing warnings in 305.18s`. This is not yet an external PASS: finish
+configured hooks/diff review, commit the slice, rebuild a fresh exact wheel,
+and rerun ordinary fresh-volume Classic before proceeding to Sliding.
 
 ### Task 5D completed checkpoint — 2026-08-15
 

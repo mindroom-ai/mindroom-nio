@@ -10,7 +10,6 @@ from uuid import UUID, uuid5
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
-from ..api import Api
 from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 from ..events.account_data import AccountDataEvent
 from ..events.ephemeral import EphemeralEvent
@@ -1599,10 +1598,14 @@ class _OwnedIngestionSession(IngestionSession):
         if type(access_token) is not str or not access_token:
             raise LocalProtocolError("local membership intent requires an access token")
         if candidate.intent.current_membership == "join":
-            method, path = Api.join(access_token, candidate.room_id)
+            method = "POST"
+            path = f"/_matrix/client/v3/join/{quote(candidate.room_id, safe='')}"
         else:
             assert candidate.intent.current_membership == "leave"
-            method, path = Api.room_leave(access_token, candidate.room_id)
+            method = "POST"
+            path = (
+                "/_matrix/client/v3/rooms/" f"{quote(candidate.room_id, safe='')}/leave"
+            )
         owner = self._journal.load_owner()
         source = self._journal.load_source()
         request = ports.NetworkRequest(

@@ -99,6 +99,10 @@ BOB_DEVICE = "BOB"
 ROOM = "!diagnostic:example.org"
 
 
+def _bearer_only_path(request: tuple[str, str]) -> str:
+    return request[1].partition("?")[0]
+
+
 class RecordingClient(AsyncClient):
     def __init__(
         self,
@@ -3085,6 +3089,70 @@ def test_owned_reopen_rejects_multiple_authenticated_local_membership_intents(
         reopen_owned_bootstrap(tmp_path, generation)
 
 
+@pytest.mark.parametrize("target_membership", ("join", "leave"))
+@pytest.mark.asyncio
+async def test_owned_local_membership_http_uses_only_bearer_authentication(
+    tmp_path,
+    target_membership: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    previous_membership = "leave"
+    response_body = canonical_json({"room_id": ROOM})
+    if target_membership == "leave":
+        operation_id, _commit, _aggregate, _work = _publish_fresh_local_join(session)
+        batch = session.next_batch()
+        assert batch is not None
+        assert batch.records[0].origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            operation_id,
+        )
+        session.acknowledge_batch(batch.ref)
+        previous_membership = "join"
+        response_body = canonical_json({})
+
+    client.responses.append(FakeResponse(200, response_body))
+    transition = asyncio.create_task(
+        session._run_local_membership_transition(
+            operation_id=uuid4(),
+            room_id=ROOM,
+            previous_membership=previous_membership,
+            previous_epoch=0,
+            current_membership=target_membership,
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        assert await session._advance_local_membership_intent() is True
+        assert await asyncio.wait_for(transition, timeout=1) is True
+        assert len(client.send_calls) == 1
+        (method, path, body, headers, trace_context, timeout), kwargs = (
+            client.send_calls[0]
+        )
+        token_path = (
+            _bearer_only_path(nio.Api.join("secret-token", ROOM))
+            if target_membership == "join"
+            else _bearer_only_path(nio.Api.room_leave("secret-token", ROOM))
+        )
+        assert (method, path, body, headers, trace_context, timeout, kwargs) == (
+            "POST",
+            token_path.partition("?")[0],
+            None,
+            {"Authorization": "Bearer secret-token"},
+            None,
+            30,
+            {},
+        )
+        assert "access_token" not in path
+    finally:
+        if not transition.done():
+            transition.cancel()
+        await asyncio.gather(transition, return_exceptions=True)
+        await session.close()
+
+
 @pytest.mark.asyncio
 async def test_owned_runner_restarts_local_membership_intent_before_source_http(
     tmp_path,
@@ -3112,7 +3180,8 @@ async def test_owned_runner_restarts_local_membership_intent_before_source_http(
             request.timeout_ms,
             request.request_cursor_json,
         ) == (
-            *nio.Api.join("secret-token", ROOM),
+            "POST",
+            _bearer_only_path(nio.Api.join("secret-token", ROOM)),
             (),
             None,
             30_000,
@@ -3255,7 +3324,7 @@ async def test_owned_local_membership_success_waits_for_work_ack_before_source(
     transition: asyncio.Task[bool] | None = None
 
     async def respond(request, **kwargs: object) -> NetworkResult:
-        if request.path == nio.Api.join("secret-token", ROOM)[1]:
+        if request.path == _bearer_only_path(nio.Api.join("secret-token", ROOM)):
             assert kwargs == {"body_disconnect_retry": True}
             assert session._journal.load_source() == source_before
             pending = session._journal._load_pending_local_membership_intents(limit=2)
@@ -3451,7 +3520,9 @@ async def test_owned_local_command_reconciles_when_lifecycle_reaches_target(
         leave_requests: list[object] = []
 
         async def leave_success(request, **kwargs: object) -> NetworkResult:
-            assert request.path == nio.Api.room_leave("secret-token", ROOM)[1]
+            assert request.path == _bearer_only_path(
+                nio.Api.room_leave("secret-token", ROOM)
+            )
             assert kwargs == {"body_disconnect_retry": True}
             leave_requests.append(request)
             return session._network_result(request, 200, canonical_json({}))
@@ -3572,7 +3643,7 @@ async def test_owned_local_join_accepts_prejoin_transport_predecessor(
         requests: list[object] = []
 
         async def join_success(request, **kwargs: object) -> NetworkResult:
-            assert request.path == nio.Api.join("secret-token", ROOM)[1]
+            assert request.path == _bearer_only_path(nio.Api.join("secret-token", ROOM))
             assert kwargs == {"body_disconnect_retry": True}
             requests.append(request)
             return session._network_result(
@@ -3719,7 +3790,7 @@ async def test_owned_prejoin_local_join_intent_restarts_without_duplicate_work(
     requests: list[object] = []
 
     async def join_success(request, **kwargs: object) -> NetworkResult:
-        assert request.path == nio.Api.join("secret-token", ROOM)[1]
+        assert request.path == _bearer_only_path(nio.Api.join("secret-token", ROOM))
         assert kwargs == {"body_disconnect_retry": True}
         requests.append(request)
         return fresh_session._network_result(
@@ -3829,8 +3900,8 @@ async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
 
     async def respond(request, **kwargs: object) -> NetworkResult:
         assert kwargs == {"body_disconnect_retry": True} or kwargs == {}
-        leave_path = nio.Api.room_leave("secret-token", ROOM)[1]
-        join_path = nio.Api.join("secret-token", ROOM)[1]
+        leave_path = _bearer_only_path(nio.Api.room_leave("secret-token", ROOM))
+        join_path = _bearer_only_path(nio.Api.join("secret-token", ROOM))
         if request.path == leave_path:
             assert kwargs == {"body_disconnect_retry": True}
             assert local_paths == []
@@ -3887,7 +3958,9 @@ async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
         runner = asyncio.create_task(session.run())
         assert await asyncio.wait_for(leave_first, timeout=1) is True
         assert await asyncio.wait_for(leave_second, timeout=1) is True
-        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+        assert local_paths == [
+            _bearer_only_path(nio.Api.room_leave("secret-token", ROOM))
+        ]
 
         owner_after_leave = session._journal.load_owner()
         with session._journal._owner.read():
@@ -3913,7 +3986,9 @@ async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
             session._run_local_membership_transition(**leave_arguments)
         )
         assert await asyncio.wait_for(leave_replay, timeout=1) is True
-        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+        assert local_paths == [
+            _bearer_only_path(nio.Api.room_leave("secret-token", ROOM))
+        ]
 
         rejoin = asyncio.create_task(
             session._run_local_membership_transition(
@@ -3927,7 +4002,9 @@ async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert rejoin.done() is False
-        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+        assert local_paths == [
+            _bearer_only_path(nio.Api.room_leave("secret-token", ROOM))
+        ]
         assert source_paths == []
 
         leave_batch = session.next_batch()
@@ -3940,8 +4017,8 @@ async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
         )
         assert await asyncio.wait_for(rejoin, timeout=1) is True
         assert local_paths == [
-            nio.Api.room_leave("secret-token", ROOM)[1],
-            nio.Api.join("secret-token", ROOM)[1],
+            _bearer_only_path(nio.Api.room_leave("secret-token", ROOM)),
+            _bearer_only_path(nio.Api.join("secret-token", ROOM)),
         ]
         assert source_paths == []
 
@@ -4157,7 +4234,7 @@ async def test_owned_runner_reports_local_membership_terminal_and_auth_fates(
 
     async def respond(request, **kwargs: object) -> NetworkResult:
         requests.append(request)
-        if request.path == nio.Api.join("secret-token", ROOM)[1]:
+        if request.path == _bearer_only_path(nio.Api.join("secret-token", ROOM)):
             assert kwargs == {"body_disconnect_retry": True}
             if fate == "terminal":
                 return session._network_result(
@@ -4574,7 +4651,7 @@ async def test_owned_local_membership_work_reopen_fences_source_until_ack(
     )
 
     async def membership_success(request, **kwargs: object) -> NetworkResult:
-        assert request.path == nio.Api.join("secret-token", ROOM)[1]
+        assert request.path == _bearer_only_path(nio.Api.join("secret-token", ROOM))
         assert kwargs == {"body_disconnect_retry": True}
         return session._network_result(
             request,
@@ -4596,8 +4673,10 @@ async def test_owned_local_membership_work_reopen_fences_source_until_ack(
     runner: asyncio.Task[None] | None = None
 
     async def source_only(request, **kwargs: object) -> NetworkResult:
-        assert request.path != nio.Api.join("secret-token", ROOM)[1]
-        assert request.path != nio.Api.room_leave("secret-token", ROOM)[1]
+        assert request.path != _bearer_only_path(nio.Api.join("secret-token", ROOM))
+        assert request.path != _bearer_only_path(
+            nio.Api.room_leave("secret-token", ROOM)
+        )
         assert kwargs == {}
         requests.append(request)
         source_entered.set()
@@ -4651,8 +4730,10 @@ async def test_owned_local_membership_work_reopen_fences_source_until_ack(
     final_runner: asyncio.Task[None] | None = None
 
     async def final_source(request, **kwargs: object) -> NetworkResult:
-        assert request.path != nio.Api.join("secret-token", ROOM)[1]
-        assert request.path != nio.Api.room_leave("secret-token", ROOM)[1]
+        assert request.path != _bearer_only_path(nio.Api.join("secret-token", ROOM))
+        assert request.path != _bearer_only_path(
+            nio.Api.room_leave("secret-token", ROOM)
+        )
         assert kwargs == {}
         final_requests.append(request)
         final_entered.set()
