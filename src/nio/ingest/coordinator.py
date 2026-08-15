@@ -599,6 +599,9 @@ class IngestionSession:
     async def _advance_local_membership_intent(self) -> bool:
         return False
 
+    def _signal_progress(self) -> None:
+        """Public sessions have no progress waiters."""
+
     async def run(self) -> None:
         self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
@@ -689,8 +692,12 @@ class IngestionSession:
                     hydration_result = normalize_hydration_response(candidate, own_user_id=owner.account_id, response_body=network.body)
                 except (TypeError, ValueError) as error:
                     raise IngestionHydrationError(candidate.intent.hydration_id) from error
-                self._journal.apply_hydration_result(result=hydration_result)
+                committed = self._journal.apply_hydration_result(
+                    result=hydration_result
+                )
                 hydration_retries = 0
+                if committed is not None:
+                    self._signal_progress()
                 continue
             hydration_retries = 0
             # fmt: on

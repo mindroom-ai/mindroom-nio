@@ -56,7 +56,7 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 bearer-auth fix `2ba7b04a90c5191cbf488459bd4c48107ac07714`; invite/knock bridge `9624ccffe164a4b20ba8a397fbfb634693deb4c2`, docs blocker `bc015263202b770d96f217411eb070656b449a33`, and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Exact-wheel Classic proved bearer-only join externally, then exposed an owned retained-Frame/HELD hydration deadlock. The only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; the causal RED is GREEN and 561 coordinator/source-journal regressions pass, but full-suite/hooks, commit, replacement wheel, and ordinary Classic remain required |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 hydration fix `a3ab35fe341f0c3bf92000173b08dba8e303a5ff`; bearer-auth fix `2ba7b04a90c5191cbf488459bd4c48107ac07714`, invite/knock bridge `9624ccffe164a4b20ba8a397fbfb634693deb4c2`, docs blocker `bc015263202b770d96f217411eb070656b449a33`, and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Exact-wheel Classic is PASS. Fresh-volume Sliding exposed a transport-agnostic post-hydration lost wake; preserved DB evidence and a read-only Claude Fable review confirm the cause. The only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; causal/focused/broad suites and configured hooks are GREEN after final hardening. Compute the final patch identity, commit, build/install a fresh exact wheel, reset only the disposable stack, and rerun Sliding |
 | `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | packaging commit `6f415e41f` over Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Durable features and packaging fix are committed; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | Exact diagnostics resolved binary `leave/0` versus authenticated `invite/0`, mixed query/Bearer auth, and then the retained-Frame/HELD hydration deadlock exposed by the next exact-wheel Classic run. The hydration scheduling RED is GREEN and coordinator/source-journal are 561/561; finish full verification, commit, rebuild/install, and rerun ordinary fresh-volume Classic. Sliding remains gated |
+| Task 8 | In progress | Exact diagnostics resolved binary `leave/0` versus authenticated `invite/0`, mixed query/Bearer auth, the retained-Frame/HELD hydration deadlock, and the later post-hydration lost wake. Hydration fix `a3ab35f...` and exact wheel SHA `52e574...` provide the current Classic PASS. The second strict-TDD slice is locally GREEN; next commit it, build a fresh exact wheel, and rerun Sliding from reset disposable volumes |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2017,7 +2017,121 @@ warnings in 305.25s`. Production Ruff `--no-fix`, Black, targeted coordinator
 mypy, `py_compile`, `git diff --check`, and every configured pre-commit hook on
 the three changed paths are GREEN. Commit this exact three-file slice next,
 then build/install a fresh exact wheel and rerun ordinary fresh-volume Classic.
-Classic remains RED and Sliding remains forbidden until that external pass.
+Those are the completed local gates; the exact external result that supersedes
+the prior Classic RED is recorded immediately below.
+
+The verified hydration slice is committed as
+`a3ab35fe341f0c3bf92000173b08dba8e303a5ff` with subject
+`fix: hydrate held owned frames before work wait`. Its exact pre-commit
+three-file binary diff SHA-256 was
+`431284a6d70101b1caa09edc93630ada20e0aea035a309e8b47cadae7e4ee92c`.
+A detached worktree at
+`/tmp/mindroom-task8-wheels.2FeteO/nio-a3ab35f` produced
+`/tmp/mindroom-task8-wheels.2FeteO/wheels-a3ab35f/mindroom_nio-0.39.0-py3-none-any.whl`,
+SHA-256 `52e57455e416e5bef757805d1a9466ba7deba0e04e9db6a8a8bb54f74c27e8da`,
+size `391889` bytes. A fresh Python 3.13.14 environment at
+`/tmp/mindroom-task8-wheels.2FeteO/venv-a3ab35f` installed 154 packages from
+that wheel plus the unchanged MindRoom wheel. Imports resolve from that
+environment's `site-packages`; installed source contains the exact hydration
+yield/break and bearer-only membership paths.
+
+After resetting only the disposable `mindroom-task8-canary` volumes, the
+ordinary Classic run is **PASS**. It produced two canonical application reply
+events (`$_B21gszEzK3S4i2yQYK6D47HK8E_S78uC-Miit-UAio` and
+`$ssKBadpoFRghx7eheLmdPLYP83qCtYuuE08bpQl_T08`) in room
+`!NJOwXnObyuCunaqoMs:task8.local`, with `crashes=0`,
+`event_loop_stalls=0`, `degraded_conversation_reads=0`, and
+`restart_drain_incomplete=0`. Both the general and router owned databases end
+at `NioIngestFrame=0` / `NioIngestWork=0`; the application journal has 24
+events, 99 receipts, four response-outbox rows, and eight visible messages.
+The reported Synapse digest remains `sha256:39f47...` / version `1.158.0`, and
+the exact nio/MindRoom wheel hashes are `52e574...` / `ab70ef...`. Classic's
+gate is now satisfied. Reset only this disposable stack's volumes once more
+and run the same ordinary harness with `sliding`; do not relabel all of Task 8
+PASS until that transport and remaining manifest gates are also GREEN.
+
+That separately fresh Sliding run is RED and preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-1786802799`. It is not the
+Classic hydration failure: the warm-up event
+`$E4jYu_xgn8qW6UlCGmi01nrnV6Vx1eU13UmiCzn2p4M` reached the general bot and
+produced response `$hzU2ZhSBBzNazekE5HVwuREJvWf5Bgbw33IjmNofUvo`. The measured
+root `$zXh96U_nGOSdY4v6QkRGV7tIjQytsEJar7yNjfZpV2U` then timed out after 90.2
+seconds. The application oracle classifies it as `settled_without_reply`:
+only `router@@mindroom_router_fuzz659b0be4:task8.local` settled it, at receipt
+order 9, and no response was staged; the journal reports no pending events.
+Treat this as a transport/parity versus MindRoom routing ambiguity, not as a
+nio fix. Inspect the preserved router/general owned graphs plus principal
+receipts/event payload and compare the Classic routing fate. Per the operator
+instruction, obtain a read-only Claude Fable judgment through `agent-cli dev`
+once that exact evidence packet is assembled; then add a causal RED only in
+the owning repository.
+
+The preserved owned graphs resolve the apparent routing ambiguity into a nio
+lost wake. Router is fully drained (`Frame=0`, `Work=0`, source request 17,
+delivery sequence 63). General has no outstanding delivery batch but remains
+at Sliding source request 4 with prepared Frame
+`efffc4f3-f4d3-5320-8d1c-0af32d2da487` (request 3, staged revision 87,
+materialized revision 88) and exactly three READY room Work rows at revision
+89 / ordinals 0..2 / room sequences 35..37. The measured root is therefore in
+that unpumped prepared response; it is absent from general's MindRoom receipts,
+not semantically rejected there. The timing boundary is exact: materialization
+signals progress while those rows are HELD, the pump may consume that wake and
+find no deliverable batch, hydration then commits HELD→READY at revision 89,
+but `_run_loop()` calls `journal.apply_hydration_result()` without the owned
+session's `_signal_progress()`. The runner subsequently waits on Frame Work
+and the pump waits for a wake that already happened. Classic passed because
+its scheduling happened to let the pump observe Work after hydration; Sliding
+exposed the legitimate opposite interleaving. Ask Fable to review whether the
+minimal contract is “every successful hydration commit signals owned progress”
+and what causal concurrency RED must pin before implementing it.
+
+Claude Fable was consulted read-only through `agent-cli dev` against detached
+commit `a3ab35f` (direct Claude auth was required after the configured Vertex
+credential path was stale and the Vertex project denied Fable). Fable's verdict
+is **diagnosis confirmed**: this is transport-agnostic, the journal is the wrong
+layer to signal, and the exact implementation boundary is a base no-op
+`_signal_progress()` plus an immediate signal iff
+`apply_hydration_result()` returns a non-`None` `CommitResult`. A stale/no-op
+`None` or any rollback/error must not signal; there must be no await between
+commit and signal. The generation/event double-check already closes set/clear
+races, and a close after commit safely wakes waiters into their existing closed
+guard.
+
+The stricter real-FIFO RED is now captured in
+`test_owned_hydration_commit_wakes_rearmed_work_pump`. It parks hydration body
+reading, lets the pump consume the materialization wake, claims/acks the one
+pre-hydration READY lifecycle record, proves the remaining hydration-gated Work
+is unavailable, rearms the pump on the cleared generation event, then releases
+hydration. Current production commits HELD→READY but both pump and runner remain
+pending; the exact failure is `hydration commit did not wake the rearmed Work
+pump: None`. Cleanup is bounded and cancels/drains both tasks. Implement only
+Fable's two coordinator boundaries, then require this node plus the prior
+hydration/runner selectors GREEN before broader gates.
+
+That implementation is GREEN at the frozen boundary. Base/public sessions now
+have a no-op `_signal_progress()`; the existing owned override remains the sole
+generation/event publisher. `_run_loop()` retains the hydration `CommitResult`
+and signals immediately, without an await, only when it is non-`None`. The
+causal lost-wakeup node plus the prior hydration and runner-wait nodes are 4/4,
+and the complete focused hydration/owned-wait selector is `23 passed / 270
+deselected`. Ruff `--no-fix`, Black, targeted coordinator mypy, `py_compile`,
+and diff-check are clean. Run coordinator/source-journal and full nio next;
+then commit, build/install another fresh wheel, reset the disposable stack, and
+rerun Sliding. Do not reuse wheel SHA `52e574...` for this second fix.
+
+The broader gates are GREEN: coordinator plus source-journal is `562 passed in
+84.11s`, and the complete nio suite is `2,323 passed, 3 skipped, 5 pre-existing
+warnings in 305.55s`. Commit the lost-wakeup slice only after the configured
+three-path pre-commit stack and final diff identity pass, then build/install a
+fresh wheel from that new commit. The prior `a3ab35f` wheel remains valid
+Classic evidence but must not be used for the next Sliding rerun.
+
+Final test hardening also observes the real non-`None` hydration commit return,
+waits for the authenticated pending intent to disappear, proves the two
+post-lifecycle Work rows are READY, and pins the cleared progress event before
+requiring the rearmed pump to wake. The exact node and 23-case focused selector
+remain GREEN, and the configured three-path pre-commit stack is GREEN after
+that hardening. Compute the final patch identity and commit next.
 
 ### Task 5D completed checkpoint — 2026-08-15
 

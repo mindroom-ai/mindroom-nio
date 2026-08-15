@@ -10497,6 +10497,107 @@ async def test_owned_runner_hydrates_held_work_before_waiting_for_pump(
 
 
 @pytest.mark.asyncio
+async def test_owned_hydration_commit_wakes_rearmed_work_pump(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CoordinatedHydrationContent(FakeContent):
+        def __init__(self, body: bytes) -> None:
+            super().__init__(body)
+            self.entered = asyncio.Event()
+            self.release_read = asyncio.Event()
+
+        async def read(self, size: int = -1) -> bytes:
+            if not self.entered.is_set():
+                self.entered.set()
+                await self.release_read.wait()
+            return await super().read(size)
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    stage_classic(bootstrap, _local_room_body())
+    content = CoordinatedHydrationContent(hydration_state())
+    hydration = FakeResponse(200, b"")
+    hydration.content = content
+    client.responses.append(hydration)
+    pump_rearmed = asyncio.Event()
+    hydration_committed = asyncio.Event()
+    real_apply_hydration = session._journal.apply_hydration_result
+
+    def observe_hydration_commit(*, result):
+        committed = real_apply_hydration(result=result)
+        assert committed is not None
+        hydration_committed.set()
+        return committed
+
+    monkeypatch.setattr(
+        session._journal,
+        "apply_hydration_result",
+        observe_hydration_commit,
+    )
+
+    async def pump_once():
+        await session._wait_for_work()
+        lifecycle = session.next_batch(max_records=1)
+        assert lifecycle is not None and len(lifecycle.records) == 1
+        lifecycle_record = lifecycle.records[0]
+        assert type(lifecycle_record) is EventRecord
+        assert lifecycle_record.kind is RecordKind.ROOM_LIFECYCLE
+        session.acknowledge_batch(lifecycle.ref)
+        assert session.next_batch(max_records=1) is None
+        pump_rearmed.set()
+        await session._wait_for_work()
+        batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        return batch
+
+    pump = asyncio.create_task(pump_once())
+    await asyncio.sleep(0)
+    runner = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(content.entered.wait(), timeout=2)
+        await asyncio.wait_for(pump_rearmed.wait(), timeout=2)
+        assert not session._progress_event.is_set()
+        assert session.next_batch(max_records=1) is None
+        content.release_read.set()
+        await asyncio.wait_for(hydration_committed.wait(), timeout=2)
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert [work.status for work in inventory.work] == ["ready", "ready"]
+        done, _pending = await asyncio.wait(
+            (runner, pump),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert pump in done, (
+            "hydration commit did not wake the rearmed Work pump: "
+            f"{runner_failure!r}"
+        )
+        batch = pump.result()
+        assert not runner.done()
+        assert client.send_count == 1
+        assert hydration.released
+        assert session.next_batch(max_records=1) == batch
+        client._assert_ingestion_not_poisoned()
+    finally:
+        content.release_read.set()
+        for task in (runner, pump):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(runner, pump, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_work_wait_wakes_when_materialization_publishes_delivery(
     tmp_path,
 ) -> None:
