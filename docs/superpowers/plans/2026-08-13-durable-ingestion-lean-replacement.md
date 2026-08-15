@@ -56,8 +56,8 @@ action**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | docs-only Task 5C handoff whose parent is `b61e186b2b63e2b81149c40ca67c0435a60ede60` | Task 5C code and restart handoff committed; tracked tree clean before Task 5D |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa` | Task 5C implementation committed; tracked tree clean, full suite and all hooks GREEN |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 5D feature commit `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; the ledger commit containing this row follows it | Task 5D nio support/tests are committed and GREEN; after the ledger commit, tracked state is clean |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 5D commit `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047` | Task 5D sole-engine, completion, and local-membership activation is committed, reviewed, and GREEN; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -107,7 +107,8 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5B MindRoom all-record adapter/pump | Complete | MindRoom `3a80947593bbf6fe508ca2e7499f19e951f416d3`; owning 319-test file, full repository suite, and all pre-commit hooks GREEN |
 | Task 4F coordinator progress/completion | Complete | nio `ec9fe0da38378e7a7d5d100737787fb7584d8662`; exact patch `1ca31931...`; 2,731 passed/3 skipped full suite |
 | Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
-| Tasks 5D, 6–10 | Not started | Task 5D is now immediate next; preserve the remaining dependency order |
+| Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
+| Tasks 6–10 | Not started | Task 6 is now the immediate next slice; preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
 
@@ -944,15 +945,526 @@ After the decrypted pair, complete Task 4E in this order:
 ### Immediate next action
 
 A fresh session can be started with: “Read the controlling design and the live
-restart handoff in this plan, verify both recorded commit boundaries and clean
-tracked trees,
-preserve unrelated untracked files, install the nio checkout editable into
-MindRoom, and begin Task 5D: make `Bot.sync_forever()` use the already-owned
-durable runner and MindRoom pump as the sole candidate engine while preserving
-the Classic/Sliding transport choice and existing lifecycle behavior. Task 5C
-is committed and GREEN in both repos. Continue autonomously without approval
-pauses; consult Claude Fable through isolated `agent-cli-dev` only for a
-material ambiguity that local evidence cannot resolve.”
+restart handoff in this plan, verify Task 5D commits
+`1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4` and
+`47180cc07e7d0177ff4981bd7ccf1f1ec65eb047` plus clean tracked trees, preserve
+the recorded unrelated untracked files, install the nio checkout editable into
+MindRoom, and begin Task 6 from its exact upstream boundary and TDD matrix:
+restore the pre-fork public desktop sync path while keeping MindRoom on the
+durable engine. Continue autonomously without approval pauses; consult Claude
+Fable through isolated `agent-cli dev` only for a material ambiguity that local
+evidence cannot resolve.”
+
+### Task 5D completed checkpoint — 2026-08-15
+
+Task 5D began from clean committed boundaries: nio
+`d1c364ac5d432d2ac58ec6ae5effb91ce9a39c49` (the docs-only Task 5C handoff,
+parent `b61e186...`) and MindRoom
+`ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`. The only expected tracked change
+before the first Task 5D RED is this living document; preserve the unrelated
+untracked paths recorded above.
+
+Initial source mapping is complete:
+
+- `Bot.start()` already owns one `_ingestion_session`, registers the durable
+  compatibility callbacks on its ingestion-owned client, and installs the
+  private frame-completion sink before `running=True`;
+- `Bot.sync_forever()` still calls `run_matrix_sync_forever()`, which reaches
+  public `client.sync_forever()` or `client.sliding_sync_forever()`. This is the
+  legacy candidate engine and must become unreachable for managed bots;
+- nio's private owned session already owns `session.run()`, source transport,
+  hydration, local membership, maintenance, completion, close cancellation,
+  Work acknowledgements, and the progress generation/event;
+- `mindroom.matrix.durable_ingestion.run_ingestion_pump()` already validates,
+  admits, settles, and wakes semantic dispatch one record at a time, but no Bot
+  calls it yet;
+- the principal-bound event journal is both the ingestion consumer/admission
+  store, and `self._journal_dispatcher.wake` is the existing semantic-dispatch
+  wake boundary;
+- the missing integration contract is one runner+pump lifetime under
+  `Bot.sync_forever()`, including a private lost-wakeup-safe Work wait and
+  frame-completion translation to health/first-sync/runtime side effects.
+
+Task 5D TDD order:
+
+1. [x] Add a causal Bot RED proving `sync_forever()` starts exactly the already
+   owned nio runner and the one-record MindRoom pump, selects Classic/Sliding
+   only through the frozen `IngestionConfig`, and never calls either legacy
+   public sync-forever method.
+2. [x] Freeze the smallest private Work-availability wait/wake boundary; prove
+   the pump cannot poll, miss a materialization wake, or outlive/cancel its
+   runner sibling.
+3. [x] Make authenticated frame completion drive the existing sync-health,
+   first-sync, ready/recovery, invite/membership, presence, E2EE/pairing, and
+   RTC-compatible side effects exactly once and outside database transactions.
+4. [x] Cover runner/pump failure, permanent authentication, cancellation,
+   watchdog restart, ordinary stop, config replacement, and cleanup ordering;
+   the owned session must close/revoke before Matrix HTTP and every cleanup
+   lane must run.
+5. [~] Route local departure/rejoin through nio's private durable membership
+   command without a source poll crossing its intent or Work; restart must
+   reconcile the exact prior fate without fabrication.
+6. [ ] Run Classic/Sliding behavioral parity, focused lifecycle/E2E suites,
+   the full MindRoom suite, exact Ruff/ty/Tach/Privata/pre-commit gates, linked
+   nio regressions/statics, diff/budget review, update this handoff, and commit
+   the complete slice as `feat: activate durable matrix ingestion`.
+
+First causal RED checkpoint:
+
+- MindRoom
+  `TestAgentBot::test_agent_bot_enters_sync_without_startup_cleanup` now starts
+  a real initialized Bot with its exact owned-session carrier, holds the owned
+  runner and pump siblings open, and installs hard tripwires on the legacy
+  selector plus both public Classic/Sliding loops. It fails solely because the
+  current `Bot.sync_forever()` invokes `run_matrix_sync_forever()`:
+  `AssertionError('managed bot invoked the legacy Matrix sync engine')`.
+- nio
+  `test_owned_work_wait_wakes_when_materialization_publishes_delivery` starts a
+  read-only waiter with no Work, stages and really materializes one canonical
+  GLOBAL_ACCOUNT_DATA delivery, and requires the waiter to expose that exact
+  batch. It fails solely with `AttributeError` because
+  `_OwnedIngestionSession._wait_for_work` does not yet exist.
+- The intended private seam snapshots the progress generation, rechecks the
+  authenticated ready batch, and then uses the existing generation/event
+  double-check. Successful owned materialization signals progress. This closes
+  both the already-waiting and materialization-before-wait race without a poll,
+  public API, or new durable state.
+
+These REDs are accepted for the first narrow GREEN. No production behavior has
+been changed at that checkpoint.
+
+First narrow GREEN:
+
+- nio now has a private `_wait_for_work()` that snapshots the progress
+  generation, checks for an authenticated ready batch, and then enters the
+  existing double-checked event wait. A successfully committed owned
+  materialization signals progress. The new RED plus both existing ack/resume
+  rows are 3/3 GREEN; exact Black, production Ruff, and coordinator mypy pass.
+- `Bot.sync_forever()` now starts only `session.run()` and
+  `run_ingestion_pump()` as named sibling tasks. The pump receives the exact
+  principal admission view, Matrix user/device identity, private Work waiter,
+  and semantic-dispatch wake. First child completion/failure cancels and joins
+  the sibling; parent cancellation joins both. The legacy selector import is
+  removed, and the exact Bot RED is GREEN.
+- authenticated frame completion now marks health, sets first-sync once,
+  invokes the existing ready/recovery/orchestrator/deferred-work side-effect
+  boundary, schedules pending RTC reconciliation, and clears frame-scoped
+  member provenance without fabricating a Sync response. Its two-completion
+  truth test and the runner/pump test are 2/2 GREEN; Bot Ruff and ty pass.
+- full `test_multi_agent_bot.py` is 42/42 GREEN and the focused nio close,
+  waiter, ack/resume, and completion selector is 19/19 GREEN.
+
+The first broader lifecycle run found seven failures plus one now-dead pure
+backoff characterization in
+`test_sync_task_cancellation.py`. They instantiate public
+`client.sync_forever()`/`sliding_sync_forever()` and assert `full_state` or the
+fork-only Classic rebuild loop. Those expectations directly contradict Task
+5D's sole-engine acceptance criterion. All eight obsolete public-loop tests
+were deleted rather than skipped or shimmed. The surviving file is now 94
+collected tests and runs 93 passed/1 skipped; no surviving Classic/Sliding
+transport configuration or lifecycle assertion was removed.
+
+The remaining boundary ambiguity was submitted to Claude Fable through
+`agent-cli dev` on 2026-08-15. The first broad read-only prompt was terminated
+after ten minutes without output; a narrower no-tools Fable prompt returned a
+decisive answer. The temporary worktree and branch
+`task5d-boundary-fable-20260815` were removed cleanly afterward. Adopted
+decisions:
+
+1. settlement remains the per-record data plane; frame completion is the
+   control-plane signal for health and first/runtime readiness;
+2. delete the seven contradictory legacy-loop tests now rather than adding a
+   shim or skips, and rewrite only surviving behavior at the durable seam;
+3. derive local operation identity deterministically with UUIDv5 over the
+   durable user/room/prior-epoch/target transition, use the EventJournal as the
+   sole previous-membership/epoch authority, and emit no operation when startup
+   desired state already equals durable state;
+4. keep one structured runner/pump owner, cancel/join the sibling on terminal
+   exit, and add causal child-failure, cancellation, restart, and no-orphan
+   tests.
+
+One Fable suggestion was rejected because it conflicts with the already frozen
+Task 4F contract: MindRoom delivery recovery, deferred tasks, and RTC work will
+not be moved into nio maintenance before the completion claim. Task 4F
+intentionally persists the claim before invoking the best-effort private sink;
+the existing background/idempotent MindRoom side effects remain on that sink.
+Changing that ordering would reopen completed crash semantics and is outside
+Task 5D.
+
+Next RED order after this decision:
+
+1. empty-frame completion drives first ready without any Work;
+2. runner or pump failure cancels/joins its sibling and restart replays the
+   exact unfinished owner without duplicate semantic effects;
+3. close/cancellation leaves no runner, pump, source HTTP, or Work waiter;
+4. local membership crash/retry reuses one deterministic operation and one
+   Matrix HTTP fate;
+5. startup already-joined emits no local operation, while durable leave plus
+   desired join emits exactly one operation from journal-authoritative state.
+
+Structured runner/pump checkpoint:
+
+- `test_owned_sync_child_failure_cancels_and_joins_sibling` is GREEN for both
+  runner-first and pump-first failure. Each exact child exception is rethrown
+  by identity only after the sibling observes cancellation and exits.
+- `test_owned_sync_parent_cancellation_joins_runner_and_pump` is GREEN. Parent
+  cancellation reaches both children, both observe `CancelledError`, and the
+  structured owner returns only after both have joined.
+- Fresh evidence:
+  `pytest -q -n0 tests/test_multi_agent_bot.py` is 46/46 GREEN;
+  `pytest -q -n0 tests/test_sync_task_cancellation.py` is 93 passed/1 skipped;
+  the two child-failure rows plus parent-cancellation row are 3/3 GREEN.
+- No restart, membership, or full-suite claim is made at this checkpoint. The
+  next implementation boundary is journal-authoritative local membership;
+  first map the existing EventJournal membership carrier and write the
+  startup-no-op plus crash/retry REDs before changing its production path.
+
+Local-membership design checkpoint:
+
+- A second isolated Claude Fable consultation was run through
+  `agent-cli dev` in temporary worktree
+  `task5d-membership-fable-20260815`, then the worktree and branch were removed
+  cleanly. Fable's decisive boundary is that the lifecycle layer remains the
+  policy/decision owner while nio's HTTP-owning durable command sits behind a
+  dedicated executor/gateway seam; the generic `join_room` and
+  `leave_non_dm_rooms` helpers remain unchanged for unmanaged callers.
+- EventJournal already has the necessary durable prior-state carrier:
+  `(departure_fenced, membership_epoch)`. The typed read projection will be
+  `leave/0` for an absent row, `join/epoch` for an unfenced row, and
+  `leave/epoch` for a fenced row. `owed_departure_reports` is bookkeeping, not
+  membership identity.
+- The gateway operation namespace is frozen as UUID
+  `0bd4e975-c3e9-5b10-8d46-68fdda1adc07`, UUIDv5 of URL
+  `https://mindroom.chat/matrix/local-membership/v1`. Each operation name is a
+  compact JSON array `[user_id, room_id, previous_epoch, target_membership]`,
+  so delimiters inside Matrix identifiers cannot alias another transition.
+- Before reading EventJournal state, the gateway must await a private nio
+  local-membership-idle boundary. This is required on restart: a prior HTTP may
+  already have published lifecycle Work that the new pump has not admitted
+  yet. Reading the old EventJournal row first could incorrectly certify a
+  startup no-op. The idle wait uses the existing nio progress generation/event
+  and Work acknowledgement signal; it must not poll.
+- The gateway must not wait for its newly published lifecycle Work to be
+  admitted before returning when called inside a pump callback (notably an
+  invite). The pump cannot admit that new Work until the current callback
+  returns, so post-command admission waiting would deadlock. A later gateway
+  call serializes, waits for the prior Work to drain, then rereads the sole
+  durable EventJournal authority.
+
+Continue this loop autonomously. Do not stop for an ordinary RED review or
+implementation approval. If a material design ambiguity remains after the
+controlling spec, code, and causal evidence are exhausted, use Claude Fable
+through the isolated `agent-cli dev` workflow recorded above, write the
+decision here, and continue.
+
+Journal-authoritative local-membership implementation checkpoint:
+
+- MindRoom now exposes exact `RoomMembershipPosition(membership,
+  membership_epoch)` through `PrincipalStore.membership_position(room_id)`.
+  The journal projection is `leave/0` when absent, `leave/epoch` when fenced,
+  and `join/epoch` when unfenced; malformed stored types fail closed. The
+  SQLite/Postgres test
+  `TestMembershipEpoch::test_membership_position_is_the_durable_local_command_authority`
+  is 2/2 GREEN for absent -> local leave -> admitted restart.
+- nio now exposes private
+  `_OwnedIngestionSession._wait_for_local_membership_idle()`. It uses the
+  existing progress generation/event and acknowledgement wake, does not poll,
+  and returns only when neither a pending local intent nor pending local
+  lifecycle Work remains. The intent/Work parameterization plus existing
+  publication/ack wake rows are 4/4 GREEN.
+- `AgentBot._change_local_membership()` is the single managed gateway. It
+  serializes local decisions, waits for the previous durable command to become
+  idle, reads the EventJournal position, returns without HTTP when the target
+  is already current, and otherwise calls nio's private durable transition
+  with the frozen UUIDv5 identity. Two repeated `leave/0 -> join` attempts use
+  literal operation UUID `1ffbf4c2-3f57-50dc-9dd1-5f0e76fad4e8`; a subsequent
+  journal-current `join/0 -> join` emits no operation.
+- Managed startup joins, authorized invites, unconfigured-room leaves, and
+  cleanup leaves now delegate to that gateway. The generic room helper accepts
+  an optional leave executor so unmanaged callers retain their pre-cutover
+  direct-HTTP behavior. `_on_room_joined` and `_fence_left_room` no longer
+  mutate EventJournal membership directly; the admitted durable lifecycle Work
+  is now the only mutation authority.
+- Causal managed-path tests prove that an already joined `join/4` startup room
+  runs setup without a fabricated Matrix join, while an unconfigured
+  `join/4 -> leave` uses exact operation UUID
+  `46fba72c-1729-5252-a01c-ca8a8746cc6e`, performs no direct
+  `client.room_leave`, and retains the local source-echo fence. The complete
+  invite/lifecycle file is 41/41 GREEN.
+- A real EventJournal-backed gateway chain is GREEN for `join/1 -> leave/2 ->
+  join/2 -> leave/3`. It proves exact operation UUIDs
+  `574bc7af-74aa-5a35-9ae2-ae47f44668ff`,
+  `6bfc9bff-6ef8-5f55-9fd3-90e768a4ac84`, and
+  `350bf27f-a7e2-5983-b5ba-850f2e311c97`; each admitted transition advances
+  the sole EventJournal authority before the next gateway decision.
+- The cross-repo crash/retry proof is closed without duplicating nio's existing
+  matrix. MindRoom proves that the same journal position recreates the same
+  operation UUID; nio then proves durable intent before HTTP, reopen-before-
+  source replay, duplicate same-operation collapse to one HTTP, ordered leave
+  then rejoin behind Work acknowledgement, terminal/auth fates, retry-backoff
+  cancellation, response/intent commit uncertainty, and source fencing until
+  lifecycle Work acknowledgement. The exact 12-node selector expands to 25/25
+  GREEN, including the new idle-wait intent/Work parameterization.
+- Empty-frame readiness is closed compositionally at the real boundaries:
+  nio's real empty Classic frame commits its cursor, claims completion,
+  retires the Frame, and reaches the second HTTP with zero Work; MindRoom's
+  completion test supplies an ingestion session whose `next_batch()` is
+  explicitly `None` and proves the authenticated completion still marks first
+  ready exactly once without consulting Work. Both exact nodes are GREEN.
+- The remaining structured-lifecycle acceptance is closed by composition of
+  the exact owner and existing supervisor tests. Six Bot rows prove
+  runner/pump child failure, parent cancellation, ingestion-before-HTTP close,
+  and later HTTP release even when ingestion close raises or is cancelled.
+  Eleven supervisor rows prove watchdog restart, repeated single-owner
+  replacement, config-reload/process cancellation, no orphan sync/response
+  tasks, stop-entity shutdown intent, and real-supervisor cancellation order.
+  nio's terminal/auth and retry-backoff-close rows add 3/3. Fresh focused
+  evidence is therefore 6/6 + 11/11 + 3/3 GREEN.
+- Final-gate checkpoint: changed MindRoom production passes Ruff, Ruff-format,
+  py_compile, and ty; Tach reports every module valid. Privata correctly found
+  the now-dead public `run_matrix_sync_forever` wrapper after the sole-engine
+  cutover, so it was deleted rather than suppressed; Privata is now GREEN.
+  The broad MindRoom lifecycle/journal/config/watchdog selection and the
+  durable-admission/client/session/appservice/manager selection both exit zero.
+  nio's full coordinator + delivery + source-journal cluster is 603/603 GREEN
+  in 94.70 seconds, and nio changed-source Ruff/mypy/Black/compile/diff gates
+  are GREEN.
+- During verification, invoking MindRoom's `uv run black` was discovered to
+  use the Python-3.14 runtime and a formatter not used by this repository; it
+  temporarily rewrote pre-existing Python-3.12-compatible formatting and
+  replaced the editable nio install. The rewrite was mechanically reversed
+  while preserving the semantic diff (back to a focused 835/357 before the
+  dead-wrapper deletion), syntax/Ruff/Ruff-format were rerun, and the local nio
+  editable install was restored and path-verified. Do not run Black in the
+  MindRoom repository; its authoritative formatter is the configured
+  `.venv/bin/ruff format`, and its lint check must be invoked with `--no-fix`
+  during read-only verification.
+- Older config/invite policy tests that intentionally construct no owned nio
+  session use explicit test-only membership adapters; they do not alter the
+  production gateway and the new causal tests replace those adapters with the
+  real bound method. The first broader compatibility failures were therefore
+  repaired at their fixture boundary, not by adding a production fallback.
+  Fresh evidence across `test_multi_agent_bot.py`, `test_config_reload.py`,
+  `test_hook_matrix_admin.py`, and `test_bot_ready_hook.py` is 147 passed/1
+  skipped.
+- nio's complete repository suite is now 2,735 passed/3 skipped with 5 warnings
+  in 435.18 seconds. This is the current full-nio Task 5D evidence, not merely
+  the earlier 603-test ingestion cluster.
+- The first complete MindRoom run found 19 failures. Eighteen were legacy
+  lightweight test bots that intentionally open no owned nio session but still
+  asserted mocked Matrix join/leave transports; one was an obsolete Classic
+  public receive-loop cancellation test. No failure identified a production
+  fallback requirement. The dead public-loop test was deleted because the sole
+  owned runner is now the explicit Task 5D contract.
+- `tests.conftest.install_runtime_journal_support()` now installs a test-only
+  direct membership adapter for those lightweight bots. It resolves the
+  monkeypatched join/leave transports at call time, treats a cache-visible room
+  as already joined without HTTP, accepts both the current `RoomJoinOutcome`
+  and old test doubles returning literal `True`, and also binds cleanup's
+  direct gateway call. Production still raises when an owned session is absent.
+  The cache check deliberately iterates keys: `_AutoRoomCache.__getitem__`
+  lazily creates rooms, so ordinary `room_id in rooms` is not side-effect-free.
+- The exact prior-failure rerun is now GREEN: all 18 surviving failures pass,
+  and the deleted public-loop test no longer collects. The immediate next gate
+  is the complete affected-file cluster followed by a second full MindRoom
+  repository run; do not treat the first full-run failure count as unresolved.
+- The complete affected-file compatibility cluster is now GREEN: 188 collected,
+  185 passed, and 3 skipped across DM behavior/preservation, Matrix continuity,
+  multi-agent E2E, router dispatch/rooms, scheduled-task restoration, and team
+  invitations.
+- The second full MindRoom run reached 100% with only two failures, both in the
+  legacy invite fixture. The first distinguished a stale cache entry after a
+  local departure from a genuinely current cached membership; the shared
+  adapter now short-circuits only when no local source-echo fence is pending.
+  The second still expected the deleted direct EventJournal fence write and now
+  asserts the surviving `_local_departures_awaiting_sync` fence instead; real
+  gateway durability remains covered by the causal membership tests above.
+  The exact two nodes and the expanded nine-file cluster are GREEN: 229
+  collected, 226 passed, and 3 skipped. A third full MindRoom run is the
+  immediate active gate.
+- The third full MindRoom repository run is GREEN: all 13,828 collected nodes
+  completed with exit status zero. Its warnings are the existing byte-order
+  pytest marker warnings, third-party OpenBB/Pydantic deprecations, and the
+  existing fork warning in the PostgreSQL harness; no Task 5D failure remains.
+  Final static/hooks, budgets, diff review, and the ordinary Task 5D commit are
+  now the active boundary.
+- The all-files MindRoom pre-commit stack is GREEN on the current tracked
+  bytes: whitespace/EOF/YAML, Ruff lint and format, ty, Vulture, generated docs
+  and model defaults, tool-extra sync, Tach boundaries, Privata, pyproject-fmt,
+  Prettier, ESLint, Bun lock consistency, TypeScript checking, and JSON format.
+  Direct scoped Ruff/Ruff-format/pycompile/diff checks are also GREEN.
+- Vulture identified code made dormant by the cutover. The Classic rebuild
+  attempt counter/backoff was deleted. The old direct
+  `MembershipFence.fence_local_departure()` production seam was deleted;
+  membership-fence tests now seed the same durable `DepartureSource.LOCAL`
+  fact through their real store because production obtains it from admitted nio
+  lifecycle Work. The directly tested Classic loop-exit recovery helper is
+  temporarily named in `vulture_whitelist.py` and retained only for the Task 6
+  compatibility/removal boundary; the whitelist comment states that intent.
+  Two type-only imports in `_owned_session.py` moved under `TYPE_CHECKING`.
+- Task 5D's committed MindRoom delta from `ba0da04...` is +147 net
+  runtime lines and +486 net test lines. The final Task 10 whole-branch hard
+  limits are not yet satisfied: from `0acaea2...` the branch is currently
+  +1,505 runtime and +3,029 tests, and the combined delta versus `925df7f...`
+  is +1,687 rather than negative. This debt is explicit and must be removed in
+  Task 10; no baseline or threshold was moved.
+- The mandatory read-only Task 5D review completed against the exact
+  working-tree diff from `ba0da04...`. It found no Critical issue and approved
+  the runner ownership, fail-closed session requirements, transport selection,
+  one-record delivery, deterministic local-operation identity, shutdown
+  ordering, and dead-code cleanup. It did find one Important commit blocker:
+  source-reported `leave -> join` lifecycle Work currently does not rearm the
+  EventJournal membership row. `_apply_ingestion_disposition()` only calls
+  `_claim_membership_state()` / `note_membership_restarted()` for `LOCAL`
+  joins. A server-reported initial join or rejoin can therefore leave the
+  journal at `leave`, causing the next managed leave to be misclassified as an
+  already-complete no-op and skip Matrix HTTP. Do not commit Task 5D until the
+  source-reported join authority is causally RED/GREEN and the review is rerun.
+- The frozen repair rule is: a reported join at the
+  journal's current membership epoch rearms that epoch; a lower-epoch reported
+  join is stale and cannot undo a newer durable local departure; a
+  higher-epoch reported join is impossible missing history and fails closed.
+  Local joins require exact epoch equality because their carrier is derived
+  from this journal authority. An absent row projects `leave/0`, so a reported
+  initial join at epoch zero creates/rearms `join/0`. Blindly rearming every
+  reported join would resurrect membership after a newer local leave, which is
+  why the code and causal matrix preserve this epoch comparison.
+- The isolated Claude Fable consultation is complete and approved that rule.
+  It ran read-only through `agent-cli dev` on temporary worktree/branch
+  `task5d-reported-join-fable-20260815`; both were removed after the verdict.
+  The exact frozen semantics are: equal REPORT epoch rearms; lower REPORT epoch
+  is consumed as a benign no-op so it cannot wedge later FIFO Work; higher
+  REPORT epoch raises a loud integrity failure; any LOCAL epoch mismatch raises
+  because LOCAL carriers derive from this journal. An initial REPORT join is
+  just the equal `leave/0 -> join/0` case, not a separate branch. This relies on
+  the current invariant that membership rows/epochs are never deleted or reset;
+  any future row GC must reopen this decision. Histories A-D resolve to
+  `join/0 -> leave/1`, reported rejoin at epoch one followed by distinct
+  `leave/2`, stale reported join-one leaving `leave/2` untouched, and
+  higher-than-stored REPORT rejection respectively.
+- The review also requested one Minor cleanup: remove the production-only
+  `join_room` re-export/F401 suppression from `bot_room_lifecycle.py` and point
+  test adapters and monkeypatches at `mindroom.matrix.client_room_admin`
+  directly. This is secondary to the membership-authority fix and must not
+  broaden runtime behavior.
+- The source-reported-join repair is now causal RED/GREEN on SQLite and
+  PostgreSQL. Before the production edit, the three exact journal nodes yielded
+  six intended failures: initial REPORT join still projected `leave/0`, the
+  lifecycle matrix had no row/rearm, and a REPORT join ahead of stored authority
+  did not raise. `_apply_ingestion_disposition()` now claims every lifecycle
+  join, consumes only lower-epoch REPORT joins as stale, requires exact epoch
+  equality otherwise, and rearms the matching row. Departures, receipt
+  sequencing, and semantic-event disposition were not changed.
+- The final matrix proves initial reported join -> `join/0`; report departure ->
+  `leave/1`; equal-epoch report rejoin -> `join/1`; local departure ->
+  `leave/2`; stale report join-one cannot undo `leave/2`; exact local rejoin can
+  rearm epoch two; and ahead REPORT plus behind/ahead LOCAL rejoins roll back
+  without advancing the graph. A real Bot/EventJournal gateway test now starts
+  with REPORT `None -> join/0`, issues one deterministic durable leave at epoch
+  zero, admits REPORT `leave/1 -> join/1`, and issues the next leave with a
+  distinct deterministic UUID, ending at `leave/2`.
+- The first final re-review found one adjacent Important gap before commit:
+  LOCAL `join -> leave` carriers were internally epoch-consistent but were not
+  compared with the claimed journal state. Behind/ahead LOCAL-departure tests
+  then produced four causal `DID NOT RAISE` failures across SQLite/PostgreSQL.
+  The lifecycle departure branch now requires the LOCAL carrier's
+  `previous_membership_epoch` to equal the stored epoch before fencing; both
+  mismatch arms roll back their receipt/frontier and graph. REPORT departures
+  retain their existing owed-echo semantics. The complete membership-authority
+  selector is now 14/14 GREEN. The final read-only review approved exact
+  MindRoom delta SHA-256
+  `5e2ed2ebedbdb6fe85e327129948ee2710530f3b572edeb46511b2dc389d3d1b`
+  with no Critical, Important, or Minor findings. It independently confirmed
+  that the LOCAL guard precedes fence/receipt mutation, mismatch rollback is
+  complete, REPORT owed-echo handling is unchanged, and REPORT join
+  equal/lower/higher plus LOCAL exactness match the frozen rule. Review status:
+  READY YES.
+- The review's Minor cleanup is complete: `bot_room_lifecycle.py` no longer
+  imports/re-exports `join_room` for tests, and the shared adapter plus all
+  affected monkeypatches target `mindroom.matrix.client_room_admin.join_room`
+  directly. No product fallback was added. The complete ten-file affected
+  cluster (durable admission, EventJournal store, Bot gateway, config reload,
+  invites, DM, continuity, router, scheduled restoration, and team invites) is
+  GREEN with the same three pre-existing byte-order marker warnings and three
+  intended skips.
+- The final post-cleanup full MindRoom repository suite is GREEN on the exact
+  commit-candidate bytes after both review repairs: all 13,838 collected nodes
+  completed with exit status zero. Its warnings are the existing three
+  byte-order pytest markers, PostgreSQL fork warning, and third-party
+  OpenBB/Pydantic deprecations. The all-files pre-commit stack is also GREEN on
+  these bytes with `UV_NO_SYNC=1`: whitespace/EOF/docstring/YAML, Ruff
+  lint/format, ty, Vulture, generated docs/defaults, extras, Tach, Privata,
+  pyproject-fmt, Prettier, ESLint, Bun, TypeScript, and JSON. The linked nio
+  checkout remains path-verified at `/work/dev/mindroom-nio/src/nio`.
+- One attempted final suite never reached collection because a changed-file
+  pre-commit command omitted `UV_NO_SYNC=1` and its internal `uv run` restored
+  released `mindroom-nio==0.37.0`. No source changed. The documented editable
+  install was restored with
+  `uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio`,
+  import paths were verified, all hooks were rerun with the no-sync guard, and
+  the successful 13,838-node full run above used the restored local checkout.
+  Preserve this exact environment boundary on restart.
+- nio's pre-commit hooks pass for all three changed files. An all-files nio hook
+  invocation reaches only two unchanged diagnostics in
+  `scripts/live_sliding_sync_check.py` (`_wait_for` and `_wait_server_up` use a
+  `timeout` parameter); those scripts are outside the Task 5D diff and were not
+  modified. The changed-file Black/Ruff/whitespace/EOF gates and earlier full
+  nio suite remain GREEN. Do not misreport the repository-wide hook baseline as
+  a Task 5D regression or silently edit those unrelated scripts in this slice.
+
+Expected state after committing this final ledger checkpoint:
+
+- nio and MindRoom tracked trees are clean at the Task 5D commits recorded
+  above. Any tracked modification means the restart boundary has changed and
+  must be inspected rather than reset;
+- preserve the unrelated untracked paths listed at the top of this document.
+
+Resume commands after a lost session:
+
+```bash
+cd /work/dev/mindroom
+uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
+UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n 0
+UV_NO_SYNC=1 .venv/bin/pre-commit run --all-files
+
+# Fast restart slice if the completed full evidence does not need repetition.
+.venv/bin/pytest -q -n0 tests/test_multi_agent_bot.py tests/test_config_reload.py \
+  tests/test_hook_matrix_admin.py tests/test_bot_ready_hook.py
+.venv/bin/pytest -q -n0 tests/test_room_invites.py
+
+# Revalidate every legacy fixture repaired after the first full run.
+UV_NO_SYNC=1 .venv/bin/pytest -q \
+  tests/test_dm_functionality.py tests/test_dm_room_preservation.py \
+  tests/test_matrix_sync_continuity.py tests/test_multi_agent_e2e.py \
+  tests/test_router_dispatch.py tests/test_router_rooms.py \
+  tests/test_scheduled_task_restoration.py tests/test_team_invitations.py
+
+cd /work/dev/mindroom-nio
+.venv/bin/pytest -q tests/ingest/coordinator_test.py \
+  -k 'local_membership_idle or local_membership_success_waits or work_wait'
+```
+
+Immediate remaining Task 5D order:
+
+1. [x] Add one real EventJournal-backed leave -> join -> leave gateway chain,
+   proving epoch advancement and distinct deterministic UUIDs after admitted
+   lifecycle transitions rather than mocked journal positions.
+2. [x] Bind crash/retry evidence to nio's existing intent/HTTP/Work tests. The
+   gateway UUID and real-journal chain supply the MindRoom boundary; no
+   duplicate integration row is needed after the 25/25 exact nio matrix.
+3. [x] Prove empty-frame completion reaches first-ready without Work.
+4. [x] Close the remaining runner/pump restart/watchdog/cleanup acceptance
+   rows.
+5. [x] Run full cross-repo lifecycle/parity suites and exact Ruff/Black/ty/Tach/
+   Privata/pre-commit gates, then review budgets and commit Task 5D. Every
+   correctness/static gate and the final independent review are complete:
+   14/14 authority cases, the ten-file affected cluster, all 13,838 full-suite
+   nodes, and the all-files hook stack are GREEN; final review is READY YES.
+   The exact Task 5D delta is +147 runtime/+486 tests and the larger Task 10
+   consolidation debt is recorded above. The linked ordinary commits are nio
+   `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4` and MindRoom
+   `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; this ledger checkpoint records
+   their completion and makes Task 6 the restart target.
 
 Task 4F is complete and committed. Its closed checklist is retained below as
 historical evidence, not as the current work queue:
