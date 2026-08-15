@@ -6,6 +6,10 @@ class FreshIngestionRequired(RuntimeError):
     """Raised when an unmarked nonempty store requires explicit initialization."""
 
 
+class _MarkedStoreRequiresSqlite(FreshIngestionRequired):
+    """Signal that a configured marked-store probe must retry as SqliteStore."""
+
+
 class JournalConflictError(RuntimeError):
     """Raised when a journal compare-and-swap or ordered operation is stale."""
 

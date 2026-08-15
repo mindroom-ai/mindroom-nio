@@ -30,6 +30,7 @@ from ..ingest.errors import (
     FreshIngestionRequired,
     JournalConflictError,
     JournalIntegrityError,
+    _MarkedStoreRequiresSqlite,
 )
 from ..ingest.model import (
     EventRecord,
@@ -1699,7 +1700,7 @@ def open_journal_database(
 
             if configured_source_store_class is not None:
                 if configured_source_store_class is not SqliteStore:
-                    raise FreshIngestionRequired(
+                    raise _MarkedStoreRequiresSqlite(
                         "marked configured reopen requires exact SqliteStore"
                     )
                 _authenticate_ordinary_store(

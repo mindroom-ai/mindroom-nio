@@ -28,6 +28,7 @@ from nio.store._sync_journal_plan import _canonical_work_plaintext
 from nio.store._sync_journal_preflight import _row
 from nio.store._sync_journal_values import MaterializerLimits
 import nio.store.sync_journal as bootstrap_api
+import nio.ingest.errors as ingest_errors
 from nio.store.sync_journal import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -644,6 +645,38 @@ def test_configured_sqlite_store_adoption_and_marked_reopen_preserve_trust(
             )
     finally:
         reopened.close()
+
+
+def test_marked_configured_default_probe_raises_typed_no_dml_signal(
+    tmp_path: Path,
+) -> None:
+    """A caller may retry marked stores as SqliteStore without message matching."""
+    _seed_populated_store(tmp_path, SqliteStore)
+    adopted = _configured_open(tmp_path, SqliteStore)
+    adopted.close()
+    database_path = tmp_path / "journal.db"
+    before = _logical_graph(database_path)
+    statements: list[str] = []
+
+    with pytest.raises(ingest_errors._MarkedStoreRequiresSqlite):
+        bootstrap_api._open_configured_ingestion_store(
+            tmp_path,
+            source_store_class=DefaultStore,
+            owned_store_class=SqliteStore,
+            source=CLASSIC_SOURCE,
+            account_id=ACCOUNT_ID,
+            device_id=DEVICE_ID,
+            consumer_generation=CONSUMER_GENERATION,
+            pickle_key=PICKLE_KEY,
+            database_name=database_path.name,
+            statement_observer=statements.append,
+        )
+
+    assert _logical_graph(database_path) == before
+    assert not any(
+        statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in statements
+    )
 
 
 def test_configured_marked_reopen_authenticates_frame_revision_order_before_dml(
