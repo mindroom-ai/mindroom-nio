@@ -2,6 +2,32 @@
 
 **Status:** controlling design, approved 2026-08-13
 
+**Implementation checkpoint (2026-08-14):** Tasks 1–4E and MindRoom Task 5A
+are committed; Task 4E is nio `be24cf315c27250d3c2b95a5862278420ee8d270`.
+The exact repository boundary, completed settlement slices, verification commands, and
+restart protocol are maintained in
+`docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md`.
+That live handoff records execution state; this document remains the semantic
+authority. The current Task 4E checkpoint includes callback-free reconstruction
+of authenticated decrypted room-key and timeline Work without re-entering Olm,
+session stores, MatrixStore crypto loads, preparation, or live sync handlers;
+failed-Megolm Work is likewise reconstructed without a second decrypt, wedge
+check, or key-request mutation. STATE settlement now restores invite-only
+`inviter` state without allowing an earlier Work item to regress the final
+snapshot, while no-route STATE performs snapshot-only reconciliation. Room
+auxiliary settlement now restores typing, tags, and presence before their
+receipt-gated callbacks while preserving unrelated state. Synthetic
+expired-verification and collected-key-request settlement now has a causal
+real-Task4C producer, phase-specific reconstruction, callback, and ack path.
+The remaining decrypted to-device kind matrix now reconstructs five exact
+classes without crypto replay. Authenticated malformed-semantic failures and
+the final all-kind disposition audit are green, including exact collected
+request types before callback. Task4E is complete; Task5B's MindRoom adapter
+from Task5A admission facts to nio `_settle_batch` is the current boundary.
+First-seen hydration is JOIN-only; invite, knock, leave, ban, or unknown
+membership cannot persist a hydration intent that the hydration protocol could
+never service.
+
 **Scope:** one indivisible review decision, implemented by one linked PR in each of the two Git repositories
 
 **Supersedes:** the schema-v2 Sliding diagnostic-canary design and its implementation plan
@@ -87,7 +113,35 @@ The schema-v1 Classic canary branch is also scaffolding, not a keeper: remove `_
 4. The prepared Frame is passed to the same pure reducer and materializer for both transports. Every `RecordKind`, including `TO_DEVICE`, and every loss becomes one-record Work with a stable `record_id`; device-list/OTK/fallback controls complete before preparation is marked. The same owner transaction persists an authenticated canonical outbound-maintenance plan inside the retained Frame envelope: exact ordered upload/query/claim/to-device request bodies, deterministic domain-separated to-device transaction IDs, exact ciphertext, canonical operation kind plus minimal typed local response-apply context, and per-operation pending/settled state. The corresponding Olm/session mutations and request bodies commit together; in-memory queues are not durable authority. Wire JSON alone is insufficient because dummy and room-key-request subtypes have distinct local settlement effects. This adds no table or column. A retained Frame is transient retry or frame-completion state, never a successful steady-state fate. The Frame remains until all of its Work is receipted/acknowledged, its persisted outbound maintenance succeeds, and its private `_FrameCompletion` claim is settled; empty Frames follow the same completion path.
 5. `next_batch()` retains the existing deterministic FIFO selection and compact outstanding descriptor.
 6. MindRoom admits every record receipt and its applicable event-journal, lifecycle, loss, projection, and frontier effects in one transaction. It returns separate `receipt_new` and `semantic_event_new` facts; a batch need not contain a Matrix event. Membership epochs retain MindRoom's tenure meaning: a joined-to-nonjoined departure advances once, while other transitions do not. nio epochs are relative transition proofs, never MindRoom's absolute counter; every ordered transition carries exact previous/current memberships, epochs, and local/reported provenance. Only a `LOCAL` join re-arms MindRoom; `REPORTED` joins never mutate its fence. Each candidate-local transition has one stable crash-recoverable intent and uses the same durable FIFO before source ingestion resumes. Departure-fenced turn-backed/loss Work commits its receipt but cannot recreate application state; a suppressed semantic event retains a settled immutable identity tombstone, while non-turn cleanup such as redaction still admits.
-7. Outside both databases, the nio compatibility applier reapplies idempotent room/client state and publishes a record callback only when the receipt is new; semantic timeline/lifecycle dispatch is additionally gated by `semantic_event_new`. Those callbacks are best-effort/at-most-once across process death, matching the existing MindRoom wrappers, and never run inside a transaction.
+7. Before the owned session becomes visible, nio authenticates every room
+   Aggregate and restores only persisted `RoomSnapshot` projections. Current
+   continuity routes `invite|knock` snapshots to `invited_rooms` and
+   `join|leave|ban|None` snapshots to `rooms`; stale snapshot membership/epoch
+   fields do not override current continuity, and an Aggregate without a
+   snapshot never fabricates a room skeleton. Incremental settlement first
+   authenticates the exact outstanding batch, Work metadata, and correlated
+   Aggregate in one read scope. Outside both databases, it overlays the
+   snapshot-owned subset in place while preserving auxiliary room state and
+   existing member-presence fields. Auxiliary callbacks run only when
+   `receipt_new`; timeline callbacks additionally require
+   `semantic_event_new`. `ROOM_LIFECYCLE` and `LossRecord` run no nio event
+   callback. Decrypted to-device Work is reconstructed from its authenticated
+   sanitized clear source plus authenticated outer encryption provenance;
+   decrypted timeline Work is reconstructed with `Event.parse_decrypted_event`
+   only after snapshot overlay and regains the authenticated verification,
+   sender-key, session, and room annotations. Settlement never decrypts or
+   reloads crypto state. Failed-Megolm Work reconstructs the durable outer
+   event, restores its room ID, and preserves the already-frozen rerequest
+   plan without retrying crypto. Routed invite STATE uses the invite parser and
+   invited-room handler solely for non-snapshot inviter compatibility, then
+   re-overlays the authenticated final snapshot before its receipt-gated
+   callback; no-route STATE never guesses a parser family. Parsing, state application, and callback fanout precede nio ack
+   and never run inside either database transaction. Callback failure or
+   cancellation leaves Work replayable; replay after a committed MindRoom
+   receipt suppresses callback and proceeds to ack. The only added protocol is
+   the non-exported owned-session
+   `_settle_batch(batch, *, receipt_new: bool, semantic_event_new: bool)`;
+   public `IngestionSession` remains unchanged.
 8. nio acknowledges only after MindRoom accepts the receipt and callback fanout returns. Ack advances the frontier and deletes Work atomically. After Work drains, nio sends only the Frame's exact pending maintenance request. Each response is parsed callback-free, then its ordinary MatrixStore/Olm writes, the current operation's settled marker, and any causally generated follow-up operation commit in one owner transaction. Follow-ups monotonically append or replace authenticated Frame-plan entries with exact body/ciphertext and deterministic transaction ID; a fixed upstream-ordered loop runs to quiescence. This includes key-claim→dummy-to-device and successful dummy/to-device→room-key-rerequest chains. Rollback after in-memory mutation poisons the session before retry. To-device retries reuse identical ciphertext and transaction ID and therefore have server-side semantic deduplication. Upload/query reuse identical bodies. Matrix `/keys/claim` has no Matrix idempotency key: response loss may consume another remote one-time key on an identical retry, so do not claim remote at-most-once; claim only locally atomic application of one successful response and no duplicate downstream event/callback. Retryable HTTP/Matrix errors preserve the same pending operation under bounded cancellable backoff; auth errors preserve it while entering the existing permanent-auth shutdown/health path. No error settles or fans out. The coordinator also owns every unresolved local membership intent: it records the stable intent before the Matrix operation, restores/reconciles it after restart, publishes its lifecycle Work into the same FIFO, and fences all source HTTP until that Work is admitted and acknowledged and the intent is retired. When all maintenance succeeds, nio reconstructs an authenticated private `_FrameCompletion(frame_id, transport, source_epoch, request_id, staged_revision, claimed_revision)`, durably claims it, invokes the optional private owned-session sink outside transactions, and then retires the Frame. Sink raise/cancel/death after claim is at-most-once: restart retires without a second invocation. Durable Sliding never fabricates a public `SyncResponse` or `SlidingSyncResponse`; ordinary public response callbacks remain exclusively on Desktop's retained pre-fork sync path. `AsyncClient.rooms` is restored from persisted `RoomSnapshot` values before incremental delivery.
 
 The coordinator expresses that lifecycle as one private progress state machine, not as a second fate engine:

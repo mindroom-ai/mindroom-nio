@@ -1,6 +1,24 @@
-# Durable ingestion lean replacement implementation plan
+# Durable Ingestion Lean Replacement Implementation Plan
 
-> Execute this plan as one indivisible review decision. nio and MindRoom are separate Git repositories, so each has one linked PR; do not split either repository into phase PRs. Do not pause for routine approval checkpoints. Stop only for a real safety, correctness, or scope blocker.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> `superpowers:executing-plans` to continue this plan task-by-task. Use
+> `superpowers:test-driven-development` for every behavior change and
+> `superpowers:verification-before-completion` before any completion claim.
+> Do not dispatch subagents unless the active session instructions or user
+> explicitly authorize it.
+
+**Goal:** Replace the fork-specific sync recovery architecture with one
+crash-safe, transport-neutral durable ingestion path while preserving the
+pre-fork public matrix-nio behavior used by Desktop.
+
+**Architecture:** Classic and Sliding normalize into one authenticated Frame,
+preparation, reducer, Work FIFO, settlement, and completion state machine. The
+same SQLite owner holds ordinary MatrixStore/E2EE state and the five ingestion
+tables; MindRoom separately owns durable receipt/application admission, and
+callbacks execute only outside both database transactions.
+
+**Tech Stack:** Python 3.14/3.15-compatible matrix-nio, asyncio, SQLite/Peewee,
+Olm/Megolm, pytest, Ruff, Black, mypy, and the linked MindRoom repository.
 
 **Design:** `docs/superpowers/specs/2026-08-13-durable-ingestion-lean-replacement-design.md`
 
@@ -10,7 +28,7 @@
 
 **Linked branches:** nio `docs/durable-ingestion-rewrite-plan`; MindRoom `wip/matrix-journal-ingress-cutover`
 
-## Invariants
+## Global Constraints
 
 - Preserve the exact pre-fork sync methods, responses, callbacks, `AsyncClient.rooms`, and desktop behavior at `69aa99c51f354980bf5306a85b4c7b7d71ff3217`.
 - Return ingestion schema to v1 and exactly five durable tables.
@@ -23,6 +41,637 @@
 - Preserve upstream `secure_delete = "fast"` and its regression from `origin/main`.
 - Final nio net budgets versus `origin/main@6ed2b98`: runtime ≤ +4,500; tests ≤ +15,000; docs/scripts ≤ +1,000.
 - Final MindRoom net budgets versus post-prune `0acaea2ba`: runtime ≤ +350; tests ≤ +1,000; the candidate is also net smaller than `925df7f3c`.
+
+---
+
+## Live execution status and restart handoff — 2026-08-14
+
+This section is the authoritative restart point. Read it together with the
+controlling design and the remaining task descriptions below. If conversation
+state is lost, do not infer progress from unchecked prose elsewhere in the
+plan: verify this checkpoint first, then continue from **Immediate next
+action**.
+
+### Repository and commit boundary
+
+| Repository | Branch | Required HEAD | State |
+| --- | --- | --- | --- |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | docs checkpoint whose parent is `be24cf315c27250d3c2b95a5862278420ee8d270` | Tasks 1–4E committed; no tracked changes expected |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc` | Desktop slices and Task 5A committed; no current tracked changes |
+
+Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
+ordinary commits only after a complete reviewed slice is green. Preserve the
+following unrelated untracked user files/directories:
+
+- nio: `docs/superpowers/reviews/`, `src/mindroom_nio.egg-info/`;
+- MindRoom: `.claude/CODEX_REVIEW_6.md`,
+  `.claude/REVIEW_2026-08-08-recovery-delivery.md`, `.claude/worktrees/`, and
+  `CODEX_REVIEW.md`.
+
+At the completed Task4E documentation checkpoint, the expected nio tracked
+dirty-file list is empty. The implementation commit contains exactly:
+
+```text
+docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md
+docs/superpowers/specs/2026-08-13-durable-ingestion-lean-replacement-design.md
+src/nio/client/base_client.py
+src/nio/ingest/coordinator.py
+src/nio/ingest/reducer.py
+src/nio/store/_sync_journal.py
+tests/ingest/coordinator_test.py
+tests/ingest/delivery_test.py
+```
+
+The exact pre-commit Task4E code/test patch (`git diff --binary -- src tests`)
+had SHA-256
+`ebf1c70c29d0329a28205e38631a7d1b73e95577b3279774d113cf1977515b29`.
+It is committed as `be24cf315c27250d3c2b95a5862278420ee8d270`.
+On restart verify commit ancestry and a clean tracked tree rather than expecting
+that former dirty-patch hash; do not reset or overwrite unrelated files.
+
+### Completed commits and gates
+
+| Slice | State | Commit/evidence |
+| --- | --- | --- |
+| Tasks 1–3 pruning/reset | Complete | Through nio `febbe9a5`; detailed authority remains below |
+| Desktop no-recovery profile | Complete | MindRoom `1fd376583` |
+| Desktop query-only identity reader | Complete | MindRoom `a5d3edc33` |
+| Task 4A configured in-place adoption | Complete | nio `044a74e` |
+| Task 4B owned bootstrap/session lease | Complete | nio docs `c06b88a`, implementation `f27f5e3c149d3e5215f9641f9daa9b291502c179` |
+| Local membership contract | Complete | nio docs `5e85330941d828751365d34512e3a73ad248dfe3` |
+| Task 5A MindRoom receipt/idempotency kernel | Complete | MindRoom `da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc` |
+| Task 4C callback-free preparation | Complete | nio `19587c4cf195e62d4265a03a70d061e407dceec4` |
+| Task 4D pure prepared planner | Complete | nio `96ff99bf36135e7eef66355953a9c1b4c8c9b2e8` |
+| Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
+| Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
+| Tasks 5B, 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
+
+### Task 4E completed and committed
+
+The following Task 4E slices are implemented, causally tested, independently
+reviewed, and must not be reopened without a new failing case:
+
+- authenticated journal settlement and room-restore views:
+  `SqliteIngestionJournal._load_batch_settlement()` and
+  `_load_room_restore_view()`;
+- open-time room restoration before session exposure, including exact
+  attach/detach rollback of `rooms`, `invited_rooms`, and `next_batch`;
+- snapshot routing by current continuity: `invite|knock` to
+  `invited_rooms`, and `join|leave|ban|None` to `rooms`; no persisted snapshot
+  means no fabricated room skeleton;
+- stale snapshot `own_membership`/`membership_epoch` values are presentation
+  carrier fields, not lifecycle routing authority;
+- in-place snapshot overlay preserves auxiliary room state and existing
+  `MatrixUser` presence fields;
+- exact fact validation and authenticated settlement before parsing, state
+  application, or callback;
+- one session-local settlement lock, same-task recursion rejection, public ack
+  fencing, duplicate/already-acked idempotency, callback error/cancellation
+  replay, and before-/after-commit ack uncertainty;
+- poison and close rechecks before ack; external close cancels and drains an
+  active settlement before detach; callback self-close rejects before lease
+  preflight; cancellation suppression cannot ack after close intent;
+- `GLOBAL_ACCOUNT_DATA` callback settlement;
+- SOURCE/NONE `TO_DEVICE` callback settlement and SOURCE/NONE no-route
+  ack-only settlement without crypto replay;
+- `ROOM_LIFECYCLE` snapshot overlay with no nio callback;
+- `LossRecord` state-free, callback-free ack-only settlement;
+- TIMELINE/NONE settlement: authenticated snapshot overlay first, parse only
+  for `semantic_event_new`, `_on_event` only for a new semantic event, and no
+  response/admission/decrypt/live replay.
+- decrypted ROOM_KEY `TO_DEVICE` reconstruction directly from authenticated
+  sanitized clear JSON plus outer Olm sender key, without generic parsing,
+  session lookup, persisted-store load, decryption, preparation, or replay;
+- decrypted TIMELINE reconstruction after authenticated in-place snapshot
+  overlay via `Event.parse_decrypted_event(clear)`, restoring the authenticated
+  verification bit plus outer Megolm sender/session keys and durable room ID,
+  without live decryption or timeline replay.
+- failed-Megolm TIMELINE reconstruction from the authenticated outer source,
+  restoring only durable `room_id` after snapshot overlay and never retrying
+  decryption, session lookup, wedge detection, key-request collection, or
+  prepared outbound-plan mutation.
+- first-seen non-JOIN room membership no longer creates an impossible JOIN-only
+  hydration barrier: cold invite and knock Aggregates retain their snapshots,
+  have no hydration intent, and release lifecycle/STATE Work immediately;
+  first-seen JOIN hydration remains unchanged.
+- SOURCE/NONE STATE settlement: invite callback routes overlay first, parse
+  only with `InviteEvent`, apply inviter state, re-overlay the final snapshot,
+  receipt-gate `_on_invited_rooms`, then ack; no-route joined/knock STATE only
+  reconciles the authenticated snapshot in place and never guesses a parser.
+- SOURCE/NONE auxiliary settlement: EPHEMERAL and ROOM_ACCOUNT_DATA overlay
+  the authenticated room snapshot, parse and idempotently apply typing/tags,
+  expose the applied state to receipt-gated callbacks, then ack; PRESENCE has
+  no Aggregate, updates every matching user in `client.rooms`, exposes that
+  update to `_on_presence`, preserves unrelated room/user state, then acks.
+
+The main production seams are currently at:
+
+```text
+src/nio/store/_sync_journal.py:403   _load_batch_settlement
+src/nio/store/_sync_journal.py:443   _load_room_restore_view
+src/nio/client/base_client.py:574    _room_from_snapshot
+src/nio/client/base_client.py:694    _overlay_room_snapshot
+src/nio/client/base_client.py:1173   _attach_ingestion_store
+src/nio/client/base_client.py:1275   _detach_ingestion_store
+src/nio/ingest/coordinator.py:556    _apply_room_lifecycle_snapshot
+src/nio/ingest/coordinator.py:643    _load_settlement_event
+src/nio/ingest/coordinator.py:817    _OwnedIngestionSession._settle_batch
+src/nio/ingest/coordinator.py:1648   _open_owned_ingestion
+```
+
+Line numbers are navigation aids only; names and behavior are authoritative.
+
+### Latest completed slice and current stop boundary
+
+The latest test-only slice is:
+
+```text
+tests/ingest/coordinator_test.py:11072
+test_owned_settle_reconstructs_decrypted_events_without_crypto_replay
+```
+
+It uses a real empty Classic warm Frame followed by the existing real owned
+crypto Frame, Task 4C materialization, hydration, exact FIFO selection, close,
+and fresh reopen. It has two parameter rows:
+
+1. decrypted `TO_DEVICE` `ROOM_KEY`;
+2. decrypted `$secret` `TIMELINE`.
+
+The verified delivery FIFO for that real frame is:
+
+| Position | Work | Frame index | Room sequence | Readiness |
+| --- | --- | ---: | ---: | --- |
+| 1 | decrypted room-key `TO_DEVICE` | 0 | — | initial revision, ordinal 0 |
+| 2 | `ROOM_LIFECYCLE` join | 2 | 1 | initial revision, ordinal 1 |
+| 3 | encryption `STATE` | 1 | 0 | after hydration, ordinal 0 |
+| 4 | Alice-member `STATE` | 2 | 2 | after hydration, ordinal 1 |
+| 5 | Bob-member `STATE` | 3 | 3 | after hydration, ordinal 2 |
+| 6 | decrypted LIVE `$secret` `TIMELINE` | 4 | 4 | after hydration, ordinal 3 |
+
+The room-key row claims position 1 without hydration. The timeline row applies
+the one real hydration, directly acknowledges the exact five predecessors,
+claims position 6, and then closes/reopens with the target still outstanding.
+Capture crypto/E2EE invariance only after Task 4C preparation, because
+preparation legitimately consumes the OTK and stores the inbound sessions.
+
+The current exact command is:
+
+```bash
+uv run pytest -q --tb=short \
+  tests/ingest/coordinator_test.py::test_owned_settle_reconstructs_decrypted_events_without_crypto_replay
+```
+
+Current result at this checkpoint is **2 passed**. Before production, the
+hardened node failed both and only on
+`LocalProtocolError: unsupported durable settlement record`:
+
+```text
+room-key -> src/nio/ingest/coordinator.py:912
+timeline -> src/nio/ingest/coordinator.py:883
+```
+
+The minimal two production predicates are now implemented. The causal fixture
+and the following hardening required by its prior independent review are
+verified:
+
+- [x] tripwire `session_store.get` and `inbound_group_store.get`, not only
+      writes;
+- [x] tripwire persisted-store crypto load methods;
+- [x] tripwire preparation/materialization entrypoints during settlement;
+- [x] assert exact metadata `record_id`, origin/room/event scalar fields;
+- [x] assert the delivery frontier/Work is still outstanding inside every
+      route/callback and immediately before ack.
+
+The exact node is now **2 passed** with all generic/session-store/
+persisted-store/preparation tripwires remaining hard. Focused settlement/close
+is 29 passed, delivery is 48 passed, and the full coordinator file is 210
+passed. Black, production Ruff `--no-fix`, isolated coordinator mypy,
+`py_compile`, and diff-check are green.
+
+The failed-Megolm test-only slice is now GREEN:
+
+```text
+tests/ingest/coordinator_test.py:11571
+test_owned_settle_failed_megolm_without_crypto_or_rerequest_replay
+```
+
+It appends one real `$missing` encrypted timeline event with authenticated
+`session_id="missing-session"` to the proven warm Classic crypto frame. Task 4C
+legitimately fails decryption and freezes one exact pending room-key-request
+operation in the retained prepared Frame. After hydration, exact FIFO drain,
+close, and fresh reopen, the sole outstanding Work is LIVE TIMELINE sequence 5,
+frame index 5, with SOURCE/MEGOLM_FAILED/EVENT metadata and no clear JSON.
+
+Before production it had **1 failure**, solely
+`LocalProtocolError: unsupported durable settlement record`. Its contract
+requires snapshot overlay before
+`Event.parse_event(source)`, exact `MegolmEvent.room_id` restoration, callback
+before ack, no decrypt/session lookup/wedge check/key-request collection/store
+load or write/reprepare path, unchanged E2EE and in-memory crypto queues, and
+byte-identical retained outbound plan. Ack may only DELETE Work and UPDATE
+Meta. The exact node is now 1 passed; focused settlement/close is 30 passed,
+delivery is 48 passed, full coordinator is 211 passed, and Black, production
+Ruff `--no-fix`, isolated mypy, `py_compile`, and diff-check are green.
+
+The STATE settlement family is now GREEN:
+
+```text
+tests/ingest/coordinator_test.py:12070
+test_owned_settle_state_uses_invite_parser_or_snapshot_only
+```
+
+Before production both rows failed solely with
+`LocalProtocolError: unsupported durable settlement record` at the dispatcher:
+
+- cold INVITE STATE uses real name + older/final own-member events. The target
+  older member Work must overlay the authenticated final snapshot, parse only
+  with `InviteEvent.parse_event`, call the exact invited-room handler to
+  restore `inviter`, re-overlay so the older member cannot regress final
+  snapshot fields, run `_on_invited_rooms` for `receipt_new`, then ack;
+- joined STATE targets the real `$local-name` Work after hydration/reopen. Its
+  route is None, so settlement must only overlay the final snapshot in place,
+  run no event parser/handler/callback, then ack.
+
+The tests hard-trip generic/invite parser misuse, response/sync/invite/join/
+timeline/preparation replay, wrong callback families, room replacement, and
+parse/apply before authenticated-read exit. Black and diff-check are green.
+The exact STATE + cold invited selectors are 4 passed; focused settlement/
+close/cold is 34 passed, reducer is 48 passed, selected first-seen/hydration
+materializer is 58 passed, delivery is 48 passed, and full coordinator is 215
+passed. Black, production Ruff `--no-fix`, isolated coordinator+reducer mypy,
+`py_compile`, and diff-check are green.
+
+The three-row auxiliary family is now GREEN:
+
+```text
+tests/ingest/coordinator_test.py:12502
+test_owned_settle_auxiliary_state_before_receipt_callback
+```
+
+Before production all rows failed solely with
+`LocalProtocolError: unsupported durable settlement record` after real Classic
+materialization, JOIN hydration, exact FIFO selection, close, and fresh reopen:
+
+- global PRESENCE has no correlated Aggregate; it must parse with exact
+  `PresenceEvent.from_dict`, update every matching user in `client.rooms`,
+  preserve unrelated user/room state, callback, then ack;
+- room EPHEMERAL must overlay the authenticated snapshot, parse the typing
+  event, call `room.handle_ephemeral_event`, callback, then ack;
+- ROOM_ACCOUNT_DATA must overlay, parse the tag event, call
+  `room.handle_account_data`, callback, then ack.
+
+Every parser/apply/route/callback asserts authenticated-read exit and the Work
+still outstanding. Wrong parsers/handlers/callback families plus response,
+sync, join/invite/timeline, preparation, and materialization paths are hard
+tripwires. The target auxiliary state is visible before callback while typing,
+tags, fully-read state, snapshot state, and Alice presence outside the target
+remain preserved. Ack is the only DML (Work DELETE + Meta UPDATE). Black and
+diff-check are green. Exact auxiliary is 3 passed; focused
+settlement/close/cold-room is 37 passed, delivery is 48 passed, reducer is 48
+passed, selected first-seen/hydration materializer is 58 passed, and full
+coordinator is 218 passed. Black, production Ruff `--no-fix`, isolated
+coordinator+reducer mypy, `py_compile`, and diff-check are green.
+
+The synthetic to-device preparation phases are now GREEN:
+`EXPIRED_VERIFICATION` must reconstruct its intentionally typeless
+`KeyVerificationCancel` directly and use the expired-verification callback
+path without `olm.clear_verifications`; `COLLECTED_KEY_REQUEST` must parse its
+authenticated source and use `_on_to_device` without
+`olm.collect_key_requests`. Both require real Task 4C-produced Work, exact
+phase/route metadata, callback-before-ack/outside-transaction assertions, and
+unchanged crypto/key-request state.
+
+The real two-row synthetic-phase test is frozen at:
+
+```text
+tests/ingest/coordinator_test.py:9330
+test_owned_settle_synthetic_to_device_phase_callbacks_without_replay
+```
+
+One real Classic frame contains a source key-request cancellation, one typeless
+expired verification returned by Task 4C's `clear_verifications()` phase, and
+the resulting collected cancellation. Each row proves exact source → expired
+→ collected FIFO, directly acknowledges only its predecessors, leaves the
+target outstanding across close/fresh reopen, authenticates exact phase,
+effective type, NONE decryption, TO_DEVICE route, origin index, and no room
+fields, then requires the phase-specific parser and callback before ack. Before
+production both failed solely at
+`LocalProtocolError: unsupported durable settlement record`. Exact synthetic
+is now 2 passed; focused settlement/close/cold-room is 39 passed, delivery and
+reducer are 48 passed each, selected first-seen/hydration materializer is 58
+passed, and full coordinator is 220 passed. Black, production Ruff `--no-fix`,
+isolated coordinator+reducer mypy, `py_compile`, and diff-check are green.
+
+The remaining decrypted SOURCE/TO_DEVICE kind matrix is now GREEN:
+FORWARDED_ROOM_KEY, DUMMY, UNKNOWN, BAD, and UNKNOWN_BAD all authenticate their
+frozen kind and sanitized clear source across close/reopen, reconstruct the
+exact event class without Olm/session/store replay, receipt-gate
+`_on_to_device`, then ack.
+
+The five-row causal RED is frozen at:
+
+```text
+tests/ingest/coordinator_test.py:9693
+test_owned_settle_remaining_decrypted_to_device_exact_classes
+```
+
+Each row uses a valid encrypted source event and Task 4C's real preparation,
+reducer, materializer, authenticated Work, FIFO claim, close, and fresh reopen.
+The prepared decrypted result is exact ForwardedRoomKeyEvent, DummyEvent,
+UnknownToDeviceEvent, BadEvent, or UnknownBadEvent. The test binds the frozen
+kind/effective type/source/clear/origin metadata, requires direct construction
+for forwarded/unknown-bad and the class-specific parser for dummy/unknown/bad,
+forbids generic parsing plus live client/Olm/session/MatrixStore/reprepare
+paths, and pins callback-before-ack with unchanged E2EE rows. Before production
+all five failed solely with
+`LocalProtocolError: unsupported durable settlement record`. Exact remaining
+decrypted kinds are now 5 passed; focused settlement/close/cold-room is 44
+passed, delivery and reducer are 48 passed each, selected
+first-seen/hydration materializer is 58 passed, and full coordinator is 225
+passed. Black, production Ruff `--no-fix`, isolated coordinator+reducer mypy,
+`py_compile`, and diff-check are green.
+
+The authenticated malformed-semantic and final disposition matrix is now
+GREEN. MAC-valid corruptions keep Work/header/authentication valid while making
+inner semantic carriers impossible; they fail with `JournalIntegrityError`,
+zero callback/state/ack, and byte-identical Work/frontier. One literal
+successful fate is verified for every RecordKind and LossRecord.
+
+The first bounded malformed matrix is frozen at:
+
+```text
+tests/ingest/coordinator_test.py:13844
+test_owned_settle_rejects_authenticated_malformed_presence_without_ack
+tests/ingest/coordinator_test.py:13977
+test_owned_settle_rejects_authenticated_malformed_collected_request
+```
+
+All cases mutate only canonical inner source JSON, rebuild the authenticated
+Work envelope/digest with the real journal codec, preserve its clear header and
+metadata, close, and pass full reopen preflight. Three PRESENCE schema failures
+already fail closed with exact `JournalIntegrityError` and no callback/DML.
+Before production the collected key-request case was the causal RED: its
+authenticated source lacks `requesting_device_id`, generic parsing returns a
+BadEvent, and the old dispatcher wrongly reached `_on_to_device`. Settlement
+now requires exact `RoomKeyRequest` or `RoomKeyRequestCancellation` before
+callback. All six malformed rows pass; the graph, outstanding Work, and
+frontier remain unchanged on failure.
+
+The final literal disposition selector is 13 passed and covers all eight
+RecordKinds plus LossRecord. The complete checkpoint is: malformed 6 passed,
+focused settlement/close/cold-room 48 passed, delivery and reducer 48 passed
+each, selected first-seen/hydration materializer 58 passed, and full
+coordinator 229 passed. Black, production Ruff `--no-fix`, isolated
+coordinator+reducer mypy, `py_compile`, and diff-check are green.
+
+Task4E's final review, consolidation decision, budget measurement, full suite,
+static gates, and ordinary implementation commit are complete. The exact
+restart boundary is Task5B in `/work/dev/mindroom`: wire the committed nio
+private `_settle_batch(batch, receipt_new, semantic_event_new)` adapter to the
+already committed Task5A receipt/idempotency kernel, without separately calling
+`acknowledge_batch` and without weakening Task4E callback-before-ack behavior.
+
+That final review is now complete with no P0–P2 blocker. No mechanical
+Task4E-only consolidation was applied: the only clear duplication is a crypto
+fixture shared conceptually with an already committed standalone crash-test
+module, and extracting it now would add a cross-module test dependency for
+little net reduction. Full repository verification on the exact recorded hash
+is **2,672 passed, 3 skipped, 5 warnings** in 411.50 seconds. Final Black,
+production Ruff `--no-fix`, isolated coordinator+reducer mypy, `py_compile`,
+and diff-check are green. The implementation is committed at
+`be24cf315c27250d3c2b95a5862278420ee8d270`; this living-document checkpoint
+records that boundary.
+
+The STATE prerequisite was discovered and closed causally at
+`test_owned_cold_invited_state_is_ready_without_join_hydration` (invite and
+knock). Before the reducer fix, both rows created a `HydrationIntent` that
+`PendingHydration` could never represent because hydration is exact-JOIN-only.
+The no-transition and prepared-transition reducer paths now create a hydration
+barrier only when the effective/current membership is `join`. Evidence: 2 cold
+integration, all 48 reducer, 58 selected first-seen/hydration materializer, and
+4 invited-room reopen tests pass; reducer Black/Ruff/mypy/compile/diff gates
+are green.
+
+The required reconstruction contract is already fixed:
+
+- decrypted room key: never call generic `ToDeviceEvent.parse_event(clear)` or
+  `RoomKeyEvent.from_dict(clear, ...)`; Task 4C deliberately stripped `keys`
+  and `content.session_key`. Directly construct `RoomKeyEvent` from the
+  authenticated sanitized clear source plus the authenticated outer Olm
+  sender key and clear `room_id`, `session_id`, and `algorithm`;
+- decrypted timeline: overlay the authenticated current snapshot first, call
+  `Event.parse_decrypted_event(clear)`, then restore `decrypted=True`, the
+  authenticated verification bit, outer Megolm `sender_key`/`session_id`, and
+  the record `room_id`; never invoke Olm or a live timeline handler.
+
+### Immediate next action
+
+A fresh session can be started with: “Read the controlling design and the live
+restart handoff in this plan, verify the recorded branches/HEADs/patch hash,
+preserve the dirty worktree, and continue from the first unchecked item.”
+
+- [x] Add only the five test hardenings listed above.
+- [x] Run the exact node and confirm the same two sole unsupported-record REDs.
+- [x] Reconcile the prior independent RED review: every requested P1/P2
+      hardening is present and the exact causal failures are unchanged.
+- [x] Implement the minimal two exact decrypted predicates and constructors.
+- [x] Run the exact GREEN first, then the existing settlement/close, full
+      coordinator, delivery, formatting, lint, type, compile, and diff gates.
+- [x] Audit the production slice for authenticated/canonical input, snapshot-
+      before-parse ordering, no crypto/store/reprepare path, callback-before-
+      ack, poison/close fencing, and exact kind/metadata predicates.
+- [x] Add a test-only causal `MEGOLM_FAILED` RED from a real Task 4C failure;
+      prove settlement neither decrypts/checks wedge nor queues another key
+      request and preserves the post-preparation E2EE/request graph.
+- [x] Add only the exact SOURCE/MEGOLM_FAILED/EVENT timeline settlement branch,
+      reconstruct via `Event.parse_event(source)`, restore `room_id`, and use
+      the existing overlay/callback/ack fence.
+- [x] Run the exact GREEN, focused settlement/close, delivery, full
+      coordinator, and all static gates; then update this handoff before STATE.
+- [x] Add the smallest real STATE test family: INVITE+EVENT parses with
+      `InviteEvent.parse_event`, restores inviter without regressing the final
+      snapshot, callbacks only for `receipt_new`; joined STATE with route None
+      performs snapshot-only in-place reconciliation and no event parsing or
+      callback.
+- [x] Implement only exact SOURCE/NONE STATE metadata: EVENT route requires an
+      invited projection, invite parser/handler, final re-overlay, and invited
+      callback; route None performs overlay-only reconciliation.
+- [x] Run the exact GREEN, cold invite/knock and all prior settlement gates,
+      full coordinator/delivery, reducer/materializer regressions, and static
+      checks; update the handoff before auxiliary kinds.
+- [x] Add one real joined-room auxiliary frame and three causal rows:
+      EPHEMERAL typing, ROOM_ACCOUNT_DATA tags, and PRESENCE. Each must overlay
+      the authenticated snapshot before parsing, idempotently apply its
+      non-snapshot state, expose that state before the exact callback, preserve
+      unrelated auxiliary fields, receipt-gate callbacks, and ack last.
+- [x] Implement only exact SOURCE/NONE metadata for those three kinds, using
+      their exact parsers/state handlers and the existing callback/ack fence;
+      do not add any other RecordKind.
+- [x] Run the exact GREEN, all prior settlement/close/cold-room and full
+      coordinator/delivery/reducer/materializer/static gates, then update this
+      handoff before synthetic to-device phases.
+- [x] Add a real Task 4C-produced two-phase synthetic to-device family:
+      typeless expired verification and collected key request. Prove exact
+      phase metadata, parser/constructor, callback family, no crypto replay,
+      callback-before-ack, restart, and FIFO behavior.
+- [x] Confirm each exact node first fails only at the unsupported-record
+      dispatcher before adding any production behavior.
+- [x] Implement only two exact non-room `TO_DEVICE` predicates: direct
+      `KeyVerificationCancel.from_dict` plus `_on_expired_verifications`, and
+      `ToDeviceEvent.parse_event` plus `_on_to_device`; retain the common
+      poison/close/ack fence and do not call either Olm collection method.
+- [x] Run exact GREEN, focused settlement/close, delivery, full coordinator,
+      reducer/materializer and static gates; update this handoff before the
+      remaining decrypted to-device kinds.
+- [x] Add the smallest real Task 4C-produced remaining-decrypted-to-device RED
+      matrix for forwarded room key, dummy, unknown, bad, and unknown-bad;
+      prove exact class reconstruction, parser/constructor choice, restart,
+      callback-before-ack, and zero crypto/store replay.
+- [x] Confirm every row fails only at the unsupported-record dispatcher before
+      adding production behavior.
+- [x] Implement only the five exact SOURCE/DECRYPTED/TO_DEVICE kind cases with
+      their direct/class-specific reconstruction; retain receipt-gated
+      `_on_to_device` and the common poison/close/ack fence.
+- [x] Run exact GREEN, focused settlement/close, delivery, full coordinator,
+      reducer/materializer and static gates; update this handoff before the
+      malformed-semantic/final disposition matrix.
+- [x] Add a bounded authenticated malformed-semantic settlement matrix that
+      corrupts parseable inner source/clear fields while resealing Work; prove
+      fail-closed `JournalIntegrityError`, no side effects, and replayability.
+- [x] Require collected key-request reconstruction to produce exact
+      `RoomKeyRequest` or `RoomKeyRequestCancellation` before callback; rerun
+      the malformed and valid synthetic nodes.
+- [x] Add/confirm one literal successful disposition for every RecordKind and
+      LossRecord, with the correct receipt/semantic gate and callback/state
+      fate.
+- [x] Review and consolidate the full Task4E diff without weakening causal or
+      crash/restart coverage; measure fixed-baseline budgets.
+- [x] Run full repository tests and complete static gates, update the handoff,
+      and commit `feat: settle durable records through compatibility callbacks`
+      only if the final review has no blocker.
+- [x] Commit the six implementation/test files with that exact message, then
+      update repository HEAD/state/hash instructions and commit this living
+      documentation checkpoint separately.
+
+After the decrypted pair, complete Task 4E in this order:
+
+1. [x] `MEGOLM_FAILED` reconstruction without decrypt/wedge/key-request replay;
+2. [x] STATE invite callback and joined/no-route snapshot-only reconciliation;
+3. [x] EPHEMERAL, ROOM_ACCOUNT_DATA, and PRESENCE idempotent state apply plus
+   receipt-gated callbacks;
+4. [x] expired-verification and collected-key-request synthetic phases;
+5. [x] remaining decrypted to-device kinds: forwarded room key, dummy, unknown,
+   bad, and unknown-bad;
+6. [x] authenticated malformed-semantic fail-closed cases and final complete
+   RecordKind/Loss disposition matrix;
+7. [x] full Task 4E verification, review, consolidation, budget check, and the
+   ordinary commit `feat: settle durable records through compatibility callbacks`.
+
+### Way of working
+
+For every remaining behavior slice, use this exact gate:
+
+1. Read the controlling design and this live handoff before touching code.
+2. Add a real, semantically valid, test-only causal RED using production
+   normalization/preparation where possible.
+3. Prove the first and sole failure is the missing behavior, not fixture setup.
+4. Review the RED independently and close every P0–P2 test-contract gap.
+5. Add the smallest production behavior; do not widen adjacent kinds.
+6. Run the exact GREEN, focused regressions, and static checks.
+7. Review production independently for semantics, trust boundaries, rollback,
+   cancellation, restart, and static regressions.
+8. Commit only a complete plan slice; never commit an intentional RED as the
+   advertised completed feature.
+
+Operational rules:
+
+- use `apply_patch` for hand edits and preserve all unrelated dirty/untracked
+  user files;
+- never use destructive reset/checkout commands;
+- do not run Ruff on excluded test files: repository Ruff has `fix=true` and
+  twice rewrote shared `coordinator_test.py` during a supposedly read-only
+  forced lint. Use Black and `git diff --check` for tests;
+- run production Ruff only with `--no-fix`;
+- keep callbacks, parsers, and compatibility state application outside owner
+  and SQLite transactions;
+- authenticate the outstanding batch, Work metadata, and Aggregate before any
+  client mutation or callback;
+- do not call sync/response/decrypt/live handlers during settlement;
+- callbacks finish before ack; errors/cancellation leave Work replayable and
+  never poison the ingestion client;
+- preparation/crypto transaction failures do poison the current client and
+  require a fresh client/Olm reconstruction;
+- keep `max_records=1`, exact FIFO, one retained Frame completion owner, schema
+  v1, and exactly five ingestion tables;
+- send concise progress updates during long work and stop only for a real
+  safety, correctness, or scope blocker.
+
+### Restart verification commands
+
+Run these before editing after a new session:
+
+```bash
+cd /work/dev/mindroom-nio
+test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
+test "$(git rev-parse HEAD^)" = be24cf315c27250d3c2b95a5862278420ee8d270
+git diff --quiet
+git diff --cached --quiet
+git status --short
+git diff --check
+
+cd /work/dev/mindroom
+test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
+test "$(git rev-parse HEAD)" = da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc
+git status --short
+```
+
+The current non-RED nio regression baseline is:
+
+```bash
+cd /work/dev/mindroom-nio
+uv run pytest -q tests/ingest/coordinator_test.py \
+# expected: 229 passed
+uv run pytest -q tests/ingest/delivery_test.py
+# expected: 48 passed
+```
+
+Current static gates are green with:
+
+```bash
+uv run black --check --fast --target-version py314 \
+  src/nio/client/base_client.py src/nio/ingest/coordinator.py \
+  src/nio/ingest/reducer.py src/nio/store/_sync_journal.py \
+  tests/ingest/coordinator_test.py tests/ingest/delivery_test.py
+uv run ruff check --no-fix src/nio/client/base_client.py \
+  src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
+  src/nio/store/_sync_journal.py
+uv run mypy src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
+  --follow-imports=skip --ignore-missing-imports
+python -m py_compile src/nio/client/base_client.py \
+  src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
+  src/nio/store/_sync_journal.py
+git diff --check
+```
+
+### Provisional budget status
+
+The final fixed budgets are not yet met because fork-recovery deletion and test
+consolidation occur later in Tasks 6 and 9. At the final Task4E checkpoint,
+measured from the fixed baselines:
+
+```text
+nio src:            +18,234 net lines  (final limit +4,500)
+nio tests:          +51,343 net lines  (final limit +15,000)
+nio docs/scripts:    +1,680 net lines  (final limit +1,000)
+nio scripts:              0 net lines
+MindRoom src:          +418 net lines  (final limit +350)
+MindRoom tests:        +990 net lines  (final limit +1,000)
+MindRoom vs canary:  -1,439 net lines
+```
+
+The living handoff currently contributes to the 680-line docs/scripts excess.
+Task 10 must consolidate completed implementation detail from this plan after
+the code is frozen; do not move the baseline or budget.
 
 ## Task 1: Freeze the lean authority and prune the canary architecture
 
@@ -49,6 +698,10 @@ durable state and Classic behavior. Full nio verification was 2,088 passed/3
 skipped; exact causal/crash evidence and review are frozen in the ledger/report.
 
 ## Desktop compatibility slice: select the upstream sync profile
+
+**Complete.** MindRoom `1fd376583` selects the exact Desktop no-recovery
+profile, and `a5d3edc33` supplies the query-only identity reader. The later 5C
+live-bot resolver replacement remains pending.
 
 Implement this MindRoom-only slice before Task 4. It is part of the same linked
 change set and adds no user-visible option.
@@ -122,6 +775,8 @@ Do not collapse these into one implementation/review gate. They remain commits
 in one PR per repository, not phase PRs.
 
 ### Task 4A: exclusive in-place v1 adoption
+
+**Complete.** Implemented and reviewed in nio `044a74e`.
 
 Adopt or reopen an exact populated store-v10 per-device database before Olm
 initialization through a non-exported `_open_configured_ingestion_store()`
@@ -199,6 +854,9 @@ rejection, process/thread close, cancellation, and stale-file identity in
 
 ### Task 4B: exact store-to-session lease transfer
 
+**Complete.** Contract documentation is nio `c06b88a`; implementation and
+review are `f27f5e3c149d3e5215f9641f9daa9b291502c179`.
+
 Preserve the existing public state machine and exact `open_ingestion()`
 signature: public session-first remains successful, and a prior direct public
 `StoreBootstrap.open_matrix_store()` continues to make public session claim
@@ -244,6 +902,9 @@ HTTP lifecycle, and cleanup.
 
 ### Task 5A: MindRoom record receipt and semantic-idempotency kernel
 
+**Complete.** Implemented and reviewed in MindRoom
+`da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc`.
+
 This MindRoom slice executes before Task 4C. Replace the undeployed receipt
 table's mandatory `event_id` foreign key with nonempty `record_id`; add no table
 or migration. Every record gets a receipt. Return separate `receipt_new` and
@@ -266,6 +927,9 @@ event retains only its settled immutable identity so it cannot resurrect.
 **Commit:** `fix: deduplicate durable matrix events semantically`
 
 ### Task 4C: callback-free shared compatibility preparation
+
+**Complete.** Implemented and reviewed in nio
+`19587c4cf195e62d4265a03a70d061e407dceec4`.
 
 Parse Classic and private durable Sliding Frames into one private preparation
 contract. Preserve the pre-fork callback-free mutation order exactly: token;
@@ -294,6 +958,11 @@ sequence, explicit failure, and zero callbacks.
 
 ### Task 4D: atomic all-kind materialization and snapshots
 
+**Complete.** The pure prepared planner is nio
+`96ff99bf36135e7eef66355953a9c1b4c8c9b2e8`; owned all-kind materialization,
+outbound freezing, local lifecycle publication, crash/capacity/parity proof,
+and runner FIFO blocking are `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`.
+
 In one owner transaction persist crypto writes, clear events, stable IDs,
 aggregates, room snapshots, every `RecordKind` including `TO_DEVICE`, every
 `LossRecord`, Work, and preparation revision. In that same transaction, make
@@ -321,6 +990,12 @@ local transition one stable operation identity and make retries reuse it.
 **Commit:** `refactor: materialize all durable record kinds atomically`
 
 ### Task 4E: snapshot restore and receipt-gated apply/ack
+
+**In progress, uncommitted.** The exact completed behavior, dirty-worktree
+boundary, current decrypted-event RED, and immediate next steps are recorded in
+the live restart handoff at the top of this plan. Do not begin Task 5B until the
+complete Task 4E disposition matrix is green, independently reviewed, and
+committed.
 
 Restore `AsyncClient.rooms` before incremental delivery. Reapply client/room
 state idempotently; publish auxiliary callbacks only when `receipt_new` and
