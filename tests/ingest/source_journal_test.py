@@ -668,7 +668,7 @@ EXPECTED_DDL = {
         intent_kind TEXT NULL CHECK (
             intent_kind IS NULL OR
             (typeof(intent_kind) = 'text'
-             AND intent_kind IN ('recovery','hydration'))
+             AND intent_kind IN ('recovery','hydration','local_membership'))
         ),
         payload BLOB NOT NULL CHECK (
             typeof(payload) = 'blob' AND length(payload) > 0

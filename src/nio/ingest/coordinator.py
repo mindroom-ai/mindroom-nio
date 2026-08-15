@@ -4,12 +4,14 @@ import asyncio
 import os
 import sys
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid5
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
+from ..api import Api
+from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 from ..events.account_data import AccountDataEvent
 from ..events.ephemeral import EphemeralEvent
 from ..events.invite_events import InviteEvent
@@ -27,7 +29,16 @@ from ..events.to_device import (
     UnknownToDeviceEvent,
 )
 from ..exceptions import LocalProtocolError
+from ..responses import (
+    JoinResponse,
+    KeysClaimResponse,
+    KeysQueryResponse,
+    KeysUploadResponse,
+    RoomLeaveResponse,
+    ToDeviceResponse,
+)
 from ..store._sync_journal_rows import (
+    _decoded_bytes,
     _encoded_bytes,
     _OutboundMaintenance,
     _OutboundOperation,
@@ -38,12 +49,14 @@ from ..store._sync_journal_values import (
     MaterializerLimits,
     MaterializeStatus,
     RoomAggregateValue,
+    _FrameCompletion,
+    _LocalMembershipIntent,
 )
 from . import ports
 from ._json import canonical_json, load_json
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
-from .errors import JournalIntegrityError
+from .errors import JournalConflictError, JournalIntegrityError
 from .hydration import normalize_hydration_response
 from .model import (
     BatchRef,
@@ -69,7 +82,7 @@ from .source import SourceResultKind, SourceScheduleStatus, SyncFrame, plan_sour
 from .state import CommitResult, SourceState, StagedFrame
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Awaitable, Callable, Coroutine
 
     from ..client.async_client import AsyncClient
     from ..store._sync_journal import SqliteIngestionJournal as _SqliteIngestionJournal
@@ -106,6 +119,12 @@ class IngestionHydrationError(IngestionError):
         super().__init__(f"room-state hydration failed for {hydration_id}")
 
 
+class _LocalMembershipCommand(NamedTuple):
+    room_id: str
+    intent: _LocalMembershipIntent
+    completion: asyncio.Future[bool]
+
+
 def _encoded_prepared_source(source_json: bytes) -> str:
     encoded = _encoded_bytes(source_json)
     assert encoded is not None
@@ -125,6 +144,267 @@ def _rerequest_context(
         "session_id": event.session_id,
         "algorithm": event.algorithm,
     }
+
+
+_KEY_CLAIM_REREQUEST_FIELDS = (
+    "source_json",
+    "room_id",
+    "event_id",
+    "sender_user_id",
+    "sender_device_id",
+    "sender_key",
+    "session_id",
+    "algorithm",
+)
+
+_KEY_CLAIM_WAITING_FIELDS = (
+    "source_json",
+    "sender_user_id",
+    "requesting_device_id",
+    "request_id",
+    "room_id",
+    "sender_key",
+    "session_id",
+    "algorithm",
+)
+
+
+def _key_claim_waiting_request(
+    value: object,
+    *,
+    user_id: str,
+    device_id: str,
+) -> RoomKeyRequest:
+    try:
+        if type(value) is not dict or tuple(value) != _KEY_CLAIM_WAITING_FIELDS:
+            raise ValueError
+        fields = value
+        if any(
+            type(fields[name]) is not str or not fields[name]
+            for name in _KEY_CLAIM_WAITING_FIELDS[1:]
+        ):
+            raise ValueError
+        source_json = _decoded_bytes(fields["source_json"], "waiting key request")
+        if source_json is None or fields["source_json"] != _encoded_bytes(source_json):
+            raise ValueError
+        source = load_json(source_json, "waiting key request")
+        if type(source) is not dict or canonical_json(source) != source_json:
+            raise ValueError
+        event = ToDeviceEvent.parse_event(source)
+        if type(event) is not RoomKeyRequest or (
+            event.sender,
+            event.requesting_device_id,
+            event.request_id,
+            event.room_id,
+            event.sender_key,
+            event.session_id,
+            event.algorithm,
+        ) != (
+            user_id,
+            device_id,
+            fields["request_id"],
+            fields["room_id"],
+            fields["sender_key"],
+            fields["session_id"],
+            fields["algorithm"],
+        ):
+            raise ValueError
+        return event
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("waiting key request is invalid") from error
+
+
+def _same_key_claim_waiting(first: RoomKeyRequest, second: RoomKeyRequest) -> bool:
+    return (
+        type(first) is RoomKeyRequest
+        and type(second) is RoomKeyRequest
+        and canonical_json(first.source) == canonical_json(second.source)
+        and (
+            first.sender,
+            first.requesting_device_id,
+            first.request_id,
+            first.room_id,
+            first.sender_key,
+            first.session_id,
+            first.algorithm,
+        )
+        == (
+            second.sender,
+            second.requesting_device_id,
+            second.request_id,
+            second.room_id,
+            second.sender_key,
+            second.session_id,
+            second.algorithm,
+        )
+    )
+
+
+def _key_claim_rerequest_event(
+    value: object,
+    *,
+    user_id: str,
+    device_id: str,
+) -> MegolmEvent:
+    try:
+        if type(value) is not dict or tuple(value) != _KEY_CLAIM_REREQUEST_FIELDS:
+            raise ValueError
+        fields = value
+        if any(
+            type(fields[name]) is not str or not fields[name]
+            for name in _KEY_CLAIM_REREQUEST_FIELDS[1:]
+        ):
+            raise ValueError
+        source_json = _decoded_bytes(fields["source_json"], "key-claim rerequest")
+        if source_json is None or fields["source_json"] != _encoded_bytes(source_json):
+            raise ValueError
+        source = load_json(source_json, "key-claim rerequest")
+        if (
+            type(source) is not dict
+            or canonical_json(source) != source_json
+            or source.get("sender") != user_id
+        ):
+            raise ValueError
+        event = Event.parse_event(source)
+        if type(event) is not MegolmEvent:
+            raise ValueError
+        event.room_id = fields["room_id"]
+        if (
+            event.event_id,
+            event.sender,
+            event.device_id,
+            event.sender_key,
+            event.session_id,
+            event.algorithm,
+        ) != (
+            fields["event_id"],
+            user_id,
+            device_id,
+            fields["sender_key"],
+            fields["session_id"],
+            fields["algorithm"],
+        ):
+            raise ValueError
+        return event
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("key-claim rerequest is invalid") from error
+
+
+def _same_key_claim_rerequest(first: MegolmEvent, second: MegolmEvent) -> bool:
+    return (
+        type(first) is MegolmEvent
+        and type(second) is MegolmEvent
+        and canonical_json(first.source) == canonical_json(second.source)
+        and (
+            first.room_id,
+            first.event_id,
+            first.sender,
+            first.device_id,
+            first.sender_key,
+            first.session_id,
+            first.algorithm,
+        )
+        == (
+            second.room_id,
+            second.event_id,
+            second.sender,
+            second.device_id,
+            second.sender_key,
+            second.session_id,
+            second.algorithm,
+        )
+    )
+
+
+def _to_device_message(
+    operation: _OutboundOperation,
+) -> tuple[ToDeviceMessage, tuple[MegolmEvent, ...]]:
+    try:
+        if (
+            operation.kind != "to_device"
+            or type(operation.transaction_id) is not str
+            or not operation.transaction_id
+            or type(operation.event_type) is not str
+            or not operation.event_type
+            or type(operation.context) is not dict
+        ):
+            raise ValueError
+        body = load_json(operation.body_json, "to-device operation body")
+        if (
+            type(body) is not dict
+            or canonical_json(body) != operation.body_json
+            or tuple(body) != ("messages",)
+        ):
+            raise ValueError
+        messages = body["messages"]
+        if type(messages) is not dict or len(messages) != 1:
+            raise ValueError
+        recipient, devices = next(iter(messages.items()))
+        if type(recipient) is not str or not recipient or type(devices) is not dict:
+            raise ValueError
+        if len(devices) != 1:
+            raise ValueError
+        device_id, content = next(iter(devices.items()))
+        if type(device_id) is not str or not device_id or type(content) is not dict:
+            raise ValueError
+        context = operation.context
+        if context == {"subtype": "generic"}:
+            message: ToDeviceMessage = ToDeviceMessage(
+                operation.event_type,
+                recipient,
+                device_id,
+                content,
+            )
+            rerequests: tuple[MegolmEvent, ...] = ()
+        elif (
+            tuple(context) == ("subtype", "rerequest_events")
+            and context["subtype"] == "dummy"
+            and type(context["rerequest_events"]) is list
+            and len(context["rerequest_events"]) <= 1
+            and operation.event_type == "m.room.encrypted"
+        ):
+            message = DummyMessage(
+                operation.event_type,
+                recipient,
+                device_id,
+                content,
+            )
+            rerequests = tuple(
+                _key_claim_rerequest_event(
+                    value,
+                    user_id=recipient,
+                    device_id=device_id,
+                )
+                for value in context["rerequest_events"]
+            )
+        elif (
+            tuple(context)
+            == ("subtype", "request_id", "session_id", "room_id", "algorithm")
+            and context["subtype"] == "room_key_request"
+            and operation.event_type == "m.room_key_request"
+            and all(
+                type(context[name]) is str and context[name]
+                for name in ("request_id", "session_id", "room_id", "algorithm")
+            )
+        ):
+            message = RoomKeyRequestMessage(
+                operation.event_type,
+                recipient,
+                device_id,
+                content,
+                context["request_id"],
+                context["session_id"],
+                context["room_id"],
+                context["algorithm"],
+            )
+            rerequests = ()
+        else:
+            raise ValueError
+        if canonical_json(message.as_dict()) != operation.body_json:
+            raise ValueError
+        return message, rerequests
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("to-device operation is invalid") from error
 
 
 def _waiting_request_context(
@@ -314,6 +594,12 @@ class IngestionSession:
     ) -> MaterializeResult:
         return self._journal.materialize_oldest_frame(limits=limits)
 
+    async def _advance_blocked_frame(self, frame_id: UUID) -> bool:
+        return False
+
+    async def _advance_local_membership_intent(self) -> bool:
+        return False
+
     async def run(self) -> None:
         self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
@@ -360,10 +646,12 @@ class IngestionSession:
                 )
                 if materialized.status is MaterializeStatus.MATERIALIZED:
                     continue
-                if materialized.status in (
-                    MaterializeStatus.BLOCKED,
-                    MaterializeStatus.AT_CAPACITY,
-                ):
+                if materialized.status is MaterializeStatus.BLOCKED:
+                    assert materialized.frame_id is not None
+                    if await self._advance_blocked_frame(materialized.frame_id):
+                        continue
+                    raise IngestionBlockedError(materialized.frame_id)
+                if materialized.status is MaterializeStatus.AT_CAPACITY:
                     raise IngestionBlockedError(materialized.frame_id)
                 frames = self._journal.list_frames(self._config.max_staged_frames + 1)
                 if frames:
@@ -405,6 +693,8 @@ class IngestionSession:
                 continue
             hydration_retries = 0
             # fmt: on
+            if await self._advance_local_membership_intent():
+                continue
             prior = self._journal.load_source()
             decision = plan_source_poll(
                 self._source,
@@ -677,11 +967,15 @@ class _OwnedIngestionSession(IngestionSession):
         store: MatrixStore,
         journal: _SqliteIngestionJournal,
         source: ClassicSource | SlidingSource,
+        completion_sink: Callable[[_FrameCompletion], Awaitable[None]] | None = None,
     ) -> None:
         self._client = client
         self._config = config
         self._journal = journal
         self._source = source
+        if completion_sink is not None and not callable(completion_sink):
+            raise TypeError("completion sink must be callable")
+        self._completion_sink = completion_sink
         self._lease = lease
         self._owned_store = store
         self._close_task: asyncio.Task[None] | None = None
@@ -689,6 +983,9 @@ class _OwnedIngestionSession(IngestionSession):
         self._terminal: BaseException | None = None
         self._settlement_lock = asyncio.Lock()
         self._settlement_task: asyncio.Task[object] | None = None
+        self._local_membership_command: _LocalMembershipCommand | None = None
+        self._progress_generation = 0
+        self._progress_event = asyncio.Event()
         self._detached = False
         self._revoked = False
         self._closed = False
@@ -814,6 +1111,636 @@ class _OwnedIngestionSession(IngestionSession):
                 self._client._poison_ingestion()
             raise
 
+    async def _advance_blocked_frame(self, frame_id: UUID) -> bool:
+        progress_generation = self._progress_generation
+        pending = self._journal._load_ready_outbound_maintenance()
+        if pending is None:
+            if self._journal._oldest_prepared_frame_has_work(frame_id):
+                await self._wait_for_progress(progress_generation)
+                return True
+            completion = self._journal._claim_frame_completion()
+            if completion is None:
+                claimed = self._journal._load_claimed_frame_completion()
+                if claimed is None:
+                    return False
+                if claimed.frame_id != frame_id:
+                    raise JournalIntegrityError(
+                        "claimed completion does not own the blocked Frame"
+                    )
+                self._journal._retire_claimed_frame(claimed)
+                return True
+            if completion.frame_id != frame_id:
+                raise JournalIntegrityError(
+                    "completion claim does not own the blocked Frame"
+                )
+            if self._completion_sink is not None:
+                await self._completion_sink(completion)
+            self._journal._retire_claimed_frame(completion)
+            return True
+        if pending.frame_id != frame_id:
+            raise JournalIntegrityError(
+                "outbound maintenance does not own the blocked Frame"
+            )
+        operation = pending.operation
+        to_device_message: ToDeviceMessage | None = None
+        to_device_rerequests: tuple[MegolmEvent, ...] = ()
+        if operation.kind == "key_upload":
+            method = "POST"
+            path = "/_matrix/client/v3/keys/upload"
+        elif operation.kind == "key_query":
+            method = "POST"
+            path = "/_matrix/client/v3/keys/query"
+        elif operation.kind == "key_claim":
+            method = "POST"
+            path = "/_matrix/client/v3/keys/claim"
+        elif operation.kind == "to_device":
+            method = "PUT"
+            to_device_message, to_device_rerequests = _to_device_message(operation)
+            assert operation.event_type is not None
+            assert operation.transaction_id is not None
+            path = (
+                "/_matrix/client/v3/sendToDevice/"
+                f"{quote(operation.event_type, safe='')}/"
+                f"{quote(operation.transaction_id, safe='')}"
+            )
+        else:
+            return False
+        request = ports.NetworkRequest(
+            pending.stream_id,
+            pending.transport,
+            pending.source_epoch,
+            pending.request_id,
+            method,
+            path,
+            (),
+            operation.body_json,
+            self._config.source.timeout_ms,
+            pending.request_cursor_json,
+        )
+        retries = 0
+        while True:
+            network = await self._request(
+                request,
+                body_disconnect_retry=True,
+            )
+            if network.status_code == 200:
+                break
+            error_code: str | None = None
+            try:
+                error_value = load_json(
+                    network.body,
+                    "outbound maintenance error",
+                )
+                if (
+                    type(error_value) is dict
+                    and canonical_json(error_value) == network.body
+                    and type(error_value.get("errcode")) is str
+                ):
+                    error_code = error_value["errcode"]
+            except (TypeError, ValueError) as _error:
+                pass
+            if error_code is None and network.status_code == 401:
+                error_code = "M_UNKNOWN_TOKEN"
+            elif error_code is None and network.status_code == 403:
+                error_code = "M_FORBIDDEN"
+            if error_code in {"M_UNKNOWN_TOKEN", "M_FORBIDDEN"}:
+                raise IngestionSourceError(
+                    "outbound maintenance authentication failed: " f"{error_code}"
+                )
+            retryable = (
+                network.failure is not None
+                or network.status_code in {408, 429}
+                or network.status_code is not None
+                and 500 <= network.status_code <= 599
+                or error_code == "M_LIMIT_EXCEEDED"
+            )
+            if not retryable:
+                detail = error_code or str(network.status_code)
+                raise IngestionSourceError(
+                    f"outbound maintenance request failed: {detail}"
+                )
+            retries += 1
+            delay = (
+                network.retry_after_ms / 1000
+                if network.retry_after_ms is not None
+                else 0.0
+            )
+            if network.retry_after_ms is None and retries >= 2:
+                delay = min(
+                    self._client.config.backoff_factor
+                    * (2 ** (min(retries, 1000) - 1)),
+                    self._client.config.max_timeout_retry_wait_time,
+                )
+            await asyncio.sleep(delay)
+            self._client._assert_ingestion_not_poisoned()
+            if self._close_task is not None or self._closed:
+                raise LocalProtocolError("ingestion session is closed")
+            current = self._journal._load_ready_outbound_maintenance()
+            if current != pending:
+                raise JournalConflictError(
+                    "outbound maintenance operation changed during retry"
+                )
+        try:
+            value = load_json(network.body, "outbound maintenance response")
+            if type(value) is not dict:
+                raise ValueError
+            if operation.kind == "key_upload":
+                response = KeysUploadResponse.from_dict(value)
+                expected_type = KeysUploadResponse
+            elif operation.kind == "key_query":
+                response = KeysQueryResponse.from_dict(value)
+                expected_type = KeysQueryResponse
+            elif operation.kind == "key_claim":
+                response = KeysClaimResponse.from_dict(value)
+                expected_type = KeysClaimResponse
+            else:
+                assert to_device_message is not None
+                response = ToDeviceResponse.from_dict(value, to_device_message)
+                expected_type = ToDeviceResponse
+            if type(response) is not expected_type:
+                raise ValueError
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise IngestionSourceError(
+                "malformed outbound maintenance result"
+            ) from error
+        olm = self._client.olm
+        if olm is None:
+            raise LocalProtocolError("owned maintenance requires Olm")
+        apply_started = False
+
+        def apply() -> tuple[_OutboundOperation, ...]:
+            nonlocal apply_started
+            apply_started = True
+            claim_targets: list[tuple[str, str]] = []
+            claim_was_waiting: set[tuple[str, str]] = set()
+            claim_rerequest_contexts: dict[tuple[str, str], list[dict[str, object]]] = (
+                {}
+            )
+            if operation.kind == "key_claim":
+                context = operation.context
+                if type(context) is not dict or set(context) != {"claims"}:
+                    raise JournalIntegrityError("key-claim context is invalid")
+                claims = context["claims"]
+                if type(claims) is not list or not claims:
+                    raise JournalIntegrityError("key-claim context is unsupported")
+                for claim in claims:
+                    if (
+                        type(claim) is not dict
+                        or set(claim)
+                        != {
+                            "user_id",
+                            "device_id",
+                            "was_wedged",
+                            "was_waiting",
+                            "waiting_key_requests",
+                            "rerequest_events",
+                        }
+                        or type(claim["was_wedged"]) is not bool
+                        or type(claim["was_waiting"]) is not bool
+                        or claim["was_wedged"] == claim["was_waiting"]
+                        or type(claim["waiting_key_requests"]) is not list
+                        or len(claim["waiting_key_requests"]) > 1
+                        or bool(claim["waiting_key_requests"]) != claim["was_waiting"]
+                        or type(claim["rerequest_events"]) is not list
+                        or len(claim["rerequest_events"]) > 1
+                        or (
+                            bool(claim["rerequest_events"])
+                            and claim["was_wedged"] is not True
+                        )
+                        or type(claim["user_id"]) is not str
+                        or type(claim["device_id"]) is not str
+                    ):
+                        raise JournalIntegrityError("key-claim context is unsupported")
+                    target = (claim["user_id"], claim["device_id"])
+                    if target in claim_targets:
+                        raise JournalIntegrityError("key-claim context is unsupported")
+                    claim_targets.append(target)
+                    if claim["was_waiting"]:
+                        claim_was_waiting.add(target)
+                    try:
+                        device = olm.device_store[target[0]][target[1]]
+                    except KeyError as error:
+                        raise JournalIntegrityError(
+                            "key-claim device is unavailable"
+                        ) from error
+                    reconstructed_waiting = tuple(
+                        _key_claim_waiting_request(
+                            value,
+                            user_id=target[0],
+                            device_id=target[1],
+                        )
+                        for value in claim["waiting_key_requests"]
+                    )
+                    reconstructed_rerequests = tuple(
+                        _key_claim_rerequest_event(
+                            value,
+                            user_id=target[0],
+                            device_id=target[1],
+                        )
+                        for value in claim["rerequest_events"]
+                    )
+                    claim_rerequest_contexts[target] = [
+                        dict(value) for value in claim["rerequest_events"]
+                    ]
+                    if reconstructed_rerequests:
+                        live_rerequests = olm.key_re_requests_events[target]
+                        if live_rerequests:
+                            if len(live_rerequests) != len(
+                                reconstructed_rerequests
+                            ) or any(
+                                not _same_key_claim_rerequest(live, expected)
+                                for live, expected in zip(
+                                    live_rerequests,
+                                    reconstructed_rerequests,
+                                    strict=True,
+                                )
+                            ):
+                                raise JournalIntegrityError(
+                                    "key-claim rerequest state changed"
+                                )
+                        else:
+                            live_rerequests.extend(reconstructed_rerequests)
+                    if target in claim_was_waiting:
+                        if device not in olm.key_request_devices_no_session:
+                            olm.key_request_devices_no_session.append(device)
+                        live_waiting = olm.key_requests_waiting_for_session[target]
+                        if live_waiting:
+                            if tuple(live_waiting) != tuple(
+                                event.request_id for event in reconstructed_waiting
+                            ) or any(
+                                not _same_key_claim_waiting(
+                                    live_waiting[event.request_id],
+                                    event,
+                                )
+                                for event in reconstructed_waiting
+                            ):
+                                raise JournalIntegrityError(
+                                    "waiting key-request state changed"
+                                )
+                        else:
+                            live_waiting.update(
+                                (event.request_id, event)
+                                for event in reconstructed_waiting
+                            )
+                    elif device not in olm.wedged_devices:
+                        olm.wedged_devices.append(device)
+                queued_before = tuple(olm.outgoing_to_device_messages)
+            elif operation.kind == "to_device":
+                assert to_device_message is not None
+                live_messages = olm.outgoing_to_device_messages
+                if live_messages:
+                    if live_messages != [to_device_message]:
+                        raise JournalIntegrityError("to-device live queue changed")
+                elif type(to_device_message) in {DummyMessage, RoomKeyRequestMessage}:
+                    live_messages.append(to_device_message)
+                if type(to_device_message) is DummyMessage:
+                    target = (
+                        to_device_message.recipient,
+                        to_device_message.recipient_device,
+                    )
+                    live_rerequests = olm.key_re_requests_events[target]
+                    if live_rerequests:
+                        if len(live_rerequests) != len(to_device_rerequests) or any(
+                            not _same_key_claim_rerequest(live, expected)
+                            for live, expected in zip(
+                                live_rerequests,
+                                to_device_rerequests,
+                                strict=True,
+                            )
+                        ):
+                            raise JournalIntegrityError("dummy rerequest state changed")
+                    else:
+                        live_rerequests.extend(to_device_rerequests)
+                queued_before = tuple(live_messages)
+            else:
+                queued_before = ()
+            olm.handle_response(response)
+            if operation.kind == "to_device":
+                assert to_device_message is not None
+                if type(to_device_message) is not DummyMessage:
+                    if olm.outgoing_to_device_messages:
+                        raise JournalIntegrityError(
+                            "generic to-device queue was not consumed"
+                        )
+                    return ()
+                generated = tuple(olm.outgoing_to_device_messages)
+                if len(generated) != len(to_device_rerequests) or any(
+                    type(message) is not RoomKeyRequestMessage for message in generated
+                ):
+                    raise JournalIntegrityError(
+                        "dummy to-device follow-ups are invalid"
+                    )
+                dummy_follow_ups: list[_OutboundOperation] = []
+                for offset, message in enumerate(generated):
+                    assert type(message) is RoomKeyRequestMessage
+                    body_json = canonical_json(message.as_dict())
+                    operation_index = pending.operation_count + offset
+                    dummy_follow_ups.append(
+                        _OutboundOperation(
+                            "to_device",
+                            "pending",
+                            body_json,
+                            str(
+                                uuid5(
+                                    pending.frame_id,
+                                    "nio.ingest.outbound-maintenance.v1:"
+                                    f"to-device:{operation_index}:"
+                                    f"{sha256(body_json).hexdigest()}",
+                                )
+                            ),
+                            message.type,
+                            {
+                                "subtype": "room_key_request",
+                                "request_id": message.request_id,
+                                "session_id": message.session_id,
+                                "room_id": message.room_id,
+                                "algorithm": message.algorithm,
+                            },
+                        )
+                    )
+                return tuple(dummy_follow_ups)
+            if operation.kind != "key_claim":
+                return ()
+            if claim_was_waiting and olm.collect_key_requests() != []:
+                raise JournalIntegrityError(
+                    "waiting key claim generated unsupported callback Work"
+                )
+            queued_after = tuple(olm.outgoing_to_device_messages)
+            if queued_after[: len(queued_before)] != queued_before:
+                raise JournalIntegrityError("key-claim changed the queued prefix")
+            follow_ups: list[_OutboundOperation] = []
+            generated = queued_after[len(queued_before) :]
+            generated_targets: set[tuple[str, str]] = set()
+            for offset, message in enumerate(generated):
+                target = (message.recipient, message.recipient_device)
+                if target not in claim_targets or target in generated_targets:
+                    raise JournalIntegrityError(
+                        "key-claim generated a follow-up for another target"
+                    )
+                generated_targets.add(target)
+                if type(message) is DummyMessage:
+                    if target in claim_was_waiting:
+                        raise JournalIntegrityError(
+                            "waiting key claim generated a dummy"
+                        )
+                    follow_up_context: dict[str, object] = {
+                        "subtype": "dummy",
+                        "rerequest_events": claim_rerequest_contexts[target],
+                    }
+                elif type(message) is ToDeviceMessage:
+                    if target not in claim_was_waiting:
+                        raise JournalIntegrityError(
+                            "wedged key claim generated a share"
+                        )
+                    follow_up_context = {"subtype": "generic"}
+                else:
+                    raise JournalIntegrityError(
+                        "key-claim generated an unsupported follow-up"
+                    )
+                body_json = canonical_json(message.as_dict())
+                operation_index = pending.operation_count + offset
+                follow_ups.append(
+                    _OutboundOperation(
+                        "to_device",
+                        "pending",
+                        body_json,
+                        str(
+                            uuid5(
+                                pending.frame_id,
+                                "nio.ingest.outbound-maintenance.v1:"
+                                f"to-device:{operation_index}:"
+                                f"{sha256(body_json).hexdigest()}",
+                            )
+                        ),
+                        message.type,
+                        follow_up_context,
+                    )
+                )
+            if not claim_was_waiting.issubset(generated_targets):
+                raise JournalIntegrityError(
+                    "waiting key claim did not generate one share"
+                )
+            return tuple(follow_ups)
+
+        try:
+            self._journal._settle_outbound_maintenance(
+                pending=pending,
+                apply=apply,
+            )
+        except BaseException:
+            if apply_started:
+                self._client._poison_ingestion()
+            raise
+        return True
+
+    async def _advance_local_membership_intent(self) -> bool:
+        command = self._local_membership_command
+        progress_generation = self._progress_generation
+        pending = self._journal._load_pending_local_membership_intents(limit=2)
+        if not pending:
+            if command is None:
+                has_local_work = self._journal._has_pending_local_membership_work()
+            else:
+                try:
+                    has_local_work, matching_revision = (
+                        self._journal._local_membership_work_state(
+                            room_id=command.room_id,
+                            intent=command.intent,
+                        )
+                    )
+                except BaseException as error:
+                    if not command.completion.done():
+                        command.completion.set_exception(error)
+                    self._local_membership_command = None
+                    raise
+                if matching_revision is not None:
+                    if not command.completion.done():
+                        command.completion.set_result(True)
+                    self._local_membership_command = None
+                    command = None
+            if has_local_work:
+                await self._wait_for_progress(progress_generation)
+                return True
+            if command is None:
+                return False
+            intent = command.intent
+            try:
+                self._journal._record_local_membership_intent(
+                    operation_id=intent.operation_id,
+                    room_id=command.room_id,
+                    previous_membership=intent.previous_membership,
+                    previous_epoch=intent.previous_epoch,
+                    current_membership=intent.current_membership,
+                )
+            except BaseException as error:
+                if not command.completion.done():
+                    command.completion.set_exception(error)
+                self._local_membership_command = None
+                raise
+            pending = self._journal._load_pending_local_membership_intents(limit=2)
+        if len(pending) != 1:
+            raise JournalIntegrityError("multiple local membership intents are pending")
+        candidate = pending[0]
+        if command is not None and (command.room_id, command.intent) != (
+            candidate.room_id,
+            candidate.intent,
+        ):
+            raise JournalConflictError("queued local membership command changed")
+        access_token = self._client.access_token
+        if type(access_token) is not str or not access_token:
+            raise LocalProtocolError("local membership intent requires an access token")
+        if candidate.intent.current_membership == "join":
+            method, path = Api.join(access_token, candidate.room_id)
+        else:
+            assert candidate.intent.current_membership == "leave"
+            method, path = Api.room_leave(access_token, candidate.room_id)
+        owner = self._journal.load_owner()
+        source = self._journal.load_source()
+        request = ports.NetworkRequest(
+            owner.stream_id,
+            owner.transport_kind,
+            source.source_epoch,
+            source.next_request_id,
+            method,
+            path,
+            (),
+            None,
+            self._config.source.timeout_ms,
+            source.cursor_json,
+        )
+
+        def fail_command(error: BaseException) -> None:
+            nonlocal command
+            if command is not None:
+                if not command.completion.done():
+                    command.completion.set_exception(error)
+                self._local_membership_command = None
+                command = None
+
+        retries = 0
+        while True:
+            network = await self._request(request, body_disconnect_retry=True)
+            if network.status_code == 200:
+                break
+            error_code: str | None = None
+            try:
+                error_value = load_json(
+                    network.body,
+                    "local membership error",
+                )
+                if (
+                    type(error_value) is dict
+                    and canonical_json(error_value) == network.body
+                    and type(error_value.get("errcode")) is str
+                ):
+                    error_code = error_value["errcode"]
+            except (TypeError, ValueError) as _error:
+                pass
+            if error_code is None and network.status_code == 401:
+                error_code = "M_UNKNOWN_TOKEN"
+            elif error_code is None and network.status_code == 403:
+                error_code = "M_FORBIDDEN"
+            if error_code in {"M_UNKNOWN_TOKEN", "M_FORBIDDEN"}:
+                failure = IngestionSourceError(
+                    "local membership authentication failed: " f"{error_code}"
+                )
+                fail_command(failure)
+                raise failure
+            retryable = (
+                network.failure is not None
+                or network.status_code in {408, 429}
+                or network.status_code is not None
+                and 500 <= network.status_code <= 599
+                or error_code == "M_LIMIT_EXCEEDED"
+            )
+            if not retryable:
+                try:
+                    self._journal._clear_local_membership_intent(
+                        room_id=candidate.room_id,
+                        intent=candidate.intent,
+                    )
+                except BaseException as error:
+                    fail_command(error)
+                    raise
+                if command is not None:
+                    if not command.completion.done():
+                        command.completion.set_result(False)
+                    self._local_membership_command = None
+                    command = None
+                self._signal_progress()
+                return True
+            retries += 1
+            delay = (
+                network.retry_after_ms / 1000
+                if network.retry_after_ms is not None
+                else 0.0
+            )
+            if network.retry_after_ms is None and retries >= 2:
+                delay = min(
+                    self._client.config.backoff_factor
+                    * (2 ** (min(retries, 1000) - 1)),
+                    self._client.config.max_timeout_retry_wait_time,
+                )
+            await asyncio.sleep(delay)
+            self._client._assert_ingestion_not_poisoned()
+            if self._close_task is not None or self._closed:
+                raise LocalProtocolError("ingestion session is closed")
+            current = self._journal._load_pending_local_membership_intents(limit=2)
+            if current != (candidate,):
+                conflict = JournalConflictError(
+                    "local membership intent changed during retry"
+                )
+                fail_command(conflict)
+                raise conflict
+        try:
+            value = load_json(network.body, "local membership response")
+            if type(value) is not dict or canonical_json(value) != network.body:
+                raise ValueError
+            if candidate.intent.current_membership == "join":
+                response = JoinResponse.from_dict(value)
+                if type(response) is not JoinResponse or response.room_id != (
+                    candidate.room_id
+                ):
+                    raise ValueError
+            else:
+                response = RoomLeaveResponse.from_dict(value)
+                if type(response) is not RoomLeaveResponse:
+                    raise ValueError
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            failure = IngestionSourceError("malformed local membership response")
+            fail_command(failure)
+            raise failure from error
+        intent = candidate.intent
+        try:
+            self._journal._publish_local_membership_transition(
+                operation_id=intent.operation_id,
+                room_id=candidate.room_id,
+                previous_membership=intent.previous_membership,
+                previous_epoch=intent.previous_epoch,
+                current_membership=intent.current_membership,
+            )
+        except BaseException as error:
+            fail_command(error)
+            raise
+        if command is not None:
+            if not command.completion.done():
+                command.completion.set_result(True)
+            self._local_membership_command = None
+        self._signal_progress()
+        return True
+
+    def _signal_progress(self) -> None:
+        self._progress_generation += 1
+        self._progress_event.set()
+
+    async def _wait_for_progress(self, observed_generation: int) -> None:
+        if self._progress_generation != observed_generation:
+            return
+        self._progress_event.clear()
+        if self._progress_generation != observed_generation:
+            return
+        await self._progress_event.wait()
+
     async def _settle_batch(
         self,
         batch: SyncBatch,
@@ -843,6 +1770,7 @@ class _OwnedIngestionSession(IngestionSession):
                 settlement = self._journal._load_batch_settlement(batch)
                 if settlement is None:
                     self._journal.acknowledge_batch(batch.ref)
+                    self._signal_progress()
                     return
 
                 work, room = settlement
@@ -1512,6 +2440,7 @@ class _OwnedIngestionSession(IngestionSession):
                 if self._close_task is not None or self._closed:
                     raise LocalProtocolError("ingestion session is closed")
                 self._journal.acknowledge_batch(batch.ref)
+                self._signal_progress()
             finally:
                 self._settlement_task = None
 
@@ -1522,6 +2451,7 @@ class _OwnedIngestionSession(IngestionSession):
         if self._settlement_task is not None:
             raise LocalProtocolError("cannot acknowledge during settlement")
         self._journal.acknowledge_batch(ref)
+        self._signal_progress()
 
     def _publish_local_membership_transition(
         self,
@@ -1542,6 +2472,40 @@ class _OwnedIngestionSession(IngestionSession):
             previous_epoch=previous_epoch,
             current_membership=current_membership,
         )
+
+    async def _run_local_membership_transition(
+        self,
+        *,
+        operation_id: UUID,
+        room_id: str,
+        previous_membership: str,
+        previous_epoch: int,
+        current_membership: str,
+    ) -> bool:
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        intent = _LocalMembershipIntent(
+            operation_id,
+            previous_membership,
+            previous_epoch,
+            current_membership,
+        )
+        command = self._local_membership_command
+        if command is None:
+            completion: asyncio.Future[bool] = (
+                asyncio.get_running_loop().create_future()
+            )
+            command = _LocalMembershipCommand(room_id, intent, completion)
+            self._local_membership_command = command
+            self._signal_progress()
+        elif (command.room_id, command.intent) != (room_id, intent):
+            raise LocalProtocolError(
+                "another local membership command is already queued"
+            )
+        return await asyncio.shield(command.completion)
 
     async def close(self) -> None:
         if self._settlement_task is asyncio.current_task():
@@ -1574,6 +2538,10 @@ class _OwnedIngestionSession(IngestionSession):
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+        command = self._local_membership_command
+        if command is not None and not command.completion.done():
+            command.completion.cancel()
+        self._local_membership_command = None
         if not self._detached:
             self._client._detach_ingestion_store(self._owned_store)
             self._detached = True
@@ -1652,6 +2620,7 @@ def _open_owned_ingestion(
     config: IngestionConfig,
     consumer_generation: UUID,
     stream_id: UUID | None,
+    _completion_sink: Callable[[_FrameCompletion], Awaitable[None]] | None = None,
 ) -> _OwnedIngestionSession:
     from ..client.async_client import AsyncClient
     from ..client.base_client import _room_from_snapshot
@@ -1687,6 +2656,8 @@ def _open_owned_ingestion(
         raise LocalProtocolError("consumer_generation must be UUID")
     if type(stream_id) is not UUID:
         raise LocalProtocolError("stream_id must be a bound UUID")
+    if _completion_sink is not None and not callable(_completion_sink):
+        raise LocalProtocolError("completion sink must be callable")
     owner = bootstrap._journal.load_owner()
     if (client.user_id, client.device_id) != (owner.account_id, owner.device_id):
         raise LocalProtocolError("client identity does not match ingestion owner")
@@ -1760,6 +2731,7 @@ def _open_owned_ingestion(
             store,
             journal,
             source,
+            _completion_sink,
         )
         candidate._commit_transfer(store, lease)
         return session

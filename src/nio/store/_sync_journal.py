@@ -74,7 +74,10 @@ from ._sync_journal_rows import (
     _frame_payload,
     _FrameDrainRow,
     _OutboundMaintenance,
+    _OutboundOperation,
+    _PendingOutboundMaintenance,
     _prepared_frame_payload,
+    _PreparedFrameState,
     _Task3WorkInventory,
 )
 from ._sync_journal_values import (
@@ -84,6 +87,8 @@ from ._sync_journal_values import (
     MaterializerLimits,
     MaterializeStatus,
     RoomAggregateValue,
+    _FrameCompletion,
+    _LocalMembershipIntent,
 )
 
 if TYPE_CHECKING:
@@ -769,6 +774,178 @@ class SqliteIngestionJournal(JournalRows):
     ) -> MaterializeResult:
         return self._materialize_oldest_frame(limits)
 
+    def _record_local_membership_intent(
+        self,
+        *,
+        operation_id: UUID,
+        room_id: str,
+        previous_membership: str,
+        previous_epoch: int,
+        current_membership: str,
+    ) -> CommitResult:
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        intent = _LocalMembershipIntent(
+            operation_id,
+            previous_membership,
+            previous_epoch,
+            current_membership,
+        )
+
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            if self._load_authenticated_frame_headers(owner):
+                raise JournalConflictError(
+                    "local membership intent requires the Frame queue to drain"
+                )
+            inventory = self._load_task3_work_inventory(owner)
+            if inventory.work:
+                raise JournalConflictError(
+                    "local membership intent requires the Work queue to drain"
+                )
+            pending_rows = self._execute(
+                "SELECT room_id FROM NioIngestRoomAggregate "
+                "WHERE account_id = ? AND intent_kind = 'local_membership' "
+                "ORDER BY room_id LIMIT 2",
+                (self.account_id,),
+            ).fetchall()
+            if pending_rows:
+                if len(pending_rows) != 1 or pending_rows[0][0] != room_id:
+                    raise JournalConflictError(
+                        "another local membership intent is pending"
+                    )
+                loaded_pending = self._load_room_aggregate(owner, room_id)
+                if loaded_pending is None:
+                    raise JournalIntegrityError(
+                        "local membership intent Aggregate disappeared"
+                    )
+                pending_value = loaded_pending[1]
+                if pending_value.pending_local_membership != intent:
+                    raise JournalConflictError(
+                        "local membership operation identity collides"
+                    )
+                return CommitResult(pending_value.updated_revision)
+
+            loaded = self._load_room_aggregate(owner, room_id)
+            if loaded is None:
+                if (previous_membership, previous_epoch, current_membership) != (
+                    "leave",
+                    0,
+                    "join",
+                ):
+                    raise JournalConflictError(
+                        "local membership intent requires an Aggregate"
+                    )
+                stored_aggregate = None
+                continuity = ingest_reducer.RoomContinuity(
+                    room_id,
+                    0,
+                    "leave",
+                    None,
+                    None,
+                    None,
+                )
+                next_room_sequence = 0
+                snapshot = None
+            else:
+                stored_aggregate, aggregate = loaded
+                continuity = aggregate.continuity
+                next_room_sequence = aggregate.next_room_sequence
+                snapshot = aggregate.room_snapshot
+                if (
+                    continuity.gap is not None
+                    or continuity.hydration_id is not None
+                    or aggregate.pending_hydration is not None
+                    or aggregate.pending_local_membership is not None
+                ):
+                    raise JournalConflictError(
+                        "local membership intent is blocked by a room barrier"
+                    )
+            if (
+                continuity.membership != previous_membership
+                or continuity.membership_epoch != previous_epoch
+            ):
+                raise JournalConflictError(
+                    "local membership intent does not match current state"
+                )
+            if owner.revision == SQLITE_INT_MAX:
+                raise LocalProtocolError("local membership revision is exhausted")
+
+            new_revision = owner.revision + 1
+            successor = RoomAggregateValue(
+                continuity,
+                next_room_sequence,
+                new_revision,
+                None,
+                snapshot,
+                intent,
+            )
+            aggregate_plaintext = _canonical_room_aggregate_plaintext(successor)
+            aggregate_payload, aggregate_digest = self._payload(
+                owner,
+                "NioIngestRoomAggregate",
+                aggregate_plaintext,
+                header=_canonical_internal([room_id, new_revision, "local_membership"]),
+            )
+            cursor = self._transition_execute(
+                "local_intent_meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "local membership intent compare-and-swap failed"
+                )
+            if stored_aggregate is None:
+                try:
+                    cursor = self._transition_execute(
+                        "local_intent_aggregate_insert",
+                        "INSERT INTO NioIngestRoomAggregate("
+                        "account_id, room_id, updated_revision, intent_kind, "
+                        "payload, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            self.account_id,
+                            room_id,
+                            new_revision,
+                            "local_membership",
+                            aggregate_payload,
+                            aggregate_digest,
+                        ),
+                    )
+                except (sqlite3.IntegrityError, IntegrityError) as error:
+                    raise JournalConflictError(
+                        "local membership intent Aggregate insert collided"
+                    ) from error
+            else:
+                cursor = self._transition_execute(
+                    "local_intent_aggregate_update",
+                    "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
+                    "intent_kind = 'local_membership', payload = ?, "
+                    "payload_sha256 = ? WHERE account_id = ? AND room_id = ? "
+                    "AND updated_revision = ? AND intent_kind IS NULL",
+                    (
+                        new_revision,
+                        aggregate_payload,
+                        aggregate_digest,
+                        self.account_id,
+                        room_id,
+                        stored_aggregate[2],
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "local membership intent Aggregate snapshot changed"
+                )
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+
     def _publish_local_membership_transition(
         self,
         *,
@@ -789,6 +966,12 @@ class SqliteIngestionJournal(JournalRows):
         )
         record_id = _local_membership_record_id(operation_id)
         source_json = _local_membership_source_json(
+            previous_membership,
+            previous_epoch,
+            current_membership,
+        )
+        expected_intent = _LocalMembershipIntent(
+            operation_id,
             previous_membership,
             previous_epoch,
             current_membership,
@@ -865,13 +1048,19 @@ class SqliteIngestionJournal(JournalRows):
                 )
                 next_room_sequence = 0
                 pending_hydration = None
+                pending_local_membership = None
                 snapshot = None
             else:
                 stored_aggregate, aggregate = loaded
                 continuity = aggregate.continuity
                 next_room_sequence = aggregate.next_room_sequence
                 pending_hydration = aggregate.pending_hydration
+                pending_local_membership = aggregate.pending_local_membership
                 snapshot = aggregate.room_snapshot
+            if pending_local_membership not in (None, expected_intent):
+                raise JournalConflictError(
+                    "local membership transition does not own the pending intent"
+                )
             if (
                 continuity.gap is not None
                 or continuity.hydration_id is not None
@@ -1057,6 +1246,162 @@ class SqliteIngestionJournal(JournalRows):
         self._transition_hook("commit")
         return CommitResult(new_revision)
 
+    def _clear_local_membership_intent(
+        self,
+        *,
+        room_id: str,
+        intent: _LocalMembershipIntent,
+    ) -> CommitResult:
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        if type(intent) is not _LocalMembershipIntent:
+            raise TypeError("intent must be _LocalMembershipIntent")
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            loaded = self._load_room_aggregate(owner, room_id)
+            if loaded is None:
+                raise JournalConflictError(
+                    "local membership intent Aggregate disappeared"
+                )
+            stored_aggregate, aggregate = loaded
+            if aggregate.pending_local_membership != intent:
+                raise JournalConflictError("local membership intent changed")
+            if owner.revision == SQLITE_INT_MAX:
+                raise LocalProtocolError("local membership revision is exhausted")
+            new_revision = owner.revision + 1
+            successor = RoomAggregateValue(
+                aggregate.continuity,
+                aggregate.next_room_sequence,
+                new_revision,
+                None,
+                aggregate.room_snapshot,
+            )
+            aggregate_plaintext = _canonical_room_aggregate_plaintext(successor)
+            aggregate_payload, aggregate_digest = self._payload(
+                owner,
+                "NioIngestRoomAggregate",
+                aggregate_plaintext,
+                header=_canonical_internal([room_id, new_revision, None]),
+            )
+            cursor = self._transition_execute(
+                "local_intent_clear_meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "local membership intent clear compare-and-swap failed"
+                )
+            cursor = self._transition_execute(
+                "local_intent_clear_aggregate_update",
+                "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
+                "intent_kind = NULL, payload = ?, payload_sha256 = ? "
+                "WHERE account_id = ? AND room_id = ? AND updated_revision = ? "
+                "AND intent_kind = 'local_membership'",
+                (
+                    new_revision,
+                    aggregate_payload,
+                    aggregate_digest,
+                    self.account_id,
+                    room_id,
+                    stored_aggregate[2],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "local membership intent Aggregate snapshot changed"
+                )
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+
+    def _has_pending_local_membership_work(self) -> bool:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            inventory = self._load_task3_work_inventory(owner)
+            return any(
+                type(item.value) is EventRecord
+                and type(item.value.origin) is SystemOrigin
+                and item.value.origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+                for item in inventory.work
+            )
+
+    def _local_membership_work_state(
+        self,
+        *,
+        room_id: str,
+        intent: _LocalMembershipIntent,
+    ) -> tuple[bool, int | None]:
+        if type(room_id) is not str or not room_id:
+            raise TypeError("room_id must be a nonempty str")
+        if type(intent) is not _LocalMembershipIntent:
+            raise TypeError("intent must be _LocalMembershipIntent")
+        current_epoch = _local_membership_transition_epoch(
+            intent.previous_membership,
+            intent.previous_epoch,
+            intent.current_membership,
+        )
+        record_id = _local_membership_record_id(intent.operation_id)
+        source_json = _local_membership_source_json(
+            intent.previous_membership,
+            intent.previous_epoch,
+            intent.current_membership,
+        )
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            inventory = self._load_task3_work_inventory(owner)
+            local_work = tuple(
+                item
+                for item in inventory.work
+                if type(item.value) is EventRecord
+                and type(item.value.origin) is SystemOrigin
+                and item.value.origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+            )
+            operation_work = tuple(
+                item
+                for item in inventory.work
+                if item.frame_id == intent.operation_id
+                or type(item.value) is EventRecord
+                and item.value.record_id == record_id
+            )
+        if not operation_work:
+            return bool(local_work), None
+        if len(operation_work) != 1:
+            raise JournalConflictError("local membership operation identity collides")
+        item = operation_work[0]
+        value = item.value
+        if (
+            type(value) is not EventRecord
+            or value
+            != EventRecord(
+                record_id,
+                RecordKind.ROOM_LIFECYCLE,
+                SystemOrigin(
+                    SystemOriginKind.MEMBERSHIP_CHANGE,
+                    intent.operation_id,
+                ),
+                room_id,
+                current_epoch,
+                value.room_sequence,
+                None,
+                None,
+                source_json,
+                None,
+            )
+            or item.status != "ready"
+            or item.frame_id != intent.operation_id
+            or item.created_revision is None
+            or item.metadata is not None
+        ):
+            raise JournalConflictError("local membership operation identity collides")
+        return True, item.created_revision
+
     def _authenticate_blocking_frame(
         self,
         owner: OwnerView,
@@ -1078,6 +1423,431 @@ class SqliteIngestionJournal(JournalRows):
             owner,
             drain_header_authenticated=True,
         )
+
+    def _ready_outbound_maintenance_with_owner(
+        self,
+        owner: OwnerView,
+        selected: _FrameDrainRow,
+    ) -> tuple[_PreparedFrameState, _PendingOutboundMaintenance] | None:
+        if (
+            selected.room_materialized_revision is None
+            or selected.callbacks_claimed_revision is not None
+        ):
+            return None
+        self._authenticate_blocking_frame(owner, selected)
+        prepared = self._load_prepared_frame_with_owner(
+            selected.frame_id,
+            owner,
+        )
+        if prepared is None:
+            return None
+        inventory = self._load_task3_work_inventory(owner)
+        if any(work.frame_id == selected.frame_id for work in inventory.work):
+            return None
+        for index, operation in enumerate(prepared.outbound_maintenance.operations):
+            if operation.state == "pending":
+                return prepared, _PendingOutboundMaintenance(
+                    selected.frame_id,
+                    owner.stream_id,
+                    owner.transport_kind,
+                    selected.source_epoch,
+                    selected.request_id,
+                    prepared.request_cursor_json,
+                    index,
+                    len(prepared.outbound_maintenance.operations),
+                    operation,
+                )
+        return None
+
+    def _load_ready_outbound_maintenance(
+        self,
+    ) -> _PendingOutboundMaintenance | None:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                return None
+            ready = self._ready_outbound_maintenance_with_owner(owner, headers[0])
+            return None if ready is None else ready[1]
+
+    def _settle_outbound_maintenance(
+        self,
+        *,
+        pending: _PendingOutboundMaintenance,
+        apply: Callable[[], tuple[_OutboundOperation, ...]],
+    ) -> CommitResult:
+        if type(pending) is not _PendingOutboundMaintenance:
+            raise TypeError("pending maintenance carrier is invalid")
+        if not callable(apply):
+            raise TypeError("maintenance apply callback must be callable")
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                raise JournalConflictError("outbound maintenance Frame is absent")
+            selected = headers[0]
+            ready = self._ready_outbound_maintenance_with_owner(owner, selected)
+            if ready is None or ready[1] != pending:
+                raise JournalConflictError("outbound maintenance operation changed")
+            prepared, _current = ready
+            selected_row = cast(
+                "Mapping[str, object]",
+                self._frame_row(selected.frame_id),
+            )
+            if (
+                self._frame_drain_row_from_full(
+                    selected_row,
+                    owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError(
+                    "outbound maintenance Frame snapshot changed"
+                )
+            operations = list(prepared.outbound_maintenance.operations)
+            operation = operations[pending.operation_index]
+            operations[pending.operation_index] = _OutboundOperation(
+                operation.kind,
+                "settled",
+                operation.body_json,
+                operation.transaction_id,
+                operation.event_type,
+                None,
+            )
+            new_revision = owner.revision + 1
+            follow_ups = apply()
+            if type(follow_ups) is not tuple or any(
+                type(operation) is not _OutboundOperation for operation in follow_ups
+            ):
+                raise TypeError("maintenance follow-up operations are invalid")
+            operations.extend(follow_ups)
+            payload, digest = _prepared_frame_payload(
+                owner=(
+                    self.account_id,
+                    owner.stream_id,
+                    owner.transport_kind,
+                ),
+                frame_id=selected.frame_id,
+                source_epoch=selected.source_epoch,
+                request_id=selected.request_id,
+                staged_revision=selected.staged_revision,
+                request_cursor_json=prepared.request_cursor_json,
+                candidate_cursor_json=prepared.candidate_cursor_json,
+                source_sha256=prepared.source_sha256,
+                compatibility_token=prepared.compatibility_token,
+                outbound_maintenance=_OutboundMaintenance(tuple(operations)),
+            )
+            cursor = self._transition_execute(
+                "outbound_meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "outbound maintenance compare-and-swap failed"
+                )
+            proof = _frame_drain_sha256(
+                owner,
+                frame_id=selected.frame_id,
+                source_epoch=selected.source_epoch,
+                request_id=selected.request_id,
+                staged_revision=selected.staged_revision,
+                payload_sha256=digest,
+                payload_length=len(payload),
+                room_materialized_revision=selected.room_materialized_revision,
+                callbacks_claimed_revision=None,
+            )
+            cursor = self._transition_execute(
+                "outbound_frame_settle",
+                "UPDATE NioIngestFrame SET payload = ?, payload_sha256 = ?, "
+                "drain_header_sha256 = ? WHERE account_id = ? AND frame_id = ? "
+                "AND source_epoch = ? AND request_id = ? AND staged_revision = ? "
+                "AND payload = ? AND payload_sha256 = ? "
+                "AND room_materialized_revision = ? "
+                "AND callbacks_claimed_revision IS NULL "
+                "AND drain_header_sha256 = ?",
+                (
+                    payload,
+                    digest,
+                    proof,
+                    selected_row["account_id"],
+                    selected_row["frame_id"],
+                    selected_row["source_epoch"],
+                    selected_row["request_id"],
+                    selected_row["staged_revision"],
+                    selected_row["payload"],
+                    selected_row["payload_sha256"],
+                    selected_row["room_materialized_revision"],
+                    selected_row["drain_header_sha256"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalIntegrityError("outbound maintenance Frame update failed")
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+
+    def _completed_prepared_frame_with_owner(
+        self,
+        owner: OwnerView,
+        selected: _FrameDrainRow,
+    ) -> _PreparedFrameState | None:
+        if selected.room_materialized_revision is None:
+            return None
+        self._authenticate_blocking_frame(owner, selected)
+        prepared = self._load_prepared_frame_with_owner(
+            selected.frame_id,
+            owner,
+        )
+        if prepared is None:
+            return None
+        inventory = self._load_task3_work_inventory(owner)
+        if any(work.frame_id == selected.frame_id for work in inventory.work):
+            return None
+        if any(
+            operation.state != "settled"
+            for operation in prepared.outbound_maintenance.operations
+        ):
+            return None
+        return prepared
+
+    def _oldest_prepared_frame_has_work(self, frame_id: UUID) -> bool:
+        if type(frame_id) is not UUID:
+            raise TypeError("Frame ID must be UUID")
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                return False
+            selected = headers[0]
+            if selected.frame_id != frame_id:
+                raise JournalConflictError("blocked Frame ownership changed")
+            if (
+                selected.room_materialized_revision is None
+                or selected.callbacks_claimed_revision is not None
+            ):
+                return False
+            self._authenticate_blocking_frame(owner, selected)
+            if self._load_prepared_frame_with_owner(frame_id, owner) is None:
+                return False
+            inventory = self._load_task3_work_inventory(owner)
+            return any(work.frame_id == frame_id for work in inventory.work)
+
+    def _completion_claim_is_ready(self) -> bool:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                return False
+            selected = headers[0]
+            return (
+                selected.callbacks_claimed_revision is None
+                and self._completed_prepared_frame_with_owner(owner, selected)
+                is not None
+            )
+
+    @staticmethod
+    def _frame_completion(
+        owner: OwnerView,
+        selected: _FrameDrainRow,
+    ) -> _FrameCompletion:
+        claimed_revision = selected.callbacks_claimed_revision
+        if claimed_revision is None:
+            raise JournalIntegrityError("Frame completion is not claimed")
+        return _FrameCompletion(
+            selected.frame_id,
+            owner.transport_kind,
+            selected.source_epoch,
+            selected.request_id,
+            selected.staged_revision,
+            claimed_revision,
+        )
+
+    def _claim_frame_completion(self) -> _FrameCompletion | None:
+        if not self._completion_claim_is_ready():
+            return None
+        completion: _FrameCompletion | None = None
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if headers:
+                selected = headers[0]
+                if (
+                    selected.callbacks_claimed_revision is None
+                    and self._completed_prepared_frame_with_owner(owner, selected)
+                    is not None
+                ):
+                    selected_row = cast(
+                        "Mapping[str, object]",
+                        self._frame_row(selected.frame_id),
+                    )
+                    if (
+                        self._frame_drain_row_from_full(
+                            selected_row,
+                            owner,
+                            authenticate=False,
+                        )
+                        != selected
+                    ):
+                        raise JournalIntegrityError("completion Frame snapshot changed")
+                    new_revision = owner.revision + 1
+                    cursor = self._transition_execute(
+                        "completion_meta_revision_epoch_cas",
+                        "UPDATE NioIngestMeta SET revision = ? "
+                        "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                        (
+                            new_revision,
+                            self.account_id,
+                            owner.revision,
+                            str(owner.writer_epoch),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise JournalConflictError(
+                            "Frame completion compare-and-swap failed"
+                        )
+                    proof = _frame_drain_sha256(
+                        owner,
+                        frame_id=selected.frame_id,
+                        source_epoch=selected.source_epoch,
+                        request_id=selected.request_id,
+                        staged_revision=selected.staged_revision,
+                        payload_sha256=selected.payload_sha256,
+                        payload_length=selected.payload_length,
+                        room_materialized_revision=(
+                            selected.room_materialized_revision
+                        ),
+                        callbacks_claimed_revision=new_revision,
+                    )
+                    cursor = self._transition_execute(
+                        "frame_completion_claim",
+                        "UPDATE NioIngestFrame SET callbacks_claimed_revision = ?, "
+                        "drain_header_sha256 = ? WHERE account_id = ? "
+                        "AND frame_id = ? AND source_epoch = ? AND request_id = ? "
+                        "AND staged_revision = ? AND payload = ? "
+                        "AND payload_sha256 = ? AND room_materialized_revision = ? "
+                        "AND callbacks_claimed_revision IS NULL "
+                        "AND drain_header_sha256 = ?",
+                        (
+                            new_revision,
+                            proof,
+                            selected_row["account_id"],
+                            selected_row["frame_id"],
+                            selected_row["source_epoch"],
+                            selected_row["request_id"],
+                            selected_row["staged_revision"],
+                            selected_row["payload"],
+                            selected_row["payload_sha256"],
+                            selected_row["room_materialized_revision"],
+                            selected_row["drain_header_sha256"],
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise JournalIntegrityError("Frame completion claim failed")
+                    self._transition_hook("before_commit")
+                    completion = _FrameCompletion(
+                        selected.frame_id,
+                        owner.transport_kind,
+                        selected.source_epoch,
+                        selected.request_id,
+                        selected.staged_revision,
+                        new_revision,
+                    )
+        if completion is not None:
+            self._transition_hook("commit")
+        return completion
+
+    def _load_claimed_frame_completion(self) -> _FrameCompletion | None:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                return None
+            selected = headers[0]
+            if (
+                selected.callbacks_claimed_revision is None
+                or self._completed_prepared_frame_with_owner(owner, selected) is None
+            ):
+                return None
+            return self._frame_completion(owner, selected)
+
+    def _retire_claimed_frame(
+        self,
+        completion: _FrameCompletion,
+    ) -> CommitResult:
+        if type(completion) is not _FrameCompletion:
+            raise TypeError("Frame completion carrier is invalid")
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers:
+                raise JournalConflictError("claimed completion Frame is absent")
+            selected = headers[0]
+            if (
+                self._completed_prepared_frame_with_owner(owner, selected) is None
+                or self._frame_completion(owner, selected) != completion
+            ):
+                raise JournalConflictError("claimed Frame completion changed")
+            selected_row = cast(
+                "Mapping[str, object]",
+                self._frame_row(selected.frame_id),
+            )
+            if (
+                self._frame_drain_row_from_full(
+                    selected_row,
+                    owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError("claimed Frame snapshot changed")
+            new_revision = owner.revision + 1
+            cursor = self._transition_execute(
+                "completion_retire_meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError("Frame retirement compare-and-swap failed")
+            cursor = self._transition_execute(
+                "frame_completion_retire",
+                "DELETE FROM NioIngestFrame WHERE account_id = ? "
+                "AND frame_id = ? AND source_epoch = ? AND request_id = ? "
+                "AND staged_revision = ? AND payload = ? AND payload_sha256 = ? "
+                "AND room_materialized_revision = ? "
+                "AND callbacks_claimed_revision = ? "
+                "AND drain_header_sha256 = ?",
+                (
+                    selected_row["account_id"],
+                    selected_row["frame_id"],
+                    selected_row["source_epoch"],
+                    selected_row["request_id"],
+                    selected_row["staged_revision"],
+                    selected_row["payload"],
+                    selected_row["payload_sha256"],
+                    selected_row["room_materialized_revision"],
+                    selected_row["callbacks_claimed_revision"],
+                    selected_row["drain_header_sha256"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalIntegrityError("claimed Frame retirement failed")
+            self._transition_hook("before_commit")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
 
     def _prepare_and_materialize_oldest_frame(
         self,

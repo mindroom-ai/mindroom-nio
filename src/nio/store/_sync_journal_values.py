@@ -5,7 +5,11 @@ from enum import StrEnum
 from typing import NamedTuple
 from uuid import UUID
 
-from ..ingest.model import RoomSnapshot
+from ..ingest.model import (
+    RoomSnapshot,
+    TransportKind,
+    _local_membership_transition_epoch,
+)
 from ..ingest.reducer import HydrationIntent, RoomContinuity
 
 SQLITE_INT_MAX = 2**63 - 1
@@ -96,12 +100,72 @@ class MaterializeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameCompletion:
+    frame_id: UUID
+    transport: TransportKind
+    source_epoch: int
+    request_id: int
+    staged_revision: int
+    claimed_revision: int
+
+    def __post_init__(self) -> None:
+        _require_exact(self.frame_id, UUID, "frame_id")
+        _require_exact(self.transport, TransportKind, "transport")
+        for field_name in (
+            "source_epoch",
+            "request_id",
+            "staged_revision",
+            "claimed_revision",
+        ):
+            _require_exact(getattr(self, field_name), int, field_name)
+        if self.source_epoch < 0 or self.request_id < 0:
+            raise ValueError("Frame completion source identity is invalid")
+        if self.staged_revision < 1:
+            raise ValueError("Frame completion staged revision must be positive")
+        if self.claimed_revision <= self.staged_revision:
+            raise ValueError("Frame completion claim must follow staging")
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalMembershipIntent:
+    operation_id: UUID
+    previous_membership: str
+    previous_epoch: int
+    current_membership: str
+
+    def __post_init__(self) -> None:
+        _require_exact(self.operation_id, UUID, "operation_id")
+        _local_membership_transition_epoch(
+            self.previous_membership,
+            self.previous_epoch,
+            self.current_membership,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingLocalMembership:
+    room_id: str
+    continuity: RoomContinuity
+    intent: _LocalMembershipIntent
+
+    def __post_init__(self) -> None:
+        _require_exact(self.room_id, str, "room_id")
+        if not self.room_id:
+            raise ValueError("room_id must be nonempty")
+        _require_exact(self.continuity, RoomContinuity, "continuity")
+        _require_exact(self.intent, _LocalMembershipIntent, "intent")
+        if self.continuity.room_id != self.room_id:
+            raise ValueError("local membership room identity disagrees")
+
+
+@dataclass(frozen=True, slots=True)
 class RoomAggregateValue:
     continuity: RoomContinuity
     next_room_sequence: int
     updated_revision: int
     pending_hydration: HydrationIntent | None
     room_snapshot: RoomSnapshot | None = None
+    pending_local_membership: _LocalMembershipIntent | None = None
 
     def __post_init__(self) -> None:
         _require_exact(self.continuity, RoomContinuity, "continuity")
@@ -115,6 +179,12 @@ class RoomAggregateValue:
             )
         if self.room_snapshot is not None:
             _require_exact(self.room_snapshot, RoomSnapshot, "room_snapshot")
+        if self.pending_local_membership is not None:
+            _require_exact(
+                self.pending_local_membership,
+                _LocalMembershipIntent,
+                "pending_local_membership",
+            )
         if self.next_room_sequence < 0:
             raise ValueError("next_room_sequence must be nonnegative")
         if self.updated_revision < 1:
@@ -122,6 +192,19 @@ class RoomAggregateValue:
 
         gap = self.continuity.gap
         hydration_id = self.continuity.hydration_id
+        local = self.pending_local_membership
+        if self.pending_hydration is not None and local is not None:
+            raise ValueError("hydration and local membership intents are exclusive")
+        if local is not None and (
+            gap is not None
+            or hydration_id is not None
+            or (
+                self.continuity.membership,
+                self.continuity.membership_epoch,
+            )
+            != (local.previous_membership, local.previous_epoch)
+        ):
+            raise ValueError("local membership intent disagrees with continuity")
         if gap is not None:
             if self.pending_hydration is not None:
                 raise ValueError("recovery and hydration intents are exclusive")

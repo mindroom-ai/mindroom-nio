@@ -56,7 +56,7 @@ action**.
 
 | Repository | Branch | Required HEAD | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Descendant of Task 5B validation checkpoint `efb5b461e7d1c2573c0c14403f9c5ea6b6f7b83c` | Tasks 1–4E committed, Task 5B completed in MindRoom, and its restart state recorded here; no tracked changes expected after this documentation commit |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | `59bbb3b05c993488d1e81a35e6b743658ac4c87b` | Task 4F in progress at the exact dirty checkpoint below; preserve it |
 | `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `3a8094759d23b3740119893419cd7eff8b0c785b` | Task 5B committed; no tracked changes expected |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
@@ -105,7 +105,8 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
 | Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
 | Task 5B MindRoom all-record adapter/pump | Complete | MindRoom `3a8094759d23b3740119893419cd7eff8b0c785b`; owning 319-test file, full repository suite, and all pre-commit hooks GREEN |
-| Tasks 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
+| Task 4F coordinator progress/completion | In progress | All implementation/checklist slices, including the complete durable local-membership matrix, are GREEN at dirty source/test patch `1ca31931...`; final whole-repository gate and commit-readiness audit are next |
+| Tasks 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
 
 ### Task 4E completed and committed
 
@@ -655,9 +656,10 @@ uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
   tests/test_durable_ingestion_admission.py
 ```
 
-Immediate next: execute Task 4F in `/work/dev/mindroom-nio`, beginning with its
-first causal progress-machine RED. Re-read the Task 4F section and current nio
-owned-session/coordinator implementation before editing. Task 5B deliberately
+Immediate next: continue Task 4F in `/work/dev/mindroom-nio` from the live
+restart handoff above. The next causal slice is local leave/rejoin plus
+duplicate/ordering behavior; the carrier, pre-HTTP restart, successful local
+publication, and Work-ack/source fence are already GREEN. Task 5B deliberately
 does not wire the pump into `bot.py` or `orchestrator.py`; Tasks 5C/5D own that
 activation after Task 4F exists.
 
@@ -685,28 +687,407 @@ After the decrypted pair, complete Task 4E in this order:
 ### Immediate next action
 
 A fresh session can be started with: “Read the controlling design and the live
-restart handoff in this plan, verify the recorded branches and clean HEADs,
-preserve unrelated untracked files, and start Task4F from its first causal RED.”
+restart handoff in this plan, verify the recorded branches and dirty hash,
+preserve unrelated untracked files, and continue Task4F from the first unchecked
+item.”
 
 Task4F is the current slice. Continue it in this order:
 
-- [ ] Re-read the controlling Task4F design/plan sections and inspect the
+- [x] Re-read the controlling Task4F design/plan sections and inspect the
       current retained prepared-Frame, owned runner, Work ack, outbound-plan,
       local-intent, close, poison, and wake seams before editing.
-- [ ] Freeze the smallest private progress-machine carrier/API boundary. Keep
+- [x] Freeze the smallest private progress-machine carrier/API boundary. Keep
       it non-exported; do not add a public `IngestionSession` method, a sixth
       table, or live MindRoom wiring.
-- [ ] Add the first real causal RED for a retained prepared Frame whose Work is
+- [x] Add the first real causal RED for a retained prepared Frame whose Work is
       fully acknowledged: it must progress into exact persisted outbound
       maintenance rather than remain generically BLOCKED, and the next source
       HTTP must remain fenced.
-- [ ] Review that RED for authenticated ownership, FIFO, crash/restart,
+- [x] Review that RED for authenticated ownership, FIFO, crash/restart,
       transaction, cancellation, poison, and no-next-source false greens.
-- [ ] Implement only the first exact progress transition, run focused GREEN and
+- [x] Implement only the first exact progress transition, run focused GREEN and
       static gates, then continue the Task4F maintenance/claim/retire matrix one
       behavior slice at a time under the Way of working below.
-- [ ] Keep the living handoff updated after each reviewed GREEN, with exact
+- [x] Keep the living handoff updated after each reviewed GREEN, with exact
       HEAD/dirty hash, tests, blockers, and the next unchecked item.
+- [x] Add a real claimed-completion sink raise/cancel/restart matrix. Prove the
+      claimed Frame remains authenticated and a fresh session retires it
+      without invoking the sink again.
+- [x] Add completion-claim and retirement statement rollback plus post-COMMIT
+      uncertainty cases, with all-old/all-new reopen fates.
+- [x] Replace terminal BLOCKED while Work is outstanding with read-only
+      `WAIT_FOR_RECORD_ACK` yield/wake behavior; prove no no-op owner write
+      transaction and no next-source HTTP.
+- [x] Dispatch and atomically apply one exact persisted key-query response,
+      callback-free and under the same Frame settlement transaction.
+- [x] Add key-query response rollback/post-COMMIT poison/reopen coverage before
+      widening to key claim.
+- [x] Add the first restart-safe exact key-claim path: authenticate one persisted
+      wedged-device claim context, rebuild the required Olm input after reopen,
+      apply the successful response, persist the Olm session, settle the claim,
+      and append the generated dummy to-device operation in the same owner
+      transaction.
+- [x] Add key-claim rollback/post-COMMIT poison/reopen coverage, including the
+      exact session, settled claim, and appended dummy-operation fates.
+- [x] Preserve a wedged claim's authenticated Megolm rerequest through restart:
+      rebuild the exact live bucket and transfer durable ownership to the
+      generated dummy operation in the same claim settlement transaction.
+- [x] Reconstruct one authenticated own-device waiting request after restart,
+      collect it only after the claim creates its Olm session, and atomically
+      append the resulting encrypted forwarded-key message as a generic pending
+      to-device operation before clearing claim ownership.
+- [x] Dispatch a generic Frame-owned to-device operation with its exact event
+      type, deterministic transaction ID, and body; apply the response and
+      settle it atomically without callback/crypto replay.
+- [x] Add generic to-device rollback/post-COMMIT poison/reopen coverage. The
+      durable Frame fate, not the already-consumed live outgoing queue, controls
+      retry.
+- [x] Reconstruct a persisted dummy and exact Megolm rerequest bucket after
+      restart; when the dummy is marked sent, append the resulting pending
+      room-key-request operation atomically with dummy settlement.
+- [x] Add dummy settlement rollback/post-COMMIT poison/reopen coverage before
+      dispatching the appended room-key-request operation.
+- [x] Reconstruct, send, and atomically settle the appended
+      `RoomKeyRequestMessage`, persisting its `OutgoingKeyRequest` under the
+      same owner transaction.
+- [x] Add room-key-request rollback/post-COMMIT poison/reopen coverage so the
+      outgoing-key-request row and Frame settlement have one exact fate.
+- [x] Add per-operation retryable Matrix/transport errors, bounded cancellable
+      backoff, permanent-auth classification, and close/cancel fencing. No
+      error may settle or fan out.
+- [x] Add multiple-claim reconstruction after the single-operation transport
+      lifecycle is complete; do not combine it with the first generic
+      to-device dispatch slice.
+- [x] Freeze the exact no-new-table local-membership-intent carrier and private
+      owned-session seam. The stable operation identity and desired transition
+      must commit before Matrix HTTP, survive restart, serialize ahead of source
+      polling, publish the existing LOCAL lifecycle Work exactly once after the
+      Matrix fate is reconciled, wait for its ack, and retire without a lost wake.
+- [ ] Add local-intent HTTP success/error/restart, duplicate/reconcile,
+      Work-ack/retirement, rollback/post-COMMIT, cancellation/close, and
+      source-poll fencing slices one causal RED at a time.
+
+Current Task4F dirty checkpoint starts from clean nio HEAD
+`59bbb3b05c993488d1e81a35e6b743658ac4c87b` and contains exactly:
+
+```text
+docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md
+src/nio/ingest/coordinator.py
+src/nio/store/_sync_journal.py
+src/nio/store/_sync_journal_preflight.py
+src/nio/store/_sync_journal_rows.py
+src/nio/store/_sync_journal_values.py
+src/nio/store/sync_journal_schema.py
+tests/ingest/coordinator_test.py
+tests/ingest/source_journal_test.py
+```
+
+The exact binary source/test patch has SHA-256
+`1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc`.
+The first RED uses one real empty Classic Frame on a fresh owned account. Task4C
+produces zero Work and one authenticated pending key-upload operation. Before
+production the owned runner stopped solely with `IngestionBlockedError`. It now
+loads an authenticated oldest prepared Frame, proves no Work still references
+it, exposes the first pending operation through a private carrier, and enters
+the exact `POST /_matrix/client/v3/keys/upload` request with the persisted body
+before any source poll. Cancellation preserves source, Frame, plan, and the
+entire SQLite graph byte-for-byte.
+
+The next causal RED proved a returned 200 response was ignored. The narrow
+success path now parses exact `KeysUploadResponse` outside the owner transaction,
+recaptures the same authenticated oldest Frame/operation after HTTP, invokes
+Olm response application inside one owner transaction, and commits the account,
+Meta revision, and pending→settled authenticated Frame envelope together. No
+callback or public `receive_response()` path runs. The two exact nodes pass;
+Black, production Ruff `--no-fix`, targeted mypy, `py_compile`, and diff-check
+are GREEN.
+
+Key-upload response application now also has exact causal uncertainty coverage.
+A failure after the authenticated Frame update rolls back account, Meta, and
+Frame to the byte-identical pending graph and poisons that client; a post-COMMIT
+hook failure reopens the all-new settled graph with the account shared. Both
+paths require a fresh client before more owned work.
+
+The private frozen `_FrameCompletion` carrier now binds exact Frame ID,
+transport, source epoch, request ID, staged revision, and claimed revision. Once
+the oldest authenticated prepared Frame has no Work and every maintenance
+operation is settled, one owner transaction advances Meta and durably writes
+its claim. The optional private owned-session sink runs after that transaction;
+retirement then advances Meta and deletes the exact claimed Frame in a second
+transaction. A real empty Classic Frame proves key upload → claim → sink →
+retire → next source HTTP, with the Frame present and claimed during the sink
+and absent before the source poll. The older retained-head runner
+characterization now blocks inside the first sink and proves private
+materializer dispatch and two-Frame FIFO without an early second prepare or
+HTTP call. The private factory alone gained the underscored completion-sink
+parameter; public `open_ingestion()` and exports remain unchanged.
+
+The sink raise/cancellation matrix is also GREEN without a further production
+change. Both exact failures propagate after the authenticated claim, retain the
+claimed Frame and settled plan, leave the client unpoisoned, and close cleanly.
+A fresh client authenticates and retires that Frame without invoking even an
+installed sink again. This is the required at-most-once fanout boundary.
+
+The four exact completion statement fates are GREEN: claim rollback is all-old
+and invokes no sink; a claim post-COMMIT failure reopens claimed and therefore
+retires without fanout; retirement rollback preserves the already-claimed
+Frame after one sink invocation; retirement post-COMMIT reopens with the Frame
+absent. Every path authenticates its precise reopen state and no path poisons
+the client.
+
+The Work boundary is now a resumable wait rather than terminal BLOCKED. Before
+attempting a completion transaction, the journal authenticates the oldest
+prepared Frame and its Work inventory under a read scope. The owned session
+uses a generation plus `asyncio.Event` signal, so an ack between classification
+and suspension cannot be lost. Public `acknowledge_batch()` and private
+`_settle_batch()` both signal only after their journal ack commits; close still
+cancels/drains the waiting runner. A real one-record GLOBAL_ACCOUNT_DATA Frame
+proves both ack authorities, zero `BEGIN IMMEDIATE` and zero HTTP while waiting,
+then completion/retirement before the next source poll. Completion claiming now
+also performs a read-only eligibility preflight and therefore opens no no-op
+write transaction for Work-owned or already-claimed Frames.
+
+Key-query is now the second exact maintenance operation. Its authenticated
+Frame-owned body is sent only to `POST /_matrix/client/v3/keys/query`; an exact
+`KeysQueryResponse` is parsed outside SQLite, then ordinary Olm/device-store
+application and pending→settled Frame replacement commit together through the
+same generic journal settlement. No callback or public response handler runs.
+
+The response crash matrix now runs upload and query through identical
+rollback/post-COMMIT boundaries. Query rollback is deliberately causal: Olm has
+already removed the user from its live query queue before the Frame write hook
+raises, yet SQLite reopens byte-identical and the client is unusable until a
+fresh reconstruction sees the pending operation. Query post-COMMIT reopens the
+settled plan; neither fate relies on reconstructing the old in-memory queue.
+
+The first exact key-claim path is now GREEN. A real remote Olm account produces
+one signed one-time key; Task4C freezes one claim for a persisted wedged device,
+including the exact `was_wedged`, `was_waiting`, waiting-request, and rerequest
+context. The test closes and reopens before dispatch, proving the live Olm queues
+are empty and the response cannot be applied correctly without the authenticated
+Frame context. The coordinator rebuilds the one supported wedged claim input,
+parses `KeysClaimResponse` outside SQLite, and applies it inside the owner
+transaction. The journal atomically persists the new Olm session, marks the
+claim settled, and appends the exact generated dummy as a pending to-device
+operation with deterministic Frame/index/body-derived transaction identity.
+
+That first claim checkpoint intentionally accepted only one wedged target. It is
+now superseded by the multi-target checkpoint below; the historical statement
+remains useful only for understanding the order in which the causal coverage
+was built.
+
+Key-claim response uncertainty now runs through the same exact statement matrix
+as upload and query. A failure after the Frame write occurs after Olm has created
+the live session and dummy, yet SQLite rolls back to the byte-identical pending
+claim with no session or follow-up; the current client is poisoned. A post-COMMIT
+failure reopens with the Olm session, settled claim, and exact deterministic
+pending dummy all durable. In both cases a fresh client authenticates the Frame
+and session fate, and the transient outgoing-message queue is empty after reopen
+because the Frame is its durable owner.
+
+Wedged-claim rerequests now survive the same restart boundary. Task4C freezes the
+exact canonical Megolm source and bound room/event/device/session fields. A fresh
+client begins with no rerequest bucket; claim application reconstructs and
+revalidates the exact `MegolmEvent` before Olm handles the response. If a live
+bucket already exists, it must match exactly. The generated dummy operation then
+owns the copied rerequest context durably, so later to-device settlement can
+produce the required room-key rerequest without relying on transient Olm state.
+Conflicting live state fails closed.
+
+The first waiting-device claim is also restart-safe. A real own-device
+`RoomKeyRequest` and inbound Megolm session are prepared through Task4C. After a
+fresh open, the coordinator rebuilds the exact waiting device/map entry, applies
+the successful claim, and invokes ordinary key-request collection inside the
+same owner transaction. The supported case must produce exactly one encrypted
+forwarded-key `ToDeviceMessage` and no callback Work. That message is appended
+as a generic pending to-device operation before the claim context is cleared.
+A second fresh client has an empty transient outgoing queue but authenticates
+the Olm session and exact Frame-owned share. Missing sessions, changed waiting
+state, callback-producing requests, and other result shapes fail closed.
+
+Each individual claim remains deliberately narrow: its preparation reason must
+be either wedged or waiting, not both. The waiting path accepts exactly one
+request and the wedged path at most one rerequest. A canonical nonempty claim
+list is now supported; combined reasons and wider per-target evidence remain
+fail-closed until their own causal coverage.
+
+Generic Frame-owned to-device delivery is now exact and restart-safe. The
+coordinator reconstructs one authenticated generic `ToDeviceMessage`, binds its
+event type and deterministic transaction ID into
+`PUT /_matrix/client/v3/sendToDevice/{type}/{txn}`, parses `ToDeviceResponse`
+outside SQLite, and applies it with the pending→settled Frame update inside one
+owner transaction. No public response/callback path runs. Its statement matrix
+proves rollback reopens pending even though the failed live client has already
+consumed its outgoing queue, while post-COMMIT reopens settled; both failure
+paths require a fresh client.
+
+Dummy delivery now has its distinct durable side-effect path. On a fresh
+client, the coordinator reconstructs the exact `DummyMessage`, restores its
+authenticated Megolm rerequest bucket, and places only that dummy in the live
+queue before applying `ToDeviceResponse`. Ordinary Olm removal produces the
+exact `RoomKeyRequestMessage`; the journal settles the dummy and appends that
+request as a pending Frame-owned operation with deterministic identity and
+authenticated request/session/room/algorithm context in the same transaction.
+A dummy without rerequests settles without a follow-up. Other live queue or
+bucket shapes fail closed.
+
+Dummy and room-key-request uncertainty are now closed. A dummy failure after the
+Frame write occurs after the live client has generated its room-key request;
+rollback nevertheless reopens the pending dummy with no appended request, while
+post-COMMIT reopens the settled dummy and exact pending request. Sending that
+persisted request reconstructs the exact `RoomKeyRequestMessage`, applies
+`ToDeviceResponse`, persists `OutgoingKeyRequest`, and settles the Frame
+operation in one transaction. Its rollback removes both the ordinary E2EE row
+and Frame settlement; post-COMMIT reopens both. All failed in-memory clients are
+poisoned and fresh clients authenticate the durable fate.
+
+Maintenance retry and permanent-auth handling now preserve the same durable
+owner. Retryable transport failures, 408/429/5xx, and `M_LIMIT_EXCEEDED` reuse
+the exact authenticated `NetworkRequest`; the retry delay is zero initially,
+honors bounded `Retry-After`, and then uses the client-configured capped
+exponential backoff. After each sleep the pending carrier is reauthenticated
+before another send. Upload and deterministic generic to-device tests prove no
+SQLite mutation between attempts and exact request equality. `M_UNKNOWN_TOKEN`
+and `M_FORBIDDEN` (including status-derived 401/403) raise one sticky
+`IngestionSourceError`, leave the Frame byte-identical and the client unpoisoned,
+and issue no second request. Closing during a held backoff cancels/drains the
+runner; a fresh client authenticates the unchanged pending operation.
+
+Multi-target key claiming is now restart-safe. The causal case freezes devices
+in reverse live order but authenticates the canonical `(user_id, device_id)`
+order, including one target-owned Megolm rerequest. A fresh client reconstructs
+both targets, applies one successful `KeysClaimResponse` once, persists both Olm
+sessions, settles the claim, and appends two exact dummy operations with globally
+monotone Frame operation indices and target-specific rerequest ownership. The
+reducer rejects duplicate targets, missing devices, changed live waiting or
+rerequest state, foreign/duplicate generated follow-ups, and unsupported
+per-target reason shapes. The shared response crash matrix now includes this
+two-device claim: an `outbound_frame_settle` failure reopens the byte-identical
+all-old Frame with neither session, while a post-COMMIT failure reopens both
+sessions plus the settled claim and both pending dummies.
+
+Fresh checkpoint evidence is fifty-two focused maintenance/completion/intent
+cases passing. The current whole coordinator + source-journal + delivery gate
+is **600 passed** (**288 + 264 + 48**). The crash-recovery,
+owned-materializer-crash, Classic/Sliding parity, and preparation gate is an
+additional **186 passed**. Black, production Ruff `--no-fix`,
+targeted changed-source mypy, `py_compile`, and diff-check are GREEN. The only
+broader mypy output is the four unchanged diagnostics at
+`_sync_journal_preflight.py:812`, blame-owned by `c0a259d7`; the Task4F change in
+that file is one exact Aggregate-state predicate at the local Work frontier.
+The local-intent carrier, pre-HTTP runner, and first success/ack checkpoint are
+GREEN. A canonical absent-room
+`leave/0 -> join` operation now commits one `_LocalMembershipIntent` inside its
+room Aggregate under authenticated `intent_kind='local_membership'`, while
+continuity remains `leave/0` and no Work, Frame, source mutation, or ordinary
+store mutation occurs. The Aggregate codec accepts the new mutually-exclusive
+private intent without changing canonical bytes for ordinary/hydration rows;
+the unchanged schema-v1/five-table topology extends only the existing CHECK
+discriminator. Fresh owned reopen authenticates and returns the exact carrier
+read-only. Existing local-publication and Aggregate/preflight selectors remain
+GREEN. The owned runner now persists that intent before Matrix HTTP, blocks the
+next source poll, reconstructs the exact request after close/reopen without the
+original caller, and consumes a successful `JoinResponse` in one owner
+transaction that clears the intent, advances continuity, and inserts the exact
+operation-keyed READY LOCAL lifecycle Work. Source HTTP stays fenced while that
+Work is outstanding and begins only after settlement wakes the runner. Exact
+concurrent callers share one request; conflicting concurrent
+commands reject before I/O; replay after Work publication resolves from the
+authenticated operation-keyed Work without another request. An existing-room
+`join/0 -> leave/1 -> join/1` chain is ordered behind each prior Work ack, and
+source remains fenced through the second ack. Retryable 429/5xx and
+`M_LIMIT_EXCEEDED` replay the byte-identical request after reauthenticating the
+intent; 401/403 retain it under one sticky auth error; a terminal rejection
+atomically clears it without Work and resumes source. Close during backoff
+leaves one restartable intent. Intent insert/update, success publication, and
+terminal clear now have all-old rollback and all-new post-COMMIT reopen proofs.
+Transport failure, 408, and malformed-200 cases are now explicit. A committed
+local Work survives fresh reopen, issues no HTTP until ack, and never
+resurrects the membership request after an ack/reopen. Preflight rejects two
+individually authenticated pending local intents and rejects a pending intent
+coexisting with Frame or Work queues. The current exact source/test patch
+SHA-256 is
+`1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc`.
+Immediate next: run the complete nio suite and final Task4F static/budget/diff
+audit, resolve any failure, then update this handoff and create the ordinary
+Task4F commit only if every gate is GREEN.
+
+#### Approved local-membership-intent design and execution plan
+
+The user approved the following design on 2026-08-14. Continue autonomously;
+do not pause the RED/review/GREEN loop for intermediate approval. Use best
+engineering judgment. If a genuinely material ambiguity remains after reading
+the design, code, and tests, consult Claude Fable through `agent-cli-dev`, record
+the conclusion here, and continue. Do not delegate ordinary implementation or
+review work merely because that consultation path exists.
+
+Use `NioIngestRoomAggregate`, not Work or Frame, as the no-new-table intent
+owner. Add private `_LocalMembershipIntent(operation_id, previous_membership,
+previous_epoch, current_membership)` and authenticate it under
+`intent_kind = 'local_membership'`; the Aggregate row supplies `room_id`.
+`RoomAggregateValue` carries at most one of `pending_hydration` and
+`pending_local_membership`. A missing-room `leave/0 -> join` intent creates the
+same canonical predecessor Aggregate that direct local publication already
+uses. Persist no access token or fabricated source identity. The runner rebuilds
+the simple current join/leave endpoint from the current authenticated client and
+room ID.
+
+The owned runner is the sole ordering authority. A non-exported
+`_run_local_membership_transition(*, operation_id: UUID, room_id: str,
+previous_membership: str, previous_epoch: int, current_membership: str) -> bool`
+queues at most one in-memory command and wakes the runner. The runner first
+finishes any older retained Frame/hydration/Work, then records the Aggregate
+intent before Matrix HTTP. It serializes and retries the exact persisted intent;
+after restart it discovers that intent without the former caller. Successful
+join/leave application consumes the matching intent while atomically invoking
+the existing operation-keyed LOCAL lifecycle publisher. The caller may receive
+success after Work publication, but source HTTP remains fenced until that Work
+is acknowledged. A terminal Matrix rejection clears the matching intent without
+publishing lifecycle Work and returns false to a live caller. Retryable errors
+retain it under bounded cancellable backoff; permanent auth follows the existing
+sticky source-error path. Close/cancellation leaves either no intent (before its
+commit) or one authenticated restartable intent (after commit).
+
+Implement the approved boundary in these independently reviewable TDD tasks:
+
+- [x] **Carrier/codec RED:** in `tests/ingest/coordinator_test.py`, record a
+      canonical missing-room join intent through the journal seam and require
+      one authenticated Aggregate with unchanged `leave/0` continuity, no Work,
+      no Frame, and `intent_kind='local_membership'`; reopen must return the same
+      exact private carrier. Current first failure must be the missing record/load
+      seam. Implement only `_LocalMembershipIntent`, Aggregate canonical codec,
+      exclusivity validation, preflight authentication, and journal
+      `_record_local_membership_intent()` / `_load_pending_local_membership_intents()`.
+- [x] **Pre-HTTP runner RED:** start the owned runner with one queued rejoin,
+      block the request hook, and prove the intent committed before the hook,
+      zero LOCAL Work exists, and no source request can start. Cancel/close after
+      the hook, reopen with a fresh client, and require the exact same join request
+      to be reconstructed from the authenticated intent. Implement the private
+      command/future seam and pending-intent runner branch only.
+- [x] **Success/ack fence RED:** return a real `JoinResponse`, require one owner
+      transaction to clear intent, advance Aggregate continuity, and insert the
+      exact operation-keyed READY LOCAL lifecycle Work. Hold its batch outstanding
+      and prove zero source HTTP; settle it, require the runner wake, then allow
+      exactly one source request. Modify the existing local publisher to consume
+      only an exact matching intent while preserving its direct idempotent path.
+- [x] **Leave/rejoin and duplicate matrix:** cover existing-room `join -> leave`
+      epoch advance, `leave -> join` same epoch, same-operation replay before and
+      after Work publication, conflicting operation/transition rejection,
+      multiple queued callers, and older Frame/Work ordering. Do not add knock,
+      invite, ban, reason bodies, or public AsyncClient behavior in Task4F.
+- [x] **HTTP/error/restart matrix:** cover retryable transport/408/429/5xx and
+      bounded close-cancellable backoff; 401/403 and Matrix auth errors; terminal
+      rejection clearing without Work; response loss/retry; restart before HTTP,
+      after HTTP before local transaction, after Work commit, and after ack.
+- [x] **Statement uncertainty matrix:** inject rollback and post-COMMIT failures
+      at intent insert/update, intent clear + Aggregate/Work publication, terminal
+      clear, and ack/retirement. Every reopen must be exactly all-old or all-new;
+      no source HTTP may cross a retained intent or LOCAL Work.
+- [x] **Final local-intent gate:** run the exact selector, coordinator,
+      source-journal, delivery, crash-recovery, Classic/Sliding parity, and nio
+      statics. Update the patch hash, test counts, remaining Task4F checklist, and
+      restart commands here before moving to final lost-wakeup/concurrent
+      runner+pump completion coverage.
 
 ### Way of working
 
@@ -757,10 +1138,44 @@ Run these before editing after a new session:
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
-git merge-base --is-ancestor efb5b461e7d1c2573c0c14403f9c5ea6b6f7b83c HEAD
-test -z "$(git status --short --untracked-files=no)"
+test "$(git rev-parse HEAD)" = 59bbb3b05c993488d1e81a35e6b743658ac4c87b
+test "$(git diff --name-only)" = "$(printf '%s\n' \
+  docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md \
+  src/nio/ingest/coordinator.py \
+  src/nio/store/_sync_journal.py \
+  src/nio/store/_sync_journal_preflight.py \
+  src/nio/store/_sync_journal_rows.py \
+  src/nio/store/_sync_journal_values.py \
+  src/nio/store/sync_journal_schema.py \
+  tests/ingest/coordinator_test.py \
+  tests/ingest/source_journal_test.py)"
+test "$(git diff --binary -- src tests | sha256sum | cut -d' ' -f1)" = \
+  1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc
 git status --short
 git diff --check
+uv run pytest -q \
+  tests/ingest/coordinator_test.py::test_owned_runner_enters_frame_owned_key_upload_before_source_poll \
+  tests/ingest/coordinator_test.py::test_owned_key_upload_response_commits_with_settled_plan \
+  tests/ingest/coordinator_test.py::test_owned_key_query_response_commits_with_settled_plan \
+  tests/ingest/coordinator_test.py::test_owned_key_claim_reconstructs_context_and_appends_dummy \
+  tests/ingest/coordinator_test.py::test_owned_key_claim_reconstructs_multiple_targets_in_canonical_order \
+  tests/ingest/coordinator_test.py::test_owned_maintenance_response_crash_boundary_requires_fresh_client \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_intent_is_durable_before_http \
+  tests/ingest/coordinator_test.py::test_owned_reopen_rejects_multiple_authenticated_local_membership_intents \
+  tests/ingest/coordinator_test.py::test_owned_runner_restarts_local_membership_intent_before_source_http \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_success_waits_for_work_ack_before_source \
+  tests/ingest/coordinator_test.py::test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_http_fate_preserves_exact_restart_state \
+  tests/ingest/coordinator_test.py::test_owned_runner_reports_local_membership_terminal_and_auth_fates \
+  tests/ingest/coordinator_test.py::test_owned_close_cancels_local_membership_retry_backoff \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_response_uncertainty_reopens_exact_fate \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_intent_uncertainty_reopens_exact_fate \
+  tests/ingest/coordinator_test.py::test_owned_local_membership_work_reopen_fences_source_until_ack \
+  tests/ingest/coordinator_test.py::test_owned_runner_claims_fans_out_retires_then_polls_source \
+  tests/ingest/coordinator_test.py::test_owned_claimed_completion_reopens_without_second_sink_call \
+  tests/ingest/coordinator_test.py::test_owned_completion_statement_boundary_reopens_exact_fate \
+  tests/ingest/coordinator_test.py::test_owned_runner_waits_read_only_for_record_ack_then_resumes
+# expected: 52 passed
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
@@ -782,9 +1197,11 @@ The current non-RED nio regression baseline is:
 ```bash
 cd /work/dev/mindroom-nio
 uv run pytest -q tests/ingest/coordinator_test.py \
-# expected: 229 passed
+# expected: 288 passed
 uv run pytest -q tests/ingest/delivery_test.py
 # expected: 48 passed
+uv run pytest -q tests/ingest/source_journal_test.py
+# expected: 264 passed
 ```
 
 Current static gates are green with:
@@ -793,15 +1210,25 @@ Current static gates are green with:
 uv run black --check --fast --target-version py314 \
   src/nio/client/base_client.py src/nio/ingest/coordinator.py \
   src/nio/ingest/reducer.py src/nio/store/_sync_journal.py \
-  tests/ingest/coordinator_test.py tests/ingest/delivery_test.py
+  src/nio/store/_sync_journal_preflight.py \
+  src/nio/store/_sync_journal_rows.py src/nio/store/_sync_journal_values.py \
+  src/nio/store/sync_journal_schema.py tests/ingest/coordinator_test.py \
+  tests/ingest/delivery_test.py tests/ingest/source_journal_test.py
 uv run ruff check --no-fix src/nio/client/base_client.py \
   src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
-  src/nio/store/_sync_journal.py
+  src/nio/store/_sync_journal.py src/nio/store/_sync_journal_preflight.py \
+  src/nio/store/_sync_journal_rows.py src/nio/store/_sync_journal_values.py \
+  src/nio/store/sync_journal_schema.py
 uv run mypy src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
+  src/nio/store/_sync_journal.py src/nio/store/_sync_journal_rows.py \
+  src/nio/store/_sync_journal_values.py \
   --follow-imports=skip --ignore-missing-imports
 python -m py_compile src/nio/client/base_client.py \
   src/nio/ingest/coordinator.py src/nio/ingest/reducer.py \
-  src/nio/store/_sync_journal.py
+  src/nio/store/_sync_journal.py src/nio/store/_sync_journal_preflight.py \
+  src/nio/store/_sync_journal_rows.py src/nio/store/_sync_journal_values.py \
+  src/nio/store/sync_journal_schema.py tests/ingest/coordinator_test.py \
+  tests/ingest/source_journal_test.py
 git diff --check
 ```
 

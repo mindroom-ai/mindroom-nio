@@ -44,7 +44,11 @@ from ._sync_journal_plan import (
     _canonical_work_plaintext as _canonical_work_plaintext,
 )
 from ._sync_journal_preflight import _row, _validate_source_cursor
-from ._sync_journal_values import RoomAggregateValue
+from ._sync_journal_values import (
+    RoomAggregateValue,
+    _LocalMembershipIntent,
+    _PendingLocalMembership,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -163,6 +167,18 @@ class _OutboundMaintenance(NamedTuple):
     operations: tuple[_OutboundOperation, ...]
 
 
+class _PendingOutboundMaintenance(NamedTuple):
+    frame_id: UUID
+    stream_id: UUID
+    transport: TransportKind
+    source_epoch: int
+    request_id: int
+    request_cursor_json: bytes
+    operation_index: int
+    operation_count: int
+    operation: _OutboundOperation
+
+
 class _PreparedFrameState(NamedTuple):
     request_cursor_json: bytes
     candidate_cursor_json: bytes
@@ -227,6 +243,7 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
     if type(value) is not RoomAggregateValue:
         raise TypeError("aggregate value must be RoomAggregateValue")
     hydration = value.pending_hydration
+    local = value.pending_local_membership
     continuity = value.continuity
     if continuity.gap is not None:
         raise ValueError("this checkpoint persists no recovery gap")
@@ -262,6 +279,13 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
         ),
         "updated_revision": value.updated_revision,
     }
+    if local is not None:
+        payload["pending_local_membership"] = {
+            "current_membership": local.current_membership,
+            "operation_id": str(local.operation_id),
+            "previous_epoch": local.previous_epoch,
+            "previous_membership": local.previous_membership,
+        }
     if value.room_snapshot is not None:
         payload["room_snapshot"] = _room_snapshot_to_dict(value.room_snapshot)
     return canonical_json(payload)
@@ -278,7 +302,7 @@ def _room_aggregate_value_from_plaintext(
             raise ValueError("aggregate room_id is invalid")
         if type(updated_revision) is not int or updated_revision < 1:
             raise ValueError("aggregate revision is invalid")
-        if intent_kind not in (None, "hydration"):
+        if intent_kind not in (None, "hydration", "local_membership"):
             raise ValueError("unsupported Aggregate intent kind")
         if type(plaintext) is not bytes:
             raise TypeError("aggregate plaintext must be bytes")
@@ -300,7 +324,27 @@ def _room_aggregate_value_from_plaintext(
             "room_snapshot",
             "updated_revision",
         )
-        if fields not in (legacy_fields, extended_fields):
+        local_fields = (
+            "continuity",
+            "next_room_sequence",
+            "pending_hydration",
+            "pending_local_membership",
+            "updated_revision",
+        )
+        local_snapshot_fields = (
+            "continuity",
+            "next_room_sequence",
+            "pending_hydration",
+            "pending_local_membership",
+            "room_snapshot",
+            "updated_revision",
+        )
+        if fields not in (
+            legacy_fields,
+            extended_fields,
+            local_fields,
+            local_snapshot_fields,
+        ):
             raise ValueError("Aggregate fields are not canonical")
         continuity = cast("dict[str, object]", aggregate["continuity"])
         if continuity["gap"] is not None:
@@ -334,11 +378,17 @@ def _room_aggregate_value_from_plaintext(
         )
 
         pending_value = aggregate["pending_hydration"]
+        local_value = aggregate.get("pending_local_membership")
         if intent_kind is None:
-            if pending_value is not None or hydration_id is not None:
+            if (
+                pending_value is not None
+                or hydration_id is not None
+                or local_value is not None
+            ):
                 raise ValueError("NULL Aggregate must have no hydration barrier")
             pending = None
-        else:
+            local = None
+        elif intent_kind == "hydration":
             if type(pending_value) is not dict or hydration_id is None:
                 raise ValueError("hydration Aggregate requires its pending intent")
             pending_map = cast("dict[str, object]", pending_value)
@@ -357,9 +407,30 @@ def _room_aggregate_value_from_plaintext(
                 _aggregate_uuid(pending_map["hydration_id"], "hydration_id"),
                 pending_origin,
             )
+            if local_value is not None:
+                raise ValueError("hydration Aggregate has a local intent")
+            local = None
+        else:
+            if pending_value is not None or hydration_id is not None:
+                raise ValueError("local Aggregate has a hydration intent")
+            if type(local_value) is not dict or tuple(local_value) != (
+                "current_membership",
+                "operation_id",
+                "previous_epoch",
+                "previous_membership",
+            ):
+                raise ValueError("local Aggregate requires its pending intent")
+            local_map = cast("dict[str, object]", local_value)
+            local = _LocalMembershipIntent(
+                _aggregate_uuid(local_map["operation_id"], "operation_id"),
+                cast("str", local_map["previous_membership"]),
+                cast("int", local_map["previous_epoch"]),
+                cast("str", local_map["current_membership"]),
+            )
+            pending = None
 
         snapshot_value = aggregate.get("room_snapshot")
-        if fields == extended_fields:
+        if fields in (extended_fields, local_snapshot_fields):
             if type(snapshot_value) is not dict:
                 raise ValueError("Aggregate room snapshot must be an object")
             snapshot_map = cast("dict[str, object]", snapshot_value)
@@ -379,6 +450,7 @@ def _room_aggregate_value_from_plaintext(
             cast("int", aggregate["updated_revision"]),
             pending,
             room_snapshot,
+            local,
         )
         if (
             value.continuity.room_id != room_id
@@ -1768,7 +1840,7 @@ class JournalRows:
                 or stored_room != room_id
                 or type(revision) is not int
                 or not 1 <= revision <= owner.revision
-                or kind not in (None, "hydration")
+                or kind not in (None, "hydration", "local_membership")
                 or type(payload) is not bytes
                 or not payload
                 or type(digest) is not bytes
@@ -1803,6 +1875,43 @@ class JournalRows:
             raise
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("invalid room Aggregate row") from error
+
+    def _load_pending_local_membership_intents(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[_PendingLocalMembership, ...]:
+        if type(limit) is not int:
+            raise TypeError("limit must be int")
+        if not 1 <= limit <= 2:
+            raise ValueError("limit must be between 1 and 2")
+        with self._read():  # type: ignore[attr-defined]
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            rows = self._execute(  # type: ignore[attr-defined]
+                "SELECT account_id, room_id, updated_revision, intent_kind, "
+                "payload, payload_sha256 FROM NioIngestRoomAggregate "
+                "WHERE account_id = ? AND intent_kind = 'local_membership' "
+                "ORDER BY room_id LIMIT ?",
+                (self.account_id, limit),
+            ).fetchall()
+            pending: list[_PendingLocalMembership] = []
+            for row in rows:
+                room_id = row["room_id"]
+                loaded = self._load_room_aggregate(owner, room_id)
+                if loaded is None or tuple(row) != loaded[0]:
+                    raise JournalIntegrityError(
+                        "local membership candidate snapshot changed"
+                    )
+                value = loaded[1]
+                intent = value.pending_local_membership
+                if intent is None:
+                    raise JournalIntegrityError(
+                        "local membership candidate has no intent"
+                    )
+                pending.append(
+                    _PendingLocalMembership(room_id, value.continuity, intent)
+                )
+            return tuple(pending)
 
     def load_pending_hydrations(self, *, limit: int) -> tuple[PendingHydration, ...]:
         if type(limit) is not int:

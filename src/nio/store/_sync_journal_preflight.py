@@ -1360,6 +1360,17 @@ def _authenticate_full_ingestion_graph(
             and hydration.origin.request_id >= source_state.next_request_id
         ):
             raise JournalIntegrityError("Aggregate origin exceeds source frontier")
+    pending_local_rooms = tuple(
+        room_id
+        for room_id, aggregate in aggregates.items()
+        if aggregate.pending_local_membership is not None
+    )
+    if len(pending_local_rooms) > 1:
+        raise JournalIntegrityError("multiple local membership intents are pending")
+    if pending_local_rooms and (headers or inventory.work):
+        raise JournalIntegrityError(
+            "local membership intent requires empty Frame and Work queues"
+        )
 
     held_identities: set[tuple[str, int, int]] = set()
     local_work_by_room: dict[
@@ -1418,6 +1429,7 @@ def _authenticate_full_ingestion_graph(
                     or continuity.gap is not None
                     or continuity.hydration_id is not None
                     or aggregate.pending_hydration is not None
+                    or aggregate.pending_local_membership is not None
                     or snapshot is not None
                     and (
                         snapshot.membership_epoch != membership_epoch

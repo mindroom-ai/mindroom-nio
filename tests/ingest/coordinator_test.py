@@ -59,7 +59,7 @@ from nio.ingest.model import (
     _DecryptedToDeviceKind,
     _PreparationPhase,
 )
-from nio.ingest.ports import NetworkResult, StagedSourceResponse
+from nio.ingest.ports import NetworkFailureKind, NetworkResult, StagedSourceResponse
 from nio.ingest.sliding import (
     RESERVED_ALL_ROOMS_LIST,
     SlidingSource,
@@ -74,6 +74,12 @@ from nio.ingest.source import (
     canonical_json,
 )
 from nio.ingest.state import CommitResult, SourceState, StagedFrame
+from nio.responses import (
+    KeysClaimResponse,
+    KeysQueryResponse,
+    KeysUploadResponse,
+    ToDeviceResponse,
+)
 from nio.store import (
     DefaultStore,
     SqliteMemoryStore,
@@ -2861,6 +2867,1398 @@ async def test_owned_materializer_enforces_exact_authenticated_prepared_frame_ca
         if not session_closed:
             connection.set_trace_callback(None)
             await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_local_membership_intent_is_durable_before_http(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    operation_id = uuid4()
+    owner_before = session._journal.load_owner()
+    source_before = session._journal.load_source()
+    ordinary_before = tuple(
+        statement for statement in connection.iterdump() if "NioIngest" not in statement
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) FROM NioIngestRoomAggregate").fetchone()[0]
+        == 0
+    )
+    assert connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM NioIngestFrame").fetchone()[0] == 0
+    try:
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        committed = session._journal._record_local_membership_intent(
+            operation_id=operation_id,
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        connection.set_trace_callback(None)
+        assert committed == CommitResult(owner_before.revision + 1)
+        transaction_statements = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert transaction_statements.count("BEGIN IMMEDIATE") == 1
+        assert transaction_statements.count("COMMIT") == 1
+        assert transaction_statements.count("ROLLBACK") == 0
+        assert (
+            sum(
+                statement.startswith("UPDATE NIOINGESTMETA")
+                for statement in transaction_statements
+            )
+            == 1
+        )
+        assert (
+            sum(
+                statement.startswith("INSERT INTO NIOINGESTROOMAGGREGATE")
+                for statement in transaction_statements
+            )
+            == 1
+        )
+        assert not any("NIOINGESTWORK" in statement for statement in statements)
+        assert not any("NIOINGESTFRAME" in statement for statement in statements)
+
+        owner_after = session._journal.load_owner()
+        assert owner_after.revision == committed.revision
+        assert session._journal.load_source() == source_before
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner_after, ROOM)
+            pending = session._journal._load_pending_local_membership_intents(limit=2)
+            inventory = session._journal._load_task3_work_inventory(owner_after)
+        assert loaded is not None
+        aggregate = loaded[1]
+        assert aggregate.continuity.room_id == ROOM
+        assert aggregate.continuity.membership == "leave"
+        assert aggregate.continuity.membership_epoch == 0
+        assert aggregate.continuity.baseline is None
+        assert aggregate.continuity.gap is None
+        assert aggregate.continuity.hydration_id is None
+        assert aggregate.next_room_sequence == 0
+        assert aggregate.updated_revision == committed.revision
+        assert aggregate.pending_hydration is None
+        assert aggregate.room_snapshot is None
+        intent = aggregate.pending_local_membership
+        assert (
+            intent.operation_id,
+            intent.previous_membership,
+            intent.previous_epoch,
+            intent.current_membership,
+        ) == (operation_id, "leave", 0, "join")
+        assert len(pending) == 1
+        assert (
+            pending[0].room_id,
+            pending[0].continuity,
+            pending[0].intent,
+        ) == (ROOM, aggregate.continuity, intent)
+        assert inventory.work == ()
+        raw_aggregate = connection.execute(
+            "SELECT * FROM NioIngestRoomAggregate WHERE room_id = ?",
+            (ROOM,),
+        ).fetchone()
+        assert raw_aggregate is not None
+        assert raw_aggregate[3] == "local_membership"
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestFrame").fetchone()[0] == 0
+        )
+        assert (
+            tuple(
+                statement
+                for statement in connection.iterdump()
+                if "NioIngest" not in statement
+            )
+            == ordinary_before
+        )
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    fresh_connection = fresh_session._owned_store.database.connection()
+    try:
+        reopened_statements: list[str] = []
+        fresh_connection.set_trace_callback(reopened_statements.append)
+        pending_after_reopen = (
+            fresh_session._journal._load_pending_local_membership_intents(limit=2)
+        )
+        fresh_connection.set_trace_callback(None)
+        assert len(pending_after_reopen) == 1
+        assert (
+            pending_after_reopen[0].room_id,
+            pending_after_reopen[0].continuity,
+            pending_after_reopen[0].intent,
+        ) == (ROOM, aggregate.continuity, intent)
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+            for statement in reopened_statements
+        )
+        assert (
+            fresh_connection.execute(
+                "SELECT * FROM NioIngestRoomAggregate WHERE room_id = ?",
+                (ROOM,),
+            ).fetchone()
+            == raw_aggregate
+        )
+    finally:
+        fresh_connection.set_trace_callback(None)
+        await fresh_session.close()
+
+
+def test_owned_reopen_rejects_multiple_authenticated_local_membership_intents(
+    tmp_path,
+) -> None:
+    from nio.store._sync_journal_preflight import _canonical_internal
+    from nio.store._sync_journal_rows import _canonical_room_aggregate_plaintext
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    journal = bootstrap._journal
+    operation_id = uuid4()
+    journal._record_local_membership_intent(
+        operation_id=operation_id,
+        room_id=ROOM,
+        previous_membership="leave",
+        previous_epoch=0,
+        current_membership="join",
+    )
+    owner = journal.load_owner()
+    with journal._owner.read():
+        loaded = journal._load_room_aggregate(owner, ROOM)
+    assert loaded is not None
+    aggregate = loaded[1]
+    intent = aggregate.pending_local_membership
+    assert intent is not None
+    other_room = "!second-local-intent:example.org"
+    second = replace(
+        aggregate,
+        continuity=replace(aggregate.continuity, room_id=other_room),
+        pending_local_membership=type(intent)(
+            uuid4(),
+            "leave",
+            0,
+            "join",
+        ),
+    )
+    plaintext = _canonical_room_aggregate_plaintext(second)
+    payload, digest = journal._payload(
+        owner,
+        "NioIngestRoomAggregate",
+        plaintext,
+        header=_canonical_internal(
+            [other_room, second.updated_revision, "local_membership"]
+        ),
+    )
+    connection = journal._owner.database.connection()
+    connection.execute(
+        "INSERT INTO NioIngestRoomAggregate("
+        "account_id, room_id, updated_revision, intent_kind, payload, "
+        "payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            ACCOUNT,
+            other_room,
+            second.updated_revision,
+            "local_membership",
+            payload,
+            digest,
+        ),
+    )
+    connection.commit()
+    bootstrap.close()
+
+    with pytest.raises(
+        JournalIntegrityError,
+        match="multiple local membership intents are pending",
+    ):
+        reopen_owned_bootstrap(tmp_path, generation)
+
+
+@pytest.mark.asyncio
+async def test_owned_runner_restarts_local_membership_intent_before_source_http(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    operation_id = uuid4()
+    source_before = session._journal.load_source()
+    requests: list[object] = []
+    request_entered = asyncio.Event()
+    request_cancelled = asyncio.Event()
+    runner: asyncio.Task[None] | None = None
+    transition: asyncio.Task[bool] | None = None
+
+    async def hold_local_request(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        assert (
+            request.method,
+            request.path,
+            request.query,
+            request.body,
+            request.timeout_ms,
+            request.request_cursor_json,
+        ) == (
+            *nio.Api.join("secret-token", ROOM),
+            (),
+            None,
+            30_000,
+            source_before.cursor_json,
+        )
+        assert connection.in_transaction is False
+        pending = session._journal._load_pending_local_membership_intents(limit=2)
+        assert len(pending) == 1
+        assert pending[0].room_id == ROOM
+        assert pending[0].intent.operation_id == operation_id
+        assert session._journal.load_source() == source_before
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestFrame").fetchone()[0] == 0
+        )
+        requests.append(request)
+        request_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            request_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    session._request = hold_local_request  # type: ignore[method-assign]
+    try:
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        await asyncio.sleep(0)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM NioIngestRoomAggregate"
+            ).fetchone()[0]
+            == 0
+        )
+        runner = asyncio.create_task(session.run())
+        await asyncio.wait_for(request_entered.wait(), timeout=1)
+        assert len(requests) == 1
+        assert transition.done() is False
+        await session.close()
+        await asyncio.wait_for(request_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+        with pytest.raises(asyncio.CancelledError):
+            await transition
+    finally:
+        if runner is not None and not runner.done():
+            runner.cancel()
+        if transition is not None and not transition.done():
+            transition.cancel()
+        await asyncio.gather(
+            *(task for task in (runner, transition) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    fresh_connection = fresh_session._owned_store.database.connection()
+    fresh_entered = asyncio.Event()
+    fresh_cancelled = asyncio.Event()
+    fresh_requests: list[object] = []
+    fresh_runner: asyncio.Task[None] | None = None
+
+    async def hold_reconstructed_request(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        assert requests == [request]
+        assert fresh_connection.in_transaction is False
+        pending = fresh_session._journal._load_pending_local_membership_intents(limit=2)
+        assert len(pending) == 1
+        assert pending[0].room_id == ROOM
+        assert pending[0].intent.operation_id == operation_id
+        assert fresh_session._journal.load_source() == source_before
+        assert (
+            fresh_connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+            == 0
+        )
+        assert (
+            fresh_connection.execute("SELECT COUNT(*) FROM NioIngestFrame").fetchone()[
+                0
+            ]
+            == 0
+        )
+        fresh_requests.append(request)
+        fresh_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            fresh_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    fresh_session._request = hold_reconstructed_request  # type: ignore[method-assign]
+    try:
+        fresh_runner = asyncio.create_task(fresh_session.run())
+        await asyncio.wait_for(fresh_entered.wait(), timeout=1)
+        assert len(fresh_requests) == 1
+        await fresh_session.close()
+        await asyncio.wait_for(fresh_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await fresh_runner
+    finally:
+        if fresh_runner is not None and not fresh_runner.done():
+            fresh_runner.cancel()
+        await asyncio.gather(
+            *(task for task in (fresh_runner,) if task is not None),
+            return_exceptions=True,
+        )
+        if not fresh_session._closed:
+            await fresh_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_local_membership_success_waits_for_work_ack_before_source(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    operation_id = uuid4()
+    source_before = session._journal.load_source()
+    local_requests: list[object] = []
+    source_requests: list[object] = []
+    source_entered = asyncio.Event()
+    source_cancelled = asyncio.Event()
+    runner: asyncio.Task[None] | None = None
+    transition: asyncio.Task[bool] | None = None
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        if request.path == nio.Api.join("secret-token", ROOM)[1]:
+            assert kwargs == {"body_disconnect_retry": True}
+            assert session._journal.load_source() == source_before
+            pending = session._journal._load_pending_local_membership_intents(limit=2)
+            assert len(pending) == 1
+            assert pending[0].intent.operation_id == operation_id
+            assert connection.in_transaction is False
+            local_requests.append(request)
+            return session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": ROOM}),
+            )
+        assert kwargs == {}
+        assert local_requests
+        assert session._journal._load_pending_local_membership_intents(limit=2) == ()
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert inventory.work == ()
+        assert connection.in_transaction is False
+        source_requests.append(request)
+        source_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            source_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        runner = asyncio.create_task(session.run())
+        assert await asyncio.wait_for(transition, timeout=1) is True
+        assert len(local_requests) == 1
+        assert source_requests == []
+        assert session._journal.load_source() == source_before
+
+        owner_after = session._journal.load_owner()
+        assert owner_after.revision == 2
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner_after, ROOM)
+            inventory = session._journal._load_task3_work_inventory(owner_after)
+        assert loaded is not None
+        aggregate = loaded[1]
+        assert aggregate.continuity.membership == "join"
+        assert aggregate.continuity.membership_epoch == 0
+        assert aggregate.pending_hydration is None
+        assert aggregate.pending_local_membership is None
+        assert aggregate.next_room_sequence == 1
+        assert aggregate.updated_revision == 2
+        assert aggregate.room_snapshot is None
+        assert len(inventory.work) == 1
+        work = inventory.work[0]
+        assert work.status == "ready"
+        assert work.frame_id == operation_id
+        assert work.metadata is None
+        assert work.value.kind is RecordKind.ROOM_LIFECYCLE
+        assert work.value.origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            operation_id,
+        )
+        assert work.value.room_id == ROOM
+        assert work.value.membership_epoch == 0
+        assert work.value.room_sequence == 0
+
+        waiting_statements: list[str] = []
+        connection.set_trace_callback(waiting_statements.append)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        connection.set_trace_callback(None)
+        assert source_requests == []
+        assert not any(
+            statement.strip().upper().startswith("BEGIN")
+            for statement in waiting_statements
+        )
+
+        batch = session.next_batch()
+        assert batch is not None
+        assert batch.records == (work.value,)
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        await asyncio.wait_for(source_entered.wait(), timeout=1)
+        assert len(source_requests) == 1
+        await session.close()
+        await asyncio.wait_for(source_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+    finally:
+        if not session._closed:
+            connection.set_trace_callback(None)
+        if runner is not None and not runner.done():
+            runner.cancel()
+        if transition is not None and not transition.done():
+            transition.cancel()
+        await asyncio.gather(
+            *(task for task in (runner, transition) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    seed_operation, _seed_commit, _seed_aggregate, _seed_work = (
+        _publish_fresh_local_join(session)
+    )
+    seed_batch = session.next_batch()
+    assert seed_batch is not None
+    assert seed_batch.records[0].origin == SystemOrigin(
+        SystemOriginKind.MEMBERSHIP_CHANGE,
+        seed_operation,
+    )
+    session.acknowledge_batch(seed_batch.ref)
+
+    leave_operation = uuid4()
+    rejoin_operation = uuid4()
+    local_paths: list[str] = []
+    source_paths: list[str] = []
+    source_entered = asyncio.Event()
+    source_cancelled = asyncio.Event()
+    runner: asyncio.Task[None] | None = None
+    leave_first: asyncio.Task[bool] | None = None
+    leave_second: asyncio.Task[bool] | None = None
+    leave_replay: asyncio.Task[bool] | None = None
+    rejoin: asyncio.Task[bool] | None = None
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True} or kwargs == {}
+        leave_path = nio.Api.room_leave("secret-token", ROOM)[1]
+        join_path = nio.Api.join("secret-token", ROOM)[1]
+        if request.path == leave_path:
+            assert kwargs == {"body_disconnect_retry": True}
+            assert local_paths == []
+            local_paths.append(request.path)
+            return session._network_result(request, 200, canonical_json({}))
+        if request.path == join_path:
+            assert kwargs == {"body_disconnect_retry": True}
+            assert local_paths == [leave_path]
+            local_paths.append(request.path)
+            return session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": ROOM}),
+            )
+        assert kwargs == {}
+        assert local_paths == [leave_path, join_path]
+        source_paths.append(request.path)
+        source_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            source_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        leave_arguments = {
+            "operation_id": leave_operation,
+            "room_id": ROOM,
+            "previous_membership": "join",
+            "previous_epoch": 0,
+            "current_membership": "leave",
+        }
+        leave_first = asyncio.create_task(
+            session._run_local_membership_transition(**leave_arguments)
+        )
+        leave_second = asyncio.create_task(
+            session._run_local_membership_transition(**leave_arguments)
+        )
+        await asyncio.sleep(0)
+        with pytest.raises(
+            LocalProtocolError,
+            match="another local membership command is already queued",
+        ):
+            await session._run_local_membership_transition(
+                operation_id=uuid4(),
+                room_id=ROOM,
+                previous_membership="join",
+                previous_epoch=0,
+                current_membership="leave",
+            )
+
+        runner = asyncio.create_task(session.run())
+        assert await asyncio.wait_for(leave_first, timeout=1) is True
+        assert await asyncio.wait_for(leave_second, timeout=1) is True
+        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+
+        owner_after_leave = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_leave = session._journal._load_room_aggregate(
+                owner_after_leave,
+                ROOM,
+            )
+            leave_inventory = session._journal._load_task3_work_inventory(
+                owner_after_leave
+            )
+        assert loaded_leave is not None
+        assert loaded_leave[1].continuity.membership == "leave"
+        assert loaded_leave[1].continuity.membership_epoch == 1
+        assert loaded_leave[1].pending_local_membership is None
+        assert len(leave_inventory.work) == 1
+        leave_work = leave_inventory.work[0]
+        assert leave_work.value.origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            leave_operation,
+        )
+
+        leave_replay = asyncio.create_task(
+            session._run_local_membership_transition(**leave_arguments)
+        )
+        assert await asyncio.wait_for(leave_replay, timeout=1) is True
+        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+
+        rejoin = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=rejoin_operation,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=1,
+                current_membership="join",
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert rejoin.done() is False
+        assert local_paths == [nio.Api.room_leave("secret-token", ROOM)[1]]
+        assert source_paths == []
+
+        leave_batch = session.next_batch()
+        assert leave_batch is not None
+        assert leave_batch.records == (leave_work.value,)
+        await session._settle_batch(
+            leave_batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert await asyncio.wait_for(rejoin, timeout=1) is True
+        assert local_paths == [
+            nio.Api.room_leave("secret-token", ROOM)[1],
+            nio.Api.join("secret-token", ROOM)[1],
+        ]
+        assert source_paths == []
+
+        owner_after_rejoin = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_rejoin = session._journal._load_room_aggregate(
+                owner_after_rejoin,
+                ROOM,
+            )
+            rejoin_inventory = session._journal._load_task3_work_inventory(
+                owner_after_rejoin
+            )
+        assert loaded_rejoin is not None
+        assert loaded_rejoin[1].continuity.membership == "join"
+        assert loaded_rejoin[1].continuity.membership_epoch == 1
+        assert loaded_rejoin[1].pending_local_membership is None
+        assert len(rejoin_inventory.work) == 1
+        rejoin_work = rejoin_inventory.work[0]
+        assert rejoin_work.value.origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            rejoin_operation,
+        )
+
+        rejoin_batch = session.next_batch()
+        assert rejoin_batch is not None
+        assert rejoin_batch.records == (rejoin_work.value,)
+        await session._settle_batch(
+            rejoin_batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        await asyncio.wait_for(source_entered.wait(), timeout=1)
+        assert len(source_paths) == 1
+        await session.close()
+        await asyncio.wait_for(source_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+    finally:
+        for task in (runner, leave_first, leave_second, leave_replay, rejoin):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (
+                    runner,
+                    leave_first,
+                    leave_second,
+                    leave_replay,
+                    rejoin,
+                )
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fate",
+    ("retry", "transport", "timeout", "terminal", "auth", "malformed"),
+)
+async def test_owned_local_membership_http_fate_preserves_exact_restart_state(
+    tmp_path,
+    fate: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    session._journal._record_local_membership_intent(
+        operation_id=operation_id,
+        room_id=ROOM,
+        previous_membership="leave",
+        previous_epoch=0,
+        current_membership="join",
+    )
+    before = session._journal._load_pending_local_membership_intents(limit=2)
+    assert len(before) == 1
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        requests.append(request)
+        if fate == "retry" and len(requests) == 1:
+            return session._network_result(
+                request,
+                429,
+                canonical_json({"errcode": "M_LIMIT_EXCEEDED"}),
+                retry_after=0,
+            )
+        if fate == "retry" and len(requests) == 2:
+            return session._network_result(
+                request,
+                503,
+                canonical_json({"errcode": "M_UNAVAILABLE"}),
+                retry_after=0,
+            )
+        if fate == "transport" and len(requests) == 1:
+            return session._network_result(
+                request,
+                None,
+                b"",
+                failure=NetworkFailureKind.CONNECTION,
+            )
+        if fate == "timeout" and len(requests) == 1:
+            return session._network_result(
+                request,
+                408,
+                canonical_json({"errcode": "M_TIMEOUT"}),
+                retry_after=0,
+            )
+        if fate == "terminal":
+            return session._network_result(
+                request,
+                400,
+                canonical_json({"errcode": "M_NOT_FOUND"}),
+            )
+        if fate == "auth":
+            return session._network_result(
+                request,
+                401,
+                canonical_json({"errcode": "M_UNKNOWN_TOKEN"}),
+            )
+        if fate == "malformed":
+            return session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": 5}),
+            )
+        return session._network_result(
+            request,
+            200,
+            canonical_json({"room_id": ROOM}),
+        )
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        if fate == "auth":
+            with pytest.raises(
+                nio.IngestionSourceError,
+                match="local membership authentication failed: M_UNKNOWN_TOKEN",
+            ):
+                await session._advance_local_membership_intent()
+        elif fate == "malformed":
+            with pytest.raises(
+                nio.IngestionSourceError,
+                match="malformed local membership response",
+            ):
+                await session._advance_local_membership_intent()
+        else:
+            assert await session._advance_local_membership_intent() is True
+
+        assert requests
+        assert all(request == requests[0] for request in requests)
+        if fate == "retry":
+            assert len(requests) == 3
+        elif fate in {"transport", "timeout"}:
+            assert len(requests) == 2
+        else:
+            assert len(requests) == 1
+
+        pending = session._journal._load_pending_local_membership_intents(limit=2)
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert loaded is not None
+        aggregate = loaded[1]
+        if fate in {"retry", "transport", "timeout"}:
+            assert pending == ()
+            assert aggregate.continuity.membership == "join"
+            assert aggregate.continuity.membership_epoch == 0
+            assert aggregate.pending_local_membership is None
+            assert len(inventory.work) == 1
+            assert inventory.work[0].value.origin == SystemOrigin(
+                SystemOriginKind.MEMBERSHIP_CHANGE,
+                operation_id,
+            )
+        elif fate == "terminal":
+            assert pending == ()
+            assert aggregate.continuity.membership == "leave"
+            assert aggregate.continuity.membership_epoch == 0
+            assert aggregate.pending_local_membership is None
+            assert inventory.work == ()
+        else:
+            assert pending == before
+            assert aggregate.pending_local_membership == before[0].intent
+            assert inventory.work == ()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fate", ("terminal", "auth"))
+async def test_owned_runner_reports_local_membership_terminal_and_auth_fates(
+    tmp_path,
+    fate: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    requests: list[object] = []
+    source_entered = asyncio.Event()
+    source_cancelled = asyncio.Event()
+    runner: asyncio.Task[None] | None = None
+    transition: asyncio.Task[bool] | None = None
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        if request.path == nio.Api.join("secret-token", ROOM)[1]:
+            assert kwargs == {"body_disconnect_retry": True}
+            if fate == "terminal":
+                return session._network_result(
+                    request,
+                    400,
+                    canonical_json({"errcode": "M_NOT_FOUND"}),
+                )
+            return session._network_result(
+                request,
+                403,
+                canonical_json({"errcode": "M_FORBIDDEN"}),
+            )
+        assert fate == "terminal"
+        assert kwargs == {}
+        source_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            source_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        runner = asyncio.create_task(session.run())
+        if fate == "terminal":
+            assert await asyncio.wait_for(transition, timeout=1) is False
+            await asyncio.wait_for(source_entered.wait(), timeout=1)
+            assert len(requests) == 2
+            assert (
+                session._journal._load_pending_local_membership_intents(limit=2) == ()
+            )
+            owner = session._journal.load_owner()
+            with session._journal._owner.read():
+                inventory = session._journal._load_task3_work_inventory(owner)
+            assert inventory.work == ()
+            await session.close()
+            await asyncio.wait_for(source_cancelled.wait(), timeout=1)
+            with pytest.raises(asyncio.CancelledError):
+                await runner
+        else:
+            with pytest.raises(
+                nio.IngestionSourceError,
+                match="local membership authentication failed: M_FORBIDDEN",
+            ) as transition_error:
+                await asyncio.wait_for(transition, timeout=1)
+            with pytest.raises(nio.IngestionSourceError) as runner_error:
+                await runner
+            assert runner_error.value is transition_error.value
+            assert len(requests) == 1
+            pending = session._journal._load_pending_local_membership_intents(limit=2)
+            assert len(pending) == 1
+            assert pending[0].intent.operation_id == operation_id
+            with pytest.raises(nio.IngestionSourceError) as sticky:
+                await session.run()
+            assert sticky.value is runner_error.value
+    finally:
+        for task in (runner, transition):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (runner, transition) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_cancels_local_membership_retry_backoff(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    request_entered = asyncio.Event()
+    runner: asyncio.Task[None] | None = None
+    transition: asyncio.Task[bool] | None = None
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        requests.append(request)
+        request_entered.set()
+        return session._network_result(
+            request,
+            429,
+            canonical_json({"errcode": "M_LIMIT_EXCEEDED"}),
+            retry_after=60_000,
+        )
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        runner = asyncio.create_task(session.run())
+        await asyncio.wait_for(request_entered.wait(), timeout=1)
+        await session.close()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+        with pytest.raises(asyncio.CancelledError):
+            await transition
+        assert len(requests) == 1
+    finally:
+        for task in (runner, transition):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (runner, transition) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    try:
+        pending = reopened._journal._load_pending_local_membership_intents(limit=2)
+        assert len(pending) == 1
+        assert pending[0].intent.operation_id == operation_id
+        owner = reopened._journal.load_owner()
+        with reopened._journal._owner.read():
+            inventory = reopened._journal._load_task3_work_inventory(owner)
+        assert inventory.work == ()
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_fate", ("success", "terminal"))
+@pytest.mark.parametrize("transaction_fate", ("rollback", "commit"))
+async def test_owned_local_membership_response_uncertainty_reopens_exact_fate(
+    tmp_path,
+    response_fate: str,
+    transaction_fate: str,
+) -> None:
+    class ResponseAbort(BaseException):
+        pass
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    session._journal._record_local_membership_intent(
+        operation_id=operation_id,
+        room_id=ROOM,
+        previous_membership="leave",
+        previous_epoch=0,
+        current_membership="join",
+    )
+    connection = session._owned_store.database.connection()
+    graph_before = tuple(connection.iterdump())
+    selected_label = (
+        "work_insert"
+        if response_fate == "success"
+        else "local_intent_clear_aggregate_update"
+    )
+    if transaction_fate == "commit":
+        selected_label = "commit"
+    sentinel = ResponseAbort(
+        f"{response_fate} {transaction_fate} acknowledgement failed"
+    )
+    labels: list[str] = []
+    statements: list[str] = []
+
+    def abort(label: str) -> None:
+        labels.append(label)
+        if label == selected_label:
+            raise sentinel
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        if response_fate == "success":
+            return session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": ROOM}),
+            )
+        return session._network_result(
+            request,
+            400,
+            canonical_json({"errcode": "M_NOT_FOUND"}),
+        )
+
+    session._request = respond  # type: ignore[method-assign]
+    session._journal.set_transition_statement_hook(abort)
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(ResponseAbort) as failure:
+            await session._advance_local_membership_intent()
+        connection.set_trace_callback(None)
+        assert failure.value is sentinel
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert normalized.count("BEGIN IMMEDIATE") == 1
+        if transaction_fate == "rollback":
+            assert normalized.count("ROLLBACK") == 1
+            assert normalized.count("COMMIT") == 0
+            assert tuple(connection.iterdump()) == graph_before
+        else:
+            assert normalized.count("COMMIT") == 1
+            assert normalized.count("ROLLBACK") == 0
+            assert tuple(connection.iterdump()) != graph_before
+        assert labels[-1] == selected_label
+    finally:
+        connection.set_trace_callback(None)
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    replay_requests: list[object] = []
+
+    async def replay(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        replay_requests.append(request)
+        if response_fate == "success":
+            return fresh_session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": ROOM}),
+            )
+        return fresh_session._network_result(
+            request,
+            400,
+            canonical_json({"errcode": "M_NOT_FOUND"}),
+        )
+
+    fresh_session._request = replay  # type: ignore[method-assign]
+    try:
+        pending = fresh_session._journal._load_pending_local_membership_intents(limit=2)
+        owner = fresh_session._journal.load_owner()
+        with fresh_session._journal._owner.read():
+            inventory = fresh_session._journal._load_task3_work_inventory(owner)
+        if transaction_fate == "rollback":
+            assert len(pending) == 1
+            assert pending[0].intent.operation_id == operation_id
+            assert inventory.work == ()
+            assert await fresh_session._advance_local_membership_intent() is True
+            assert len(replay_requests) == 1
+            pending = fresh_session._journal._load_pending_local_membership_intents(
+                limit=2
+            )
+            owner = fresh_session._journal.load_owner()
+            with fresh_session._journal._owner.read():
+                inventory = fresh_session._journal._load_task3_work_inventory(owner)
+        else:
+            assert replay_requests == []
+        assert pending == ()
+        if response_fate == "success":
+            assert len(inventory.work) == 1
+            assert inventory.work[0].value.origin == SystemOrigin(
+                SystemOriginKind.MEMBERSHIP_CHANGE,
+                operation_id,
+            )
+        else:
+            assert inventory.work == ()
+    finally:
+        await fresh_session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("insert", "update"))
+@pytest.mark.parametrize("transaction_fate", ("rollback", "commit"))
+async def test_owned_local_membership_intent_uncertainty_reopens_exact_fate(
+    tmp_path,
+    path: str,
+    transaction_fate: str,
+) -> None:
+    class IntentAbort(BaseException):
+        pass
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    if path == "insert":
+        previous_membership, previous_epoch, current_membership = (
+            "leave",
+            0,
+            "join",
+        )
+    else:
+        _seed_operation, _commit, _aggregate, _work = _publish_fresh_local_join(session)
+        seed_batch = session.next_batch()
+        assert seed_batch is not None
+        session.acknowledge_batch(seed_batch.ref)
+        previous_membership, previous_epoch, current_membership = (
+            "join",
+            0,
+            "leave",
+        )
+    operation_id = uuid4()
+    connection = session._owned_store.database.connection()
+    owner_before = session._journal.load_owner()
+    graph_before = tuple(connection.iterdump())
+    aggregate_label = f"local_intent_aggregate_{path}"
+    selected_label = "commit" if transaction_fate == "commit" else aggregate_label
+    sentinel = IntentAbort(f"intent {path} {transaction_fate} failed")
+    labels: list[str] = []
+    statements: list[str] = []
+
+    def abort(label: str) -> None:
+        labels.append(label)
+        if label == selected_label:
+            raise sentinel
+
+    session._journal.set_transition_statement_hook(abort)
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(IntentAbort) as failure:
+            session._journal._record_local_membership_intent(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership=previous_membership,
+                previous_epoch=previous_epoch,
+                current_membership=current_membership,
+            )
+        connection.set_trace_callback(None)
+        assert failure.value is sentinel
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert normalized.count("BEGIN IMMEDIATE") == 1
+        if transaction_fate == "rollback":
+            assert normalized.count("ROLLBACK") == 1
+            assert normalized.count("COMMIT") == 0
+            assert tuple(connection.iterdump()) == graph_before
+        else:
+            assert normalized.count("COMMIT") == 1
+            assert normalized.count("ROLLBACK") == 0
+            assert tuple(connection.iterdump()) != graph_before
+        assert labels[-1] == selected_label
+    finally:
+        connection.set_trace_callback(None)
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    try:
+        pending = reopened._journal._load_pending_local_membership_intents(limit=2)
+        if transaction_fate == "rollback":
+            assert pending == ()
+            committed = reopened._journal._record_local_membership_intent(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership=previous_membership,
+                previous_epoch=previous_epoch,
+                current_membership=current_membership,
+            )
+            assert committed == CommitResult(owner_before.revision + 1)
+            pending = reopened._journal._load_pending_local_membership_intents(limit=2)
+        assert len(pending) == 1
+        assert pending[0].room_id == ROOM
+        assert pending[0].intent.operation_id == operation_id
+        reopened_connection = reopened._journal._owner.database.connection()
+        graph_after = tuple(reopened_connection.iterdump())
+        retry_statements: list[str] = []
+        reopened_connection.set_trace_callback(retry_statements.append)
+        retried = reopened._journal._record_local_membership_intent(
+            operation_id=operation_id,
+            room_id=ROOM,
+            previous_membership=previous_membership,
+            previous_epoch=previous_epoch,
+            current_membership=current_membership,
+        )
+        reopened_connection.set_trace_callback(None)
+        assert retried == CommitResult(owner_before.revision + 1)
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+            for statement in retry_statements
+        )
+        assert tuple(reopened_connection.iterdump()) == graph_after
+    finally:
+        reopened._journal._owner.database.connection().set_trace_callback(None)
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_local_membership_work_reopen_fences_source_until_ack(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    session._journal._record_local_membership_intent(
+        operation_id=operation_id,
+        room_id=ROOM,
+        previous_membership="leave",
+        previous_epoch=0,
+        current_membership="join",
+    )
+
+    async def membership_success(request, **kwargs: object) -> NetworkResult:
+        assert request.path == nio.Api.join("secret-token", ROOM)[1]
+        assert kwargs == {"body_disconnect_retry": True}
+        return session._network_result(
+            request,
+            200,
+            canonical_json({"room_id": ROOM}),
+        )
+
+    session._request = membership_success  # type: ignore[method-assign]
+    assert await session._advance_local_membership_intent() is True
+    assert session.next_batch() is not None
+    await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    source_entered = asyncio.Event()
+    source_cancelled = asyncio.Event()
+    requests: list[object] = []
+    runner: asyncio.Task[None] | None = None
+
+    async def source_only(request, **kwargs: object) -> NetworkResult:
+        assert request.path != nio.Api.join("secret-token", ROOM)[1]
+        assert request.path != nio.Api.room_leave("secret-token", ROOM)[1]
+        assert kwargs == {}
+        requests.append(request)
+        source_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            source_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    fresh_session._request = source_only  # type: ignore[method-assign]
+    try:
+        runner = asyncio.create_task(fresh_session.run())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert requests == []
+        batch = fresh_session.next_batch()
+        assert batch is not None
+        assert len(batch.records) == 1
+        assert batch.records[0].origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            operation_id,
+        )
+        await fresh_session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        await asyncio.wait_for(source_entered.wait(), timeout=1)
+        assert len(requests) == 1
+        await fresh_session.close()
+        await asyncio.wait_for(source_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+    finally:
+        if runner is not None and not runner.done():
+            runner.cancel()
+        await asyncio.gather(
+            *(task for task in (runner,) if task is not None),
+            return_exceptions=True,
+        )
+        if not fresh_session._closed:
+            await fresh_session.close()
+
+    final_bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+    final_client = owned_client(tmp_path)
+    final_session = open_owned_session(final_client, final_bootstrap, generation)
+    final_entered = asyncio.Event()
+    final_cancelled = asyncio.Event()
+    final_requests: list[object] = []
+    final_runner: asyncio.Task[None] | None = None
+
+    async def final_source(request, **kwargs: object) -> NetworkResult:
+        assert request.path != nio.Api.join("secret-token", ROOM)[1]
+        assert request.path != nio.Api.room_leave("secret-token", ROOM)[1]
+        assert kwargs == {}
+        final_requests.append(request)
+        final_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            final_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    final_session._request = final_source  # type: ignore[method-assign]
+    try:
+        assert final_session.next_batch() is None
+        assert (
+            final_session._journal._load_pending_local_membership_intents(limit=2) == ()
+        )
+        final_runner = asyncio.create_task(final_session.run())
+        await asyncio.wait_for(final_entered.wait(), timeout=1)
+        assert len(final_requests) == 1
+        await final_session.close()
+        await asyncio.wait_for(final_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await final_runner
+    finally:
+        if final_runner is not None and not final_runner.done():
+            final_runner.cancel()
+        await asyncio.gather(
+            *(task for task in (final_runner,) if task is not None),
+            return_exceptions=True,
+        )
+        if not final_session._closed:
+            await final_session.close()
 
 
 @pytest.mark.asyncio
@@ -5926,7 +7324,115 @@ async def test_owned_materializer_commit_hook_poison_reopens_committed_graph(
 
 
 @pytest.mark.asyncio
-async def test_owned_runner_uses_private_materializer_and_blocks_on_retained_oldest_frame(
+async def test_owned_runner_enters_frame_owned_key_upload_before_source_poll(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    staged = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    owner = session._journal.load_owner()
+    source = session._journal.load_source()
+    with session._journal._owner.read():
+        headers = session._journal._load_authenticated_frame_headers(owner)
+        prepared = session._journal._load_prepared_frame_with_owner(
+            staged.frame_id,
+            owner,
+        )
+        inventory = session._journal._load_task3_work_inventory(owner)
+    assert len(headers) == 1
+    header = headers[0]
+    assert header.frame_id == staged.frame_id
+    assert header.room_materialized_revision is not None
+    assert header.callbacks_claimed_revision is None
+    assert prepared is not None
+    assert inventory.work == ()
+    assert len(prepared.outbound_maintenance.operations) == 1
+    operation = prepared.outbound_maintenance.operations[0]
+    assert (operation.kind, operation.state) == ("key_upload", "pending")
+    assert operation.transaction_id is None
+    assert operation.event_type is None
+    assert operation.context is None
+    graph_before = tuple(connection.iterdump())
+
+    requests: list[object] = []
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def observe_request(request, **kwargs: object):
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        assert (
+            request.stream_id,
+            request.transport,
+            request.source_epoch,
+            request.request_id,
+            request.method,
+            request.path,
+            request.query,
+            request.body,
+            request.timeout_ms,
+            request.request_cursor_json,
+        ) == (
+            owner.stream_id,
+            owner.transport_kind,
+            header.source_epoch,
+            header.request_id,
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            (),
+            operation.body_json,
+            classic_config().source.timeout_ms,
+            prepared.request_cursor_json,
+        )
+        entered.set()
+        await never_release.wait()
+        raise AssertionError("maintenance request unexpectedly resumed")
+
+    session._request = observe_request  # type: ignore[method-assign]
+    runner = asyncio.create_task(session.run())
+    entered_wait = asyncio.create_task(entered.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            (runner, entered_wait),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert entered_wait in done, (
+            "owned runner stopped before pending maintenance: " f"{runner_failure!r}"
+        )
+        assert not runner.done()
+        assert len(requests) == 1
+        assert session._journal.load_source() == source
+        assert tuple(connection.iterdump()) == graph_before
+        current_owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            current = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                current_owner,
+            )
+        assert current == prepared
+        assert client.send_count == 0
+    finally:
+        never_release.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        if not entered_wait.done():
+            entered_wait.cancel()
+        await asyncio.gather(entered_wait, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_key_upload_response_commits_with_settled_plan(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5934,6 +7440,2516 @@ async def test_owned_runner_uses_private_materializer_and_blocks_on_retained_old
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
     session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    staged = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    owner_before = session._journal.load_owner()
+    source_before = session._journal.load_source()
+    with session._journal._owner.read():
+        prepared_before = session._journal._load_prepared_frame_with_owner(
+            staged.frame_id,
+            owner_before,
+        )
+        inventory = session._journal._load_task3_work_inventory(owner_before)
+    assert prepared_before is not None
+    assert inventory.work == ()
+    assert len(prepared_before.outbound_maintenance.operations) == 1
+    pending = prepared_before.outbound_maintenance.operations[0]
+    assert (pending.kind, pending.state, pending.context) == (
+        "key_upload",
+        "pending",
+        None,
+    )
+    assert client.olm is not None
+    olm = client.olm
+    assert not olm.account.shared
+    assert olm.uploaded_key_count is None
+    account_before = connection.execute("SELECT account FROM accounts").fetchone()
+    assert account_before is not None
+
+    response_body = canonical_json(
+        {
+            "one_time_key_counts": {
+                "curve25519": 0,
+                "signed_curve25519": 7,
+            }
+        }
+    )
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        assert (request.path, request.body) == (
+            "/_matrix/client/v3/keys/upload",
+            pending.body_json,
+        )
+        return session._network_result(request, 200, response_body)
+
+    session._request = respond  # type: ignore[method-assign]
+    parsed_responses: list[KeysUploadResponse] = []
+    real_parse = KeysUploadResponse.from_dict
+
+    def observe_parse(_cls, value: object):
+        assert not connection.in_transaction
+        assert session._journal._owner._outer_scope is None
+        response = real_parse(value)  # type: ignore[arg-type]
+        assert type(response) is KeysUploadResponse
+        parsed_responses.append(response)
+        return response
+
+    monkeypatch.setattr(KeysUploadResponse, "from_dict", classmethod(observe_parse))
+    applied_responses: list[KeysUploadResponse] = []
+    real_handle = olm.handle_response
+
+    def observe_apply(response: object) -> None:
+        assert connection.in_transaction
+        assert session._journal._owner._outer_scope == "journal_write"
+        assert response is parsed_responses[0]
+        applied_responses.append(response)
+        real_handle(response)
+
+    monkeypatch.setattr(olm, "handle_response", observe_apply)
+
+    def forbid_callback(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("key-upload maintenance invoked a callback")
+
+    for callback_name in (
+        "_on_to_device",
+        "_on_invited_rooms",
+        "_on_event",
+        "_on_ephemeral",
+        "_on_room_account_data",
+        "_on_presence",
+        "_on_global_account_data",
+        "_on_expired_verifications",
+    ):
+        monkeypatch.setattr(client, callback_name, forbid_callback)
+    monkeypatch.setattr(client, "receive_response", forbid_callback)
+
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        assert await session._advance_blocked_frame(staged.frame_id)
+        connection.set_trace_callback(None)
+        assert len(requests) == 1
+        assert len(parsed_responses) == 1
+        assert applied_responses == parsed_responses
+        assert olm.account.shared
+        assert olm.uploaded_key_count == 7
+        persisted = client.store._load_persisted_account()
+        assert persisted is not None
+        assert persisted.shared
+        assert connection.execute("SELECT account FROM accounts").fetchone() != (
+            account_before
+        )
+
+        owner_after = session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        assert session._journal.load_source() == source_before
+        with session._journal._owner.read():
+            prepared_after = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        assert (
+            prepared_after._replace(
+                outbound_maintenance=prepared_before.outbound_maintenance
+            )
+            == prepared_before
+        )
+        assert prepared_after.outbound_maintenance.operations == (
+            pending._replace(state="settled", context=None),
+        )
+        transaction_statements = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert transaction_statements.count("BEGIN IMMEDIATE") == 1
+        assert transaction_statements.count("COMMIT") == 1
+        assert transaction_statements.count("ROLLBACK") == 0
+        assert any(
+            statement.lstrip().upper().startswith("UPDATE")
+            and "ACCOUNTS" in statement.upper()
+            for statement in statements
+        )
+        assert any(
+            statement.lstrip().upper().startswith("UPDATE")
+            and "NIOINGESTMETA" in statement.upper()
+            for statement in statements
+        )
+        assert any(
+            statement.lstrip().upper().startswith("UPDATE")
+            and "NIOINGESTFRAME" in statement.upper()
+            for statement in statements
+        )
+        assert not any(
+            "/_matrix/client/v3/sync" in getattr(request, "path", "")
+            for request in requests
+        )
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_key_query_response_commits_with_settled_plan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    olm = client.olm
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.users_for_key_query.add(BOB)
+    olm.save_account()
+    staged = stage_classic(
+        bootstrap,
+        {
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    owner_before = session._journal.load_owner()
+    with session._journal._owner.read():
+        prepared_before = session._journal._load_prepared_frame_with_owner(
+            staged.frame_id,
+            owner_before,
+        )
+        inventory = session._journal._load_task3_work_inventory(owner_before)
+    assert prepared_before is not None
+    assert inventory.work == ()
+    assert prepared_before.outbound_maintenance.operations == (
+        prepared_before.outbound_maintenance.operations[0],
+    )
+    pending = prepared_before.outbound_maintenance.operations[0]
+    assert (pending.kind, pending.state, pending.context) == (
+        "key_query",
+        "pending",
+        None,
+    )
+    assert pending.body_json == canonical_json({"device_keys": {BOB: []}})
+    assert olm.users_for_key_query == {BOB}
+    assert BOB not in olm.tracked_users
+
+    response_body = canonical_json(
+        {
+            "device_keys": {BOB: {}},
+            "failures": {},
+        }
+    )
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        assert (request.method, request.path, request.body) == (
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            pending.body_json,
+        )
+        return session._network_result(request, 200, response_body)
+
+    session._request = respond  # type: ignore[method-assign]
+    connection = session._owned_store.database.connection()
+    parsed_responses: list[KeysQueryResponse] = []
+    real_parse = KeysQueryResponse.from_dict
+
+    def observe_parse(_cls, value: object):
+        assert not connection.in_transaction
+        assert session._journal._owner._outer_scope is None
+        response = real_parse(value)  # type: ignore[arg-type]
+        assert type(response) is KeysQueryResponse
+        parsed_responses.append(response)
+        return response
+
+    monkeypatch.setattr(KeysQueryResponse, "from_dict", classmethod(observe_parse))
+    applied_responses: list[KeysQueryResponse] = []
+    real_handle = olm.handle_response
+
+    def observe_apply(response: object) -> None:
+        assert connection.in_transaction
+        assert session._journal._owner._outer_scope == "journal_write"
+        assert response is parsed_responses[0]
+        applied_responses.append(response)
+        real_handle(response)
+
+    monkeypatch.setattr(olm, "handle_response", observe_apply)
+
+    def forbid_callback(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("key-query maintenance invoked a callback")
+
+    for callback_name in (
+        "_on_to_device",
+        "_on_invited_rooms",
+        "_on_event",
+        "_on_ephemeral",
+        "_on_room_account_data",
+        "_on_presence",
+        "_on_global_account_data",
+        "_on_expired_verifications",
+    ):
+        monkeypatch.setattr(client, callback_name, forbid_callback)
+    monkeypatch.setattr(client, "receive_response", forbid_callback)
+
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        assert await session._advance_blocked_frame(staged.frame_id)
+        connection.set_trace_callback(None)
+        assert len(requests) == 1
+        assert len(parsed_responses) == 1
+        assert applied_responses == parsed_responses
+        assert BOB not in olm.users_for_key_query
+        assert BOB in olm.tracked_users
+        owner_after = session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        with session._journal._owner.read():
+            prepared_after = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        assert (
+            prepared_after._replace(
+                outbound_maintenance=prepared_before.outbound_maintenance
+            )
+            == prepared_before
+        )
+        assert prepared_after.outbound_maintenance.operations == (
+            pending._replace(state="settled", context=None),
+        )
+        transactions = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert transactions.count("BEGIN IMMEDIATE") == 1
+        assert transactions.count("COMMIT") == 1
+        assert transactions.count("ROLLBACK") == 0
+        assert any(
+            statement.lstrip().upper().startswith("UPDATE")
+            and "NIOINGESTMETA" in statement.upper()
+            for statement in statements
+        )
+        assert any(
+            statement.lstrip().upper().startswith("UPDATE")
+            and "NIOINGESTFRAME" in statement.upper()
+            for statement in statements
+        )
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.parametrize("with_rerequest", (False, True), ids=("plain", "rerequest"))
+@pytest.mark.asyncio
+async def test_owned_key_claim_reconstructs_context_and_appends_dummy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_rerequest: bool,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    remote_store = SqliteMemoryStore(BOB, BOB_DEVICE, "remote-secret")
+    remote = Olm(BOB, BOB_DEVICE, remote_store)
+    remote.account.generate_one_time_keys(1)
+    shared = remote.share_keys()
+    one_time_key = next(iter(shared["one_time_keys"].items()))
+    response_body = canonical_json(
+        {
+            "failures": {},
+            "one_time_keys": {
+                BOB: {
+                    BOB_DEVICE: {
+                        one_time_key[0]: one_time_key[1],
+                    }
+                }
+            },
+        }
+    )
+    staged: StagedFrame | None = None
+    prepared_before: object | None = None
+    pending: object | None = None
+    rerequest_contexts: list[dict[str, object]] = []
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        remote_device = OlmDevice(
+            BOB,
+            BOB_DEVICE,
+            remote.account.identity_keys,
+        )
+        client.store.save_device_keys({BOB: {BOB_DEVICE: remote_device}})
+        olm.device_store.add(remote_device)
+        olm.wedged_devices.append(remote_device)
+        if with_rerequest:
+            rerequest_source = {
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "rerequest-ciphertext",
+                    "device_id": BOB_DEVICE,
+                    "sender_key": remote_device.curve25519,
+                    "session_id": "missing-session",
+                },
+                "event_id": "$missing-key",
+                "origin_server_ts": 1,
+                "sender": BOB,
+                "type": "m.room.encrypted",
+            }
+            rerequest = Event.parse_event(rerequest_source)
+            assert type(rerequest) is MegolmEvent
+            rerequest.room_id = ROOM
+            olm.key_re_requests_events[(BOB, BOB_DEVICE)].append(rerequest)
+            rerequest_contexts.append(
+                {
+                    "source_json": base64.b64encode(
+                        canonical_json(rerequest_source)
+                    ).decode("ascii"),
+                    "room_id": ROOM,
+                    "event_id": "$missing-key",
+                    "sender_user_id": BOB,
+                    "sender_device_id": BOB_DEVICE,
+                    "sender_key": remote_device.curve25519,
+                    "session_id": "missing-session",
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                }
+            )
+        staged = stage_classic(
+            bootstrap,
+            {
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "s1",
+                "rooms": {},
+            },
+        )
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            prepared_before = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner,
+            )
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert prepared_before is not None
+        assert inventory.work == ()
+        assert len(prepared_before.outbound_maintenance.operations) == 1
+        pending = prepared_before.outbound_maintenance.operations[0]
+        assert (pending.kind, pending.state, pending.context) == (
+            "key_claim",
+            "pending",
+            {
+                "claims": [
+                    {
+                        "device_id": BOB_DEVICE,
+                        "rerequest_events": rerequest_contexts,
+                        "user_id": BOB,
+                        "waiting_key_requests": [],
+                        "was_waiting": False,
+                        "was_wedged": True,
+                    }
+                ]
+            },
+        )
+        assert pending.body_json == canonical_json(
+            {"one_time_keys": {BOB: {BOB_DEVICE: "signed_curve25519"}}}
+        )
+    finally:
+        await session.close()
+
+    assert staged is not None
+    assert prepared_before is not None
+    assert pending is not None
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    connection = fresh_session._owned_store.database.connection()
+    expected_operations: object | None = None
+    try:
+        assert fresh_client.olm is not None
+        fresh_olm = fresh_client.olm
+        assert fresh_olm.wedged_devices == []
+        assert fresh_olm.key_request_devices_no_session == []
+        assert dict(fresh_olm.key_re_requests_events) == {}
+        assert fresh_olm.outgoing_to_device_messages == []
+        stored_device = fresh_olm.device_store[BOB][BOB_DEVICE]
+        assert stored_device.curve25519 == remote_device.curve25519
+        assert fresh_olm.session_store.get(stored_device.curve25519) is None
+        owner_before = fresh_session._journal.load_owner()
+        session_rows_before = tuple(
+            connection.execute("SELECT * FROM olmsessions ORDER BY session_id")
+        )
+        requests: list[object] = []
+
+        async def respond(request, **kwargs: object) -> NetworkResult:
+            requests.append(request)
+            assert kwargs == {"body_disconnect_retry": True}
+            assert (request.method, request.path, request.body) == (
+                "POST",
+                "/_matrix/client/v3/keys/claim",
+                pending.body_json,
+            )
+            return fresh_session._network_result(request, 200, response_body)
+
+        fresh_session._request = respond  # type: ignore[method-assign]
+        parsed_responses: list[KeysClaimResponse] = []
+        real_parse = KeysClaimResponse.from_dict
+
+        def observe_parse(_cls, value: object):
+            assert not connection.in_transaction
+            assert fresh_session._journal._owner._outer_scope is None
+            response = real_parse(value)  # type: ignore[arg-type]
+            assert type(response) is KeysClaimResponse
+            parsed_responses.append(response)
+            return response
+
+        monkeypatch.setattr(KeysClaimResponse, "from_dict", classmethod(observe_parse))
+        applied_responses: list[KeysClaimResponse] = []
+        real_handle = fresh_olm.handle_response
+
+        def observe_apply(response: object) -> None:
+            assert connection.in_transaction
+            assert fresh_session._journal._owner._outer_scope == "journal_write"
+            assert response is parsed_responses[0]
+            assert fresh_olm.wedged_devices == [stored_device]
+            queued_rerequests = fresh_olm.key_re_requests_events[(BOB, BOB_DEVICE)]
+            assert len(queued_rerequests) == len(rerequest_contexts)
+            if queued_rerequests:
+                reconstructed = queued_rerequests[0]
+                assert type(reconstructed) is MegolmEvent
+                assert (
+                    reconstructed.room_id,
+                    reconstructed.event_id,
+                    reconstructed.sender,
+                    reconstructed.device_id,
+                    reconstructed.sender_key,
+                    reconstructed.session_id,
+                    reconstructed.algorithm,
+                ) == (
+                    ROOM,
+                    "$missing-key",
+                    BOB,
+                    BOB_DEVICE,
+                    remote_device.curve25519,
+                    "missing-session",
+                    "m.megolm.v1.aes-sha2",
+                )
+            applied_responses.append(response)
+            real_handle(response)
+
+        monkeypatch.setattr(fresh_olm, "handle_response", observe_apply)
+
+        def forbid_callback(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("key-claim maintenance invoked a callback")
+
+        for callback_name in (
+            "_on_to_device",
+            "_on_invited_rooms",
+            "_on_event",
+            "_on_ephemeral",
+            "_on_room_account_data",
+            "_on_presence",
+            "_on_global_account_data",
+            "_on_expired_verifications",
+        ):
+            monkeypatch.setattr(fresh_client, callback_name, forbid_callback)
+        monkeypatch.setattr(fresh_client, "receive_response", forbid_callback)
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        assert await fresh_session._advance_blocked_frame(staged.frame_id)
+        connection.set_trace_callback(None)
+        assert len(requests) == 1
+        assert len(parsed_responses) == 1
+        assert applied_responses == parsed_responses
+        assert fresh_olm.wedged_devices == []
+        assert len(fresh_olm.key_re_requests_events[(BOB, BOB_DEVICE)]) == len(
+            rerequest_contexts
+        )
+        assert len(fresh_olm.outgoing_to_device_messages) == 1
+        dummy = fresh_olm.outgoing_to_device_messages[0]
+        assert type(dummy) is DummyMessage
+        assert (dummy.recipient, dummy.recipient_device, dummy.type) == (
+            BOB,
+            BOB_DEVICE,
+            "m.room.encrypted",
+        )
+        assert fresh_olm.session_store.get(stored_device.curve25519) is not None
+        session_rows_after = tuple(
+            connection.execute("SELECT * FROM olmsessions ORDER BY session_id")
+        )
+        assert len(session_rows_after) == len(session_rows_before) + 1
+        owner_after = fresh_session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        with fresh_session._journal._owner.read():
+            prepared_after = fresh_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        operations = prepared_after.outbound_maintenance.operations
+        assert len(operations) == 2
+        assert operations[0] == pending._replace(state="settled", context=None)
+        expected_body = canonical_json({"messages": {BOB: {BOB_DEVICE: dummy.content}}})
+        assert operations[1].body_json == expected_body
+        assert operations[1].event_type == "m.room.encrypted"
+        assert operations[1].context == {
+            "rerequest_events": rerequest_contexts,
+            "subtype": "dummy",
+        }
+        assert operations[1].transaction_id == str(
+            uuid5(
+                staged.frame_id,
+                "nio.ingest.outbound-maintenance.v1:"
+                f"to-device:1:{hashlib.sha256(expected_body).hexdigest()}",
+            )
+        )
+        transactions = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert transactions.count("BEGIN IMMEDIATE") == 1
+        assert transactions.count("COMMIT") == 1
+        assert transactions.count("ROLLBACK") == 0
+    finally:
+        connection.set_trace_callback(None)
+        await fresh_session.close()
+
+    reopened_again = reopen_owned_bootstrap(tmp_path, generation)
+    final_client = owned_client(tmp_path)
+    final_session = open_owned_session(final_client, reopened_again, generation)
+    try:
+        assert final_client.olm is not None
+        final_olm = final_client.olm
+        assert final_olm.outgoing_to_device_messages == []
+        assert dict(final_olm.key_re_requests_events) == {}
+        final_owner = final_session._journal.load_owner()
+        with final_session._journal._owner.read():
+            final_prepared = final_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                final_owner,
+            )
+        assert final_prepared is not None
+        pending_dummy = final_prepared.outbound_maintenance.operations[1]
+        requests: list[object] = []
+
+        async def respond(request, **kwargs: object) -> NetworkResult:
+            requests.append(request)
+            assert kwargs == {"body_disconnect_retry": True}
+            assert (request.method, request.path, request.body) == (
+                "PUT",
+                "/_matrix/client/v3/sendToDevice/"
+                f"m.room.encrypted/{pending_dummy.transaction_id}",
+                pending_dummy.body_json,
+            )
+            return final_session._network_result(request, 200, canonical_json({}))
+
+        final_session._request = respond  # type: ignore[method-assign]
+        real_handle = final_olm.handle_response
+        handled: list[ToDeviceResponse] = []
+
+        def observe_handle(response: object) -> None:
+            assert final_session._owned_store.database.connection().in_transaction
+            assert final_session._journal._owner._outer_scope == "journal_write"
+            assert type(response) is ToDeviceResponse
+            assert type(response.to_device_message) is DummyMessage
+            assert final_olm.outgoing_to_device_messages == [response.to_device_message]
+            assert len(final_olm.key_re_requests_events[(BOB, BOB_DEVICE)]) == len(
+                rerequest_contexts
+            )
+            handled.append(response)
+            real_handle(response)
+
+        monkeypatch.setattr(final_olm, "handle_response", observe_handle)
+        assert await final_session._advance_blocked_frame(staged.frame_id)
+        assert len(requests) == 1
+        assert len(handled) == 1
+        generated = tuple(final_olm.outgoing_to_device_messages)
+        assert len(generated) == len(rerequest_contexts)
+        owner_after_dummy = final_session._journal.load_owner()
+        assert owner_after_dummy.revision == final_owner.revision + 1
+        with final_session._journal._owner.read():
+            after_dummy = final_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after_dummy,
+            )
+        assert after_dummy is not None
+        expected_prefix = (
+            final_prepared.outbound_maintenance.operations[0],
+            pending_dummy._replace(state="settled", context=None),
+        )
+        if not rerequest_contexts:
+            assert after_dummy.outbound_maintenance.operations == expected_prefix
+        else:
+            assert len(generated) == 1
+            request_message = generated[0]
+            assert type(request_message) is RoomKeyRequestMessage
+            assert (
+                request_message.recipient,
+                request_message.recipient_device,
+                request_message.request_id,
+                request_message.session_id,
+                request_message.room_id,
+                request_message.algorithm,
+            ) == (
+                BOB,
+                BOB_DEVICE,
+                "missing-session",
+                "missing-session",
+                ROOM,
+                "m.megolm.v1.aes-sha2",
+            )
+            appended = after_dummy.outbound_maintenance.operations[2]
+            expected_body = canonical_json(request_message.as_dict())
+            assert after_dummy.outbound_maintenance.operations[:2] == expected_prefix
+            assert (
+                appended.kind,
+                appended.state,
+                appended.body_json,
+                appended.event_type,
+                appended.context,
+            ) == (
+                "to_device",
+                "pending",
+                expected_body,
+                "m.room_key_request",
+                {
+                    "subtype": "room_key_request",
+                    "request_id": "missing-session",
+                    "session_id": "missing-session",
+                    "room_id": ROOM,
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                },
+            )
+            assert appended.transaction_id == str(
+                uuid5(
+                    staged.frame_id,
+                    "nio.ingest.outbound-maintenance.v1:"
+                    f"to-device:2:{hashlib.sha256(expected_body).hexdigest()}",
+                )
+            )
+    finally:
+        await final_session.close()
+
+    if with_rerequest:
+        request_reopen = reopen_owned_bootstrap(tmp_path, generation)
+        request_client = owned_client(tmp_path)
+        request_session = open_owned_session(request_client, request_reopen, generation)
+        try:
+            assert request_client.olm is not None
+            request_olm = request_client.olm
+            assert request_olm.outgoing_to_device_messages == []
+            assert request_olm.outgoing_key_requests == {}
+            request_owner = request_session._journal.load_owner()
+            with request_session._journal._owner.read():
+                request_prepared = (
+                    request_session._journal._load_prepared_frame_with_owner(
+                        staged.frame_id,
+                        request_owner,
+                    )
+                )
+            assert request_prepared is not None
+            pending_request = request_prepared.outbound_maintenance.operations[2]
+            requests: list[object] = []
+
+            async def respond(request, **kwargs: object) -> NetworkResult:
+                requests.append(request)
+                assert kwargs == {"body_disconnect_retry": True}
+                assert (request.method, request.path, request.body) == (
+                    "PUT",
+                    "/_matrix/client/v3/sendToDevice/"
+                    f"m.room_key_request/{pending_request.transaction_id}",
+                    pending_request.body_json,
+                )
+                return request_session._network_result(
+                    request,
+                    200,
+                    canonical_json({}),
+                )
+
+            request_session._request = respond  # type: ignore[method-assign]
+            assert await request_session._advance_blocked_frame(staged.frame_id)
+            assert len(requests) == 1
+            assert request_olm.outgoing_to_device_messages == []
+            assert tuple(request_olm.outgoing_key_requests) == ("missing-session",)
+            persisted_requests = request_client.store.load_outgoing_key_requests()
+            assert tuple(persisted_requests) == ("missing-session",)
+            persisted_request = persisted_requests["missing-session"]
+            assert (
+                persisted_request.request_id,
+                persisted_request.session_id,
+                persisted_request.room_id,
+                persisted_request.algorithm,
+            ) == (
+                "missing-session",
+                "missing-session",
+                ROOM,
+                "m.megolm.v1.aes-sha2",
+            )
+            settled_owner = request_session._journal.load_owner()
+            assert settled_owner.revision == request_owner.revision + 1
+            with request_session._journal._owner.read():
+                settled_request_frame = (
+                    request_session._journal._load_prepared_frame_with_owner(
+                        staged.frame_id,
+                        settled_owner,
+                    )
+                )
+            assert settled_request_frame is not None
+            assert settled_request_frame.outbound_maintenance.operations == (
+                *request_prepared.outbound_maintenance.operations[:2],
+                pending_request._replace(state="settled", context=None),
+            )
+        finally:
+            await request_session.close()
+        remote_store.database.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_key_claim_reconstructs_waiting_request_and_appends_share(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_device_id = "OTHER"
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    sender_store = SqliteMemoryStore(BOB, BOB_DEVICE, "sender-secret")
+    sender = Olm(BOB, BOB_DEVICE, sender_store)
+    remote_store = SqliteMemoryStore(ACCOUNT, other_device_id, "remote-secret")
+    remote = Olm(ACCOUNT, other_device_id, remote_store)
+    assert client.olm is not None
+    olm = client.olm
+    recipient_device = OlmDevice(ACCOUNT, DEVICE, olm.account.identity_keys)
+    sender_device = OlmDevice(BOB, BOB_DEVICE, sender.account.identity_keys)
+    sender.store.save_device_keys({ACCOUNT: {DEVICE: recipient_device}})
+    sender.device_store.add(recipient_device)
+    sender.verify_device(recipient_device)
+    client.store.save_device_keys({BOB: {BOB_DEVICE: sender_device}})
+    olm.device_store.add(sender_device)
+    olm.verify_device(sender_device)
+    olm.account.generate_one_time_keys(1)
+    recipient_one_time_key = next(
+        iter(olm.account.one_time_keys["curve25519"].values())
+    )
+    sender.create_session(recipient_one_time_key, recipient_device.curve25519)
+    _sharing_with, room_key_message = sender.share_group_session(ROOM, [ACCOUNT])
+    sender_group = sender.outbound_group_sessions[ROOM]
+    olm.account.mark_keys_as_published()
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.save_account()
+
+    remote.account.generate_one_time_keys(1)
+    remote_shared = remote.share_keys()
+    claim_one_time_key = next(iter(remote_shared["one_time_keys"].items()))
+    remote_device = OlmDevice(
+        ACCOUNT,
+        other_device_id,
+        remote.account.identity_keys,
+    )
+    client.store.save_device_keys({ACCOUNT: {other_device_id: remote_device}})
+    olm.device_store.add(remote_device)
+    olm.verify_device(remote_device)
+    request_source = {
+        "content": {
+            "action": "request",
+            "body": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": ROOM,
+                "sender_key": sender.account.identity_keys["curve25519"],
+                "session_id": sender_group.id,
+            },
+            "request_id": "waiting-request",
+            "requesting_device_id": other_device_id,
+        },
+        "sender": ACCOUNT,
+        "type": "m.room_key_request",
+    }
+    waiting_request = ToDeviceEvent.parse_event(request_source)
+    assert type(waiting_request) is RoomKeyRequest
+    olm.key_request_devices_no_session.append(remote_device)
+    olm.key_requests_waiting_for_session[(ACCOUNT, other_device_id)][
+        waiting_request.request_id
+    ] = waiting_request
+    staged = stage_classic(
+        bootstrap,
+        {
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "rooms": {},
+            "to_device": {
+                "events": [
+                    {
+                        "content": room_key_message["messages"][ACCOUNT][DEVICE],
+                        "sender": BOB,
+                        "type": "m.room.encrypted",
+                    }
+                ]
+            },
+        },
+    )
+    response_body = canonical_json(
+        {
+            "failures": {},
+            "one_time_keys": {
+                ACCOUNT: {
+                    other_device_id: {
+                        claim_one_time_key[0]: claim_one_time_key[1],
+                    }
+                }
+            },
+        }
+    )
+    prepared_before: object | None = None
+    pending: object | None = None
+    try:
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        batch = session.next_batch()
+        assert batch is not None
+        assert len(batch.records) == 1
+        room_key_record = batch.records[0]
+        assert type(room_key_record) is EventRecord
+        assert room_key_record.kind is RecordKind.TO_DEVICE
+        session.acknowledge_batch(batch.ref)
+        assert session.next_batch() is None
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            prepared_before = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner,
+            )
+        assert prepared_before is not None
+        assert len(prepared_before.outbound_maintenance.operations) == 1
+        pending = prepared_before.outbound_maintenance.operations[0]
+        assert (pending.kind, pending.state) == ("key_claim", "pending")
+        assert pending.context == {
+            "claims": [
+                {
+                    "device_id": other_device_id,
+                    "rerequest_events": [],
+                    "user_id": ACCOUNT,
+                    "waiting_key_requests": [
+                        {
+                            "algorithm": "m.megolm.v1.aes-sha2",
+                            "request_id": "waiting-request",
+                            "requesting_device_id": other_device_id,
+                            "room_id": ROOM,
+                            "sender_key": sender.account.identity_keys["curve25519"],
+                            "sender_user_id": ACCOUNT,
+                            "session_id": sender_group.id,
+                            "source_json": base64.b64encode(
+                                canonical_json(request_source)
+                            ).decode("ascii"),
+                        }
+                    ],
+                    "was_waiting": True,
+                    "was_wedged": False,
+                }
+            ]
+        }
+    finally:
+        await session.close()
+
+    assert prepared_before is not None
+    assert pending is not None
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    connection = fresh_session._owned_store.database.connection()
+    try:
+        assert fresh_client.olm is not None
+        fresh_olm = fresh_client.olm
+        stored_device = fresh_olm.device_store[ACCOUNT][other_device_id]
+        assert fresh_olm.key_request_devices_no_session == []
+        assert dict(fresh_olm.key_requests_waiting_for_session) == {}
+        assert fresh_olm.received_key_requests == {}
+        assert fresh_olm.outgoing_to_device_messages == []
+        assert (
+            fresh_olm.inbound_group_store.get(
+                ROOM,
+                sender.account.identity_keys["curve25519"],
+                sender_group.id,
+            )
+            is not None
+        )
+        requests: list[object] = []
+
+        async def respond(request, **kwargs: object) -> NetworkResult:
+            requests.append(request)
+            assert kwargs == {"body_disconnect_retry": True}
+            assert (request.path, request.body) == (
+                "/_matrix/client/v3/keys/claim",
+                pending.body_json,
+            )
+            return fresh_session._network_result(request, 200, response_body)
+
+        fresh_session._request = respond  # type: ignore[method-assign]
+        real_collect = fresh_olm.collect_key_requests
+        collected: list[tuple[object, ...]] = []
+
+        def observe_collect():
+            assert connection.in_transaction
+            assert fresh_session._journal._owner._outer_scope == "journal_write"
+            assert fresh_olm.key_request_devices_no_session == []
+            assert (
+                fresh_olm.key_requests_waiting_for_session[(ACCOUNT, other_device_id)]
+                == {}
+            )
+            assert tuple(fresh_olm.received_key_requests) == ("waiting-request",)
+            result = tuple(real_collect())
+            collected.append(result)
+            return list(result)
+
+        monkeypatch.setattr(fresh_olm, "collect_key_requests", observe_collect)
+        owner_before = fresh_session._journal.load_owner()
+        assert await fresh_session._advance_blocked_frame(staged.frame_id)
+        assert len(requests) == 1
+        assert collected == [()]
+        assert fresh_olm.received_key_requests == {}
+        assert len(fresh_olm.outgoing_to_device_messages) == 1
+        share = fresh_olm.outgoing_to_device_messages[0]
+        assert type(share) is ToDeviceMessage
+        assert (share.recipient, share.recipient_device, share.type) == (
+            ACCOUNT,
+            other_device_id,
+            "m.room.encrypted",
+        )
+        assert fresh_olm.session_store.get(stored_device.curve25519) is not None
+        owner_after = fresh_session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        with fresh_session._journal._owner.read():
+            prepared_after = fresh_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        operations = prepared_after.outbound_maintenance.operations
+        assert len(operations) == 2
+        assert operations[0] == pending._replace(state="settled", context=None)
+        expected_body = canonical_json(share.as_dict())
+        assert (
+            operations[1].kind,
+            operations[1].state,
+            operations[1].body_json,
+            operations[1].event_type,
+            operations[1].context,
+        ) == (
+            "to_device",
+            "pending",
+            expected_body,
+            "m.room.encrypted",
+            {"subtype": "generic"},
+        )
+        assert operations[1].transaction_id == str(
+            uuid5(
+                staged.frame_id,
+                "nio.ingest.outbound-maintenance.v1:"
+                f"to-device:1:{hashlib.sha256(expected_body).hexdigest()}",
+            )
+        )
+        expected_operations = operations
+    finally:
+        await fresh_session.close()
+
+    assert expected_operations is not None
+    reopened_again = reopen_owned_bootstrap(tmp_path, generation)
+    final_client = owned_client(tmp_path)
+    final_session = open_owned_session(final_client, reopened_again, generation)
+    try:
+        assert final_client.olm is not None
+        assert final_client.olm.outgoing_to_device_messages == []
+        final_device = final_client.olm.device_store[ACCOUNT][other_device_id]
+        assert final_client.olm.session_store.get(final_device.curve25519) is not None
+        final_owner = final_session._journal.load_owner()
+        with final_session._journal._owner.read():
+            final_prepared = final_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                final_owner,
+            )
+        assert final_prepared is not None
+        assert final_prepared.outbound_maintenance.operations == expected_operations
+        pending_share = final_prepared.outbound_maintenance.operations[1]
+        requests: list[object] = []
+
+        async def respond(request, **kwargs: object) -> NetworkResult:
+            requests.append(request)
+            assert kwargs == {"body_disconnect_retry": True}
+            assert (
+                request.method,
+                request.path,
+                request.body,
+            ) == (
+                "PUT",
+                "/_matrix/client/v3/sendToDevice/"
+                f"m.room.encrypted/{pending_share.transaction_id}",
+                pending_share.body_json,
+            )
+            return final_session._network_result(request, 200, canonical_json({}))
+
+        final_session._request = respond  # type: ignore[method-assign]
+        parsed: list[ToDeviceResponse] = []
+        real_parse = ToDeviceResponse.from_dict
+
+        def observe_parse(_cls, value: object, message: object):
+            assert not final_session._owned_store.database.connection().in_transaction
+            assert final_session._journal._owner._outer_scope is None
+            assert type(message) is ToDeviceMessage
+            assert message.as_dict() == json.loads(pending_share.body_json)
+            response = real_parse(value, message)
+            assert type(response) is ToDeviceResponse
+            parsed.append(response)
+            return response
+
+        monkeypatch.setattr(ToDeviceResponse, "from_dict", classmethod(observe_parse))
+        applied: list[ToDeviceResponse] = []
+        real_handle = final_client.olm.handle_response
+
+        def observe_handle(response: object) -> None:
+            assert final_session._owned_store.database.connection().in_transaction
+            assert final_session._journal._owner._outer_scope == "journal_write"
+            assert response is parsed[0]
+            applied.append(response)
+            real_handle(response)
+
+        monkeypatch.setattr(final_client.olm, "handle_response", observe_handle)
+        assert await final_session._advance_blocked_frame(staged.frame_id)
+        assert len(requests) == 1
+        assert applied == parsed
+        assert final_client.olm.outgoing_to_device_messages == []
+        settled_owner = final_session._journal.load_owner()
+        assert settled_owner.revision == final_owner.revision + 1
+        with final_session._journal._owner.read():
+            settled_prepared = final_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                settled_owner,
+            )
+        assert settled_prepared is not None
+        assert settled_prepared.outbound_maintenance.operations == (
+            expected_operations[0],
+            pending_share._replace(state="settled", context=None),
+        )
+    finally:
+        await final_session.close()
+        sender_store.database.close()
+        remote_store.database.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_key_claim_reconstructs_multiple_targets_in_canonical_order(
+    tmp_path,
+) -> None:
+    device_ids = ("A", "B")
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    olm = client.olm
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.save_account()
+    remote_stores: list[SqliteMemoryStore] = []
+    devices: dict[str, OlmDevice] = {}
+    response_keys: dict[str, object] = {}
+    rerequest_context: dict[str, object] | None = None
+    for device_id in reversed(device_ids):
+        remote_store = SqliteMemoryStore(BOB, device_id, f"remote-{device_id}")
+        remote_stores.append(remote_store)
+        remote = Olm(BOB, device_id, remote_store)
+        remote.account.generate_one_time_keys(1)
+        shared = remote.share_keys()
+        one_time_key = next(iter(shared["one_time_keys"].items()))
+        response_keys[device_id] = {one_time_key[0]: one_time_key[1]}
+        device = OlmDevice(BOB, device_id, remote.account.identity_keys)
+        devices[device_id] = device
+        client.store.save_device_keys({BOB: {device_id: device}})
+        olm.device_store.add(device)
+        olm.wedged_devices.append(device)
+        if device_id == "A":
+            source = {
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "multi-rerequest-ciphertext",
+                    "device_id": device_id,
+                    "sender_key": device.curve25519,
+                    "session_id": "multi-missing-session",
+                },
+                "event_id": "$multi-rerequest",
+                "origin_server_ts": 1,
+                "sender": BOB,
+                "type": "m.room.encrypted",
+            }
+            event = Event.parse_event(source)
+            assert type(event) is MegolmEvent
+            event.room_id = ROOM
+            olm.key_re_requests_events[(BOB, device_id)].append(event)
+            rerequest_context = {
+                "source_json": base64.b64encode(canonical_json(source)).decode("ascii"),
+                "room_id": ROOM,
+                "event_id": "$multi-rerequest",
+                "sender_user_id": BOB,
+                "sender_device_id": device_id,
+                "sender_key": device.curve25519,
+                "session_id": "multi-missing-session",
+                "algorithm": "m.megolm.v1.aes-sha2",
+            }
+    assert rerequest_context is not None
+    staged = stage_classic(
+        bootstrap,
+        {
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    pending: object | None = None
+    try:
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            prepared = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner,
+            )
+        assert prepared is not None
+        assert len(prepared.outbound_maintenance.operations) == 1
+        pending = prepared.outbound_maintenance.operations[0]
+        assert pending.kind == "key_claim"
+        assert pending.body_json == canonical_json(
+            {
+                "one_time_keys": {
+                    BOB: {device_id: "signed_curve25519" for device_id in device_ids}
+                }
+            }
+        )
+        assert [
+            (claim["user_id"], claim["device_id"])
+            for claim in pending.context["claims"]
+        ] == [(BOB, device_id) for device_id in device_ids]
+        assert pending.context["claims"][0]["rerequest_events"] == [rerequest_context]
+        assert pending.context["claims"][1]["rerequest_events"] == []
+    finally:
+        await session.close()
+
+    assert pending is not None
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    try:
+        assert fresh_client.olm is not None
+        fresh_olm = fresh_client.olm
+        assert fresh_olm.wedged_devices == []
+        assert dict(fresh_olm.key_re_requests_events) == {}
+        assert fresh_olm.outgoing_to_device_messages == []
+        response_body = canonical_json(
+            {"failures": {}, "one_time_keys": {BOB: response_keys}}
+        )
+
+        async def respond(request, **kwargs: object) -> NetworkResult:
+            assert kwargs == {"body_disconnect_retry": True}
+            assert (request.path, request.body) == (
+                "/_matrix/client/v3/keys/claim",
+                pending.body_json,
+            )
+            return fresh_session._network_result(request, 200, response_body)
+
+        fresh_session._request = respond  # type: ignore[method-assign]
+        owner_before = fresh_session._journal.load_owner()
+        assert await fresh_session._advance_blocked_frame(staged.frame_id)
+        assert fresh_olm.wedged_devices == []
+        assert tuple(
+            (message.recipient, message.recipient_device)
+            for message in fresh_olm.outgoing_to_device_messages
+        ) == tuple((BOB, device_id) for device_id in device_ids)
+        for device_id in device_ids:
+            assert (
+                fresh_olm.session_store.get(devices[device_id].curve25519) is not None
+            )
+        owner_after = fresh_session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        with fresh_session._journal._owner.read():
+            prepared_after = fresh_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        operations = prepared_after.outbound_maintenance.operations
+        assert len(operations) == 3
+        assert operations[0] == pending._replace(state="settled", context=None)
+        for index, (operation, message, device_id) in enumerate(
+            zip(
+                operations[1:],
+                fresh_olm.outgoing_to_device_messages,
+                device_ids,
+                strict=True,
+            ),
+            start=1,
+        ):
+            expected_body = canonical_json(message.as_dict())
+            assert operation.body_json == expected_body
+            assert operation.transaction_id == str(
+                uuid5(
+                    staged.frame_id,
+                    "nio.ingest.outbound-maintenance.v1:"
+                    f"to-device:{index}:{hashlib.sha256(expected_body).hexdigest()}",
+                )
+            )
+            assert operation.context == {
+                "subtype": "dummy",
+                "rerequest_events": ([rerequest_context] if device_id == "A" else []),
+            }
+    finally:
+        await fresh_session.close()
+        for remote_store in remote_stores:
+            remote_store.database.close()
+
+
+@pytest.mark.parametrize(
+    "abort_at",
+    ("outbound_frame_settle", "commit"),
+    ids=("rollback-after-frame-write", "postcommit-uncertainty"),
+)
+@pytest.mark.parametrize(
+    "maintenance_kind",
+    (
+        "key_upload",
+        "key_query",
+        "key_claim",
+        "multi_key_claim",
+        "to_device",
+        "dummy",
+        "room_key_request",
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_maintenance_response_crash_boundary_requires_fresh_client(
+    tmp_path,
+    abort_at: str,
+    maintenance_kind: str,
+) -> None:
+    class MaintenanceAbort(BaseException):
+        pass
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    assert client.olm is not None
+    olm = client.olm
+    remote_stores: list[SqliteMemoryStore] = []
+    remote_devices: list[OlmDevice] = []
+    claim_response_keys: dict[str, object] = {}
+    if maintenance_kind in {
+        "key_query",
+        "key_claim",
+        "multi_key_claim",
+        "to_device",
+        "dummy",
+        "room_key_request",
+    }:
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        if maintenance_kind == "key_query":
+            olm.users_for_key_query.add(BOB)
+        elif maintenance_kind in {"key_claim", "multi_key_claim"}:
+            device_ids = (
+                (BOB_DEVICE,)
+                if maintenance_kind == "key_claim"
+                else ("multi-a", "multi-b")
+            )
+            for device_id in device_ids:
+                remote_store = SqliteMemoryStore(
+                    BOB,
+                    device_id,
+                    f"remote-{device_id}",
+                )
+                remote_stores.append(remote_store)
+                remote = Olm(BOB, device_id, remote_store)
+                remote.account.generate_one_time_keys(1)
+                shared = remote.share_keys()
+                one_time_key = next(iter(shared["one_time_keys"].items()))
+                claim_response_keys[device_id] = {one_time_key[0]: one_time_key[1]}
+                remote_device = OlmDevice(
+                    BOB,
+                    device_id,
+                    remote.account.identity_keys,
+                )
+                remote_devices.append(remote_device)
+                client.store.save_device_keys({BOB: {device_id: remote_device}})
+                olm.device_store.add(remote_device)
+                olm.wedged_devices.append(remote_device)
+        elif maintenance_kind == "to_device":
+            olm.outgoing_to_device_messages.append(
+                ToDeviceMessage(
+                    "org.example.maintenance",
+                    BOB,
+                    BOB_DEVICE,
+                    {"value": "durable"},
+                )
+            )
+        elif maintenance_kind == "dummy":
+            dummy_rerequest_source = {
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "dummy-rerequest-ciphertext",
+                    "device_id": BOB_DEVICE,
+                    "sender_key": "dummy-rerequest-sender-key",
+                    "session_id": "dummy-rerequest-session",
+                },
+                "event_id": "$dummy-rerequest",
+                "origin_server_ts": 1,
+                "sender": BOB,
+                "type": "m.room.encrypted",
+            }
+            dummy_rerequest = Event.parse_event(dummy_rerequest_source)
+            assert type(dummy_rerequest) is MegolmEvent
+            dummy_rerequest.room_id = ROOM
+            olm.key_re_requests_events[(BOB, BOB_DEVICE)].append(dummy_rerequest)
+            olm.outgoing_to_device_messages.append(
+                DummyMessage(
+                    "m.room.encrypted",
+                    BOB,
+                    BOB_DEVICE,
+                    {
+                        "algorithm": "m.olm.v1.curve25519-aes-sha2",
+                        "ciphertext": {
+                            "dummy-curve-key": {
+                                "body": "dummy-ciphertext",
+                                "type": 0,
+                            }
+                        },
+                        "sender_key": "owner-curve-key",
+                    },
+                )
+            )
+        else:
+            olm.outgoing_to_device_messages.append(
+                RoomKeyRequestMessage(
+                    "m.room_key_request",
+                    BOB,
+                    BOB_DEVICE,
+                    {
+                        "action": "request",
+                        "body": {
+                            "algorithm": "m.megolm.v1.aes-sha2",
+                            "room_id": ROOM,
+                            "sender_key": "request-sender-key",
+                            "session_id": "request-session",
+                        },
+                        "request_id": "request-session",
+                        "requesting_device_id": DEVICE,
+                    },
+                    "request-session",
+                    "request-session",
+                    ROOM,
+                    "m.megolm.v1.aes-sha2",
+                )
+            )
+        olm.save_account()
+        body = {
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "rooms": {},
+        }
+    else:
+        body = {"next_batch": "s1", "rooms": {}}
+    staged = stage_classic(bootstrap, body)
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    owner_before = session._journal.load_owner()
+    source_before = session._journal.load_source()
+    with session._journal._owner.read():
+        prepared_before = session._journal._load_prepared_frame_with_owner(
+            staged.frame_id,
+            owner_before,
+        )
+    assert prepared_before is not None
+    assert len(prepared_before.outbound_maintenance.operations) == 1
+    pending = prepared_before.outbound_maintenance.operations[0]
+    expected_kind = (
+        "to_device"
+        if maintenance_kind in {"to_device", "dummy", "room_key_request"}
+        else "key_claim" if maintenance_kind == "multi_key_claim" else maintenance_kind
+    )
+    assert (pending.kind, pending.state) == (expected_kind, "pending")
+    account_before = connection.execute("SELECT account FROM accounts").fetchone()
+    assert account_before is not None
+    sessions_before = tuple(
+        connection.execute("SELECT * FROM olmsessions ORDER BY session_id")
+    )
+    graph_before = tuple(connection.iterdump())
+    if maintenance_kind == "key_query":
+        response_body = canonical_json({"device_keys": {BOB: {}}, "failures": {}})
+    elif maintenance_kind in {"key_claim", "multi_key_claim"}:
+        response_body = canonical_json(
+            {
+                "failures": {},
+                "one_time_keys": {BOB: claim_response_keys},
+            }
+        )
+    elif maintenance_kind in {"to_device", "dummy", "room_key_request"}:
+        response_body = canonical_json({})
+    else:
+        response_body = canonical_json(
+            {
+                "one_time_key_counts": {
+                    "curve25519": 0,
+                    "signed_curve25519": 7,
+                }
+            }
+        )
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        assert (
+            request.method
+            == {
+                "key_upload": "POST",
+                "key_query": "POST",
+                "key_claim": "POST",
+                "multi_key_claim": "POST",
+                "to_device": "PUT",
+                "dummy": "PUT",
+                "room_key_request": "PUT",
+            }[maintenance_kind]
+        )
+        assert (
+            request.path
+            == {
+                "key_upload": "/_matrix/client/v3/keys/upload",
+                "key_query": "/_matrix/client/v3/keys/query",
+                "key_claim": "/_matrix/client/v3/keys/claim",
+                "multi_key_claim": "/_matrix/client/v3/keys/claim",
+                "to_device": (
+                    "/_matrix/client/v3/sendToDevice/"
+                    f"{pending.event_type}/{pending.transaction_id}"
+                ),
+                "dummy": (
+                    "/_matrix/client/v3/sendToDevice/"
+                    f"{pending.event_type}/{pending.transaction_id}"
+                ),
+                "room_key_request": (
+                    "/_matrix/client/v3/sendToDevice/"
+                    f"{pending.event_type}/{pending.transaction_id}"
+                ),
+            }[maintenance_kind]
+        )
+        assert request.body == pending.body_json
+        return session._network_result(request, 200, response_body)
+
+    session._request = respond  # type: ignore[method-assign]
+    labels: list[str] = []
+    sentinel = MaintenanceAbort(abort_at)
+
+    def abort(label: str) -> None:
+        labels.append(label)
+        if label == abort_at:
+            raise sentinel
+
+    session._journal.set_transition_statement_hook(abort)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(MaintenanceAbort) as failure:
+            await session.run()
+        connection.set_trace_callback(None)
+        assert failure.value is sentinel
+        assert len(requests) == 1
+        assert "outbound_meta_revision_epoch_cas" in labels
+        assert "outbound_frame_settle" in labels
+        if maintenance_kind == "key_query":
+            assert BOB not in olm.users_for_key_query
+            assert BOB in olm.tracked_users
+        elif maintenance_kind in {"key_claim", "multi_key_claim"}:
+            assert olm.wedged_devices == []
+            assert all(
+                olm.session_store.get(device.curve25519) is not None
+                for device in remote_devices
+            )
+            assert len(olm.outgoing_to_device_messages) == len(remote_devices)
+            assert all(
+                type(message) is DummyMessage
+                for message in olm.outgoing_to_device_messages
+            )
+        elif maintenance_kind == "to_device":
+            assert olm.outgoing_to_device_messages == []
+        elif maintenance_kind == "dummy":
+            assert len(olm.outgoing_to_device_messages) == 1
+            assert type(olm.outgoing_to_device_messages[0]) is RoomKeyRequestMessage
+        elif maintenance_kind == "room_key_request":
+            assert olm.outgoing_to_device_messages == []
+            assert tuple(olm.outgoing_key_requests) == ("request-session",)
+        transaction_statements = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        if abort_at == "outbound_frame_settle":
+            assert labels[-1] == "outbound_frame_settle"
+            assert "before_commit" not in labels
+            assert transaction_statements.count("BEGIN IMMEDIATE") == 1
+            assert transaction_statements.count("ROLLBACK") == 1
+            assert transaction_statements.count("COMMIT") == 0
+            assert tuple(connection.iterdump()) == graph_before
+            assert session._journal.load_owner() == owner_before
+            assert session._journal.load_source() == source_before
+            assert (
+                connection.execute("SELECT account FROM accounts").fetchone()
+                == account_before
+            )
+            assert (
+                tuple(
+                    connection.execute("SELECT * FROM olmsessions ORDER BY session_id")
+                )
+                == sessions_before
+            )
+            current_owner = owner_before
+            expected_prepared = prepared_before
+        else:
+            assert labels[-2:] == ["before_commit", "commit"]
+            assert transaction_statements.count("BEGIN IMMEDIATE") == 1
+            assert transaction_statements.count("COMMIT") == 1
+            assert transaction_statements.count("ROLLBACK") == 0
+            current_owner = session._journal.load_owner()
+            assert current_owner.revision == owner_before.revision + 1
+            assert session._journal.load_source() == source_before
+            account_after = connection.execute(
+                "SELECT account FROM accounts"
+            ).fetchone()
+            if maintenance_kind == "key_upload":
+                assert account_after != account_before
+            else:
+                assert account_after == account_before
+            sessions_after = tuple(
+                connection.execute("SELECT * FROM olmsessions ORDER BY session_id")
+            )
+            assert len(sessions_after) == len(sessions_before) + (
+                len(remote_devices)
+                if maintenance_kind in {"key_claim", "multi_key_claim"}
+                else 0
+            )
+            with session._journal._owner.read():
+                expected_prepared = session._journal._load_prepared_frame_with_owner(
+                    staged.frame_id,
+                    current_owner,
+                )
+            assert expected_prepared is not None
+            if maintenance_kind in {"key_claim", "multi_key_claim"}:
+                expected_claim_operations = [
+                    pending._replace(state="settled", context=None)
+                ]
+                for operation_index, dummy in enumerate(
+                    olm.outgoing_to_device_messages,
+                    start=1,
+                ):
+                    expected_body = canonical_json(dummy.as_dict())
+                    expected_claim_operations.append(
+                        pending.__class__(
+                            "to_device",
+                            "pending",
+                            expected_body,
+                            str(
+                                uuid5(
+                                    staged.frame_id,
+                                    "nio.ingest.outbound-maintenance.v1:"
+                                    f"to-device:{operation_index}:"
+                                    f"{hashlib.sha256(expected_body).hexdigest()}",
+                                )
+                            ),
+                            dummy.type,
+                            {"subtype": "dummy", "rerequest_events": []},
+                        )
+                    )
+                expected_operations = tuple(expected_claim_operations)
+            elif maintenance_kind == "dummy":
+                request_message = olm.outgoing_to_device_messages[0]
+                expected_body = canonical_json(request_message.as_dict())
+                expected_operations = (
+                    pending._replace(state="settled", context=None),
+                    pending.__class__(
+                        "to_device",
+                        "pending",
+                        expected_body,
+                        str(
+                            uuid5(
+                                staged.frame_id,
+                                "nio.ingest.outbound-maintenance.v1:"
+                                "to-device:1:"
+                                f"{hashlib.sha256(expected_body).hexdigest()}",
+                            )
+                        ),
+                        request_message.type,
+                        {
+                            "subtype": "room_key_request",
+                            "request_id": request_message.request_id,
+                            "session_id": request_message.session_id,
+                            "room_id": request_message.room_id,
+                            "algorithm": request_message.algorithm,
+                        },
+                    ),
+                )
+            else:
+                expected_operations = (pending._replace(state="settled", context=None),)
+            assert (
+                expected_prepared.outbound_maintenance.operations == expected_operations
+            )
+
+        poison_message = (
+            "owned ingestion session is poisoned; reopen with a fresh client"
+        )
+        poisoned_sql: list[str] = []
+        connection.set_trace_callback(poisoned_sql.append)
+        with pytest.raises(LocalProtocolError, match=poison_message):
+            session.next_batch()
+        connection.set_trace_callback(None)
+        assert poisoned_sql == []
+    finally:
+        connection.set_trace_callback(None)
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    try:
+        reopened_owner = fresh_session._journal.load_owner()
+        assert reopened_owner.revision == current_owner.revision
+        assert fresh_session._journal.load_source() == source_before
+        with fresh_session._journal._owner.read():
+            reopened_prepared = fresh_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                reopened_owner,
+            )
+        assert reopened_prepared == expected_prepared
+        assert fresh_client.olm is not None
+        assert fresh_client.olm.account.shared == (
+            maintenance_kind
+            in {
+                "key_query",
+                "key_claim",
+                "multi_key_claim",
+                "to_device",
+                "dummy",
+            }
+            or maintenance_kind == "room_key_request"
+            or abort_at == "commit"
+        )
+        assert fresh_client.olm.uploaded_key_count is None
+        if maintenance_kind in {"key_claim", "multi_key_claim"}:
+            assert all(
+                (fresh_client.olm.session_store.get(device.curve25519) is not None)
+                == (abort_at == "commit")
+                for device in remote_devices
+            )
+            assert fresh_client.olm.outgoing_to_device_messages == []
+        elif maintenance_kind in {"to_device", "dummy"}:
+            assert fresh_client.olm.outgoing_to_device_messages == []
+        elif maintenance_kind == "room_key_request":
+            assert fresh_client.olm.outgoing_to_device_messages == []
+            assert tuple(fresh_client.olm.outgoing_key_requests) == (
+                ("request-session",) if abort_at == "commit" else ()
+            )
+    finally:
+        await fresh_session.close()
+        for remote_store in remote_stores:
+            remote_store.database.close()
+
+
+def _single_owned_maintenance(
+    bootstrap,
+    client: AsyncClient,
+    session,
+    kind: str,
+) -> tuple[StagedFrame, object]:
+    assert client.olm is not None
+    if kind == "to_device":
+        client.olm.account.shared = True
+        client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+        client.olm.outgoing_to_device_messages.append(
+            ToDeviceMessage(
+                "org.example.retry",
+                BOB,
+                BOB_DEVICE,
+                {"value": "byte-identical"},
+            )
+        )
+        client.olm.save_account()
+        body = {
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": client.olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "rooms": {},
+        }
+    else:
+        assert kind == "key_upload"
+        body = {"next_batch": "s1", "rooms": {}}
+    staged = stage_classic(bootstrap, body)
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    owner = session._journal.load_owner()
+    with session._journal._owner.read():
+        prepared = session._journal._load_prepared_frame_with_owner(
+            staged.frame_id,
+            owner,
+        )
+    assert prepared is not None
+    assert len(prepared.outbound_maintenance.operations) == 1
+    pending = prepared.outbound_maintenance.operations[0]
+    assert pending.state == "pending"
+    return staged, pending
+
+
+@pytest.mark.parametrize("kind", ("key_upload", "to_device"))
+@pytest.mark.asyncio
+async def test_owned_maintenance_retry_reuses_exact_authenticated_request(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    staged, pending = _single_owned_maintenance(bootstrap, client, session, kind)
+    owner_before = session._journal.load_owner()
+    graph_before = tuple(connection.iterdump())
+    requests: list[object] = []
+    attempts = [
+        (503, canonical_json({"errcode": "M_UNAVAILABLE"}), None),
+        (429, canonical_json({"errcode": "M_LIMIT_EXCEEDED"}), 7),
+        (
+            200,
+            (
+                canonical_json({})
+                if kind == "to_device"
+                else canonical_json(
+                    {
+                        "one_time_key_counts": {
+                            "curve25519": 0,
+                            "signed_curve25519": 7,
+                        }
+                    }
+                )
+            ),
+            None,
+        ),
+    ]
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        status, body, retry_after = attempts.pop(0)
+        return session._network_result(
+            request,
+            status,
+            body,
+            retry_after=retry_after,
+        )
+
+    session._request = respond  # type: ignore[method-assign]
+    sleeps: list[float] = []
+
+    async def observe_sleep(delay: float) -> None:
+        assert tuple(connection.iterdump()) == graph_before
+        assert session._journal.load_owner() == owner_before
+        with session._journal._owner.read():
+            current = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_before,
+            )
+        assert current is not None
+        assert current.outbound_maintenance.operations == (pending,)
+        sleeps.append(delay)
+
+    monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", observe_sleep)
+    try:
+        assert await session._advance_blocked_frame(staged.frame_id)
+        assert attempts == []
+        assert requests == [requests[0], requests[0], requests[0]]
+        assert sleeps == [0.0, 0.007]
+        owner_after = session._journal.load_owner()
+        assert owner_after.revision == owner_before.revision + 1
+        with session._journal._owner.read():
+            prepared_after = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner_after,
+            )
+        assert prepared_after is not None
+        assert prepared_after.outbound_maintenance.operations == (
+            pending._replace(state="settled", context=None),
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "errcode"),
+    (
+        (401, canonical_json({}), "M_UNKNOWN_TOKEN"),
+        (403, canonical_json({"errcode": "M_FORBIDDEN"}), "M_FORBIDDEN"),
+        (400, canonical_json({"errcode": "M_UNKNOWN_TOKEN"}), "M_UNKNOWN_TOKEN"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_maintenance_auth_error_is_sticky_and_retains_frame(
+    tmp_path,
+    status: int,
+    body: bytes,
+    errcode: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    staged, pending = _single_owned_maintenance(
+        bootstrap,
+        client,
+        session,
+        "key_upload",
+    )
+    graph_before = tuple(connection.iterdump())
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {"body_disconnect_retry": True}
+        return session._network_result(request, status, body)
+
+    session._request = respond  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            nio.IngestionSourceError,
+            match=f"outbound maintenance authentication failed: {errcode}",
+        ) as first:
+            await session.run()
+        with pytest.raises(nio.IngestionSourceError) as second:
+            await session.run()
+        assert second.value is first.value
+        assert len(requests) == 1
+        assert tuple(connection.iterdump()) == graph_before
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            retained = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner,
+            )
+        assert retained is not None
+        assert retained.outbound_maintenance.operations == (pending,)
+        client._assert_ingestion_not_poisoned()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_cancels_maintenance_backoff_with_pending_frame(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    staged, pending = _single_owned_maintenance(
+        bootstrap,
+        client,
+        session,
+        "key_upload",
+    )
+    sleeping = asyncio.Event()
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        assert kwargs == {"body_disconnect_retry": True}
+        return session._network_result(
+            request,
+            503,
+            canonical_json({"errcode": "M_UNAVAILABLE"}),
+        )
+
+    async def held_sleep(_delay: float) -> None:
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    session._request = respond  # type: ignore[method-assign]
+    monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", held_sleep)
+    runner = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(sleeping.wait(), 1)
+        await session.close()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+    finally:
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        if session._close_task is None:
+            await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    try:
+        owner = fresh_session._journal.load_owner()
+        with fresh_session._journal._owner.read():
+            retained = fresh_session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                owner,
+            )
+        assert retained is not None
+        assert retained.outbound_maintenance.operations == (pending,)
+    finally:
+        await fresh_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_runner_claims_fans_out_retires_then_polls_source(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    staged = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    stored = session._journal.load_frame(staged.frame_id)
+    assert stored is not None
+    completion_calls: list[object] = []
+
+    async def completion_sink(completion: object) -> None:
+        assert not connection.in_transaction
+        assert session._journal._owner._outer_scope is None
+        claimed_owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(claimed_owner)
+        assert len(headers) == 1
+        assert headers[0].frame_id == staged.frame_id
+        assert headers[0].callbacks_claimed_revision == claimed_owner.revision
+        assert (
+            completion.frame_id,
+            completion.transport,
+            completion.source_epoch,
+            completion.request_id,
+            completion.staged_revision,
+            completion.claimed_revision,
+        ) == (
+            staged.frame_id,
+            TransportKind.CLASSIC,
+            stored.response.request.source_epoch,
+            stored.response.request.request_id,
+            stored.staged_revision,
+            claimed_owner.revision,
+        )
+        completion_calls.append(completion)
+
+    session._completion_sink = completion_sink  # type: ignore[attr-defined]
+    response_body = canonical_json(
+        {
+            "one_time_key_counts": {
+                "curve25519": 0,
+                "signed_curve25519": 7,
+            }
+        }
+    )
+    requests: list[object] = []
+    source_entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        if len(requests) == 1:
+            assert kwargs == {"body_disconnect_retry": True}
+            assert request.path == "/_matrix/client/v3/keys/upload"
+            return session._network_result(request, 200, response_body)
+        assert kwargs == {}
+        assert completion_calls
+        assert session._journal.load_frame(staged.frame_id) is None
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            assert session._journal._load_authenticated_frame_headers(owner) == ()
+        assert request.path == "/_matrix/client/v3/sync"
+        source_entered.set()
+        await never_release.wait()
+        raise AssertionError("source request unexpectedly resumed")
+
+    session._request = respond  # type: ignore[method-assign]
+    runner = asyncio.create_task(session.run())
+    source_wait = asyncio.create_task(source_entered.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            (runner, source_wait),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert source_wait in done, (
+            "owned runner stopped before completion/next source: " f"{runner_failure!r}"
+        )
+        assert not runner.done()
+        assert len(completion_calls) == 1
+        completion = completion_calls[0]
+        assert type(completion).__name__ == "_FrameCompletion"
+        assert len(requests) == 2
+        assert session._journal.load_source().next_request_id == 1
+        assert session._journal.load_owner().revision == 5
+    finally:
+        never_release.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        if not source_wait.done():
+            source_wait.cancel()
+        await asyncio.gather(source_wait, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (RuntimeError, asyncio.CancelledError),
+    ids=("raise", "cancel"),
+)
+@pytest.mark.asyncio
+async def test_owned_claimed_completion_reopens_without_second_sink_call(
+    tmp_path,
+    failure_type: type[BaseException],
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    staged = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    connection = session._owned_store.database.connection()
+    sink_calls: list[object] = []
+    sentinel = failure_type("completion sink stopped")
+
+    async def stop_after_claim(completion: object) -> None:
+        assert not connection.in_transaction
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(owner)
+        assert len(headers) == 1
+        assert headers[0].frame_id == staged.frame_id
+        assert headers[0].callbacks_claimed_revision == owner.revision
+        assert completion.claimed_revision == owner.revision
+        sink_calls.append(completion)
+        raise sentinel
+
+    session._completion_sink = stop_after_claim  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(failure_type) as failure:
+            await session.run()
+        assert failure.value is sentinel
+        assert len(sink_calls) == 1
+        client._assert_ingestion_not_poisoned()
+        claimed_owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(claimed_owner)
+            prepared = session._journal._load_prepared_frame_with_owner(
+                staged.frame_id,
+                claimed_owner,
+            )
+            inventory = session._journal._load_task3_work_inventory(claimed_owner)
+        assert len(headers) == 1
+        assert headers[0].callbacks_claimed_revision == claimed_owner.revision
+        assert prepared is not None
+        assert prepared.outbound_maintenance.operations == ()
+        assert inventory.work == ()
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    second_sink_calls = 0
+
+    async def forbid_second_sink(_completion: object) -> None:
+        nonlocal second_sink_calls
+        second_sink_calls += 1
+        raise AssertionError("claimed completion sink ran twice")
+
+    fresh_session._completion_sink = forbid_second_sink  # type: ignore[attr-defined]
+    try:
+        result = fresh_session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert result == MaterializeResult(
+            MaterializeStatus.BLOCKED,
+            staged.frame_id,
+            None,
+        )
+        assert await fresh_session._advance_blocked_frame(staged.frame_id)
+        assert second_sink_calls == 0
+        assert fresh_session._journal.load_frame(staged.frame_id) is None
+        owner = fresh_session._journal.load_owner()
+        with fresh_session._journal._owner.read():
+            assert fresh_session._journal._load_authenticated_frame_headers(owner) == ()
+    finally:
+        await fresh_session.close()
+
+
+@pytest.mark.parametrize(
+    "abort_at",
+    (
+        "frame_completion_claim",
+        "claim_commit",
+        "frame_completion_retire",
+        "retire_commit",
+    ),
+    ids=("claim-rollback", "claim-postcommit", "retire-rollback", "retire-postcommit"),
+)
+@pytest.mark.asyncio
+async def test_owned_completion_statement_boundary_reopens_exact_fate(
+    tmp_path,
+    abort_at: str,
+) -> None:
+    class CompletionAbort(BaseException):
+        pass
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    staged = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    revision_before_materialization = session._journal.load_owner().revision
+    assert session._materialize_oldest_frame(limits=MaterializerLimits()) == (
+        MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            staged.frame_id,
+            revision_before_materialization + 1,
+        )
+    )
+    connection = session._owned_store.database.connection()
+    owner_before = session._journal.load_owner()
+    graph_before = tuple(connection.iterdump())
+    sink_calls: list[object] = []
+
+    async def completion_sink(completion: object) -> None:
+        sink_calls.append(completion)
+
+    session._completion_sink = completion_sink  # type: ignore[attr-defined]
+    labels: list[str] = []
+    sentinel = CompletionAbort(abort_at)
+    commit_count = 0
+
+    def abort(label: str) -> None:
+        nonlocal commit_count
+        labels.append(label)
+        if label == "commit":
+            commit_count += 1
+        if label == abort_at:
+            raise sentinel
+        if abort_at == "claim_commit" and label == "commit" and commit_count == 1:
+            raise sentinel
+        if abort_at == "retire_commit" and label == "commit" and commit_count == 2:
+            raise sentinel
+
+    session._journal.set_transition_statement_hook(abort)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(CompletionAbort) as failure:
+            await session._advance_blocked_frame(staged.frame_id)
+        connection.set_trace_callback(None)
+        assert failure.value is sentinel
+        transactions = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        if abort_at == "frame_completion_claim":
+            assert labels == [
+                "completion_meta_revision_epoch_cas",
+                "frame_completion_claim",
+            ]
+            assert transactions.count("BEGIN IMMEDIATE") == 1
+            assert transactions.count("ROLLBACK") == 1
+            assert transactions.count("COMMIT") == 0
+            assert tuple(connection.iterdump()) == graph_before
+            assert session._journal.load_owner() == owner_before
+            assert sink_calls == []
+            claimed = False
+        elif abort_at == "claim_commit":
+            assert labels[-2:] == ["before_commit", "commit"]
+            assert transactions.count("BEGIN IMMEDIATE") == 1
+            assert transactions.count("ROLLBACK") == 0
+            assert transactions.count("COMMIT") == 1
+            assert sink_calls == []
+            claimed = True
+        elif abort_at == "frame_completion_retire":
+            assert labels[-2:] == [
+                "completion_retire_meta_revision_epoch_cas",
+                "frame_completion_retire",
+            ]
+            assert transactions.count("BEGIN IMMEDIATE") == 2
+            assert transactions.count("ROLLBACK") == 1
+            assert transactions.count("COMMIT") == 1
+            assert len(sink_calls) == 1
+            claimed = True
+        else:
+            assert labels[-2:] == ["before_commit", "commit"]
+            assert transactions.count("BEGIN IMMEDIATE") == 2
+            assert transactions.count("ROLLBACK") == 0
+            assert transactions.count("COMMIT") == 2
+            assert len(sink_calls) == 1
+            claimed = False
+
+        owner_after = session._journal.load_owner()
+        if abort_at == "frame_completion_claim":
+            assert owner_after == owner_before
+        elif abort_at in {"claim_commit", "frame_completion_retire"}:
+            assert owner_after.revision == owner_before.revision + 1
+        else:
+            assert owner_after.revision == owner_before.revision + 2
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(owner_after)
+        if abort_at == "retire_commit":
+            assert headers == ()
+        else:
+            assert len(headers) == 1
+            assert headers[0].frame_id == staged.frame_id
+            assert (headers[0].callbacks_claimed_revision is not None) is claimed
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    fresh_sink_calls: list[object] = []
+
+    async def fresh_sink(completion: object) -> None:
+        fresh_sink_calls.append(completion)
+
+    fresh_session._completion_sink = fresh_sink  # type: ignore[attr-defined]
+    try:
+        result = fresh_session._materialize_oldest_frame(limits=MaterializerLimits())
+        if abort_at == "retire_commit":
+            assert result == MaterializeResult(MaterializeStatus.IDLE, None, None)
+        else:
+            assert result == MaterializeResult(
+                MaterializeStatus.BLOCKED,
+                staged.frame_id,
+                None,
+            )
+            assert await fresh_session._advance_blocked_frame(staged.frame_id)
+        assert len(fresh_sink_calls) == (abort_at == "frame_completion_claim")
+        assert fresh_session._journal.load_frame(staged.frame_id) is None
+        fresh_owner = fresh_session._journal.load_owner()
+        with fresh_session._journal._owner.read():
+            assert (
+                fresh_session._journal._load_authenticated_frame_headers(fresh_owner)
+                == ()
+            )
+    finally:
+        await fresh_session.close()
+
+
+@pytest.mark.parametrize("settle_privately", (False, True), ids=("ack", "settle"))
+@pytest.mark.asyncio
+async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
+    tmp_path,
+    settle_privately: bool,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    event_source = {
+        "content": {"value": "wait-for-ack"},
+        "type": "org.example.task4f.wait",
+    }
+    staged = stage_classic(
+        bootstrap,
+        {
+            "account_data": {"events": [event_source]},
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": client.olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "s1",
+            "presence": {"events": []},
+            "rooms": {},
+            "to_device": {"events": []},
+        },
+    )
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    batch = session.next_batch(max_records=1)
+    assert batch is not None and len(batch.records) == 1
+    record = batch.records[0]
+    assert type(record) is EventRecord
+    assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+    assert record.source_json == canonical_json(event_source)
+    connection = session._owned_store.database.connection()
+    completion_calls: list[object] = []
+
+    async def completion_sink(completion: object) -> None:
+        completion_calls.append(completion)
+
+    session._completion_sink = completion_sink  # type: ignore[attr-defined]
+    maintenance_checked = asyncio.Event()
+    real_load_maintenance = session._journal._load_ready_outbound_maintenance
+
+    def observe_maintenance_check():
+        pending = real_load_maintenance()
+        assert pending is None
+        maintenance_checked.set()
+        return pending
+
+    session._journal._load_ready_outbound_maintenance = observe_maintenance_check
+    source_entered = asyncio.Event()
+    never_release = asyncio.Event()
+    requests: list[object] = []
+
+    async def respond(request, **kwargs: object) -> NetworkResult:
+        requests.append(request)
+        assert kwargs == {}
+        assert request.path == "/_matrix/client/v3/sync"
+        assert completion_calls
+        assert session._journal.load_frame(staged.frame_id) is None
+        source_entered.set()
+        await never_release.wait()
+        raise AssertionError("source request unexpectedly resumed")
+
+    session._request = respond  # type: ignore[method-assign]
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    runner = asyncio.create_task(session.run())
+    maintenance_wait = asyncio.create_task(maintenance_checked.wait())
+    source_wait = asyncio.create_task(source_entered.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            (runner, maintenance_wait),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert maintenance_wait in done, (
+            "runner stopped before the Work wait boundary: " f"{runner_failure!r}"
+        )
+        await asyncio.sleep(0)
+        assert not runner.done(), f"record wait became terminal: {runner_failure!r}"
+        assert not any(
+            statement.strip().rstrip(";").upper() == "BEGIN IMMEDIATE"
+            for statement in statements
+        )
+        assert requests == []
+        assert completion_calls == []
+        assert session.next_batch(max_records=1) == batch
+
+        if settle_privately:
+            await session._settle_batch(
+                batch,
+                receipt_new=False,
+                semantic_event_new=False,
+            )
+        else:
+            session.acknowledge_batch(batch.ref)
+        done, _pending = await asyncio.wait(
+            (runner, source_wait),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert source_wait in done, (
+            "record ack did not resume completion: " f"{runner_failure!r}"
+        )
+        assert not runner.done()
+        assert len(completion_calls) == 1
+        assert len(requests) == 1
+        assert session.next_batch(max_records=1) is None
+    finally:
+        connection.set_trace_callback(None)
+        never_release.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for waiter in (maintenance_wait, source_wait):
+            if not waiter.done():
+                waiter.cancel()
+        await asyncio.gather(maintenance_wait, source_wait, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_runner_uses_private_materializer_in_fifo_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
     first = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
     second = stage_classic(bootstrap, {"next_batch": "s2", "rooms": {}})
     stored_first = session._journal.load_frame(first.frame_id)
@@ -5981,12 +9997,34 @@ async def test_owned_runner_uses_private_materializer_and_blocks_on_retained_old
         return prepared
 
     client._prepare_ingestion_frame = capture_prepare
+    completion_calls: list[object] = []
+    completion_entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def hold_first_completion(completion: object) -> None:
+        completion_calls.append(completion)
+        completion_entered.set()
+        await never_release.wait()
+        raise AssertionError("first completion unexpectedly resumed")
+
+    session._completion_sink = hold_first_completion  # type: ignore[attr-defined]
+    runner = asyncio.create_task(session.run())
+    completion_wait = asyncio.create_task(completion_entered.wait())
     try:
-        with pytest.raises(nio.IngestionBlockedError) as first_blocked:
-            await session.run()
-        assert first_blocked.value.frame_id == first.frame_id
+        done, _pending = await asyncio.wait(
+            (runner, completion_wait),
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        runner_failure = runner.exception() if runner.done() else None
+        assert completion_wait in done, (
+            "owned runner stopped before first completion: " f"{runner_failure!r}"
+        )
+        assert not runner.done()
         assert legacy_calls == 0
         assert http_calls == 0
+        assert len(completion_calls) == 1
+        assert completion_calls[0].frame_id == first.frame_id
         assert len(prepared_args) == 1
         assert getattr(prepared_args[0][0], "frame_id") == first.frame_id
         assert prepared_args[0][1] == stored_first.staged_revision
@@ -6016,85 +10054,18 @@ async def test_owned_runner_uses_private_materializer_and_blocks_on_retained_old
             second.frame_id,
         )
         assert headers[0].room_materialized_revision is not None
+        assert headers[0].callbacks_claimed_revision == owner.revision
         assert headers[1].room_materialized_revision is None
         assert prepared is not None
     finally:
+        never_release.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        if not completion_wait.done():
+            completion_wait.cancel()
+        await asyncio.gather(completion_wait, return_exceptions=True)
         await session.close()
-
-    reopened = reopen_owned_bootstrap(tmp_path, generation)
-    fresh_client = owned_client(tmp_path)
-    fresh_session = open_owned_session(fresh_client, reopened, generation)
-    fresh_connection = fresh_session._owned_store.database.connection()
-    fresh_legacy_calls = 0
-
-    def forbid_fresh_legacy(*_args: object, **_kwargs: object) -> None:
-        nonlocal fresh_legacy_calls
-        fresh_legacy_calls += 1
-        raise AssertionError("reopened owned runner invoked legacy materialization")
-
-    fresh_http_calls = 0
-
-    async def forbid_fresh_http(*_args: object, **_kwargs: object) -> None:
-        nonlocal fresh_http_calls
-        fresh_http_calls += 1
-        raise AssertionError("reopened owned runner attempted HTTP")
-
-    monkeypatch.setattr(
-        fresh_session._journal,
-        "materialize_oldest_frame",
-        forbid_fresh_legacy,
-    )
-    monkeypatch.setattr(fresh_client, "send", forbid_fresh_http)
-    fresh_private_results: list[MaterializeResult] = []
-    real_fresh_private_materializer = fresh_session._materialize_oldest_frame
-
-    def capture_fresh_private_materializer(*args: object, **kwargs: object):
-        result = real_fresh_private_materializer(*args, **kwargs)
-        fresh_private_results.append(result)
-        return result
-
-    fresh_session._materialize_oldest_frame = capture_fresh_private_materializer
-    fresh_prepare_calls = 0
-    real_fresh_prepare = fresh_client._prepare_ingestion_frame
-
-    def capture_fresh_prepare(*args: object, **kwargs: object):
-        nonlocal fresh_prepare_calls
-        prepared_frame = real_fresh_prepare(*args, **kwargs)
-        fresh_prepare_calls += 1
-        return prepared_frame
-
-    fresh_client._prepare_ingestion_frame = capture_fresh_prepare
-    before_reopened_run = tuple(fresh_connection.iterdump())
-    statements: list[str] = []
-    fresh_connection.set_trace_callback(statements.append)
-    try:
-        with pytest.raises(nio.IngestionBlockedError) as reopened_blocked:
-            await fresh_session.run()
-        fresh_connection.set_trace_callback(None)
-        assert reopened_blocked.value.frame_id == first.frame_id
-        assert fresh_legacy_calls == 0
-        assert fresh_http_calls == 0
-        assert fresh_prepare_calls == 0
-        assert fresh_private_results == [
-            MaterializeResult(MaterializeStatus.BLOCKED, first.frame_id, None)
-        ]
-        assert not any(
-            statement.strip().rstrip(";").upper() == "BEGIN IMMEDIATE"
-            for statement in statements
-        )
-        assert tuple(fresh_connection.iterdump()) == before_reopened_run
-        assert fresh_session._journal.load_frame(first.frame_id) is None
-        assert fresh_session._journal.load_frame(second.frame_id) == stored_second
-        fresh_owner = fresh_session._journal.load_owner()
-        with fresh_session._journal._owner.read():
-            reopened_prepared = fresh_session._journal._load_prepared_frame_with_owner(
-                first.frame_id,
-                fresh_owner,
-            )
-        assert reopened_prepared == prepared
-    finally:
-        fresh_connection.set_trace_callback(None)
-        await fresh_session.close()
 
 
 @pytest.mark.asyncio
@@ -6490,6 +10461,7 @@ def test_owned_factories_and_protocol_remain_private_with_public_signature() -> 
         "config",
         "consumer_generation",
         "stream_id",
+        "_completion_sink",
     )
     assert not hasattr(nio, "_open_owned_ingestion")
     assert not hasattr(nio, "_OwnedIngestionSession")
