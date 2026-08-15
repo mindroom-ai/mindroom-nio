@@ -56,8 +56,8 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 7 feature commit `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; the docs-ledger commit containing this row follows it | Task 7 crash/parity verification is committed and GREEN; after the ledger commit, tracked state is clean |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 7 commit `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Task 7 cross-database crash/parity verification is committed and GREEN; tracked state is clean |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 second-fix feature `9624ccffe164a4b20ba8a397fbfb634693deb4c2`; parent docs blocker `bc015263202b770d96f217411eb070656b449a33` and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Invite/knock predecessor bridge is committed after 2,319-test full-suite and configured-hook GREEN; this living ledger is the only intended tracked edit, and Classic remains RED until an exact rebuilt wheel passes |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | packaging commit `6f415e41f` over Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Durable features and packaging fix are committed; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | Classic exposed a membership race; nio fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` is fully GREEN and exact wheel/canary rebuild is next |
+| Task 8 | In progress | First fix `1c6bd92...` is externally insufficient. Exact diagnostics found binary `leave/0` authority versus authenticated `invite/0`; Fable-approved invite/knock bridge `9624ccf...` is committed after 2,319 passed and hook GREEN. Exact-wheel rebuild/install and fresh-volume Classic rerun are next |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -1701,6 +1701,174 @@ whitespace, Black, and Ruff; the feature commit contains only those two
 production files and the causal test. This living-document edit remains the
 only intended tracked change after that commit; the unrelated untracked review
 directory and generated egg-info remain user-owned and must not be removed.
+
+The exact replacement wheel is now built from a fresh detached worktree at
+feature commit `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3`:
+
+- `/tmp/mindroom-task8-wheels.2FeteO/wheels-1c6bd92/mindroom_nio-0.39.0-py3-none-any.whl`
+- SHA-256 `c6799f56ad60446b9b0312a32cf61f5c1d450172dfc95a8c88f67cbc6d9ba885`
+
+A second fresh Python 3.13 environment at
+`/tmp/mindroom-task8-wheels.2FeteO/venv-1c6bd92` installed that wheel and the
+unchanged exact MindRoom wheel from `6f415e41f` (SHA-256
+`ab70ef8c61762992c3e5317b12adacbc47c3cd7fe13288c9e910bcfb7c7be65f`)
+with all 154 dependencies. Imports resolve from that environment's
+`site-packages`, metadata reports MindRoom
+`2026.8.30.post1.dev491+g6f415e41f` and nio `0.39.0`, and source inspection of
+the installed journal confirms the already-current membership branch is
+present. This is the new wheel install/import PASS; Classic remains the next
+required external gate.
+
+The fresh-volume Classic rerun with that replacement wheel is also RED. It
+again timed out after 90 seconds with the warm-up event not admitted and the
+owned runner terminal on the same predecessor mismatch. Therefore
+`1c6bd92...` is a verified unit/integration closure but is insufficient for the
+external startup ordering; do not call it the canary fix or Classic PASS. The
+disposable stack was reset with `docker compose ... down -v`, recreated
+healthy at the same exact image digests, and the installed wheel was confirmed
+to contain the branch before this rerun.
+
+Immediate restart action is systematic evidence gathering, not another guessed
+fix: reproduce with operator-only diagnostics that capture the queued command
+tuple, authenticated Aggregate continuity/barriers, Frame/Work inventory, and
+MindRoom membership authority at the exact failing journal call. Trace the
+values back through startup orchestration and admission, add the smallest
+causal automated RED for the actual mismatch, then change production once.
+
+That diagnostic pass is complete and disproves the first root-cause hypothesis
+as the explanation for this external failure. The operator-only
+`sitecustomize.py` instrumentation lives at
+`/tmp/mindroom-task8-wheels.2FeteO/diagnostics/sitecustomize.py`; the preserved
+15-second diagnostic failure is
+`/tmp/mindroom-task8-wheels.2FeteO/failure-classic-1786798789`, with the exact
+process log at `mindroom.log` below that directory. At the failing journal
+call, all of the following were simultaneously authenticated or read from the
+owning application authority:
+
+- MindRoom's binary membership authority was `leave/0`;
+- the queued local command was `leave/0 -> join`;
+- nio's Aggregate continuity was `invite/0`, its snapshot also said
+  `invite/0`, and `next_room_sequence == 8`;
+- `pending_hydration`, `pending_local_membership`, continuity baseline/gap,
+  and `hydration_id` were all absent;
+- the authenticated Frame-header and Work inventories were both empty;
+- nio's pending-intent inventory was empty and owner revision was `28`.
+
+This is the ordinary invited-room startup join, not a race where another
+lifecycle Work has already reached `join`. MindRoom deliberately projects its
+command authority to the binary joined/not-joined domain, while nio retains the
+wire-level `invite` predecessor. Exact raw predecessor equality therefore
+rejects a valid command before its Matrix join HTTP request. The earlier
+`1c6bd92...` already-current reconciliation remains valid and covered, but it
+cannot resolve this transport-vs-command-domain mismatch.
+
+A second causal TDD node now exists in the nio working tree as
+`test_owned_local_join_accepts_invited_transport_predecessor`. It creates and
+drains a real Classic invite Frame, proves the authenticated Aggregate is an
+unblocked `invite/0` with no Frame or Work, and proves a direct private local
+publisher still rejects `leave/0 -> join` without a matching pending intent.
+It then drives the durable owned-command path through one exact mocked join
+HTTP boundary, requires a single canonical `leave/0 -> join/0` local lifecycle
+Work, settles it, and checks the client moves from `invited_rooms` to `rooms`.
+Against strict predecessor equality it failed only with the external
+`JournalConflictError`; the current candidate passes by sharing one exact
+predecessor predicate across intent persistence, authenticated Aggregate
+validation, and final publication, while keeping direct publication strict.
+
+The one material boundary still awaiting arbitration is whether that bridge
+should accept only authenticated `invite`, which is the observed external
+case, or both `invite` and `knock`, since both are invited-room projections but
+Task 4F explicitly warned against expanding invite/knock behavior. Per the
+standing autonomy rule, consult Claude Fable read-only through an isolated
+`agent-cli dev` worktree, record the decision here, then finish the smallest
+TDD matrix and verification without pausing for human approval. Never include
+`ban`; require exact epoch equality; and permit the bridge only for a durable
+pending HTTP-owned `leave -> join` intent. Direct publication without that
+intent remains exact-predecessor-only.
+
+That arbitration is complete. Claude Fable ran read-only with no tools through
+the isolated `agent-cli dev` worktree/branch
+`task8-invite-bridge-fable-20260815`. The first launcher inherited the known
+stale Vertex route and failed before reading the prompt; the successful rerun
+used `agent-cli dev run` in the same worktree, unset only the Vertex/model
+routing variables, selected `--model=fable`, and used existing local Claude
+authentication. Fable chose **both `invite` and `knock`**, with this exact
+private predicate:
+
+1. the binary command and exact integer epoch must be valid;
+2. an exact raw predecessor at that epoch remains accepted normally;
+3. otherwise, only a field-exact matching durable pending HTTP-owned
+   `leave -> join` intent may bridge raw `invite` or `knock` at that same epoch;
+4. direct publication without that intent, every departure, `ban`, every other
+   target, and every epoch mismatch remain rejected.
+
+The reason is domain consistency, not surface expansion: MindRoom collapses
+both `invite` and `knock` into the same binary not-joined authority, Task 4E
+restores both into `invited_rooms`, and both are pre-join projections. Accepting
+only invite would leave the identical knock startup failure latent. Task 4F's
+scope warning still holds because no public invite/knock command is added;
+this is a private predecessor check for the already-existing generic join.
+`ban` is excluded because it is a moderation state rather than a pre-join
+projection.
+
+The crash argument is durable and deterministic: all predicate inputs are
+authenticated persisted state; a restart re-evaluates the same pure rule; an
+HTTP-success crash that has already advanced continuity to `join` exits this
+bridge and uses the existing fulfilled-command reconciliation; and consuming
+the exact intent closes the bridge. Finish TDD with real invite and knock
+integration rows, strict direct-publication rejection, unit boundaries for
+ban/epoch/exact leave, and a restart/replay row proving one canonical lifecycle
+Work and no duplicate. Then run broad verification, commit, rebuild the exact
+wheel, and rerun the uninstrumented 90-second Classic canary on fresh volumes.
+
+The Fable matrix is now implemented in the working tree. To preserve honest
+TDD for the newly selected knock arm, production was temporarily narrowed to
+invite-only and the real pre-join integration test was parameterized. The
+selector produced exactly one failure: invite passed and knock failed at
+`JournalConflictError("local membership intent does not match current state")`.
+The pure predicate table likewise produced exactly one failure for knock while
+exact leave, invite, ban rejection, and epoch rejection behaved as expected.
+Restoring the two-member `{invite, knock}` equivalence made both selectors
+GREEN. The pure table also pins exact `join -> leave` and rejects using an
+invite predecessor for a departure.
+
+The restart row is GREEN without further production change. It drains a real
+Classic invite Frame, persists the exact pending `leave/0 -> join` intent,
+closes, reopens under a fresh owner/client, authenticates the identical raw
+Aggregate, performs one join request, and obtains one canonical local
+lifecycle Work. Replaying the same publication returns the committed revision
+with a byte-identical database and no duplicate Work; settling the sole record
+moves the restored client from `invited_rooms` to `rooms`. Current exact focused
+result is `10 passed` across the seven predicate cases, two real invite/knock
+rows, and restart row. Immediate continuation is broad local/coordinator/journal
+verification and statics; external Classic remains RED until a committed exact
+wheel passes the ordinary uninstrumented harness.
+
+The first broad checkpoint is GREEN: the 52-node local/prejoin selector passed,
+and complete `model_test.py + coordinator_test.py + source_journal_test.py`
+passed `592/592` in `85.78s`. Black is clean after mechanically formatting only
+the new coordinator rows; production Ruff `--no-fix`, targeted mypy over the
+three changed production modules, and `git diff --check` are clean. The complete
+nio suite and configured pre-commit hooks remain the next local gates before an
+ordinary feature commit and exact-wheel rebuild.
+
+The complete nio suite is now GREEN on these candidate bytes: `2319 passed`,
+`3 skipped`, and the same five pre-existing deprecation warnings in `304.82s`.
+The warnings are the two Python 3.16 `asyncio.iscoroutinefunction` notices and
+the three existing fork-from-multithreaded-process notices. No new warning or
+failure appeared. Immediate continuation is configured changed-file hooks plus
+the final exact diff/patch audit, then an ordinary feature commit and a separate
+living-ledger checkpoint before rebuilding the wheel.
+
+The second fix is committed ordinarily as
+`9624ccffe164a4b20ba8a397fbfb634693deb4c2` with subject
+`fix: reconcile prejoin membership commands`. The exact five-file code/test
+patch SHA-256 before commit was
+`8b0ad4b5488b477c84b2f87a37ada08b977bf308cea07b13953ac5e79c929d8f`;
+its stat is `+404/-9`. Changed-file pre-commit passed EOF, whitespace, Black,
+and Ruff. This living document is now the only intended tracked edit; commit it
+as the restart ledger, then build/install a fresh nio wheel from exact
+`9624ccf...` without changing the MindRoom wheel.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
