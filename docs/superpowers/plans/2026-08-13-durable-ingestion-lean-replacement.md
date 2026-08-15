@@ -1870,6 +1870,26 @@ and Ruff. This living document is now the only intended tracked edit; commit it
 as the restart ledger, then build/install a fresh nio wheel from exact
 `9624ccf...` without changing the MindRoom wheel.
 
+That exact build/install checkpoint is GREEN. A fresh detached worktree at
+`/tmp/mindroom-task8-wheels.2FeteO/nio-9624ccf` is pinned to
+`9624ccffe164a4b20ba8a397fbfb634693deb4c2`. `uv build --wheel` produced:
+
+- `/tmp/mindroom-task8-wheels.2FeteO/wheels-9624ccf/mindroom_nio-0.39.0-py3-none-any.whl`
+- SHA-256 `27ba4f0dc4835a80fd4fc936d2ebdb404dffef6dd3700cb16bc0b463070ffbb2`
+- size `391877` bytes.
+
+A new Python 3.13.14 environment at
+`/tmp/mindroom-task8-wheels.2FeteO/venv-9624ccf` installed that exact nio wheel
+and the unchanged exact MindRoom wheel from `6f415e41f` (SHA-256
+`ab70ef8c61762992c3e5317b12adacbc47c3cd7fe13288c9e910bcfb7c7be65f`),
+resolving/installing 154 packages. Metadata reports MindRoom
+`2026.8.30.post1.dev491+g6f415e41f` and nio `0.39.0`; both `nio` and
+`nio.ingest.model` import from this fresh environment's `site-packages`.
+Runtime source inspection confirms the installed helper contains the exact
+`{"invite", "knock"}` bridge. This is wheel build/install/import PASS only.
+Restore the operator harness to its ordinary 90-second, no-diagnostic launch,
+reset only the disposable Task 8 Synapse volumes, and rerun Classic next.
+
 ### Task 5D completed checkpoint — 2026-08-15
 
 Task 5D began from clean committed boundaries: nio
