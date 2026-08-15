@@ -206,6 +206,35 @@ def _local_membership_transition_epoch(
     )
 
 
+def _local_membership_predecessor_matches(
+    observed_membership: str | None,
+    observed_epoch: int,
+    *,
+    previous_membership: str,
+    previous_epoch: int,
+    current_membership: str,
+) -> bool:
+    _local_membership_transition_epoch(
+        previous_membership,
+        previous_epoch,
+        current_membership,
+    )
+    if (
+        type(observed_membership) is not str
+        or observed_membership not in _LOCAL_MEMBERSHIPS
+    ):
+        return False
+    if type(observed_epoch) is not int or observed_epoch != previous_epoch:
+        return False
+    if observed_membership == previous_membership:
+        return True
+    return (
+        previous_membership == "leave"
+        and current_membership == "join"
+        and observed_membership in {"invite", "knock"}
+    )
+
+
 def _local_membership_record_id(operation_id: UUID) -> str:
     _require_exact(operation_id, UUID, "operation_id")
     return str(uuid5(operation_id, _LOCAL_ROOM_LIFECYCLE_DOMAIN))

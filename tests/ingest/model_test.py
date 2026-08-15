@@ -24,6 +24,7 @@ from nio.ingest import (
     TransportKind,
 )
 from nio.ingest.membership import MembershipObservation
+from nio.ingest.model import _local_membership_predecessor_matches
 import nio.ingest.ports as ingest_ports
 from nio.ingest.ports import NetworkRequest, _frame_id_for_response
 from nio.ingest.source import RoomSection, RoomSegment
@@ -87,6 +88,43 @@ def test_wire_enums_have_stable_string_values() -> None:
         "UNAVAILABLE": "unavailable",
     }
     assert TimelineEventProvenance is TopLevelTimelineEventProvenance
+
+
+@pytest.mark.parametrize(
+    (
+        "observed_membership",
+        "observed_epoch",
+        "previous_membership",
+        "current_membership",
+        "expected",
+    ),
+    (
+        ("leave", 0, "leave", "join", True),
+        ("invite", 0, "leave", "join", True),
+        ("knock", 0, "leave", "join", True),
+        ("ban", 0, "leave", "join", False),
+        ("invite", 1, "leave", "join", False),
+        ("join", 0, "join", "leave", True),
+        ("invite", 0, "join", "leave", False),
+    ),
+)
+def test_local_join_predecessor_matches_binary_command_authority(
+    observed_membership: str,
+    observed_epoch: int,
+    previous_membership: str,
+    current_membership: str,
+    expected: bool,
+) -> None:
+    assert (
+        _local_membership_predecessor_matches(
+            observed_membership,
+            observed_epoch,
+            previous_membership=previous_membership,
+            previous_epoch=0,
+            current_membership=current_membership,
+        )
+        is expected
+    )
 
 
 def test_wire_dataclasses_are_frozen_and_slotted() -> None:

@@ -3484,6 +3484,318 @@ async def test_owned_local_command_reconciles_when_lifecycle_reaches_target(
             await session.close()
 
 
+@pytest.mark.parametrize("membership", ("invite", "knock"))
+@pytest.mark.asyncio
+async def test_owned_local_join_accepts_prejoin_transport_predecessor(
+    tmp_path,
+    membership: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    operation_id = uuid4()
+    transition: asyncio.Task[bool] | None = None
+    try:
+        state_key = "invite_state" if membership == "invite" else "knock_state"
+        staged = stage_classic(
+            bootstrap,
+            {
+                "device_one_time_keys_count": {
+                    "signed_curve25519": client.olm.account.max_one_time_keys,
+                },
+                "next_batch": f"{membership}-before-local-join",
+                "rooms": {
+                    membership: {
+                        ROOM: {
+                            state_key: {
+                                "events": [
+                                    {
+                                        "content": {
+                                            "displayname": "Prejoin Alice",
+                                            "membership": membership,
+                                        },
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        while batch := session.next_batch():
+            session.acknowledge_batch(batch.ref)
+        assert await session._advance_blocked_frame(staged.frame_id)
+
+        owner_before = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_before = session._journal._load_room_aggregate(owner_before, ROOM)
+            inventory_before = session._journal._load_task3_work_inventory(owner_before)
+            headers_before = session._journal._load_authenticated_frame_headers(
+                owner_before
+            )
+        assert loaded_before is not None
+        assert loaded_before[1].continuity.membership == membership
+        assert loaded_before[1].continuity.membership_epoch == 0
+        assert loaded_before[1].pending_hydration is None
+        assert loaded_before[1].pending_local_membership is None
+        assert inventory_before.work == ()
+        assert headers_before == ()
+        assert tuple(client.invited_rooms) == (ROOM,)
+
+        connection = session._owned_store.database.connection()
+        graph_before_direct_publish = tuple(connection.iterdump())
+        with pytest.raises(
+            JournalConflictError,
+            match="local membership transition does not match current state",
+        ):
+            session._publish_local_membership_transition(
+                operation_id=uuid4(),
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        assert tuple(connection.iterdump()) == graph_before_direct_publish
+
+        requests: list[object] = []
+
+        async def join_success(request, **kwargs: object) -> NetworkResult:
+            assert request.path == nio.Api.join("secret-token", ROOM)[1]
+            assert kwargs == {"body_disconnect_retry": True}
+            requests.append(request)
+            return session._network_result(
+                request,
+                200,
+                canonical_json({"room_id": ROOM}),
+            )
+
+        session._request = join_success  # type: ignore[method-assign]
+        transition = asyncio.create_task(
+            session._run_local_membership_transition(
+                operation_id=operation_id,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        await asyncio.sleep(0)
+        assert await session._advance_local_membership_intent() is True
+        assert await asyncio.wait_for(transition, timeout=1) is True
+        assert len(requests) == 1
+
+        owner_after = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_after = session._journal._load_room_aggregate(owner_after, ROOM)
+            inventory_after = session._journal._load_task3_work_inventory(owner_after)
+        assert loaded_after is not None
+        assert loaded_after[1].continuity.membership == "join"
+        assert loaded_after[1].continuity.membership_epoch == 0
+        assert loaded_after[1].pending_local_membership is None
+        assert loaded_after[1].room_snapshot is not None
+        assert loaded_after[1].room_snapshot.own_membership == "join"
+        assert len(inventory_after.work) == 1
+        work = inventory_after.work[0]
+        assert work.value.origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            operation_id,
+        )
+        assert work.value.source_json == _local_source("leave", 0, "join", 0)
+
+        batch = session.next_batch()
+        assert batch is not None
+        assert batch.records == (work.value,)
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert tuple(client.rooms) == (ROOM,)
+        assert client.invited_rooms == {}
+    finally:
+        await asyncio.sleep(0)
+        if transition is not None and not transition.done():
+            transition.cancel()
+        await asyncio.gather(
+            *(task for task in (transition,) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_prejoin_local_join_intent_restarts_without_duplicate_work(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    operation_id = uuid4()
+    try:
+        staged = stage_classic(
+            bootstrap,
+            {
+                "device_one_time_keys_count": {
+                    "signed_curve25519": client.olm.account.max_one_time_keys,
+                },
+                "next_batch": "invited-intent-before-restart",
+                "rooms": {
+                    "invite": {
+                        ROOM: {
+                            "invite_state": {
+                                "events": [
+                                    {
+                                        "content": {
+                                            "displayname": "Restarted Alice",
+                                            "membership": "invite",
+                                        },
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        while batch := session.next_batch():
+            session.acknowledge_batch(batch.ref)
+        assert await session._advance_blocked_frame(staged.frame_id)
+
+        committed = session._journal._record_local_membership_intent(
+            operation_id=operation_id,
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        pending_before = session._journal._load_pending_local_membership_intents(
+            limit=2
+        )
+        assert committed == CommitResult(session._journal.load_owner().revision)
+        assert len(pending_before) == 1
+        assert pending_before[0].continuity.membership == "invite"
+        assert pending_before[0].continuity.membership_epoch == 0
+        assert pending_before[0].intent.operation_id == operation_id
+        raw_aggregate_before = (
+            session._owned_store.database.connection()
+            .execute(
+                "SELECT * FROM NioIngestRoomAggregate WHERE room_id = ?",
+                (ROOM,),
+            )
+            .fetchone()
+        )
+        assert raw_aggregate_before is not None
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    requests: list[object] = []
+
+    async def join_success(request, **kwargs: object) -> NetworkResult:
+        assert request.path == nio.Api.join("secret-token", ROOM)[1]
+        assert kwargs == {"body_disconnect_retry": True}
+        requests.append(request)
+        return fresh_session._network_result(
+            request,
+            200,
+            canonical_json({"room_id": ROOM}),
+        )
+
+    fresh_session._request = join_success  # type: ignore[method-assign]
+    try:
+        pending_after = fresh_session._journal._load_pending_local_membership_intents(
+            limit=2
+        )
+        assert pending_after == pending_before
+        assert (
+            fresh_session._owned_store.database.connection()
+            .execute(
+                "SELECT * FROM NioIngestRoomAggregate WHERE room_id = ?",
+                (ROOM,),
+            )
+            .fetchone()
+            == raw_aggregate_before
+        )
+        assert tuple(fresh_client.invited_rooms) == (ROOM,)
+
+        assert await fresh_session._advance_local_membership_intent() is True
+        assert len(requests) == 1
+        owner_after = fresh_session._journal.load_owner()
+        with fresh_session._journal._owner.read():
+            loaded_after = fresh_session._journal._load_room_aggregate(
+                owner_after,
+                ROOM,
+            )
+            inventory_after = fresh_session._journal._load_task3_work_inventory(
+                owner_after
+            )
+        assert loaded_after is not None
+        assert loaded_after[1].continuity.membership == "join"
+        assert loaded_after[1].continuity.membership_epoch == 0
+        assert loaded_after[1].pending_local_membership is None
+        assert len(inventory_after.work) == 1
+        local_work = inventory_after.work[0]
+        assert local_work.value.origin == SystemOrigin(
+            SystemOriginKind.MEMBERSHIP_CHANGE,
+            operation_id,
+        )
+        assert local_work.value.source_json == _local_source("leave", 0, "join", 0)
+
+        graph_after = tuple(fresh_session._owned_store.database.connection().iterdump())
+        assert fresh_session._publish_local_membership_transition(
+            operation_id=operation_id,
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        ) == CommitResult(owner_after.revision)
+        assert (
+            tuple(fresh_session._owned_store.database.connection().iterdump())
+            == graph_after
+        )
+
+        batch = fresh_session.next_batch()
+        assert batch is not None
+        assert batch.records == (local_work.value,)
+        await fresh_session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert fresh_session.next_batch() is None
+        assert tuple(fresh_client.rooms) == (ROOM,)
+        assert fresh_client.invited_rooms == {}
+    finally:
+        await fresh_session.close()
+
+
 @pytest.mark.asyncio
 async def test_owned_runner_orders_duplicate_leave_and_rejoin_behind_local_work(
     tmp_path,

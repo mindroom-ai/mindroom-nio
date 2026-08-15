@@ -34,6 +34,7 @@ from ..ingest.model import (
     SystemOrigin,
     SystemOriginKind,
     TransportKind,
+    _local_membership_predecessor_matches,
     _local_membership_record_id,
     _local_membership_source_json,
     _local_membership_transition_epoch,
@@ -863,9 +864,12 @@ class SqliteIngestionJournal(JournalRows):
                     )
                 if continuity.membership == current_membership:
                     return CommitResult(aggregate.updated_revision)
-            if (
-                continuity.membership != previous_membership
-                or continuity.membership_epoch != previous_epoch
+            if not _local_membership_predecessor_matches(
+                continuity.membership,
+                continuity.membership_epoch,
+                previous_membership=previous_membership,
+                previous_epoch=previous_epoch,
+                current_membership=current_membership,
             ):
                 raise JournalConflictError(
                     "local membership intent does not match current state"
@@ -1077,10 +1081,19 @@ class SqliteIngestionJournal(JournalRows):
                 raise JournalConflictError(
                     "local membership transition is blocked by a room barrier"
                 )
-            if (
-                continuity.membership != previous_membership
-                or continuity.membership_epoch != previous_epoch
-            ):
+            predecessor_matches = (
+                continuity.membership == previous_membership
+                and continuity.membership_epoch == previous_epoch
+            )
+            if pending_local_membership == expected_intent:
+                predecessor_matches = _local_membership_predecessor_matches(
+                    continuity.membership,
+                    continuity.membership_epoch,
+                    previous_membership=previous_membership,
+                    previous_epoch=previous_epoch,
+                    current_membership=current_membership,
+                )
+            if not predecessor_matches:
                 raise JournalConflictError(
                     "local membership transition does not match current state"
                 )

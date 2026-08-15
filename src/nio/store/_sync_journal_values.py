@@ -8,6 +8,7 @@ from uuid import UUID
 from ..ingest.model import (
     RoomSnapshot,
     TransportKind,
+    _local_membership_predecessor_matches,
     _local_membership_transition_epoch,
 )
 from ..ingest.reducer import HydrationIntent, RoomContinuity
@@ -198,11 +199,13 @@ class RoomAggregateValue:
         if local is not None and (
             gap is not None
             or hydration_id is not None
-            or (
+            or not _local_membership_predecessor_matches(
                 self.continuity.membership,
                 self.continuity.membership_epoch,
+                previous_membership=local.previous_membership,
+                previous_epoch=local.previous_epoch,
+                current_membership=local.current_membership,
             )
-            != (local.previous_membership, local.previous_epoch)
         ):
             raise ValueError("local membership intent disagrees with continuity")
         if gap is not None:
