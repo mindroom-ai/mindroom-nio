@@ -10445,6 +10445,58 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
 
 
 @pytest.mark.asyncio
+async def test_owned_runner_hydrates_held_work_before_waiting_for_pump(
+    tmp_path,
+) -> None:
+    class HydratedWorkWaitReached(Exception):
+        pass
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    staged = stage_classic(bootstrap, _local_room_body())
+    hydration = FakeResponse(200, hydration_state())
+    client.responses.append(hydration)
+    waits: list[int] = []
+
+    async def stop_at_hydrated_work(observed_generation: int) -> None:
+        waits.append(observed_generation)
+        assert client.send_count == 1
+        assert client.send_calls[0][0][:2] == (
+            "GET",
+            "/_matrix/client/v3/rooms/%21diagnostic%3Aexample.org/state",
+        )
+        assert hydration.released
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(owner)
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(headers) == 1 and headers[0].frame_id == staged.frame_id
+        assert [work.status for work in inventory.work] == [
+            "ready",
+            "ready",
+            "ready",
+        ]
+        raise HydratedWorkWaitReached
+
+    session._wait_for_progress = stop_at_hydrated_work  # type: ignore[method-assign]
+    try:
+        with pytest.raises(HydratedWorkWaitReached):
+            await session.run()
+        assert len(waits) == 1
+        assert client.send_count == 1
+        client._assert_ingestion_not_poisoned()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_work_wait_wakes_when_materialization_publishes_delivery(
     tmp_path,
 ) -> None:

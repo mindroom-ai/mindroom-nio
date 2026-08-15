@@ -56,7 +56,7 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 second-fix feature `9624ccffe164a4b20ba8a397fbfb634693deb4c2`; parent docs blocker `bc015263202b770d96f217411eb070656b449a33` and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Invite/knock predecessor bridge is committed and its exact wheel exposed the mixed-auth join defect. Before the next commit, the only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; all are fully verified but Classic remains RED until the replacement exact wheel passes |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 bearer-auth fix `2ba7b04a90c5191cbf488459bd4c48107ac07714`; invite/knock bridge `9624ccffe164a4b20ba8a397fbfb634693deb4c2`, docs blocker `bc015263202b770d96f217411eb070656b449a33`, and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Exact-wheel Classic proved bearer-only join externally, then exposed an owned retained-Frame/HELD hydration deadlock. The only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; the causal RED is GREEN and 561 coordinator/source-journal regressions pass, but full-suite/hooks, commit, replacement wheel, and ordinary Classic remain required |
 | `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | packaging commit `6f415e41f` over Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Durable features and packaging fix are committed; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | First fix `1c6bd92...` was externally insufficient. Exact diagnostics found binary `leave/0` authority versus authenticated `invite/0`; Fable-approved invite/knock bridge `9624ccf...` is committed, verified, and installed as an exact wheel. Its fresh-volume Classic rerun remains RED: every owned join reaches Synapse but receives HTTP 401 while the same bot's `/sync` authenticates. Diagnose the join-token divergence before any new code or Sliding run |
+| Task 8 | In progress | Exact diagnostics resolved binary `leave/0` versus authenticated `invite/0`, mixed query/Bearer auth, and then the retained-Frame/HELD hydration deadlock exposed by the next exact-wheel Classic run. The hydration scheduling RED is GREEN and coordinator/source-journal are 561/561; finish full verification, commit, rebuild/install, and rerun ordinary fresh-volume Classic. Sliding remains gated |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -1945,6 +1945,79 @@ are clean. The complete nio suite is also GREEN at `2,321 passed, 3 skipped, 5
 pre-existing warnings in 305.18s`. This is not yet an external PASS: finish
 configured hooks/diff review, commit the slice, rebuild a fresh exact wheel,
 and rerun ordinary fresh-volume Classic before proceeding to Sliding.
+
+That slice is committed as
+`2ba7b04a90c5191cbf488459bd4c48107ac07714` with subject
+`fix: use bearer auth for local membership`. Its pre-commit three-file binary
+diff SHA-256 was
+`cfd4d09b9a5ee443490d8fa4e9af811289e5dff4b2e7e118c498f4ca050f0574`.
+A detached build worktree at
+`/tmp/mindroom-task8-wheels.2FeteO/nio-2ba7b04` produced
+`/tmp/mindroom-task8-wheels.2FeteO/wheels-2ba7b04/mindroom_nio-0.39.0-py3-none-any.whl`,
+SHA-256 `6ccdd034d6d60d4cd995b1677c374d442bc8e5247770a928e9d91c20c6ac9230`,
+size `391883` bytes. A new Python 3.13.14 environment at
+`/tmp/mindroom-task8-wheels.2FeteO/venv-2ba7b04` installed that wheel plus the
+unchanged exact MindRoom wheel (SHA-256 `ab70ef8c...`, 154 total packages).
+Imports resolve from the new environment's `site-packages`; metadata is
+MindRoom `2026.8.30.post1.dev491+g6f415e41f` and nio `0.39.0`; installed source
+contains both token-free membership endpoint paths and no `Api.join` or query
+token in the membership runner. The operator harness now points to this exact
+environment/hash and remains ordinary (no diagnostics). Reset only the
+disposable Task 8 Synapse volumes and run Classic next.
+
+The ordinary fresh-volume Classic rerun against that exact environment is
+still RED, but it proves the bearer fix at the external boundary. The general
+bot receives the invite and logs `Joined room` at `13:45:30.781`; startup then
+logs `All agents have joined their configured rooms` and completes room
+maintenance. There are no repeated join failures or visible authentication
+errors. The later application oracle times out after 90.1 seconds waiting for
+the warm-up event `$i_H3gGhQ4IbSlm51yHm6YA-GFgEMlAVCI1VPyOYAC9Y`, reporting
+`journal: no pending events` and `not_admitted - no principal admitted the
+event: Matrix sync never delivered it, or ingress dropped it before the
+journal`. The harness preserved the complete run at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-classic-1786801621`. Treat this as a
+new post-join source/delivery boundary: correlate Synapse sync responses with
+the preserved Source/Frame/Work and MindRoom admission/frontier state before
+changing code. Do not proceed to Sliding or relabel Classic PASS.
+
+That preserved-state correlation is now exact and read-only. The current
+general-client database (device `SYBZSPMLPD`, including its copied WAL) has
+owner revision `72`, active Classic Source epoch `0` / next request `4`, and
+cursor `s28_4_0_1_1_1_1_15_0_1_2_1_1`. Request `3` is not lost: Frame
+`d4a65908-1598-542e-b452-1889c26f1b88` remains authenticated/prepared at
+revision `68`. It owns three room Work rows, all `held`, at membership epoch
+`1` / room sequences `23..25`; the room Aggregate is also revision `68` with
+`intent_kind=hydration`. The delivery frontier has no outstanding batch and
+MindRoom's application journal has no pending event, so this is upstream of
+admission. Synapse shows the warm-up was sent before the last successful
+general-bot `/sync`; no later source request follows. The causal code path is
+the owned retained-Frame branch: `_advance_blocked_frame()` treats *any* Work,
+including hydration-gated HELD Work, as pump-owned and waits for progress,
+while `_run_loop()` can execute its pending-hydration HTTP block only after
+that blocked-Frame branch yields. This violates the already-frozen Task 4F
+rule that first-room HELD Work must complete hydration HTTP. Add an owned-runner
+RED that reaches the real retained prepared Frame and proves hydration occurs
+before the progress wait; then make only that scheduling boundary GREEN.
+
+That strict RED was captured in
+`test_owned_runner_hydrates_held_work_before_waiting_for_pump`: before the
+production edit, the real owned runner materialized the Frame and entered its
+progress wait with `client.send_count == 0`, while the hydration intent and
+three HELD Work rows remained unchanged. The bounded GREEN leaves outbound
+maintenance first, but makes `_advance_blocked_frame()` yield instead of
+waiting when an authenticated pending hydration exists; `_run_loop()` then
+enters its existing hydration block rather than treating the retained Frame as
+terminally blocked. The exact node is `1 passed`; after hydration it proves the
+GET path, released response, empty pending-hydration set, retained prepared
+Frame, all three Work rows READY, and only then the pump wait. The focused
+hydration plus owned record-wait selector is `22 passed / 270 deselected`.
+The complete coordinator plus source-journal regression is `561 passed in
+84.97s`, and the complete nio suite is `2,322 passed, 3 skipped, 5 pre-existing
+warnings in 305.25s`. Production Ruff `--no-fix`, Black, targeted coordinator
+mypy, `py_compile`, `git diff --check`, and every configured pre-commit hook on
+the three changed paths are GREEN. Commit this exact three-file slice next,
+then build/install a fresh exact wheel and rerun ordinary fresh-volume Classic.
+Classic remains RED and Sliding remains forbidden until that external pass.
 
 ### Task 5D completed checkpoint — 2026-08-15
 

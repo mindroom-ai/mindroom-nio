@@ -649,6 +649,8 @@ class IngestionSession:
                     assert materialized.frame_id is not None
                     if await self._advance_blocked_frame(materialized.frame_id):
                         continue
+                    if self._journal.load_pending_hydrations(limit=1):
+                        break
                     raise IngestionBlockedError(materialized.frame_id)
                 if materialized.status is MaterializeStatus.AT_CAPACITY:
                     raise IngestionBlockedError(materialized.frame_id)
@@ -1117,6 +1119,8 @@ class _OwnedIngestionSession(IngestionSession):
         progress_generation = self._progress_generation
         pending = self._journal._load_ready_outbound_maintenance()
         if pending is None:
+            if self._journal.load_pending_hydrations(limit=1):
+                return False
             if self._journal._oldest_prepared_frame_has_work(frame_id):
                 await self._wait_for_progress(progress_generation)
                 return True
