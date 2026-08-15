@@ -49,14 +49,14 @@ Olm/Megolm, pytest, Ruff, Black, mypy, and the linked MindRoom repository.
 This section is the authoritative restart point. Read it together with the
 controlling design and the remaining task descriptions below. If conversation
 state is lost, do not infer progress from unchecked prose elsewhere in the
-plan: verify this checkpoint first, then continue from the **Task 7 active
+plan: verify this checkpoint first, then continue from the **Task 8 active
 checkpoint**.
 
 ### Repository and commit boundary
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 6 feature commit `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; Task 6 docs-ledger commit `739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7` | Task 6 public compatibility and zero-use work is committed, reviewed, and GREEN; Task 7 modifies only this plan and `tests/ingest/source_journal_test.py` |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 7 feature commit `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; the docs-ledger commit containing this row follows it | Task 7 crash/parity verification is committed and GREEN; after the ledger commit, tracked state is clean |
 | `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 7 commit `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Task 7 cross-database crash/parity verification is committed and GREEN; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
@@ -109,8 +109,9 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
-| Task 7 | Complete pending nio ledger | MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; nio test/plan commit has subject `test: verify durable crash parity` and this ledger is its source |
-| Tasks 8–10 | Not started | Preserve the remaining dependency order |
+| Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
+| Task 8 | In progress | Clean committed candidate boundary; inventory the existing external Classic/Sliding canary harness and pinned Synapse environment next |
+| Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
 
@@ -1309,12 +1310,12 @@ MindRoom is committed at
 ordinary docs-ledger commit records both repository SHAs and establishes the
 clean Task 7 restart boundary. No unrelated untracked path is included.
 
-### Task 7 active checkpoint — 2026-08-15
+### Task 7 completed checkpoint — 2026-08-15
 
 Task 7 begins from the two clean Task 6 feature commits above plus nio
 docs-ledger commit `739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7`.
-Continue autonomously without approval pauses. The only Task 7 tracked edits in
-nio are this living plan and `tests/ingest/source_journal_test.py`. MindRoom's
+Task 7 is committed in nio at
+`6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94` and MindRoom's
 `tests/test_durable_ingestion_cross_database_crash.py` is committed at
 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; production is unchanged.
 Reuse existing journal transition hooks, process-kill harnesses,
@@ -1420,8 +1421,8 @@ UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
 # 6 passed in 6.5s
 ```
 
-Immediate next action: map the existing per-transaction process-kill matrices
-onto the complete end-to-end chain and add only genuinely missing
+The verification sequence next mapped the existing per-transaction process-kill
+matrices onto the complete end-to-end chain and added only genuinely missing
 cross-repository boundaries rather than duplicating already causal
 source/materializer/admission/claim/ack tests. The cross-repository carrier now
 binds both conflicting canonical digest rejection and one real
@@ -1478,10 +1479,9 @@ No production file changed in either repository. No Claude consultation was
 needed: the only design-looking issue was resolved causally by the existing
 Sliding connection-rotation contract and exact tests. The focused review and
 hashing below are complete; MindRoom is committed at
-`2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`. Immediate next action is the
-ordinary nio `test: verify durable crash parity` commit, followed by one
-docs-ledger commit that records its exact SHA and establishes Task 8's clean
-restart boundary.
+`2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; nio is committed at
+`6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`. This docs-ledger change
+establishes Task 8's clean restart boundary.
 
 The focused final review found no P0-P2 correctness issue. The Task 7
 functional patch identities before commit are:
@@ -1501,6 +1501,27 @@ MindRoom remains `+195` runtime and becomes effectively `+2,448` tests from
 source/test lines smaller than `925df7f`. Task 9 recovery deletion and Task 10
 consolidation must close the fixed overages without moving either baseline or
 limit.
+
+### Task 8 active checkpoint — 2026-08-15
+
+Task 8 begins from clean committed candidate features: nio
+`6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94` and MindRoom
+`2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`, plus the nio docs-ledger commit
+containing this checkpoint. No Task 8 production or test edit exists yet.
+Continue autonomously without approval pauses, but do not call a local
+simulation an external canary PASS.
+
+Immediate next action is read-only inventory of the existing canary, wheel,
+Synapse, Docker, and evidence tooling in both repositories. Bind the exact
+pinned Synapse version, ordinary Classic/Sliding configuration, homeserver
+credentials, clean isolated environment, and wheel-build commands before
+starting anything. Reuse an existing harness if it meets Task 8; do not add
+product diagnostic state, a control room, `probe`, or canary-only production
+path. If external credentials/infrastructure are unavailable, complete every
+local build/harness validation that is honest, record the exact external
+blocker, and leave Task 8 in progress rather than inventing evidence. Claude
+Fable remains reserved for a material design ambiguity that local sources and
+causal tests cannot resolve.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
@@ -2474,31 +2495,23 @@ Operational rules:
 
 ### Restart verification commands
 
-For the active Task 7 checkpoint, run these after a new session. They are
-read-only except for pytest caches. Expected state is this modified living plan
-and source-journal test in nio and the new cross-database test file in MindRoom,
-plus only the unrelated
-untracked paths listed near the top of this document. A missing plan edit or
-test file means the active checkpoint was not preserved; stop rather than
-silently recreating it from memory.
+For the clean Task 8 entry checkpoint, run these after a new session. They are
+read-only except for pytest caches. Expected state is tracked-clean in both
+repositories plus only the unrelated untracked paths listed near the top of
+this document.
 
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
-test "$(git rev-parse HEAD)" = 739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7
-test "$(git rev-parse HEAD^)" = 70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a
-test "$(git log -1 --format=%s)" = "docs: record Task 6 completion"
-test "$(git status --porcelain --untracked-files=no)" = \
-  " M docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md
- M tests/ingest/source_journal_test.py"
+test "$(git rev-parse HEAD^)" = 6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94
+test "$(git log -1 --format=%s)" = "docs: record Task 7 completion"
+test -z "$(git status --porcelain --untracked-files=no)"
 git status --short
 git diff --check
 uv run pytest -q --tb=short \
-  tests/public_sync_compatibility_test.py \
-  tests/ingest/owned_login_prerequisite_test.py tests/store_test.py \
-  tests/sync_recovery_test.py tests/sliding_membership_test.py \
-  tests/sync_response_ordering_test.py
-# expected at this checkpoint: 142 passed
+  tests/ingest/source_journal_test.py::test_stage_crash_boundary_reopens_to_exact_old_or_new_graph \
+  tests/ingest/source_journal_test.py::test_sliding_stage_failure_is_atomic_before_rotated_reopen
+# expected at this checkpoint: 10 passed
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
@@ -2512,22 +2525,21 @@ UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
 # expected at this checkpoint: 6 passed
 ```
 
-The inventory commands below are historical/reference-only; their results are
-already summarized in the active checkpoint and need not be rerun before the
-next exact action:
+Then inventory Task 8 without editing:
 
 ```bash
 cd /work/dev/mindroom-nio
-rg -n "crash|kill|before_commit|transition_statement_hook|Classic|Sliding|Postgres" \
-  tests/ingest tests
+rg -n "canary|Synapse|wheel|docker|compose|Sliding|Classic|M_UNKNOWN_POS" \
+  . --glob '!src/mindroom_nio.egg-info/**'
 cd /work/dev/mindroom
-rg -n "crash|kill|before_commit|transition_statement_hook|receipt|frontier|Postgres" \
-  tests src/mindroom/event_journal
+rg -n "canary|Synapse|wheel|docker|compose|Sliding|Classic|M_UNKNOWN_POS" \
+  . --glob '!.claude/worktrees/**'
 ```
 
-Continue with the final review/hash/commit step described in the Task 7 active
-checkpoint. Update that checkpoint after every review, static gate, or commit
-so this file remains sufficient restart authority.
+Continue with the canary-harness inventory described in the Task 8 active
+checkpoint. Update that checkpoint after every material discovery, build,
+canary attempt, blocker, or evidence review so this file remains sufficient
+restart authority.
 
 Historical pre-Task6 restart commands (reference only; do not execute against
 the current Task 7 boundary):
