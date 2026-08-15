@@ -104,7 +104,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4D pure prepared planner | Complete | nio `96ff99bf36135e7eef66355953a9c1b4c8c9b2e8` |
 | Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
 | Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
-| Task 5B MindRoom all-record adapter/pump | In progress | Owned settlement authority, all-record validation, receipt-only lifecycle facts, and the isolated semantic-wake pump are GREEN at dirty patch `85492711...`; malformed evidence and stop/error boundaries are next |
+| Task 5B MindRoom all-record adapter/pump | In progress | Adapter, strict all-record validation, lifecycle facts, and the isolated pump are GREEN at dirty patch `87e657a0...`; full-repository verification/review is next |
 | Tasks 4F, 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
 
 ### Task 4E completed and committed
@@ -573,7 +573,7 @@ Task 5B is the current slice. Continue it in this order:
 - [x] Implement the smallest all-record adapter and one-record pump, preserving
       the existing MindRoom event-journal transaction as application authority
       and nio settlement as callback/ack authority.
-- [ ] Prove cancellation, restart/replay, callback failure, duplicate receipt,
+- [x] Prove cancellation, restart/replay, callback failure, duplicate receipt,
       and orderly stop/reload behavior before the ordinary Task 5B commit
       `feat: consume every durable ingestion record`.
 - [ ] Run the exact, focused, full MindRoom, formatting, lint, type, import-
@@ -607,7 +607,7 @@ tests/test_durable_ingestion_admission.py
 ```
 
 The binary patch over `src tests` has SHA-256
-`85492711f42d55f79eb1812ba3dce312a9c2b90098008aaa455d76c36642c948`.
+`87e657a024cc3bffd03d12bcc52579c28d5525e0af0b819acaab3a8003959b56`.
 The first RED proved current MindRoom called public `acknowledge_batch()` after
 admission; the private-owned fake made that a hard tripwire. The adapter now
 uses a local structural owned-session Protocol and awaits
@@ -616,20 +616,23 @@ three exact fact pairs. Existing cancellation, admission error, malformed fact,
 settlement error, and duplicate replay tests were migrated to that authority;
 19 focused adapter cases pass.
 
-The literal validator matrix now has 17 GREEN rows: Classic and Sliding
+The literal validator matrix now has 18 GREEN rows: Classic and Sliding
 LIVE/RECOVERED/HISTORY timeline, decrypted timeline, failed Megolm,
-nonsemantic timeline, reported/initial/local lifecycle, all six compatibility
-kinds, and transport/system losses. Initial reported lifecycle preserves its
-real `previous_membership=None` evidence only at epoch zero; Task 5A now accepts
-that exact case, while LOCAL transitions remain string-to-string. Lifecycle
-commits its receipt and fencing effects without claiming a semantic Matrix
+nonsemantic timeline, state/section/timeline reported lifecycle, local
+lifecycle, all six compatibility kinds, and transport/system losses. Initial
+reported lifecycle preserves its real `previous_membership=None` evidence only
+at epoch zero; Task 5A now accepts that exact case, while LOCAL transitions
+remain string-to-string with current membership restricted to `join|leave`.
+Reported lifecycle evidence is bound to Task 4C's exact section/state/timeline
+source correlations, and non-timeline compatibility event IDs are bound to the
+canonical source. Lifecycle commits its receipt and fencing effects without claiming a semantic Matrix
 event: its first-admission facts are exactly `receipt_new=True` and
 `semantic_event_new=False`. The isolated `run_ingestion_pump()` drains only
 `max_records=1`, passes every fact pair to owned settlement, wakes MindRoom
 dispatch only for semantic work, waits on an injected non-polling wake boundary
 when idle, and propagates cancellation.
 
-Fresh checkpoint evidence on 2026-08-14 is 298 passed in the complete owning
+Fresh checkpoint evidence on 2026-08-14 is 319 passed in the complete owning
 `tests/test_durable_ingestion_admission.py` file across SQLite and Postgres.
 Because the released `mindroom-nio` wheel does not yet contain this unmerged
 ingestion surface, run linked tests with:
@@ -641,13 +644,18 @@ PYTHONPATH=/work/dev/mindroom-nio/src \
   tests/test_durable_ingestion_admission.py
 ```
 
-Immediate next: inspect the Task 4C lifecycle producer correlations, then add
-the smallest causal malformed-evidence matrix for lifecycle, loss, and
-compatibility carrier shapes. Invalid values must fail before admission and
-owned settlement. Add the pump error/orderly-stop cases needed to prove no
-semantic wake or idle wait occurs after validation, admission, or settlement
-failure. Do not wire the pump into `bot.py` or `orchestrator.py` before Tasks
-5C/5D.
+Immediate next: run full MindRoom verification and a complete production/diff
+review. The current adapter tests prove invalid lifecycle, compatibility, and
+loss evidence never reaches admission/settlement; pump admission/settlement
+failures propagate without idle wait or semantic wake. Do not wire the pump
+into `bot.py` or `orchestrator.py` before Tasks 5C/5D.
+
+At this checkpoint the uncommitted Task 5B slice is exactly +350 net runtime
+lines and +899 net test lines versus MindRoom HEAD `da6ac44e4`. The complete
+branch versus the fixed post-prune `0acaea2ba` baseline is +768 runtime and
++1,889 tests. This is an intermediate state, not a budget pass: Tasks 6 and 9
+must perform the planned old-engine deletion and test consolidation before the
+fixed final +350/+1,000 limits can be claimed.
 
 After the decrypted pair, complete Task 4E in this order:
 
@@ -722,11 +730,11 @@ test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
 test "$(git rev-parse HEAD)" = da6ac44e44f6ea65a131dbee1bfc7bdd63ff0fbc
 git status --short
 test "$(git diff --binary -- src tests | sha256sum | cut -d' ' -f1)" = \
-  85492711f42d55f79eb1812ba3dce312a9c2b90098008aaa455d76c36642c948
+  87e657a024cc3bffd03d12bcc52579c28d5525e0af0b819acaab3a8003959b56
 PYTHONPATH=/work/dev/mindroom-nio/src \
   .venv/bin/python -m pytest -q -n 0 \
   tests/test_durable_ingestion_admission.py
-# expected: 298 passed
+# expected: 319 passed
 ```
 
 The current non-RED nio regression baseline is:
