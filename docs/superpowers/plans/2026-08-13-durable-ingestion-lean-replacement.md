@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | Clean committed candidate boundary; inventory the existing external Classic/Sliding canary harness and pinned Synapse environment next |
+| Task 8 | In progress | Classic exposed a membership race; nio fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` is fully GREEN and exact wheel/canary rebuild is next |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -1522,6 +1522,185 @@ local build/harness validation that is honest, record the exact external
 blocker, and leave Task 8 in progress rather than inventing evidence. Claude
 Fable remains reserved for a material design ambiguity that local sources and
 causal tests cannot resolve.
+
+#### Task 8 inventory and wheel checkpoint — 2026-08-15
+
+The first inventory pass found three concrete facts that supersede the generic
+"inventory next" instruction above:
+
+- `scripts/live_sliding_sync_check.py` is not a reusable Task 8 harness. It
+  imports and calls the public `SlidingSyncResponse`, `sliding_sync()`, and
+  `sliding_sync_forever()` surfaces deliberately removed by Task 6. Do not
+  restore those APIs merely to revive the old script.
+- MindRoom's local Synapse compose uses `matrixdotorg/synapse:latest`, so it is
+  not an explicitly pinned Task 8 environment yet. Inspect the locally
+  available image/digest and the complete homeserver config before starting it;
+  pin an exact version or digest in the disposable operator environment, not
+  through a canary-only production path.
+- MindRoom declared `mindroom-nio[e2e]>=0.37,<0.39`, while the exact nio
+  candidate wheel reports version `0.39.0`. A focused packaging test now
+  requires the durable minor exactly (`0.38.99` rejected, `0.39.0` accepted,
+  `0.40.0` rejected). The causal RED was the old specifier accepting `0.38.99`
+  and excluding the candidate. The narrow working-tree fix is
+  `mindroom-nio[e2e]>=0.39,<0.40` plus the regenerated `uv.lock`; the focused
+  node and the complete ten-node `tests/test_hatch_build.py` file are GREEN.
+
+There is an important release-candidate distinction: the registry's existing
+`mindroom-nio==0.39.0` wheel does not contain `nio.ingest`, even though it has
+the same version as the unreleased candidate checkout. A plain
+`uv run --locked` therefore installs the registry wheel and fails MindRoom's
+startup import. For repository tests, restore the linked candidate explicitly:
+
+```bash
+cd /work/dev/mindroom
+uv pip install --python .venv/bin/python -e /work/dev/mindroom-nio
+.venv/bin/pytest -q tests/test_hatch_build.py
+```
+
+For Task 8, do not use the registry artifact and do not treat its shared version
+number as identity. Build the exact nio candidate wheel from commit
+`6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`, build the MindRoom wheel from the
+eventual commit containing the dependency fix, record both wheel SHA-256 values,
+and install those two explicit local wheel paths into a fresh isolated
+environment. Verify `nio.ingest` imports from the installed candidate wheel
+before any canary attempt.
+
+The packaging closure is committed in MindRoom as
+`6f415e41f` (`build: require durable nio candidate`). Exact detached worktrees
+were then created at nio
+`6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94` and MindRoom
+`6f415e41f`, and both wheels built successfully. The exact artifacts were:
+
+- `mindroom_nio-0.39.0-py3-none-any.whl`, SHA-256
+  `051841f78d259765f5fb9d85dbbf9dd4e20a35fd50e94859e9d2d75317e1faf1`;
+- `mindroom-2026.8.30.post1.dev491+g6f415e41f-py3-none-any.whl`, SHA-256
+  `ab70ef8c61762992c3e5317b12adacbc47c3cd7fe13288c9e910bcfb7c7be65f`.
+
+They currently live under `/tmp/mindroom-task8-wheels.2FeteO/wheels/`; that path
+is disposable and the hashes/commits above, not `/tmp`, are the authority. The
+build used `uv build --wheel --out-dir ...` in each detached worktree. A new
+Python 3.13 virtual environment installed both explicit local wheel paths plus
+all 154 resolved base/E2EE dependencies. From that isolated environment,
+`mindroom.bot` and `nio.ingest` imported from `site-packages`; metadata reported
+the exact MindRoom development version above and nio `0.39.0`. This is a wheel
+build/install/import PASS only, not a Classic or Sliding canary PASS.
+
+Current restart state after the wheel checkpoint:
+
+- nio HEAD remains docs ledger `5bee5e44a6038c39923fc039132925fc2ea66bdb`;
+  this living document is the only intended tracked nio edit;
+- MindRoom HEAD is packaging commit `6f415e41f`, whose parent is Task 7
+  `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; its tracked tree is clean;
+- unrelated untracked paths listed in the Task 7 checkpoint remain user-owned
+  and must be preserved.
+
+Immediate continuation: finish the read-only Docker/Synapse/homeserver
+credential inventory and bind an ordinary production-path canary harness. Only
+after an explicitly pinned real Synapse and that harness are bound may Classic
+run; Sliding may run only after the new Classic evidence is accepted. Never
+label a local unit/integration simulation an external PASS.
+
+The pinned infrastructure preflight is now GREEN. The locally cached Synapse
+image is exactly version `1.158.0`, upstream git SHA
+`7a3e98b6f77ee3a5fe4dbeb934b0a0c1721e6afe`, linux/arm64 digest
+`sha256:39f47bcea65c544ef3a6d58848ee98e2ea98387e9991df30474d25b54477a0af`.
+Its installed source confirms the simplified MSC3575/MSC4186 endpoint and that
+`msc3575_enabled` defaults true. The disposable Task 8 manifest makes it
+explicitly true and pins Postgres 15-alpine digest
+`sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f`
+and Redis 7-alpine digest
+`sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2`.
+It runs as Compose project `mindroom-task8-canary` on host port `18008` with
+fresh named volumes; disposable operator files live under
+`/tmp/mindroom-task8-wheels.2FeteO/synapse/`.
+
+Using the fresh exact-wheel virtual environment, a new real Synapse account was
+registered and the candidate's own `ClassicSource` and `SlidingSource` each
+planned an ordinary initial request, received HTTP 200 from Synapse, and
+normalized the real response to `SourceResultKind.FRAME` with a candidate
+cursor. This is `transport-preflight=PASS`: it proves the pin, endpoint, auth,
+wire shapes, and candidate normalizers interoperate. It is still not the
+MindRoom Classic/Sliding canary because it has not yet exercised the production
+bot, durable store, MindRoom admission, or a visible application result.
+
+Immediate continuation is therefore narrower: adapt only operator-side harness
+launching so the exact installed `mindroom` executable runs its ordinary
+`mindroom run` configuration against this pinned Synapse and deterministic
+OpenAI-compatible model stub. Reuse the existing live harness's account/room,
+model-stub, message/result, process restart, and journal observation logic where
+possible, but do not use its Tuwunel provisioning or `uv run` child launch.
+Run the complete Classic canary first; retain the stack and artifacts only if
+its concise evidence is accepted, then run Sliding.
+
+The first exact-wheel Classic attempt is a causal external RED and Task 8 is
+blocked on it. Pinned Synapse and the ordinary installed `mindroom run` process
+both started; MindRoom created the configured public room, a real external
+account joined it, and the warm-up event was accepted by Synapse. The durable
+sync loop then repeatedly terminated with
+`JournalConflictError("local membership intent does not match current state")`.
+After 90 seconds the application oracle reported the warm-up event
+`not_admitted`, zero pending MindRoom journal events, and no agent reply. This
+must not be labelled a Classic PASS.
+
+Source inspection identifies a real local/reported membership race. Startup
+room reconciliation can read MindRoom's membership authority as `leave/0`
+while a reported `join/0` lifecycle Work is being admitted. Once that reported
+Work commits and is acknowledged, nio's Aggregate is `join/0`, but the already
+queued local command still asks for `leave/0 -> join`; the Work queue is now
+empty, so `_record_local_membership_intent()` reaches its stale predecessor
+check and makes the owned session terminal. The intended target is already
+satisfied, so retrying the transition would be wrong and terminal failure is
+unnecessary.
+
+Immediate TDD continuation: add a focused owned-session RED in nio where a
+membership transition reaches the requested target before a stale queued local
+command records its intent. Require the command to reconcile as a successful
+no-op, emit no new Work/DML, and leave the session reusable. Implement the
+narrow target-already-current branch in the journal/session command path, rerun
+the focused and complete relevant suites, build a new exact nio wheel/updated
+MindRoom wheel if commit identity changes, and then rerun Classic from a fresh
+Synapse volume. Preserve the failed attempt only as RED evidence.
+
+That focused TDD boundary is now implemented in the working tree. The new node
+`test_owned_local_command_reconciles_when_lifecycle_reaches_target` queues the
+stale `leave/0 -> join` command first, publishes and settles a distinct real
+lifecycle transition that reaches `join/0`, then advances the stale command.
+Against the prior production bytes it failed only at
+`JournalConflictError("local membership intent does not match current state")`.
+The narrow GREEN recognizes an already-current target only after authenticated
+Frame and Work queues are empty and no Aggregate barrier is present; it returns
+without HTTP or journal DML. The owned session treats the resulting absence of
+a pending intent as successful reconciliation, clears the command, signals
+progress, and remains reusable. The test proves byte-identical graph state
+across the no-op and then successfully executes a new real `join/0 -> leave`
+command. Exact focused result: `1 passed in 0.26s`.
+
+This is not yet the external Classic PASS. Immediate continuation is focused
+and broad nio verification, static checks, independent diff review, a committed
+nio candidate boundary, exact wheel rebuild/reinstall, and a fresh-volume
+rerun of the pinned Classic canary. Update the hashes and canary evidence here
+before treating any disposable `/tmp` artifact as authoritative.
+
+Verification of the working-tree closure is now complete:
+
+- the 49-node local-membership selector passed;
+- full `coordinator_test.py + source_journal_test.py` passed `555/555`;
+- the complete nio suite passed `2309`, skipped `3`, and emitted only five
+  pre-existing deprecation warnings in `304.86s`;
+- Black left the two production files and focused test unchanged; Ruff
+  `--no-fix`, targeted mypy, `py_compile` coverage through the test run, and
+  `git diff --check` are clean.
+
+The external Classic result remains RED until the exact committed wheel is
+rebuilt and the fresh-volume ordinary MindRoom harness passes. Next restart
+action is to rebuild/reinstall the nio wheel from exact feature commit
+`1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` (`fix: reconcile fulfilled
+membership commands`) and rerun the pinned Classic canary. The configured
+pre-commit hooks on the three implementation/test files passed EOF,
+whitespace, Black, and Ruff; the feature commit contains only those two
+production files and the causal test. This living-document edit remains the
+only intended tracked change after that commit; the unrelated untracked review
+directory and generated egg-info remain user-owned and must not be removed.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
