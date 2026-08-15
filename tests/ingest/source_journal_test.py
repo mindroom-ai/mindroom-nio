@@ -3151,6 +3151,61 @@ def test_stage_crash_boundary_reopens_to_exact_old_or_new_graph(
         reopened.close()
 
 
+@pytest.mark.parametrize("boundary", STAGE_HOOK_LABELS)
+def test_sliding_stage_failure_is_atomic_before_rotated_reopen(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    class SlidingStageAbort(BaseException):
+        pass
+
+    bootstrap = _open(tmp_path, SLIDING_SOURCE)
+    journal = bootstrap._journal
+    owner_before = journal.load_owner()
+    source_before = journal.load_source()
+    proposal = _stage_proposal(journal, SLIDING_SOURCE, 1)
+    observed: list[str] = []
+    sentinel = SlidingStageAbort(boundary)
+
+    def abort_at_boundary(label: str) -> None:
+        observed.append(label)
+        if label == boundary:
+            raise sentinel
+
+    committed = boundary == "commit"
+    expected_frame = (
+        replace(proposal.frame, staged_revision=owner_before.revision + 1)
+        if committed
+        else None
+    )
+    journal.set_transition_statement_hook(abort_at_boundary)
+    try:
+        with pytest.raises(SlidingStageAbort) as failure:
+            _stage(journal, proposal=proposal)
+        assert failure.value is sentinel
+        assert observed == list(
+            STAGE_HOOK_LABELS[: STAGE_HOOK_LABELS.index(boundary) + 1]
+        )
+        assert journal.load_owner().revision == owner_before.revision + int(committed)
+        assert journal.load_source() == (
+            proposal.successor_source if committed else source_before
+        )
+        assert journal.load_frame(proposal.frame.frame_id) == expected_frame
+    finally:
+        journal.set_transition_statement_hook(None)
+        bootstrap.close()
+
+    reopened = _open(tmp_path, SLIDING_SOURCE)
+    try:
+        reopened_source = reopened._journal.load_source()
+        reopened_cursor = json.loads(reopened_source.cursor_json)
+        assert reopened_cursor["pos"] is None
+        assert reopened_source.next_request_id == 0
+        assert reopened._journal.load_frame(proposal.frame.frame_id) == expected_frame
+    finally:
+        reopened.close()
+
+
 def test_nested_real_e2ee_write_rolls_back_with_crashed_source_stage(
     tmp_path: Path,
 ) -> None:

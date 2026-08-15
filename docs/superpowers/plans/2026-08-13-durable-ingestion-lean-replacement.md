@@ -56,8 +56,8 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 6 feature commit `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; the docs-ledger commit containing this row follows it | Task 6 public compatibility and zero-use work is committed, reviewed, and GREEN; after the ledger commit, tracked state is clean |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 6 commit `253c76245174f106162368993bf1393d452c6698` | Task 6 durable-engine-only cleanup is committed, reviewed, and GREEN; tracked state is clean |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 6 feature commit `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; Task 6 docs-ledger commit `739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7` | Task 6 public compatibility and zero-use work is committed, reviewed, and GREEN; Task 7 modifies only this plan and `tests/ingest/source_journal_test.py` |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 7 commit `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Task 7 cross-database crash/parity verification is committed and GREEN; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -109,7 +109,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
-| Task 7 | In progress | Clean committed entry boundary; cross-database crash/parity inventory is the next exact action |
+| Task 7 | Complete pending nio ledger | MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; nio test/plan commit has subject `test: verify durable crash parity` and this ledger is its source |
 | Tasks 8–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -1311,14 +1311,15 @@ clean Task 7 restart boundary. No unrelated untracked path is included.
 
 ### Task 7 active checkpoint — 2026-08-15
 
-Task 7 begins from the two clean Task 6 feature commits above plus this nio
-docs-ledger commit. No Task 7 production or test edit exists at this checkpoint.
-Continue autonomously without approval pauses. First inventory the real crash
-and parity harnesses in both repositories against the Task 7 specification,
-then write the smallest causal matrix for the five crash boundaries across
-SQLite and PostgreSQL without adding production evidence hooks. Reuse existing
-journal transition hooks, process-kill harnesses, Classic/Sliding owned
-fixtures, and MindRoom admission/frontier helpers before creating anything new.
+Task 7 begins from the two clean Task 6 feature commits above plus nio
+docs-ledger commit `739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7`.
+Continue autonomously without approval pauses. The only Task 7 tracked edits in
+nio are this living plan and `tests/ingest/source_journal_test.py`. MindRoom's
+`tests/test_durable_ingestion_cross_database_crash.py` is committed at
+`2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; production is unchanged.
+Reuse existing journal transition hooks, process-kill harnesses,
+Classic/Sliding owned fixtures, and MindRoom admission/frontier helpers before
+creating anything new.
 
 The required observable chain is:
 
@@ -1336,6 +1337,170 @@ GREEN before any broad gate. Preserve the unrelated untracked paths in the
 repository table. Consult Claude Fable through isolated `agent-cli dev` only
 if local code and causal evidence leave a material design ambiguity; record the
 question and decision here before continuing.
+
+Read-only Task 7 inventory is complete. Existing coverage is deep but remains
+split at the repository boundary:
+
+- nio already process-kills Classic source staging at every transaction hook
+  (`test_stage_crash_boundary_reopens_to_exact_old_or_new_graph`),
+  kills all 18 real materializer DML positions plus `before_commit` / `commit`,
+  kills delivery and local-membership transactions, and kills Sliding reopen;
+- nio separately proves cold Classic/Sliding semantic parity, prepared-Frame
+  retention, callback-before-ack transaction exclusion, ack rollback/commit
+  uncertainty, and positioned `M_UNKNOWN_POS` reset/replan ordering;
+- MindRoom already runs fresh admission, rollback at each statement class,
+  post-commit uncertainty, hidden-until-commit facts, replay/conflict taxonomy,
+  and concurrent classification against both the SQLite and PostgreSQL
+  backends; its adapter tests prove exact one-record fact transfer and
+  redelivery after settlement failure;
+- MindRoom's nine-boundary turn crash matrix proves one terminal dispatch and
+  at most one visible response after admission, but it starts from an already
+  admitted event rather than a real nio batch.
+
+The uncovered Task 7 boundary is therefore one real cross-repository carrier:
+the same authenticated nio Work must enter a real MindRoom backend, survive a
+crash after MindRoom admission but before nio ack, reopen, classify as an exact
+receipt replay, suppress the second callback/application dispatch, and finally
+ack without losing the retained Frame. The equivalent Classic and Sliding
+inputs must yield the same transport-neutral persisted event/projection facts.
+After that base matrix is GREEN, extend the Sliding row through positioned
+`M_UNKNOWN_POS` after this admission-before-ack restart.
+
+The first causal node is
+`tests/test_durable_ingestion_cross_database_crash.py::test_real_owned_batch_replays_after_admission_before_nio_ack`,
+parameterized by Classic/Sliding and the existing `journal_database`
+SQLite/PostgreSQL fixture. It uses a real warm transport cursor followed by one
+joined-room LIVE timeline message, real nio source normalization,
+materialization, hydration, one-record FIFO delivery, MindRoom
+`consume_one_ingestion_batch()`, and the existing nio `before_commit`
+transition hook to abort the first ack. The preceding lifecycle/state Work is
+admitted through MindRoom as receipt-only work so the two durable consumer
+frontiers remain identical; privately acknowledging that prefix was the first
+fixture error and correctly produced `IngestionBatchSequenceError`. The only
+other setup corrections were creating the nio store directory, constructing
+the client before adopting the bootstrap-owned SQLite store, and treating
+MindRoom's `PendingPage` as its documented tuple subtype.
+
+The exact four-case matrix is GREEN unchanged production:
+
+```text
+UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
+  tests/test_durable_ingestion_cross_database_crash.py::test_real_owned_batch_replays_after_admission_before_nio_ack \
+  --tb=short
+# 4 passed in 6.2s: Classic/Sliding × SQLite/PostgreSQL
+```
+
+Each row proves one first-receipt callback outside nio's transaction after the
+MindRoom receipt/event/projection/frontier has committed; the injected nio ack
+rollback leaves the exact Work and prepared Frame outstanding. A valid
+same-sequence competing nio batch with a recomputed but conflicting canonical
+digest is rejected by MindRoom with `IngestionBatchIntegrityError` and leaves
+the original semantic event intact. Close/fresh-client reopen returns the same
+original batch; MindRoom classifies it as `(receipt_new=False,
+semantic_event_new=False)`; no second callback runs; final ack removes the Work
+while the Frame remains its completion owner. The real `PendingEventWorker`
+then dispatches that pending semantic event exactly once, settles it, and a
+second drain returns zero. Both transports persist and dispatch the same
+literal MindRoom event signature. No production hook or table was added.
+
+The positioned Sliding continuation is also GREEN unchanged production in
+`test_sliding_unknown_position_after_admission_before_nio_ack`, parameterized by
+the same SQLite/PostgreSQL fixture. It deliberately retries the already-admitted
+batch on the still-positioned session first, proving replay facts `(False,
+False)` and no second callback. The runner then retires the prepared Frame,
+sends the exact `pos=p2` request, receives exact HTTP 400
+`M_UNKNOWN_POS`, atomically advances the source epoch and resets only `pos`
+while preserving `to_device_since=td2`, replans request 0 without a position,
+and survives a fresh configured-store/client/session reopen with no Work or
+Frame loss. The combined file is:
+
+```text
+UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
+  tests/test_durable_ingestion_cross_database_crash.py --tb=short
+# 6 passed in 6.5s
+```
+
+Immediate next action: map the existing per-transaction process-kill matrices
+onto the complete end-to-end chain and add only genuinely missing
+cross-repository boundaries rather than duplicating already causal
+source/materializer/admission/claim/ack tests. The cross-repository carrier now
+binds both conflicting canonical digest rejection and one real
+`PendingEventWorker` dispatch, so neither is an open gap. Run the exact existing
+source-stage, Task4C/freeze/materializer, batch-claim, MindRoom admission, nio
+ack, and turn-crash selectors as one Task 7 verification manifest. Add a new
+case only if that manifest exposes an unowned before/after boundary. Then run
+focused affected suites and all configured statics, record patch
+identities/review, and commit the Task 7 slice.
+
+The first manifest run found exactly one test-coverage asymmetry: the five-hook
+subprocess source-stage crash test was Classic-only. Directly parameterizing
+that subprocess with Sliding is invalid because configured Sliding reopen
+intentionally rotates the connection-scoped source before the child can apply a
+parent-built proposal; the resulting proposal is correctly rejected as stale.
+The narrow companion
+`test_sliding_stage_failure_is_atomic_before_rotated_reopen` therefore builds
+the proposal under one live Sliding owner, injects a `BaseException` at each
+exact stage hook, proves all-old for the four precommit boundaries and all-new
+at `commit`, then closes and proves the intentional positionless rotated reopen
+preserves the corresponding absent/present Frame. Classic subprocess death plus
+Sliding exact transaction failure now pass `10/10`. No production change was
+needed.
+
+Initial composite crash manifest evidence:
+
+```text
+# nio: Classic stage process death, full 18-DML materializer process death,
+# preparation freeze/poison, batch claim, ack, parity, and positioned reset
+37 passed in 12.14s
+
+# MindRoom: the 6 cross-repository rows, every admission rollback/commit
+# boundary on both backends, and the complete downstream turn crash matrix
+98 passed, exit 0
+```
+
+The rerun and complete affected gates are GREEN:
+
+```text
+# nio complete tests/ingest suite, including the 10 Classic/Sliding staging rows
+1704 passed in 256.92s
+
+# MindRoom complete admission + downstream crash + cross-repository files
+# (329 + 76 + 6 collected nodes)
+411 passed, exit 0
+
+# touched-file gates
+nio: Black, Ruff pre-commit, mypy, compileall, whitespace/end-of-file, diff-check GREEN
+MindRoom: Ruff check/format, full configured ty hook, Tach, privata,
+          compileall, whitespace/end-of-file, diff-check GREEN
+```
+
+No production file changed in either repository. No Claude consultation was
+needed: the only design-looking issue was resolved causally by the existing
+Sliding connection-rotation contract and exact tests. The focused review and
+hashing below are complete; MindRoom is committed at
+`2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`. Immediate next action is the
+ordinary nio `test: verify durable crash parity` commit, followed by one
+docs-ledger commit that records its exact SHA and establishes Task 8's clean
+restart boundary.
+
+The focused final review found no P0-P2 correctness issue. The Task 7
+functional patch identities before commit are:
+
+- nio source-stage test patch:
+  `b0b1835fa383a3cb1b36a2183d01279849be700adf85cbb3b19498c84e2a603b`;
+- MindRoom new cross-repository test patch:
+  `81837bc15b9231f0d4d0598034077ce8dd41f65b0975b3eecf6a0c39797118ce`.
+
+Suppression inventory: nio adds none; MindRoom adds only two test-local
+`# noqa: PLR0915` markers on the two intentionally literal end-to-end scenarios
+and no type-ignore, coverage, lint, or production suppression. Fixed budgets
+remain a Task 9/10 blocker rather than a Task 7 regression: nio is currently
+`+19,833` runtime, `+56,082` tests, and `+3,722` docs from `6ed2b98`;
+MindRoom remains `+195` runtime and becomes effectively `+2,448` tests from
+`0acaea2` after including the new untracked 688-line test. It remains 204 net
+source/test lines smaller than `925df7f`. Task 9 recovery deletion and Task 10
+consolidation must close the fixed overages without moving either baseline or
+limit.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
@@ -2309,17 +2474,23 @@ Operational rules:
 
 ### Restart verification commands
 
-For the clean Task 7 entry checkpoint, run these before editing after a new
-session. They are read-only except for pytest caches. The expected `git status`
-output contains only the unrelated untracked paths listed near the top of this
-document.
+For the active Task 7 checkpoint, run these after a new session. They are
+read-only except for pytest caches. Expected state is this modified living plan
+and source-journal test in nio and the new cross-database test file in MindRoom,
+plus only the unrelated
+untracked paths listed near the top of this document. A missing plan edit or
+test file means the active checkpoint was not preserved; stop rather than
+silently recreating it from memory.
 
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
+test "$(git rev-parse HEAD)" = 739f3f44ac0c5a5ca1c7d68b160a09f86a9570c7
 test "$(git rev-parse HEAD^)" = 70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a
 test "$(git log -1 --format=%s)" = "docs: record Task 6 completion"
-test -z "$(git status --porcelain --untracked-files=no)"
+test "$(git status --porcelain --untracked-files=no)" = \
+  " M docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md
+ M tests/ingest/source_journal_test.py"
 git status --short
 git diff --check
 uv run pytest -q --tb=short \
@@ -2331,18 +2502,19 @@ uv run pytest -q --tb=short \
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
-test "$(git rev-parse HEAD)" = 253c76245174f106162368993bf1393d452c6698
+test "$(git rev-parse HEAD)" = 2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f
 test -z "$(git status --porcelain --untracked-files=no)"
+test -f tests/test_durable_ingestion_cross_database_crash.py
 git status --short
 git diff --check
 UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
-  tests/test_multi_agent_bot.py tests/test_bot_ready_hook.py \
-  tests/test_matrix_public_sync_cutover.py tests/test_matrix_client_session.py \
-  tests/test_scheduled_task_restoration.py --tb=short
-# expected at this checkpoint: 106 selected nodes, exit 0
+  tests/test_durable_ingestion_cross_database_crash.py --tb=short
+# expected at this checkpoint: 6 passed
 ```
 
-Then inventory Task 7 without editing:
+The inventory commands below are historical/reference-only; their results are
+already summarized in the active checkpoint and need not be rerun before the
+next exact action:
 
 ```bash
 cd /work/dev/mindroom-nio
@@ -2353,8 +2525,9 @@ rg -n "crash|kill|before_commit|transition_statement_hook|receipt|frontier|Postg
   tests src/mindroom/event_journal
 ```
 
-Update the Task 7 active checkpoint before the first RED with the exact reused
-harnesses, test node, and expected causal failure.
+Continue with the final review/hash/commit step described in the Task 7 active
+checkpoint. Update that checkpoint after every review, static gate, or commit
+so this file remains sufficient restart authority.
 
 Historical pre-Task6 restart commands (reference only; do not execute against
 the current Task 7 boundary):
