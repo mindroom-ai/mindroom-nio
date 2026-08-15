@@ -44,7 +44,7 @@ Olm/Megolm, pytest, Ruff, Black, mypy, and the linked MindRoom repository.
 
 ---
 
-## Live execution status and restart handoff — 2026-08-14
+## Live execution status and restart handoff — 2026-08-15
 
 This section is the authoritative restart point. Read it together with the
 controlling design and the remaining task descriptions below. If conversation
@@ -54,10 +54,10 @@ action**.
 
 ### Repository and commit boundary
 
-| Repository | Branch | Required HEAD | State |
+| Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | `59bbb3b05c993488d1e81a35e6b743658ac4c87b` | Task 4F in progress at the exact dirty checkpoint below; preserve it |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `3a8094759d23b3740119893419cd7eff8b0c785b` | Task 5B committed; no tracked changes expected |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | docs-only Task 5C handoff whose parent is `b61e186b2b63e2b81149c40ca67c0435a60ede60` | Task 5C code and restart handoff committed; tracked tree clean before Task 5D |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa` | Task 5C implementation committed; tracked tree clean, full suite and all hooks GREEN |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -104,9 +104,268 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4D pure prepared planner | Complete | nio `96ff99bf36135e7eef66355953a9c1b4c8c9b2e8` |
 | Task 4D owned all-kind materialization | Complete | nio `eb77f5d0e1c17658ea322016ef04a16bac6e40e9`; full suite 2,622 passed/3 skipped |
 | Task 4E restore/settlement | Complete | nio `be24cf315c27250d3c2b95a5862278420ee8d270`; full suite 2,672 passed/3 skipped |
-| Task 5B MindRoom all-record adapter/pump | Complete | MindRoom `3a8094759d23b3740119893419cd7eff8b0c785b`; owning 319-test file, full repository suite, and all pre-commit hooks GREEN |
-| Task 4F coordinator progress/completion | In progress | All implementation/checklist slices, including the complete durable local-membership matrix, are GREEN at dirty source/test patch `1ca31931...`; final whole-repository gate and commit-readiness audit are next |
-| Tasks 5C, 5D, 6–10 | Not started | Follow the dependency order in this plan |
+| Task 5B MindRoom all-record adapter/pump | Complete | MindRoom `3a80947593bbf6fe508ca2e7499f19e951f416d3`; owning 319-test file, full repository suite, and all pre-commit hooks GREEN |
+| Task 4F coordinator progress/completion | Complete | nio `ec9fe0da38378e7a7d5d100737787fb7584d8662`; exact patch `1ca31931...`; 2,731 passed/3 skipped full suite |
+| Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
+| Tasks 5D, 6–10 | Not started | Task 5D is now immediate next; preserve the remaining dependency order |
+
+### Task 5C completed checkpoint
+
+Task 5C implementation is complete in both repositories. The MindRoom tree is
+tracked-clean at the required commit above. nio's three-file typed prerequisite
+is committed at `b61e186...`; the next nio commit is this docs-only completion
+handoff. Verify its subject and parent with the restart commands rather than
+embedding its self-referential commit ID here.
+
+Historical discovery completed before the first RED; every gap below is now
+resolved by the active implementation checkpoint later in this section:
+
+- `src/mindroom/matrix/client_session.py` owns `_MindRoomAsyncClient`,
+  `create_authenticated_client()`, password `login()`, token login, and restored
+  login. Password login currently keeps one configured client after HTTP login;
+  token login closes a temporary credential client and then constructs the
+  authenticated client.
+- `src/mindroom/matrix/users.py` selects restored, password, or appservice
+  credentials; the appservice path can obtain credentials through HTTPX without
+  constructing a temporary MatrixStore/AsyncClient.
+- `src/mindroom/bot.py::Bot.start()` previously received only a client. Task 5C
+  now makes the bot own the private ingestion session separately;
+  `Bot.sync_forever()` remains unchanged because Task 5D owns durable-engine
+  activation.
+- `src/mindroom/desktop/identity.py` previously read the per-device SQLite store
+  directly. Task 5C now uses an injected resolver over the target bot's
+  already-owned live client, with no SQLite read/open in that identity path.
+- nio's private `_open_fresh_ingestion_store()`,
+  `_open_configured_ingestion_store()`, and `_open_owned_ingestion()` are the
+  only authorized construction path. Do not introduce a public nio API, a
+  second store open, or an independent ingestion database.
+
+The configured-store-class ambiguity was resolved on 2026-08-14 with Claude
+Fable through the installed `agent-cli dev` workflow. The documented
+`agent-cli-dev` wrapper name was not on `PATH`; the available backend was
+`/home/basnijholt/.local/bin/agent-cli`. Its configured Vertex credential path
+was stale/missing, so the successful Fable invocation used the isolated
+`task5c-store-adoption-fable` worktree and unset only the Vertex-routing
+variables, falling back to Claude's existing local authentication. Fable's
+decisive recommendation was the smallest option:
+
+1. call the existing configured opener with exact `DefaultStore`;
+2. if and only if nio raises a dedicated typed, machine-readable no-DML signal
+   that the store is already marked and therefore requires `SqliteStore`, close
+   that failed bootstrap/owner completely and retry the exact same
+   account/device/generation/source/path with exact `SqliteStore`;
+3. never branch on exception text, inspect SQLite before the lease, try
+   `SqliteStore` optimistically, or persist a MindRoom-side class marker.
+
+The lease gap is acceptable because the first marked-store attempt performs no
+DML and releases all ownership, while the second opener repeats full ordinary
+and ingestion graph authentication under a fresh exclusive lease before writer
+or source mutation. If the current `FreshIngestionRequired` class is too broad
+to distinguish this case without text matching, add the narrowest private nio
+subclass/signal; do not add an auto-classifying public opener.
+
+Task 5C TDD order and state:
+
+1. [x] add a focused MindRoom credential-to-owned-session factory RED proving the
+   temporary no-store/no-sync credential client's HTTP closes on success,
+   login error, owned-factory failure, and cancellation, while appservice
+   credentials create no temporary MatrixStore/client;
+2. [x] add configured adoption/marked-reopen rows using the typed nio signal and
+   prove exact account/session/token/E2EE preservation plus one owned session;
+3. [x] add bot ownership and cleanup ordering: runner/pump are still unwired,
+   session closes/releases before HTTP, every cleanup lane runs, and
+   replacement waits for lease release;
+4. [x] replace the raw desktop identity reader with the injected live-bot resolver
+   and cover target/missing/mismatch/replacement without any SQLite open;
+5. [x] commit MindRoom and the nio typed prerequisite ordinarily, with
+   pre-commit, final diff/budget audit, and the full suite GREEN. Commit this
+   final handoff docs-only before Task 5D.
+
+First checkpoint is GREEN:
+
+- MindRoom `_MatrixCredentials`, `_create_credential_client()`, and
+  `_login_password_credentials()` keep password HTTP on an explicit storeless
+  client and close it before returning credentials; success, permanent login
+  rejection, and `CancelledError` are 3/3 GREEN. `_restore_credentials()` now
+  performs the persisted-token `whoami` check on the same storeless boundary
+  and closes that temporary HTTP client before returning exact credentials.
+- nio `_MarkedStoreRequiresSqlite` is a private subclass of
+  `FreshIngestionRequired`; the exact marked-Default probe raises that type,
+  emits no DML, and preserves the full graph. Its focused probe plus the 11-row
+  configured negative matrix are 12/12 GREEN.
+- Exact touched production Ruff and formatting checks are GREEN after import
+  normalization; do not force Ruff over excluded nio tests.
+
+The real credential-to-owned-session factory checkpoint is also GREEN:
+
+- `_open_owned_matrix_session()` loads/creates one MindRoom consumer, uses
+  nio's fresh or configured bootstrap, binds the returned stream ID back to the
+  exact consumer, constructs one pristine `SqliteStore`-configured client
+  without calling `restore_login()`/`load_store()`, and transfers it through
+  `_open_owned_ingestion()`.
+- real fresh creation, real historical DefaultStore adoption, and typed marked
+  SqliteStore reopen preserve the exact Olm identity and stream binding;
+  transfer failure, a simultaneously failing HTTP cleanup lane, and
+  cancellation all release the bootstrap so the same graph reopens.
+- complete `tests/test_matrix_client_session.py` is now 21/21 GREEN; exact
+  production Ruff, Ruff format, ty, and diff-check are GREEN. The nio typed
+  signal/negative selector remains 12/12 GREEN with Black/Ruff/diff-check.
+
+The high-level agent-owned session checkpoint is GREEN:
+
+- appservice credential acquisition is factored into a direct HTTPX-only
+  helper; the legacy `login_appservice_user()` remains for old callers, while
+  Task 5C creates no temporary Matrix client/store on that path;
+- `_owned_agent_credentials()` preserves the existing restored/password/
+  appservice selection semantics while returning exact `_MatrixCredentials`;
+- `login_agent_owned_session()` obtains credentials first, calls the owned
+  factory exactly once, validates identity, persists the session, and performs
+  cross-signing. A post-open failure closes the ingestion session before the
+  client's HTTP lane while preserving the primary exception;
+- the complete three-file auth/factory suite is 82/82 GREEN
+  (`test_matrix_client_session.py` 21, `test_matrix_appservice.py` 14,
+  `test_matrix_agent_manager.py` 47), with production Ruff and ty clean.
+
+The Bot owned-session lifecycle checkpoint is GREEN:
+
+- `_bot_ingestion_config()` freezes the existing Classic timeout/filter or the
+  Sliding connection/list/room-subscription/extension settings into canonical
+  nio source bytes;
+- `Bot.start()` passes its exact existing journal principal as the durable
+  consumer store, generates only a candidate generation, calls
+  `login_agent_owned_session()` once, and retains the returned ingestion
+  session separately from `client`;
+- startup error and `CancelledError` after ownership both release the ingestion
+  session before HTTP, continue the second cleanup lane if the first raises,
+  preserve the primary failure, and clear both Bot fields;
+- `Bot.stop()` releases the ingestion session before HTTP and still runs HTTP
+  cleanup when session close raises. The focused Bot lifecycle/scheduling
+  group is 89/89 GREEN; all former Bot-start mocks now use the owned carrier,
+  and affected sync-continuity/multi-agent/streaming selectors are GREEN;
+- exact touched production Ruff and ty plus diff-check are GREEN. The durable
+  runner/pump and `Bot.sync_forever()` remain unchanged as required.
+
+The completion-sink and live-controller checkpoint is GREEN:
+
+- `login_agent_owned_session()` and the private owned-session factory accept
+  and forward the exact completion sink. `Bot.start()` installs the bound
+  `_on_ingestion_frame_completion` seam before any future source activation;
+  the method is intentionally a no-op until Task 5D, and no runner/pump is
+  activated in Task 5C;
+- `controller_identity_for_live_bot()` validates a currently running target
+  Bot, registry/entity name, persisted/live Matrix user and device IDs, and
+  the live Olm ed25519 fingerprint. It never opens SQLite or a second store;
+- the orchestrator resolves the target from its current registry on every
+  call, so replacement is observed dynamically. Desktop command setup and
+  confirmation receive that resolver through `CommandTurnExecutorDeps` and
+  `CommandHandlerContext`; missing, stopped, mismatched, or replaced targets
+  fail closed;
+- the final post-boundary auth/factory group is 82/82 GREEN and the combined
+  Bot/controller focused group is 164/164 GREEN. Earlier turn/command and
+  scheduling groups remain GREEN, and continuity/multi-agent/streaming is
+  138 passed/2 skipped;
+- the final full MindRoom run on the current dirty bytes is 13,704 passed and
+  123 skipped. Exact changed production Ruff and ty, changed formatting, and
+  `git diff --check` are GREEN. One initial full-run failure was a hand-built
+  `object.__new__(AgentBot)` fixture missing the new field; it now explicitly
+  initializes `_ingestion_session = None`, and the full rerun is GREEN;
+- nio `tests/ingest/journal_test.py` is 86/86 GREEN; Black, Ruff, and
+  `git diff --check` are GREEN. The raw two-file mypy command still reports six
+  unchanged pre-existing diagnostics at preflight lines 813 and 1312–1313;
+  no Task 5C changed hunk owns those diagnostics.
+- Fable's ownership correction is implemented. Exact Tach dependency/interface
+  validation and Privata `--methods` are GREEN; the final all-files MindRoom
+  pre-commit run passes every configured hook when invoked with
+  `UV_NO_SYNC=1` after installing the linked nio checkout editable. The flag is
+  required because an ordinary internal `uv run` otherwise restores the
+  released `mindroom-nio==0.37.0` pin before `ty`, which cannot see Task4F;
+- the complete staged MindRoom Task5C patch is
+  `fd617dcca42d7cf740e665c6ffd7d7dbab9f97a93f82edbc11ceba73c644c49f`.
+  It is +609 net runtime lines and +639 net test lines versus MindRoom HEAD.
+  The whole branch versus fixed post-prune `0acaea2ba` is currently +1,358
+  runtime and +2,543 tests; this is the explicitly expected intermediate
+  over-budget state before Tasks 6/9 old-engine deletion and consolidation,
+  not a final budget claim.
+
+The committed MindRoom Task5C manifest (29 files) is:
+
+```text
+src/mindroom/bot.py
+src/mindroom/command_turn_executor.py
+src/mindroom/commands/desktop_commands.py
+src/mindroom/commands/handler.py
+src/mindroom/desktop/identity.py
+src/mindroom/matrix/_owned_session.py
+src/mindroom/matrix/appservice.py
+src/mindroom/matrix/client_session.py
+src/mindroom/matrix/sync_loop.py
+src/mindroom/matrix/users.py
+src/mindroom/orchestrator.py
+src/mindroom/runtime_protocols.py
+tach.toml
+tests/bot_helpers.py
+tests/test_bot_scheduling.py
+tests/test_bot_sync_lifecycle.py
+tests/test_commands.py
+tests/test_desktop_cloudflare_access.py
+tests/test_desktop_identity.py
+tests/test_desktop_pairing.py
+tests/test_matrix_agent_manager.py
+tests/test_matrix_appservice.py
+tests/test_matrix_client_session.py
+tests/test_matrix_sync_continuity.py
+tests/test_multi_agent_bot.py
+tests/test_multi_agent_e2e.py
+tests/test_streaming_e2e.py
+tests/test_sync_task_cancellation.py
+tests/test_turn_controller_focused.py
+```
+
+These exact bytes are committed as
+`ba0da04b5553bac9ce36b92cb1f0133211b1c3aa` with subject
+`feat: own durable Matrix ingestion sessions`. The nio prerequisite is
+committed as `b61e186b2b63e2b81149c40ca67c0435a60ede60`; its journal file is
+86/86 GREEN, and exact changed-file Black/Ruff, focused mypy, `py_compile`,
+diff-check, and changed-file pre-commit all pass. Immediate next: commit this
+final handoff docs-only, then begin Task 5D from its plan section. If a causal
+failure appears, fix it without an approval pause. If a material ambiguity
+survives local evidence, consult Claude Fable through the isolated
+`agent-cli-dev` workflow, record the decision here, and continue. Do not
+activate the runner/pump or change `Bot.sync_forever()`; that remains Task 5D.
+
+The first all-files pre-commit run exposed one test-style finding plus genuine
+Tach/Privata ownership failures. Per the autonomy rule, Claude Fable was
+consulted through an isolated `task5c-boundary-fable-20260814` `agent-cli dev`
+worktree with `--model=fable`; the stale Vertex credential variables were
+unset for the successful local-auth invocation. Its accepted decision is:
+
+1. move the entire exact owned-session cluster into the private package module
+   `mindroom.matrix._owned_session`; use public symbol names *inside that
+   private module* so `matrix.users` can consume them without Privata evasion,
+   while Tach visibility permits only `matrix.users`. Keep the concrete
+   `IngestionConsumer` dependency there rather than weakening exact-type and
+   equality checks to a structural approximation;
+2. keep `client_session` slim. Expose only the three low-level client primitives
+   needed by `_owned_session` through a second Tach interface visible solely to
+   that private module; do not add the owned factory to the broad existing
+   client-session interface;
+3. move canonical Bot ingestion-config construction into `matrix.sync_loop` as
+   one public function, leaving its three sliding request-shape helpers private
+   and co-located with the live sync request construction;
+4. retain `desktop.identity` as the dependency-free controller identity value
+   and resolver module, declare the deliberate Bot/orchestrator Tach edges,
+   replace untyped `getattr` probing with private read-only structural
+   Protocols, and keep command/runtime consumers on the narrow callable value
+   seam;
+5. rename the direct appservice credential helper public within its already
+   one-consumer module boundary instead of reaching it through a private
+   attribute. No runner/pump, store, SQLite, or controller semantics change.
+
+This exact ownership correction is implemented and all named gates are GREEN.
+The unrelated nio
+all-files Ruff findings are two pre-existing timeout-parameter rules in
+`scripts/live_sliding_sync_check.py`; Task 5C's exact changed-file Black/Ruff
+gates are GREEN, so do not edit that unrelated script.
 
 ### Task 4E completed and committed
 
@@ -596,7 +855,7 @@ activation. Task 5B owns pump cancellation/stop behavior in isolation; Task 4F
 supplies the runner/pump wake and Frame-progress state machine.
 
 Task 5B is committed at MindRoom
-`3a8094759d23b3740119893419cd7eff8b0c785b`. Its implementation commit contains
+`3a80947593bbf6fe508ca2e7499f19e951f416d3`. Its implementation commit contains
 exactly:
 
 ```text
@@ -656,12 +915,10 @@ uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
   tests/test_durable_ingestion_admission.py
 ```
 
-Immediate next: continue Task 4F in `/work/dev/mindroom-nio` from the live
-restart handoff above. The next causal slice is local leave/rejoin plus
-duplicate/ordering behavior; the carrier, pre-HTTP restart, successful local
-publication, and Work-ack/source fence are already GREEN. Task 5B deliberately
-does not wire the pump into `bot.py` or `orchestrator.py`; Tasks 5C/5D own that
-activation after Task 4F exists.
+Historical transition satisfied: Task 5C now owns the private session factory,
+credential/cleanup lifecycle, completion-sink seam, and live-controller
+identity resolver. Task 5B/5C still deliberately do not activate the pump in
+`bot.py` or `orchestrator.py`; Task 5D owns candidate-engine activation.
 
 The committed Task 5B slice is +331 net runtime lines and +914 net test lines
 versus MindRoom parent `da6ac44e4`. The complete branch versus the fixed
@@ -687,11 +944,18 @@ After the decrypted pair, complete Task 4E in this order:
 ### Immediate next action
 
 A fresh session can be started with: “Read the controlling design and the live
-restart handoff in this plan, verify the recorded branches and dirty hash,
-preserve unrelated untracked files, and continue Task4F from the first unchecked
-item.”
+restart handoff in this plan, verify both recorded commit boundaries and clean
+tracked trees,
+preserve unrelated untracked files, install the nio checkout editable into
+MindRoom, and begin Task 5D: make `Bot.sync_forever()` use the already-owned
+durable runner and MindRoom pump as the sole candidate engine while preserving
+the Classic/Sliding transport choice and existing lifecycle behavior. Task 5C
+is committed and GREEN in both repos. Continue autonomously without approval
+pauses; consult Claude Fable through isolated `agent-cli-dev` only for a
+material ambiguity that local evidence cannot resolve.”
 
-Task4F is the current slice. Continue it in this order:
+Task 4F is complete and committed. Its closed checklist is retained below as
+historical evidence, not as the current work queue:
 
 - [x] Re-read the controlling Task4F design/plan sections and inspect the
       current retained prepared-Frame, owned runner, Work ack, outbound-plan,
@@ -763,12 +1027,12 @@ Task4F is the current slice. Continue it in this order:
       must commit before Matrix HTTP, survive restart, serialize ahead of source
       polling, publish the existing LOCAL lifecycle Work exactly once after the
       Matrix fate is reconciled, wait for its ack, and retire without a lost wake.
-- [ ] Add local-intent HTTP success/error/restart, duplicate/reconcile,
+- [x] Add local-intent HTTP success/error/restart, duplicate/reconcile,
       Work-ack/retirement, rollback/post-COMMIT, cancellation/close, and
       source-poll fencing slices one causal RED at a time.
 
-Current Task4F dirty checkpoint starts from clean nio HEAD
-`59bbb3b05c993488d1e81a35e6b743658ac4c87b` and contains exactly:
+The completed Task4F implementation commit is
+`ec9fe0da38378e7a7d5d100737787fb7584d8662` and contains exactly:
 
 ```text
 docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md
@@ -782,7 +1046,9 @@ tests/ingest/coordinator_test.py
 tests/ingest/source_journal_test.py
 ```
 
-The exact binary source/test patch has SHA-256
+After this living handoff update, the expected tracked dirty list is only this
+plan file; all `src/` and `tests/` paths must be clean. The exact committed
+binary source/test patch has SHA-256
 `1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc`.
 The first RED uses one real empty Classic Frame on a fresh owned account. Task4C
 produces zero Work and one authenticated pending key-upload operation. Before
@@ -1008,9 +1274,19 @@ individually authenticated pending local intents and rejects a pending intent
 coexisting with Frame or Work queues. The current exact source/test patch
 SHA-256 is
 `1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc`.
-Immediate next: run the complete nio suite and final Task4F static/budget/diff
-audit, resolve any failure, then update this handoff and create the ordinary
-Task4F commit only if every gate is GREEN.
+The complete repository gate is **2,731 passed, 3 skipped** with five unchanged
+platform/deprecation warnings. Exact touched-file pre-commit hooks, public
+signature/export checks, compile checks, and diff-check are GREEN. The Task4F
+slice is +1,946 net runtime lines and +3,972 net test lines; the larger fixed
+branch budgets remain intentionally deferred to the Tasks 6/9 deletion and
+consolidation work. These exact bytes are committed as
+`ec9fe0da38378e7a7d5d100737787fb7584d8662`.
+
+Historical transition satisfied: the Task 5C factory, login lifecycle,
+completion sink, and controller-identity resolver are implemented and
+full-suite GREEN. The live handoff above owns current finalization. Do not wire
+`Bot.sync_forever()` yet; Task 5D owns candidate-engine activation after the
+ordinary Task 5C commits.
 
 #### Approved local-membership-intent design and execution plan
 
@@ -1129,7 +1405,13 @@ Operational rules:
 - keep `max_records=1`, exact FIFO, one retained Frame completion owner, schema
   v1, and exactly five ingestion tables;
 - send concise progress updates during long work and stop only for a real
-  safety, correctness, or scope blocker.
+  safety, correctness, or scope blocker;
+- do not pause the implementation/review loop merely to request approval.
+  Exercise best judgment and continue through ordinary TDD/review checkpoints.
+  If a material ambiguity remains after local evidence, consult Claude Fable
+  through the documented `agent-cli-dev`/`agent-cli dev` isolated-worktree
+  workflow, record the question and decision in this live handoff, then
+  continue.
 
 ### Restart verification commands
 
@@ -1138,21 +1420,14 @@ Run these before editing after a new session:
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
-test "$(git rev-parse HEAD)" = 59bbb3b05c993488d1e81a35e6b743658ac4c87b
-test "$(git diff --name-only)" = "$(printf '%s\n' \
-  docs/superpowers/plans/2026-08-13-durable-ingestion-lean-replacement.md \
-  src/nio/ingest/coordinator.py \
-  src/nio/store/_sync_journal.py \
-  src/nio/store/_sync_journal_preflight.py \
-  src/nio/store/_sync_journal_rows.py \
-  src/nio/store/_sync_journal_values.py \
-  src/nio/store/sync_journal_schema.py \
-  tests/ingest/coordinator_test.py \
-  tests/ingest/source_journal_test.py)"
-test "$(git diff --binary -- src tests | sha256sum | cut -d' ' -f1)" = \
-  1ca31931088369a02520a28e1d61280592bef3940531ba5dbc88d6403e7eb1bc
+test "$(git rev-parse HEAD^)" = b61e186b2b63e2b81149c40ca67c0435a60ede60
+test "$(git log -1 --format=%s)" = "docs: record Task 5C completion"
+test -z "$(git status --porcelain --untracked-files=no)"
 git status --short
 git diff --check
+uv run pytest -q \
+  tests/ingest/journal_test.py::test_marked_configured_default_probe_raises_typed_no_dml_signal
+# expected: 1 passed
 uv run pytest -q \
   tests/ingest/coordinator_test.py::test_owned_runner_enters_frame_owned_key_upload_before_source_poll \
   tests/ingest/coordinator_test.py::test_owned_key_upload_response_commits_with_settled_plan \
@@ -1179,13 +1454,52 @@ uv run pytest -q \
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
-test "$(git rev-parse HEAD)" = 3a8094759d23b3740119893419cd7eff8b0c785b
-test -z "$(git status --short --untracked-files=no)"
+test "$(git rev-parse HEAD)" = ba0da04b5553bac9ce36b92cb1f0133211b1c3aa
+test -z "$(git status --porcelain --untracked-files=no)"
 git status --short
 uv pip install --python .venv/bin/python --no-deps -e /work/dev/mindroom-nio
+.venv/bin/pytest -q \
+  tests/test_matrix_client_session.py \
+  tests/test_matrix_appservice.py \
+  tests/test_matrix_agent_manager.py
+# expected: 82 passed
+.venv/bin/ruff check --no-fix \
+  src/mindroom/bot.py \
+  src/mindroom/desktop/identity.py \
+  src/mindroom/matrix/_owned_session.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/appservice.py \
+  src/mindroom/matrix/sync_loop.py \
+  src/mindroom/matrix/users.py
+.venv/bin/ty check \
+  src/mindroom/bot.py \
+  src/mindroom/desktop/identity.py \
+  src/mindroom/matrix/_owned_session.py \
+  src/mindroom/matrix/client_session.py \
+  src/mindroom/matrix/appservice.py \
+  src/mindroom/matrix/sync_loop.py \
+  src/mindroom/matrix/users.py
+.venv/bin/tach check --dependencies --interfaces
+.venv/bin/privata --methods .
+.venv/bin/pytest -q -n 0 \
+  tests/test_multi_agent_bot.py \
+  tests/test_bot_sync_lifecycle.py \
+  tests/test_bot_scheduling.py
+# expected: 89 passed
+.venv/bin/pytest -q -n 0 \
+  tests/test_desktop_identity.py \
+  tests/test_desktop_pairing.py \
+  tests/test_commands.py \
+  tests/test_turn_dispatch_pipeline.py \
+  tests/test_turn_controller_focused.py
+# expected: 154 passed
 .venv/bin/python -m pytest -q -n 0 \
   tests/test_durable_ingestion_admission.py
 # expected: 319 passed
+.venv/bin/pytest
+# expected: 13,704 passed, 123 skipped
+UV_NO_SYNC=1 .venv/bin/pre-commit run --all-files
+# expected: all configured hooks pass
 ```
 
 To reproduce the final Task 5B full gate, use the same editable installation
@@ -1202,6 +1516,8 @@ uv run pytest -q tests/ingest/delivery_test.py
 # expected: 48 passed
 uv run pytest -q tests/ingest/source_journal_test.py
 # expected: 264 passed
+uv run pytest -q
+# expected: 2731 passed, 3 skipped
 ```
 
 Current static gates are green with:
@@ -1621,7 +1937,7 @@ from `_open_owned_ingestion()`.
 ### Task 5B: MindRoom all-record adapter and pump
 
 **Complete.** Implemented in MindRoom commit
-`3a8094759d23b3740119893419cd7eff8b0c785b`. The live handoff above records the
+`3a80947593bbf6fe508ca2e7499f19e951f416d3`. The live handoff above records the
 exact verification, linked-checkout requirement, budget state, and next task.
 
 Accept both origins and map every record/loss to Task 5A's disposition. Timeline
