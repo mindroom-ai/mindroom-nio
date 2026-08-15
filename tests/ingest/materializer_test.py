@@ -3943,6 +3943,96 @@ def test_prepared_gap_fallback_persists_loss_release_and_new_hydration() -> None
     assert plan.room_values[0].pending_hydration is not None
 
 
+def test_prepared_new_gap_is_lost_and_released_without_persisting_gap() -> None:
+    source_json = _prepared_event(
+        "m.room.member",
+        event_id="$member",
+        membership="join",
+    )
+    segment = replace(
+        _prepared_segment(
+            _prepared_observation("join", "join", "$member"),
+            section=RoomSection.JOIN,
+            state=(source_json,),
+        ),
+        timeline_limited=True,
+        timeline_prev_batch="room-new",
+    )
+    frame = replace(
+        _prepared_frame(room_segments=(segment,)),
+        origin=RecordOrigin(TransportKind.SLIDING, 0, 1, 0),
+    )
+    record = _prepared_record(
+        0,
+        RecordKind.STATE,
+        source_json,
+        event_type="m.room.member",
+        room=True,
+        event_id="$member",
+    )._replace(
+        origin=frame.origin,
+    )
+    aggregate = _prepared_aggregate(
+        epoch=3,
+        membership="join",
+        next_sequence=4,
+        baseline=MembershipBaseline("$member", "room-old"),
+    )
+    case = _PreparedPlannerFixture(
+        frame,
+        _prepared_payload(frame, (record,))._replace(compatibility_token=None),
+        aggregate,
+    )
+
+    plan = _plan_prepared(case)
+
+    assert plan is not None
+    assert tuple(
+        journal_rows_module._canonical_room_aggregate_plaintext(value)
+        for value in plan.room_values
+    )
+    assert plan.room_values == (
+        RoomAggregateValue(
+            RoomContinuity(
+                _PREPARED_ROOM_ID,
+                3,
+                "join",
+                MembershipBaseline("$member", "room-new"),
+                None,
+                None,
+            ),
+            5,
+            3,
+            None,
+        ),
+    )
+    assert plan.work_releases == ()
+    assert len(plan.work_inserts) == 2
+    loss_item, event_item = plan.work_inserts
+    assert loss_item.ready_ordinal == 0
+    assert type(loss_item.value) is LossRecord
+    assert (
+        loss_item.value.origin,
+        loss_item.value.room_id,
+        loss_item.value.membership_epoch,
+        loss_item.value.reason,
+        loss_item.value.boundary,
+    ) == (
+        frame.origin,
+        _PREPARED_ROOM_ID,
+        3,
+        LossReason.BASELINE_LOST,
+        LossBoundary(None, None, "room-old", "room-new"),
+    )
+    assert event_item.ready_ordinal == 1
+    assert type(event_item.value) is EventRecord
+    assert (
+        event_item.value.record_id,
+        event_item.value.membership_epoch,
+        event_item.value.room_sequence,
+    ) == (record.record_id, 3, 4)
+
+
 def test_prepared_empty_gap_barrier_precedes_later_accountwide_work() -> None:
     case, held = _prepared_gap_case(empty=True)
 

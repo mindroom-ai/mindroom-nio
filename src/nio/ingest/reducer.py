@@ -1268,6 +1268,36 @@ def reduce_prepared_frame(
                     "source membership change has no prepared transition"
                 )
             result, route = _plan_room(stream_id, frame, segment, before)
+            if result.recovery is not None:
+                gap = result.recovery
+                if (
+                    result.before != before
+                    or result.after.gap != gap
+                    or result.after.hydration_id is not None
+                    or result.hydration is not None
+                    or result.retirement_epoch is not None
+                    or result.losses
+                    or result.release is not RecoveryRelease.NONE
+                    or route is not DescriptorRoute.HOLD_FOR_GAP
+                ):
+                    raise ReducerInputError(
+                        "prepared new-gap recovery result is invalid"
+                    )
+                result = replace(
+                    result,
+                    after=replace(result.after, gap=None),
+                    recovery=None,
+                    losses=(
+                        _loss(
+                            before,
+                            LossReason.BASELINE_LOST,
+                            gap.start_token,
+                            gap.target_token,
+                        ),
+                    ),
+                    release=RecoveryRelease.LOSS_THEN_HELD,
+                )
+                route = DescriptorRoute.RELEASE_AFTER_LOSS
             room_results[segment.room_id] = result
             delegated_routes[segment.room_id] = route
             states[segment.room_id] = (
