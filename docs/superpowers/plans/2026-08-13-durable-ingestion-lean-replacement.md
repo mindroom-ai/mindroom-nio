@@ -49,15 +49,15 @@ Olm/Megolm, pytest, Ruff, Black, mypy, and the linked MindRoom repository.
 This section is the authoritative restart point. Read it together with the
 controlling design and the remaining task descriptions below. If conversation
 state is lost, do not infer progress from unchecked prose elsewhere in the
-plan: verify this checkpoint first, then continue from **Immediate next
-action**.
+plan: verify this checkpoint first, then continue from the **Task 7 active
+checkpoint**.
 
 ### Repository and commit boundary
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 5D feature commit `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; the ledger commit containing this row follows it | Task 5D nio support/tests are committed and GREEN; after the ledger commit, tracked state is clean |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 5D commit `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047` | Task 5D sole-engine, completion, and local-membership activation is committed, reviewed, and GREEN; tracked state is clean |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 6 feature commit `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; the docs-ledger commit containing this row follows it | Task 6 public compatibility and zero-use work is committed, reviewed, and GREEN; after the ledger commit, tracked state is clean |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | Task 6 commit `253c76245174f106162368993bf1393d452c6698` | Task 6 durable-engine-only cleanup is committed, reviewed, and GREEN; tracked state is clean |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -108,8 +108,9 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4F coordinator progress/completion | Complete | nio `ec9fe0da38378e7a7d5d100737787fb7584d8662`; exact patch `1ca31931...`; 2,731 passed/3 skipped full suite |
 | Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
-| Task 6 | In progress | MindRoom prerequisite, nio public-surface removal, retained Classic behavior, active-only store adoption, and external recovery zero-use are GREEN in uncommitted bytes; legacy-test consolidation/static cleanup is active |
-| Tasks 7–10 | Not started | Preserve the remaining dependency order |
+| Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
+| Task 7 | In progress | Clean committed entry boundary; cross-database crash/parity inventory is the next exact action |
+| Tasks 8–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
 
@@ -960,7 +961,7 @@ durable engine. Continue autonomously without approval pauses; consult Claude
 Fable through isolated `agent-cli dev` only for a material ambiguity that local
 evidence cannot resolve.”
 
-### Task 6 active checkpoint — 2026-08-15
+### Task 6 completed checkpoint — 2026-08-15
 
 Task 6 started from clean tracked boundaries: nio ledger tip `726771d` over
 feature commit `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`, and MindRoom
@@ -1282,16 +1283,11 @@ the combined MindRoom source/test tree is already 892 net lines smaller than
 the canary baseline `925df7f`. Tasks 9/10 still own recovery-source deletion
 and branch-wide consolidation; no baseline or limit moved.
 
-Restart handoff: continue autonomously without approval pauses. The exact next
-step is the final Task 6 diff/review gate: inspect the complete
-deletion/retirement mapping, rerun compile/diff checks after this ledger update,
-perform final review, update the exact patch hashes, and commit Task 6 as
-`test: bind durable sync compatibility`. If any failure appears, use focused
-causal REDs and the smallest active contract fix or explicit `_retired_*`
-classification—never restore fresh-store recovery tables or public
+Task 6 is committed and no longer an active dirty-tree handoff. If a later
+regression appears, use focused causal REDs and the smallest active-contract
+fix; never restore fresh-store recovery tables or the removed public
 Sliding/recovery surface. Keep the six recovery source modules present through
-the Task 8/9 observation gate. Consult Claude Fable through isolated
-`agent-cli dev` only if local evidence leaves a material design ambiguity.
+the Task 8/9 observation gate.
 
 The final Task 6 review is complete with no blocking finding. It covered every
 changed production hunk, the public API and ordinary-store compatibility
@@ -1306,12 +1302,40 @@ pre-commit patch identities are:
 
 No Claude consultation was needed because causal tests, the pinned upstream
 comparison, and complete local/static evidence resolved the final boundaries.
-MindRoom is now committed at
+MindRoom is committed at
 `253c76245174f106162368993bf1393d452c6698` with subject
-`test: bind durable sync compatibility`. Commit nio with that same subject,
-then follow it with one ordinary nio docs-ledger commit recording both
-repository SHAs and the clean Task 7 restart boundary. Do not include any
-unrelated untracked path.
+`test: bind durable sync compatibility`; nio is committed at
+`70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a` with the same subject. This
+ordinary docs-ledger commit records both repository SHAs and establishes the
+clean Task 7 restart boundary. No unrelated untracked path is included.
+
+### Task 7 active checkpoint — 2026-08-15
+
+Task 7 begins from the two clean Task 6 feature commits above plus this nio
+docs-ledger commit. No Task 7 production or test edit exists at this checkpoint.
+Continue autonomously without approval pauses. First inventory the real crash
+and parity harnesses in both repositories against the Task 7 specification,
+then write the smallest causal matrix for the five crash boundaries across
+SQLite and PostgreSQL without adding production evidence hooks. Reuse existing
+journal transition hooks, process-kill harnesses, Classic/Sliding owned
+fixtures, and MindRoom admission/frontier helpers before creating anything new.
+
+The required observable chain is:
+
+```text
+HTTP response -> Frame -> shared materializer -> Work -> batch
+-> MindRoom event/projection/receipt/frontier -> nio ack
+```
+
+The Task 7 matrix must prove response/cursor atomicity, deterministic replay,
+exactly one application dispatch, integrity failure for conflicting identity or
+digest, no Work/Frame loss, frontier advancement only in its owning
+transaction, and callbacks outside database transactions. Include Sliding
+reopen and exact `M_UNKNOWN_POS` after admission-before-ack. Run focused RED /
+GREEN before any broad gate. Preserve the unrelated untracked paths in the
+repository table. Consult Claude Fable through isolated `agent-cli dev` only
+if local code and causal evidence leave a material design ambiguity; record the
+question and decision here before continuing.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
@@ -2285,26 +2309,30 @@ Operational rules:
 
 ### Restart verification commands
 
-For the active Task 6 dirty-tree checkpoint, run these before editing after a
-new session. They are read-only except for pytest caches. Do **not** run the
-historical clean-tree/hash assertions that follow this block; those describe a
-completed pre-Task6 checkpoint.
+For the clean Task 7 entry checkpoint, run these before editing after a new
+session. They are read-only except for pytest caches. The expected `git status`
+output contains only the unrelated untracked paths listed near the top of this
+document.
 
 ```bash
 cd /work/dev/mindroom-nio
 test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
-test "$(git rev-parse HEAD)" = 726771d62c1cca2850418e2c73b52f5875805b47
+test "$(git rev-parse HEAD^)" = 70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a
+test "$(git log -1 --format=%s)" = "docs: record Task 6 completion"
+test -z "$(git status --porcelain --untracked-files=no)"
 git status --short
 git diff --check
 uv run pytest -q --tb=short \
-  tests/ingest/owned_login_prerequisite_test.py \
-  tests/store_test.py tests/sync_recovery_test.py \
-  tests/sliding_membership_test.py tests/sync_response_ordering_test.py
-# expected at this checkpoint: 130 passed
+  tests/public_sync_compatibility_test.py \
+  tests/ingest/owned_login_prerequisite_test.py tests/store_test.py \
+  tests/sync_recovery_test.py tests/sliding_membership_test.py \
+  tests/sync_response_ordering_test.py
+# expected at this checkpoint: 142 passed
 
 cd /work/dev/mindroom
 test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
-test "$(git rev-parse HEAD)" = 47180cc07e7d0177ff4981bd7ccf1f1ec65eb047
+test "$(git rev-parse HEAD)" = 253c76245174f106162368993bf1393d452c6698
+test -z "$(git status --porcelain --untracked-files=no)"
 git status --short
 git diff --check
 UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
@@ -2314,13 +2342,22 @@ UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
 # expected at this checkpoint: 106 selected nodes, exit 0
 ```
 
-Then continue with the final nio static/full rerun and MindRoom
-static/pre-commit gates in the active checkpoint above. Update this section
-with the new evidence, inspect the final delta/budget, and only then prepare the
-commit-ready handoff.
+Then inventory Task 7 without editing:
+
+```bash
+cd /work/dev/mindroom-nio
+rg -n "crash|kill|before_commit|transition_statement_hook|Classic|Sliding|Postgres" \
+  tests/ingest tests
+cd /work/dev/mindroom
+rg -n "crash|kill|before_commit|transition_statement_hook|receipt|frontier|Postgres" \
+  tests src/mindroom/event_journal
+```
+
+Update the Task 7 active checkpoint before the first RED with the exact reused
+harnesses, test node, and expected causal failure.
 
 Historical pre-Task6 restart commands (reference only; do not execute against
-the current dirty Task 6 tree):
+the current Task 7 boundary):
 
 ```bash
 cd /work/dev/mindroom-nio
