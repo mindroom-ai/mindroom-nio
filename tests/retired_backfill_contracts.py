@@ -28,7 +28,6 @@ from nio import (
     LoginResponse,
     MegolmEvent,
     PresenceEvent,
-    RecoveryAbandonment,
     RoomEncryptedImage,
     RoomEncryptionEvent,
     RoomForgetError,
@@ -41,7 +40,6 @@ from nio import (
     RoomNameEvent,
     Rooms,
     SendRetryError,
-    SlidingSyncResponse,
     SlidingSyncRoom,
     SyncResponse,
     Timeline,
@@ -62,7 +60,13 @@ from nio.client.sync_recovery import (
     should_dispatch_timeline_event,
 )
 from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
-from nio.responses import RoomMessagesError, RoomMessagesResponse, SlidingSyncError
+from nio.recovery_abandonment import RecoveryAbandonment
+from nio.responses import (
+    RoomMessagesError,
+    RoomMessagesResponse,
+    SlidingSyncError,
+    SlidingSyncResponse,
+)
 from nio.sliding_sync_tokens import SlidingWindowToken
 
 BASE_URL = f"https://example.org{MATRIX_API_PATH_V3}"

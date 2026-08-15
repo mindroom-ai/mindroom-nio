@@ -13,6 +13,8 @@
 # CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+from __future__ import annotations
+
 import asyncio
 import inspect
 import io
@@ -34,7 +36,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
@@ -43,7 +45,51 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
+    from ..recovery_abandonment import RecoveryAbandonment
+    from ..sliding_sync_tokens import SlidingWindowToken
     from ..store.database import MatrixStore
+    from .sliding_membership import (
+        plan_sliding_prev_batches,
+        sliding_live_event_count,
+        sliding_membership_proof_mismatch,
+        sliding_recovery_cursor,
+        sliding_recovery_membership,
+        sliding_room_is_invite,
+        sliding_unrecoverable_discontinuity_room_ids,
+    )
+    from .sync_recovery import (
+        PendingEventKind,
+        RecoveryOptions,
+        RecoveryPlan,
+        RecoveryState,
+        _LiveCallbackError,
+        acknowledge_unrecovered_rooms,
+        drain_recovery_dispatches,
+        drain_recovery_room_dispatches,
+        has_pending_recovery_work,
+        is_recovery_dispatch_task,
+        merge_recovery_plans,
+        persist_response_plan,
+        plan_room_timeline,
+        pump_recovery,
+        record_completed_timeline_event,
+        should_dispatch_timeline_event,
+        take_recovery_outcomes,
+        would_plan_real_gap,
+    )
+    from .sync_reset_fence import (
+        SyncRequestId,
+        SyncResetFence,
+        commit_one_time_key_counts,
+        finish_sync_request,
+        issue_sync_request,
+        mark_room_reset,
+    )
+    from .sync_response_ordering import (
+        OneTimeKeyCountCommit,
+        account_data_kind,
+        ordered_response_view,
+    )
 
 import aiofiles
 from aiofiles.threadpool.binary import AsyncBufferedReader
@@ -105,11 +151,9 @@ from ..exceptions import (
     InsufficientRecursionDepthError,
     LocalProtocolError,
     RemoteProtocolError,
-    SendRetryError,
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
-from ..recovery_abandonment import RecoveryAbandonment
 from ..responses import (
     ChangePasswordError,
     ChangePasswordResponse,
@@ -257,58 +301,12 @@ from ..responses import (
     WhoamiResponse,
 )
 from ..rooms import MatrixRoom
-from ..sliding_sync_tokens import SlidingWindowToken
 from .base_client import (
     Client,
     ClientCallback,
     ClientConfig,
     logged_in_async,
     store_loaded,
-)
-from .sliding_membership import (
-    plan_sliding_prev_batches,
-    sliding_live_event_count,
-    sliding_membership_proof_mismatch,
-    sliding_recovery_cursor,
-    sliding_recovery_membership,
-    sliding_room_is_invite,
-    sliding_unrecoverable_discontinuity_room_ids,
-)
-from .sync_recovery import (
-    PendingEventKind,
-    RecoveryOptions,
-    RecoveryPlan,
-    RecoveryState,
-    _LiveCallbackError,
-    acknowledge_unrecovered_rooms,
-    drain_recovery_dispatches,
-    drain_recovery_room_dispatches,
-    has_pending_recovery_work,
-    is_recovered_dispatch_task,
-    is_recovery_dispatch_task,
-    load_recovery_state,
-    merge_recovery_plans,
-    persist_response_plan,
-    plan_room_timeline,
-    plan_sync_response,
-    pump_recovery,
-    record_completed_timeline_event,
-    should_dispatch_timeline_event,
-    take_recovery_outcomes,
-    would_plan_real_gap,
-)
-from .sync_reset_fence import (
-    SyncRequestId,
-    SyncResetFence,
-    commit_one_time_key_counts,
-    finish_sync_request,
-    issue_sync_request,
-    mark_room_reset,
-)
-from .sync_response_ordering import (
-    OneTimeKeyCountCommit,
-    account_data_kind,
-    ordered_response_view,
 )
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
@@ -469,10 +467,6 @@ def client_session(func):
 
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
-        if self._sync_request_generation_is_stale():
-            raise LocalProtocolError(
-                "Request context belongs to a closed client generation."
-            )
         if not self.client_session:
             trace = TraceConfig()
             trace.on_request_chunk_sent.append(on_request_chunk_sent)
@@ -664,6 +658,39 @@ class AsyncClient(Client):
 
     """
 
+    if TYPE_CHECKING:
+        # Retained Task 9 recovery source refers to these carriers, but the
+        # active Task 6 client deliberately does not construct them at runtime.
+        event_admission_callback: ClientCallback | None
+        _sync_generation: _SyncGeneration
+        _closing: bool
+        _sync_response_lock: asyncio.Lock
+        _classic_sync_state_operation_lock: asyncio.Lock
+        _classic_sync_state_operation_context: ContextVar[object | None]
+        _active_classic_sync_state_operation: object | None
+        _sync_request_generation: ContextVar[_SyncGeneration | None]
+        _sync_request_id: ContextVar[SyncRequestId | None]
+        _sync_reset_fence: SyncResetFence
+        _sync_response_seen: bool
+        _classic_sync_rebuild_pending: bool
+        _classic_sync_state_staged: bool
+        _classic_sync_acknowledgeable_token: str | None
+        _classic_sync_abandonment_before_staged_response: dict[
+            str, frozenset[RecoveryAbandonment]
+        ]
+        _current_response_room_ids: ContextVar[frozenset[str] | None]
+        _sync_executor_context: ContextVar[object | None]
+        _active_sync_executor_token: object | None
+        _recovery_room_gates: dict[str, asyncio.Lock]
+        _recovery: RecoveryState
+        _pending_sliding_room_account_data: dict[
+            str, dict[tuple[str, str | None], AccountDataEvent]
+        ]
+        _sliding_room_prev_batch: dict[str, SlidingWindowToken]
+        _sliding_request_scope: ContextVar[str | None]
+        _sliding_sync_to_device_since: str | None
+        _sliding_receive_recovery_scope: str
+
     def __init__(
         self,
         homeserver: str,
@@ -684,7 +711,6 @@ class AsyncClient(Client):
 
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
-        self.event_admission_callback: ClientCallback | None = None
         self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
         )
@@ -707,56 +733,6 @@ class AsyncClient(Client):
         self.config: AsyncClientConfig = config or AsyncClientConfig()
 
         self._stop_sync_forever = False
-        self._sync_generation = _SyncGeneration()
-        self._closing = False
-
-        self._sync_response_lock = asyncio.Lock()
-        self._classic_sync_state_operation_lock = asyncio.Lock()
-        self._classic_sync_state_operation_context: ContextVar[object | None] = (
-            ContextVar(f"nio_classic_sync_state_operation_{id(self)}", default=None)
-        )
-        self._active_classic_sync_state_operation: object | None = None
-        self._sync_request_generation: ContextVar[_SyncGeneration | None] = ContextVar(
-            f"nio_sync_request_generation_{id(self)}", default=None
-        )
-        self._sync_request_id: ContextVar[SyncRequestId | None] = ContextVar(
-            f"nio_sync_request_id_{id(self)}", default=None
-        )
-        self._sync_reset_fence = SyncResetFence()
-        self._sync_response_seen = False
-        self._classic_sync_rebuild_pending = False
-        self._classic_sync_state_staged = False
-        self._classic_sync_acknowledgeable_token: str | None = None
-        self._classic_sync_abandonment_before_staged_response: dict[
-            str, frozenset[RecoveryAbandonment]
-        ] = {}
-        self._current_response_room_ids: ContextVar[frozenset[str] | None] = ContextVar(
-            f"nio_current_response_room_ids_{id(self)}", default=None
-        )
-        self._sync_executor_context: ContextVar[object | None] = ContextVar(
-            f"nio_sync_executor_{id(self)}", default=None
-        )
-        self._active_sync_executor_token: object | None = None
-        self._recovery_room_gates: dict[str, asyncio.Lock] = {}
-        self._recovery = RecoveryState(max_held_events=self.config.backfill_max_events)
-
-        # Sliding account data retained until its room is known.
-        self._pending_sliding_room_account_data: dict[
-            str, dict[tuple[str, str | None], AccountDataEvent]
-        ] = {}
-
-        # Per-room /messages token from each room's last sliding window,
-        # used as the start of the next limited window's recovery walk.
-        # Restored from the store when recovery persistence is enabled;
-        # otherwise it lives only in memory and cannot survive a restart.
-        self._sliding_room_prev_batch: dict[str, SlidingWindowToken] = {}
-        self._sliding_request_scope: ContextVar[str | None] = ContextVar(
-            f"nio_sliding_request_scope_{id(self)}", default=None
-        )
-
-        # Device-scoped token surviving sliding connection expiry.
-        self._sliding_sync_to_device_since: str | None = None
-        self._sliding_receive_recovery_scope = uuid4().hex
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -769,7 +745,7 @@ class AsyncClient(Client):
         return self.config.store_sync_tokens if persist is None else persist
 
     @property
-    def _recovery_store(self) -> "MatrixStore | None":
+    def _recovery_store(self) -> MatrixStore | None:
         """Return the loaded recovery store when configured persistence is enabled."""
         if not self._recovery_persistence_enabled:
             return None
@@ -786,7 +762,7 @@ class AsyncClient(Client):
             )
 
     @staticmethod
-    def _require_atomic_recovery_store(store: "MatrixStore") -> None:
+    def _require_atomic_recovery_store(store: MatrixStore) -> None:
         if not store.supports_atomic_recovery:
             raise LocalProtocolError(
                 "The configured store does not support atomic recovery writes."
@@ -794,15 +770,8 @@ class AsyncClient(Client):
 
     def load_store(self):
         super().load_store()
-        store = self._recovery_store
-        if store:
-            load_recovery_state(
-                self._recovery,
-                *store.load_sync_recovery(),
-            )
-            self._sliding_room_prev_batch.update(store.load_sliding_window_tokens())
 
-    def clear_persisted_sync_recovery(self) -> None:
+    def _legacy_clear_persisted_sync_recovery(self) -> None:
         """Remove durable sync residue before application-owned Classic Sync.
 
         This is a startup migration boundary for clients that disable both nio
@@ -843,11 +812,11 @@ class AsyncClient(Client):
         self._classic_sync_abandonment_before_staged_response.clear()
 
     @property
-    def has_uncommitted_classic_sync_state(self) -> bool:
+    def _legacy_has_uncommitted_classic_sync_state(self) -> bool:
         """Return whether application-owned Classic state still needs acknowledgement."""
         return self._classic_sync_state_staged
 
-    def acknowledge_classic_sync(self, next_batch: str) -> None:
+    def _legacy_acknowledge_classic_sync(self, next_batch: str) -> None:
         """Acknowledge that the application durably committed one Classic response."""
         if not self.config.backfill_limited_timelines:
             raise LocalProtocolError(
@@ -878,7 +847,7 @@ class AsyncClient(Client):
             self._recovery.abandoned
         )
 
-    async def reset_classic_sync_state(self) -> None:
+    async def _legacy_reset_classic_sync_state(self) -> None:
         """Discard uncommitted Classic Sync state owned only in memory.
 
         Applications that durably own the Classic Sync checkpoint can disable
@@ -1016,7 +985,7 @@ class AsyncClient(Client):
         cb = ClientCallback(func, cb_filter)
         self.response_callbacks.append(cb)
 
-    def add_event_admission_callback(
+    def _legacy_add_event_admission_callback(
         self,
         callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
@@ -1174,7 +1143,6 @@ class AsyncClient(Client):
 
     async def _handle_invited_rooms(self, response: SyncResponse) -> None:
         for room_id, info in response.rooms.invite.items():
-            await self._pump_sync_recovery(room_id)
             room = self._get_invited_room(room_id)
 
             for event in info.invite_state:
@@ -1186,28 +1154,32 @@ class AsyncClient(Client):
         encrypted_rooms: set[str] = set()
 
         for room_id, join_info in response.rooms.join.items():
-            if self.config.backfill_limited_timelines:
-                if not self._room_component_is_current(room_id):
-                    await self._pump_sync_recovery(room_id)
-                    continue
-            else:
-                self._handle_joined_state(room_id, join_info, encrypted_rooms)
+            self._handle_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
-            if self._room_component_is_current(room_id):
-                await self._process_timeline(
-                    room_id, room, join_info.timeline.events, encrypted_rooms
+            decrypted_events: list[tuple[int, Event | BadEventType]] = []
+
+            for index, event in enumerate(join_info.timeline.events):
+                decrypted_event = self._handle_timeline_event(
+                    event, room_id, room, encrypted_rooms
                 )
 
-            await self._pump_sync_recovery(room_id)
-            if not self.config.backfill_limited_timelines:
-                for event in join_info.ephemeral:
-                    room.handle_ephemeral_event(event)
-                    await self._on_ephemeral(event, room)
+                if decrypted_event:
+                    event = decrypted_event
+                    decrypted_events.append((index, decrypted_event))
 
-                for event in join_info.account_data:
-                    room.handle_account_data(event)
-                    await self._on_room_account_data(event, room)
+                await self._on_event(event, room)
+
+            for index, event in decrypted_events:
+                join_info.timeline.events[index] = event
+
+            for event in join_info.ephemeral:
+                room.handle_ephemeral_event(event)
+                await self._on_ephemeral(event, room)
+
+            for event in join_info.account_data:
+                room.handle_account_data(event)
+                await self._on_room_account_data(event, room)
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -1382,9 +1354,10 @@ class AsyncClient(Client):
         if not self.config.backfill_limited_timelines:
             return
         recovered, unrecovered, abandoned = take_recovery_outcomes(self._recovery)
-        response.recovered_room_ids = recovered
-        response.unrecovered_room_ids = unrecovered
-        response.abandoned_rooms = abandoned
+        legacy_response = cast(Any, response)
+        legacy_response.recovered_room_ids = recovered
+        legacy_response.unrecovered_room_ids = unrecovered
+        legacy_response.abandoned_rooms = abandoned
 
     def _classic_response_real_gap_room_ids(
         self,
@@ -1464,9 +1437,12 @@ class AsyncClient(Client):
         # folded in, a cancelled sync would be the one response that reports a
         # permanently lost room as healthy.
         abandoned = dict(self._recovery.abandoned)
-        response.recovered_room_ids = frozenset()
-        response.unrecovered_room_ids = frozenset(unrecovered) | frozenset(abandoned)
-        response.abandoned_rooms = abandoned
+        legacy_response = cast(Any, response)
+        legacy_response.recovered_room_ids = frozenset()
+        legacy_response.unrecovered_room_ids = frozenset(unrecovered) | frozenset(
+            abandoned
+        )
+        legacy_response.abandoned_rooms = abandoned
 
     async def _recovery_room_messages(
         self,
@@ -1592,95 +1568,15 @@ class AsyncClient(Client):
                 scope.active = False
                 self._response_callback_scope.reset(token)
 
-    async def _handle_sync(
-        self,
-        envelope: _SyncResponseEnvelope,
-        *,
-        one_time_key_count_commit: OneTimeKeyCountCommit | None = None,
-    ) -> None:
-        response = envelope.response
-        request_since = envelope.request_since
-
-        if (
-            not self._classic_sync_rebuild_pending
-            and self.next_batch == response.next_batch
-        ):
-            await self._pump_sync_recovery()
+    async def _handle_sync(self, response: SyncResponse) -> None:
+        if self.next_batch == response.next_batch:
             return
 
-        application_owned_classic_state = (
-            self.config.backfill_limited_timelines
-            and not self._recovery_persistence_enabled
-        )
-        if application_owned_classic_state:
-            if not self._classic_sync_state_staged:
-                self._classic_sync_abandonment_before_staged_response = dict(
-                    self._recovery.abandoned
-                )
-            self._classic_sync_state_staged = True
-            self._classic_sync_acknowledgeable_token = None
-
-        if self.config.backfill_limited_timelines:
-            reset_rooms = set(response.rooms.leave) | set(response.rooms.invite)
-            new_gap_room_ids = self._classic_response_real_gap_room_ids(
-                response,
-                request_since,
-            )
-            async with self._recovery_response_room_state(
-                set(response.rooms.join) | reset_rooms,
-                new_gap_room_ids,
-            ):
-                plan = plan_sync_response(
-                    self._recovery,
-                    user_id=self.user_id,
-                    request_since=request_since,
-                    response_token=response.next_batch,
-                    joined_rooms=response.rooms.join,
-                    reset_room_ids=reset_rooms,
-                    current_room_ids=self._current_response_room_ids.get(),
-                )
-                persist_response_plan(
-                    self._recovery,
-                    self._recovery_store,
-                    token=(
-                        response.next_batch if self.config.store_sync_tokens else None
-                    ),
-                    plan=plan,
-                    # A membership this transport saw end invalidates the
-                    # sliding baseline too: a rejoin must not walk from a
-                    # token taken under the old membership.
-                    forgotten_rooms=reset_rooms,
-                )
-                for room_id in reset_rooms:
-                    if self._recovery_store is None:
-                        self._forget_sliding_window_token(room_id)
-                    else:
-                        self._sliding_room_prev_batch.pop(room_id, None)
-            self.next_batch = response.next_batch
-            if self.config.store_sync_tokens and self.store:
-                if self._recovery_store is None:
-                    # Recovery rows are off, so nothing above wrote the
-                    # token; a restart would otherwise replay from an old
-                    # position.
-                    self.store.save_sync_token(response.next_batch)
-                self.loaded_sync_token = response.next_batch
-            for room_id, join_info in response.rooms.join.items():
-                if self._room_component_is_current(room_id):
-                    self._handle_joined_state(
-                        room_id,
-                        join_info,
-                        self.encrypted_rooms,
-                    )
-            if self.store:
-                self.store.save_encrypted_rooms(self.encrypted_rooms)
-        else:
-            self.next_batch = response.next_batch
-            if self.config.store_sync_tokens and self.store:
-                self.store.save_sync_token(response.next_batch)
-                self.loaded_sync_token = response.next_batch
+        self.next_batch = response.next_batch
+        if self.config.store_sync_tokens and self.store:
+            self.store.save_sync_token(response.next_batch)
 
         await self._handle_to_device(response)
-
         await self._handle_invited_rooms(response)
         await self._handle_joined_rooms(response)
         await self._handle_presence_events(response)
@@ -1689,21 +1585,7 @@ class AsyncClient(Client):
         if self.olm:
             await self._handle_expired_verifications()
             self._handle_olm_events(response)
-            if one_time_key_count_commit is not None:
-                commit_one_time_key_counts(
-                    self._sync_reset_fence,
-                    one_time_key_count_commit.components,
-                    one_time_key_count_commit.request_id,
-                )
             await self._collect_key_requests()
-        await self._pump_sync_recovery()
-        self._classic_sync_rebuild_pending = False
-        if (
-            application_owned_classic_state
-            and not self._recovery._active_dispatches
-            and not has_pending_recovery_work(self._recovery)
-        ):
-            self._classic_sync_acknowledgeable_token = response.next_batch
 
     async def _collect_key_requests(self):
         events = self.olm.collect_key_requests()
@@ -2415,21 +2297,7 @@ class AsyncClient(Client):
             raise ValueError("Invalid response received")
 
         if isinstance(response, SyncResponse):
-            await self._receive_sync_family(
-                _SyncResponseEnvelope(
-                    response,
-                    self.next_batch or self.loaded_sync_token or None,
-                    self._sync_request_id.get(),
-                )
-            )
-        elif isinstance(response, SlidingSyncResponse):
-            await self._receive_sync_family(
-                _SyncResponseEnvelope(
-                    response,
-                    None,
-                    self._sync_request_id.get(),
-                )
-            )
+            await self._handle_sync(response)
         else:
             super().receive_response(response)
 
@@ -2475,7 +2343,7 @@ class AsyncClient(Client):
         if not self.config.backfill_limited_timelines:
             self._sync_response_seen = True
             if isinstance(sync_response, SyncResponse):
-                await self._handle_sync(envelope)
+                await self._handle_sync(sync_response)
             else:
                 await self._handle_sliding_sync(sync_response)
             return
@@ -2526,12 +2394,7 @@ class AsyncClient(Client):
                     )
                     try:
                         if isinstance(ordered.response, SyncResponse):
-                            await self._handle_sync(
-                                replace(envelope, response=ordered.response),
-                                one_time_key_count_commit=(
-                                    ordered.one_time_key_count_commit
-                                ),
-                            )
+                            await self._handle_sync(ordered.response)
                         else:
                             await self._handle_sliding_sync(
                                 ordered.response,
@@ -2695,12 +2558,7 @@ class AsyncClient(Client):
         got_timeouts = 0
         max_timeouts = self.config.max_timeouts
 
-        first_attempt = True
         while True:
-            if first_attempt:
-                first_attempt = False
-            else:
-                self._refresh_sync_request_context(sync_request_context)
             if data_provider:
                 # mypy expects an "Awaitable[Any]" but data_provider is a
                 # method generated during runtime that may or may not be
@@ -2742,8 +2600,6 @@ class AsyncClient(Client):
                         retry_after_ms,
                     )
                     await asyncio.sleep(retry_after_ms / 1000)
-                    if self._sync_request_generation_is_stale():
-                        break
                 else:
                     break
 
@@ -2756,23 +2612,9 @@ class AsyncClient(Client):
                 wait = await self.get_timeout_retry_wait_time(got_timeouts)
                 logger.warning("Timed out, sleeping for %ds", wait)
                 await asyncio.sleep(wait)
-                if self._sync_request_generation_is_stale():
-                    raise
 
         if process_response:
-            if (
-                isinstance(resp, (SyncResponse, SlidingSyncResponse))
-                and sync_request_context is not None
-            ):
-                await self._receive_sync_family(
-                    _SyncResponseEnvelope(
-                        resp,
-                        sync_request_context.request_since,
-                        sync_request_context.request_id,
-                    )
-                )
-            else:
-                await self.receive_response(resp)
+            await self.receive_response(resp)
         return resp
 
     @client_session
@@ -3140,75 +2982,30 @@ class AsyncClient(Client):
         a `SyncError` if there was an error with the request.
         """
 
-        self._require_valid_classic_recovery_ownership()
-        self._raise_on_sync_reentry()
+        sync_token = since or self.next_batch
         presence = set_presence or self._presence
+        method, path = Api.sync(
+            self.access_token,
+            since=sync_token or self.loaded_sync_token,
+            timeout=(
+                int(self.config.request_timeout) * 1000
+                if timeout is None
+                else timeout or None
+            ),
+            filter=sync_filter,
+            full_state=full_state,
+            set_presence=presence,
+        )
 
-        async def send_sync(
-            sync_token: str | None,
-            request_context: _SyncRequestContext | None,
-        ) -> SyncResponse | SyncError:
-            method, path = Api.sync(
-                self.access_token,
-                since=sync_token,
-                timeout=(
-                    int(self.config.request_timeout) * 1000
-                    if timeout is None
-                    else timeout or None
-                ),
-                filter=sync_filter,
-                full_state=full_state,
-                set_presence=presence,
-            )
-            return await self._send(
-                SyncResponse,
-                method,
-                path,
-                # 0 if full_state: server doesn't respect timeout if full_state
-                # + 15: give server a chance to naturally return before we timeout
-                timeout=(
-                    0 if full_state else timeout / 1000 + 15 if timeout else timeout
-                ),
-                sync_request_context=request_context,
-            )
-
-        if not self.config.backfill_limited_timelines:
-            sync_token = since or self.next_batch or self.loaded_sync_token or None
-            return await send_sync(sync_token, None)
-
-        while True:
-            generation = self._sync_generation
-            # Keep request issue, retries, and response application in one scope.
-            # Room and account-data ordering relies on this stream lock.
-            async with (
-                generation.classic_request_lock,
-                self._to_device_sync_request(generation, True, "classic"),
-            ):
-                if generation is not self._sync_generation:
-                    continue
-                sync_token = since or self.next_batch or self.loaded_sync_token or None
-                request_context = _SyncRequestContext(
-                    sync_token,
-                    issue_sync_request(
-                        self._sync_reset_fence,
-                        "classic",
-                    ),
-                )
-                generation_token = self._sync_request_generation.set(generation)
-                request_id_token = self._sync_request_id.set(request_context.request_id)
-                try:
-                    return await send_sync(sync_token, request_context)
-                finally:
-                    self._sync_request_id.reset(request_id_token)
-                    self._sync_request_generation.reset(generation_token)
-                    assert request_context.request_id is not None
-                    finish_sync_request(
-                        self._sync_reset_fence,
-                        request_context.request_id,
-                    )
+        return await self._send(
+            SyncResponse,
+            method,
+            path,
+            timeout=0 if full_state else timeout / 1000 + 15 if timeout else timeout,
+        )
 
     @logged_in_async
-    async def sliding_sync(
+    async def _legacy_sliding_sync(
         self,
         conn_id: str | None = None,
         pos: str | None = None,
@@ -3432,10 +3229,9 @@ class AsyncClient(Client):
                 One of: ["online", "offline", "unavailable"]
         """
 
-        sync_generation = self._sync_generation
         first_sync = True
 
-        while not self._stop_sync_forever and sync_generation is self._sync_generation:
+        while not self._stop_sync_forever:
             try:
                 initial_sync_complete = not first_sync
                 use_filter = (
@@ -3501,11 +3297,9 @@ class AsyncClient(Client):
                     await _run_to_completion(_cancel_and_drain_tasks(tasks))
                 except asyncio.CancelledError:
                     pass
-                if sync_generation is self._sync_generation:
-                    self._stop_sync_forever = False
+                self._stop_sync_forever = False
                 raise
-        if sync_generation is self._sync_generation:
-            self._stop_sync_forever = False
+        self._stop_sync_forever = False
 
     def _sliding_sync_request_extensions(
         self, extensions: dict[str, Any] | None
@@ -3549,7 +3343,7 @@ class AsyncClient(Client):
         return requested
 
     @logged_in_async
-    async def sliding_sync_forever(
+    async def _legacy_sliding_sync_forever(
         self,
         timeout: int = 30_000,  # noqa: ASYNC109
         conn_id: str = "nio",
@@ -3649,7 +3443,7 @@ class AsyncClient(Client):
                 # before the other requests, this helps to ensure that after one
                 # fired synced event the state is indeed fully synced.
                 if first_sync:
-                    response = await self.sliding_sync(
+                    response = await self._legacy_sliding_sync(
                         conn_id=conn_id,
                         pos=pos,
                         timeout=use_timeout,
@@ -3665,7 +3459,7 @@ class AsyncClient(Client):
                     tasks = [
                         asyncio.ensure_future(coro)
                         for coro in (
-                            self.sliding_sync(
+                            self._legacy_sliding_sync(
                                 conn_id=conn_id,
                                 pos=pos,
                                 timeout=use_timeout,
@@ -4270,34 +4064,20 @@ class AsyncClient(Client):
         This method also makes sure that the room members are fully synced and
         that keys are queried before sending messages to an encrypted room.
 
-        If timeline recovery is pending or encrypted state cannot be fully
-        synced after a couple of retries, this raises `SendRetryError`.
-
-        The exact callback task draining this room's recovery gap may send to
-        the same room. Child tasks and sends to other recovering rooms remain
-        blocked so recovery authority cannot outlive or escape its callback.
+        If encrypted state cannot be fully synced after a couple of retries,
+        this raises `SendRetryError`.
 
         Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
 
-        if self.config.backfill_limited_timelines:
-            async with self._recovery_room_state((room_id,)):
-                request = await self._prepare_room_send(
-                    room_id,
-                    message_type,
-                    content,
-                    uuid,
-                    ignore_unverified_devices,
-                )
-        else:
-            request = await self._prepare_room_send(
-                room_id,
-                message_type,
-                content,
-                uuid,
-                ignore_unverified_devices,
-            )
+        request = await self._prepare_room_send(
+            room_id,
+            message_type,
+            content,
+            uuid,
+            ignore_unverified_devices,
+        )
 
         method, path, data = request
         return await self._send(RoomSendResponse, method, path, data, (room_id,))
@@ -4310,24 +4090,10 @@ class AsyncClient(Client):
         tx_id: str | UUID,
         ignore_unverified_devices: bool,
     ) -> tuple[str, str, str]:
-        if any(
-            gap.cursor_token is not None or gap.target_token
-            for gap in self._recovery.gaps.get(room_id, ())
-        ) and not is_recovered_dispatch_task(
-            self._recovery,
-            asyncio.current_task(),
-            room_id,
-        ):
-            raise SendRetryError("Room timeline recovery is still pending.")
-
         if self.olm:
             try:
                 room = self.rooms[room_id]
             except KeyError:
-                if self._classic_sync_rebuild_pending:
-                    raise SendRetryError(
-                        "Classic Sync room state is being rebuilt."
-                    ) from None
                 raise LocalProtocolError(f"No such room with id {room_id} found.")
 
             if room.encrypted:
@@ -4929,50 +4695,10 @@ class AsyncClient(Client):
         )
 
     async def close(self):
-        """Drain recovery callbacks and close the underlying HTTP session.
-
-        Call ``stop_sync_forever()`` from a timeline callback, then await
-        ``close()`` from the task that owns the sync loop after that loop exits.
-        Recovery-enabled close waits through cancellation for the sync response
-        lock and every started callback; a callback that never returns therefore
-        prevents close from returning. Cancellation is re-raised after a clean
-        drain, while a callback or finalization failure takes precedence.
-
-        Raises:
-            LocalProtocolError: If called from a serialized sync-loop
-                timeline callback.
-            Exception: The first retained callback or durable finalization
-                failure encountered while draining recovery work.
-        """
-        caller = asyncio.current_task()
-        if is_recovery_dispatch_task(self._recovery, caller) or (
-            self._active_sync_executor_token is not None
-            and self._sync_executor_context.get() is self._active_sync_executor_token
-        ):
-            raise LocalProtocolError(
-                "AsyncClient.close() cannot run from a timeline callback."
-            )
-
-        self._closing = True
-        self._sync_generation = _SyncGeneration()
-        self._stop_sync_forever = False
-
-        async def finish_close() -> None:
-            try:
-                if self.config.backfill_limited_timelines:
-                    async with self._sync_response_lock:
-                        await drain_recovery_dispatches(self._recovery)
-                else:
-                    await drain_recovery_dispatches(self._recovery)
-            finally:
-                try:
-                    if self.client_session:
-                        await self.client_session.close()
-                        self.client_session = None
-                finally:
-                    self._closing = False
-
-        await _run_to_completion(finish_close())
+        """Close the underlying HTTP session."""
+        if self.client_session:
+            await self.client_session.close()
+            self.client_session = None
 
     @store_loaded
     async def export_keys(self, outfile: str, passphrase: str, count: int = 10000):
@@ -5252,17 +4978,9 @@ class AsyncClient(Client):
 
         Args:
             room_id: The room id of the room to leave.
-
-        Raises:
-            LocalProtocolError: If called from an event callback or active sync
-                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_leave(self.access_token, room_id)
-
-        async def send_request() -> RoomLeaveResponse | RoomLeaveError:
-            return await self._send(RoomLeaveResponse, method, path)
-
-        return await self._run_room_membership_reset(room_id, send_request)
+        return await self._send(RoomLeaveResponse, method, path)
 
     @logged_in_async
     async def room_forget(self, room_id: str) -> RoomForgetResponse | RoomForgetError:
@@ -5279,19 +4997,11 @@ class AsyncClient(Client):
 
         Args:
             room_id (str): The room id of the room to forget.
-
-        Raises:
-            LocalProtocolError: If called from an event callback or active sync
-                response-callback context while limited-timeline recovery is enabled.
         """
         method, path = Api.room_forget(self.access_token, room_id)
-
-        async def send_request() -> RoomForgetResponse | RoomForgetError:
-            return await self._send(
-                RoomForgetResponse, method, path, response_data=(room_id,)
-            )
-
-        return await self._run_room_membership_reset(room_id, send_request)
+        return await self._send(
+            RoomForgetResponse, method, path, response_data=(room_id,)
+        )
 
     @logged_in_async
     async def room_kick(

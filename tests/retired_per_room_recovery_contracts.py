@@ -25,7 +25,6 @@ from nio import (
     DeviceOneTimeKeyCount,
     LocalProtocolError,
     LoginResponse,
-    RecoveryAbandonment,
     RoomForgetResponse,
     RoomInfo,
     RoomLeaveResponse,
@@ -36,6 +35,7 @@ from nio import (
     TimelineEventProvenance,
 )
 from nio.responses import RoomMessagesError, RoomMessagesResponse
+from nio.recovery_abandonment import RecoveryAbandonment
 from nio.client.sync_recovery import (
     RecoveryGap,
     RecoveryPlan,

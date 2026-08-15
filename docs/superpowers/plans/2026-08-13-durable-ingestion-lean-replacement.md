@@ -108,7 +108,8 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 4F coordinator progress/completion | Complete | nio `ec9fe0da38378e7a7d5d100737787fb7584d8662`; exact patch `1ca31931...`; 2,731 passed/3 skipped full suite |
 | Task 5C durable session factory/controller resolver | Complete | MindRoom `ba0da04b5553bac9ce36b92cb1f0133211b1c3aa`; nio typed prerequisite `b61e186b2b63e2b81149c40ca67c0435a60ede60`; all recorded gates GREEN |
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
-| Tasks 6–10 | Not started | Task 6 is now the immediate next slice; preserve the remaining dependency order |
+| Task 6 | In progress | MindRoom prerequisite, nio public-surface removal, retained Classic behavior, active-only store adoption, and external recovery zero-use are GREEN in uncommitted bytes; legacy-test consolidation/static cleanup is active |
+| Tasks 7–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
 
@@ -942,9 +943,13 @@ After the decrypted pair, complete Task 4E in this order:
 7. [x] full Task 4E verification, review, consolidation, budget check, and the
    ordinary commit `feat: settle durable records through compatibility callbacks`.
 
-### Immediate next action
+### Historical Task 6 start instruction (superseded)
 
-A fresh session can be started with: “Read the controlling design and the live
+This was the clean handoff into Task 6. It remains only as decision history;
+the active authority is the Task 6 checkpoint below and the restart-command
+section near the end of this document.
+
+A fresh session at that former boundary could be started with: “Read the controlling design and the live
 restart handoff in this plan, verify Task 5D commits
 `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4` and
 `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047` plus clean tracked trees, preserve
@@ -954,6 +959,359 @@ restore the pre-fork public desktop sync path while keeping MindRoom on the
 durable engine. Continue autonomously without approval pauses; consult Claude
 Fable through isolated `agent-cli dev` only for a material ambiguity that local
 evidence cannot resolve.”
+
+### Task 6 active checkpoint — 2026-08-15
+
+Task 6 started from clean tracked boundaries: nio ledger tip `726771d` over
+feature commit `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`, and MindRoom
+`47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`. Preserve the unrelated untracked
+paths in the repository table. The exact local upstream comparison boundary
+`69aa99c51f354980bf5306a85b4c7b7d71ff3217` exists and is an ancestor of the
+current nio branch.
+
+Initial read-only mapping found that the required pre-deletion MindRoom source
+scan is intentionally RED, so do not remove nio public symbols yet:
+
+- `bot.py` still constructs `SyncCheckpointTrust`, prepares/acknowledges/resets
+  Classic recovery, defines the old Sync/Sliding response-certification path,
+  refers to recovered/unrecovered response fields, and registers
+  `SyncResponse | SlidingSyncResponse` plus SyncError callbacks even though
+  Task 5D now uses only the owned durable runner/pump;
+- `matrix/journal_ingress.py` still exposes the old
+  `add_event_admission_callback` registration path; `sync_loop.py`,
+  `client_session.py`, and certification/checkpoint helpers retain fork-only
+  Sliding/recovery types for legacy tests;
+- nio still publicly exposes `AsyncClient.sliding_sync()` /
+  `sliding_sync_forever()`, `SlidingSyncResponse`, the admission callback, and
+  Classic reset/ack/recovered-state APIs. The delta from `69aa99c...` is large
+  and also contains later E2EE/security work, so whole-file checkout is
+  forbidden.
+
+Active Task 6 TDD order:
+
+1. add a fail-closed production-source scan over the exact MindRoom files named
+   in Task 6 and capture the current forbidden references as the first RED;
+2. remove only dead old-engine registrations/calls/types from MindRoom while
+   retaining the durable callback/application behavior and leaving historical
+   modules present but unused for the later zero-use observation gate;
+3. freeze public AsyncClient behavior/signatures against `69aa99c...` with a
+   retained compatibility matrix, then restore methods one behavior slice at a
+   time without undoing later E2EE/cross-signing/security changes;
+4. remove fork-only public Sliding/recovery exports only after the MindRoom scan
+   is GREEN, run desktop/durable Classic+Sliding compatibility, coverage
+   zero-use, full cross-repo/static/review gates, update this ledger, and commit
+   `test: bind durable sync compatibility`.
+
+First Task 6 RED→GREEN boundary is complete in the still-uncommitted MindRoom
+worktree. `TestAgentBot.test_agent_bot_start` was first changed to require zero
+public admission and zero sync-response callback registrations while retaining
+the owned-session configuration and the invite/RTC compatibility callbacks. It
+failed causally because `JournalIngress._admit` was still registered exactly
+once. The minimal production change removed `Bot.start()`'s legacy checkpoint
+startup call, `JournalDispatcher.register(client)`, and both Sync/SyncError
+response-callback registrations. The exact node is now GREEN:
+
+```text
+UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
+  tests/test_multi_agent_bot.py::TestAgentBot::test_agent_bot_start
+1 passed
+```
+
+The temporary six-file source gate remains RED by design because unreachable
+legacy methods/types still exist. The next action is to remove the dead Bot
+certification/response block and its dispatcher admission adapter while
+preserving `_run_sync_response_side_effects()` as the frame-completion-owned
+health/ready/outbox path. Then shrink `sync_loop.py` to owned ingestion config,
+narrow `MindRoomAsyncClient._handle_olm_events()` to ordinary `SyncResponse`,
+and leave the certification/checkpoint modules present but unimported and free
+of the forbidden public nio references before touching nio itself.
+
+That MindRoom prerequisite is now GREEN. The implementation removed the dead
+Bot response-certification/rewind/error/membership-scan methods and state,
+startup/shutdown checkpoint calls, public response/admission registrations,
+the JournalDispatcher-owned `JournalIngress` adapter, and the old provenance
+filter around RTC compatibility callbacks. Frame completion still exclusively
+drives `_mark_sync_progress()`, first-ready/outbox/orchestrator side effects,
+and one call-manager reconciliation. Batch admission still wakes the same
+JournalDispatcher application worker. `sync_loop.py` now owns only Classic or
+Sliding private `IngestionConfig` construction, and
+`MindRoomAsyncClient._handle_olm_events()` accepts the retained public Classic
+`SyncResponse`. `sync_certification.py` and `sync_checkpoint_trust.py` remain as
+inert documented marker modules for external zero-use coverage; production no
+longer imports them.
+
+The RTC behavior was separately RED then GREEN: a callback delivered by the
+owned authenticated settlement path initially did not reach the call manager
+without the legacy context-variable provenance marker; removing that duplicate
+gate made membership and call-state compatibility callbacks run exactly once.
+The current focused gate is:
+
+```text
+tests/test_multi_agent_bot.py::TestAgentBot::test_agent_bot_start
+tests/test_multi_agent_bot.py::TestAgentBot::test_owned_frame_completion_without_work_drives_sync_health_and_ready_once
+tests/test_bot_ready_hook.py::test_call_manager_room_callbacks_run_without_legacy_delivery_provenance
+tests/test_matrix_public_sync_cutover.py
+9 passed
+```
+
+The exact six-file source scan is `6 passed`: no production reference remains
+to the public admission callback, public Sliding response type, Classic
+ack/reset/recovery methods, or recovered/unrecovered response fields. It is now
+safe to remove those nio symbols. The next TDD slice is the retained public
+desktop compatibility matrix against `69aa99c...`, beginning with method
+signatures and ordinary Classic response/callback ordering before deleting
+nio's public Sliding surface.
+
+The first nio compatibility node now exists at
+`tests/public_sync_compatibility_test.py`. Its retained signature table is
+derived literally from `69aa99c...` and is GREEN for `sync()`,
+`sync_forever()`, `stop_sync_forever()`, `receive_response()`,
+`run_response_callbacks()`, `add_response_callback()`, `close()`, and the six
+retained event callback registration families. The separate removal assertion
+was observed RED against the real current class:
+
+```text
+uv run pytest -q tests/public_sync_compatibility_test.py
+1 passed, 1 failed
+```
+
+Its sole failure is that all seven fork-only `AsyncClient` members remain
+visible: `sliding_sync`, `sliding_sync_forever`,
+`add_event_admission_callback`, `acknowledge_classic_sync`,
+`reset_classic_sync_state`, `has_uncommitted_classic_sync_state`, and
+`clear_persisted_sync_recovery`. The same test also requires the top-level
+`nio.SlidingSyncResponse` and `nio.SlidingSyncError` exports to disappear. No
+nio production file has been changed in this Task 6 slice yet. Continue by
+removing only this public surface, rerun the exact node GREEN, then add the
+first real Classic response/callback behavior RED before changing active sync
+implementation code.
+
+That public-surface slice is now GREEN in uncommitted nio bytes. The seven
+methods remain only as underscore-prefixed historical implementation for the
+later Task 9 deletion, while the public names are absent. `SlidingSyncResponse`
+and `SlidingSyncError` are no longer top-level exports, and the fork-only
+`RecoveryAbandonment` / `SlidingWindowToken` exports are also absent. Classic
+`SyncResponse` no longer carries `recovered_room_ids`,
+`unrecovered_room_ids`, or `abandoned_rooms`.
+
+Two subsequent behavioral RED→GREEN slices restored the active Classic path:
+
+- a real timeline callback synchronously applying a second Classic
+  `SyncResponse` failed only at the fork recovery executor's re-entry guard;
+  `receive_response()` and `_handle_sync()` now use the pinned upstream order
+  directly (token persistence, to-device, invited/joined projection and
+  callbacks, presence/global account data, then Olm maintenance), and the
+  nested response ends at the literal newer token;
+- a real HTTP `sync(since="s0")` under deliberately conflicting retired
+  recovery configuration failed only at the recovery-ownership check; the
+  public `sync()` request construction and response application now follow the
+  upstream path and ignore those retired settings.
+
+The ordinary store boundary is also GREEN. `AsyncClient.load_store()` no
+longer reads recovery or Sliding token state. A fresh real SQLite store creates
+only active E2EE/trust/sync-token tables and omits
+`pendingtimelineevents`, `slidingwindowtokens`,
+`syncrecoveryabandonedrooms`, and `syncrecoverygaps`. A real higher-version
+store seeded with those historical tables retains them byte/schema-wise on
+reopen and ordinary token loading does not touch them. Existing version rows
+are advanced nondestructively without running the retired recovery migrations.
+
+The required external zero-use gate is now executable, not a source-text
+assertion. In an isolated Python process, coverage starts before `import nio`,
+then constructs an ordinary `AsyncClient`, applies a Classic response, runs
+response callbacks, and creates a real in-memory SQLite store. It reports zero
+executed lines in all six named modules:
+
+```text
+client/sliding_membership.py
+client/sync_recovery.py
+client/sync_reset_fence.py
+client/sync_response_ordering.py
+recovery_abandonment.py
+sliding_sync_tokens.py
+```
+
+Module-level runtime imports and recovery-object construction were removed;
+historical type references are `TYPE_CHECKING`-only and legacy database APIs
+use local imports only if explicitly invoked. The recovery source files remain
+present for the Task 9 observation/deletion boundary.
+
+The current retained compatibility checkpoint is `24 passed`: the full new
+public matrix plus existing Classic sync, presence, callback-exception, and
+`sync_forever` nodes plus ordinary encrypted send and error-response behavior.
+The matrix pins all retained method signatures, removed
+surface, response fields, callback family projection/order, response callback
+registration-order re-entry and exception short-circuiting, Classic callback
+response re-entry, real HTTP sync behavior, fresh/historical store fates, and
+external recovery zero-use. `sync_forever()` no longer depends on the fork
+generation object; the later explicit fixes that retain the first full-state
+request across `SyncError` and drain cancelled child tasks remain covered.
+
+The ordinary-send gate first failed causally because `room_send()` still
+entered the retired recovery room state and dereferenced `_recovery` before
+encryption. The public send path now calls the existing E2EE preparation
+directly, retains membership/key-query/group-session behavior, and no longer
+consults a recovery gap or Classic rebuild marker. The external six-module
+zero-use assertion remains GREEN.
+
+The first owned-ingestion regression after removing ordinary recovery state
+found two real cross-boundary couplings and captured both before repair. First,
+configured adoption still required the four retired recovery tables even
+though a fresh `SqliteStore` now creates only active tables. Preflight now
+accepts exactly either the active ordinary schema or that schema plus all four
+historical tables; partial/malformed layouts remain rejected. Second, the
+owned-client pristine check still dereferenced the deleted recovery fence,
+generation, and state objects. It now validates only live ownership facts:
+store/Olm/HTTP absence, empty cursor and room projections, no active callback
+scope, no sharing/synced state, and no prior ingestion attachment. Owned attach
+also loads historical recovery state only when a historical recovery carrier
+actually exists. Obsolete tests that mutated the removed generation locks or
+registered the removed public admission callback were narrowed to the active
+private boundaries. Evidence after both fixes:
+
+```text
+tests/ingest/journal_test.py::test_configured_sqlite_store_adoption_and_marked_reopen_preserve_trust
+1 passed
+
+tests/ingest/journal_test.py -k 'configured or fresh_owned'
+80 passed, 6 deselected
+
+tests/ingest/coordinator_test.py -k 'owned_factory or owned_settle or owned_close'
+78 passed, 207 deselected
+```
+
+The complete retained `AsyncClient` file is now `131 passed` after restoring
+ordinary `room_leave()` / `room_forget()` to the direct upstream-style request
+path and retaining the later E2EE behavior. Eighteen tests that directly
+required the removed public Sliding engine or recovery-generation close state
+are preserved in that file as `_retired_*` source for Task 9 rather than being
+collected. The retained public Classic matrix is `24 passed`.
+
+Collection cleanup is also explicit. The wholly obsolete public-engine files
+`tests/backfill_test.py` and `tests/per_room_recovery_contract_test.py` were
+renamed to `tests/retired_backfill_contracts.py` and
+`tests/retired_per_room_recovery_contracts.py`; they remain visible for Task 9
+but are not pytest-discoverable. Historical pure helper tests import their
+types from private modules rather than recreating top-level exports. Current
+collection after those moves is `2,367 tests`.
+
+A fresh full-suite run then provided the authoritative remaining boundary:
+
+```text
+uv run pytest -q --tb=short --maxfail=20
+20 failed, 2227 passed, 3 skipped in 312.88s
+```
+
+One failure was only an assertion on the deleted private
+`AsyncClient._sync_response_seen` carrier in the storeless-login prerequisite.
+The other nineteen reached the old recovery persistence methods against a
+fresh active-only store and failed because the retired tables correctly do not
+exist. Recreating those tables would violate Task 6. The contiguous private
+recovery/migration block in `tests/store_test.py` is therefore retained as
+`_retired_*` source, while active store tests and configured historical-schema
+adoption tests remain collected. Seven additional `sync_recovery_test.py`
+assertions were retired narrowly: the removed `SlidingSyncResponse`
+`abandoned_rooms` field plus six deleted recovery-dispatch `close()` contracts.
+All remaining tests in that boundary are GREEN:
+
+```text
+uv run pytest -q --tb=short \
+  tests/ingest/owned_login_prerequisite_test.py tests/store_test.py \
+  tests/sync_recovery_test.py tests/sliding_membership_test.py \
+  tests/sync_response_ordering_test.py
+130 passed in 3.96s
+```
+
+The post-retirement full nio suite is now freshly GREEN:
+
+```text
+uv run pytest -q --tb=short
+2303 passed, 3 skipped, 5 warnings in 305.64s
+```
+
+The warnings are the existing Python 3.14 `asyncio.iscoroutinefunction` and
+multi-threaded-fork deprecations; no test warning was introduced by this
+cutover. The active collected suite is therefore 2,306 cases, while the
+retired source remains present and visibly named for Task 9.
+
+The authoritative post-cleanup nio gate on the final current bytes is:
+
+```text
+uv run pytest -q --tb=short
+2303 passed, 3 skipped, 5 warnings in 307.25s
+```
+
+The public/ordinary-store compatibility boundary is **142 passed**. Production
+Ruff, Black over all changed Python files, `compileall`, and `git diff --check`
+are GREEN. Exact changed-production mypy with `--follow-imports=skip` reports
+38 baseline diagnostics versus 59 on a clean HEAD clone; every current
+diagnostic matches a HEAD category/location modulo line shifts, so there are
+zero new changed-hunk diagnostics and 21 removed diagnostics.
+
+MindRoom's legacy-contract cleanup is also complete. The affected engine,
+cutover, client-session, and scheduled-restoration gate selects **106 nodes**
+and exits zero. The authoritative parallel complete non-live suite is **13,444
+passed, 110 skipped, 12 warnings in 97.97 seconds**. Changed-production Ruff,
+full-repository `ty`, formatter, `compileall`, and `git diff --check` are GREEN;
+the configured all-files pre-commit stack passes every hook, including Vulture,
+Privata, Tach, generated docs/models, frontend lint/format/type checks, and
+lockfile consistency. The final private OTK override accepts `object` and
+locally casts the Classic carrier, preserving the runtime path while remaining
+substitutable with nio's private Classic/Sliding base signature without
+restoring a public Sliding type.
+
+Five files wholly owned by the deleted certification/recovery engine are
+preserved under `tests/retired_*.py.txt` as exact Git renames, so static tools do
+not treat archival source as live Python. Mixed suites retain valid routing,
+room-member, watchdog, supervisor, journal, and lifecycle tests; obsolete
+checkpoint/raw-response/admission bodies were deleted rather than masked with
+test-only stubs. The first pre-commit pass usefully exposed this distinction.
+Dormant production compatibility seams were made private and are explicitly
+named in one documented Vulture whitelist block that Task 9 deletes with the
+observation-only source.
+The production zero-use scan is clean for every removed public recovery,
+checkpoint, Sliding-response, and admission API; the only generic `.register(`
+hit is the unrelated Matrix account-registration request.
+
+Task 6 itself is deletion-heavy. Relative to its two clean start commits, nio
+is **−382 runtime, +563 tests, +354 docs** and MindRoom is **−1,310 runtime,
+−1,269 tests**. The fixed final Task 10 budgets are deliberately not claimed
+yet: nio is currently +19,833 runtime, +56,027 tests, and +3,494 docs/scripts
+from `6ed2b98`; MindRoom is +195 runtime and +1,760 tests from `0acaea2`, while
+the combined MindRoom source/test tree is already 892 net lines smaller than
+the canary baseline `925df7f`. Tasks 9/10 still own recovery-source deletion
+and branch-wide consolidation; no baseline or limit moved.
+
+Restart handoff: continue autonomously without approval pauses. The exact next
+step is the final Task 6 diff/review gate: inspect the complete
+deletion/retirement mapping, rerun compile/diff checks after this ledger update,
+perform final review, update the exact patch hashes, and commit Task 6 as
+`test: bind durable sync compatibility`. If any failure appears, use focused
+causal REDs and the smallest active contract fix or explicit `_retired_*`
+classification—never restore fresh-store recovery tables or public
+Sliding/recovery surface. Keep the six recovery source modules present through
+the Task 8/9 observation gate. Consult Claude Fable through isolated
+`agent-cli dev` only if local evidence leaves a material design ambiguity.
+
+The final Task 6 review is complete with no blocking finding. It covered every
+changed production hunk, the public API and ordinary-store compatibility
+matrix, the MindRoom deletion/retirement mapping, archived test fates, the
+Vulture observation whitelist, and the fixed budget comparisons. The exact
+pre-commit patch identities are:
+
+- nio functional patch excluding this self-updating ledger:
+  `ebc29535742d36ecced14b39b643af2f99d3d53736d8809377831d5db95ebbb3`;
+- complete MindRoom staged patch:
+  `41dd0831ceda0eda7c1124787537ba985e4b65a5455ff5317395e4f06e128442`.
+
+No Claude consultation was needed because causal tests, the pinned upstream
+comparison, and complete local/static evidence resolved the final boundaries.
+MindRoom is now committed at
+`253c76245174f106162368993bf1393d452c6698` with subject
+`test: bind durable sync compatibility`. Commit nio with that same subject,
+then follow it with one ordinary nio docs-ledger commit recording both
+repository SHAs and the clean Task 7 restart boundary. Do not include any
+unrelated untracked path.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
@@ -1927,7 +2285,42 @@ Operational rules:
 
 ### Restart verification commands
 
-Run these before editing after a new session:
+For the active Task 6 dirty-tree checkpoint, run these before editing after a
+new session. They are read-only except for pytest caches. Do **not** run the
+historical clean-tree/hash assertions that follow this block; those describe a
+completed pre-Task6 checkpoint.
+
+```bash
+cd /work/dev/mindroom-nio
+test "$(git branch --show-current)" = docs/durable-ingestion-rewrite-plan
+test "$(git rev-parse HEAD)" = 726771d62c1cca2850418e2c73b52f5875805b47
+git status --short
+git diff --check
+uv run pytest -q --tb=short \
+  tests/ingest/owned_login_prerequisite_test.py \
+  tests/store_test.py tests/sync_recovery_test.py \
+  tests/sliding_membership_test.py tests/sync_response_ordering_test.py
+# expected at this checkpoint: 130 passed
+
+cd /work/dev/mindroom
+test "$(git branch --show-current)" = wip/matrix-journal-ingress-cutover
+test "$(git rev-parse HEAD)" = 47180cc07e7d0177ff4981bd7ccf1f1ec65eb047
+git status --short
+git diff --check
+UV_NO_SYNC=1 .venv/bin/python -m pytest -q -n0 \
+  tests/test_multi_agent_bot.py tests/test_bot_ready_hook.py \
+  tests/test_matrix_public_sync_cutover.py tests/test_matrix_client_session.py \
+  tests/test_scheduled_task_restoration.py --tb=short
+# expected at this checkpoint: 106 selected nodes, exit 0
+```
+
+Then continue with the final nio static/full rerun and MindRoom
+static/pre-commit gates in the active checkpoint above. Update this section
+with the new evidence, inspect the final delta/budget, and only then prepare the
+commit-ready handoff.
+
+Historical pre-Task6 restart commands (reference only; do not execute against
+the current dirty Task 6 tree):
 
 ```bash
 cd /work/dev/mindroom-nio

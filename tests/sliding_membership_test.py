@@ -5,7 +5,6 @@ import pytest
 from nio import (
     RoomMemberEvent,
     RoomMessageText,
-    SlidingSyncResponse,
     SlidingSyncRoom,
     SlidingSyncStateStub,
 )
@@ -17,6 +16,7 @@ from nio.client.sliding_membership import (
     sliding_room_is_invite,
     sliding_unrecoverable_discontinuity_room_ids,
 )
+from nio.responses import SlidingSyncResponse
 from nio.sliding_sync_tokens import SlidingWindowToken
 
 ROOM_A = "!a:example.org"

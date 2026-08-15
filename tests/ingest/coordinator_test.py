@@ -10603,10 +10603,6 @@ def test_owned_factories_and_protocol_remain_private_with_public_signature() -> 
         "encryption_disabled",
         "dirty_sync",
         "client_session",
-        "classic_request_lock",
-        "to_device_request_lock",
-        "to_device_transport",
-        "sliding_request_lock",
         "wrong_identity",
         "missing_auth",
         "custom_authorization",
@@ -10644,14 +10640,6 @@ async def test_owned_factory_rejects_invalid_client_without_consuming_bootstrap(
         client.next_batch = "already-synced"
     elif invalid == "client_session":
         client.client_session = object()  # type: ignore[assignment]
-    elif invalid == "classic_request_lock":
-        await client._sync_generation.classic_request_lock.acquire()
-    elif invalid == "to_device_request_lock":
-        await client._sync_generation.to_device_request_lock.acquire()
-    elif invalid == "to_device_transport":
-        client._sync_generation.to_device_transport = "classic"
-    elif invalid == "sliding_request_lock":
-        client._sync_generation.sliding_request_locks[None] = object()  # type: ignore[assignment]
     elif invalid == "wrong_identity":
         client.user_id = "@mallory:example.org"
     elif invalid == "missing_auth":
@@ -10682,11 +10670,6 @@ async def test_owned_factory_rejects_invalid_client_without_consuming_bootstrap(
             stream_id=supplied_stream,
         )
 
-    if invalid == "classic_request_lock":
-        client._sync_generation.classic_request_lock.release()
-    elif invalid == "to_device_request_lock":
-        client._sync_generation.to_device_request_lock.release()
-
     replacement = owned_client(tmp_path)
     session = open_owned_session(replacement, bootstrap, generation)
     await session.close()
@@ -10703,8 +10686,6 @@ async def test_owned_factory_rejects_invalid_client_without_consuming_bootstrap(
         "load_outgoing_key_requests",
         "load_encrypted_rooms",
         "load_sync_token",
-        "load_sync_recovery",
-        "load_sliding_window_tokens",
         "session_construction",
     ),
 )
@@ -10727,10 +10708,12 @@ async def test_owned_factory_post_creation_failure_restores_tombstones_and_reope
     previous = (
         client.store,
         client.olm,
+        client.rooms,
+        client.invited_rooms,
         client.encrypted_rooms,
+        client.next_batch,
         client.loaded_sync_token,
-        client._recovery,
-        client._sliding_room_prev_batch,
+        client._ingestion_store_snapshot,
     )
     revoked: list[SqliteStore] = []
     real_revoke = SqliteStore._revoke_ingestion_lease
@@ -10775,10 +10758,12 @@ async def test_owned_factory_post_creation_failure_restores_tombstones_and_reope
     restored = (
         client.store,
         client.olm,
+        client.rooms,
+        client.invited_rooms,
         client.encrypted_rooms,
+        client.next_batch,
         client.loaded_sync_token,
-        client._recovery,
-        client._sliding_room_prev_batch,
+        client._ingestion_store_snapshot,
     )
     assert all(current is original for current, original in zip(restored, previous))
     assert len(revoked) == 1
@@ -12764,7 +12749,7 @@ async def test_owned_settle_global_account_data_callbacks_before_ack_outside_sto
         client.add_global_account_data_callback(on_global_account_data, None)
         client.add_response_callback(forbidden_response, None)
         client.add_event_callback(forbidden_event, None)
-        client.add_event_admission_callback(forbidden_admission, None)
+        monkeypatch.setattr(client, "_on_event_admission", forbidden_admission)
         real_on_global_account_data = client._on_global_account_data
         routed_events: list[object] = []
 
@@ -12991,7 +12976,11 @@ async def test_owned_settle_source_to_device_reconstructs_without_crypto_replay(
         client.add_to_device_callback(on_to_device, None)
         client.add_response_callback(wrong_callback("response"), None)
         client.add_event_callback(wrong_callback("event"), None)
-        client.add_event_admission_callback(wrong_callback("admission"), None)
+        monkeypatch.setattr(
+            client,
+            "_on_event_admission",
+            wrong_callback("admission"),
+        )
         client.add_ephemeral_callback(wrong_callback("ephemeral"), None)
         client.add_room_account_data_callback(
             wrong_callback("room-account-data"),
@@ -15057,7 +15046,7 @@ def _install_owned_settlement_callback_tripwires(
     client.add_event_callback(room_event, None)
     client.add_ephemeral_callback(room_event, None)
     client.add_room_account_data_callback(room_event, None)
-    client.add_event_admission_callback(admission, None)
+    client._on_event_admission = admission  # type: ignore[method-assign]
     client.add_response_callback(response, None)
 
 
@@ -15819,7 +15808,7 @@ async def test_owned_settle_live_timeline_none_truth_table_restores_snapshot_bef
             raise AssertionError("timeline settlement invoked a response callback")
 
         client.add_event_callback(observe_event_callback, None)
-        client.add_event_admission_callback(forbid_admission, None)
+        monkeypatch.setattr(client, "_on_event_admission", forbid_admission)
         client.add_response_callback(forbid_response, None)
         acknowledgements: list[BatchRef] = []
         real_acknowledge = session._journal.acknowledge_batch

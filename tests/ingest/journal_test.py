@@ -16,7 +16,14 @@ from nio.ingest.serialization import batch_from_records
 from nio.ingest.source import canonical_json
 from nio.ingest.state import SourceState, StagedFrame
 from nio.exceptions import LocalProtocolError
-from nio.store import DefaultStore, SqliteStore
+from nio.store import (
+    DefaultStore,
+    PendingTimelineEvents,
+    SlidingWindowTokens,
+    SqliteStore,
+    SyncRecoveryAbandonedRooms,
+    SyncRecoveryGaps,
+)
 from nio.store._sync_journal_rows import (
     _canonical_internal,
     _canonical_room_aggregate_plaintext,
@@ -113,6 +120,25 @@ def _configured_open(
         database_name="journal.db",
         **kwargs,
     )
+
+
+def _add_historical_recovery_schema(tmp_path: Path) -> None:
+    historical_models = (
+        PendingTimelineEvents,
+        SlidingWindowTokens,
+        SyncRecoveryAbandonedRooms,
+        SyncRecoveryGaps,
+    )
+    store = SqliteStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(tmp_path),
+        pickle_key=PICKLE_KEY,
+        database_name="journal.db",
+    )
+    with store.database.bind_ctx(historical_models):
+        store.database.create_tables(historical_models)
+    store.database.close()
 
 
 def _table_names(path: Path) -> set[str]:
@@ -1151,6 +1177,7 @@ def test_configured_adoption_accepts_exact_historical_v10_alter_layouts(
     tmp_path: Path,
 ) -> None:
     _seed_populated_store(tmp_path, SqliteStore)
+    _add_historical_recovery_schema(tmp_path)
     with sqlite3.connect(tmp_path / "journal.db") as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("DROP TABLE pendingtimelineevents")
@@ -1222,6 +1249,7 @@ def test_configured_adoption_rejects_reordered_base_columns_in_migrated_table(
     tmp_path: Path,
 ) -> None:
     _seed_populated_store(tmp_path, SqliteStore)
+    _add_historical_recovery_schema(tmp_path)
     with sqlite3.connect(tmp_path / "journal.db") as connection:
         connection.execute("DROP TABLE pendingtimelineevents")
         connection.execute(

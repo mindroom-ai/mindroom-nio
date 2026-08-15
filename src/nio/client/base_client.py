@@ -1240,7 +1240,7 @@ class Client:
             recovery = previous_recovery
             sliding_tokens = previous_sliding_tokens
             recovery_enabled = getattr(self, "_recovery_persistence_enabled", False)
-            if recovery_enabled:
+            if previous_recovery is not None and recovery_enabled:
                 from .sync_recovery import RecoveryState, load_recovery_state
 
                 recovery = RecoveryState(

@@ -13,7 +13,5 @@ from .ingest.coordinator import *
 from .events import *
 from .exceptions import *
 from .monitors import *
-from .recovery_abandonment import RecoveryAbandonment
 from .responses import *
 from .rooms import *
-from .sliding_sync_tokens import SlidingWindowToken

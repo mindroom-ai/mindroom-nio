@@ -2584,60 +2584,23 @@ class _OwnedIngestionSession(IngestionSession):
 
 def _validate_owned_client_is_pristine(client: AsyncClient) -> None:
     client._assert_ingestion_not_poisoned()
-    fence = client._sync_reset_fence
-    recovery = client._recovery
-    if recovery is None:
-        raise LocalProtocolError("owned ingestion requires pristine recovery state")
+    event_scope = client._event_callback_scope.get()
+    response_scope = client._response_callback_scope.get()
     dirty = (
         client.store is not None
         or client.olm is not None
         or client.client_session is not None
-        or client._closing
         or client._stop_sync_forever
-        or client._sync_response_seen
-        or client._sync_response_lock.locked()
-        or client._active_sync_executor_token is not None
-        or client._active_classic_sync_state_operation is not None
-        or client._sync_generation.classic_request_lock.locked()
-        or client._sync_generation.to_device_request_lock.locked()
-        or client._sync_generation.to_device_transport is not None
-        or bool(client._sync_generation.sliding_request_locks)
-        or fence.request_id != 0
-        or bool(fence.active_request_ids)
-        or bool(fence.room_cutoffs)
-        or fence.to_device_floor != 0
-        or bool(fence.one_time_key_count_floors)
         or bool(client.next_batch)
         or bool(client.loaded_sync_token)
         or bool(client.rooms)
         or bool(client.invited_rooms)
         or bool(client.encrypted_rooms)
-        or client._classic_sync_rebuild_pending
-        or client._classic_sync_state_staged
-        or client._classic_sync_acknowledgeable_token is not None
-        or bool(client._classic_sync_abandonment_before_staged_response)
-        or bool(client._pending_sliding_room_account_data)
-        or bool(client._sliding_room_prev_batch)
-        or client._sliding_sync_to_device_since is not None
-        or bool(client._recovery_room_gates)
         or bool(client.sharing_session)
         or client.synced.is_set()
-        or bool(recovery.gaps)
-        or bool(recovery.events)
-        or bool(recovery.completed)
-        or bool(recovery.outcomes)
-        or bool(recovery.abandoned)
-        or recovery.room_offset != 0
-        or bool(recovery._active_dispatches)
-        or bool(recovery._dispatch_waiters)
-        or bool(recovery._deferred_dispatch_errors)
-        or client._sync_request_generation.get() is not None
-        or client._sync_request_id.get() is not None
-        or client._classic_sync_state_operation_context.get() is not None
-        or client._current_response_room_ids.get() is not None
-        or client._sliding_request_scope.get() is not None
-        or client._event_callback_scope.get() is not None
-        or client._response_callback_scope.get() is not None
+        or client._ingestion_store_snapshot is not None
+        or (event_scope is not None and event_scope.active)
+        or (response_scope is not None and response_scope.active)
     )
     if dirty:
         raise LocalProtocolError("owned ingestion requires a pristine pre-sync client")

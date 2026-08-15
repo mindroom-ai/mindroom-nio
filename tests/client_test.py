@@ -45,7 +45,6 @@ from nio import (
     RoomSummary,
     RoomTypingResponse,
     ShareGroupSessionResponse,
-    SlidingSyncResponse,
     SyncResponse,
     TagEvent,
     ThumbnailResponse,
@@ -54,6 +53,7 @@ from nio import (
     TypingNoticeEvent,
 )
 from nio.event_builders import ToDeviceMessage
+from nio.responses import SlidingSyncResponse
 
 HOST = "example.org"
 USER = "example"

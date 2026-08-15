@@ -99,7 +99,7 @@ _E2EE_TABLES = frozenset(
     }
 )
 
-_ORDINARY_MODELS = (
+_ACTIVE_ORDINARY_MODELS = (
     Accounts,
     OlmSessions,
     MegolmInboundSessions,
@@ -110,11 +110,14 @@ _ORDINARY_MODELS = (
     StoreVersion,
     Keys,
     SyncTokens,
+)
+_RETIRED_RECOVERY_MODELS = (
     SyncRecoveryGaps,
     SyncRecoveryAbandonedRooms,
     PendingTimelineEvents,
     SlidingWindowTokens,
 )
+_ORDINARY_MODELS = _ACTIVE_ORDINARY_MODELS + _RETIRED_RECOVERY_MODELS
 _TRUST_SIDECAR_SUFFIXES = (
     "trusted_devices",
     "blacklisted_devices",
@@ -457,8 +460,14 @@ def _capture_named_contract(
 
 
 @cache
-def _ordinary_contract(include_trust: bool) -> tuple[object, ...]:
-    models = (*_ORDINARY_MODELS, *((DeviceTrustState,) if include_trust else ()))
+def _ordinary_contract(
+    include_trust: bool,
+    include_retired_recovery: bool,
+) -> tuple[object, ...]:
+    ordinary_models = (
+        _ORDINARY_MODELS if include_retired_recovery else _ACTIVE_ORDINARY_MODELS
+    )
+    models = (*ordinary_models, *((DeviceTrustState,) if include_trust else ()))
     return _model_contract(models)
 
 
@@ -479,30 +488,42 @@ def _validate_ordinary_topology(
 ) -> bool:
     from .database import DefaultStore, SqliteStore
 
-    base_tables = frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
+    active_tables = frozenset(
+        model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS
+    )
+    historical_tables = frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
     trust_table = DeviceTrustState._meta.table_name
     actual_tables = _ordinary_table_names(connection)
+    accepted_tables: tuple[frozenset[str], ...]
     if source_store_class is SqliteStore:
-        expected_tables = base_tables | {trust_table}
+        accepted_tables = (
+            active_tables | {trust_table},
+            historical_tables | {trust_table},
+        )
         include_trust = True
     elif source_store_class is DefaultStore:
-        if actual_tables == base_tables:
-            expected_tables = base_tables
-            include_trust = False
-        else:
-            expected_tables = base_tables | {trust_table}
-            include_trust = True
+        accepted_tables = (
+            active_tables,
+            active_tables | {trust_table},
+            historical_tables,
+            historical_tables | {trust_table},
+        )
+        include_trust = trust_table in actual_tables
     else:  # Pair validation should have rejected this before filesystem access.
         raise LocalProtocolError("configured source store class is unsupported")
-    if actual_tables != expected_tables:
+    if actual_tables not in accepted_tables:
         raise FreshIngestionRequired("configured ordinary store topology is incomplete")
+    include_retired_recovery = actual_tables in (
+        historical_tables,
+        historical_tables | {trust_table},
+    )
     try:
         actual = _capture_named_contract(
             connection,
             actual_tables,
             allow_ingestion_objects=connection.table_exists("NioIngestMeta"),
         )
-        expected = _ordinary_contract(include_trust)
+        expected = _ordinary_contract(include_trust, include_retired_recovery)
     except (sqlite3.DatabaseError, PeeweeDatabaseError) as error:
         raise FreshIngestionRequired(
             "configured ordinary store topology is invalid"
@@ -1126,12 +1147,17 @@ def _inspect_existing(
         )
     }
     borrowed_tables = {name for name in all_tables if not name.startswith("NioIngest")}
-    ordinary_tables = {model._meta.table_name for model in _ORDINARY_MODELS}
+    active_ordinary_tables = {
+        model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS
+    }
+    historical_ordinary_tables = {model._meta.table_name for model in _ORDINARY_MODELS}
     allowed_borrowed: tuple[set[str], ...] = (
         set(),
         set(_E2EE_TABLES),
-        ordinary_tables,
-        ordinary_tables | {DeviceTrustState._meta.table_name},
+        active_ordinary_tables,
+        active_ordinary_tables | {DeviceTrustState._meta.table_name},
+        historical_ordinary_tables,
+        historical_ordinary_tables | {DeviceTrustState._meta.table_name},
     )
     if borrowed_tables not in allowed_borrowed:
         raise FreshIngestionRequired(
@@ -1710,11 +1736,14 @@ def open_journal_database(
                     device_id=device_id,
                     pickle_key=pickle_key,
                 )
-            elif _ordinary_table_names(connection) in (
+            elif _ordinary_table_names(connection) in {
+                frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS),
+                frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS)
+                | {DeviceTrustState._meta.table_name},
                 frozenset(model._meta.table_name for model in _ORDINARY_MODELS),
                 frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
                 | {DeviceTrustState._meta.table_name},
-            ):
+            }:
                 raise FreshIngestionRequired(
                     "populated marked stores require the private configured opener"
                 )

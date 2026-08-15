@@ -3,7 +3,6 @@ from nio import (
     DeviceOneTimeKeyCount,
     RoomInfo,
     Rooms,
-    SlidingSyncResponse,
     SlidingSyncRoom,
     SyncResponse,
     Timeline,
@@ -19,6 +18,7 @@ from nio.client.sync_response_ordering import (
     ordered_response_view,
     response_room_ids,
 )
+from nio.responses import SlidingSyncResponse
 
 ROOM_A = "!a:example.org"
 ROOM_B = "!b:example.org"

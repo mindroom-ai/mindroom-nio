@@ -41,11 +41,6 @@ from ..crypto import (
 )
 from ..event_provenance import TimelineEventProvenance
 from ..exceptions import LocalProtocolError
-from ..recovery_abandonment import (
-    RecoveryAbandonment,
-    normalize_abandonment_reasons,
-)
-from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
     DeviceKeys,
@@ -77,6 +72,8 @@ if TYPE_CHECKING:
         PendingTimelineEvent,
         RecoveryGap,
     )
+    from ..recovery_abandonment import RecoveryAbandonment
+    from ..sliding_sync_tokens import SlidingWindowToken
     from ._ingestion_store_owner import IngestionStoreOwner
     from .sync_journal import StoreBootstrap, _OwnedStoreCandidate
 
@@ -206,10 +203,6 @@ class MatrixStore:
         StoreVersion,
         Keys,
         SyncTokens,
-        SyncRecoveryGaps,
-        SyncRecoveryAbandonedRooms,
-        PendingTimelineEvents,
-        SlidingWindowTokens,
     ]
     store_version = 10
     user_id: str = field()
@@ -379,7 +372,7 @@ class MatrixStore:
             f'INSERT OR IGNORE INTO "{table}" '
             '("room_id", "reason", "account_id") '
             f'SELECT "room_id", {reason}, "account_id" FROM "{source_table}"',
-            (RecoveryAbandonment.UNKNOWN.value,),
+            ("unknown",),
         )
 
     def _repair_recovery_abandonment_schema(self) -> bool:
@@ -453,7 +446,7 @@ class MatrixStore:
             f'AND NOT EXISTS (SELECT 1 FROM "{table}" AS abandoned '
             'WHERE abandoned."account_id" = gaps."account_id" '
             'AND abandoned."room_id" = gaps."room_id")',
-            (RecoveryAbandonment.UNKNOWN.value, ""),
+            ("unknown", ""),
         )
 
     @use_database_atomic
@@ -507,31 +500,11 @@ class MatrixStore:
         if store_version == 1:
             self.upgrade_to_v2()
             store_version = 2
-        if store_version == 2:
-            self.upgrade_to_v3()
-            store_version = 3
-        if store_version in (3, 4):
-            self.upgrade_to_v5()
-            store_version = 5
-        if store_version == 5:
-            self.upgrade_to_v6()
-            store_version = 6
-        if store_version == 6:
-            self.upgrade_to_v7()
-            store_version = 7
-        if store_version == 7:
-            self.upgrade_to_v8()
-            store_version = 8
-        if store_version == 8:
-            self.upgrade_to_v9()
-            store_version = 9
-        if store_version == 9:
-            self.upgrade_to_v10()
+        if store_version < self.store_version:
+            self._update_version(self.store_version)
 
-        self._preflight_queued_recovery_schema_rebuild()
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
-        self._repair_v10_recovery_abandonments()
 
     def _post_init_ingestion_store(
         self, bootstrap: StoreBootstrap | _OwnedStoreCandidate
@@ -1007,6 +980,10 @@ class MatrixStore:
         abandoned_rooms: Mapping[str, object],
     ) -> None:
         """Append every normalized cause without erasing standing causes."""
+        from ..recovery_abandonment import (  # noqa: PLC0415
+            normalize_abandonment_reasons,
+        )
+
         rows = [
             {"account": account, "room_id": room_id, "reason": reason.value}
             for room_id, value in abandoned_rooms.items()
@@ -1032,6 +1009,11 @@ class MatrixStore:
         abandoned_room_reasons: Mapping[str, object] | None = None,
         clear_room_reasons: Mapping[str, object] | None = None,
     ) -> None:
+        from ..recovery_abandonment import (  # noqa: PLC0415
+            RecoveryAbandonment,
+            normalize_abandonment_reasons,
+        )
+
         account = self._get_account()
         assert account
 
@@ -1312,6 +1294,9 @@ class MatrixStore:
     ]:
         """Load room obligations, their ordered pending callbacks, and lost rooms."""
         from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
+        from ..recovery_abandonment import (  # noqa: PLC0415
+            normalize_abandonment_reasons,
+        )
 
         account = self._get_account()
         if not account:
@@ -1434,6 +1419,8 @@ class MatrixStore:
     @use_database
     def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
         """Load each room's last sliding window token."""
+        from ..sliding_sync_tokens import SlidingWindowToken  # noqa: PLC0415
+
         account = self._get_account()
         if not account:
             return {}

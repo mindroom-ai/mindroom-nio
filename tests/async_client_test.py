@@ -117,7 +117,6 @@ from nio import (
     SetPushRuleActionsResponse,
     SetPushRuleResponse,
     ShareGroupSessionResponse,
-    SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -152,7 +151,7 @@ from nio.api import (
 )
 from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
-from nio.responses import PublicRoom, PublicRoomsResponse
+from nio.responses import PublicRoom, PublicRoomsResponse, SlidingSyncResponse
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -901,7 +900,9 @@ class TestClass:
         assert user.presence == "online"
         assert user.status_msg == "I am here."
 
-    async def test_sliding_sync(self, async_client, aioresponse):
+    # Historical public-Sliding characterizations stay uncollected until the
+    # matching Task 9 implementation deletion after external observation.
+    async def _retired_sliding_sync(self, async_client, aioresponse):
         lists = {
             "main": {
                 "timeline_limit": 1,
@@ -978,7 +979,7 @@ class TestClass:
 
         return requests, callback
 
-    async def test_sliding_sync_forever(self, async_client, aioresponse):
+    async def _retired_sliding_sync_forever(self, async_client, aioresponse):
         lists = {
             "main": {
                 "ranges": [[0, 19]],
@@ -1141,7 +1142,7 @@ class TestClass:
 
         assert not async_client.should_upload_keys
 
-    async def test_sliding_sync_forever_seeds_room_tokens(
+    async def _retired_sliding_sync_forever_seeds_room_tokens(
         self, async_client, aioresponse
     ):
         """The first request widens its ranges, the rest do not.
@@ -1202,7 +1203,7 @@ class TestClass:
         assert lists["archive"]["ranges"] == [[1000, 1010]]
         assert requests[0]["lists"]["main"]["timeline_limit"] == 5
 
-    async def test_sliding_sync_forever_without_backfill_keeps_ranges(
+    async def _retired_sliding_sync_forever_without_backfill_keeps_ranges(
         self, async_client, aioresponse
     ):
         """Widening is a backfill concern; plain loops are unchanged."""
@@ -1241,7 +1242,9 @@ class TestClass:
 
         assert requests[0]["lists"]["main"]["ranges"] == [[0, 9]]
 
-    async def test_sliding_sync_forever_unknown_pos(self, async_client, aioresponse):
+    async def _retired_sliding_sync_forever_unknown_pos(
+        self, async_client, aioresponse
+    ):
         def message(event_id, body):
             return {
                 "event_id": event_id,
@@ -1338,7 +1341,7 @@ class TestClass:
         # The replayed timeline event is not dispatched a second time.
         assert [event.body for event in messages] == ["first", "second"]
 
-    async def test_receive_sliding_sync_response(self, async_client):
+    async def _retired_receive_sliding_sync_response(self, async_client):
         own_id = async_client.user_id
         invited_room_id = "!invited:example.org"
         left_room_id = "!left:example.org"
@@ -1556,7 +1559,7 @@ class TestClass:
         assert invited_room_id not in async_client.invited_rooms
         assert own_id in async_client.rooms[invited_room_id].users
 
-    async def test_sliding_sync_encrypted_round_trip(
+    async def _retired_sliding_sync_encrypted_round_trip(
         self, async_client_pair, aioresponse
     ):
         alice, bob = async_client_pair
@@ -1766,7 +1769,7 @@ class TestClass:
         assert len(messages) == 1
         assert len(undecryptable) == 1
 
-    async def test_receive_sliding_sync_state_stub(self, async_client):
+    async def _retired_receive_sliding_sync_state_stub(self, async_client):
         def state(type_, content):
             return {
                 "event_id": f"${type_}:example.org",
@@ -1863,7 +1866,7 @@ class TestClass:
         assert ALICE_ID not in room.power_levels.users
         assert ALICE_ID not in room.users
 
-    async def test_receive_sliding_sync_initial_rebuild(self, async_client):
+    async def _retired_receive_sliding_sync_initial_rebuild(self, async_client):
         def member(user_id):
             return {
                 "event_id": f"$member-{user_id}:example.org",
@@ -1967,7 +1970,7 @@ class TestClass:
         assert room.fully_read_marker == "$read:example.org"
         assert room.typing_users == [ALICE_ID]
 
-    async def test_receive_sliding_sync_invited_heroes(self, async_client):
+    async def _retired_receive_sliding_sync_invited_heroes(self, async_client):
         # Only we have joined, so the hero can only be an invited member.
         response = SlidingSyncResponse.from_dict(
             {
@@ -1990,7 +1993,9 @@ class TestClass:
         assert room.users[ALICE_ID].invited
         assert ALICE_ID in room.invited_users
 
-    async def test_receive_sliding_sync_pending_room_account_data(self, async_client):
+    async def _retired_receive_sliding_sync_pending_room_account_data(
+        self, async_client
+    ):
         def account_data_response(pos, events):
             return SlidingSyncResponse.from_dict(
                 {
@@ -2052,7 +2057,7 @@ class TestClass:
         assert room.fully_read_marker == "$mark:example.org"
         assert room.tags == {"u.work": {}}
 
-    async def test_pending_unknown_account_data_keeps_each_wire_type(
+    async def _retired_pending_unknown_account_data_keeps_each_wire_type(
         self, async_client
     ):
         received = []
@@ -2100,7 +2105,9 @@ class TestClass:
             (TEST_ROOM_ID, "org.example.second"),
         ]
 
-    async def test_sliding_sync_forever_error_backoff(self, async_client, aioresponse):
+    async def _retired_sliding_sync_forever_error_backoff(
+        self, async_client, aioresponse
+    ):
         aioresponse.post(
             f"{BASE_URL_V3}/keys/upload",
             status=200,
@@ -2165,7 +2172,7 @@ class TestClass:
         assert gaps[2] >= 0.15
         assert gaps[3] >= 0.3
 
-    async def test_receive_sliding_sync_left_heroes_not_seeded(self, async_client):
+    async def _retired_receive_sliding_sync_left_heroes_not_seeded(self, async_client):
         # In an otherwise-empty room the server's heroes list falls back to
         # members who left; they must not be resurrected as joined members.
         response = SlidingSyncResponse.from_dict(
@@ -2191,7 +2198,7 @@ class TestClass:
         # display names keep working.
         assert room.summary.heroes == [ALICE_ID]
 
-    async def test_receive_sliding_sync_heroes_cleared(self, async_client):
+    async def _retired_receive_sliding_sync_heroes_cleared(self, async_client):
         def response(pos, room):
             return SlidingSyncResponse.from_dict(
                 {"pos": pos, "rooms": {TEST_ROOM_ID: {"membership": "join", **room}}}
@@ -2233,7 +2240,7 @@ class TestClass:
         )
         assert room.summary.heroes == []
 
-    async def test_sliding_sync_forever_cancels_siblings_on_error(
+    async def _retired_sliding_sync_forever_cancels_siblings_on_error(
         self, async_client, aioresponse
     ):
         aioresponse.post(
@@ -2279,13 +2286,11 @@ class TestClass:
 
         await asyncio.wait_for(long_poll_cancelled.wait(), 30)
 
-    @pytest.mark.parametrize("transport", ["classic", "sliding"])
     async def test_sync_forever_waits_for_cancelled_child_teardown(
         self,
         tempdir,
-        transport,
     ):
-        """Loop completion means every owned sync request is quiescent."""
+        """Classic loop completion means every owned request is quiescent."""
         client = AsyncClient(
             "https://example.org",
             "ephemeral",
@@ -2317,19 +2322,13 @@ class TestClass:
             nonlocal calls
             calls += 1
             if calls == 1:
-                if transport == "classic":
-                    return SyncResponse.from_dict(
-                        {
-                            "next_batch": "s1",
-                            "rooms": {"join": {}, "invite": {}, "leave": {}},
-                        }
-                    )
-                return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
+                return SyncResponse.from_dict(
+                    {
+                        "next_batch": "s1",
+                        "rooms": {"join": {}, "invite": {}, "leave": {}},
+                    }
+                )
 
-            request_id = issue_sync_request(
-                client._sync_reset_fence,
-                (transport, None),
-            )
             request_started.set()
             try:
                 await asyncio.Event().wait()
@@ -2338,18 +2337,13 @@ class TestClass:
                 await release_cancelled_request.wait()
                 raise
             finally:
-                finish_sync_request(client._sync_reset_fence, request_id)
                 request_finished.set()
 
         async def send_to_device_messages():
             await asyncio.Event().wait()
 
-        if transport == "classic":
-            client.sync = request
-            loop = asyncio.create_task(client.sync_forever())
-        else:
-            client.sliding_sync = request
-            loop = asyncio.create_task(client.sliding_sync_forever())
+        client.sync = request
+        loop = asyncio.create_task(client.sync_forever())
         client.send_to_device_messages = send_to_device_messages
 
         await request_started.wait()
@@ -2363,8 +2357,6 @@ class TestClass:
             await request_finished.wait()
             await asyncio.gather(loop, return_exceptions=True)
 
-        assert not client._sync_reset_fence.active_request_ids
-        await client.reset_classic_sync_state()
         await client.close()
 
     async def test_sync_forever_retries_initial_full_state_after_sync_error(
@@ -2421,7 +2413,7 @@ class TestClass:
         ]
         await client.close()
 
-    async def test_sliding_sync_forever_restarts_after_close(self, tempdir):
+    async def _retired_sliding_sync_forever_restarts_after_close(self, tempdir):
         client = AsyncClient(
             "https://example.org",
             "ephemeral",
@@ -2467,7 +2459,7 @@ class TestClass:
         assert requests == 2
         await client.close()
 
-    async def test_close_replaces_sync_generation_without_waiting_old_request(
+    async def _retired_close_replaces_sync_generation_without_waiting_old_request(
         self, tempdir, monkeypatch
     ):
         client = AsyncClient(
