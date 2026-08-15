@@ -17,7 +17,25 @@ import nio
 from nio import AsyncClient, AsyncClientConfig
 from nio.crypto import Olm, OlmAccount, OlmDevice
 from nio.event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
-from nio.events import Event, MegolmEvent, RoomKeyRequest, ToDeviceEvent
+from nio.events import (
+    AccountDataEvent,
+    EphemeralEvent,
+    Event,
+    InviteEvent,
+    KeyVerificationCancel,
+    MegolmEvent,
+    PresenceEvent,
+    RoomKeyEvent,
+    RoomKeyRequest,
+    RoomKeyRequestCancellation,
+    ToDeviceEvent,
+)
+from nio.events.misc import BadEvent, UnknownBadEvent
+from nio.events.to_device import (
+    DummyEvent,
+    ForwardedRoomKeyEvent,
+    UnknownToDeviceEvent,
+)
 from nio.exceptions import LocalProtocolError
 from nio.ingest.errors import JournalConflictError, JournalIntegrityError
 from nio.ingest.hydration import normalize_hydration_response
@@ -31,9 +49,15 @@ from nio.ingest.model import (
     BatchRef,
     EventRecord,
     LossRecord,
+    RecordKind,
     RecordOrigin,
     SystemOrigin,
     SystemOriginKind,
+    TransportKind,
+    _CallbackRoute,
+    _DecryptionDisposition,
+    _DecryptedToDeviceKind,
+    _PreparationPhase,
 )
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.sliding import (
@@ -1155,6 +1179,87 @@ def _local_room_body() -> dict[str, object]:
     }
 
 
+def _rich_joined_room_body() -> dict[str, object]:
+    def state_event(
+        event_type: str,
+        content: dict[str, object],
+        timestamp: int,
+        state_key: str,
+    ) -> dict[str, object]:
+        return {
+            "content": content,
+            "event_id": f"$rich-{timestamp}",
+            "origin_server_ts": timestamp,
+            "sender": ACCOUNT,
+            "state_key": state_key,
+            "type": event_type,
+        }
+
+    values = (
+        (
+            "m.room.create",
+            {"creator": ACCOUNT, "m.federate": False, "room_version": "10"},
+            "",
+        ),
+        ("m.room.encryption", {"algorithm": "m.megolm.v1.aes-sha2"}, ""),
+        ("m.room.name", {"name": "Durable Room"}, ""),
+        ("m.room.canonical_alias", {"alias": "#durable:example.org"}, ""),
+        ("m.room.topic", {"topic": "Persist every projected field"}, ""),
+        ("m.room.avatar", {"url": "mxc://example.org/durable-room"}, ""),
+        ("m.room.join_rules", {"join_rule": "knock"}, ""),
+        ("m.room.guest_access", {"guest_access": "can_join"}, ""),
+        (
+            "m.room.power_levels",
+            {
+                "ban": 75,
+                "events": {"m.room.message": 5, "m.room.name": 60},
+                "events_default": 5,
+                "invite": 10,
+                "kick": 65,
+                "notifications": {"room": 70},
+                "redact": 55,
+                "state_default": 50,
+                "users": {ACCOUNT: 100, BOB: 25},
+                "users_default": 3,
+            },
+            "",
+        ),
+        (
+            "m.room.member",
+            {
+                "avatar_url": "mxc://example.org/alice",
+                "displayname": "Alice Durable",
+                "membership": "join",
+            },
+            ACCOUNT,
+        ),
+        (
+            "m.room.member",
+            {
+                "avatar_url": "mxc://example.org/bob",
+                "displayname": "Bob Invited",
+                "membership": "invite",
+            },
+            BOB,
+        ),
+    )
+    state = tuple(
+        state_event(event_type, content, timestamp, state_key)
+        for timestamp, (event_type, content, state_key) in enumerate(values, start=1)
+    )
+    return {
+        "next_batch": "rich-snapshot-token",
+        "rooms": {
+            "join": {
+                ROOM: {
+                    "state": {"events": state},
+                    "timeline": {"events": [], "limited": False},
+                }
+            }
+        },
+    }
+
+
 def _ready_local_room(session, bootstrap):
     staged = stage_classic(bootstrap, _local_room_body())
     assert (
@@ -1547,6 +1652,494 @@ async def test_owned_factory_attaches_exact_store_before_olm_initialization(
     assert client.olm.account.identity_keys == account.identity_keys
     assert client.store.database is bootstrap._journal._owner.database
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_factory_restores_rich_joined_snapshot_before_delivery(
+    tmp_path,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, store_sync_tokens=True)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        stage_classic(bootstrap, _rich_joined_room_body())
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        hydrated = normalize_hydration_response(
+            pending[0],
+            own_user_id=ACCOUNT,
+            response_body=hydration_state(),
+        )
+        assert session._journal.apply_hydration_result(result=hydrated) is not None
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        snapshot = loaded[1].room_snapshot
+        assert snapshot is not None
+        assert (
+            snapshot.own_membership,
+            snapshot.membership_epoch,
+            snapshot.name,
+            snapshot.canonical_alias,
+            snapshot.topic,
+            snapshot.avatar_url,
+            snapshot.join_rule,
+            snapshot.room_version,
+            snapshot.guest_access,
+        ) == (
+            "join",
+            0,
+            "Durable Room",
+            "#durable:example.org",
+            "Persist every projected field",
+            "mxc://example.org/durable-room",
+            "knock",
+            "10",
+            "can_join",
+        )
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(restored_client.config, store_sync_tokens=True)
+
+    def callback_tripwire(*_args: object) -> None:
+        raise AssertionError("owned snapshot restore invoked an application callback")
+
+    for callback_name in (
+        "_on_to_device",
+        "_on_invited_rooms",
+        "_on_event",
+        "_on_ephemeral",
+        "_on_room_account_data",
+        "_on_presence",
+        "_on_global_account_data",
+        "_on_expired_verifications",
+    ):
+        setattr(restored_client, callback_name, callback_tripwire)
+    restored_client.add_event_callback(callback_tripwire, None)
+    restored_client.add_ephemeral_callback(callback_tripwire, None)
+    restored_client.add_global_account_data_callback(callback_tripwire, None)
+    restored_client.add_room_account_data_callback(callback_tripwire, None)
+    restored_client.add_to_device_callback(callback_tripwire, None)
+    restored_client.add_presence_callback(callback_tripwire, None)
+    restored_client.add_response_callback(callback_tripwire, None)
+
+    connection = reopened._journal._owner.database.connection()
+    database_before = tuple(connection.iterdump())
+    restore_statements: list[str] = []
+    connection.set_trace_callback(restore_statements.append)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    connection.set_trace_callback(None)
+    try:
+        assert restored_client.send_count == 0
+        assert tuple(connection.iterdump()) == database_before
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(
+                (
+                    "INSERT ",
+                    "UPDATE ",
+                    "DELETE ",
+                    "REPLACE ",
+                    "CREATE ",
+                    "DROP ",
+                    "ALTER ",
+                )
+            )
+            for statement in restore_statements
+        )
+        assert restored_client.loaded_sync_token == "rich-snapshot-token"
+
+        # Restoration is an owned-open prerequisite, not incremental Work.
+        assert tuple(restored_client.rooms) == (ROOM,)
+        assert restored_client.invited_rooms == {}
+        room = restored_client.rooms[ROOM]
+        assert type(room) is nio.MatrixRoom
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        assert tuple(room.invited_users) == (BOB,)
+        assert dict(room.names) == {
+            "Alice Durable": [ACCOUNT],
+            "Bob Invited": [BOB],
+        }
+        assert restored_client.encrypted_rooms == {ROOM}
+
+        batch = restored_session.next_batch()
+        assert batch is not None
+    finally:
+        connection.set_trace_callback(None)
+        await restored_session.close()
+
+    assert (
+        restored_client.store,
+        restored_client.olm,
+        restored_client.rooms,
+        restored_client.invited_rooms,
+        restored_client.encrypted_rooms,
+        restored_client.next_batch,
+        restored_client.loaded_sync_token,
+    ) == (None, None, {}, {}, set(), "", "")
+
+
+@pytest.mark.asyncio
+async def test_owned_factory_does_not_fabricate_snapshotless_encrypted_room(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        _operation_id, _committed, aggregate, _work = _publish_fresh_local_join(session)
+        assert aggregate.continuity.membership == "join"
+        assert aggregate.room_snapshot is None
+        session._owned_store.save_encrypted_rooms({ROOM})
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    try:
+        assert restored_client.encrypted_rooms == {ROOM}
+        assert restored_client.rooms == {}
+        assert restored_client.invited_rooms == {}
+    finally:
+        await restored_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_restores_first_materializing_client_room_maps_and_token(
+    tmp_path,
+) -> None:
+    invite_room = "!first-client-invite:example.org"
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    pristine_rooms = client.rooms
+    pristine_invited_rooms = client.invited_rooms
+    pristine_encrypted_rooms = client.encrypted_rooms
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        body = _rich_joined_room_body()
+        rooms = body["rooms"]
+        assert type(rooms) is dict
+        rooms["invite"] = {
+            invite_room: {
+                "invite_state": {
+                    "events": [
+                        {
+                            "content": {
+                                "displayname": "Invited Alice",
+                                "membership": "invite",
+                            },
+                            "event_id": "$first-client-invite",
+                            "sender": BOB,
+                            "state_key": ACCOUNT,
+                            "type": "m.room.member",
+                        }
+                    ]
+                }
+            }
+        }
+        stage_classic(bootstrap, body)
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        assert tuple(client.rooms) == (ROOM,)
+        assert tuple(client.invited_rooms) == (invite_room,)
+        assert client.next_batch == "rich-snapshot-token"
+        assert client.rooms is not pristine_rooms
+        assert client.invited_rooms is not pristine_invited_rooms
+    finally:
+        await session.close()
+
+    assert client.rooms is pristine_rooms
+    assert client.invited_rooms is pristine_invited_rooms
+    assert client.encrypted_rooms is pristine_encrypted_rooms
+    assert client.next_batch == ""
+
+
+@pytest.mark.parametrize("membership", ["invite", "knock"])
+@pytest.mark.asyncio
+async def test_owned_factory_restores_invited_room_from_current_membership(
+    tmp_path,
+    membership: str,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    state_key = "invite_state" if membership == "invite" else "knock_state"
+    try:
+        stage_classic(
+            bootstrap,
+            {
+                "next_batch": f"{membership}-snapshot-token",
+                "rooms": {
+                    membership: {
+                        ROOM: {
+                            state_key: {
+                                "events": [
+                                    {
+                                        "content": {"membership": membership},
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        snapshot = loaded[1].room_snapshot
+        assert snapshot is not None
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    try:
+        assert restored_client.rooms == {}
+        assert tuple(restored_client.invited_rooms) == (ROOM,)
+        room = restored_client.invited_rooms[ROOM]
+        assert type(room) is nio.MatrixInvitedRoom
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+    finally:
+        await restored_session.close()
+
+
+@pytest.mark.parametrize("membership", ["invite", "knock"])
+@pytest.mark.asyncio
+async def test_owned_cold_invited_state_is_ready_without_join_hydration(
+    tmp_path,
+    membership: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        section = "invite_state" if membership == "invite" else "knock_state"
+        stage_classic(
+            bootstrap,
+            {
+                "next_batch": f"cold-{membership}-s1",
+                "rooms": {
+                    membership: {
+                        ROOM: {
+                            section: {
+                                "events": [
+                                    {
+                                        "content": {
+                                            "name": "Cold invited room",
+                                        },
+                                        "sender": BOB,
+                                        "state_key": "",
+                                        "type": "m.room.name",
+                                    },
+                                    {
+                                        "content": {
+                                            "displayname": "Cold invited Alice",
+                                            "membership": membership,
+                                        },
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        assert aggregate.continuity.membership == membership
+        assert aggregate.room_snapshot is not None
+        assert aggregate.pending_hydration is None
+        assert aggregate.continuity.hydration_id is None
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+
+        leading_state = session.next_batch(max_records=1)
+        assert leading_state is not None
+        assert len(leading_state.records) == 1
+        leading_record = leading_state.records[0]
+        assert type(leading_record) is EventRecord
+        assert (
+            leading_record.kind,
+            leading_record.room_id,
+            leading_record.membership_epoch,
+            leading_record.room_sequence,
+            json.loads(leading_record.source_json)["type"],
+        ) == (RecordKind.STATE, ROOM, 0, 0, "m.room.name")
+        session.acknowledge_batch(leading_state.ref)
+
+        lifecycle = session.next_batch(max_records=1)
+        assert lifecycle is not None
+        assert len(lifecycle.records) == 1
+        assert lifecycle.records[0].kind is RecordKind.ROOM_LIFECYCLE
+        session.acknowledge_batch(lifecycle.ref)
+        state = session.next_batch(max_records=1)
+        assert state is not None
+        assert len(state.records) == 1
+        state_record = state.records[0]
+        assert type(state_record) is EventRecord
+        assert (
+            state_record.kind,
+            state_record.room_id,
+            state_record.membership_epoch,
+            state_record.room_sequence,
+            json.loads(state_record.source_json)["type"],
+        ) == (RecordKind.STATE, ROOM, 0, 2, "m.room.member")
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    try:
+        assert restored_session.next_batch(max_records=1) == state
+        assert restored_client.rooms == {}
+        assert tuple(restored_client.invited_rooms) == (ROOM,)
+    finally:
+        await restored_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_factory_routes_preserved_snapshot_by_current_continuity(
+    tmp_path,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        stage_classic(bootstrap, _rich_joined_room_body())
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        hydrated = normalize_hydration_response(
+            pending[0],
+            own_user_id=ACCOUNT,
+            response_body=hydration_state(),
+        )
+        assert session._journal.apply_hydration_result(result=hydrated) is not None
+        while batch := session.next_batch():
+            session.acknowledge_batch(batch.ref)
+        owner_before = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_before = session._journal._load_room_aggregate(owner_before, ROOM)
+        assert loaded_before is not None
+        previous = loaded_before[1].continuity
+        assert (previous.membership, previous.membership_epoch) == ("join", 0)
+        session._publish_local_membership_transition(
+            operation_id=uuid4(),
+            room_id=ROOM,
+            previous_membership="join",
+            previous_epoch=previous.membership_epoch,
+            current_membership="leave",
+        )
+        while batch := session.next_batch():
+            session.acknowledge_batch(batch.ref)
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        current = loaded[1]
+        current_snapshot = current.room_snapshot
+        assert current_snapshot is not None
+        assert (
+            current.continuity.membership,
+            current.continuity.membership_epoch,
+            current_snapshot.own_membership,
+            current_snapshot.membership_epoch,
+        ) == ("leave", 1, "leave", 1)
+        stale_snapshot = replace(
+            current_snapshot,
+            own_membership="join",
+            membership_epoch=0,
+        )
+        stale_aggregate = replace(current, room_snapshot=stale_snapshot)
+        _reseal_local_aggregate(session, stale_aggregate)
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    try:
+        assert tuple(restored_client.rooms) == (ROOM,)
+        assert restored_client.invited_rooms == {}
+        room = restored_client.rooms[ROOM]
+        assert type(room) is nio.MatrixRoom
+        assert (
+            _room_snapshot(
+                room,
+                stale_snapshot.membership_epoch,
+                stale_snapshot.own_membership,
+            )
+            == stale_snapshot
+        )
+    finally:
+        await restored_session.close()
 
 
 @pytest.mark.asyncio
@@ -7923,3 +8516,5634 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
     assert kwargs["timeout"] == 30.0
     client.client_session = None
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_global_account_data_callbacks_before_ack_outside_store(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    event_source = {
+        "content": {"theme": "durable"},
+        "type": "org.example.settlement.theme",
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        staged = stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": [event_source]},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "settled-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": []},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert materialized.frame_id == staged.frame_id
+        assert materialized.revision is not None
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind.value == "global_account_data"
+
+        authenticated_views: list[object] = []
+        parsed_events: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+        real_parse_account_data = AccountDataEvent.parse_event
+
+        def observe_authenticated_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room = view
+            assert work.value == record
+            assert work.metadata is not None
+            assert work.metadata.record_id == record.record_id
+            assert work.metadata.preparation_phase.value == "source"
+            assert work.metadata.effective_event_type == "org.example.settlement.theme"
+            assert work.metadata.decryption.value == "none"
+            assert work.metadata.decryption_verified is None
+            assert work.metadata.decrypted_to_device_kind is None
+            assert work.metadata.callback_route is not None
+            assert work.metadata.callback_route.value == "global_account_data"
+            assert room is None
+            authenticated_views.append(view)
+            return view
+
+        def observe_account_data_parse(
+            _event_type: type[AccountDataEvent],
+            source: dict[object, object],
+        ) -> object:
+            assert authenticated_views
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            assert canonical_json(source) == record.source_json
+            parsed = real_parse_account_data(source)
+            assert parsed.source == event_source
+            parsed_events.append(parsed)
+            return parsed
+
+        monkeypatch.setattr(
+            session._journal,
+            "_load_batch_settlement",
+            observe_authenticated_settlement,
+        )
+        monkeypatch.setattr(
+            AccountDataEvent,
+            "parse_event",
+            classmethod(observe_account_data_parse),
+        )
+
+        def delivery_state() -> tuple[object, ...]:
+            row = connection.execute(
+                "SELECT delivery_next_sequence, delivery_acknowledged_sha256, "
+                "delivery_outstanding_work_id, "
+                "delivery_outstanding_ready_revision, "
+                "delivery_outstanding_ready_ordinal, "
+                "delivery_outstanding_batch_sha256 FROM NioIngestMeta"
+            ).fetchone()
+            assert row is not None
+            return tuple(row)
+
+        outstanding = delivery_state()
+        assert outstanding == (
+            1,
+            None,
+            record.record_id,
+            batch.created_revision,
+            0,
+            batch.ref.sha256,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+
+        callback_events: list[object] = []
+        forbidden_callbacks: list[str] = []
+
+        async def on_global_account_data(event: object) -> None:
+            assert authenticated_views
+            assert len(parsed_events) == 1
+            assert event is parsed_events[0]
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            assert delivery_state() == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 1
+            )
+            assert type(event) is nio.UnknownAccountDataEvent
+            assert event.source == event_source
+            callback_events.append(event)
+
+        async def forbidden_response(_response: object) -> None:
+            forbidden_callbacks.append("response")
+            raise AssertionError("settlement invoked a response callback")
+
+        async def forbidden_event(_room: object, _event: object) -> None:
+            forbidden_callbacks.append("event")
+            raise AssertionError("settlement invoked an event callback")
+
+        async def forbidden_admission(
+            _room: object,
+            _event: object,
+            _provenance: object,
+        ) -> None:
+            forbidden_callbacks.append("admission")
+            raise AssertionError("settlement invoked event admission")
+
+        client.add_global_account_data_callback(on_global_account_data, None)
+        client.add_response_callback(forbidden_response, None)
+        client.add_event_callback(forbidden_event, None)
+        client.add_event_admission_callback(forbidden_admission, None)
+        real_on_global_account_data = client._on_global_account_data
+        routed_events: list[object] = []
+
+        async def observe_global_route(event: object) -> None:
+            assert len(parsed_events) == 1
+            assert event is parsed_events[0]
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            routed_events.append(event)
+            await real_on_global_account_data(event)
+
+        monkeypatch.setattr(
+            client,
+            "_on_global_account_data",
+            observe_global_route,
+        )
+        outstanding_graph = tuple(connection.iterdump())
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+
+        for receipt_new, semantic_event_new in (
+            (1, False),
+            (True, 0),
+            (False, True),
+        ):
+            statements.clear()
+            with pytest.raises(LocalProtocolError):
+                await session._settle_batch(  # type: ignore[attr-defined]
+                    batch,
+                    receipt_new=receipt_new,  # type: ignore[arg-type]
+                    semantic_event_new=semantic_event_new,  # type: ignore[arg-type]
+                )
+            assert statements == []
+            assert authenticated_views == []
+            assert parsed_events == []
+            assert routed_events == []
+            assert callback_events == []
+            assert forbidden_callbacks == []
+            assert tuple(connection.iterdump()) == outstanding_graph
+            assert delivery_state() == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 1
+            )
+
+        statements.clear()
+        await session._settle_batch(  # type: ignore[attr-defined]
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated_views) == 1
+        assert len(parsed_events) == 1
+        assert routed_events == callback_events
+        assert routed_events[0] is parsed_events[0]
+        assert len(callback_events) == 1
+        assert forbidden_callbacks == []
+        assert client.send_count == 0
+        assert delivery_state() == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+        client._assert_ingestion_not_poisoned()
+        assert session.next_batch() is None
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_source_to_device_reconstructs_without_crypto_replay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    event_source = {
+        "content": {"value": "durable"},
+        "sender": BOB,
+        "type": "org.example.settlement.to_device",
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        staged = stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "to-device-settled-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": [event_source]},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert materialized.frame_id == staged.frame_id
+        assert materialized.revision is not None
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.TO_DEVICE
+        assert record.source_json == canonical_json(event_source)
+        assert record.clear_json is None
+        assert (
+            record.room_id,
+            record.membership_epoch,
+            record.room_sequence,
+            record.event_id,
+            record.provenance,
+        ) == (None, None, None, None, None)
+
+        authenticated_views: list[object] = []
+        parsed_events: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+        real_parse_to_device = ToDeviceEvent.parse_event
+
+        def observe_authenticated_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room = view
+            assert work.value == record
+            assert work.metadata is not None
+            assert work.metadata.record_id == record.record_id
+            assert work.metadata.preparation_phase is _PreparationPhase.SOURCE
+            assert work.metadata.effective_event_type == event_source["type"]
+            assert work.metadata.decryption is _DecryptionDisposition.NONE
+            assert work.metadata.decryption_verified is None
+            assert work.metadata.decrypted_to_device_kind is None
+            assert work.metadata.callback_route is _CallbackRoute.TO_DEVICE
+            assert room is None
+            authenticated_views.append(view)
+            return view
+
+        def observe_to_device_parse(
+            _event_type: type[ToDeviceEvent],
+            source: dict[object, object],
+        ) -> object:
+            assert authenticated_views
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            assert source == event_source
+            assert canonical_json(source) == record.source_json
+            parsed = real_parse_to_device(source)
+            assert type(parsed) is nio.UnknownToDeviceEvent
+            assert parsed.source == event_source
+            assert parsed.sender == BOB
+            assert parsed.type == event_source["type"]
+            parsed_events.append(parsed)
+            return parsed
+
+        outstanding = _owned_delivery_frontier(connection)
+        assert outstanding == (
+            1,
+            None,
+            record.record_id,
+            batch.created_revision,
+            0,
+            batch.ref.sha256,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        e2ee_rows = _raw_e2ee_rows(connection)
+
+        callback_events: list[object] = []
+        routed_events: list[object] = []
+        forbidden_callbacks: list[str] = []
+        forbidden_paths: list[str] = []
+
+        async def on_to_device(event: object) -> None:
+            assert authenticated_views
+            assert len(parsed_events) == 1
+            assert event is parsed_events[0]
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 1
+            )
+            assert type(event) is nio.UnknownToDeviceEvent
+            assert event.source == event_source
+            callback_events.append(event)
+
+        def wrong_callback(name: str):
+            async def forbidden(*_args: object) -> None:
+                forbidden_callbacks.append(name)
+                raise AssertionError(f"settlement invoked {name} callback")
+
+            return forbidden
+
+        client.add_to_device_callback(on_to_device, None)
+        client.add_response_callback(wrong_callback("response"), None)
+        client.add_event_callback(wrong_callback("event"), None)
+        client.add_event_admission_callback(wrong_callback("admission"), None)
+        client.add_ephemeral_callback(wrong_callback("ephemeral"), None)
+        client.add_room_account_data_callback(
+            wrong_callback("room-account-data"),
+            None,
+        )
+        client.add_global_account_data_callback(
+            wrong_callback("global-account-data"),
+            None,
+        )
+        client.add_presence_callback(wrong_callback("presence"), None)
+        real_on_to_device = client._on_to_device
+
+        async def observe_to_device_route(event: object) -> None:
+            assert len(parsed_events) == 1
+            assert event is parsed_events[0]
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            routed_events.append(event)
+            await real_on_to_device(event)
+
+        def forbid_sync(name: str):
+            def forbidden(*_args: object, **_kwargs: object) -> None:
+                forbidden_paths.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden
+
+        def forbid_async(name: str):
+            async def forbidden(*_args: object, **_kwargs: object) -> None:
+                forbidden_paths.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session._journal,
+                "_load_batch_settlement",
+                observe_authenticated_settlement,
+            )
+            patch.setattr(
+                ToDeviceEvent,
+                "parse_event",
+                classmethod(observe_to_device_parse),
+            )
+            patch.setattr(client, "_on_to_device", observe_to_device_route)
+            for name in (
+                "_handle_decrypt_to_device",
+                "_handle_olm_events",
+                "_handle_timeline_event",
+                "_invalidate_session_for_member_event",
+                "_collect_key_requests",
+                "_publish_recovery_outcome",
+            ):
+                patch.setattr(client, name, forbid_sync(f"client.{name}"))
+            for name in (
+                "_dispatch_timeline_event",
+                "_handle_expired_verifications",
+                "_handle_sync",
+                "_handle_to_device",
+                "_on_event_admission",
+                "_on_response",
+                "_pump_sync_recovery",
+            ):
+                patch.setattr(client, name, forbid_async(f"client.{name}"))
+            for name in (
+                "handle_to_device_event",
+                "decrypt_event",
+                "_decrypt_megolm_no_error",
+                "decrypt_megolm_event",
+                "clear_verifications",
+                "collect_key_requests",
+                "update_tracked_users",
+                "add_changed_users",
+                "save_account",
+            ):
+                patch.setattr(olm, name, forbid_sync(f"olm.{name}"))
+
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated_views) == 1
+        assert len(parsed_events) == 1
+        assert routed_events == callback_events
+        assert routed_events[0] is parsed_events[0]
+        assert len(callback_events) == 1
+        assert forbidden_callbacks == []
+        assert forbidden_paths == []
+        assert client.send_count == 0
+        assert client.send_calls == []
+        assert _raw_e2ee_rows(connection) == e2ee_rows
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+        client._assert_ingestion_not_poisoned()
+        assert session.next_batch() is None
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_source_to_device_without_callback_is_ack_only(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    request_id = "settlement-untrusted-request"
+    request_source = {
+        "content": {
+            "action": "request",
+            "body": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": ROOM,
+                "sender_key": "settlement-sender-key",
+                "session_id": "settlement-session",
+            },
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    cancellation_source = {
+        "content": {
+            "action": "request_cancellation",
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        pending_request = ToDeviceEvent.parse_event(request_source)
+        assert type(pending_request) is RoomKeyRequest
+        olm.key_request_from_untrusted[request_id] = pending_request
+
+        staged = stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "to-device-ack-only-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": [cancellation_source]},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert materialized.frame_id == staged.frame_id
+        assert materialized.revision is not None
+        assert olm.key_request_from_untrusted == {}
+        assert olm.received_key_requests == {}
+
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(inventory.work) == 2
+        source_work = next(
+            work
+            for work in inventory.work
+            if work.metadata is not None
+            and work.metadata.preparation_phase is _PreparationPhase.SOURCE
+        )
+        collected_work = next(
+            work
+            for work in inventory.work
+            if work.metadata is not None
+            and work.metadata.preparation_phase
+            is _PreparationPhase.COLLECTED_KEY_REQUEST
+        )
+        assert type(source_work.value) is EventRecord
+        assert type(collected_work.value) is EventRecord
+        assert source_work.value.kind is RecordKind.TO_DEVICE
+        assert collected_work.value.kind is RecordKind.TO_DEVICE
+        assert source_work.value.source_json == canonical_json(cancellation_source)
+        assert collected_work.value.source_json == source_work.value.source_json
+        assert source_work.value.clear_json is None
+        assert collected_work.value.clear_json is None
+        assert source_work.value.origin.frame_index == 0
+        assert collected_work.value.origin.frame_index == 1
+        assert source_work.value.record_id != collected_work.value.record_id
+        assert source_work.metadata is not None
+        assert source_work.metadata.effective_event_type == "m.room_key_request"
+        assert source_work.metadata.decryption is _DecryptionDisposition.NONE
+        assert source_work.metadata.decryption_verified is None
+        assert source_work.metadata.decrypted_to_device_kind is None
+        assert source_work.metadata.callback_route is None
+        assert collected_work.metadata is not None
+        assert collected_work.metadata.effective_event_type == "m.room_key_request"
+        assert collected_work.metadata.decryption is _DecryptionDisposition.NONE
+        assert collected_work.metadata.decryption_verified is None
+        assert collected_work.metadata.decrypted_to_device_kind is None
+        assert collected_work.metadata.callback_route is _CallbackRoute.TO_DEVICE
+
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert batch.records == (source_work.value,)
+        outstanding = _owned_delivery_frontier(connection)
+        assert outstanding == (
+            1,
+            None,
+            source_work.value.record_id,
+            batch.created_revision,
+            0,
+            batch.ref.sha256,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 2
+        )
+        e2ee_rows = _raw_e2ee_rows(connection)
+
+        def key_request_state() -> tuple[object, ...]:
+            return (
+                tuple(olm.received_key_requests.items()),
+                tuple(olm.key_request_from_untrusted.items()),
+                tuple(
+                    (target, tuple(requests.items()))
+                    for target, requests in sorted(
+                        olm.key_requests_waiting_for_session.items()
+                    )
+                ),
+                tuple(olm.key_request_devices_no_session),
+                tuple(olm.outgoing_to_device_messages),
+                tuple(
+                    (target, tuple(events))
+                    for target, events in sorted(olm.key_re_requests_events.items())
+                ),
+            )
+
+        prepared_key_request_state = key_request_state()
+        authenticated_views: list[object] = []
+        acked_refs: list[BatchRef] = []
+        forbidden_paths: list[str] = []
+        real_load_settlement = session._journal._load_batch_settlement
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_authenticated_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view == (source_work, None)
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            authenticated_views.append(view)
+            return view
+
+        def observe_acknowledge(ref: BatchRef) -> None:
+            assert authenticated_views == [(source_work, None)]
+            assert forbidden_paths == []
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 2
+            )
+            assert _raw_e2ee_rows(connection) == e2ee_rows
+            assert key_request_state() == prepared_key_request_state
+            acked_refs.append(ref)
+            real_acknowledge(ref)
+
+        def forbid_sync(name: str):
+            def forbidden(*_args: object, **_kwargs: object) -> None:
+                forbidden_paths.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden
+
+        def forbid_async(name: str):
+            async def forbidden(*_args: object, **_kwargs: object) -> None:
+                forbidden_paths.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session._journal,
+                "_load_batch_settlement",
+                observe_authenticated_settlement,
+            )
+            patch.setattr(
+                session._journal,
+                "acknowledge_batch",
+                observe_acknowledge,
+            )
+            patch.setattr(
+                "nio.ingest.coordinator.load_json",
+                forbid_sync("coordinator.load_json"),
+            )
+            patch.setattr(
+                "nio.ingest.coordinator.canonical_json",
+                forbid_sync("coordinator.canonical_json"),
+            )
+            patch.setattr(
+                ToDeviceEvent,
+                "parse_event",
+                classmethod(forbid_sync("ToDeviceEvent.parse_event")),
+            )
+            patch.setattr(
+                RoomKeyRequest,
+                "from_dict",
+                classmethod(forbid_sync("RoomKeyRequest.from_dict")),
+            )
+            patch.setattr(
+                RoomKeyRequestCancellation,
+                "from_dict",
+                classmethod(forbid_sync("RoomKeyRequestCancellation.from_dict")),
+            )
+            for name in (
+                "_handle_decrypt_to_device",
+                "_handle_olm_events",
+                "_collect_key_requests",
+                "_publish_recovery_outcome",
+            ):
+                patch.setattr(client, name, forbid_sync(f"client.{name}"))
+            for name in (
+                "_handle_expired_verifications",
+                "_handle_sync",
+                "_handle_to_device",
+                "_on_event_admission",
+                "_on_response",
+                "_on_to_device",
+                "_pump_sync_recovery",
+            ):
+                patch.setattr(client, name, forbid_async(f"client.{name}"))
+            for name in (
+                "handle_to_device_event",
+                "_handle_key_requests",
+                "decrypt_event",
+                "_decrypt_megolm_no_error",
+                "decrypt_megolm_event",
+                "clear_verifications",
+                "collect_key_requests",
+                "update_tracked_users",
+                "add_changed_users",
+                "save_account",
+            ):
+                patch.setattr(olm, name, forbid_sync(f"olm.{name}"))
+
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        connection.set_trace_callback(None)
+        assert authenticated_views == [(source_work, None)]
+        assert acked_refs == [batch.ref]
+        assert forbidden_paths == []
+        assert client.send_count == 0
+        assert client.send_calls == []
+        assert _raw_e2ee_rows(connection) == e2ee_rows
+        assert key_request_state() == prepared_key_request_state
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+
+        synthetic = session.next_batch(max_records=1)
+        assert synthetic is not None
+        assert synthetic.ref.sequence == 1
+        assert synthetic.records == (collected_work.value,)
+        synthetic_view = session._journal._load_batch_settlement(synthetic)
+        assert synthetic_view == (collected_work, None)
+        assert _raw_e2ee_rows(connection) == e2ee_rows
+        assert key_request_state() == prepared_key_request_state
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        _PreparationPhase.EXPIRED_VERIFICATION,
+        _PreparationPhase.COLLECTED_KEY_REQUEST,
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_settle_synthetic_to_device_phase_callbacks_without_replay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: _PreparationPhase,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    request_id = "settlement-synthetic-request"
+    request_source = {
+        "content": {
+            "action": "request",
+            "body": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": ROOM,
+                "sender_key": "settlement-synthetic-sender-key",
+                "session_id": "settlement-synthetic-session",
+            },
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    cancellation_source = {
+        "content": {
+            "action": "request_cancellation",
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    expired_source = {
+        "content": {
+            "code": "m.timeout",
+            "reason": "Expired",
+            "transaction_id": "settlement-expired-verification",
+        },
+        "sender": ACCOUNT,
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        pending_request = ToDeviceEvent.parse_event(request_source)
+        expired_event = KeyVerificationCancel.from_dict(expired_source)
+        assert type(pending_request) is RoomKeyRequest
+        assert type(expired_event) is KeyVerificationCancel
+        olm.key_request_from_untrusted[request_id] = pending_request
+        clear_calls: list[None] = []
+
+        def clear_verifications() -> list[KeyVerificationCancel]:
+            clear_calls.append(None)
+            return [expired_event]
+
+        monkeypatch.setattr(olm, "clear_verifications", clear_verifications)
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "synthetic-to-device-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": [cancellation_source]},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert clear_calls == [None]
+        assert olm.key_request_from_untrusted == {}
+        assert olm.received_key_requests == {}
+
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(inventory.work) == 3
+        phase_work = {
+            work.metadata.preparation_phase: work
+            for work in inventory.work
+            if work.metadata is not None
+        }
+        assert set(phase_work) == {
+            _PreparationPhase.SOURCE,
+            _PreparationPhase.EXPIRED_VERIFICATION,
+            _PreparationPhase.COLLECTED_KEY_REQUEST,
+        }
+        target = phase_work[phase]
+        assert type(target.value) is EventRecord
+        record = target.value
+        metadata = target.metadata
+        assert metadata is not None
+        expected_source = (
+            expired_source
+            if phase is _PreparationPhase.EXPIRED_VERIFICATION
+            else cancellation_source
+        )
+        expected_type = (
+            "m.key.verification.cancel"
+            if phase is _PreparationPhase.EXPIRED_VERIFICATION
+            else "m.room_key_request"
+        )
+        assert record.kind is RecordKind.TO_DEVICE
+        assert type(record.origin) is RecordOrigin
+        assert record.origin.frame_index == (
+            1 if phase is _PreparationPhase.EXPIRED_VERIFICATION else 2
+        )
+        assert record.room_id is None
+        assert record.membership_epoch is None
+        assert record.room_sequence is None
+        assert record.event_id is None
+        assert record.provenance is None
+        assert record.source_json == canonical_json(expected_source)
+        assert record.clear_json is None
+        assert metadata.record_id == record.record_id
+        assert metadata.preparation_phase is phase
+        assert metadata.effective_event_type == expected_type
+        assert metadata.decryption is _DecryptionDisposition.NONE
+        assert metadata.decryption_verified is None
+        assert metadata.decrypted_to_device_kind is None
+        assert metadata.callback_route is _CallbackRoute.TO_DEVICE
+
+        predecessors = {
+            _PreparationPhase.EXPIRED_VERIFICATION: (
+                phase_work[_PreparationPhase.SOURCE].value,
+            ),
+            _PreparationPhase.COLLECTED_KEY_REQUEST: (
+                phase_work[_PreparationPhase.SOURCE].value,
+                phase_work[_PreparationPhase.EXPIRED_VERIFICATION].value,
+            ),
+        }[phase]
+        for predecessor in predecessors:
+            prior = session.next_batch(max_records=1)
+            assert prior is not None
+            assert prior.records == (predecessor,)
+            session.acknowledge_batch(prior.ref)
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert batch.records == (record,)
+        outstanding = _owned_delivery_frontier(connection)
+        e2ee_rows = _raw_e2ee_rows(connection)
+        assert connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[
+            0
+        ] == 3 - len(predecessors)
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    restored_connection = restored_session._owned_store.database.connection()
+    try:
+        assert restored_client.olm is not None
+        restored_olm = restored_client.olm
+        assert restored_session.next_batch(max_records=1) == batch
+        assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+        assert _owned_delivery_frontier(restored_connection) == outstanding
+        authenticated: list[object] = []
+        parsed: list[ToDeviceEvent] = []
+        routed: list[ToDeviceEvent] = []
+        callbacks: list[ToDeviceEvent] = []
+        acknowledged: list[BatchRef] = []
+        forbidden: list[str] = []
+        real_load = restored_session._journal._load_batch_settlement
+        real_ack = restored_session._journal.acknowledge_batch
+        real_cancel_parse = KeyVerificationCancel.from_dict
+        real_to_device_parse = ToDeviceEvent.parse_event
+        real_route = (
+            restored_client._on_expired_verifications
+            if phase is _PreparationPhase.EXPIRED_VERIFICATION
+            else restored_client._on_to_device
+        )
+
+        def observe_load(candidate):
+            assert candidate == batch
+            view = real_load(candidate)
+            assert view == (target, None)
+            assert restored_connection.in_transaction is False
+            assert restored_session._journal._owner._depth == 0
+            assert restored_session._journal._owner.database.transaction_depth() == 0
+            authenticated.append(view)
+            return view
+
+        def assert_outside_store() -> None:
+            assert authenticated == [(target, None)]
+            assert restored_connection.in_transaction is False
+            assert restored_session._journal._owner._depth == 0
+            assert restored_session._journal._owner.database.transaction_depth() == 0
+            assert _owned_delivery_frontier(restored_connection) == outstanding
+            assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+
+        def observe_cancel_parse(_cls, source):
+            assert phase is _PreparationPhase.EXPIRED_VERIFICATION
+            assert source == expected_source
+            assert "type" not in source
+            assert_outside_store()
+            event = real_cancel_parse(source)
+            assert type(event) is KeyVerificationCancel
+            parsed.append(event)
+            return event
+
+        def observe_to_device_parse(_cls, source):
+            assert phase is _PreparationPhase.COLLECTED_KEY_REQUEST
+            assert source == expected_source
+            assert_outside_store()
+            event = real_to_device_parse(source)
+            assert type(event) is RoomKeyRequestCancellation
+            parsed.append(event)
+            return event
+
+        async def observe_route(event: ToDeviceEvent) -> None:
+            assert parsed == [event]
+            assert_outside_store()
+            routed.append(event)
+            await real_route(event)
+
+        async def callback(event: ToDeviceEvent) -> None:
+            assert routed == [event]
+            assert_outside_store()
+            callbacks.append(event)
+
+        def observe_ack(ref: BatchRef) -> None:
+            assert callbacks == parsed
+            assert forbidden == []
+            assert_outside_store()
+            acknowledged.append(ref)
+            real_ack(ref)
+
+        def forbid(name: str):
+            def forbidden_path(*_args: object, **_kwargs: object) -> None:
+                forbidden.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden_path
+
+        restored_client.add_to_device_callback(callback, None)
+        statements: list[str] = []
+        restored_connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                restored_session._journal,
+                "_load_batch_settlement",
+                observe_load,
+            )
+            patch.setattr(
+                restored_session._journal,
+                "acknowledge_batch",
+                observe_ack,
+            )
+            if phase is _PreparationPhase.EXPIRED_VERIFICATION:
+                patch.setattr(
+                    KeyVerificationCancel,
+                    "from_dict",
+                    classmethod(observe_cancel_parse),
+                )
+                patch.setattr(
+                    ToDeviceEvent,
+                    "parse_event",
+                    classmethod(forbid("ToDeviceEvent.parse_event")),
+                )
+                patch.setattr(
+                    restored_client,
+                    "_on_expired_verifications",
+                    observe_route,
+                )
+                patch.setattr(
+                    restored_client,
+                    "_on_to_device",
+                    forbid("client._on_to_device"),
+                )
+            else:
+                patch.setattr(
+                    ToDeviceEvent,
+                    "parse_event",
+                    classmethod(observe_to_device_parse),
+                )
+                patch.setattr(
+                    KeyVerificationCancel,
+                    "from_dict",
+                    classmethod(forbid("KeyVerificationCancel.from_dict")),
+                )
+                patch.setattr(restored_client, "_on_to_device", observe_route)
+                patch.setattr(
+                    restored_client,
+                    "_on_expired_verifications",
+                    forbid("client._on_expired_verifications"),
+                )
+            for name in ("clear_verifications", "collect_key_requests"):
+                patch.setattr(restored_olm, name, forbid(f"olm.{name}"))
+            patch.setattr(
+                restored_client,
+                "_handle_expired_verifications",
+                forbid("client._handle_expired_verifications"),
+            )
+            patch.setattr(
+                restored_client,
+                "_collect_key_requests",
+                forbid("client._collect_key_requests"),
+            )
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        restored_connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert len(parsed) == 1
+        assert routed == parsed
+        assert callbacks == parsed
+        assert acknowledged == [batch.ref]
+        assert forbidden == []
+        assert restored_client.send_count == 0
+        assert restored_client.send_calls == []
+        assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+        assert _owned_delivery_frontier(restored_connection) == (
+            batch.ref.sequence + 1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+    finally:
+        restored_connection.set_trace_callback(None)
+        await restored_session.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "decrypted_kind"),
+    (
+        ("forwarded", _DecryptedToDeviceKind.FORWARDED_ROOM_KEY),
+        ("dummy", _DecryptedToDeviceKind.DUMMY),
+        ("unknown", _DecryptedToDeviceKind.UNKNOWN),
+        ("bad", _DecryptedToDeviceKind.BAD),
+        ("unknown-bad", _DecryptedToDeviceKind.UNKNOWN_BAD),
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_settle_remaining_decrypted_to_device_exact_classes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    decrypted_kind: _DecryptedToDeviceKind,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    outer_sender_key = "settlement-outer-sender-key"
+    outer_source = {
+        "content": {
+            "algorithm": "m.olm.v1.curve25519-aes-sha2",
+            "ciphertext": {
+                "YWJjZA": {
+                    "body": "settlement-ciphertext",
+                    "type": 0,
+                }
+            },
+            "sender_key": outer_sender_key,
+        },
+        "sender": BOB,
+        "type": "m.room.encrypted",
+    }
+    if kind == "forwarded":
+        clear_input = {
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "forwarding_curve25519_key_chain": ["forwarded-curve-key"],
+                "room_id": ROOM,
+                "sender_claimed_ed25519_key": "forwarded-ed25519-key",
+                "sender_key": "forwarded-sender-key",
+                "session_id": "forwarded-session",
+                "session_key": "forwarded-session-secret",
+            },
+            "sender": BOB,
+            "type": "m.forwarded_room_key",
+        }
+        decrypted_event = ForwardedRoomKeyEvent.from_dict(
+            clear_input,
+            BOB,
+            outer_sender_key,
+        )
+    elif kind == "dummy":
+        clear_input = {
+            "content": {},
+            "keys": {"ed25519": "dummy-ed25519-key"},
+            "sender": BOB,
+            "sender_device": BOB_DEVICE,
+            "type": "m.dummy",
+        }
+        decrypted_event = DummyEvent.from_dict(
+            clear_input,
+            BOB,
+            outer_sender_key,
+        )
+    elif kind == "unknown":
+        clear_input = {
+            "content": {"value": "unknown"},
+            "sender": BOB,
+            "type": "org.example.settlement.unknown",
+        }
+        decrypted_event = UnknownToDeviceEvent.from_dict(clear_input)
+    elif kind == "bad":
+        clear_input = {
+            "content": {"value": "bad"},
+            "event_id": "$settlement-bad",
+            "origin_server_ts": 7,
+            "sender": BOB,
+            "type": "org.example.settlement.bad",
+        }
+        decrypted_event = BadEvent.from_dict(clear_input)
+    else:
+        assert kind == "unknown-bad"
+        clear_input = {
+            "content": {"value": "unknown-bad"},
+            "type": "org.example.settlement.unknown-bad",
+        }
+        decrypted_event = UnknownBadEvent(clear_input)
+    assert type(decrypted_event.source) is dict
+    clear = decrypted_event.source
+    assert canonical_json(clear) == canonical_json(decrypted_event.source)
+    if kind == "forwarded":
+        assert "session_key" not in clear["content"]
+
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        decrypt_calls: list[object] = []
+
+        def decrypt_to_device(event: object) -> object:
+            assert getattr(event, "source", None) == outer_source
+            decrypt_calls.append(event)
+            return decrypted_event
+
+        monkeypatch.setattr(client, "_handle_decrypt_to_device", decrypt_to_device)
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": f"decrypted-{kind}-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": [outer_source]},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert len(decrypt_calls) == 1
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.TO_DEVICE
+        assert type(record.origin) is RecordOrigin
+        assert record.origin.frame_index == 0
+        assert record.room_id is None
+        assert record.membership_epoch is None
+        assert record.room_sequence is None
+        assert record.event_id is None
+        assert record.provenance is None
+        assert record.source_json == canonical_json(outer_source)
+        assert record.clear_json == canonical_json(clear)
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(inventory.work) == 1
+        work = inventory.work[0]
+        assert work.value == record
+        metadata = work.metadata
+        assert metadata is not None
+        assert metadata.record_id == record.record_id
+        assert metadata.preparation_phase is _PreparationPhase.SOURCE
+        assert metadata.effective_event_type == clear["type"]
+        assert metadata.decryption is _DecryptionDisposition.DECRYPTED
+        assert metadata.decryption_verified is None
+        assert metadata.decrypted_to_device_kind is decrypted_kind
+        assert metadata.callback_route is _CallbackRoute.TO_DEVICE
+        outstanding = _owned_delivery_frontier(connection)
+        e2ee_rows = _raw_e2ee_rows(connection)
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    restored_connection = restored_session._owned_store.database.connection()
+    try:
+        assert restored_client.olm is not None
+        assert restored_client.store is not None
+        assert restored_session.next_batch(max_records=1) == batch
+        assert _owned_delivery_frontier(restored_connection) == outstanding
+        assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+        authenticated: list[object] = []
+        reconstructed: list[object] = []
+        routed: list[object] = []
+        callbacks: list[object] = []
+        acknowledgements: list[BatchRef] = []
+        forbidden: list[str] = []
+        real_load = restored_session._journal._load_batch_settlement
+        real_ack = restored_session._journal.acknowledge_batch
+        real_route = restored_client._on_to_device
+
+        def assert_outside_store() -> None:
+            assert authenticated == [(work, None)]
+            assert restored_connection.in_transaction is False
+            assert restored_session._journal._owner._depth == 0
+            assert restored_session._journal._owner.database.transaction_depth() == 0
+            assert _owned_delivery_frontier(restored_connection) == outstanding
+            assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+
+        def observe_load(candidate):
+            assert candidate == batch
+            view = real_load(candidate)
+            assert view == (work, None)
+            assert restored_connection.in_transaction is False
+            assert restored_session._journal._owner._depth == 0
+            assert restored_session._journal._owner.database.transaction_depth() == 0
+            authenticated.append(view)
+            return view
+
+        def assert_event(event: object) -> None:
+            assert type(event) is type(decrypted_event)
+            assert event.source == clear
+            if kind == "forwarded":
+                assert (
+                    event.sender,
+                    event.sender_key,
+                    event.room_id,
+                    event.session_id,
+                    event.algorithm,
+                ) == (
+                    BOB,
+                    outer_sender_key,
+                    ROOM,
+                    "forwarded-session",
+                    "m.megolm.v1.aes-sha2",
+                )
+            elif kind == "dummy":
+                assert (event.sender, event.sender_key, event.sender_device) == (
+                    BOB,
+                    outer_sender_key,
+                    BOB_DEVICE,
+                )
+            elif kind == "unknown":
+                assert (event.sender, event.type) == (BOB, clear["type"])
+            elif kind == "bad":
+                assert (
+                    event.event_id,
+                    event.sender,
+                    event.server_timestamp,
+                    event.type,
+                ) == ("$settlement-bad", BOB, 7, clear["type"])
+
+        def capture(event: object) -> object:
+            assert_outside_store()
+            reconstructed.append(event)
+            return event
+
+        real_forwarded_init = ForwardedRoomKeyEvent.__init__
+        real_dummy_parse = DummyEvent.from_dict
+        real_unknown_parse = UnknownToDeviceEvent.from_dict
+        real_bad_parse = BadEvent.from_dict
+        real_unknown_bad_init = UnknownBadEvent.__init__
+
+        def observe_forwarded_init(self, *args: object, **kwargs: object) -> None:
+            real_forwarded_init(self, *args, **kwargs)
+            capture(self)
+
+        def observe_dummy_parse(_cls, source, sender, sender_key):
+            assert (source, sender, sender_key) == (clear, BOB, outer_sender_key)
+            return capture(real_dummy_parse(source, sender, sender_key))
+
+        def observe_unknown_parse(_cls, source):
+            assert source == clear
+            return capture(real_unknown_parse(source))
+
+        def observe_bad_parse(_cls, source):
+            assert source == clear
+            return capture(real_bad_parse(source))
+
+        def observe_unknown_bad_init(
+            self,
+            source,
+            transaction_id=None,
+        ) -> None:
+            assert source == clear
+            real_unknown_bad_init(self, source, transaction_id)
+            capture(self)
+
+        async def observe_route(event: object) -> None:
+            assert reconstructed == [event]
+            assert_event(event)
+            assert_outside_store()
+            routed.append(event)
+            await real_route(event)  # type: ignore[arg-type]
+
+        async def callback(event: object) -> None:
+            assert routed == [event]
+            assert_event(event)
+            assert_outside_store()
+            callbacks.append(event)
+
+        def observe_ack(ref: BatchRef) -> None:
+            assert callbacks == reconstructed
+            assert forbidden == []
+            assert_outside_store()
+            acknowledgements.append(ref)
+            real_ack(ref)
+
+        def forbid(name: str):
+            def forbidden_path(*_args: object, **_kwargs: object) -> None:
+                forbidden.append(name)
+                raise AssertionError(f"settlement invoked {name}")
+
+            return forbidden_path
+
+        restored_client.add_to_device_callback(callback, None)
+        statements: list[str] = []
+        restored_connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                restored_session._journal,
+                "_load_batch_settlement",
+                observe_load,
+            )
+            patch.setattr(restored_session._journal, "acknowledge_batch", observe_ack)
+            patch.setattr(restored_client, "_on_to_device", observe_route)
+            patch.setattr(
+                ToDeviceEvent,
+                "parse_event",
+                classmethod(forbid("ToDeviceEvent.parse_event")),
+            )
+            if kind == "forwarded":
+                patch.setattr(ForwardedRoomKeyEvent, "__init__", observe_forwarded_init)
+                patch.setattr(
+                    ForwardedRoomKeyEvent,
+                    "from_dict",
+                    classmethod(forbid("ForwardedRoomKeyEvent.from_dict")),
+                )
+            elif kind == "dummy":
+                patch.setattr(
+                    DummyEvent,
+                    "from_dict",
+                    classmethod(observe_dummy_parse),
+                )
+            elif kind == "unknown":
+                patch.setattr(
+                    UnknownToDeviceEvent,
+                    "from_dict",
+                    classmethod(observe_unknown_parse),
+                )
+            elif kind == "bad":
+                patch.setattr(
+                    BadEvent,
+                    "from_dict",
+                    classmethod(observe_bad_parse),
+                )
+            else:
+                patch.setattr(UnknownBadEvent, "__init__", observe_unknown_bad_init)
+            for name in (
+                "receive_response",
+                "_receive_sync_family",
+                "_handle_sync",
+                "_handle_sliding_sync",
+                "_handle_to_device",
+                "_handle_decrypt_to_device",
+                "_handle_olm_events",
+                "_prepare_ingestion_frame",
+            ):
+                patch.setattr(restored_client, name, forbid(f"client.{name}"))
+            for name in (
+                "handle_to_device_event",
+                "decrypt_event",
+                "_try_decrypt",
+                "_handle_olm_event",
+                "decrypt",
+                "save_session",
+                "save_inbound_group_session",
+                "save_account",
+                "collect_key_requests",
+                "clear_verifications",
+            ):
+                patch.setattr(restored_client.olm, name, forbid(f"olm.{name}"))
+            patch.setattr(
+                restored_client.olm.session_store,
+                "get",
+                forbid("session_store.get"),
+            )
+            patch.setattr(
+                restored_client.olm.inbound_group_store,
+                "get",
+                forbid("inbound_group_store.get"),
+            )
+            for name in (
+                "load_account",
+                "load_sessions",
+                "load_inbound_group_sessions",
+                "save_account",
+                "save_session",
+                "save_inbound_group_session",
+            ):
+                patch.setattr(restored_client.store, name, forbid(f"store.{name}"))
+            patch.setattr(
+                restored_session,
+                "_materialize_oldest_frame",
+                forbid("session._materialize_oldest_frame"),
+            )
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        restored_connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert len(reconstructed) == 1
+        assert reconstructed == routed == callbacks
+        assert acknowledgements == [batch.ref]
+        assert forbidden == []
+        assert restored_client.send_count == 0
+        assert restored_client.send_calls == []
+        assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+        assert _owned_delivery_frontier(restored_connection) == (
+            batch.ref.sequence + 1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+    finally:
+        restored_connection.set_trace_callback(None)
+        await restored_session.close()
+
+
+def _claimed_owned_global_settlement(tmp_path):
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    olm = client.olm
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.save_account()
+    sources = (
+        {
+            "content": {"index": 0},
+            "type": "org.example.settlement.retry",
+        },
+        {
+            "content": {"index": 1},
+            "type": "org.example.settlement.retry",
+        },
+    )
+    stage_classic(
+        bootstrap,
+        {
+            "account_data": {"events": list(sources)},
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+            "next_batch": "settlement-retry-token",
+            "presence": {"events": []},
+            "rooms": {},
+            "to_device": {"events": []},
+        },
+    )
+    materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+    assert materialized.status is MaterializeStatus.MATERIALIZED
+    batch = session.next_batch(max_records=1)
+    assert batch is not None
+    assert len(batch.records) == 1
+    assert type(batch.records[0]) is EventRecord
+    assert batch.records[0].source_json == canonical_json(sources[0])
+    connection = session._owned_store.database.connection()
+    assert connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 2
+    return client, session, connection, batch, sources
+
+
+def _owned_delivery_frontier(connection) -> tuple[object, ...]:
+    row = connection.execute(
+        "SELECT delivery_next_sequence, delivery_acknowledged_sha256, "
+        "delivery_outstanding_work_id, delivery_outstanding_ready_revision, "
+        "delivery_outstanding_ready_ordinal, "
+        "delivery_outstanding_batch_sha256 FROM NioIngestMeta"
+    ).fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_blocks_callback_reentrant_ack_before_later_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    outstanding = _owned_delivery_frontier(connection)
+    graph = tuple(connection.iterdump())
+    authenticated: list[object] = []
+    real_load_settlement = session._journal._load_batch_settlement
+
+    def observe_settlement(candidate):
+        view = real_load_settlement(candidate)
+        authenticated.append(view)
+        return view
+
+    monkeypatch.setattr(
+        session._journal,
+        "_load_batch_settlement",
+        observe_settlement,
+    )
+    callback_order: list[str] = []
+    sentinel = RuntimeError("later callback failed")
+
+    async def reentrant_ack(_event: object) -> None:
+        callback_order.append("ack")
+        with pytest.raises(LocalProtocolError):
+            session.acknowledge_batch(batch.ref)
+        assert _owned_delivery_frontier(connection) == outstanding
+        assert tuple(connection.iterdump()) == graph
+
+    async def fail_later(_event: object) -> None:
+        callback_order.append("fail")
+        raise sentinel
+
+    client.add_global_account_data_callback(reentrant_ack, None)
+    client.add_global_account_data_callback(fail_later, None)
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+        assert failure.value is sentinel
+        assert callback_order == ["ack", "fail"]
+        assert len(authenticated) == 1
+        assert _owned_delivery_frontier(connection) == outstanding
+        assert tuple(connection.iterdump()) == graph
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 2
+        )
+        client._assert_ingestion_not_poisoned()
+
+        await session._settle_batch(
+            batch,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert callback_order == ["ack", "fail"]
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_rejects_recursive_same_task_settlement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    authenticated: list[object] = []
+    real_load_settlement = session._journal._load_batch_settlement
+
+    def observe_settlement(candidate):
+        view = real_load_settlement(candidate)
+        authenticated.append(view)
+        return view
+
+    monkeypatch.setattr(
+        session._journal,
+        "_load_batch_settlement",
+        observe_settlement,
+    )
+    callback_depth = 0
+    callback_calls = 0
+
+    async def callback(_event: object) -> None:
+        nonlocal callback_calls, callback_depth
+        callback_calls += 1
+        callback_depth += 1
+        try:
+            if callback_depth > 1:
+                raise AssertionError("recursive settlement reentered callbacks")
+            with pytest.raises(LocalProtocolError):
+                await session._settle_batch(
+                    batch,
+                    receipt_new=True,
+                    semantic_event_new=False,
+                )
+            assert len(authenticated) == 1
+        finally:
+            callback_depth -= 1
+
+    client.add_global_account_data_callback(callback, None)
+    try:
+        await asyncio.wait_for(
+            session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            ),
+            timeout=1,
+        )
+        assert callback_calls == 1
+        assert len(authenticated) == 1
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_serializes_concurrent_calls_for_same_batch(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    authenticated: list[object] = []
+    real_load_settlement = session._journal._load_batch_settlement
+
+    def observe_settlement(candidate):
+        view = real_load_settlement(candidate)
+        authenticated.append(view)
+        return view
+
+    monkeypatch.setattr(
+        session._journal,
+        "_load_batch_settlement",
+        observe_settlement,
+    )
+    callback_events: list[object] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        entered.set()
+        await release.wait()
+
+    client.add_global_account_data_callback(callback, None)
+    first = asyncio.create_task(
+        session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+    )
+    second_started = asyncio.Event()
+
+    async def settle_second() -> None:
+        second_started.set()
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+    second: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        second = asyncio.create_task(settle_second())
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        pre_release_callbacks = len(callback_events)
+        pre_release_views = len(authenticated)
+        second_pending = not second.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+        assert pre_release_callbacks == 1
+        assert pre_release_views == 1
+        assert second_pending
+        assert len(callback_events) == 1
+        assert len(authenticated) == 2
+        assert sum(view is not None for view in authenticated) == 1
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        release.set()
+        pending = [task for task in (first, second) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_duplicate_receipts_ack_without_callbacks_or_rewrites(
+    tmp_path,
+) -> None:
+    client, session, connection, first, sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    callbacks: list[object] = []
+
+    async def callback(event: object) -> None:
+        callbacks.append(event)
+
+    client.add_global_account_data_callback(callback, None)
+    labels: list[str] = []
+    session._journal.set_transition_statement_hook(labels.append)
+    try:
+        await session._settle_batch(
+            first,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert callbacks == []
+        assert labels == [
+            "delivery_work_delete",
+            "delivery_ack_meta_cas",
+            "before_commit",
+            "commit",
+        ]
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            first.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+
+        labels.clear()
+        no_outstanding = tuple(connection.iterdump())
+        await session._settle_batch(
+            first,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert callbacks == []
+        assert labels == []
+        assert tuple(connection.iterdump()) == no_outstanding
+
+        second = session.next_batch(max_records=1)
+        assert second is not None
+        assert second.ref.sequence == 1
+        assert second.records[0].source_json == canonical_json(sources[1])
+        labels.clear()
+        next_outstanding = tuple(connection.iterdump())
+        next_frontier = _owned_delivery_frontier(connection)
+        await session._settle_batch(
+            first,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert callbacks == []
+        assert labels == []
+        assert tuple(connection.iterdump()) == next_outstanding
+        assert _owned_delivery_frontier(connection) == next_frontier
+
+        await session._settle_batch(
+            second,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert callbacks == []
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    (RuntimeError, asyncio.CancelledError),
+    ids=("error", "cancel"),
+)
+@pytest.mark.asyncio
+async def test_owned_settle_callback_failure_keeps_work_for_receipt_replay(
+    tmp_path,
+    error_type,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    sentinel = error_type("callback interrupted")
+    callback_events: list[object] = []
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        raise sentinel
+
+    client.add_global_account_data_callback(callback, None)
+    outstanding = _owned_delivery_frontier(connection)
+    graph = tuple(connection.iterdump())
+    try:
+        with pytest.raises(error_type) as failure:
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+        assert failure.value is sentinel
+        assert len(callback_events) == 1
+        assert _owned_delivery_frontier(connection) == outstanding
+        assert tuple(connection.iterdump()) == graph
+        assert session.next_batch(max_records=1) == batch
+        client._assert_ingestion_not_poisoned()
+
+        await session._settle_batch(
+            batch,
+            receipt_new=False,
+            semantic_event_new=False,
+        )
+        assert len(callback_events) == 1
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize("boundary", ("before_commit", "commit"))
+@pytest.mark.asyncio
+async def test_owned_settle_ack_uncertainty_retries_without_second_callback(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    callback_events: list[object] = []
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+
+    client.add_global_account_data_callback(callback, None)
+    parsed_events: list[object] = []
+    real_parse_account_data = AccountDataEvent.parse_event
+
+    def observe_parse(
+        _event_type: type[AccountDataEvent],
+        source: dict[object, object],
+    ) -> object:
+        event = real_parse_account_data(source)
+        parsed_events.append(event)
+        return event
+
+    monkeypatch.setattr(
+        AccountDataEvent,
+        "parse_event",
+        classmethod(observe_parse),
+    )
+    sentinel = RuntimeError(f"ack {boundary} uncertainty")
+    labels: list[str] = []
+
+    def abort(label: str) -> None:
+        labels.append(label)
+        if label == boundary:
+            raise sentinel
+
+    session._journal.set_transition_statement_hook(abort)
+    outstanding = _owned_delivery_frontier(connection)
+    graph = tuple(connection.iterdump())
+    expected_labels = (
+        "delivery_work_delete",
+        "delivery_ack_meta_cas",
+        "before_commit",
+        "commit",
+    )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+        connection.set_trace_callback(None)
+        assert failure.value is sentinel
+        assert len(callback_events) == 1
+        assert len(parsed_events) == 1
+        assert labels == list(expected_labels[: expected_labels.index(boundary) + 1])
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        assert normalized.count("BEGIN IMMEDIATE") == 1
+        assert any(
+            statement.startswith("DELETE FROM NIOINGESTWORK")
+            for statement in normalized
+        )
+        assert any(
+            statement.startswith("UPDATE NIOINGESTMETA") for statement in normalized
+        )
+        client._assert_ingestion_not_poisoned()
+
+        if boundary == "before_commit":
+            assert normalized.count("ROLLBACK") == 1
+            assert normalized.count("COMMIT") == 0
+            assert tuple(connection.iterdump()) == graph
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert session.next_batch(max_records=1) == batch
+            retry_receipt_new = False
+        else:
+            assert normalized.count("COMMIT") == 1
+            assert normalized.count("ROLLBACK") == 0
+            assert tuple(connection.iterdump()) != graph
+            assert _owned_delivery_frontier(connection) == (
+                1,
+                batch.ref.sha256,
+                None,
+                None,
+                None,
+                None,
+            )
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 1
+            )
+            retry_receipt_new = True
+
+        session._journal.set_transition_statement_hook(None)
+        labels.clear()
+        parsed_events.clear()
+        before_retry = tuple(connection.iterdump())
+        await session._settle_batch(
+            batch,
+            receipt_new=retry_receipt_new,
+            semantic_event_new=False,
+        )
+        assert len(callback_events) == 1
+        if boundary == "before_commit":
+            assert len(parsed_events) == 1
+            assert tuple(connection.iterdump()) != before_retry
+        else:
+            assert parsed_events == []
+            assert tuple(connection.iterdump()) == before_retry
+        assert labels == []
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 1
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        session._journal.set_transition_statement_hook(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_rechecks_poison_after_callback_before_ack(tmp_path) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    outstanding = _owned_delivery_frontier(connection)
+    graph = tuple(connection.iterdump())
+    callback_events: list[object] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        entered.set()
+        await release.wait()
+
+    client.add_global_account_data_callback(callback, None)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    settlement = asyncio.create_task(
+        session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+    )
+    poison_message = "owned ingestion session is poisoned; reopen with a fresh client"
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        client._poison_ingestion()
+        release.set()
+        with pytest.raises(LocalProtocolError, match=poison_message):
+            await settlement
+
+        assert len(callback_events) == 1
+        assert _owned_delivery_frontier(connection) == outstanding
+        assert tuple(connection.iterdump()) == graph
+        assert session._settlement_task is None
+        assert session._settlement_lock.locked() is False
+
+        statements.clear()
+        with pytest.raises(LocalProtocolError, match=poison_message):
+            await session._settle_batch(
+                batch,
+                receipt_new=False,
+                semantic_event_new=False,
+            )
+        assert statements == []
+        assert _owned_delivery_frontier(connection) == outstanding
+        assert tuple(connection.iterdump()) == graph
+    finally:
+        release.set()
+        await asyncio.gather(settlement, return_exceptions=True)
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_cancels_blocked_settlement_before_detach_and_replays(
+    tmp_path,
+) -> None:
+    client, session, _connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    generation = session._journal.load_owner().consumer_generation
+    saved_store = session._owned_store
+    callback_events: list[object] = []
+    entered = asyncio.Event()
+    callback_cancelled = asyncio.Event()
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert client.store is saved_store
+            assert session._detached is False
+            callback_cancelled.set()
+            raise
+
+    client.add_global_account_data_callback(callback, None)
+    settlement = asyncio.create_task(
+        session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+    )
+    close_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        close_task = asyncio.create_task(session.close())
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await settlement
+        await asyncio.wait_for(close_task, timeout=1)
+        assert callback_events
+        assert len(callback_events) == 1
+        assert session._closed
+        assert client.store is None and client.olm is None
+    finally:
+        if not settlement.done():
+            settlement.cancel()
+        await asyncio.gather(settlement, return_exceptions=True)
+        if close_task is not None:
+            if not close_task.done():
+                close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        if not session._closed:
+            await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    try:
+        assert fresh_session.next_batch(max_records=1) == batch
+    finally:
+        await fresh_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_callback_close_fails_before_lease_and_outer_settles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session, connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    saved_store = session._owned_store
+    prepare_close_calls: list[None] = []
+    real_prepare_close = session._lease._prepare_close
+
+    def observe_prepare_close() -> None:
+        prepare_close_calls.append(None)
+        raise AssertionError("callback close reached lease preparation")
+
+    monkeypatch.setattr(session._lease, "_prepare_close", observe_prepare_close)
+    callback_events: list[object] = []
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        with pytest.raises(LocalProtocolError):
+            await session.close()
+        assert prepare_close_calls == []
+        assert client.store is saved_store
+        assert session._close_task is None
+        assert session._detached is False
+
+    client.add_global_account_data_callback(callback, None)
+    try:
+        await asyncio.wait_for(
+            session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            ),
+            timeout=1,
+        )
+        assert len(callback_events) == 1
+        assert prepare_close_calls == []
+        assert _owned_delivery_frontier(connection) == (
+            1,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        second = session.next_batch(max_records=1)
+        assert second is not None
+        session.acknowledge_batch(second.ref)
+        assert session.next_batch(max_records=1) is None
+        client._assert_ingestion_not_poisoned()
+    finally:
+        monkeypatch.setattr(session._lease, "_prepare_close", real_prepare_close)
+        if not session._closed:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_close_waits_for_cancel_suppressing_callback_and_prevents_ack(
+    tmp_path,
+) -> None:
+    client, session, _connection, batch, _sources = _claimed_owned_global_settlement(
+        tmp_path
+    )
+    generation = session._journal.load_owner().consumer_generation
+    saved_store = session._owned_store
+    callback_events: list[object] = []
+    entered = asyncio.Event()
+    cancellation_suppressed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def callback(event: object) -> None:
+        callback_events.append(event)
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_suppressed.set()
+            await release.wait()
+
+    client.add_global_account_data_callback(callback, None)
+    settlement = asyncio.create_task(
+        session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+    )
+    first_close: asyncio.Task[None] | None = None
+    second_close: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        first_close = asyncio.create_task(session.close())
+        await asyncio.wait_for(cancellation_suppressed.wait(), timeout=1)
+        assert first_close.done() is False
+        assert client.store is saved_store
+        assert session._detached is False
+
+        second_close = asyncio.create_task(session.close())
+        first_close.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert first_close.done() is False
+        assert second_close.done() is False
+        assert client.store is saved_store
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        await asyncio.wait_for(second_close, timeout=1)
+        with pytest.raises(LocalProtocolError, match="ingestion session is closed"):
+            await settlement
+        assert len(callback_events) == 1
+        assert session._closed
+        assert client.store is None and client.olm is None
+    finally:
+        release.set()
+        if not settlement.done():
+            settlement.cancel()
+        await asyncio.gather(settlement, return_exceptions=True)
+        for task in (first_close, second_close):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (first_close, second_close) if task is not None),
+            return_exceptions=True,
+        )
+        if not session._closed:
+            await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    fresh_client = owned_client(tmp_path)
+    fresh_session = open_owned_session(fresh_client, reopened, generation)
+    try:
+        assert fresh_session.next_batch(max_records=1) == batch
+    finally:
+        await fresh_session.close()
+
+
+def _install_owned_settlement_callback_tripwires(
+    client: RecordingClient,
+    forbidden: list[str],
+) -> None:
+    async def one_arg(_event: object) -> None:
+        forbidden.append("one-arg")
+        raise AssertionError("settlement invoked an auxiliary callback")
+
+    async def room_event(_room: object, _event: object) -> None:
+        forbidden.append("room-event")
+        raise AssertionError("settlement invoked a room callback")
+
+    async def admission(
+        _room: object,
+        _event: object,
+        _provenance: object,
+    ) -> None:
+        forbidden.append("admission")
+        raise AssertionError("settlement invoked event admission")
+
+    async def response(_response: object) -> None:
+        forbidden.append("response")
+        raise AssertionError("settlement invoked a response callback")
+
+    client.add_global_account_data_callback(one_arg, None)
+    client.add_presence_callback(one_arg, None)
+    client.add_to_device_callback(one_arg, None)
+    client.add_event_callback(room_event, None)
+    client.add_ephemeral_callback(room_event, None)
+    client.add_room_account_data_callback(room_event, None)
+    client.add_event_admission_callback(admission, None)
+    client.add_response_callback(response, None)
+
+
+def _seed_owned_room_auxiliary_sentinels(room: nio.MatrixRoom, label: str):
+    expected_tags: dict[str, dict[str, float] | None] = {
+        f"u.settlement.{label}": {"order": 0.375}
+    }
+    room.tags = {f"u.settlement.{label}": {"order": 0.375}}
+    expected_typing_users = (BOB,)
+    room.typing_users = [BOB]
+    expected_fully_read_marker = f"$settlement-{label}-fully-read"
+    room.fully_read_marker = expected_fully_read_marker
+    expected_presence = (
+        "online",
+        4242,
+        True,
+        f"{label} presence sentinel",
+    )
+    own_user = room.users[ACCOUNT]
+    (
+        own_user.presence,
+        own_user.last_active_ago,
+        own_user.currently_active,
+        own_user.status_msg,
+    ) = expected_presence
+    return (
+        expected_tags,
+        expected_typing_users,
+        expected_fully_read_marker,
+        expected_presence,
+    )
+
+
+def _assert_owned_room_auxiliary_sentinels(
+    client: RecordingClient,
+    room: nio.MatrixRoom,
+    expected,
+) -> None:
+    (
+        expected_tags,
+        expected_typing_users,
+        expected_fully_read_marker,
+        expected_presence,
+    ) = expected
+    current_room = client.rooms[ROOM]
+    assert current_room is room
+    assert current_room.tags == expected_tags
+    assert tuple(current_room.typing_users) == expected_typing_users
+    assert current_room.fully_read_marker == expected_fully_read_marker
+    own_user = current_room.users[ACCOUNT]
+    assert (
+        own_user.presence,
+        own_user.last_active_ago,
+        own_user.currently_active,
+        own_user.status_msg,
+    ) == expected_presence
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_room_lifecycle_overlays_snapshot_then_acks_without_callbacks(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    try:
+        stage_classic(bootstrap, _local_room_body())
+        result = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert result.status is MaterializeStatus.MATERIALIZED
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        hydrated = normalize_hydration_response(
+            pending[0],
+            own_user_id=ACCOUNT,
+            response_body=hydration_state(),
+        )
+        assert session._journal.apply_hydration_result(result=hydrated) is not None
+        batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind.value == "room_lifecycle"
+        assert record.room_id == ROOM
+
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        snapshot = aggregate.room_snapshot
+        assert snapshot is not None
+        assert snapshot.name == "Local transition room"
+        continuity = aggregate.continuity
+        snapshot = replace(
+            snapshot,
+            membership_epoch=snapshot.membership_epoch + 7,
+            own_membership="leave",
+        )
+        aggregate = replace(aggregate, room_snapshot=snapshot)
+        _reseal_local_aggregate(session, aggregate)
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            reloaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert reloaded is not None and reloaded[1] == aggregate
+        assert aggregate.continuity == continuity
+        room = client.rooms[ROOM]
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        auxiliary_sentinels = _seed_owned_room_auxiliary_sentinels(
+            room,
+            "lifecycle",
+        )
+        room.name = "corrupted lifecycle projection"
+        room.users[ACCOUNT].display_name = "Corrupted Alice"
+        room.users[ACCOUNT].power_level = 88
+        room.power_levels.users[ACCOUNT] = 88
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            != snapshot
+        )
+
+        forbidden: list[str] = []
+        _install_owned_settlement_callback_tripwires(client, forbidden)
+
+        def forbid_event_parse(
+            _event_type: type[Event],
+            _source: dict[object, object],
+        ) -> object:
+            raise AssertionError("room lifecycle settlement parsed an event")
+
+        monkeypatch.setattr(Event, "parse_event", classmethod(forbid_event_parse))
+        authenticated: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            assert work.value == record
+            assert work.metadata is None
+            assert room_value == aggregate
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            authenticated.append(view)
+            return view
+
+        monkeypatch.setattr(
+            session._journal,
+            "_load_batch_settlement",
+            observe_settlement,
+        )
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert authenticated
+            assert ref == batch.ref
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            _assert_owned_room_auxiliary_sentinels(
+                client,
+                room,
+                auxiliary_sentinels,
+            )
+            assert (
+                _room_snapshot(
+                    client.rooms[ROOM],
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        monkeypatch.setattr(
+            session._journal,
+            "acknowledge_batch",
+            observe_acknowledgement,
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert acknowledgements == [batch.ref]
+        assert forbidden == []
+        assert client.send_count == 0
+        _assert_owned_room_auxiliary_sentinels(
+            client,
+            room,
+            auxiliary_sentinels,
+        )
+        assert (
+            _room_snapshot(
+                client.rooms[ROOM],
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        begin = normalized.index("BEGIN IMMEDIATE")
+        delete = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("DELETE FROM NIOINGESTWORK")
+        )
+        meta_update = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("UPDATE NIOINGESTMETA")
+        )
+        commit = normalized.index("COMMIT")
+        assert begin < delete < meta_update < commit
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 2
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_terminal_loss_acks_without_state_parse_or_callbacks(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    try:
+        stage_classic(bootstrap, _local_room_body())
+        result = session._materialize_oldest_frame(
+            limits=MaterializerLimits(max_record_canonical_bytes=1)
+        )
+        assert result.status is MaterializeStatus.MATERIALIZED
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+        lifecycle = session.next_batch(max_records=1)
+        assert lifecycle is not None and len(lifecycle.records) == 1
+        lifecycle_record = lifecycle.records[0]
+        assert type(lifecycle_record) is EventRecord
+        assert lifecycle_record.kind.value == "room_lifecycle"
+        session.acknowledge_batch(lifecycle.ref)
+
+        batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        loss = batch.records[0]
+        assert type(loss) is LossRecord
+        assert loss.reason.value == "oversized_event"
+        assert loss.room_id == ROOM
+        assert loss.membership_epoch == 0
+        assert (
+            loss.boundary.prior_event_id,
+            loss.boundary.prior_origin_server_ts,
+            loss.boundary.start_token,
+            loss.boundary.target_token,
+        ) == (None, None, None, None)
+
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        snapshot = aggregate.room_snapshot
+        assert snapshot is not None
+        room = client.rooms[ROOM]
+        auxiliary_sentinels = _seed_owned_room_auxiliary_sentinels(
+            room,
+            "loss",
+        )
+        room.name = "loss must not restore this mutation"
+        room.users[ACCOUNT].power_level = 77
+        room.power_levels.users[ACCOUNT] = 77
+        mutated_snapshot = _room_snapshot(
+            room,
+            aggregate.continuity.membership_epoch,
+            aggregate.continuity.membership,
+        )
+        assert mutated_snapshot != snapshot
+
+        forbidden: list[str] = []
+        _install_owned_settlement_callback_tripwires(client, forbidden)
+
+        def forbid_event_parse(
+            _event_type: type[Event],
+            _source: dict[object, object],
+        ) -> object:
+            raise AssertionError("Loss settlement parsed an event")
+
+        monkeypatch.setattr(Event, "parse_event", classmethod(forbid_event_parse))
+        authenticated: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            assert work.value == loss
+            assert work.metadata is None
+            assert room_value is None
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            authenticated.append(view)
+            return view
+
+        monkeypatch.setattr(
+            session._journal,
+            "_load_batch_settlement",
+            observe_settlement,
+        )
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert authenticated
+            assert ref == batch.ref
+            assert connection.in_transaction is False
+            assert session._journal._owner._depth == 0
+            assert session._journal._owner.database.transaction_depth() == 0
+            _assert_owned_room_auxiliary_sentinels(
+                client,
+                room,
+                auxiliary_sentinels,
+            )
+            assert (
+                _room_snapshot(
+                    client.rooms[ROOM],
+                    aggregate.continuity.membership_epoch,
+                    aggregate.continuity.membership,
+                )
+                == mutated_snapshot
+            )
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        monkeypatch.setattr(
+            session._journal,
+            "acknowledge_batch",
+            observe_acknowledgement,
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert acknowledgements == [batch.ref]
+        assert forbidden == []
+        assert client.send_count == 0
+        _assert_owned_room_auxiliary_sentinels(
+            client,
+            room,
+            auxiliary_sentinels,
+        )
+        assert (
+            _room_snapshot(
+                client.rooms[ROOM],
+                aggregate.continuity.membership_epoch,
+                aggregate.continuity.membership,
+            )
+            == mutated_snapshot
+        )
+        owner_after = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded_after = session._journal._load_room_aggregate(owner_after, ROOM)
+        assert loaded_after is not None and loaded_after[1] == aggregate
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        begin = normalized.index("BEGIN IMMEDIATE")
+        delete = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("DELETE FROM NIOINGESTWORK")
+        )
+        meta_update = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("UPDATE NIOINGESTMETA")
+        )
+        commit = normalized.index("COMMIT")
+        assert begin < delete < meta_update < commit
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+async def _open_claimed_owned_live_timeline(tmp_path):
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    warm_frame = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    warm = bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits())
+    assert (warm.status, warm.frame_id) == (
+        MaterializeStatus.MATERIALIZED,
+        warm_frame.frame_id,
+    )
+    assert bootstrap._journal.list_frames(1) == ()
+    assert bootstrap._journal.load_pending_hydrations(limit=1) == ()
+    assert bootstrap._journal.load_source().cursor_json == canonical_classic_cursor(
+        ClassicCursor("s1")
+    )
+    assert (
+        bootstrap._journal._owner.database.connection()
+        .execute("SELECT COUNT(*) FROM NioIngestWork")
+        .fetchone()[0]
+        == 0
+    )
+
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        event_source = {
+            "content": {"name": "Timeline Final"},
+            "event_id": "$timeline-final-name",
+            "origin_server_ts": 3,
+            "sender": ACCOUNT,
+            "state_key": "",
+            "type": "m.room.name",
+        }
+        body = _local_room_body()
+        body["next_batch"] = "s2"
+        rooms = body["rooms"]
+        assert type(rooms) is dict
+        joined = rooms["join"]
+        assert type(joined) is dict
+        room_body = joined[ROOM]
+        assert type(room_body) is dict
+        room_body["timeline"] = {"events": [event_source], "limited": False}
+        stage_classic(bootstrap, body)
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        hydrated = normalize_hydration_response(
+            pending[0],
+            own_user_id=ACCOUNT,
+            response_body=hydration_state(),
+        )
+        assert session._journal.apply_hydration_result(result=hydrated) is not None
+
+        for expected_kind, expected_event_id in (
+            (RecordKind.ROOM_LIFECYCLE, None),
+            (RecordKind.STATE, "$local-member"),
+            (RecordKind.STATE, "$local-name"),
+        ):
+            prior = session.next_batch(max_records=1)
+            assert prior is not None
+            assert len(prior.records) == 1
+            prior_record = prior.records[0]
+            assert type(prior_record) is EventRecord
+            assert (prior_record.kind, prior_record.event_id) == (
+                expected_kind,
+                expected_event_id,
+            )
+            session.acknowledge_batch(prior.ref)
+
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        assert len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert (
+            record.kind,
+            record.event_id,
+            record.provenance,
+            record.source_json,
+            record.clear_json,
+        ) == (
+            RecordKind.TIMELINE,
+            "$timeline-final-name",
+            nio.TimelineEventProvenance.LIVE,
+            canonical_json(event_source),
+            None,
+        )
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        snapshot = aggregate.room_snapshot
+        assert snapshot is not None
+        assert snapshot.name == "Timeline Final"
+        assert (
+            _room_snapshot(
+                client.rooms[ROOM],
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        assert (
+            session._owned_store.database.connection()
+            .execute("SELECT COUNT(*) FROM NioIngestWork")
+            .fetchone()[0]
+            == 1
+        )
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    try:
+        assert restored_session.next_batch(max_records=1) == batch
+        owner = restored_session._journal.load_owner()
+        with restored_session._journal._owner.read():
+            restored = restored_session._journal._load_room_aggregate(owner, ROOM)
+        assert restored is not None
+        assert restored[1] == aggregate
+        room = restored_client.rooms[ROOM]
+        assert type(room) is nio.MatrixRoom
+        assert restored_client.invited_rooms == {}
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+    except BaseException:
+        await restored_session.close()
+        raise
+    return restored_client, restored_session, batch, record, aggregate, snapshot, room
+
+
+@pytest.mark.parametrize(
+    ("receipt_new", "semantic_event_new", "expected_callbacks"),
+    (
+        (False, False, 0),
+        (True, False, 0),
+        (True, True, 1),
+        (False, True, None),
+    ),
+    ids=("duplicate", "receipt-only", "semantic-event", "invalid-facts"),
+)
+@pytest.mark.asyncio
+async def test_owned_settle_live_timeline_none_truth_table_restores_snapshot_before_callback(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_new: bool,
+    semantic_event_new: bool,
+    expected_callbacks: int | None,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    (
+        client,
+        session,
+        batch,
+        record,
+        aggregate,
+        snapshot,
+        room,
+    ) = await _open_claimed_owned_live_timeline(tmp_path)
+    connection = session._owned_store.database.connection()
+    try:
+        room.name = "corrupted timeline projection"
+        room.users[ACCOUNT].display_name = "Corrupted Alice"
+        room.users[ACCOUNT].power_level = 77
+        room.power_levels.users[ACCOUNT] = 77
+        mutated_snapshot = _room_snapshot(
+            room,
+            snapshot.membership_epoch,
+            snapshot.own_membership,
+        )
+        assert mutated_snapshot != snapshot
+
+        def assert_outside_owner_transaction() -> None:
+            assert (
+                connection.in_transaction,
+                session._journal._owner._depth,
+                session._journal._owner.database.transaction_depth(),
+            ) == (False, 0, 0)
+
+        def assert_snapshot_overlay() -> None:
+            assert client.rooms[ROOM] is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+
+        forbidden: list[str] = []
+        authenticated: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            metadata = work.metadata
+            assert work.value == record
+            assert metadata is not None
+            assert (
+                metadata.record_id,
+                metadata.preparation_phase,
+                metadata.effective_event_type,
+                metadata.decryption,
+                metadata.decryption_verified,
+                metadata.decrypted_to_device_kind,
+                metadata.callback_route,
+            ) == (
+                record.record_id,
+                _PreparationPhase.SOURCE,
+                "m.room.name",
+                _DecryptionDisposition.NONE,
+                None,
+                None,
+                _CallbackRoute.EVENT,
+            )
+            assert room_value == aggregate
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == mutated_snapshot
+            )
+            assert_outside_owner_transaction()
+            authenticated.append(view)
+            return view
+
+        monkeypatch.setattr(
+            session._journal,
+            "_load_batch_settlement",
+            observe_settlement,
+        )
+        parsed: list[object] = []
+        real_parse_event = Event.parse_event
+
+        def observe_event_parse(
+            _event_type: type[Event],
+            source: dict[object, object],
+        ) -> object:
+            assert len(authenticated) == 1
+            assert canonical_json(source) == record.source_json
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            event = real_parse_event(source)
+            assert type(event) is nio.RoomNameEvent
+            assert event.source["content"] == {"name": "Timeline Final"}
+            parsed.append(event)
+            return event
+
+        monkeypatch.setattr(Event, "parse_event", classmethod(observe_event_parse))
+
+        def forbid_state_replay(_event: object) -> None:
+            raise AssertionError("timeline settlement reapplied durable room state")
+
+        monkeypatch.setattr(room, "handle_event", forbid_state_replay)
+
+        def forbid_live_replay(*_args: object, **_kwargs: object) -> None:
+            forbidden.append("live-replay")
+            raise AssertionError("timeline settlement entered a live replay path")
+
+        for method_name in (
+            "receive_response",
+            "_receive_sync_family",
+            "_handle_sync",
+            "_handle_sliding_sync",
+            "_handle_timeline_event",
+            "_on_to_device",
+            "_on_global_account_data",
+            "_on_ephemeral",
+            "_on_room_account_data",
+            "_on_presence",
+            "_on_invited_rooms",
+        ):
+            monkeypatch.setattr(client, method_name, forbid_live_replay)
+        assert client.olm is not None
+        monkeypatch.setattr(client.olm, "_decrypt_megolm_no_error", forbid_live_replay)
+        routed: list[object] = []
+        callbacks: list[object] = []
+        real_on_event = client._on_event
+
+        async def observe_event_route(event: object, candidate_room: object) -> None:
+            assert len(parsed) == 1
+            assert event is parsed[0]
+            assert candidate_room is room
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            routed.append(event)
+            await real_on_event(event, candidate_room)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(client, "_on_event", observe_event_route)
+
+        async def observe_event_callback(
+            candidate_room: object,
+            event: object,
+        ) -> None:
+            assert len(parsed) == 1
+            assert event is parsed[0]
+            assert candidate_room is room
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            callbacks.append(event)
+
+        async def forbid_admission(*_args: object) -> None:
+            forbidden.append("admission")
+            raise AssertionError("timeline settlement invoked event admission")
+
+        async def forbid_response(*_args: object) -> None:
+            forbidden.append("response")
+            raise AssertionError("timeline settlement invoked a response callback")
+
+        client.add_event_callback(observe_event_callback, None)
+        client.add_event_admission_callback(forbid_admission, None)
+        client.add_response_callback(forbid_response, None)
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            expected = int(semantic_event_new)
+            assert len(parsed) == expected
+            assert len(routed) == expected
+            assert len(callbacks) == expected
+            assert ref == batch.ref
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        monkeypatch.setattr(
+            session._journal,
+            "acknowledge_batch",
+            observe_acknowledgement,
+        )
+        outstanding = _owned_delivery_frontier(connection)
+        graph = tuple(connection.iterdump())
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+
+        if expected_callbacks is None:
+            try:
+                with pytest.raises(LocalProtocolError):
+                    await session._settle_batch(
+                        batch,
+                        receipt_new=receipt_new,
+                        semantic_event_new=semantic_event_new,
+                    )
+            finally:
+                connection.set_trace_callback(None)
+            assert statements == []
+            assert (authenticated, parsed, routed, callbacks) == ([], [], [], [])
+            assert acknowledgements == []
+            assert forbidden == []
+            assert client.send_count == 0
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert tuple(connection.iterdump()) == graph
+            assert client.rooms[ROOM] is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == mutated_snapshot
+            )
+            client._assert_ingestion_not_poisoned()
+            return
+
+        try:
+            await session._settle_batch(
+                batch,
+                receipt_new=receipt_new,
+                semantic_event_new=semantic_event_new,
+            )
+        finally:
+            connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert (len(parsed), len(routed), len(callbacks)) == (
+            expected_callbacks,
+            expected_callbacks,
+            expected_callbacks,
+        )
+        if expected_callbacks:
+            assert routed[0] is parsed[0]
+            assert callbacks[0] is parsed[0]
+        assert acknowledgements == [batch.ref]
+        assert forbidden == []
+        assert client.send_count == 0
+        assert_snapshot_overlay()
+        assert _owned_delivery_frontier(connection) == (
+            4,
+            batch.ref.sha256,
+            None,
+            None,
+            None,
+            None,
+        )
+        owner_after = session._journal.load_owner()
+        with session._journal._owner.read():
+            aggregate_after = session._journal._load_room_aggregate(owner_after, ROOM)
+        assert aggregate_after is not None
+        assert aggregate_after[1] == aggregate
+        normalized = tuple(
+            statement.strip().rstrip(";").upper() for statement in statements
+        )
+        begin = normalized.index("BEGIN IMMEDIATE")
+        delete = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("DELETE FROM NIOINGESTWORK")
+        )
+        update = next(
+            index
+            for index, statement in enumerate(normalized)
+            if statement.startswith("UPDATE NIOINGESTMETA")
+        )
+        commit = normalized.index("COMMIT")
+        assert begin < delete < update < commit
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+async def _open_claimed_owned_decrypted_settlement(tmp_path, target: str):
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    warm_frame = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
+    warm = bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits())
+    assert (warm.status, warm.frame_id) == (
+        MaterializeStatus.MATERIALIZED,
+        warm_frame.frame_id,
+    )
+    assert bootstrap._journal.list_frames(1) == ()
+    assert bootstrap._journal.load_source().cursor_json == canonical_classic_cursor(
+        ClassicCursor("s1")
+    )
+
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    sender_store: SqliteMemoryStore | None = None
+    try:
+        body, sender_store = _owned_crypto_classic_body(client)
+        body["next_batch"] = "s2"
+        if target == "megolm-failed":
+            rooms = body["rooms"]
+            assert type(rooms) is dict
+            joined = rooms["join"]
+            assert type(joined) is dict
+            room_body = joined[ROOM]
+            assert type(room_body) is dict
+            timeline = room_body["timeline"]
+            assert type(timeline) is dict
+            events = timeline["events"]
+            assert type(events) is list and len(events) == 1
+            encrypted = events[0]
+            assert type(encrypted) is dict
+            encrypted_content = encrypted["content"]
+            assert type(encrypted_content) is dict
+            missing_content = {
+                **encrypted_content,
+                "session_id": "missing-session",
+            }
+            events.append(
+                {
+                    **encrypted,
+                    "content": missing_content,
+                    "event_id": "$missing",
+                    "origin_server_ts": 4,
+                }
+            )
+        staged = stage_classic(bootstrap, body)
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        assert materialized.frame_id == staged.frame_id
+        assert materialized.revision is not None
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        if target in {"timeline", "megolm-failed"}:
+            hydrated = normalize_hydration_response(
+                pending[0],
+                own_user_id=ACCOUNT,
+                response_body=hydration_state(),
+            )
+            assert session._journal.apply_hydration_result(result=hydrated) is not None
+
+        expected_fifo = (
+            (RecordKind.TO_DEVICE, None),
+            (RecordKind.ROOM_LIFECYCLE, None),
+            (RecordKind.STATE, "$encryption"),
+            (RecordKind.STATE, f"$member-{ACCOUNT}"),
+            (RecordKind.STATE, f"$member-{BOB}"),
+            (RecordKind.TIMELINE, "$secret"),
+        )
+        if target == "megolm-failed":
+            expected_fifo += ((RecordKind.TIMELINE, "$missing"),)
+        target_index = 0 if target == "room-key" else len(expected_fifo) - 1
+        for index, expected in enumerate(expected_fifo[: target_index + 1]):
+            claimed = session.next_batch(max_records=1)
+            assert claimed is not None
+            assert len(claimed.records) == 1
+            claimed_record = claimed.records[0]
+            assert type(claimed_record) is EventRecord
+            assert (claimed_record.kind, claimed_record.event_id) == expected
+            if index == target_index:
+                batch = claimed
+                record = claimed_record
+            else:
+                session.acknowledge_batch(claimed.ref)
+
+        aggregate = None
+        snapshot = None
+        if target in {"timeline", "megolm-failed"}:
+            assert record.provenance is nio.TimelineEventProvenance.LIVE
+            owner = session._journal.load_owner()
+            with session._journal._owner.read():
+                loaded = session._journal._load_room_aggregate(owner, ROOM)
+            assert loaded is not None
+            aggregate = loaded[1]
+            snapshot = aggregate.room_snapshot
+            assert snapshot is not None
+            assert (
+                _room_snapshot(
+                    client.rooms[ROOM],
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+        connection = session._owned_store.database.connection()
+        e2ee_rows = _raw_e2ee_rows(connection)
+        work_count = connection.execute(
+            "SELECT COUNT(*) FROM NioIngestWork"
+        ).fetchone()[0]
+        assert work_count == len(expected_fifo) - target_index
+    finally:
+        if sender_store is not None:
+            sender_store.database.close()
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    restored_connection = restored_session._owned_store.database.connection()
+    try:
+        assert _raw_e2ee_rows(restored_connection) == e2ee_rows
+        if target in {"timeline", "megolm-failed"}:
+            assert snapshot is not None
+            assert (
+                _room_snapshot(
+                    restored_client.rooms[ROOM],
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+        assert restored_session.next_batch(max_records=1) == batch
+    except BaseException:
+        await restored_session.close()
+        raise
+    return (
+        restored_client,
+        restored_session,
+        batch,
+        record,
+        aggregate,
+        snapshot,
+        e2ee_rows,
+        work_count,
+    )
+
+
+@pytest.mark.parametrize("target", ("room-key", "timeline"))
+@pytest.mark.asyncio
+async def test_owned_settle_reconstructs_decrypted_events_without_crypto_replay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    (
+        client,
+        session,
+        batch,
+        record,
+        aggregate,
+        snapshot,
+        e2ee_rows,
+        work_count,
+    ) = await _open_claimed_owned_decrypted_settlement(tmp_path, target)
+    connection = session._owned_store.database.connection()
+    try:
+        assert record.clear_json is not None
+        outer = json.loads(record.source_json)
+        clear = json.loads(record.clear_json)
+        assert canonical_json(outer) == record.source_json
+        assert canonical_json(clear) == record.clear_json
+        assert outer["type"] == "m.room.encrypted"
+        outer_content = outer["content"]
+        clear_content = clear["content"]
+        assert type(outer_content) is dict
+        assert type(clear_content) is dict
+        assert type(outer["sender"]) is str
+        assert type(outer_content["sender_key"]) is str
+        assert type(record.origin) is RecordOrigin
+        expected_record_fields = (
+            (
+                RecordKind.TO_DEVICE,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            if target == "room-key"
+            else (
+                RecordKind.TIMELINE,
+                4,
+                ROOM,
+                0,
+                4,
+                "$secret",
+                nio.TimelineEventProvenance.LIVE,
+            )
+        )
+        assert (
+            record.kind,
+            record.origin.frame_index,
+            record.room_id,
+            record.membership_epoch,
+            record.room_sequence,
+            record.event_id,
+            record.provenance,
+        ) == expected_record_fields
+        assert (
+            record.origin.transport,
+            record.origin.source_epoch,
+            record.origin.request_id,
+        ) == (TransportKind.CLASSIC, 0, 1)
+        assert batch.records == (record,)
+        outstanding = _owned_delivery_frontier(connection)
+
+        room = None
+        mutated_snapshot = None
+        if target == "timeline":
+            assert aggregate is not None
+            assert snapshot is not None
+            room = client.rooms[ROOM]
+            room.name = "corrupted decrypted timeline projection"
+            room.users[ACCOUNT].display_name = "Corrupted Alice"
+            room.users[ACCOUNT].power_level = 77
+            room.power_levels.users[ACCOUNT] = 77
+            mutated_snapshot = _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            assert mutated_snapshot != snapshot
+
+        def assert_outside_owner_transaction() -> None:
+            assert (
+                connection.in_transaction,
+                session._journal._owner._depth,
+                session._journal._owner.database.transaction_depth(),
+            ) == (False, 0, 0)
+
+        def assert_timeline_overlay() -> None:
+            if target != "timeline":
+                return
+            assert room is not None
+            assert snapshot is not None
+            assert client.rooms[ROOM] is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+
+        authenticated: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            metadata = work.metadata
+            assert work.value == record
+            assert metadata is not None
+            assert metadata.record_id == record.record_id
+            expected_metadata = (
+                (
+                    "m.room_key",
+                    None,
+                    _DecryptedToDeviceKind.ROOM_KEY,
+                    _CallbackRoute.TO_DEVICE,
+                )
+                if target == "room-key"
+                else ("m.room.message", True, None, _CallbackRoute.EVENT)
+            )
+            assert (
+                metadata.preparation_phase,
+                metadata.effective_event_type,
+                metadata.decryption,
+                metadata.decryption_verified,
+                metadata.decrypted_to_device_kind,
+                metadata.callback_route,
+            ) == (
+                _PreparationPhase.SOURCE,
+                expected_metadata[0],
+                _DecryptionDisposition.DECRYPTED,
+                expected_metadata[1],
+                expected_metadata[2],
+                expected_metadata[3],
+            )
+            assert room_value == (None if target == "room-key" else aggregate)
+            if target == "timeline":
+                assert room is not None
+                assert snapshot is not None
+                assert mutated_snapshot is not None
+                assert (
+                    _room_snapshot(
+                        room,
+                        snapshot.membership_epoch,
+                        snapshot.own_membership,
+                    )
+                    == mutated_snapshot
+                )
+            assert_outside_owner_transaction()
+            authenticated.append(view)
+            return view
+
+        reconstructed: list[object] = []
+        real_room_key_init = RoomKeyEvent.__init__
+        real_parse_decrypted = Event.parse_decrypted_event
+
+        def observe_room_key_init(
+            event: RoomKeyEvent,
+            source: dict[object, object],
+            sender: str,
+            sender_key: str,
+            room_id: str,
+            session_id: str,
+            algorithm: str,
+        ) -> None:
+            assert len(authenticated) == 1
+            assert source == clear
+            assert (sender, sender_key) == (
+                outer["sender"],
+                outer_content["sender_key"],
+            )
+            assert (room_id, session_id, algorithm) == (
+                clear_content["room_id"],
+                clear_content["session_id"],
+                clear_content["algorithm"],
+            )
+            assert_outside_owner_transaction()
+            real_room_key_init(
+                event,
+                source,
+                sender,
+                sender_key,
+                room_id,
+                session_id,
+                algorithm,
+            )
+            reconstructed.append(event)
+
+        def observe_decrypted_parse(
+            _event_type: type[Event],
+            source: dict[object, object],
+        ) -> object:
+            assert len(authenticated) == 1
+            assert source == clear
+            assert_timeline_overlay()
+            assert_outside_owner_transaction()
+            event = real_parse_decrypted(source)
+            assert type(event) is nio.RoomMessageText
+            assert event.decrypted is False
+            assert event.verified is False
+            assert event.sender_key is None
+            assert event.session_id is None
+            reconstructed.append(event)
+            return event
+
+        def forbidden_path(*_args: object, **_kwargs: object) -> None:
+            forbidden_paths.append("crypto-or-replay")
+            raise AssertionError(
+                "decrypted settlement replayed live client or crypto state"
+            )
+
+        def assert_reconstructed(event: object) -> None:
+            assert len(reconstructed) == 1
+            assert event is reconstructed[0]
+            if target == "room-key":
+                assert type(event) is RoomKeyEvent
+                assert event.source == clear
+                assert (
+                    event.sender,
+                    event.sender_key,
+                    event.room_id,
+                    event.session_id,
+                    event.algorithm,
+                ) == (
+                    outer["sender"],
+                    outer_content["sender_key"],
+                    clear_content["room_id"],
+                    clear_content["session_id"],
+                    clear_content["algorithm"],
+                )
+            else:
+                assert type(event) is nio.RoomMessageText
+                assert event.source == clear
+                assert (
+                    event.decrypted,
+                    event.verified,
+                    event.sender_key,
+                    event.session_id,
+                    event.room_id,
+                ) == (
+                    True,
+                    True,
+                    outer_content["sender_key"],
+                    outer_content["session_id"],
+                    ROOM,
+                )
+
+        def assert_work_is_outstanding() -> None:
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == work_count
+            )
+
+        forbidden_callbacks: list[str] = []
+        forbidden_paths: list[str] = []
+        _install_owned_settlement_callback_tripwires(client, forbidden_callbacks)
+        callbacks: list[object] = []
+        routed: list[object] = []
+        if target == "room-key":
+            client.to_device_callbacks.clear()
+            real_route = client._on_to_device
+
+            async def callback(event: object) -> None:
+                assert_reconstructed(event)
+                assert_outside_owner_transaction()
+                assert_work_is_outstanding()
+                assert _raw_e2ee_rows(connection) == e2ee_rows
+                callbacks.append(event)
+
+            async def observe_route(event: object) -> None:
+                assert_reconstructed(event)
+                assert_outside_owner_transaction()
+                assert_work_is_outstanding()
+                routed.append(event)
+                await real_route(event)  # type: ignore[arg-type]
+
+            client.add_to_device_callback(callback, None)
+        else:
+            client.event_callbacks.clear()
+            real_route = client._on_event
+
+            async def callback(candidate_room: object, event: object) -> None:
+                assert candidate_room is room
+                assert_reconstructed(event)
+                assert_timeline_overlay()
+                assert_outside_owner_transaction()
+                assert_work_is_outstanding()
+                assert _raw_e2ee_rows(connection) == e2ee_rows
+                callbacks.append(event)
+
+            async def observe_route(event: object, candidate_room: object) -> None:
+                assert candidate_room is room
+                assert_reconstructed(event)
+                assert_timeline_overlay()
+                assert_outside_owner_transaction()
+                assert_work_is_outstanding()
+                routed.append(event)
+                await real_route(event, candidate_room)  # type: ignore[arg-type]
+
+            client.add_event_callback(callback, None)
+
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert ref == batch.ref
+            assert len(authenticated) == 1
+            assert len(callbacks) == 1
+            assert routed == callbacks
+            assert_reconstructed(callbacks[0])
+            assert_timeline_overlay()
+            assert_outside_owner_transaction()
+            assert _raw_e2ee_rows(connection) == e2ee_rows
+            assert_work_is_outstanding()
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        client_forbidden = (
+            "receive_response",
+            "_receive_sync_family",
+            "_handle_sync",
+            "_handle_sliding_sync",
+            "_handle_to_device",
+            "_dispatch_timeline_event",
+            "_handle_decrypt_to_device",
+            "_handle_olm_events",
+            "_handle_timeline_event",
+            "decrypt_event",
+            "_on_event_admission",
+            "_on_response",
+        )
+        olm_forbidden = (
+            "handle_to_device_event",
+            "decrypt_event",
+            "_try_decrypt",
+            "_handle_olm_event",
+            "_handle_room_key_event",
+            "create_group_session",
+            "_decrypt_megolm_no_error",
+            "decrypt_megolm_event",
+            "decrypt",
+            "message_index_ok",
+            "check_if_wedged",
+            "save_session",
+            "save_inbound_group_session",
+            "save_account",
+            "update_tracked_users",
+            "add_changed_users",
+            "collect_key_requests",
+            "clear_verifications",
+        )
+        store_forbidden = (
+            "load_account",
+            "load_sessions",
+            "load_inbound_group_sessions",
+            "load_device_keys",
+            "load_encrypted_rooms",
+            "load_outgoing_key_requests",
+            "save_account",
+            "save_session",
+            "save_inbound_group_session",
+            "save_device_keys",
+            "add_outgoing_key_request",
+            "remove_outgoing_key_request",
+            "save_encrypted_rooms",
+            "save_sync_token",
+            "save_recovery",
+            "save_sliding_window_tokens",
+            "delete_encrypted_room",
+            "blacklist_device",
+            "verify_device",
+            "unverify_device",
+        )
+        assert client.olm is not None
+        assert client.store is not None
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session._journal,
+                "_load_batch_settlement",
+                observe_settlement,
+            )
+            patch.setattr(
+                session._journal,
+                "acknowledge_batch",
+                observe_acknowledgement,
+            )
+            if target == "room-key":
+                patch.setattr(RoomKeyEvent, "__init__", observe_room_key_init)
+                patch.setattr(RoomKeyEvent, "from_dict", classmethod(forbidden_path))
+                patch.setattr(
+                    ToDeviceEvent,
+                    "parse_event",
+                    classmethod(forbidden_path),
+                )
+                patch.setattr(client, "_on_to_device", observe_route)
+            else:
+                patch.setattr(
+                    Event,
+                    "parse_decrypted_event",
+                    classmethod(observe_decrypted_parse),
+                )
+                patch.setattr(Event, "parse_event", classmethod(forbidden_path))
+                patch.setattr(client, "_on_event", observe_route)
+                assert room is not None
+                patch.setattr(room, "handle_event", forbidden_path)
+            for name in client_forbidden:
+                patch.setattr(client, name, forbidden_path)
+            for name in olm_forbidden:
+                patch.setattr(client.olm, name, forbidden_path)
+            patch.setattr(client.olm.session_store, "get", forbidden_path)
+            patch.setattr(client.olm.session_store, "add", forbidden_path)
+            patch.setattr(client.olm.inbound_group_store, "get", forbidden_path)
+            patch.setattr(client.olm.inbound_group_store, "add", forbidden_path)
+            for name in store_forbidden:
+                patch.setattr(client.store, name, forbidden_path)
+            patch.setattr(client, "_prepare_ingestion_frame", forbidden_path)
+            patch.setattr(session, "_materialize_oldest_frame", forbidden_path)
+            patch.setattr(
+                session._journal,
+                "_prepare_and_materialize_oldest_frame",
+                forbidden_path,
+            )
+
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=target == "timeline",
+            )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert len(reconstructed) == 1
+        assert len(routed) == 1
+        assert routed == callbacks
+        assert acknowledgements == [batch.ref]
+        assert forbidden_callbacks == []
+        assert forbidden_paths == []
+        assert client.send_count == 0
+        assert client.send_calls == []
+        assert_timeline_overlay()
+        assert _raw_e2ee_rows(connection) == e2ee_rows
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+            == work_count - 1
+        )
+        assert any(
+            statement.lstrip().upper().startswith("DELETE FROM NIOINGESTWORK")
+            for statement in statements
+        )
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_failed_megolm_without_crypto_or_rerequest_replay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    (
+        client,
+        session,
+        batch,
+        record,
+        aggregate,
+        snapshot,
+        e2ee_rows,
+        work_count,
+    ) = await _open_claimed_owned_decrypted_settlement(tmp_path, "megolm-failed")
+    connection = session._owned_store.database.connection()
+    try:
+        assert type(record.origin) is RecordOrigin
+        assert (
+            record.kind,
+            record.origin.transport,
+            record.origin.source_epoch,
+            record.origin.request_id,
+            record.origin.frame_index,
+            record.room_id,
+            record.membership_epoch,
+            record.room_sequence,
+            record.event_id,
+            record.provenance,
+            record.clear_json,
+        ) == (
+            RecordKind.TIMELINE,
+            TransportKind.CLASSIC,
+            0,
+            1,
+            5,
+            ROOM,
+            0,
+            5,
+            "$missing",
+            nio.TimelineEventProvenance.LIVE,
+            None,
+        )
+        source = json.loads(record.source_json)
+        assert canonical_json(source) == record.source_json
+        assert source["type"] == "m.room.encrypted"
+        source_content = source["content"]
+        assert type(source_content) is dict
+        assert (
+            source_content["algorithm"],
+            source_content["session_id"],
+        ) == ("m.megolm.v1.aes-sha2", "missing-session")
+        assert aggregate is not None
+        assert snapshot is not None
+        room = client.rooms[ROOM]
+        room.name = "corrupted failed-Megolm projection"
+        mutated_snapshot = _room_snapshot(
+            room,
+            snapshot.membership_epoch,
+            snapshot.own_membership,
+        )
+        assert mutated_snapshot != snapshot
+
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            headers = session._journal._load_authenticated_frame_headers(owner)
+            assert len(headers) == 1
+            prepared = session._journal._load_prepared_frame_with_owner(
+                headers[0].frame_id,
+                owner,
+            )
+        assert prepared is not None
+        assert tuple(
+            (operation.kind, operation.state, operation.context)
+            for operation in prepared.outbound_maintenance.operations
+        ) == (
+            ("key_upload", "pending", None),
+            ("key_query", "pending", None),
+            (
+                "to_device",
+                "pending",
+                {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "request_id": "missing-session",
+                    "room_id": ROOM,
+                    "session_id": "missing-session",
+                    "subtype": "room_key_request",
+                },
+            ),
+        )
+        frame_rows = tuple(
+            connection.execute("SELECT * FROM NioIngestFrame ORDER BY rowid")
+        )
+        outstanding = _owned_delivery_frontier(connection)
+        assert work_count == 1
+        assert client.olm is not None
+        assert client.store is not None
+
+        def crypto_queue_state() -> tuple[object, ...]:
+            olm = client.olm
+            assert olm is not None
+            return (
+                tuple(sorted(olm.outgoing_key_requests)),
+                tuple(olm.outgoing_to_device_messages),
+                tuple(olm.wedged_devices),
+                tuple(
+                    (key, tuple(events))
+                    for key, events in sorted(olm.key_re_requests_events.items())
+                ),
+                tuple(sorted(olm.received_key_requests)),
+                tuple(sorted(olm.key_request_from_untrusted)),
+                tuple(olm.key_request_devices_no_session),
+                tuple(
+                    (key, tuple(sorted(events)))
+                    for key, events in sorted(
+                        olm.key_requests_waiting_for_session.items()
+                    )
+                ),
+                tuple(sorted(olm.users_for_key_query)),
+            )
+
+        queues = crypto_queue_state()
+        assert queues == ((), (), (), (), (), (), (), (), ())
+
+        def assert_outside_owner_transaction() -> None:
+            assert (
+                connection.in_transaction,
+                session._journal._owner._depth,
+                session._journal._owner.database.transaction_depth(),
+            ) == (False, 0, 0)
+
+        def assert_snapshot_overlay() -> None:
+            assert client.rooms[ROOM] is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+
+        def assert_outstanding_and_stable() -> None:
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == work_count
+            )
+            assert _raw_e2ee_rows(connection) == e2ee_rows
+            assert crypto_queue_state() == queues
+            assert (
+                tuple(connection.execute("SELECT * FROM NioIngestFrame ORDER BY rowid"))
+                == frame_rows
+            )
+
+        authenticated: list[object] = []
+        real_load_settlement = session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            metadata = work.metadata
+            assert work.value == record
+            assert metadata is not None
+            assert (
+                metadata.record_id,
+                metadata.preparation_phase,
+                metadata.effective_event_type,
+                metadata.decryption,
+                metadata.decryption_verified,
+                metadata.decrypted_to_device_kind,
+                metadata.callback_route,
+            ) == (
+                record.record_id,
+                _PreparationPhase.SOURCE,
+                "m.room.encrypted",
+                _DecryptionDisposition.MEGOLM_FAILED,
+                None,
+                None,
+                _CallbackRoute.EVENT,
+            )
+            assert room_value == aggregate
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == mutated_snapshot
+            )
+            assert_outside_owner_transaction()
+            assert_outstanding_and_stable()
+            authenticated.append(view)
+            return view
+
+        parsed: list[MegolmEvent] = []
+        real_parse_event = Event.parse_event
+
+        def observe_parse_event(
+            _event_type: type[Event],
+            event_source: dict[object, object],
+        ) -> object:
+            assert len(authenticated) == 1
+            assert event_source == source
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding_and_stable()
+            event = real_parse_event(event_source)
+            assert type(event) is MegolmEvent
+            assert event.room_id is None
+            parsed.append(event)
+            return event
+
+        forbidden_callbacks: list[str] = []
+        forbidden_paths: list[str] = []
+        _install_owned_settlement_callback_tripwires(client, forbidden_callbacks)
+
+        def forbidden_path(*_args: object, **_kwargs: object) -> None:
+            forbidden_paths.append("crypto-or-replay")
+            raise AssertionError("failed Megolm settlement replayed live crypto")
+
+        routed: list[object] = []
+        callbacks: list[object] = []
+        real_route = client._on_event
+
+        def assert_reconstructed(event: object) -> None:
+            assert len(parsed) == 1
+            assert event is parsed[0]
+            assert type(event) is MegolmEvent
+            assert event.source == source
+            assert event.room_id == ROOM
+            assert event.sender_key == source_content["sender_key"]
+            assert event.session_id == "missing-session"
+
+        async def observe_route(event: object, candidate_room: object) -> None:
+            assert candidate_room is room
+            assert_reconstructed(event)
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding_and_stable()
+            routed.append(event)
+            await real_route(event, candidate_room)  # type: ignore[arg-type]
+
+        async def callback(candidate_room: object, event: object) -> None:
+            assert candidate_room is room
+            assert_reconstructed(event)
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding_and_stable()
+            callbacks.append(event)
+
+        client.event_callbacks.clear()
+        client.add_event_callback(callback, None)
+
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert ref == batch.ref
+            assert len(authenticated) == 1
+            assert routed == callbacks == parsed
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding_and_stable()
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        client_forbidden = (
+            "receive_response",
+            "_receive_sync_family",
+            "_handle_sync",
+            "_handle_sliding_sync",
+            "_handle_timeline_event",
+            "_dispatch_timeline_event",
+            "_handle_decrypt_to_device",
+            "decrypt_event",
+            "_prepare_ingestion_frame",
+            "_on_event_admission",
+            "_on_response",
+        )
+        olm_forbidden = (
+            "_decrypt_megolm_no_error",
+            "decrypt_megolm_event",
+            "decrypt_event",
+            "check_if_wedged",
+            "message_index_ok",
+            "collect_key_requests",
+            "save_session",
+            "save_inbound_group_session",
+            "save_account",
+        )
+        store_forbidden = (
+            "load_account",
+            "load_sessions",
+            "load_inbound_group_sessions",
+            "load_device_keys",
+            "load_outgoing_key_requests",
+            "add_outgoing_key_request",
+            "remove_outgoing_key_request",
+            "save_session",
+            "save_inbound_group_session",
+            "save_account",
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session._journal,
+                "_load_batch_settlement",
+                observe_settlement,
+            )
+            patch.setattr(
+                session._journal,
+                "acknowledge_batch",
+                observe_acknowledgement,
+            )
+            patch.setattr(Event, "parse_event", classmethod(observe_parse_event))
+            patch.setattr(Event, "parse_decrypted_event", classmethod(forbidden_path))
+            patch.setattr(client, "_on_event", observe_route)
+            patch.setattr(room, "handle_event", forbidden_path)
+            for name in client_forbidden:
+                patch.setattr(client, name, forbidden_path)
+            for name in olm_forbidden:
+                patch.setattr(client.olm, name, forbidden_path)
+            patch.setattr(client.olm.session_store, "get", forbidden_path)
+            patch.setattr(client.olm.inbound_group_store, "get", forbidden_path)
+            for name in store_forbidden:
+                patch.setattr(client.store, name, forbidden_path)
+            patch.setattr(session, "_materialize_oldest_frame", forbidden_path)
+            patch.setattr(
+                session._journal,
+                "_prepare_and_materialize_oldest_frame",
+                forbidden_path,
+            )
+
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=True,
+            )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert len(parsed) == 1
+        assert routed == callbacks == parsed
+        assert acknowledgements == [batch.ref]
+        assert forbidden_callbacks == []
+        assert forbidden_paths == []
+        assert client.send_count == 0
+        assert client.send_calls == []
+        assert_snapshot_overlay()
+        assert _raw_e2ee_rows(connection) == e2ee_rows
+        assert crypto_queue_state() == queues
+        assert (
+            tuple(connection.execute("SELECT * FROM NioIngestFrame ORDER BY rowid"))
+            == frame_rows
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        )
+        owner_after = session._journal.load_owner()
+        with session._journal._owner.read():
+            prepared_after = session._journal._load_prepared_frame_with_owner(
+                headers[0].frame_id,
+                owner_after,
+            )
+        assert prepared_after == prepared
+        journal_dml = tuple(
+            statement.lstrip().upper()
+            for statement in statements
+            if statement.lstrip()
+            .upper()
+            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+        )
+        assert len(journal_dml) == 2
+        assert journal_dml[0].startswith("DELETE FROM NIOINGESTWORK")
+        assert journal_dml[1].startswith("UPDATE NIOINGESTMETA")
+        client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await session.close()
+
+
+@pytest.mark.parametrize("target", ["invite", "joined-no-route"])
+@pytest.mark.asyncio
+async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        if target == "invite":
+            body = {
+                "next_batch": "state-invite-s1",
+                "rooms": {
+                    "invite": {
+                        ROOM: {
+                            "invite_state": {
+                                "events": [
+                                    {
+                                        "content": {"name": "Final Invite Name"},
+                                        "sender": BOB,
+                                        "state_key": "",
+                                        "type": "m.room.name",
+                                    },
+                                    {
+                                        "content": {
+                                            "displayname": "Older Invite Alice",
+                                            "membership": "invite",
+                                        },
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    },
+                                    {
+                                        "content": {
+                                            "displayname": "Final Invite Alice",
+                                            "membership": "invite",
+                                        },
+                                        "sender": BOB,
+                                        "state_key": ACCOUNT,
+                                        "type": "m.room.member",
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                },
+            }
+        else:
+            body = _local_room_body()
+        stage_classic(bootstrap, body)
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        if target == "joined-no-route":
+            pending = session._journal.load_pending_hydrations(limit=2)
+            assert len(pending) == 1
+            hydrated = normalize_hydration_response(
+                pending[0],
+                own_user_id=ACCOUNT,
+                response_body=hydration_state(),
+            )
+            assert session._journal.apply_hydration_result(result=hydrated) is not None
+
+        expected_sources = (
+            ("m.room.name", "room_lifecycle", "m.room.member")
+            if target == "invite"
+            else ("room_lifecycle", "m.room.member", "m.room.name")
+        )
+        for index, expected_type in enumerate(expected_sources):
+            claimed = session.next_batch(max_records=1)
+            assert claimed is not None
+            assert len(claimed.records) == 1
+            claimed_record = claimed.records[0]
+            if expected_type == "room_lifecycle":
+                assert claimed_record.kind is RecordKind.ROOM_LIFECYCLE
+            else:
+                assert type(claimed_record) is EventRecord
+                assert claimed_record.kind is RecordKind.STATE
+                assert json.loads(claimed_record.source_json)["type"] == expected_type
+            if index == len(expected_sources) - 1:
+                batch = claimed
+                record = claimed_record
+            else:
+                session.acknowledge_batch(claimed.ref)
+
+        assert type(record) is EventRecord
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        snapshot = aggregate.room_snapshot
+        assert snapshot is not None
+        expected_membership = "invite" if target == "invite" else "join"
+        assert aggregate.continuity.membership == expected_membership
+        connection = session._owned_store.database.connection()
+        work_count = connection.execute(
+            "SELECT COUNT(*) FROM NioIngestWork"
+        ).fetchone()[0]
+        assert work_count == (2 if target == "invite" else 1)
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    connection = restored_session._owned_store.database.connection()
+    try:
+        assert restored_session.next_batch(max_records=1) == batch
+        room = (
+            restored_client.invited_rooms[ROOM]
+            if target == "invite"
+            else restored_client.rooms[ROOM]
+        )
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        if target == "invite":
+            assert type(room) is nio.MatrixInvitedRoom
+            assert room.inviter is None
+        else:
+            assert type(room) is nio.MatrixRoom
+        room.name = "corrupted STATE projection"
+        room.users[ACCOUNT].display_name = "Corrupted STATE Alice"
+        room.users[ACCOUNT].power_level = 88
+        room.power_levels.users[ACCOUNT] = 88
+        mutated_snapshot = _room_snapshot(
+            room,
+            snapshot.membership_epoch,
+            snapshot.own_membership,
+        )
+        assert mutated_snapshot != snapshot
+
+        expected_record = (
+            (
+                "m.room.member",
+                None,
+                1,
+                2,
+                _CallbackRoute.EVENT,
+            )
+            if target == "invite"
+            else (
+                "m.room.name",
+                "$local-name",
+                1,
+                2,
+                None,
+            )
+        )
+        assert type(record.origin) is RecordOrigin
+        assert (
+            json.loads(record.source_json)["type"],
+            record.event_id,
+            record.origin.frame_index,
+            record.room_sequence,
+        ) == expected_record[:4]
+        assert (
+            record.origin.transport,
+            record.origin.source_epoch,
+            record.origin.request_id,
+            record.room_id,
+            record.membership_epoch,
+            record.provenance,
+            record.clear_json,
+        ) == (TransportKind.CLASSIC, 0, 0, ROOM, 0, None, None)
+        source = json.loads(record.source_json)
+        assert canonical_json(source) == record.source_json
+        outstanding = _owned_delivery_frontier(connection)
+
+        def assert_outside_owner_transaction() -> None:
+            assert (
+                connection.in_transaction,
+                restored_session._journal._owner._depth,
+                restored_session._journal._owner.database.transaction_depth(),
+            ) == (False, 0, 0)
+
+        def assert_snapshot_overlay() -> None:
+            selected = (
+                restored_client.invited_rooms[ROOM]
+                if target == "invite"
+                else restored_client.rooms[ROOM]
+            )
+            assert selected is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+
+        def assert_outstanding() -> None:
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == work_count
+            )
+
+        authenticated: list[object] = []
+        real_load_settlement = restored_session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            metadata = work.metadata
+            assert work.value == record
+            assert metadata is not None
+            assert (
+                metadata.record_id,
+                metadata.preparation_phase,
+                metadata.effective_event_type,
+                metadata.decryption,
+                metadata.decryption_verified,
+                metadata.decrypted_to_device_kind,
+                metadata.callback_route,
+            ) == (
+                record.record_id,
+                _PreparationPhase.SOURCE,
+                expected_record[0],
+                _DecryptionDisposition.NONE,
+                None,
+                None,
+                expected_record[4],
+            )
+            assert room_value == aggregate
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == mutated_snapshot
+            )
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            authenticated.append(view)
+            return view
+
+        parsed: list[object] = []
+        handled: list[object] = []
+        real_invite_parse = InviteEvent.parse_event
+        real_handle_event = room.handle_event
+
+        def forbidden_path(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("STATE settlement guessed or replayed a parser path")
+
+        def observe_invite_parse(
+            _event_type: type[InviteEvent],
+            event_source: dict[object, object],
+        ) -> object:
+            assert target == "invite"
+            assert len(authenticated) == 1
+            assert event_source == source
+            assert_snapshot_overlay()
+            assert room.inviter is None
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            event = real_invite_parse(event_source)
+            assert type(event) is nio.InviteMemberEvent
+            parsed.append(event)
+            return event
+
+        def observe_handle_event(event: object) -> None:
+            assert target == "invite"
+            assert parsed == [event]
+            assert_snapshot_overlay()
+            assert room.inviter is None
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            real_handle_event(event)  # type: ignore[arg-type]
+            assert room.inviter == BOB
+            assert room.users[ACCOUNT].display_name == "Older Invite Alice"
+            handled.append(event)
+
+        forbidden_callbacks: list[str] = []
+        _install_owned_settlement_callback_tripwires(
+            restored_client,
+            forbidden_callbacks,
+        )
+        routed: list[object] = []
+        callbacks: list[object] = []
+        if target == "invite":
+            restored_client.event_callbacks.clear()
+            real_route = restored_client._on_invited_rooms
+
+            async def callback(candidate_room: object, event: object) -> None:
+                assert candidate_room is room
+                assert parsed == handled == [event]
+                assert room.inviter == BOB
+                assert_snapshot_overlay()
+                assert room.users[ACCOUNT].display_name == "Final Invite Alice"
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                callbacks.append(event)
+
+            async def observe_route(event: object, candidate_room: object) -> None:
+                assert candidate_room is room
+                assert parsed == handled == [event]
+                assert room.inviter == BOB
+                assert_snapshot_overlay()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                routed.append(event)
+                await real_route(event, candidate_room)  # type: ignore[arg-type]
+
+            restored_client.add_event_callback(callback, None)
+
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = restored_session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert ref == batch.ref
+            assert len(authenticated) == 1
+            expected_count = int(target == "invite")
+            assert len(parsed) == len(handled) == expected_count
+            assert len(routed) == len(callbacks) == expected_count
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                restored_session._journal,
+                "_load_batch_settlement",
+                observe_settlement,
+            )
+            patch.setattr(
+                restored_session._journal,
+                "acknowledge_batch",
+                observe_acknowledgement,
+            )
+            patch.setattr(Event, "parse_event", classmethod(forbidden_path))
+            if target == "invite":
+                patch.setattr(
+                    InviteEvent,
+                    "parse_event",
+                    classmethod(observe_invite_parse),
+                )
+                patch.setattr(room, "handle_event", observe_handle_event)
+                patch.setattr(restored_client, "_on_invited_rooms", observe_route)
+            else:
+                patch.setattr(
+                    InviteEvent,
+                    "parse_event",
+                    classmethod(forbidden_path),
+                )
+                patch.setattr(room, "handle_event", forbidden_path)
+
+            live_paths = (
+                "receive_response",
+                "_receive_sync_family",
+                "_handle_sync",
+                "_handle_sliding_sync",
+                "_handle_invited_rooms",
+                "_handle_joined_rooms",
+                "_handle_joined_state",
+                "_dispatch_timeline_event",
+                "_handle_timeline_event",
+                "_prepare_ingestion_frame",
+                "_on_event",
+                "_on_ephemeral",
+                "_on_room_account_data",
+                "_on_presence",
+                "_on_global_account_data",
+                "_on_to_device",
+                "_on_event_admission",
+                "_on_response",
+            )
+            for name in live_paths:
+                patch.setattr(restored_client, name, forbidden_path)
+            if target != "invite":
+                patch.setattr(restored_client, "_on_invited_rooms", forbidden_path)
+            patch.setattr(restored_session, "_materialize_oldest_frame", forbidden_path)
+            patch.setattr(
+                restored_session._journal,
+                "_prepare_and_materialize_oldest_frame",
+                forbidden_path,
+            )
+
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        connection.set_trace_callback(None)
+        expected_count = int(target == "invite")
+        assert len(authenticated) == 1
+        assert len(parsed) == len(handled) == expected_count
+        assert len(routed) == len(callbacks) == expected_count
+        assert acknowledgements == [batch.ref]
+        assert forbidden_callbacks == []
+        assert_snapshot_overlay()
+        if target == "invite":
+            assert room.inviter == BOB
+        assert restored_client.send_count == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+            == work_count - 1
+        )
+        restored_client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await restored_session.close()
+
+
+@pytest.mark.parametrize("target", ["presence", "ephemeral", "room-account-data"])
+@pytest.mark.asyncio
+async def test_owned_settle_auxiliary_state_before_receipt_callback(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from nio.client.base_client import _room_snapshot
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.config = replace(client.config, backfill_limited_timelines=True)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        assert client.olm is not None
+        body = _parity_response(
+            "classic",
+            None,
+            nonempty=True,
+            one_time_key_count=client.olm.account.max_one_time_keys,
+        )
+        to_device = body["to_device"]
+        account_data = body["account_data"]
+        rooms = body["rooms"]
+        assert type(to_device) is dict
+        assert type(account_data) is dict
+        assert type(rooms) is dict
+        to_device["events"] = []
+        account_data["events"] = []
+        joined = rooms["join"]
+        assert type(joined) is dict
+        room_body = joined[ROOM]
+        assert type(room_body) is dict
+        timeline = room_body["timeline"]
+        state = room_body["state"]
+        assert type(timeline) is dict
+        assert type(state) is dict
+        timeline["events"] = []
+        state_events = state["events"]
+        assert type(state_events) is list
+        state_events.append(
+            {
+                "content": {"displayname": "Bob", "membership": "join"},
+                "event_id": "$aux-bob",
+                "origin_server_ts": 2,
+                "sender": BOB,
+                "state_key": BOB,
+                "type": "m.room.member",
+            }
+        )
+        stage_classic(bootstrap, body)
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        pending = session._journal.load_pending_hydrations(limit=2)
+        assert len(pending) == 1
+        hydrated = normalize_hydration_response(
+            pending[0],
+            own_user_id=ACCOUNT,
+            response_body=hydration_state(),
+        )
+        assert session._journal.apply_hydration_result(result=hydrated) is not None
+
+        fifo = (
+            RecordKind.ROOM_LIFECYCLE,
+            RecordKind.PRESENCE,
+            RecordKind.STATE,
+            RecordKind.STATE,
+            RecordKind.EPHEMERAL,
+            RecordKind.ROOM_ACCOUNT_DATA,
+        )
+        target_kind = {
+            "presence": RecordKind.PRESENCE,
+            "ephemeral": RecordKind.EPHEMERAL,
+            "room-account-data": RecordKind.ROOM_ACCOUNT_DATA,
+        }[target]
+        target_index = fifo.index(target_kind)
+        for index, expected_kind in enumerate(fifo[: target_index + 1]):
+            claimed = session.next_batch(max_records=1)
+            assert claimed is not None
+            assert len(claimed.records) == 1
+            assert claimed.records[0].kind is expected_kind
+            if index == target_index:
+                batch = claimed
+                record = claimed.records[0]
+            else:
+                session.acknowledge_batch(claimed.ref)
+        assert type(record) is EventRecord
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            loaded = session._journal._load_room_aggregate(owner, ROOM)
+        assert loaded is not None
+        aggregate = loaded[1]
+        snapshot = aggregate.room_snapshot
+        assert snapshot is not None
+        connection = session._owned_store.database.connection()
+        work_count = connection.execute(
+            "SELECT COUNT(*) FROM NioIngestWork"
+        ).fetchone()[0]
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_client.config = replace(
+        restored_client.config,
+        backfill_limited_timelines=True,
+    )
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    connection = restored_session._owned_store.database.connection()
+    try:
+        assert restored_session.next_batch(max_records=1) == batch
+        room = restored_client.rooms[ROOM]
+        assert type(room) is nio.MatrixRoom
+        assert (
+            _room_snapshot(
+                room,
+                snapshot.membership_epoch,
+                snapshot.own_membership,
+            )
+            == snapshot
+        )
+        assert BOB in room.users
+        if target != "presence":
+            room.name = "corrupted auxiliary snapshot"
+            room.users[ACCOUNT].display_name = "Corrupted auxiliary Alice"
+        room.fully_read_marker = "$aux-keep"
+        room.tags = {"u.keep": {"order": 0.25}}
+        room.typing_users = [ACCOUNT]
+        alice_presence = ("unavailable", 91, False, "Alice preserved")
+        (
+            room.users[ACCOUNT].presence,
+            room.users[ACCOUNT].last_active_ago,
+            room.users[ACCOUNT].currently_active,
+            room.users[ACCOUNT].status_msg,
+        ) = alice_presence
+        mutated_snapshot = _room_snapshot(
+            room,
+            snapshot.membership_epoch,
+            snapshot.own_membership,
+        )
+        assert (mutated_snapshot != snapshot) is (target != "presence")
+
+        expected_metadata = {
+            "presence": (
+                "m.presence",
+                _CallbackRoute.PRESENCE,
+                None,
+                None,
+                None,
+            ),
+            "ephemeral": (
+                "m.typing",
+                _CallbackRoute.EPHEMERAL,
+                ROOM,
+                0,
+                3,
+            ),
+            "room-account-data": (
+                "m.tag",
+                _CallbackRoute.ROOM_ACCOUNT_DATA,
+                ROOM,
+                0,
+                4,
+            ),
+        }[target]
+        assert (
+            record.kind,
+            record.room_id,
+            record.membership_epoch,
+            record.room_sequence,
+            record.event_id,
+            record.provenance,
+            record.clear_json,
+        ) == (
+            target_kind,
+            expected_metadata[2],
+            expected_metadata[3],
+            expected_metadata[4],
+            None,
+            None,
+            None,
+        )
+        source = json.loads(record.source_json)
+        assert canonical_json(source) == record.source_json
+        outstanding = _owned_delivery_frontier(connection)
+
+        def assert_outside_owner_transaction() -> None:
+            assert (
+                connection.in_transaction,
+                restored_session._journal._owner._depth,
+                restored_session._journal._owner.database.transaction_depth(),
+            ) == (False, 0, 0)
+
+        def assert_snapshot_overlay() -> None:
+            assert restored_client.rooms[ROOM] is room
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == snapshot
+            )
+
+        def assert_outstanding() -> None:
+            assert _owned_delivery_frontier(connection) == outstanding
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == work_count
+            )
+
+        def assert_preserved_auxiliary() -> None:
+            assert room.fully_read_marker == "$aux-keep"
+            assert (
+                room.users[ACCOUNT].presence,
+                room.users[ACCOUNT].last_active_ago,
+                room.users[ACCOUNT].currently_active,
+                room.users[ACCOUNT].status_msg,
+            ) == alice_presence
+            if target != "ephemeral":
+                assert room.typing_users == [ACCOUNT]
+            if target != "room-account-data":
+                assert room.tags == {"u.keep": {"order": 0.25}}
+
+        def assert_applied() -> None:
+            if target == "presence":
+                bob = room.users[BOB]
+                assert (
+                    bob.presence,
+                    bob.last_active_ago,
+                    bob.currently_active,
+                    bob.status_msg,
+                ) == ("online", 0, True, "ready")
+            elif target == "ephemeral":
+                assert room.typing_users == [BOB]
+            else:
+                assert room.tags == {"u.work": {"order": 1}}
+            assert_preserved_auxiliary()
+
+        authenticated: list[object] = []
+        real_load_settlement = restored_session._journal._load_batch_settlement
+
+        def observe_settlement(candidate):
+            assert candidate == batch
+            view = real_load_settlement(candidate)
+            assert view is not None
+            work, room_value = view
+            metadata = work.metadata
+            assert work.value == record
+            assert metadata is not None
+            assert (
+                metadata.record_id,
+                metadata.preparation_phase,
+                metadata.effective_event_type,
+                metadata.decryption,
+                metadata.decryption_verified,
+                metadata.decrypted_to_device_kind,
+                metadata.callback_route,
+            ) == (
+                record.record_id,
+                _PreparationPhase.SOURCE,
+                expected_metadata[0],
+                _DecryptionDisposition.NONE,
+                None,
+                None,
+                expected_metadata[1],
+            )
+            assert room_value == (None if target == "presence" else aggregate)
+            assert (
+                _room_snapshot(
+                    room,
+                    snapshot.membership_epoch,
+                    snapshot.own_membership,
+                )
+                == mutated_snapshot
+            )
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            authenticated.append(view)
+            return view
+
+        parsed: list[object] = []
+        applied: list[object] = []
+        real_ephemeral_parse = EphemeralEvent.parse_event
+        real_account_parse = AccountDataEvent.parse_event
+        real_presence_parse = PresenceEvent.from_dict
+        real_handle_ephemeral = room.handle_ephemeral_event
+        real_handle_account = room.handle_account_data
+
+        def forbidden_path(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("auxiliary settlement replayed a wrong path")
+
+        def observe_parse(
+            _event_type: type[object],
+            event_source: dict[object, object],
+        ) -> object:
+            assert len(authenticated) == 1
+            assert event_source == source
+            assert_snapshot_overlay()
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            if target == "presence":
+                event = real_presence_parse(event_source)
+                assert type(event) is PresenceEvent
+            elif target == "ephemeral":
+                event = real_ephemeral_parse(event_source)
+                assert type(event) is nio.TypingNoticeEvent
+            else:
+                event = real_account_parse(event_source)
+                assert type(event) is nio.TagEvent
+            parsed.append(event)
+            return event
+
+        def observe_handle(event: object) -> None:
+            assert parsed == [event]
+            assert_snapshot_overlay()
+            assert_preserved_auxiliary()
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            if target == "ephemeral":
+                real_handle_ephemeral(event)  # type: ignore[arg-type]
+            else:
+                assert target == "room-account-data"
+                real_handle_account(event)  # type: ignore[arg-type]
+            applied.append(event)
+            assert_applied()
+
+        forbidden_callbacks: list[str] = []
+        _install_owned_settlement_callback_tripwires(
+            restored_client,
+            forbidden_callbacks,
+        )
+        routed: list[object] = []
+        callbacks: list[object] = []
+        if target == "presence":
+            restored_client.presence_callbacks.clear()
+            real_route = restored_client._on_presence
+
+            async def callback(event: object) -> None:
+                assert parsed == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                callbacks.append(event)
+
+            async def observe_route(event: object) -> None:
+                assert parsed == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                routed.append(event)
+                await real_route(event)  # type: ignore[arg-type]
+
+            restored_client.add_presence_callback(callback, None)
+        elif target == "ephemeral":
+            restored_client.ephemeral_callbacks.clear()
+            real_route = restored_client._on_ephemeral
+
+            async def callback(candidate_room: object, event: object) -> None:
+                assert candidate_room is room
+                assert parsed == applied == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                callbacks.append(event)
+
+            async def observe_route(event: object, candidate_room: object) -> None:
+                assert candidate_room is room
+                assert parsed == applied == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                routed.append(event)
+                await real_route(event, candidate_room)  # type: ignore[arg-type]
+
+            restored_client.add_ephemeral_callback(callback, None)
+        else:
+            restored_client.room_account_data_callbacks.clear()
+            real_route = restored_client._on_room_account_data
+
+            async def callback(candidate_room: object, event: object) -> None:
+                assert candidate_room is room
+                assert parsed == applied == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                callbacks.append(event)
+
+            async def observe_route(event: object, candidate_room: object) -> None:
+                assert candidate_room is room
+                assert parsed == applied == [event]
+                assert_applied()
+                assert_outside_owner_transaction()
+                assert_outstanding()
+                routed.append(event)
+                await real_route(event, candidate_room)  # type: ignore[arg-type]
+
+            restored_client.add_room_account_data_callback(callback, None)
+
+        acknowledgements: list[BatchRef] = []
+        real_acknowledge = restored_session._journal.acknowledge_batch
+
+        def observe_acknowledgement(ref: BatchRef) -> None:
+            assert ref == batch.ref
+            assert len(authenticated) == 1
+            assert routed == callbacks == parsed
+            if target == "presence":
+                assert applied == []
+            else:
+                assert applied == parsed
+            assert_snapshot_overlay()
+            assert_applied()
+            assert_outside_owner_transaction()
+            assert_outstanding()
+            acknowledgements.append(ref)
+            real_acknowledge(ref)
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                restored_session._journal,
+                "_load_batch_settlement",
+                observe_settlement,
+            )
+            patch.setattr(
+                restored_session._journal,
+                "acknowledge_batch",
+                observe_acknowledgement,
+            )
+            patch.setattr(Event, "parse_event", classmethod(forbidden_path))
+            patch.setattr(InviteEvent, "parse_event", classmethod(forbidden_path))
+            patch.setattr(room, "handle_event", forbidden_path)
+            if target == "presence":
+                patch.setattr(PresenceEvent, "from_dict", classmethod(observe_parse))
+                patch.setattr(
+                    EphemeralEvent, "parse_event", classmethod(forbidden_path)
+                )
+                patch.setattr(
+                    AccountDataEvent,
+                    "parse_event",
+                    classmethod(forbidden_path),
+                )
+                patch.setattr(restored_client, "_on_presence", observe_route)
+            elif target == "ephemeral":
+                patch.setattr(EphemeralEvent, "parse_event", classmethod(observe_parse))
+                patch.setattr(PresenceEvent, "from_dict", classmethod(forbidden_path))
+                patch.setattr(
+                    AccountDataEvent,
+                    "parse_event",
+                    classmethod(forbidden_path),
+                )
+                patch.setattr(room, "handle_ephemeral_event", observe_handle)
+                patch.setattr(restored_client, "_on_ephemeral", observe_route)
+            else:
+                patch.setattr(
+                    AccountDataEvent,
+                    "parse_event",
+                    classmethod(observe_parse),
+                )
+                patch.setattr(PresenceEvent, "from_dict", classmethod(forbidden_path))
+                patch.setattr(
+                    EphemeralEvent, "parse_event", classmethod(forbidden_path)
+                )
+                patch.setattr(room, "handle_account_data", observe_handle)
+                patch.setattr(
+                    restored_client,
+                    "_on_room_account_data",
+                    observe_route,
+                )
+
+            live_paths = (
+                "receive_response",
+                "_receive_sync_family",
+                "_handle_sync",
+                "_handle_sliding_sync",
+                "_handle_invited_rooms",
+                "_handle_joined_rooms",
+                "_handle_joined_state",
+                "_dispatch_timeline_event",
+                "_handle_timeline_event",
+                "_prepare_ingestion_frame",
+                "_on_event",
+                "_on_invited_rooms",
+                "_on_to_device",
+                "_on_global_account_data",
+                "_on_event_admission",
+                "_on_response",
+            )
+            for name in live_paths:
+                patch.setattr(restored_client, name, forbidden_path)
+            expected_route = {
+                "presence": "_on_presence",
+                "ephemeral": "_on_ephemeral",
+                "room-account-data": "_on_room_account_data",
+            }[target]
+            for name in ("_on_presence", "_on_ephemeral", "_on_room_account_data"):
+                if name != expected_route:
+                    patch.setattr(restored_client, name, forbidden_path)
+            if target != "ephemeral":
+                patch.setattr(room, "handle_ephemeral_event", forbidden_path)
+            if target != "room-account-data":
+                patch.setattr(room, "handle_account_data", forbidden_path)
+            patch.setattr(restored_session, "_materialize_oldest_frame", forbidden_path)
+            patch.setattr(
+                restored_session._journal,
+                "_prepare_and_materialize_oldest_frame",
+                forbidden_path,
+            )
+
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        connection.set_trace_callback(None)
+        assert len(authenticated) == 1
+        assert len(parsed) == len(routed) == len(callbacks) == 1
+        assert acknowledgements == [batch.ref]
+        assert forbidden_callbacks == []
+        assert_snapshot_overlay()
+        assert_applied()
+        assert (
+            connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+            == work_count - 1
+        )
+        journal_dml = tuple(
+            statement.lstrip().upper()
+            for statement in statements
+            if statement.lstrip()
+            .upper()
+            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+        )
+        assert len(journal_dml) == 2
+        assert journal_dml[0].startswith("DELETE FROM NIOINGESTWORK")
+        assert journal_dml[1].startswith("UPDATE NIOINGESTMETA")
+        assert restored_client.send_count == 0
+        restored_client._assert_ingestion_not_poisoned()
+    finally:
+        connection.set_trace_callback(None)
+        await restored_session.close()
+
+
+@pytest.mark.parametrize(
+    "malformed_source",
+    (
+        {"content": {"presence": "online"}, "type": "m.presence"},
+        {"content": {}, "sender": BOB, "type": "m.presence"},
+        {"content": {"presence": 7}, "sender": BOB, "type": "m.presence"},
+    ),
+)
+@pytest.mark.asyncio
+async def test_owned_settle_rejects_authenticated_malformed_presence_without_ack(
+    tmp_path,
+    malformed_source: dict[str, object],
+) -> None:
+    from nio.store._sync_journal_plan import _canonical_work_plaintext
+    from nio.store._sync_journal_preflight import _canonical_internal
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    valid_source = {
+        "content": {
+            "currently_active": True,
+            "presence": "online",
+            "status_msg": "valid before authenticated reseal",
+        },
+        "sender": BOB,
+        "type": "m.presence",
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "malformed-presence-token",
+                "presence": {"events": [valid_source]},
+                "rooms": {},
+                "to_device": {"events": []},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(inventory.work) == 1
+        work = inventory.work[0]
+        assert type(work.value) is EventRecord
+        assert work.value.kind is RecordKind.PRESENCE
+        assert work.metadata is not None
+        assert work.metadata.callback_route is _CallbackRoute.PRESENCE
+        malformed = replace(
+            work.value,
+            source_json=canonical_json(malformed_source),
+        )
+        row = connection.execute(
+            "SELECT account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload, payload_sha256 FROM NioIngestWork "
+            "WHERE account_id = ? AND work_id = ?",
+            (ACCOUNT, work.value.record_id),
+        ).fetchone()
+        assert row is not None
+        plaintext = _canonical_work_plaintext("event", malformed, work.metadata)
+        payload, digest = session._journal._payload(
+            owner,
+            "NioIngestWork",
+            plaintext,
+            header=_canonical_internal(row[1:11]),
+        )
+        connection.execute(
+            "UPDATE NioIngestWork SET payload = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND work_id = ?",
+            (payload, digest, ACCOUNT, work.value.record_id),
+        )
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    restored_connection = restored_session._owned_store.database.connection()
+    try:
+        batch = restored_session.next_batch(max_records=1)
+        assert batch is not None
+        assert batch.records == (malformed,)
+        settlement = restored_session._journal._load_batch_settlement(batch)
+        assert settlement is not None
+        authenticated_work, aggregate = settlement
+        assert authenticated_work.value == malformed
+        assert authenticated_work.metadata == work.metadata
+        assert aggregate is None
+        frontier = _owned_delivery_frontier(restored_connection)
+        graph = tuple(restored_connection.iterdump())
+        callbacks: list[object] = []
+
+        async def callback(event: object) -> None:
+            callbacks.append(event)
+            raise AssertionError("malformed presence reached a callback")
+
+        restored_client.add_presence_callback(callback, None)
+        statements: list[str] = []
+        restored_connection.set_trace_callback(statements.append)
+        with pytest.raises(
+            JournalIntegrityError,
+            match="presence event source is invalid",
+        ):
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        restored_connection.set_trace_callback(None)
+        assert callbacks == []
+        assert tuple(restored_connection.iterdump()) == graph
+        assert _owned_delivery_frontier(restored_connection) == frontier
+        assert restored_session.next_batch(max_records=1) == batch
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+            for statement in statements
+        )
+        restored_client._assert_ingestion_not_poisoned()
+    finally:
+        restored_connection.set_trace_callback(None)
+        await restored_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_settle_rejects_authenticated_malformed_collected_request(
+    tmp_path,
+) -> None:
+    from nio.store._sync_journal_plan import _canonical_work_plaintext
+    from nio.store._sync_journal_preflight import _canonical_internal
+
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    connection = session._owned_store.database.connection()
+    request_id = "malformed-collected-request"
+    request_source = {
+        "content": {
+            "action": "request",
+            "body": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": ROOM,
+                "sender_key": "malformed-collected-sender-key",
+                "session_id": "malformed-collected-session",
+            },
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    cancellation_source = {
+        "content": {
+            "action": "request_cancellation",
+            "request_id": request_id,
+            "requesting_device_id": BOB_DEVICE,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    malformed_source = {
+        "content": {
+            "action": "request_cancellation",
+            "request_id": request_id,
+        },
+        "sender": BOB,
+        "type": "m.room_key_request",
+    }
+    try:
+        assert client.olm is not None
+        olm = client.olm
+        olm.account.shared = True
+        olm.uploaded_key_count = olm.account.max_one_time_keys
+        olm.save_account()
+        pending = ToDeviceEvent.parse_event(request_source)
+        assert type(pending) is RoomKeyRequest
+        olm.key_request_from_untrusted[request_id] = pending
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": []},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": olm.account.max_one_time_keys
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "malformed-collected-token",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": [cancellation_source]},
+            },
+        )
+        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
+        assert materialized.status is MaterializeStatus.MATERIALIZED
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            inventory = session._journal._load_task3_work_inventory(owner)
+        assert len(inventory.work) == 2
+        source_work = next(
+            work
+            for work in inventory.work
+            if work.metadata is not None
+            and work.metadata.preparation_phase is _PreparationPhase.SOURCE
+        )
+        collected_work = next(
+            work
+            for work in inventory.work
+            if work.metadata is not None
+            and work.metadata.preparation_phase
+            is _PreparationPhase.COLLECTED_KEY_REQUEST
+        )
+        assert type(collected_work.value) is EventRecord
+        malformed = replace(
+            collected_work.value,
+            source_json=canonical_json(malformed_source),
+        )
+        row = connection.execute(
+            "SELECT account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload, payload_sha256 FROM NioIngestWork "
+            "WHERE account_id = ? AND work_id = ?",
+            (ACCOUNT, collected_work.value.record_id),
+        ).fetchone()
+        assert row is not None
+        plaintext = _canonical_work_plaintext(
+            "event",
+            malformed,
+            collected_work.metadata,
+        )
+        payload, digest = session._journal._payload(
+            owner,
+            "NioIngestWork",
+            plaintext,
+            header=_canonical_internal(row[1:11]),
+        )
+        connection.execute(
+            "UPDATE NioIngestWork SET payload = ?, payload_sha256 = ? "
+            "WHERE account_id = ? AND work_id = ?",
+            (payload, digest, ACCOUNT, collected_work.value.record_id),
+        )
+        first = session.next_batch(max_records=1)
+        assert first is not None
+        assert first.records == (source_work.value,)
+        session.acknowledge_batch(first.ref)
+    finally:
+        await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    restored_connection = restored_session._owned_store.database.connection()
+    try:
+        batch = restored_session.next_batch(max_records=1)
+        assert batch is not None
+        assert batch.records == (malformed,)
+        settlement = restored_session._journal._load_batch_settlement(batch)
+        assert settlement is not None
+        authenticated_work, aggregate = settlement
+        assert authenticated_work.value == malformed
+        assert authenticated_work.metadata == collected_work.metadata
+        assert aggregate is None
+        frontier = _owned_delivery_frontier(restored_connection)
+        graph = tuple(restored_connection.iterdump())
+        callbacks: list[object] = []
+
+        async def callback(event: object) -> None:
+            callbacks.append(event)
+            raise AssertionError("malformed collected request reached a callback")
+
+        restored_client.add_to_device_callback(callback, None)
+        statements: list[str] = []
+        restored_connection.set_trace_callback(statements.append)
+        with pytest.raises(
+            JournalIntegrityError,
+            match="collected key-request source is invalid",
+        ):
+            await restored_session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=False,
+            )
+
+        restored_connection.set_trace_callback(None)
+        assert callbacks == []
+        assert tuple(restored_connection.iterdump()) == graph
+        assert _owned_delivery_frontier(restored_connection) == frontier
+        assert restored_session.next_batch(max_records=1) == batch
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+            for statement in statements
+        )
+        restored_client._assert_ingestion_not_poisoned()
+    finally:
+        restored_connection.set_trace_callback(None)
+        await restored_session.close()

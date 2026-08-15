@@ -10,6 +10,22 @@ from uuid import UUID, uuid5
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
 
+from ..events.account_data import AccountDataEvent
+from ..events.ephemeral import EphemeralEvent
+from ..events.invite_events import InviteEvent
+from ..events.misc import BadEvent, UnknownBadEvent
+from ..events.presence import PresenceEvent
+from ..events.room_events import Event, MegolmEvent
+from ..events.to_device import (
+    DummyEvent,
+    ForwardedRoomKeyEvent,
+    KeyVerificationCancel,
+    RoomKeyEvent,
+    RoomKeyRequest,
+    RoomKeyRequestCancellation,
+    ToDeviceEvent,
+    UnknownToDeviceEvent,
+)
 from ..exceptions import LocalProtocolError
 from ..store._sync_journal_rows import (
     _encoded_bytes,
@@ -21,16 +37,25 @@ from ..store._sync_journal_values import (
     MaterializeResult,
     MaterializerLimits,
     MaterializeStatus,
+    RoomAggregateValue,
 )
 from . import ports
 from ._json import canonical_json, load_json
 from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
+from .errors import JournalIntegrityError
 from .hydration import normalize_hydration_response
 from .model import (
     BatchRef,
+    EventRecord,
+    LossRecord,
+    RecordKind,
     SyncBatch,
     TransportKind,
+    _CallbackRoute,
+    _DecryptedToDeviceKind,
+    _DecryptionDisposition,
+    _PreparationPhase,
     _PreparedCryptoDelta,
     _PreparedIngestionFrame,
     _PreparedMegolmRerequest,
@@ -542,6 +567,105 @@ async def _drain_owned_cleanup(
         raise asyncio.CancelledError
 
 
+def _apply_room_lifecycle_snapshot(
+    client: AsyncClient,
+    record: EventRecord,
+    aggregate: RoomAggregateValue,
+) -> None:
+    from ..client.base_client import _overlay_room_snapshot
+    from ..rooms import MatrixInvitedRoom, MatrixRoom
+
+    continuity = aggregate.continuity
+    room_id = record.room_id
+    membership = continuity.membership
+    snapshot = aggregate.room_snapshot
+    if (
+        type(room_id) is not str
+        or not room_id
+        or continuity.room_id != room_id
+        or membership not in {None, "invite", "join", "knock", "leave", "ban"}
+        or type(client.user_id) is not str
+        or not client.user_id
+        or type(client.rooms) is not dict
+        or type(client.invited_rooms) is not dict
+    ):
+        raise JournalIntegrityError("room lifecycle Aggregate identity is invalid")
+    if snapshot is not None and (
+        snapshot.room_id != room_id or snapshot.own_user_id != client.user_id
+    ):
+        raise JournalIntegrityError("room lifecycle snapshot identity is invalid")
+
+    invited = membership in {"invite", "knock"}
+    desired = client.invited_rooms if invited else client.rooms
+    opposite = client.rooms if invited else client.invited_rooms
+    desired_room = desired.get(room_id)
+    opposite_room = opposite.get(room_id)
+    if desired_room is not None and opposite_room is not None:
+        raise LocalProtocolError("owned room projection has duplicate routing")
+    desired_type = MatrixInvitedRoom if invited else MatrixRoom
+    opposite_type = MatrixRoom if invited else MatrixInvitedRoom
+
+    def validate_live_room(room: MatrixRoom, expected_type: type[MatrixRoom]) -> None:
+        if type(room) is not expected_type or (
+            room.room_id,
+            room.own_user_id,
+        ) != (room_id, client.user_id):
+            raise LocalProtocolError("owned room projection identity is invalid")
+
+    if desired_room is not None:
+        validate_live_room(desired_room, desired_type)
+    if opposite_room is not None:
+        validate_live_room(opposite_room, opposite_type)
+    if snapshot is None:
+        if opposite_room is not None:
+            opposite.pop(room_id)
+        return
+
+    try:
+        projected = _overlay_room_snapshot(
+            desired_room if desired_room is not None else opposite_room,
+            snapshot,
+            invited=invited,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("room lifecycle snapshot is invalid") from error
+    if type(projected) is not desired_type or (
+        projected.room_id,
+        projected.own_user_id,
+    ) != (room_id, client.user_id):
+        raise JournalIntegrityError("room lifecycle projection identity is invalid")
+    if desired_room is not None and projected is not desired_room:
+        raise JournalIntegrityError("room lifecycle overlay replaced a routed room")
+    if opposite_room is not None:
+        opposite.pop(room_id)
+    if invited:
+        if type(projected) is not MatrixInvitedRoom:
+            raise JournalIntegrityError(
+                "room lifecycle invited projection has the wrong type"
+            )
+        client.invited_rooms[room_id] = projected
+    else:
+        if type(projected) is not MatrixRoom:
+            raise JournalIntegrityError(
+                "room lifecycle current projection has the wrong type"
+            )
+        client.rooms[room_id] = projected
+
+
+def _load_settlement_event(
+    payload: bytes,
+    field_name: str,
+    invalid_message: str,
+) -> dict[str, object]:
+    try:
+        value = load_json(payload, field_name)
+        if type(value) is not dict or canonical_json(value) != payload:
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise JournalIntegrityError(invalid_message) from error
+    return value
+
+
 class _OwnedIngestionSession(IngestionSession):
     """Private ingestion session holding the exact journal/store close token."""
 
@@ -563,6 +687,8 @@ class _OwnedIngestionSession(IngestionSession):
         self._close_task: asyncio.Task[None] | None = None
         self._running: asyncio.Task[None] | None = None
         self._terminal: BaseException | None = None
+        self._settlement_lock = asyncio.Lock()
+        self._settlement_task: asyncio.Task[object] | None = None
         self._detached = False
         self._revoked = False
         self._closed = False
@@ -688,6 +814,715 @@ class _OwnedIngestionSession(IngestionSession):
                 self._client._poison_ingestion()
             raise
 
+    async def _settle_batch(
+        self,
+        batch: SyncBatch,
+        *,
+        receipt_new: bool,
+        semantic_event_new: bool,
+    ) -> None:
+        if type(receipt_new) is not bool or type(semantic_event_new) is not bool:
+            raise LocalProtocolError("settlement facts must be booleans")
+        if semantic_event_new and not receipt_new:
+            raise LocalProtocolError("a new semantic event requires a new receipt")
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        current = asyncio.current_task()
+        assert current is not None
+        if self._settlement_task is current:
+            raise LocalProtocolError("settlement cannot recursively settle")
+
+        async with self._settlement_lock:
+            self._client._assert_ingestion_not_poisoned()
+            if self._close_task is not None or self._closed:
+                raise LocalProtocolError("ingestion session is closed")
+            assert self._settlement_task is None
+            self._settlement_task = current
+            try:
+                settlement = self._journal._load_batch_settlement(batch)
+                if settlement is None:
+                    self._journal.acknowledge_batch(batch.ref)
+                    return
+
+                work, room = settlement
+                record = work.value
+                metadata = work.metadata
+                terminal = False
+                if type(record) is LossRecord:
+                    if metadata is not None or room is not None:
+                        raise LocalProtocolError(
+                            "unsupported durable settlement record"
+                        )
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.ROOM_LIFECYCLE
+                ):
+                    if metadata is not None or type(room) is not RoomAggregateValue:
+                        raise LocalProtocolError(
+                            "unsupported durable settlement record"
+                        )
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.STATE
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.NONE
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route in (None, _CallbackRoute.EVENT)
+                ):
+                    invite_callback = metadata.callback_route is _CallbackRoute.EVENT
+                    if invite_callback and room.continuity.membership != "invite":
+                        raise LocalProtocolError(
+                            "unsupported durable settlement record"
+                        )
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    if invite_callback:
+                        from ..rooms import MatrixInvitedRoom
+
+                        room_id = record.room_id
+                        if type(room_id) is not str:
+                            raise JournalIntegrityError("invite STATE event is invalid")
+                        projected_room = self._client.invited_rooms.get(room_id)
+                        if type(projected_room) is not MatrixInvitedRoom:
+                            raise JournalIntegrityError(
+                                "invite STATE Aggregate has no invited projection"
+                            )
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "invite STATE event",
+                            "invite STATE event source is invalid",
+                        )
+                        if source.get("type") != metadata.effective_event_type:
+                            raise JournalIntegrityError(
+                                "invite STATE event source is invalid"
+                            )
+                        event = InviteEvent.parse_event(source)
+                        if event is None:
+                            raise JournalIntegrityError(
+                                "invite STATE event source is invalid"
+                            )
+                        if isinstance(event, InviteEvent):
+                            projected_room.handle_event(event)  # type: ignore[arg-type]
+                        _apply_room_lifecycle_snapshot(self._client, record, room)
+                        if (
+                            self._client.invited_rooms.get(room_id)
+                            is not projected_room
+                        ):
+                            raise JournalIntegrityError(
+                                "invite STATE overlay replaced the invited projection"
+                            )
+                        if receipt_new:
+                            await self._client._on_invited_rooms(  # type: ignore[arg-type]
+                                event,
+                                projected_room,
+                            )
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.EPHEMERAL
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.NONE
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.EPHEMERAL
+                ):
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    room_id = record.room_id
+                    if type(room_id) is not str:
+                        raise JournalIntegrityError("ephemeral event is invalid")
+                    projected_rooms = (
+                        self._client.invited_rooms
+                        if room.continuity.membership in {"invite", "knock"}
+                        else self._client.rooms
+                    )
+                    projected_room = projected_rooms.get(room_id)
+                    if projected_room is None:
+                        raise JournalIntegrityError(
+                            "ephemeral Aggregate has no room projection"
+                        )
+                    source = _load_settlement_event(
+                        record.source_json,
+                        "ephemeral event",
+                        "ephemeral event source is invalid",
+                    )
+                    if source.get("type") != metadata.effective_event_type:
+                        raise JournalIntegrityError("ephemeral event source is invalid")
+                    event = EphemeralEvent.parse_event(source)
+                    if event is None:
+                        raise JournalIntegrityError("ephemeral event source is invalid")
+                    projected_room.handle_ephemeral_event(event)
+                    if receipt_new:
+                        await self._client._on_ephemeral(event, projected_room)
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.ROOM_ACCOUNT_DATA
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.NONE
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.ROOM_ACCOUNT_DATA
+                ):
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    room_id = record.room_id
+                    if type(room_id) is not str:
+                        raise JournalIntegrityError(
+                            "room account-data event is invalid"
+                        )
+                    projected_rooms = (
+                        self._client.invited_rooms
+                        if room.continuity.membership in {"invite", "knock"}
+                        else self._client.rooms
+                    )
+                    projected_room = projected_rooms.get(room_id)
+                    if projected_room is None:
+                        raise JournalIntegrityError(
+                            "room account-data Aggregate has no room projection"
+                        )
+                    source = _load_settlement_event(
+                        record.source_json,
+                        "room account-data event",
+                        "room account-data source is invalid",
+                    )
+                    if source.get("type") != metadata.effective_event_type:
+                        raise JournalIntegrityError(
+                            "room account-data source is invalid"
+                        )
+                    event = AccountDataEvent.parse_event(source)
+                    projected_room.handle_account_data(event)
+                    if receipt_new:
+                        await self._client._on_room_account_data(
+                            event,
+                            projected_room,
+                        )
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.PRESENCE
+                    and room is None
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.NONE
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.PRESENCE
+                ):
+                    source = _load_settlement_event(
+                        record.source_json,
+                        "presence event",
+                        "presence event source is invalid",
+                    )
+                    if source.get("type") != metadata.effective_event_type:
+                        raise JournalIntegrityError("presence event source is invalid")
+                    event = PresenceEvent.from_dict(source)
+                    if type(event) is not PresenceEvent:
+                        raise JournalIntegrityError("presence event source is invalid")
+                    for projected_room in self._client.rooms.values():
+                        user = projected_room.users.get(event.user_id)
+                        if user is None:
+                            continue
+                        user.presence = event.presence
+                        user.last_active_ago = event.last_active_ago
+                        user.currently_active = event.currently_active
+                        user.status_msg = event.status_msg
+                    if receipt_new:
+                        await self._client._on_presence(event)
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.TIMELINE
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.NONE
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.EVENT
+                ):
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    if semantic_event_new:
+                        room_id = record.room_id
+                        assert room_id is not None
+                        projected_rooms = (
+                            self._client.invited_rooms
+                            if room.continuity.membership in {"invite", "knock"}
+                            else self._client.rooms
+                        )
+                        projected_room = projected_rooms.get(room_id)
+                        if projected_room is None:
+                            raise JournalIntegrityError(
+                                "timeline Aggregate has no room projection"
+                            )
+                        source = load_json(record.source_json, "timeline event")
+                        if (
+                            type(source) is not dict
+                            or canonical_json(source) != record.source_json
+                        ):
+                            raise JournalIntegrityError(
+                                "timeline event source is invalid"
+                            )
+                        event = Event.parse_event(source)
+                        await self._client._on_event(event, projected_room)
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.TIMELINE
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.DECRYPTED
+                    and type(metadata.decryption_verified) is bool
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.EVENT
+                ):
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    if semantic_event_new:
+                        room_id = record.room_id
+                        if type(room_id) is not str or record.clear_json is None:
+                            raise JournalIntegrityError(
+                                "decrypted timeline event is invalid"
+                            )
+                        projected_rooms = (
+                            self._client.invited_rooms
+                            if room.continuity.membership in {"invite", "knock"}
+                            else self._client.rooms
+                        )
+                        projected_room = projected_rooms.get(room_id)
+                        if projected_room is None:
+                            raise JournalIntegrityError(
+                                "timeline Aggregate has no room projection"
+                            )
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "encrypted timeline event",
+                            "encrypted timeline event source is invalid",
+                        )
+                        clear = _load_settlement_event(
+                            record.clear_json,
+                            "decrypted timeline event",
+                            "decrypted timeline event is invalid",
+                        )
+                        source_content = source.get("content")
+                        if (
+                            source.get("type") != "m.room.encrypted"
+                            or type(source_content) is not dict
+                            or source_content.get("algorithm") != "m.megolm.v1.aes-sha2"
+                            or type(source_content.get("sender_key")) is not str
+                            or not source_content["sender_key"]
+                            or type(source_content.get("session_id")) is not str
+                            or not source_content["session_id"]
+                            or clear.get("type") != metadata.effective_event_type
+                            or clear.get("event_id") != record.event_id
+                            or clear.get("room_id") != room_id
+                            or clear.get("sender") != source.get("sender")
+                        ):
+                            raise JournalIntegrityError(
+                                "decrypted timeline event is invalid"
+                            )
+                        event = Event.parse_decrypted_event(clear)
+                        if not isinstance(event, UnknownBadEvent):
+                            event.decrypted = True
+                            event.verified = metadata.decryption_verified
+                            event.sender_key = source_content["sender_key"]
+                            event.session_id = source_content["session_id"]
+                            setattr(event, "room_id", room_id)
+                        await self._client._on_event(event, projected_room)
+                    terminal = True
+                elif (
+                    type(record) is EventRecord
+                    and record.kind is RecordKind.TIMELINE
+                    and type(room) is RoomAggregateValue
+                    and metadata is not None
+                    and metadata.preparation_phase is _PreparationPhase.SOURCE
+                    and metadata.decryption is _DecryptionDisposition.MEGOLM_FAILED
+                    and metadata.decryption_verified is None
+                    and metadata.decrypted_to_device_kind is None
+                    and metadata.callback_route is _CallbackRoute.EVENT
+                ):
+                    _apply_room_lifecycle_snapshot(self._client, record, room)
+                    if semantic_event_new:
+                        room_id = record.room_id
+                        if type(room_id) is not str:
+                            raise JournalIntegrityError(
+                                "failed Megolm event is invalid"
+                            )
+                        projected_rooms = (
+                            self._client.invited_rooms
+                            if room.continuity.membership in {"invite", "knock"}
+                            else self._client.rooms
+                        )
+                        projected_room = projected_rooms.get(room_id)
+                        if projected_room is None:
+                            raise JournalIntegrityError(
+                                "timeline Aggregate has no room projection"
+                            )
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "failed Megolm event",
+                            "failed Megolm event source is invalid",
+                        )
+                        source_content = source.get("content")
+                        if (
+                            source.get("type") != "m.room.encrypted"
+                            or type(source_content) is not dict
+                            or source_content.get("algorithm") != "m.megolm.v1.aes-sha2"
+                            or source.get("event_id") != record.event_id
+                        ):
+                            raise JournalIntegrityError(
+                                "failed Megolm event source is invalid"
+                            )
+                        event = Event.parse_event(source)
+                        if type(event) is not MegolmEvent:
+                            raise JournalIntegrityError(
+                                "failed Megolm event source is invalid"
+                            )
+                        event.room_id = room_id
+                        await self._client._on_event(event, projected_room)
+                    terminal = True
+
+                if not terminal:
+                    if (
+                        type(record) is not EventRecord
+                        or metadata is None
+                        or room is not None
+                    ):
+                        raise LocalProtocolError(
+                            "unsupported durable settlement record"
+                        )
+                    global_account_data = (
+                        record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+                        and metadata.callback_route
+                        is _CallbackRoute.GLOBAL_ACCOUNT_DATA
+                    )
+                    source_to_device = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase is _PreparationPhase.SOURCE
+                        and metadata.decryption is _DecryptionDisposition.NONE
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind is None
+                        and metadata.callback_route is _CallbackRoute.TO_DEVICE
+                    )
+                    source_to_device_ack_only = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase is _PreparationPhase.SOURCE
+                        and metadata.decryption is _DecryptionDisposition.NONE
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind is None
+                        and metadata.callback_route is None
+                    )
+                    decrypted_room_key = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase is _PreparationPhase.SOURCE
+                        and metadata.decryption is _DecryptionDisposition.DECRYPTED
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind
+                        is _DecryptedToDeviceKind.ROOM_KEY
+                        and metadata.callback_route is _CallbackRoute.TO_DEVICE
+                    )
+                    expired_verification = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase
+                        is _PreparationPhase.EXPIRED_VERIFICATION
+                        and metadata.effective_event_type == "m.key.verification.cancel"
+                        and metadata.decryption is _DecryptionDisposition.NONE
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind is None
+                        and metadata.callback_route is _CallbackRoute.TO_DEVICE
+                    )
+                    collected_key_request = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase
+                        is _PreparationPhase.COLLECTED_KEY_REQUEST
+                        and metadata.effective_event_type == "m.room_key_request"
+                        and metadata.decryption is _DecryptionDisposition.NONE
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind is None
+                        and metadata.callback_route is _CallbackRoute.TO_DEVICE
+                    )
+                    remaining_decrypted_to_device = (
+                        record.kind is RecordKind.TO_DEVICE
+                        and metadata.preparation_phase is _PreparationPhase.SOURCE
+                        and metadata.decryption is _DecryptionDisposition.DECRYPTED
+                        and metadata.decryption_verified is None
+                        and metadata.decrypted_to_device_kind
+                        in {
+                            _DecryptedToDeviceKind.FORWARDED_ROOM_KEY,
+                            _DecryptedToDeviceKind.DUMMY,
+                            _DecryptedToDeviceKind.UNKNOWN,
+                            _DecryptedToDeviceKind.BAD,
+                            _DecryptedToDeviceKind.UNKNOWN_BAD,
+                        }
+                        and metadata.callback_route is _CallbackRoute.TO_DEVICE
+                    )
+                    if (
+                        not global_account_data
+                        and not source_to_device
+                        and not source_to_device_ack_only
+                        and not decrypted_room_key
+                        and not expired_verification
+                        and not collected_key_request
+                        and not remaining_decrypted_to_device
+                    ):
+                        raise LocalProtocolError(
+                            "unsupported durable settlement record"
+                        )
+
+                    if decrypted_room_key:
+                        if record.clear_json is None:
+                            raise JournalIntegrityError(
+                                "decrypted room-key event is invalid"
+                            )
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "encrypted to-device event",
+                            "encrypted to-device source is invalid",
+                        )
+                        clear = _load_settlement_event(
+                            record.clear_json,
+                            "decrypted room-key event",
+                            "decrypted room-key event is invalid",
+                        )
+                        source_content = source.get("content")
+                        clear_content = clear.get("content")
+                        if (
+                            source.get("type") != "m.room.encrypted"
+                            or type(source.get("sender")) is not str
+                            or not source["sender"]
+                            or type(source_content) is not dict
+                            or source_content.get("algorithm")
+                            != "m.olm.v1.curve25519-aes-sha2"
+                            or type(source_content.get("sender_key")) is not str
+                            or not source_content["sender_key"]
+                            or clear.get("type") != metadata.effective_event_type
+                            or clear.get("sender") != source["sender"]
+                            or "keys" in clear
+                            or type(clear_content) is not dict
+                            or "session_key" in clear_content
+                            or type(clear_content.get("room_id")) is not str
+                            or not clear_content["room_id"]
+                            or type(clear_content.get("session_id")) is not str
+                            or not clear_content["session_id"]
+                            or type(clear_content.get("algorithm")) is not str
+                            or not clear_content["algorithm"]
+                        ):
+                            raise JournalIntegrityError(
+                                "decrypted room-key event is invalid"
+                            )
+                        event = RoomKeyEvent(
+                            clear,
+                            source["sender"],
+                            source_content["sender_key"],
+                            clear_content["room_id"],
+                            clear_content["session_id"],
+                            clear_content["algorithm"],
+                        )
+                        if receipt_new:
+                            await self._client._on_to_device(event)
+                    elif remaining_decrypted_to_device:
+                        if record.clear_json is None:
+                            raise JournalIntegrityError(
+                                "decrypted to-device event is invalid"
+                            )
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "encrypted to-device event",
+                            "encrypted to-device source is invalid",
+                        )
+                        clear = _load_settlement_event(
+                            record.clear_json,
+                            "decrypted to-device event",
+                            "decrypted to-device event is invalid",
+                        )
+                        source_content = source.get("content")
+                        if (
+                            source.get("type") != "m.room.encrypted"
+                            or type(source.get("sender")) is not str
+                            or not source["sender"]
+                            or type(source_content) is not dict
+                            or source_content.get("algorithm")
+                            != "m.olm.v1.curve25519-aes-sha2"
+                            or type(source_content.get("sender_key")) is not str
+                            or not source_content["sender_key"]
+                            or clear.get("type") != metadata.effective_event_type
+                        ):
+                            raise JournalIntegrityError(
+                                "decrypted to-device event is invalid"
+                            )
+                        sender = source["sender"]
+                        sender_key = source_content["sender_key"]
+                        if (
+                            metadata.decrypted_to_device_kind
+                            is _DecryptedToDeviceKind.FORWARDED_ROOM_KEY
+                        ):
+                            clear_content = clear.get("content")
+                            if (
+                                clear.get("type") != "m.forwarded_room_key"
+                                or clear.get("sender") != sender
+                                or type(clear_content) is not dict
+                                or "session_key" in clear_content
+                                or type(clear_content.get("room_id")) is not str
+                                or not clear_content["room_id"]
+                                or type(clear_content.get("session_id")) is not str
+                                or not clear_content["session_id"]
+                                or type(clear_content.get("algorithm")) is not str
+                                or not clear_content["algorithm"]
+                            ):
+                                raise JournalIntegrityError(
+                                    "decrypted forwarded room-key event is invalid"
+                                )
+                            event = ForwardedRoomKeyEvent(
+                                clear,
+                                sender,
+                                sender_key,
+                                clear_content["room_id"],
+                                clear_content["session_id"],
+                                clear_content["algorithm"],
+                            )
+                        elif (
+                            metadata.decrypted_to_device_kind
+                            is _DecryptedToDeviceKind.DUMMY
+                        ):
+                            if clear.get("type") != "m.dummy":
+                                raise JournalIntegrityError(
+                                    "decrypted dummy event is invalid"
+                                )
+                            event = DummyEvent.from_dict(clear, sender, sender_key)
+                            if type(event) is not DummyEvent:
+                                raise JournalIntegrityError(
+                                    "decrypted dummy event is invalid"
+                                )
+                        elif (
+                            metadata.decrypted_to_device_kind
+                            is _DecryptedToDeviceKind.UNKNOWN
+                        ):
+                            if type(clear.get("sender")) is not str:
+                                raise JournalIntegrityError(
+                                    "decrypted unknown event is invalid"
+                                )
+                            event = UnknownToDeviceEvent.from_dict(clear)
+                            if type(event) is not UnknownToDeviceEvent:
+                                raise JournalIntegrityError(
+                                    "decrypted unknown event is invalid"
+                                )
+                        elif (
+                            metadata.decrypted_to_device_kind
+                            is _DecryptedToDeviceKind.BAD
+                        ):
+                            if (
+                                type(clear.get("event_id")) is not str
+                                or type(clear.get("sender")) is not str
+                                or type(clear.get("origin_server_ts")) is not int
+                            ):
+                                raise JournalIntegrityError(
+                                    "decrypted bad event is invalid"
+                                )
+                            event = BadEvent.from_dict(clear)
+                            if type(event) is not BadEvent:
+                                raise JournalIntegrityError(
+                                    "decrypted bad event is invalid"
+                                )
+                        else:
+                            assert (
+                                metadata.decrypted_to_device_kind
+                                is _DecryptedToDeviceKind.UNKNOWN_BAD
+                            )
+                            event = UnknownBadEvent(clear)
+                        if receipt_new:
+                            await self._client._on_to_device(event)  # type: ignore[arg-type]
+                    elif expired_verification:
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "expired verification",
+                            "expired verification source is invalid",
+                        )
+                        if source.get("type") not in (
+                            None,
+                            metadata.effective_event_type,
+                        ):
+                            raise JournalIntegrityError(
+                                "expired verification source is invalid"
+                            )
+                        event = KeyVerificationCancel.from_dict(source)
+                        if type(event) is not KeyVerificationCancel:
+                            raise JournalIntegrityError(
+                                "expired verification source is invalid"
+                            )
+                        if receipt_new:
+                            await self._client._on_expired_verifications(event)
+                    elif collected_key_request:
+                        source = _load_settlement_event(
+                            record.source_json,
+                            "collected key request",
+                            "collected key-request source is invalid",
+                        )
+                        if source.get("type") != metadata.effective_event_type:
+                            raise JournalIntegrityError(
+                                "collected key-request source is invalid"
+                            )
+                        event = ToDeviceEvent.parse_event(source)
+                        if type(event) not in (
+                            RoomKeyRequest,
+                            RoomKeyRequestCancellation,
+                        ):
+                            raise JournalIntegrityError(
+                                "collected key-request source is invalid"
+                            )
+                        if receipt_new:
+                            await self._client._on_to_device(event)
+                    elif not source_to_device_ack_only:
+                        source_name = (
+                            "global account-data event"
+                            if global_account_data
+                            else "to-device event"
+                        )
+                        source = load_json(record.source_json, source_name)
+                        if (
+                            type(source) is not dict
+                            or canonical_json(source) != record.source_json
+                        ):
+                            invalid_source = (
+                                "global account-data source is invalid"
+                                if global_account_data
+                                else "to-device source is invalid"
+                            )
+                            raise JournalIntegrityError(invalid_source)
+                        if global_account_data:
+                            event = AccountDataEvent.parse_event(source)
+                            if receipt_new:
+                                await self._client._on_global_account_data(event)
+                        else:
+                            event = ToDeviceEvent.parse_event(source)
+                            if event is None:
+                                raise JournalIntegrityError(
+                                    "to-device event is invalid"
+                                )
+                            if receipt_new:
+                                await self._client._on_to_device(event)
+                self._client._assert_ingestion_not_poisoned()
+                if self._close_task is not None or self._closed:
+                    raise LocalProtocolError("ingestion session is closed")
+                self._journal.acknowledge_batch(batch.ref)
+            finally:
+                self._settlement_task = None
+
+    def acknowledge_batch(self, ref: BatchRef) -> None:
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        if self._settlement_task is not None:
+            raise LocalProtocolError("cannot acknowledge during settlement")
+        self._journal.acknowledge_batch(ref)
+
     def _publish_local_membership_transition(
         self,
         *,
@@ -709,6 +1544,8 @@ class _OwnedIngestionSession(IngestionSession):
         )
 
     async def close(self) -> None:
+        if self._settlement_task is asyncio.current_task():
+            raise LocalProtocolError("owned ingestion settlement cannot close itself")
         self._lease._prepare_close()
         if self._closed:
             raise LocalProtocolError("owned ingestion session is already closed")
@@ -729,9 +1566,14 @@ class _OwnedIngestionSession(IngestionSession):
         await _drain_owned_cleanup(wait_for_shared_cleanup())
 
     async def _cleanup(self) -> None:
-        if self._running is not None:
-            self._running.cancel()
-            await asyncio.gather(self._running, return_exceptions=True)
+        active: list[asyncio.Task[object]] = []
+        for task in (self._running, self._settlement_task):
+            if task is not None and all(task is not candidate for candidate in active):
+                active.append(task)
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
         if not self._detached:
             self._client._detach_ingestion_store(self._owned_store)
             self._detached = True
@@ -812,6 +1654,8 @@ def _open_owned_ingestion(
     stream_id: UUID | None,
 ) -> _OwnedIngestionSession:
     from ..client.async_client import AsyncClient
+    from ..client.base_client import _room_from_snapshot
+    from ..rooms import MatrixInvitedRoom, MatrixRoom
     from ..store.database import SqliteStore
     from ..store.sync_journal import StoreBootstrap
 
@@ -872,6 +1716,26 @@ def _open_owned_ingestion(
     _validate_owned_client_is_pristine(client)
 
     journal = bootstrap._journal
+    rooms: dict[str, MatrixRoom] = {}
+    invited_rooms: dict[str, MatrixInvitedRoom] = {}
+    restore_view = journal._load_room_restore_view()
+    try:
+        for continuity, snapshot in restore_view:
+            membership = continuity.membership
+            if membership not in {None, "invite", "join", "knock", "leave", "ban"}:
+                raise ValueError("persisted room membership is invalid")
+            if snapshot is None:
+                continue
+            invited = membership in {"invite", "knock"}
+            room = _room_from_snapshot(snapshot, invited=invited)
+            if invited:
+                if type(room) is not MatrixInvitedRoom:
+                    raise TypeError("invited room restore has the wrong type")
+                invited_rooms[continuity.room_id] = room
+            else:
+                rooms[continuity.room_id] = room
+    except (TypeError, ValueError) as error:
+        raise JournalIntegrityError("persisted room restore view is invalid") from error
     source_type = (
         ClassicSource
         if owner.transport_kind is TransportKind.CLASSIC
@@ -883,7 +1747,11 @@ def _open_owned_ingestion(
     store = candidate._store_for_attachment()
     try:
         _validate_owned_client_is_pristine(client)
-        client._attach_ingestion_store(store)
+        client._attach_ingestion_store(
+            store,
+            rooms=rooms,
+            invited_rooms=invited_rooms,
+        )
         lease = candidate._prepare_transfer(store)
         session = _OwnedIngestionSession(
             client,

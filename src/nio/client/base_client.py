@@ -35,6 +35,7 @@ from ..events import (
     AccountDataEvent,
     BadEvent,
     BadEventType,
+    DefaultLevels,
     DummyEvent,
     EphemeralEvent,
     Event,
@@ -42,6 +43,7 @@ from ..events import (
     InviteEvent,
     KeyVerificationCancel,
     MegolmEvent,
+    PowerLevels,
     PresenceEvent,
     RoomEncryptionEvent,
     RoomKeyEvent,
@@ -106,7 +108,7 @@ from ..responses import (
     ToDeviceResponse,
     WhoamiResponse,
 )
-from ..rooms import MatrixInvitedRoom, MatrixRoom
+from ..rooms import MatrixInvitedRoom, MatrixRoom, MatrixUser
 
 if ENCRYPTION_ENABLED:
     from ..crypto import Olm
@@ -569,11 +571,223 @@ def _room_snapshot(
     )
 
 
+def _room_from_snapshot(
+    snapshot: RoomSnapshot,
+    *,
+    invited: bool,
+) -> MatrixRoom:
+    """Reconstruct exactly the MatrixRoom state carried by a durable snapshot."""
+    room: MatrixRoom = (
+        MatrixInvitedRoom(snapshot.room_id, snapshot.own_user_id)
+        if invited
+        else MatrixRoom(
+            snapshot.room_id,
+            snapshot.own_user_id,
+            snapshot.encrypted,
+        )
+    )
+    room.encrypted = snapshot.encrypted
+    room.name = snapshot.name
+    room.canonical_alias = snapshot.canonical_alias
+    room.topic = snapshot.topic
+    room.room_avatar_url = snapshot.avatar_url
+    room.join_rule = snapshot.join_rule  # type: ignore[assignment]
+    room.room_version = snapshot.room_version  # type: ignore[assignment]
+    room.guest_access = snapshot.guest_access  # type: ignore[assignment]
+
+    if snapshot.power_levels_json is not None:
+        value = _canonical_ingestion_object(
+            snapshot.power_levels_json,
+            "room snapshot power levels",
+        )
+        fields = {
+            "ban",
+            "creators",
+            "events",
+            "events_default",
+            "invite",
+            "kick",
+            "notifications",
+            "redact",
+            "state_default",
+            "users",
+            "users_default",
+        }
+        integers = (
+            "ban",
+            "events_default",
+            "invite",
+            "kick",
+            "redact",
+            "state_default",
+            "users_default",
+        )
+
+        def integer_map(name: str) -> dict[str, int]:
+            mapping = value.get(name)
+            if type(mapping) is not dict or any(
+                type(key) is not str or type(level) is not int
+                for key, level in mapping.items()
+            ):
+                raise ValueError(f"room snapshot {name} must map strings to integers")
+            return dict(mapping)
+
+        creators = value.get("creators")
+        if set(value) != fields or any(
+            type(value.get(name)) is not int for name in integers
+        ):
+            raise ValueError("room snapshot power levels are invalid")
+        if type(creators) is not dict or any(
+            type(user_id) is not str or creator is not True
+            for user_id, creator in creators.items()
+        ):
+            raise ValueError("room snapshot creators are invalid")
+        defaults = DefaultLevels(
+            value["ban"],
+            value["invite"],
+            value["kick"],
+            value["redact"],
+            value["state_default"],
+            value["events_default"],
+            value["users_default"],
+            integer_map("notifications"),
+        )
+        room.power_levels = PowerLevels(
+            defaults,
+            integer_map("users"),
+            integer_map("events"),
+            dict(creators),
+        )
+        room.creators = set(creators)
+
+    for member in snapshot.members:
+        if member.membership not in {"join", "invite"} or not room.add_member(
+            member.user_id,
+            member.display_name,
+            member.avatar_url,
+            invited=member.membership == "invite",
+        ):
+            raise ValueError("room snapshot members are invalid")
+        room.users[member.user_id].power_level = member.power_level
+    return room
+
+
+_ROOM_AUXILIARY_FIELDS = (
+    "federate",
+    "room_type",
+    "history_visibility",
+    "parents",
+    "children",
+    "typing_users",
+    "read_receipts",
+    "threaded_read_receipts",
+    "summary",
+    "fully_read_marker",
+    "tags",
+    "unread_notifications",
+    "unread_highlights",
+    "members_synced",
+    "replacement_room",
+)
+
+
+def _overlay_room_snapshot(
+    room: MatrixRoom | None,
+    snapshot: RoomSnapshot,
+    *,
+    invited: bool,
+) -> MatrixRoom:
+    """Apply snapshot-owned projection while preserving live auxiliary state."""
+    if type(snapshot) is not RoomSnapshot or type(invited) is not bool:
+        raise TypeError("room snapshot overlay inputs are invalid")
+    candidate = _room_from_snapshot(snapshot, invited=invited)
+    if (
+        candidate.room_id != snapshot.room_id
+        or candidate.own_user_id != snapshot.own_user_id
+        or _room_snapshot(
+            candidate,
+            snapshot.membership_epoch,
+            snapshot.own_membership,
+        )
+        != snapshot
+    ):
+        raise ValueError("room snapshot does not reconstruct exactly")
+    if room is None:
+        return candidate
+    if type(room) not in (MatrixRoom, MatrixInvitedRoom) or (
+        room.room_id,
+        room.own_user_id,
+    ) != (snapshot.room_id, snapshot.own_user_id):
+        raise ValueError("existing room identity is invalid")
+    if type(room.users) is not dict or any(
+        type(user_id) is not str
+        or type(user) is not MatrixUser
+        or user.user_id != user_id
+        for user_id, user in room.users.items()
+    ):
+        raise ValueError("existing room member identities are invalid")
+
+    if type(room) is not type(candidate):
+        for field_name in _ROOM_AUXILIARY_FIELDS:
+            setattr(candidate, field_name, getattr(room, field_name))
+        for user_id, user in candidate.users.items():
+            current = room.users.get(user_id)
+            if current is not None:
+                (
+                    user.presence,
+                    user.last_active_ago,
+                    user.currently_active,
+                    user.status_msg,
+                ) = (
+                    current.presence,
+                    current.last_active_ago,
+                    current.currently_active,
+                    current.status_msg,
+                )
+        return candidate
+
+    projected_users: dict[str, MatrixUser] = {}
+    projected_invited_users: dict[str, MatrixUser] = {}
+    user_updates: list[tuple[MatrixUser, MatrixUser]] = []
+    for user_id, snapshot_user in candidate.users.items():
+        projected_user = room.users.get(user_id)
+        if projected_user is None:
+            projected_user = snapshot_user
+        else:
+            user_updates.append((projected_user, snapshot_user))
+        projected_users[user_id] = projected_user
+        if snapshot_user.invited:
+            projected_invited_users[user_id] = projected_user
+
+    for user, snapshot_user in user_updates:
+        user.display_name = snapshot_user.display_name
+        user.avatar_url = snapshot_user.avatar_url
+        user.power_level = snapshot_user.power_level
+        user.invited = snapshot_user.invited
+    room.encrypted = candidate.encrypted
+    room.name = candidate.name
+    room.canonical_alias = candidate.canonical_alias
+    room.topic = candidate.topic
+    room.room_avatar_url = candidate.room_avatar_url
+    room.join_rule = candidate.join_rule
+    room.room_version = candidate.room_version
+    room.guest_access = candidate.guest_access
+    room.power_levels = candidate.power_levels
+    room.creators = candidate.creators
+    room.users = projected_users
+    room.invited_users = projected_invited_users
+    room.names = candidate.names
+    return room
+
+
 @dataclass(frozen=True)
 class _IngestionStoreSnapshot:
     store: MatrixStore | None
     olm: Olm | None
+    rooms: dict[str, MatrixRoom]
+    invited_rooms: dict[str, MatrixInvitedRoom]
     encrypted_rooms: set[str]
+    next_batch: str
     loaded_sync_token: str | None
     recovery: object | None
     sliding_tokens: object | None
@@ -956,7 +1170,13 @@ class Client:
     def _poison_ingestion(self) -> None:
         self._ingestion_poisoned = True
 
-    def _attach_ingestion_store(self, store: MatrixStore) -> None:
+    def _attach_ingestion_store(
+        self,
+        store: MatrixStore,
+        *,
+        rooms: dict[str, MatrixRoom] | None = None,
+        invited_rooms: dict[str, MatrixInvitedRoom] | None = None,
+    ) -> None:
         """Attach one exact borrowed SqliteStore before constructing Olm."""
         self._assert_ingestion_not_poisoned()
         if type(store) is not SqliteStore:
@@ -974,17 +1194,33 @@ class Client:
             raise LocalProtocolError("owned ingestion requires a bound device id")
         if (store.user_id, store.device_id) != (self.user_id, self.device_id):
             raise LocalProtocolError("borrowed store identity does not match client")
+        if (rooms is None) != (invited_rooms is None):
+            raise LocalProtocolError(
+                "owned room restore maps must be supplied together"
+            )
+        attached_rooms = self.rooms if rooms is None else rooms
+        attached_invited_rooms = (
+            self.invited_rooms if invited_rooms is None else invited_rooms
+        )
+        if set(attached_rooms) & set(attached_invited_rooms):
+            raise LocalProtocolError("owned room restore maps overlap")
 
         previous_store = self.store
         previous_olm = self.olm
+        previous_rooms = self.rooms
+        previous_invited_rooms = self.invited_rooms
         previous_encrypted_rooms = self.encrypted_rooms
+        previous_next_batch = self.next_batch
         previous_loaded_sync_token = self.loaded_sync_token
         previous_recovery = getattr(self, "_recovery", None)
         previous_sliding_tokens = getattr(self, "_sliding_room_prev_batch", None)
         snapshot = _IngestionStoreSnapshot(
             previous_store,
             previous_olm,
+            previous_rooms,
+            previous_invited_rooms,
             previous_encrypted_rooms,
+            previous_next_batch,
             previous_loaded_sync_token,
             previous_recovery,
             previous_sliding_tokens,
@@ -1013,6 +1249,8 @@ class Client:
                 load_recovery_state(recovery, *store.load_sync_recovery())
                 sliding_tokens = dict(store.load_sliding_window_tokens())
             self.olm = olm
+            self.rooms = attached_rooms
+            self.invited_rooms = attached_invited_rooms
             self.encrypted_rooms = encrypted_rooms
             self.loaded_sync_token = loaded_sync_token
             if previous_recovery is not None:
@@ -1023,7 +1261,10 @@ class Client:
         except BaseException:
             self.olm = previous_olm
             self.store = previous_store
+            self.rooms = previous_rooms
+            self.invited_rooms = previous_invited_rooms
             self.encrypted_rooms = previous_encrypted_rooms
+            self.next_batch = previous_next_batch
             self.loaded_sync_token = previous_loaded_sync_token
             if previous_recovery is not None:
                 setattr(self, "_recovery", previous_recovery)
@@ -1043,7 +1284,10 @@ class Client:
             raise LocalProtocolError("client no longer owns the borrowed store")
         self.olm = None
         self.store = None
+        self.rooms = snapshot.rooms
+        self.invited_rooms = snapshot.invited_rooms
         self.encrypted_rooms = snapshot.encrypted_rooms
+        self.next_batch = snapshot.next_batch
         self.loaded_sync_token = cast(Any, snapshot.loaded_sync_token)
         if snapshot.recovery is not None:
             setattr(self, "_recovery", snapshot.recovery)

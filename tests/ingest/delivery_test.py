@@ -1,7 +1,8 @@
 import hashlib
 import json
 import sqlite3
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import fields, replace
 from pathlib import Path
 from uuid import UUID, uuid5
@@ -10,6 +11,7 @@ import pytest
 
 from nio.event_provenance import TimelineEventProvenance
 from nio.exceptions import LocalProtocolError
+from nio.ingest._json import canonical_json
 from nio.ingest.config import ClassicSourceConfig
 from nio.ingest.errors import (
     BatchIntegrityError,
@@ -21,17 +23,30 @@ from nio.ingest.model import (
     EventRecord,
     RecordKind,
     RecordOrigin,
+    RoomSnapshot,
     SyncBatch,
     TransportKind,
+    _CallbackRoute,
+    _DecryptionDisposition,
+    _PreparationPhase,
 )
+from nio.ingest.reducer import RoomContinuity
 from nio.ingest.serialization import (
     _batch_from_payload,
     batch_from_records,
     canonical_batch_payload,
 )
 from nio.store._sync_journal import SqliteIngestionJournal
-from nio.store._sync_journal_plan import _canonical_work_plaintext
-from nio.store._sync_journal_rows import _canonical_internal
+from nio.store._sync_journal_plan import (
+    AuthenticatedWork,
+    _PreparedWorkMetadata,
+    _canonical_work_plaintext,
+)
+from nio.store._sync_journal_rows import (
+    _canonical_internal,
+    _canonical_room_aggregate_plaintext,
+)
+from nio.store._sync_journal_values import RoomAggregateValue
 from nio.store.sync_journal import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -119,6 +134,7 @@ def _seed_work(
     ready_revision: int | None,
     ready_ordinal: int | None,
     status: str = "ready",
+    metadata: _PreparedWorkMetadata | None = None,
 ) -> tuple[object, ...]:
     owner = journal.load_owner()
     created_revision = ready_revision or max(owner.revision, 1)
@@ -137,7 +153,7 @@ def _seed_work(
     payload, digest = journal._payload(
         owner,
         "NioIngestWork",
-        _canonical_work_plaintext("event", record),
+        _canonical_work_plaintext("event", record, metadata),
         header=_canonical_internal(clear),
     )
     row = (journal.account_id, *clear, payload, digest)
@@ -153,6 +169,46 @@ def _seed_work(
     return row
 
 
+def _seed_room_aggregates(
+    journal: SqliteIngestionJournal,
+    values: tuple[RoomAggregateValue, ...],
+) -> tuple[tuple[object, ...], ...]:
+    owner = journal.load_owner()
+    rows: list[tuple[object, ...]] = []
+    for value in values:
+        room_id = value.continuity.room_id
+        payload, digest = journal._payload(
+            owner,
+            "NioIngestRoomAggregate",
+            _canonical_room_aggregate_plaintext(value),
+            header=_canonical_internal([room_id, value.updated_revision, None]),
+        )
+        rows.append(
+            (
+                journal.account_id,
+                room_id,
+                value.updated_revision,
+                None,
+                payload,
+                digest,
+            )
+        )
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestMeta SET revision = ? WHERE account_id = ?",
+            (
+                max(owner.revision, *(value.updated_revision for value in values)),
+                journal.account_id,
+            ),
+        )
+        for row in rows:
+            journal._execute(
+                "INSERT INTO NioIngestRoomAggregate VALUES (?, ?, ?, ?, ?, ?)",
+                row,
+            )
+    return tuple(rows)
+
+
 def _raw_delivery_graph(database_path: Path) -> tuple[tuple[object, ...], ...]:
     with sqlite3.connect(database_path) as connection:
         return tuple(
@@ -160,6 +216,73 @@ def _raw_delivery_graph(database_path: Path) -> tuple[tuple[object, ...], ...]:
             for table in ("NioIngestMeta", "NioIngestWork")
             for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
         )
+
+
+def _raw_journal_graph(
+    database_path: Path,
+) -> tuple[tuple[str, tuple[object, ...]], ...]:
+    with sqlite3.connect(database_path) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'NioIngest%' ORDER BY name"
+            )
+        )
+        return tuple(
+            (table, tuple(row))
+            for table in tables
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+        )
+
+
+def _same_length_tamper(value: object) -> bytes:
+    assert type(value) is bytes and value
+    return bytes((value[0] ^ 1,)) + value[1:]
+
+
+def _observe_owner_scopes(
+    journal: SqliteIngestionJournal,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], list[str]]:
+    reads: list[str] = []
+    writes: list[str] = []
+    real_read = journal._owner.read
+    real_write = journal._owner.journal_write
+
+    @contextmanager
+    def observed_read() -> Iterator[None]:
+        reads.append("read")
+        with real_read():
+            yield
+
+    def observed_write() -> AbstractContextManager[None]:
+        writes.append("write")
+        return real_write()
+
+    monkeypatch.setattr(journal._owner, "read", observed_read)
+    monkeypatch.setattr(journal._owner, "journal_write", observed_write)
+    return reads, writes
+
+
+@contextmanager
+def _one_read_without_writes(
+    *,
+    database_path: Path,
+    statements: list[str],
+    reads: list[str],
+    writes: list[str],
+) -> Iterator[None]:
+    before = _raw_journal_graph(database_path)
+    statements.clear()
+    reads.clear()
+    writes.clear()
+    yield
+    assert reads == ["read"]
+    assert writes == []
+    assert _raw_journal_graph(database_path) == before
+    assert statements
+    assert all(sql.lstrip().upper().startswith("SELECT") for sql in statements)
 
 
 def _delivery_frontier(database_path: Path) -> tuple[object, ...]:
@@ -191,6 +314,262 @@ def _replace_work(
             row,
         )
     return row
+
+
+def test_settlement_view_authenticates_batch_work_and_room_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statement_observer=statements.append)
+    journal = bootstrap._journal
+    room_id = "!settlement:example.org"
+    source = canonical_json(
+        {
+            "content": {"body": "hello", "msgtype": "m.text"},
+            "event_id": "$settlement",
+            "sender": "@bob:example.org",
+            "type": "m.room.message",
+        }
+    )
+    record = EventRecord(
+        "00000000-0000-4000-8000-000000000070",
+        RecordKind.TIMELINE,
+        RecordOrigin(TransportKind.CLASSIC, 0, 0, 70),
+        room_id,
+        0,
+        0,
+        "$settlement",
+        TimelineEventProvenance.LIVE,
+        source,
+        None,
+    )
+    metadata = _PreparedWorkMetadata(
+        record.record_id,
+        _PreparationPhase.SOURCE,
+        "m.room.message",
+        _DecryptionDisposition.NONE,
+        None,
+        None,
+        _CallbackRoute.EVENT,
+    )
+    snapshot = RoomSnapshot(
+        room_id=room_id,
+        membership_epoch=0,
+        own_user_id=ACCOUNT_ID,
+        own_membership="join",
+        encrypted=True,
+        name="Settlement room",
+        canonical_alias=None,
+        topic=None,
+        avatar_url=None,
+        join_rule=None,
+        room_version=None,
+        guest_access=None,
+        power_levels_json=None,
+        members=(),
+    )
+    aggregate = RoomAggregateValue(
+        RoomContinuity(room_id, 0, "join", None, None, None),
+        1,
+        1,
+        None,
+        snapshot,
+    )
+    decoy = RoomAggregateValue(
+        RoomContinuity("!decoy:example.org", 0, "join", None, None, None),
+        0,
+        1,
+        None,
+        None,
+    )
+    aggregate_rows = _seed_room_aggregates(journal, (decoy, aggregate))
+    stored = _seed_work(
+        journal,
+        record,
+        ready_revision=1,
+        ready_ordinal=0,
+        metadata=metadata,
+    )
+    batch = journal.next_batch(max_records=1)
+    assert batch is not None
+    plaintext = _canonical_work_plaintext("event", record, metadata)
+    reads, writes = _observe_owner_scopes(journal, monkeypatch)
+
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        settlement = journal._load_batch_settlement(batch)  # type: ignore[attr-defined]
+
+    assert settlement is not None
+    work, room = settlement
+    assert type(work) is AuthenticatedWork
+    assert work.value == record
+    assert work.status == "ready"
+    assert work.canonical_size == len(stored[11])
+    assert work.metadata == metadata
+    assert work.plaintext == plaintext
+    assert work.frame_id == UUID(int=10_070)
+    assert work.created_revision == 1
+    assert room == aggregate
+
+    changed_record = replace(
+        record,
+        source_json=source.replace(b"hello", b"changed"),
+    )
+    competing = batch_from_records(
+        account_id=batch.account_id,
+        device_id=batch.device_id,
+        consumer_generation=batch.consumer_generation,
+        stream_id=batch.ref.stream_id,
+        sequence=batch.ref.sequence,
+        created_revision=batch.created_revision,
+        records=(changed_record,),
+    )
+    assert competing.ref != batch.ref
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        with pytest.raises(BatchIntegrityError):
+            journal._load_batch_settlement(competing)  # type: ignore[attr-defined]
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestWork SET payload_sha256 = ? WHERE work_id = ?",
+            (_same_length_tamper(stored[12]), record.record_id),
+        )
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        with pytest.raises(JournalIntegrityError):
+            journal._load_batch_settlement(batch)  # type: ignore[attr-defined]
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestWork SET payload_sha256 = ? WHERE work_id = ?",
+            (stored[12], record.record_id),
+        )
+        journal._execute(
+            "UPDATE NioIngestRoomAggregate SET payload_sha256 = ? WHERE room_id = ?",
+            (_same_length_tamper(aggregate_rows[1][5]), room_id),
+        )
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        with pytest.raises(JournalIntegrityError):
+            journal._load_batch_settlement(batch)  # type: ignore[attr-defined]
+    bootstrap.close()
+
+
+def test_restore_view_authenticates_exact_states_in_room_order_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statement_observer=statements.append)
+    journal = bootstrap._journal
+    leave_room = "!a-preserved:example.org"
+    join_room = "!z-snapshotless:example.org"
+    stale_snapshot = RoomSnapshot(
+        room_id=leave_room,
+        membership_epoch=3,
+        own_user_id=ACCOUNT_ID,
+        own_membership="join",
+        encrypted=True,
+        name="Preserved room",
+        canonical_alias=None,
+        topic=None,
+        avatar_url=None,
+        join_rule=None,
+        room_version=None,
+        guest_access=None,
+        power_levels_json=None,
+        members=(),
+    )
+    preserved_leave = RoomAggregateValue(
+        RoomContinuity(leave_room, 4, "leave", None, None, None),
+        8,
+        1,
+        None,
+        stale_snapshot,
+    )
+    snapshotless_join = RoomAggregateValue(
+        RoomContinuity(join_room, 0, "join", None, None, None),
+        1,
+        2,
+        None,
+        None,
+    )
+    aggregate_rows = _seed_room_aggregates(
+        journal,
+        (snapshotless_join, preserved_leave),
+    )
+    owner = journal.load_owner()
+    authenticated = tuple(
+        journal._load_room_aggregate(owner, room_id)
+        for room_id in (leave_room, join_room)
+    )
+    assert all(item is not None for item in authenticated)
+    assert tuple(item[1] for item in authenticated if item is not None) == (
+        preserved_leave,
+        snapshotless_join,
+    )
+    reads, writes = _observe_owner_scopes(journal, monkeypatch)
+
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        states = journal._load_room_restore_view()  # type: ignore[attr-defined]
+
+    assert states == (
+        (preserved_leave.continuity, stale_snapshot),
+        (snapshotless_join.continuity, None),
+    )
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestRoomAggregate SET payload_sha256 = ? WHERE room_id = ?",
+            (_same_length_tamper(aggregate_rows[1][5]), leave_room),
+        )
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        with pytest.raises(JournalIntegrityError):
+            journal._load_room_restore_view()  # type: ignore[attr-defined]
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestRoomAggregate SET payload_sha256 = ?, "
+            "updated_revision = ? WHERE room_id = ?",
+            (aggregate_rows[1][5], 2, leave_room),
+        )
+    with _one_read_without_writes(
+        database_path=bootstrap.database_path,
+        statements=statements,
+        reads=reads,
+        writes=writes,
+    ):
+        with pytest.raises(JournalIntegrityError):
+            journal._load_room_restore_view()  # type: ignore[attr-defined]
+    bootstrap.close()
 
 
 def test_direct_generation_batch_wire_is_canonical_and_strict() -> None:

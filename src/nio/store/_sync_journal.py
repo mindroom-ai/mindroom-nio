@@ -30,6 +30,7 @@ from ..ingest.model import (
     BatchRef,
     EventRecord,
     RecordKind,
+    SyncBatch,
     SystemOrigin,
     SystemOriginKind,
     TransportKind,
@@ -39,11 +40,16 @@ from ..ingest.model import (
     _PreparedIngestionFrame,
 )
 from ..ingest.ports import NetworkRequest, _revalidated_staged_source_response
-from ..ingest.serialization import batch_from_records, canonical_batch_payload
+from ..ingest.serialization import (
+    _validate_batch,
+    batch_from_records,
+    canonical_batch_payload,
+)
 from ..ingest.sliding import SlidingSource, _sliding_cursor_from_json
 from ..ingest.source import SyncFrame, _frame_room_ids, renormalize_staged_frame
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
+    AuthenticatedWork,
     _canonical_work_plaintext,
     _work_id,
     plan_frame_materialization,
@@ -83,7 +89,8 @@ from ._sync_journal_values import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from ..ingest.model import LossRecord, SyncBatch
+    from ..ingest.model import LossRecord, RoomSnapshot
+    from ..ingest.reducer import RoomContinuity
     from .database import MatrixStore
 
 
@@ -392,6 +399,72 @@ class SqliteIngestionJournal(JournalRows):
         if not hmac.compare_digest(batch.ref.sha256, digest):
             raise JournalIntegrityError("claimed Work does not match batch digest")
         return batch, member[1]
+
+    def _load_batch_settlement(
+        self,
+        batch: SyncBatch,
+    ) -> tuple[AuthenticatedWork, RoomAggregateValue | None] | None:
+        if type(batch) is not SyncBatch:
+            raise LocalProtocolError("settlement batch must be a SyncBatch")
+        _validate_batch(batch)
+        with self._read():
+            _meta, owner, state, inventory = self._delivery_snapshot()
+            if batch.ref.stream_id != owner.stream_id:
+                raise LocalProtocolError("settlement batch stream is invalid")
+            outstanding = state.outstanding_work_id is not None
+            acknowledged_sequence = state.next_sequence - (2 if outstanding else 1)
+            acknowledged = state.acknowledged_sha256
+            if acknowledged is not None and batch.ref.sequence == acknowledged_sequence:
+                name = f"{acknowledged_sequence}:{acknowledged.hex()}"
+                expected = acknowledged, uuid5(owner.stream_id, name)
+                if (batch.ref.sha256, batch.ref.batch_id) != expected:
+                    raise ingest_errors.BatchIntegrityError(
+                        "acknowledged batch changed"
+                    )
+                return None
+            if not outstanding or batch.ref.sequence != state.next_sequence - 1:
+                raise LocalProtocolError("settlement batch is not FIFO")
+            expected_batch, storage = self._replay_batch(owner, state, inventory)
+            if batch != expected_batch:
+                raise ingest_errors.BatchIntegrityError("outstanding batch changed")
+            try:
+                index = inventory.storage_rows.index(storage)
+            except ValueError as error:
+                raise JournalIntegrityError("settlement Work disappeared") from error
+            work = inventory.work[index]
+            room: RoomAggregateValue | None = None
+            if type(work.value) is EventRecord and work.value.room_id is not None:
+                loaded = self._load_room_aggregate(owner, work.value.room_id)
+                if loaded is None:
+                    raise JournalIntegrityError("room settlement Aggregate is missing")
+                room = loaded[1]
+            return work, room
+
+    def _load_room_restore_view(
+        self,
+    ) -> tuple[tuple[RoomContinuity, RoomSnapshot | None], ...]:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            identities = self._execute(
+                "SELECT account_id, room_id FROM NioIngestRoomAggregate "
+                "ORDER BY room_id"
+            ).fetchall()
+            states: list[tuple[RoomContinuity, RoomSnapshot | None]] = []
+            for account_id, room_id in identities:
+                if (
+                    account_id != self.account_id
+                    or type(room_id) is not str
+                    or not room_id
+                ):
+                    raise JournalIntegrityError(
+                        "persisted Aggregate room identity is invalid"
+                    )
+                loaded = self._load_room_aggregate(owner, room_id)
+                if loaded is None:
+                    raise JournalIntegrityError("persisted Aggregate disappeared")
+                value = loaded[1]
+                states.append((value.continuity, value.room_snapshot))
+            return tuple(states)
 
     def next_batch(
         self,

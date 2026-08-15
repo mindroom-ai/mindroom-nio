@@ -401,6 +401,21 @@ def _plan_room(
                 DescriptorRoute.READY,
             )
 
+    if membership != "join":
+        after = RoomContinuity(segment.room_id, epoch, membership, None, None, None)
+        return (
+            RoomProposal(
+                before,
+                after,
+                None,
+                None,
+                None,
+                (),
+                RecoveryRelease.NONE,
+            ),
+            DescriptorRoute.READY,
+        )
+
     hydration_id = uuid5(
         stream_id,
         f"hydrate:{segment.room_id}:{epoch}:{frame.frame_id}",
@@ -1264,7 +1279,11 @@ def reduce_prepared_frame(
         if before is None:
             first_seen.add(segment.room_id)
             states[segment.room_id] = (0, None)
-            routes_before_change[segment.room_id] = DescriptorRoute.HOLD_FOR_HYDRATION
+            routes_before_change[segment.room_id] = (
+                DescriptorRoute.HOLD_FOR_HYDRATION
+                if transitions[0].current_membership == "join"
+                else DescriptorRoute.READY
+            )
         else:
             states[segment.room_id] = (
                 before.membership_epoch,
@@ -1400,7 +1419,11 @@ def reduce_prepared_frame(
             if loss is not None:
                 active_hydrations.pop(transition_action.room_id, None)
                 routes_before_change[transition_action.room_id] = DescriptorRoute.READY
-            elif transition_action.room_id in first_seen and membership is None:
+            elif (
+                transition_action.room_id in first_seen
+                and membership is None
+                and transition_action.current_membership == "join"
+            ):
                 hydration_id = uuid5(
                     stream_id,
                     (
