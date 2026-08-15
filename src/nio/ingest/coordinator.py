@@ -1101,11 +1101,14 @@ class _OwnedIngestionSession(IngestionSession):
             )
 
         try:
-            return self._journal._prepare_and_materialize_oldest_frame(
+            result = self._journal._prepare_and_materialize_oldest_frame(
                 prepare=prepare,
                 freeze_outbound=freeze_outbound,
                 limits=limits,
             )
+            if result.status is MaterializeStatus.MATERIALIZED:
+                self._signal_progress()
+            return result
         except BaseException:
             if preparation_started:
                 self._client._poison_ingestion()
@@ -1732,6 +1735,33 @@ class _OwnedIngestionSession(IngestionSession):
     def _signal_progress(self) -> None:
         self._progress_generation += 1
         self._progress_event.set()
+
+    async def _wait_for_work(self) -> None:
+        """Wait without polling until one delivery may be available."""
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        observed_generation = self._progress_generation
+        if self.next_batch(max_records=1) is not None:
+            return
+        await self._wait_for_progress(observed_generation)
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+
+    async def _wait_for_local_membership_idle(self) -> None:
+        """Wait without polling until no local intent or lifecycle Work remains."""
+        while True:
+            self._client._assert_ingestion_not_poisoned()
+            if self._close_task is not None or self._closed:
+                raise LocalProtocolError("ingestion session is closed")
+            observed_generation = self._progress_generation
+            if (
+                not self._journal._load_pending_local_membership_intents(limit=1)
+                and not self._journal._has_pending_local_membership_work()
+            ):
+                return
+            await self._wait_for_progress(observed_generation)
 
     async def _wait_for_progress(self, observed_generation: int) -> None:
         if self._progress_generation != observed_generation:

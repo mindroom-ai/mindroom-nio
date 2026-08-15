@@ -9938,6 +9938,122 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
 
 
 @pytest.mark.asyncio
+async def test_owned_work_wait_wakes_when_materialization_publishes_delivery(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    connection = session._owned_store.database.connection()
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    waiting = asyncio.create_task(session._wait_for_work())
+    try:
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        assert not any(
+            statement.lstrip()
+            .upper()
+            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+            for statement in statements
+        )
+
+        event_source = {
+            "content": {"value": "wake-pump"},
+            "type": "org.example.task5d.wake",
+        }
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": [event_source]},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": client.olm.account.max_one_time_keys,
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "s1",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": []},
+            },
+        )
+        assert not waiting.done()
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        await asyncio.wait_for(waiting, timeout=2)
+        batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+        assert record.source_json == canonical_json(event_source)
+    finally:
+        connection.set_trace_callback(None)
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_kind", ("intent", "work"))
+async def test_owned_local_membership_idle_waits_for_durable_progress(
+    tmp_path,
+    pending_kind: str,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    operation_id = uuid4()
+    if pending_kind == "intent":
+        session._journal._record_local_membership_intent(
+            operation_id=operation_id,
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+    else:
+        operation_id, _committed, _aggregate, _work = _publish_fresh_local_join(
+            session,
+        )
+
+    waiting = asyncio.create_task(session._wait_for_local_membership_idle())
+    try:
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        if pending_kind == "intent":
+            pending = session._journal._load_pending_local_membership_intents(
+                limit=2,
+            )
+            assert len(pending) == 1
+            assert pending[0].intent.operation_id == operation_id
+            session._journal._clear_local_membership_intent(
+                room_id=ROOM,
+                intent=pending[0].intent,
+            )
+            session._signal_progress()
+        else:
+            batch = session.next_batch(max_records=1)
+            assert batch is not None
+            session.acknowledge_batch(batch.ref)
+        await asyncio.wait_for(waiting, timeout=2)
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_runner_uses_private_materializer_in_fifo_order(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
