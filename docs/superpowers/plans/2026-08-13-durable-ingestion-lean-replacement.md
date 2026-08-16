@@ -24,6 +24,10 @@ in matrix-nio and one in MindRoom.
 
 - The public compatibility boundary is matrix-nio commit
   `69aa99c51f354980bf5306a85b4c7b7d71ff3217`.
+- Preserve the later upstream `origin/main` behavior
+  `secure_delete = "fast"` and its regression
+  `tests/store_test.py::test_disk_store_uses_fast_secure_delete`; restoring the
+  pre-fork public surface does not authorize reverting that behavior.
 - Preserve `AsyncClient.sync()`, `sync_forever()`, `stop_sync_forever()`,
   `receive_response()`, `run_response_callbacks()`, response callback
   registration, all six event callback families, callback order/re-entry,
@@ -93,7 +97,7 @@ The baselines and limits never move:
 Fresh Task 10A entry measurements on 2026-08-16 were:
 
 - matrix-nio entry: runtime `+19,930`, tests `+56,870`, docs/scripts `+5,260`;
-  this 346-line consolidation reduces docs/scripts to `+639`;
+  this 354-line consolidation reduces docs/scripts to `+647`;
 - MindRoom: runtime `+201`, tests `+2,551`, and `src tests = -95`
   versus canary commit `925df7f3cbcc39d4904140efd9d16b93c77238ea`;
 - the six whole legacy matrix-nio modules listed in Task 9 contain 2,433
@@ -223,6 +227,9 @@ hours and 100 successful responses, including:
 
 - one process restart;
 - one real to-device callback;
+- zero duplicate visible effects;
+- zero unexplained event loss;
+- no permanently growing backlog;
 - zero callback/order/authentication failure;
 - external coverage showing zero execution of fork-recovery code.
 
@@ -270,7 +277,8 @@ After Task 9's observation-gated deletion:
    persistence rewrite.
 2. Run the complete matrix-nio suite and complete affected MindRoom suite.
 3. Run Classic and Sliding compatibility matrices, the cross-database crash
-   matrix, and post-deletion bot and Desktop smoke/soak checks.
+   matrix, the exact upstream `secure_delete = "fast"` regression, and
+   post-deletion bot and Desktop smoke/soak checks.
 4. Run Ruff, type checking, repository formatters, bytecode compilation,
    `git diff --check`, configured pre-commit hooks, and a suppression scan.
 5. Run an independent code/evidence review and resolve every valid blocking
