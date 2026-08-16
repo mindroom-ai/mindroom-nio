@@ -16,7 +16,3 @@ from .recovery_abandonment import RecoveryAbandonment
 from .responses import *
 from .rooms import *
 from .sliding_sync_tokens import SlidingWindowToken
-from .client.timeline_admission import (
-    TimelineAdmissionDisposition,
-    TimelineAdmissionEntry,
-)

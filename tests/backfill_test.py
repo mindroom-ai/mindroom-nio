@@ -45,7 +45,6 @@ from nio import (
     SlidingSyncRoom,
     SyncResponse,
     Timeline,
-    TimelineAdmissionDisposition,
     TimelineEventProvenance,
     ToDeviceEvent,
     TypingNoticeEvent,
@@ -2718,59 +2717,26 @@ class TestRoomLocalRecovery:
         ):
             client.add_event_admission_callback(second, RoomMessageText)
 
-    async def test_batch_admission_rejects_simultaneous_admission_owners(
-        self,
-        client,
-    ):
-        def admit_batch(entries):
-            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
-
-        async def admit_event(_room, _event, _provenance):
-            pass
-
-        client.add_event_batch_admission_callback(admit_batch, RoomMessageText)
-
-        with pytest.raises(
-            LocalProtocolError,
-            match="admission callback is already registered",
-        ):
-            client.add_event_admission_callback(admit_event, RoomMessageText)
-
-        other = AsyncClient(
-            "https://example.org",
-            OWN_ID,
-            config=AsyncClientConfig(backfill_limited_timelines=True),
-        )
-        try:
-            other.add_event_admission_callback(admit_event, RoomMessageText)
-
-            with pytest.raises(
-                LocalProtocolError,
-                match="admission callback is already registered",
-            ):
-                other.add_event_batch_admission_callback(
-                    admit_batch,
-                    RoomMessageText,
-                )
-        finally:
-            await other.close()
-
-    async def test_batch_admission_commits_before_any_event_fanout(self, client):
+    async def test_grouped_admission_commits_before_any_event_fanout(self, client):
         release = asyncio.Event()
         started = asyncio.Event()
-        order: list[object] = []
+        order: list[str] = []
 
-        async def admit(entries):
-            order.append([entry.event.event_id for entry in entries])
-            started.set()
-            await release.wait()
-            order.append("committed")
-            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+        async def admit(_room, event, _provenance):
+            order.append(f"admit:{event.event_id}")
+            if event.event_id == "$two":
+                started.set()
+                await release.wait()
+                order.append("admitted:$two")
 
         async def observe(_room, event):
-            order.append(event.event_id)
+            order.append(f"fanout:{event.event_id}")
 
-        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
         client.add_event_callback(observe, RoomMessageText)
         task = asyncio.create_task(
             client.receive_response(
@@ -2783,27 +2749,34 @@ class TestRoomLocalRecovery:
         )
 
         await asyncio.wait_for(started.wait(), timeout=0.5)
-        assert order == [["$one", "$two"]]
+        assert order == ["admit:$one", "admit:$two"]
 
         release.set()
         await asyncio.wait_for(task, timeout=0.5)
 
-        assert order == [["$one", "$two"], "committed", "$one", "$two"]
+        assert order == [
+            "admit:$one",
+            "admit:$two",
+            "admitted:$two",
+            "fanout:$one",
+            "fanout:$two",
+        ]
 
-    async def test_batch_admission_preserves_recovered_timeline_order(
+    async def test_grouped_admission_preserves_recovered_timeline_order(
         self,
         client,
         aioresponse,
     ):
-        batches: list[list[tuple[str, TimelineEventProvenance]]] = []
+        admissions: list[tuple[str, TimelineEventProvenance]] = []
 
-        def admit(entries):
-            batches.append(
-                [(entry.event.event_id, entry.provenance) for entry in entries]
-            )
-            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+        def admit(_room, event, provenance):
+            admissions.append((event.event_id, provenance))
 
-        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
         client.next_batch = "s1"
         aioresponse.get(
             MESSAGES_URL,
@@ -2826,32 +2799,36 @@ class TestRoomLocalRecovery:
             )
         )
 
-        assert batches == [
-            [
-                ("$gap-one", TimelineEventProvenance.RECOVERED),
-                ("$gap-two", TimelineEventProvenance.RECOVERED),
-                ("$held", TimelineEventProvenance.LIVE),
-            ]
+        assert admissions == [
+            ("$gap-one", TimelineEventProvenance.RECOVERED),
+            ("$gap-two", TimelineEventProvenance.RECOVERED),
+            ("$held", TimelineEventProvenance.LIVE),
         ]
 
-    async def test_batch_admission_rejection_retains_and_retries_whole_batch(
+    async def test_grouped_admission_rejection_retries_uncommitted_prefix(
         self,
         client,
         aioresponse,
     ):
-        attempts: list[list[str]] = []
+        attempts: list[str] = []
         ordinary: list[str] = []
+        rejected = False
 
-        def admit(entries):
-            attempts.append([entry.event.event_id for entry in entries])
-            if len(attempts) == 1:
-                raise CallbackNotAcceptedError("durable batch admission failed")
-            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+        def admit(_room, event, _provenance):
+            nonlocal rejected
+            attempts.append(event.event_id)
+            if event.event_id == "$gap-two" and not rejected:
+                rejected = True
+                raise CallbackNotAcceptedError("durable grouped admission failed")
 
         async def observe(_room, event):
             ordinary.append(event.event_id)
 
-        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
         client.add_event_callback(observe, RoomMessageText)
         client.next_batch = "s1"
         aioresponse.get(
@@ -2874,7 +2851,7 @@ class TestRoomLocalRecovery:
 
         with pytest.raises(
             CallbackNotAcceptedError,
-            match="durable batch admission failed",
+            match="durable grouped admission failed",
         ):
             await client.receive_response(response)
 
@@ -2883,39 +2860,16 @@ class TestRoomLocalRecovery:
         await client.receive_response(response)
 
         expected = ["$gap-one", "$gap-two", "$held"]
-        assert attempts == [expected, expected]
+        assert attempts == ["$gap-one", "$gap-two", *expected]
         assert ordinary == expected
 
-    @pytest.mark.parametrize(
-        "result",
-        [
-            (TimelineAdmissionDisposition.FANOUT,),
-            ("fanout", "fanout"),
-        ],
-    )
-    async def test_batch_admission_validates_dispositions(self, client, result):
-        def admit(_entries):
-            return result
-
-        client.add_event_batch_admission_callback(admit, RoomMessageText)
-
-        with pytest.raises(LocalProtocolError, match="Batch admission"):
-            await client.receive_response(
-                timeline_response(
-                    "classic",
-                    "s1",
-                    [text_event("$one", 1), text_event("$two", 2)],
-                )
-            )
-
-    async def test_batch_admission_skips_durably_accepted_entry(self, client):
-        admissions: list[list[str]] = []
+    async def test_grouped_admission_skips_durably_accepted_entry(self, client):
+        admissions: list[str] = []
         ordinary: list[str] = []
         accepted_marks = 0
 
-        def admit(entries):
-            admissions.append([entry.event.event_id for entry in entries])
-            return (TimelineAdmissionDisposition.FANOUT,) * len(entries)
+        def admit(_room, event, _provenance):
+            admissions.append(event.event_id)
 
         async def observe(_room, event):
             ordinary.append(event.event_id)
@@ -2924,7 +2878,11 @@ class TestRoomLocalRecovery:
             nonlocal accepted_marks
             accepted_marks += 1
 
-        client.add_event_batch_admission_callback(admit, RoomMessageText)
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
         client.add_event_callback(observe, RoomMessageText)
         pending_events = (
             replace(
@@ -2953,31 +2911,37 @@ class TestRoomLocalRecovery:
             mark_admission_accepted,
         )
 
-        assert admissions == [["$new"]]
+        assert admissions == ["$new"]
         assert ordinary == ["$accepted", "$new"]
         assert accepted_marks == 1
 
-    async def test_batch_admission_non_semantic_still_updates_state_and_fans_out(
+    async def test_grouped_admission_observes_state_at_each_event(
         self,
         client,
     ):
-        observations: list[tuple[str, str | None]] = []
+        observations: list[tuple[str, str, str | None]] = []
 
-        def admit(entries):
-            observations.append(("admit", entries[0].room.name))
-            return (TimelineAdmissionDisposition.NON_SEMANTIC,)
+        def admit(room, event, _provenance):
+            observations.append(("admit", event.event_id, room.name))
 
-        async def observe(room, _event):
-            observations.append(("ordinary", room.name))
+        async def observe(room, event):
+            observations.append(("ordinary", event.event_id, room.name))
 
-        client.add_event_batch_admission_callback(admit, RoomNameEvent)
+        client.add_event_admission_callback(
+            admit,
+            RoomNameEvent,
+            group_recovery_commits=True,
+        )
         client.add_event_callback(observe, RoomNameEvent)
 
         response = sync_response(
             "s1",
             {
                 ROOM_A: room_info(
-                    [name_event("$name", 1, "New name")],
+                    [
+                        name_event("$first", 1, "First name"),
+                        name_event("$second", 2, "Second name"),
+                    ],
                     limited=False,
                     prev_batch="p0",
                 )
@@ -2986,10 +2950,12 @@ class TestRoomLocalRecovery:
         await client.receive_response(response)
 
         assert observations == [
-            ("admit", "New name"),
-            ("ordinary", "New name"),
+            ("admit", "$first", "First name"),
+            ("admit", "$second", "Second name"),
+            ("ordinary", "$first", "Second name"),
+            ("ordinary", "$second", "Second name"),
         ]
-        assert client.rooms[ROOM_A].name == "New name"
+        assert client.rooms[ROOM_A].name == "Second name"
 
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_two_argument_admission_callback_remains_supported(

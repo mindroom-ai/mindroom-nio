@@ -312,12 +312,6 @@ from .sync_response_ordering import (
     account_data_kind,
     ordered_response_view,
 )
-from .timeline_admission import (
-    TimelineAdmissionDisposition,
-    TimelineAdmissionEntry,
-    TimelineBatchAdmissionCallback,
-    _TimelineBatchAdmission,
-)
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
 
@@ -695,7 +689,7 @@ class AsyncClient(Client):
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
         self.event_admission_callback: ClientCallback | None = None
-        self.event_batch_admission_callback: _TimelineBatchAdmission | None = None
+        self._group_recovery_commits = False
         self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
         )
@@ -1031,6 +1025,8 @@ class AsyncClient(Client):
         self,
         callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
+        *,
+        group_recovery_commits: bool = False,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
 
@@ -1053,6 +1049,10 @@ class AsyncClient(Client):
         and nio's acceptance marker cannot share one transaction.
         Events excluded by ``cb_filter`` are accepted without invoking the
         callback.
+        Set ``group_recovery_commits`` to admit a recovery-page prefix before
+        committing nio's acceptance markers, then fan it out before committing
+        its completion markers. This reduces store commits but widens the
+        interruption replay window to the whole uncommitted prefix.
 
         The exception propagates from sync(), receive_response(), or
         sync_forever(); the caller must continue the sync loop to retry it.
@@ -1061,10 +1061,7 @@ class AsyncClient(Client):
             raise LocalProtocolError(
                 "Event admission requires limited-timeline recovery."
             )
-        if (
-            self.event_admission_callback is not None
-            or self.event_batch_admission_callback is not None
-        ):
+        if self.event_admission_callback is not None:
             raise LocalProtocolError(
                 "An event admission callback is already registered."
             )
@@ -1072,36 +1069,7 @@ class AsyncClient(Client):
             _adapt_event_admission_callback(callback),
             cb_filter,
         )
-
-    def add_event_batch_admission_callback(
-        self,
-        callback: TimelineBatchAdmissionCallback,
-        cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
-    ) -> None:
-        """Set the sole owner of ordered timeline-batch admission.
-
-        The callback must durably and idempotently accept the ordered entries
-        before returning one disposition per entry. Nio then commits its batch
-        acceptance markers before ordinary callback fanout. A crash during
-        fanout can replay callbacks whose grouped completion did not commit;
-        use the single-event admission API when that wider replay window is
-        unsuitable.
-        """
-        if not self.config.backfill_limited_timelines:
-            raise LocalProtocolError(
-                "Event admission requires limited-timeline recovery."
-            )
-        if (
-            self.event_admission_callback is not None
-            or self.event_batch_admission_callback is not None
-        ):
-            raise LocalProtocolError(
-                "An event admission callback is already registered."
-            )
-        self.event_batch_admission_callback = _TimelineBatchAdmission(
-            callback,
-            cb_filter,
-        )
+        self._group_recovery_commits = group_recovery_commits
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -1420,80 +1388,45 @@ class AsyncClient(Client):
         mark_admission_accepted: Callable[[], None],
     ) -> tuple[Event | BadEventType | None, ...]:
         """Prepare, admit, then fan out one ordered timeline prefix."""
-        prepared = tuple(
-            self._prepare_timeline_event(
+        prepared: list[tuple[MatrixRoom, Event | BadEventType] | None] = []
+        for index, (pending, event) in enumerate(
+            zip(pending_events, events, strict=True)
+        ):
+            item = self._prepare_timeline_event(
                 pending.room_id,
                 event,
                 was_completed=pending.was_completed,
                 sync_origin=pending.is_live,
                 apply_room_state=pending.apply_room_state,
             )
-            for pending, event in zip(pending_events, events, strict=True)
-        )
-        callback = self.event_batch_admission_callback
-        admission_entries_list = []
-        for pending, item in zip(pending_events, prepared, strict=True):
+            prepared.append(item)
             if pending.admission_accepted or item is None:
                 continue
             room, event = item
-            if not isinstance(event, Event):
-                continue
-            if (
-                callback is not None
-                and callback.event_filter is not None
-                and not isinstance(event, callback.event_filter)
-            ):
-                continue
-            admission_entries_list.append(
-                TimelineAdmissionEntry(room, event, pending.provenance)
-            )
-        admission_entries = tuple(admission_entries_list)
-        if callback is not None and admission_entries:
-            scope = _CallbackScope()
-            token = self._event_callback_scope.set(scope)
             try:
-                dispositions = callback.callback(admission_entries)
-                if inspect.isawaitable(dispositions):
-                    dispositions = await dispositions
+                await self._on_event_admission(event, room, pending.provenance)
             except CallbackNotAcceptedError as error:
                 raise _BatchCallbackError(error, (), accepted=False) from error
             except Exception as error:
                 completed_live = tuple(
-                    (index, item[1] if item is not None else None)
-                    for index, (pending, item) in enumerate(
-                        zip(pending_events, prepared, strict=True)
+                    (completed_index, completed_item[1])
+                    for completed_index, (
+                        completed_pending,
+                        completed_item,
+                    ) in enumerate(
+                        zip(
+                            pending_events[: index + 1],
+                            prepared,
+                            strict=True,
+                        )
                     )
-                    if pending.is_live
+                    if completed_pending.is_live and completed_item is not None
                 )
                 raise _BatchCallbackError(
                     error,
                     completed_live,
                     accepted=True,
                 ) from error
-            finally:
-                scope.active = False
-                self._event_callback_scope.reset(token)
-            if not isinstance(dispositions, tuple) or len(dispositions) != len(
-                admission_entries
-            ):
-                raise _BatchCallbackError(
-                    LocalProtocolError(
-                        "Batch admission must return one disposition per entry."
-                    ),
-                    (),
-                    accepted=False,
-                )
-            if not all(
-                isinstance(disposition, TimelineAdmissionDisposition)
-                for disposition in dispositions
-            ):
-                raise _BatchCallbackError(
-                    LocalProtocolError(
-                        "Batch admission returned an invalid disposition."
-                    ),
-                    (),
-                    accepted=False,
-                )
         try:
             mark_admission_accepted()
         except Exception as error:
@@ -1539,9 +1472,7 @@ class AsyncClient(Client):
             fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
             dispatch_event_batch=(
-                self._dispatch_timeline_batch
-                if self.event_batch_admission_callback is not None
-                else None
+                self._dispatch_timeline_batch if self._group_recovery_commits else None
             ),
             store=self._recovery_store,
             ready_room_id=ready_room_id,
