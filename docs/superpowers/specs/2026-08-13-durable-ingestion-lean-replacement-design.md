@@ -57,7 +57,9 @@ The mistake in the superseded design was allowing proof for one live canary to b
    non-sensitive execution boundary, the authoritative observation is a fresh
    hardened disposable local ordinary-product cohort; real deployment,
    credentials, and production process control remain notes-only.
-8. Live-canary evidence is external release assurance, never a reason to add production schema or semantics.
+8. External canary and local observation evidence is behavioral and deletion-
+   gate evidence only. It provides no release, deployment, cutover, or security
+   assurance and is never a reason to add production schema or semantics.
 
 ## Compatibility boundary
 
@@ -264,7 +266,9 @@ Required tests:
 - an explicit receipt/application disposition for every `RecordKind` and `LossRecord`, with no retained Frame or Work backlog after successful ordinary responses;
 - conflicting retained-identity rollback;
 - public method signatures, response values, callback order, callback re-entry, and desktop to-device behavior against the upstream-style implementation;
-- ordinary-room live canaries using released wheels and normal journal/frontier/application outcomes;
+- ordinary-room live canaries and the fresh hardened local cohort using the
+  exact reviewed candidate wheels and normal journal/frontier/application
+  outcomes;
 - the exact MindRoom and desktop observation thresholds above, with external coverage proving zero fork-recovery calls before deletion.
 
 Test consolidation is part of the design. Preserve behavior matrices, not one test for every internal helper or historical implementation topology.
@@ -298,8 +302,8 @@ Any new persistent table, production module, public option, or transport-specifi
 - No removal or semantic change of the true pre-fork sync and callback surface; fork-added AsyncClient Sliding and recovery APIs are not part of it.
 - No generalized nio event-dedup database.
 - No deletion of fork recovery before MindRoom activation plus observation; no migration of desktop to the durable batch engine.
-- No merge, release, production deployment, or cutover claim from local
-  observation alone.
+- Local observation does not support a merge, release, production deployment,
+  or cutover claim.
 
 ## Completion criteria
 

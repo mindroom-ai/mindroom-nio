@@ -104,7 +104,8 @@ consolidation program while retaining a measurable margin:
 Fresh Task 10A entry measurements on 2026-08-16 were:
 
 - matrix-nio entry: runtime `+19,930`, tests `+56,870`, docs/scripts `+5,260`;
-  this 354-line consolidation reduces docs/scripts to `+647`;
+  the 354-line Task 10A consolidation reduced docs/scripts to `+647`, and the
+  current plan/spec gate amendment leaves the tracked delta at `+690`;
 - MindRoom: runtime `+201`, tests `+2,551`, and `src tests = -95`
   versus canary commit `925df7f3cbcc39d4904140efd9d16b93c77238ea`;
 - the six whole legacy matrix-nio modules listed in Task 9 contain 2,433
@@ -220,9 +221,9 @@ PR handoff, merge, release, and cutover are not complete.
 Observation must precede deletion. The authoritative cohort is a fresh,
 disposable, local ordinary-product stack using the reviewed candidate, exact
 wheels, synthetic local identities, and an external fail-closed operator. This
-is release-assurance evidence, not a production deployment or security test.
-There is no product opt-in, fallback switch, canary-agent variable, new YAML
-setting, or production evidence hook.
+is Task 9 deletion-gate evidence only; it provides no production, release,
+cutover, or security assurance. There is no product opt-in, fallback switch,
+canary-agent variable, new YAML setting, or production evidence hook.
 
 ### MindRoom observation gate
 
