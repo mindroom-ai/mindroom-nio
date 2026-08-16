@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | Canary evidence PASS; re-review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the corrected outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `7d5db343...`. The last result authenticates the exact Work payload and binds its EventRecord/source event plus receipt to the measured Matrix event before revalidating the descriptor around the kill; recovery preserves identity, produces one application effect, and reaches stable zero Frame/Work. The seven-test operator suite now directly covers canonical LossRecord authentication/skip as well as measured EventRecord binding. Controller-dispatched re-review remains before Task 8 completion. |
+| Task 8 | Complete | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the corrected outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `7d5db343...`. The last result authenticates the exact Work payload and binds its EventRecord/source event plus receipt to the measured Matrix event before revalidating the descriptor around the kill; recovery preserves identity, produces one application effect, and reaches stable zero Frame/Work. The seven-test operator suite directly covers canonical LossRecord authentication/skip as well as measured EventRecord binding. Controller-dispatched re-review found no Critical, Important, or Minor issues. |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2991,8 +2991,9 @@ runtime harness dependencies, and the exact wheels. Consultation notes, the
 pre-review harness, historical `sliding.json`, historical exact-Compose copy,
 README, and rejected run diagnostics are excluded. `SHA256SUMS` remains the
 complete provenance manifest and no longer carries acceptance semantics. No
-product source/test changed; re-review remains controller-owned; Task 9 remains
-unauthorized.
+product source/test changed. Independent re-review reproduced the seven focused
+tests and both manifests, found no Critical, Important, or Minor issues, and
+accepted Task 8. Task 9 remains unauthorized.
 
 #### Task 8 LossRecord coverage correction — 2026-08-16
 
