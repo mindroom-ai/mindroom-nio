@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | Canary evidence PASS; review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the separate outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `cb42b149...`. The last result revalidates one authenticated non-null descriptor around the kill, preserves exact receipt/batch identity across recovery, produces one application effect, and reaches a stable zero-Frame/Work boundary. Independent evidence review remains with the controller before Task 8 is marked complete. |
+| Task 8 | Canary evidence PASS; re-review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the corrected outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `7d5db343...`. The last result authenticates the exact Work payload and binds its EventRecord/source event plus receipt to the measured Matrix event before revalidating the descriptor around the kill; recovery preserves identity, produces one application effect, and reaches stable zero Frame/Work. Controller-dispatched re-review remains before Task 8 completion. |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2904,7 +2904,8 @@ consecutive unchanged one-second samples with every owned Frame/Work count
 zero, plus no second application effect. Reset only the disposable volumes and
 run that exact acceptance boundary next.
 
-The final fresh-volume outstanding-batch run is **PASS**. Accepted evidence is
+The first pre-review fresh-volume outstanding-batch run reported **PASS**. Its
+review-candidate evidence was
 `outstanding-batch.json`, SHA-256
 `cb42b149d541973acae41ab7fee5cc6ec2772a11404cc59566c6d8929b37ce42`,
 in the durable Task 8 evidence bundle. The external-only operator observed
@@ -2924,14 +2925,72 @@ records the cleared post-recovery descriptor and binds the
 already accepted `sliding-restart.json` and `sliding-unknown-pos.json` hashes;
 it does not substitute a third idle test for them.
 
-The accepted allowlist includes the result, exact operator, its focused tests,
-the two final wheels, pinned Compose/configuration, and all previously accepted
-results; `sha256sum -c SHA256SUMS` is GREEN. Pre-acceptance failures and one
-later no-stimulus Compose-start sequencing diagnostic remain clearly labelled
-outside that accepted allowlist. No product source or test changed. Independent
-review is deliberately not self-dispatched; the
-controller owns that final Task 8 acceptance step. Task 9 remains unauthorized
-and must not start.
+The initial combined provenance manifest included the result, exact operator,
+its focused tests, the two final wheels, pinned Compose/configuration, and all
+previously accepted results; `sha256sum -c SHA256SUMS` was GREEN. It was
+initially described as the accepted allowlist, which subsequent review rejected
+as ambiguous because historical and consultation artifacts also appeared in
+it. No product source or test changed. Independent review is deliberately not
+self-dispatched; the controller owns that Task 8 acceptance step. Task 9 remains
+unauthorized and must not start.
+
+#### Task 8 outstanding-batch review correction — 2026-08-16
+
+Independent review correctly rejected the `cb42b149...` result as insufficient
+for the central causal claim. It authenticated an arbitrary outstanding READY
+Work and matching receipt, then separately observed the measured event settle
+and receive one response; it never proved that the Work payload contained that
+measured Matrix event. The same review also found that calling `SHA256SUMS` an
+accepted allowlist was ambiguous because it intentionally contained historical
+and consultation provenance.
+
+External-only TDD closed the causal gap. Three initial binding tests were RED
+because no binding API existed while the two original descriptor tests stayed
+GREEN. The operator now uses the candidate's production `_row` format to
+reconstruct and authenticate the exact `NioIngestWork` row envelope and
+`_decode_work_plaintext` to validate the canonical wrapper/value/record
+identity. It extracts the authenticated EventRecord event ID and canonical
+source JSON event ID, requires both to equal the measured Matrix event, requires
+the receipt record ID to equal the Work record ID, and only then sends
+`SIGSTOP`. A valid unrelated READY Work/receipt is refused before freeze. Tests
+cover unrelated event payload, unrelated receipt, exact binding, non-target
+Work skip, canonical descriptor/batch identity, and missing-Work rejection.
+
+The first live rerun after that change is preserved at
+`run/failure-outstanding-batch-1786900444`. It reached no freeze or kill: a
+canonical unrelated non-event Work appeared first and the initial observer
+treated it as corrupt rather than skipping it. A focused RED reproduced that
+classification error; the GREEN authenticates EventRecord/LossRecord payloads
+without claiming a measured-event binding and keeps waiting unless the exact
+event identity matches. All six focused tests then passed.
+
+The corrected fresh-volume live run is **PASS**. Accepted
+`outstanding-batch.json` SHA-256 is
+`7d5db3432e6395edc150fb27e9b065236b117bef23dffb700f06fcc5aa7eb233`.
+Its authenticated causal binding records the same measured/Work/source event
+ID `$0aigB2S6Fl7s1zC7-D_1KCQJyZf1W9etFCVk_9pXkmE`, Work/receipt record ID
+`137fdb31-130d-52d0-bd49-5c88ceb9c90e`, and Work payload SHA-256
+`c6f53373e18744c4742204275cf9871b0807d49bf44a269388b400edad711777`.
+That binding is equal before stop, after all 38 tasks are confirmed stopped,
+immediately before `SIGKILL`, and after recovery. The descriptor itself is
+equal through post-kill revalidation at sequence 47/batch
+`425dcdef-d41d-5a6e-a519-701dab88c8d8`; the target journal moves pending to
+settled, zero responses exist at kill, exactly one exists after recovery, the
+source rotates epoch 0 to 1, the descriptor becomes explicitly null, and both
+owned databases remain at zero Frame/Work through 12 unchanged samples over
+11.04 seconds. Diagnostic counters remain zero and both accepted prior idle
+hashes remain bound.
+
+`ACCEPTED_SHA256SUMS` is now the unambiguous accepted-evidence dependency
+manifest (SHA-256
+`c65edec673ac3c23b61019fd33b23adf56d91c99ca6cd876e2059d48c5310f22`).
+It contains only accepted results, live configuration, operator, focused tests,
+runtime harness dependencies, and the exact wheels. Consultation notes, the
+pre-review harness, historical `sliding.json`, historical exact-Compose copy,
+README, and rejected run diagnostics are excluded. `SHA256SUMS` remains the
+complete provenance manifest and no longer carries acceptance semantics. No
+product source/test changed; re-review remains controller-owned; Task 9 remains
+unauthorized.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
