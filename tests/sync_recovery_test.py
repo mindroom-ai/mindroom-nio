@@ -416,7 +416,9 @@ class InlineStore:
     def __init__(self):
         self.thread_ids: list[int] = []
         self.finished: list[tuple[str, int, str | None, bool]] = []
+        self.finished_batches: list[tuple[list[tuple[str, int, str]], list]] = []
         self.accepted: list[tuple[str, int, str]] = []
+        self.accepted_batches: list[list[tuple[str, int, str]]] = []
         self.saved_abandoned_rooms: list[tuple[str, ...]] = []
         self.actions: list[str] = []
 
@@ -444,10 +446,272 @@ class InlineStore:
         self.thread_ids.append(threading.get_ident())
         self.accepted.append((room_id, generation, event_id))
 
+    def accept_recovery_events(self, keys):
+        self.thread_ids.append(threading.get_ident())
+        self.accepted_batches.append(list(keys))
+
+    def finish_recovery_events(self, keys, completed):
+        self.thread_ids.append(threading.get_ident())
+        self.finished_batches.append((list(keys), list(completed)))
+
 
 def accept_admission(admission_accepted, mark_admission_accepted):
     if not admission_accepted:
         mark_admission_accepted()
+
+
+@pytest.mark.asyncio
+async def test_batch_dispatch_groups_store_transitions():
+    gap = RecoveryGap(ROOM, 1, "", None)
+    queued = [pending("$one", 0), pending("$two", 1), pending("$live-three", 2)]
+    state = RecoveryState(
+        gaps={ROOM: [gap]},
+        events={(ROOM, 1): queued},
+    )
+    store = InlineStore()
+
+    async def reject_individual(*_args):
+        raise AssertionError("timeline rows must use the batch dispatcher")
+
+    async def dispatch_batch(pending_events, events, mark_admission_accepted):
+        assert [item.event_id for item in pending_events] == [
+            "$one",
+            "$two",
+            "$live-three",
+        ]
+        mark_admission_accepted()
+        return events
+
+    async def unused_fetch(*_args):
+        raise AssertionError("closed gap must not fetch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=reject_individual,
+        dispatch_event_batch=dispatch_batch,
+        store=store,
+    )
+
+    expected_keys = [
+        (ROOM, 1, "$one"),
+        (ROOM, 1, "$two"),
+        (ROOM, 1, "$live-three"),
+    ]
+    assert store.accepted_batches == [expected_keys]
+    assert [item[0] for item in store.finished_batches] == [expected_keys]
+    assert [
+        (item.was_encrypted, item.provenance) for item in store.finished_batches[0][1]
+    ] == [
+        (False, TimelineEventProvenance.HISTORY),
+        (False, TimelineEventProvenance.HISTORY),
+        (False, TimelineEventProvenance.LIVE),
+    ]
+    assert store.accepted == []
+    assert store.finished == [(ROOM, 1, None, False)]
+    assert not state.gaps
+
+
+@pytest.mark.parametrize(
+    ("page_size", "event_count", "expected_batch_sizes"),
+    [(10, 25, [10, 10, 5]), (0, 1, [1])],
+)
+@pytest.mark.asyncio
+async def test_batch_dispatch_is_bounded_by_page_size(
+    page_size, event_count, expected_batch_sizes
+):
+    gap = RecoveryGap(ROOM, 1, "", None)
+    queued = [pending(f"${index}", index) for index in range(event_count)]
+    state = RecoveryState(gaps={ROOM: [gap]}, events={(ROOM, 1): queued})
+    batch_sizes: list[int] = []
+
+    async def reject_individual(*_args):
+        raise AssertionError("timeline rows must use the batch dispatcher")
+
+    async def dispatch_batch(pending_events, events, mark_admission_accepted):
+        batch_sizes.append(len(pending_events))
+        mark_admission_accepted()
+        return events
+
+    async def unused_fetch(*_args):
+        raise AssertionError("closed gap must not fetch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, event_count, page_size, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=reject_individual,
+        dispatch_event_batch=dispatch_batch,
+        store=None,
+    )
+
+    assert batch_sizes == expected_batch_sizes
+    assert not state.gaps
+
+
+@pytest.mark.asyncio
+async def test_batch_dispatch_live_failure_completes_failed_live_event():
+    gap = RecoveryGap(ROOM, 1, "", None)
+    queued = [pending("$one", 0), pending("$live-two", 1), pending("$three", 2)]
+    state = RecoveryState(gaps={ROOM: [gap]}, events={(ROOM, 1): queued})
+    store = InlineStore()
+
+    async def dispatch_batch(pending_events, events, mark_admission_accepted):
+        mark_admission_accepted()
+        raise sync_recovery._BatchCallbackError(
+            RuntimeError("live callback failed"),
+            ((0, events[0]), (1, events[1])),
+            accepted=True,
+            failed_is_live=True,
+        )
+
+    async def unused(*_args):
+        raise AssertionError("individual path must not run")
+
+    with pytest.raises(RuntimeError, match="live callback failed"):
+        await pump_recovery(
+            state,
+            user_id="@me:example.org",
+            options=RecoveryOptions(1, 10, 10, 10),
+            fetch_messages=unused,
+            dispatch_event=unused,
+            dispatch_event_batch=dispatch_batch,
+            store=store,
+        )
+
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == ["$three"]
+    assert store.finished_batches[0][0] == [
+        (ROOM, 1, "$one"),
+        (ROOM, 1, "$live-two"),
+    ]
+    assert state.outcomes == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_dispatch_history_failure_keeps_failed_suffix_pending():
+    gap = RecoveryGap(ROOM, 1, "target", None)
+    queued = [pending("$one", 0), pending("$two", 1), pending("$three", 2)]
+    state = RecoveryState(gaps={ROOM: [gap]}, events={(ROOM, 1): queued})
+    store = InlineStore()
+
+    async def dispatch_batch(pending_events, events, mark_admission_accepted):
+        mark_admission_accepted()
+        raise sync_recovery._BatchCallbackError(
+            RuntimeError("history callback failed"),
+            ((0, events[0]),),
+            accepted=True,
+            failed_is_live=False,
+        )
+
+    async def unused(*_args):
+        raise AssertionError("individual path must not run")
+
+    with pytest.raises(RuntimeError, match="history callback failed"):
+        await pump_recovery(
+            state,
+            user_id="@me:example.org",
+            options=RecoveryOptions(1, 10, 10, 10),
+            fetch_messages=unused,
+            dispatch_event=unused,
+            dispatch_event_batch=dispatch_batch,
+            store=store,
+        )
+
+    assert [item.event_id for item in state.events[(ROOM, 1)]] == [
+        "$two",
+        "$three",
+    ]
+    assert store.finished_batches[0][0] == [(ROOM, 1, "$one")]
+    assert state.outcomes == {ROOM: False}
+
+
+@pytest.mark.asyncio
+async def test_batch_dispatch_keeps_mixed_kinds_on_individual_path():
+    gap = RecoveryGap(ROOM, 1, "", None)
+    notice = TypingNoticeEvent(["@sender:example.org"])
+    notice.source = {
+        "type": "m.typing",
+        "content": {"user_ids": ["@sender:example.org"]},
+    }
+    ephemeral = PendingTimelineEvent(
+        ROOM,
+        1,
+        0,
+        "~sync:s1:ephemeral:0",
+        json.dumps(notice.source),
+        False,
+        False,
+        kind="ephemeral",
+    )
+    queued = [ephemeral, pending("$one", 1), pending("$two", 2)]
+    state = RecoveryState(gaps={ROOM: [gap]}, events={(ROOM, 1): queued})
+    seen: list[tuple[str, str]] = []
+
+    async def dispatch_individual(
+        _room,
+        value,
+        _was_completed,
+        kind,
+        _provenance,
+        _sync_origin,
+        _apply_room_state,
+        _admission_accepted,
+        _mark_admission_accepted,
+    ):
+        seen.append((kind, getattr(value, "event_id", "~ephemeral")))
+        return value
+
+    async def reject_batch(*_args):
+        raise AssertionError("mixed-kind suffix must not enter a timeline batch")
+
+    async def unused_fetch(*_args):
+        raise AssertionError("closed gap must not fetch")
+
+    await pump_recovery(
+        state,
+        user_id="@me:example.org",
+        options=RecoveryOptions(1, 10, 10, 10),
+        fetch_messages=unused_fetch,
+        dispatch_event=dispatch_individual,
+        dispatch_event_batch=reject_batch,
+        store=None,
+    )
+
+    assert seen == [
+        ("ephemeral", "~ephemeral"),
+        ("timeline", "$one"),
+        ("timeline", "$two"),
+    ]
+    assert not state.gaps
+
+
+def test_batch_completion_validates_memory_before_store_commit():
+    gap = RecoveryGap(ROOM, 1, "", None)
+    existing = pending("$one", 0)
+    missing = pending("$missing", 1)
+    state = RecoveryState(
+        gaps={ROOM: [gap]},
+        events={(ROOM, 1): [existing]},
+    )
+    store = InlineStore()
+
+    with pytest.raises(
+        ValueError,
+        match=r"Pending recovery event disappeared: \$missing",
+    ):
+        sync_recovery._finish_recovery_event_batch(
+            state,
+            store,
+            gap,
+            (existing, missing),
+            (event("$one", 0), event("$missing", 1)),
+        )
+
+    assert store.finished_batches == []
+    assert state.events[(ROOM, 1)] == [existing]
 
 
 @pytest.mark.asyncio
@@ -1280,6 +1544,28 @@ async def test_dispatch_drain_reaches_tasks_registered_while_waiting():
     await drain
 
     assert nested_finished.is_set()
+    assert not state._active_dispatches
+
+
+@pytest.mark.asyncio
+async def test_room_drain_clears_every_failed_batch_alias():
+    state = RecoveryState()
+
+    async def failed_batch():
+        return sync_recovery._LiveCallbackError(
+            RuntimeError("batch callback failed"),
+            False,
+            accepted=False,
+        )
+
+    task = asyncio.create_task(failed_batch())
+    await task
+    for event_id in ("$one", "$two", "$three"):
+        state._active_dispatches[(ROOM, event_id, "timeline")] = task
+
+    with pytest.raises(RuntimeError, match="batch callback failed"):
+        await sync_recovery.drain_recovery_room_dispatches(state, {ROOM})
+
     assert not state._active_dispatches
 
 

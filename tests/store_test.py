@@ -6,11 +6,15 @@ from pathlib import Path
 
 import pytest
 from helpers import faker
-from peewee import SqliteDatabase
+from peewee import IntegrityError, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from nio import RecoveryAbandonment, TimelineEventProvenance
-from nio.client.sync_recovery import PendingTimelineEvent, RecoveryGap
+from nio.client.sync_recovery import (
+    CompletedTimelineEvent,
+    PendingTimelineEvent,
+    RecoveryGap,
+)
 from nio.crypto import (
     InboundGroupSession,
     OlmAccount,
@@ -1093,6 +1097,76 @@ class TestClass:
         _, events, _ = sqlstore.load_sync_recovery()
         assert events[0].admission_accepted
 
+    def test_accept_recovery_events_marks_every_row(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        events = [
+            PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                index,
+                event_id,
+                "{}",
+                True,
+                False,
+            )
+            for index, event_id in enumerate(("$one", "$two", "$three"))
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+
+        sqlstore.accept_recovery_events(
+            [(TEST_ROOM, 1, event.event_id) for event in events]
+        )
+
+        assert all(
+            event.admission_accepted for event in sqlstore.load_sync_recovery()[1]
+        )
+
+    def test_accept_recovery_events_tolerates_stale_and_cleared_rows(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 2, "p1", None)
+        events = [
+            PendingTimelineEvent(TEST_ROOM, 2, 0, "$one", "{}", True, False),
+            PendingTimelineEvent(TEST_ROOM, 2, 1, "$three", "{}", True, False),
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+
+        sqlstore.accept_recovery_events(
+            [
+                (TEST_ROOM, 99, "$one"),
+                (TEST_ROOM, 2, "$already-cleared"),
+                (TEST_ROOM, 2, "$three"),
+            ]
+        )
+
+        assert all(
+            event.admission_accepted for event in sqlstore.load_sync_recovery()[1]
+        )
+
+    def test_accept_recovery_events_rolls_back_database_failure(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        events = [
+            PendingTimelineEvent(TEST_ROOM, 1, 0, "$one", "{}", True, False),
+            PendingTimelineEvent(TEST_ROOM, 1, 1, "$two", "{}", True, False),
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+        table = PendingTimelineEvents._meta.table_name
+        sqlstore.database.execute_sql(f"""
+            CREATE TEMP TRIGGER fail_second_accept
+            BEFORE UPDATE OF admission_accepted ON "{table}"
+            WHEN NEW.event_id = '$two'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected acceptance failure');
+            END
+            """)
+
+        with pytest.raises(IntegrityError, match="injected acceptance failure"):
+            sqlstore.accept_recovery_events(
+                [(TEST_ROOM, 1, "$one"), (TEST_ROOM, 1, "$two")]
+            )
+
+        assert not any(
+            event.admission_accepted for event in sqlstore.load_sync_recovery()[1]
+        )
+
     def test_finish_recovery_survives_missing_row(self, sqlstore):
         """Completing an event whose row a concurrent iteration already
         cleared still records the completed marker instead of raising."""
@@ -1136,6 +1210,161 @@ class TestClass:
             )
             for event in events
         ] == [("$done", 0, TimelineEventProvenance.LIVE, False)]
+
+    def test_finish_recovery_events_writes_all_markers_atomically(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        event_ids = ("$one", "$two", "$three")
+        provenances = (
+            TimelineEventProvenance.LIVE,
+            TimelineEventProvenance.RECOVERED,
+            TimelineEventProvenance.HISTORY,
+        )
+        events = [
+            PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                index,
+                event_id,
+                "{}",
+                True,
+                False,
+                provenance=provenance,
+            )
+            for index, (event_id, provenance) in enumerate(
+                zip(event_ids, provenances, strict=True)
+            )
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+
+        sqlstore.finish_recovery_events(
+            [(TEST_ROOM, 1, event_id) for event_id in event_ids],
+            [
+                CompletedTimelineEvent(False, TimelineEventProvenance.LIVE),
+                CompletedTimelineEvent(True, TimelineEventProvenance.RECOVERED),
+                CompletedTimelineEvent(False, TimelineEventProvenance.HISTORY),
+            ],
+        )
+
+        _, stored, _ = sqlstore.load_sync_recovery()
+        assert [
+            (
+                event.event_id,
+                event.generation,
+                bool(event.was_encrypted),
+                event.provenance,
+            )
+            for event in stored
+        ] == [
+            ("$one", 0, False, TimelineEventProvenance.LIVE),
+            ("$two", 0, True, TimelineEventProvenance.RECOVERED),
+            ("$three", 0, False, TimelineEventProvenance.HISTORY),
+        ]
+
+    def test_finish_recovery_events_rejects_mismatched_counts(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        event = PendingTimelineEvent(TEST_ROOM, 1, 0, "$one", "{}", True, False)
+        sqlstore.save_recovery(None, set(), [gap], [event], None)
+
+        with pytest.raises(
+            ValueError,
+            match="Recovery completion count does not match its keys",
+        ):
+            sqlstore.finish_recovery_events(
+                [(TEST_ROOM, 1, "$one")],
+                [],
+            )
+
+        _, stored, _ = sqlstore.load_sync_recovery()
+        assert [(item.event_id, item.generation) for item in stored] == [("$one", 1)]
+
+    def test_finish_recovery_events_handles_missing_and_synthetic_rows(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        synthetic = PendingTimelineEvent(
+            TEST_ROOM,
+            1,
+            0,
+            "~synthetic",
+            "{}",
+            False,
+            False,
+        )
+        sqlstore.save_recovery(None, set(), [gap], [synthetic], None)
+
+        sqlstore.finish_recovery_events(
+            [
+                (TEST_ROOM, 99, "$vanished"),
+                (TEST_ROOM, 99, "~synthetic"),
+            ],
+            [
+                CompletedTimelineEvent(False, TimelineEventProvenance.HISTORY),
+                CompletedTimelineEvent(False, TimelineEventProvenance.HISTORY),
+            ],
+        )
+
+        _, stored, _ = sqlstore.load_sync_recovery()
+        assert [(item.event_id, item.generation) for item in stored] == [
+            ("$vanished", 0)
+        ]
+
+    def test_finish_recovery_events_rolls_back_database_failure(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        events = [
+            PendingTimelineEvent(TEST_ROOM, 1, 0, "$one", "{}", True, False),
+            PendingTimelineEvent(TEST_ROOM, 1, 1, "$two", "{}", True, False),
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+        table = PendingTimelineEvents._meta.table_name
+        sqlstore.database.execute_sql(f"""
+            CREATE TEMP TRIGGER fail_second_completion
+            BEFORE INSERT ON "{table}"
+            WHEN NEW.event_id = '$two' AND NEW.generation = 0
+            BEGIN
+                SELECT RAISE(ABORT, 'injected completion failure');
+            END
+            """)
+
+        with pytest.raises(IntegrityError, match="injected completion failure"):
+            sqlstore.finish_recovery_events(
+                [(TEST_ROOM, 1, "$one"), (TEST_ROOM, 1, "$two")],
+                [
+                    CompletedTimelineEvent(False, TimelineEventProvenance.LIVE),
+                    CompletedTimelineEvent(False, TimelineEventProvenance.LIVE),
+                ],
+            )
+
+        _, stored, _ = sqlstore.load_sync_recovery()
+        assert [(item.event_id, item.generation) for item in stored] == [
+            ("$one", 1),
+            ("$two", 1),
+        ]
+
+    def test_finish_recovery_events_prunes_completed_markers(self, sqlstore):
+        gap = RecoveryGap(TEST_ROOM, 1, "p1", None)
+        events = [
+            PendingTimelineEvent(
+                TEST_ROOM,
+                1,
+                index,
+                f"${index}",
+                "{}",
+                True,
+                False,
+            )
+            for index in range(513)
+        ]
+        sqlstore.save_recovery(None, set(), [gap], events, None)
+
+        sqlstore.finish_recovery_events(
+            [(TEST_ROOM, 1, event.event_id) for event in events],
+            [
+                CompletedTimelineEvent(False, TimelineEventProvenance.LIVE)
+                for _event in events
+            ],
+        )
+
+        _, stored, _ = sqlstore.load_sync_recovery()
+        assert len(stored) == 512
+        assert "$0" not in {event.event_id for event in stored}
 
     def test_sync_recovery_load_preserves_write_order_for_sequence_ties(
         self,

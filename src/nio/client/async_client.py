@@ -276,9 +276,11 @@ from .sliding_membership import (
 )
 from .sync_recovery import (
     PendingEventKind,
+    PendingTimelineEvent,
     RecoveryOptions,
     RecoveryPlan,
     RecoveryState,
+    _BatchCallbackError,
     _LiveCallbackError,
     acknowledge_unrecovered_rooms,
     drain_recovery_dispatches,
@@ -687,6 +689,7 @@ class AsyncClient(Client):
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
         self.event_admission_callback: ClientCallback | None = None
+        self._group_recovery_commits = False
         self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
         )
@@ -1022,6 +1025,8 @@ class AsyncClient(Client):
         self,
         callback: EventAdmissionCallback | LegacyEventAdmissionCallback,
         cb_filter: type[Event] | tuple[type[Event], ...] | None = None,
+        *,
+        group_recovery_commits: bool = False,
     ) -> None:
         """Set the callback that durably accepts timeline events before fanout.
 
@@ -1044,6 +1049,10 @@ class AsyncClient(Client):
         and nio's acceptance marker cannot share one transaction.
         Events excluded by ``cb_filter`` are accepted without invoking the
         callback.
+        Set ``group_recovery_commits`` to admit a recovery-page prefix before
+        committing nio's acceptance markers, then fan it out before committing
+        its completion markers. This reduces store commits but widens the
+        interruption replay window to the whole uncommitted prefix.
 
         The exception propagates from sync(), receive_response(), or
         sync_forever(); the caller must continue the sync loop to retry it.
@@ -1060,6 +1069,7 @@ class AsyncClient(Client):
             _adapt_event_admission_callback(callback),
             cb_filter,
         )
+        self._group_recovery_commits = group_recovery_commits
 
     async def parse_body(self, transport_response: ClientResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -1255,14 +1265,13 @@ class AsyncClient(Client):
         admission_accepted: bool,
         mark_admission_accepted: Callable[[], None],
     ) -> Event | BadEventType | EphemeralEvent | AccountDataEvent | None:
-        state_suppressed = kind == "timeline" and sync_origin and not apply_room_state
-        room = self.rooms.get(room_id)
-        if room is None:
-            room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
-            if not state_suppressed:
-                self.rooms[room_id] = room
-
         if kind == "ephemeral":
+            room = self.rooms.get(room_id)
+            if room is None:
+                room = MatrixRoom(
+                    room_id, self.user_id, room_id in self.encrypted_rooms
+                )
+                self.rooms[room_id] = room
             if not isinstance(event, EphemeralEvent):
                 raise ValueError("Invalid pending ephemeral event")
             room.handle_ephemeral_event(event)
@@ -1272,6 +1281,12 @@ class AsyncClient(Client):
                 raise _LiveCallbackError(error, False) from error
             return event
         if kind == "account_data":
+            room = self.rooms.get(room_id)
+            if room is None:
+                room = MatrixRoom(
+                    room_id, self.user_id, room_id in self.encrypted_rooms
+                )
+                self.rooms[room_id] = room
             if not isinstance(event, AccountDataEvent | BadEventType):
                 raise ValueError("Invalid pending account data event")
             room.handle_account_data(event)
@@ -1282,26 +1297,16 @@ class AsyncClient(Client):
             return event
         if not isinstance(event, Event | BadEventType):
             raise ValueError("Invalid pending timeline event")
-        if apply_room_state:
-            decrypted = self._handle_timeline_event(
-                event, room_id, room, self.encrypted_rooms
-            )
-            if decrypted:
-                event = decrypted
-            if self.store and isinstance(event, RoomEncryptionEvent):
-                self.store.save_encrypted_rooms({room_id})
-        elif isinstance(event, RoomEncryptionEvent) and not state_suppressed:
-            self.encrypted_rooms.add(room_id)
-            room.handle_event(event)
-            if self.store:
-                self.store.save_encrypted_rooms({room_id})
-            if self.olm:
-                self.olm.update_tracked_users(room)
-        elif isinstance(event, MegolmEvent) and self.olm:
-            event.room_id = room_id
-            event = self.olm._decrypt_megolm_no_error(event) or event
-        if was_completed and isinstance(event, MegolmEvent):
+        prepared = self._prepare_timeline_event(
+            room_id,
+            event,
+            was_completed=was_completed,
+            sync_origin=sync_origin,
+            apply_room_state=apply_room_state,
+        )
+        if prepared is None:
             return None
+        room, event = prepared
         if not admission_accepted and self.event_admission_callback is not None:
             try:
                 await self._on_event_admission(event, room, provenance)
@@ -1325,10 +1330,130 @@ class AsyncClient(Client):
                     accepted=False,
                 ) from error
         try:
-            await self._on_event(event, room)
+            await self._fanout_prepared_timeline_event(room, event)
         except Exception as error:
             raise _LiveCallbackError(error, isinstance(event, MegolmEvent)) from error
         return event
+
+    def _prepare_timeline_event(
+        self,
+        room_id: str,
+        event: Event | BadEventType,
+        *,
+        was_completed: bool,
+        sync_origin: bool,
+        apply_room_state: bool,
+    ) -> tuple[MatrixRoom, Event | BadEventType] | None:
+        """Apply room state and decrypt one timeline event without fanout."""
+        state_suppressed = sync_origin and not apply_room_state
+        room = self.rooms.get(room_id)
+        if room is None:
+            room = MatrixRoom(room_id, self.user_id, room_id in self.encrypted_rooms)
+            if not state_suppressed:
+                self.rooms[room_id] = room
+        if apply_room_state:
+            decrypted = self._handle_timeline_event(
+                event, room_id, room, self.encrypted_rooms
+            )
+            if decrypted:
+                event = decrypted
+            if self.store and isinstance(event, RoomEncryptionEvent):
+                self.store.save_encrypted_rooms({room_id})
+        elif isinstance(event, RoomEncryptionEvent) and not state_suppressed:
+            self.encrypted_rooms.add(room_id)
+            room.handle_event(event)
+            if self.store:
+                self.store.save_encrypted_rooms({room_id})
+            if self.olm:
+                self.olm.update_tracked_users(room)
+        elif isinstance(event, MegolmEvent) and self.olm:
+            event.room_id = room_id
+            event = self.olm._decrypt_megolm_no_error(event) or event
+        if was_completed and isinstance(event, MegolmEvent):
+            return None
+        return room, event
+
+    async def _fanout_prepared_timeline_event(
+        self,
+        room: MatrixRoom,
+        event: Event | BadEventType,
+    ) -> None:
+        """Run ordinary callbacks for an already-prepared timeline event."""
+        await self._on_event(event, room)
+
+    async def _dispatch_timeline_batch(
+        self,
+        pending_events: tuple[PendingTimelineEvent, ...],
+        events: tuple[Event | BadEventType, ...],
+        mark_admission_accepted: Callable[[], None],
+    ) -> tuple[Event | BadEventType | None, ...]:
+        """Prepare, admit, then fan out one ordered timeline prefix."""
+        prepared: list[tuple[MatrixRoom, Event | BadEventType] | None] = []
+        for index, (pending, event) in enumerate(
+            zip(pending_events, events, strict=True)
+        ):
+            item = self._prepare_timeline_event(
+                pending.room_id,
+                event,
+                was_completed=pending.was_completed,
+                sync_origin=pending.is_live,
+                apply_room_state=pending.apply_room_state,
+            )
+            prepared.append(item)
+            if pending.admission_accepted or item is None:
+                continue
+            room, event = item
+            try:
+                await self._on_event_admission(event, room, pending.provenance)
+            except CallbackNotAcceptedError as error:
+                raise _BatchCallbackError(error, (), accepted=False) from error
+            except Exception as error:
+                completed_live = tuple(
+                    (completed_index, completed_item[1])
+                    for completed_index, (
+                        completed_pending,
+                        completed_item,
+                    ) in enumerate(
+                        zip(
+                            pending_events[: index + 1],
+                            prepared,
+                            strict=True,
+                        )
+                    )
+                    if completed_pending.is_live and completed_item is not None
+                )
+                raise _BatchCallbackError(
+                    error,
+                    completed_live,
+                    accepted=True,
+                ) from error
+        try:
+            mark_admission_accepted()
+        except Exception as error:
+            raise _BatchCallbackError(error, (), accepted=False) from error
+
+        delivered: list[Event | BadEventType | None] = []
+        for index, (pending, item) in enumerate(
+            zip(pending_events, prepared, strict=True)
+        ):
+            if item is None:
+                delivered.append(None)
+                continue
+            room, event = item
+            try:
+                await self._fanout_prepared_timeline_event(room, event)
+            except Exception as error:
+                completed_fanout = list(enumerate(delivered))
+                if pending.is_live:
+                    completed_fanout.append((index, event))
+                raise _BatchCallbackError(
+                    error,
+                    tuple(completed_fanout),
+                    accepted=True,
+                    failed_is_live=pending.is_live,
+                ) from error
+            delivered.append(event)
+        return tuple(delivered)
 
     async def _pump_sync_recovery(self, ready_room_id: str | None = None) -> None:
         if not self.config.backfill_limited_timelines or not has_pending_recovery_work(
@@ -1346,6 +1471,9 @@ class AsyncClient(Client):
             ),
             fetch_messages=self._recovery_room_messages,
             dispatch_event=self._dispatch_timeline_event,
+            dispatch_event_batch=(
+                self._dispatch_timeline_batch if self._group_recovery_commits else None
+            ),
             store=self._recovery_store,
             ready_room_id=ready_room_id,
         )

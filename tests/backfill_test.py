@@ -2717,6 +2717,246 @@ class TestRoomLocalRecovery:
         ):
             client.add_event_admission_callback(second, RoomMessageText)
 
+    async def test_grouped_admission_commits_before_any_event_fanout(self, client):
+        release = asyncio.Event()
+        started = asyncio.Event()
+        order: list[str] = []
+
+        async def admit(_room, event, _provenance):
+            order.append(f"admit:{event.event_id}")
+            if event.event_id == "$two":
+                started.set()
+                await release.wait()
+                order.append("admitted:$two")
+
+        async def observe(_room, event):
+            order.append(f"fanout:{event.event_id}")
+
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
+        client.add_event_callback(observe, RoomMessageText)
+        task = asyncio.create_task(
+            client.receive_response(
+                timeline_response(
+                    "classic",
+                    "s1",
+                    [text_event("$one", 1), text_event("$two", 2)],
+                )
+            )
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        assert order == ["admit:$one", "admit:$two"]
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.5)
+
+        assert order == [
+            "admit:$one",
+            "admit:$two",
+            "admitted:$two",
+            "fanout:$one",
+            "fanout:$two",
+        ]
+
+    async def test_grouped_admission_preserves_recovered_timeline_order(
+        self,
+        client,
+        aioresponse,
+    ):
+        admissions: list[tuple[str, TimelineEventProvenance]] = []
+
+        def admit(_room, event, provenance):
+            admissions.append((event.event_id, provenance))
+
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap-one", 1), text_event("$gap-two", 2)],
+                "p1",
+            ),
+        )
+
+        await client.receive_response(
+            sync_response(
+                "s2",
+                {
+                    ROOM_A: room_info(
+                        [text_event("$held", 3)],
+                        limited=True,
+                        prev_batch="p1",
+                    )
+                },
+            )
+        )
+
+        assert admissions == [
+            ("$gap-one", TimelineEventProvenance.RECOVERED),
+            ("$gap-two", TimelineEventProvenance.RECOVERED),
+            ("$held", TimelineEventProvenance.LIVE),
+        ]
+
+    async def test_grouped_admission_rejection_retries_uncommitted_prefix(
+        self,
+        client,
+        aioresponse,
+    ):
+        attempts: list[str] = []
+        ordinary: list[str] = []
+        rejected = False
+
+        def admit(_room, event, _provenance):
+            nonlocal rejected
+            attempts.append(event.event_id)
+            if event.event_id == "$gap-two" and not rejected:
+                rejected = True
+                raise CallbackNotAcceptedError("durable grouped admission failed")
+
+        async def observe(_room, event):
+            ordinary.append(event.event_id)
+
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
+        client.add_event_callback(observe, RoomMessageText)
+        client.next_batch = "s1"
+        aioresponse.get(
+            MESSAGES_URL,
+            payload=messages(
+                [text_event("$gap-one", 1), text_event("$gap-two", 2)],
+                "p1",
+            ),
+        )
+        response = sync_response(
+            "s2",
+            {
+                ROOM_A: room_info(
+                    [text_event("$held", 3)],
+                    limited=True,
+                    prev_batch="p1",
+                )
+            },
+        )
+
+        with pytest.raises(
+            CallbackNotAcceptedError,
+            match="durable grouped admission failed",
+        ):
+            await client.receive_response(response)
+
+        assert ordinary == []
+
+        await client.receive_response(response)
+
+        expected = ["$gap-one", "$gap-two", "$held"]
+        assert attempts == ["$gap-one", "$gap-two", *expected]
+        assert ordinary == expected
+
+    async def test_grouped_admission_skips_durably_accepted_entry(self, client):
+        admissions: list[str] = []
+        ordinary: list[str] = []
+        accepted_marks = 0
+
+        def admit(_room, event, _provenance):
+            admissions.append(event.event_id)
+
+        async def observe(_room, event):
+            ordinary.append(event.event_id)
+
+        def mark_admission_accepted():
+            nonlocal accepted_marks
+            accepted_marks += 1
+
+        client.add_event_admission_callback(
+            admit,
+            RoomMessageText,
+            group_recovery_commits=True,
+        )
+        client.add_event_callback(observe, RoomMessageText)
+        pending_events = (
+            replace(
+                PendingTimelineEvent.from_event(
+                    ROOM_A,
+                    1,
+                    0,
+                    text_event("$accepted", 1),
+                    True,
+                ),
+                admission_accepted=True,
+            ),
+            PendingTimelineEvent.from_event(
+                ROOM_A,
+                1,
+                1,
+                text_event("$new", 2),
+                True,
+            ),
+        )
+        assert all(pending_events)
+
+        await client._dispatch_timeline_batch(
+            pending_events,
+            (text_event("$accepted", 1), text_event("$new", 2)),
+            mark_admission_accepted,
+        )
+
+        assert admissions == ["$new"]
+        assert ordinary == ["$accepted", "$new"]
+        assert accepted_marks == 1
+
+    async def test_grouped_admission_observes_state_at_each_event(
+        self,
+        client,
+    ):
+        observations: list[tuple[str, str, str | None]] = []
+
+        def admit(room, event, _provenance):
+            observations.append(("admit", event.event_id, room.name))
+
+        async def observe(room, event):
+            observations.append(("ordinary", event.event_id, room.name))
+
+        client.add_event_admission_callback(
+            admit,
+            RoomNameEvent,
+            group_recovery_commits=True,
+        )
+        client.add_event_callback(observe, RoomNameEvent)
+
+        response = sync_response(
+            "s1",
+            {
+                ROOM_A: room_info(
+                    [
+                        name_event("$first", 1, "First name"),
+                        name_event("$second", 2, "Second name"),
+                    ],
+                    limited=False,
+                    prev_batch="p0",
+                )
+            },
+        )
+        await client.receive_response(response)
+
+        assert observations == [
+            ("admit", "$first", "First name"),
+            ("admit", "$second", "Second name"),
+            ("ordinary", "$first", "Second name"),
+            ("ordinary", "$second", "Second name"),
+        ]
+        assert client.rooms[ROOM_A].name == "Second name"
+
     @pytest.mark.parametrize("protocol", ["classic", "sliding"])
     async def test_two_argument_admission_callback_remains_supported(
         self,
