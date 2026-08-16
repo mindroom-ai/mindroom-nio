@@ -56,8 +56,8 @@ checkpoint**.
 
 | Repository | Branch | Required commit boundary | State |
 | --- | --- | --- | --- |
-| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Task 8 hydration fix `a3ab35fe341f0c3bf92000173b08dba8e303a5ff`; bearer-auth fix `2ba7b04a90c5191cbf488459bd4c48107ac07714`, invite/knock bridge `9624ccffe164a4b20ba8a397fbfb634693deb4c2`, docs blocker `bc015263202b770d96f217411eb070656b449a33`, and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Exact-wheel Classic is PASS. Fresh-volume Sliding exposed a transport-agnostic post-hydration lost wake; preserved DB evidence and a read-only Claude Fable review confirm the cause. The only intended tracked edits are this ledger, `coordinator.py`, and `coordinator_test.py`; causal/focused/broad suites and configured hooks are GREEN after final hardening. Compute the final patch identity, commit, build/install a fresh exact wheel, reset only the disposable stack, and rerun Sliding |
-| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | packaging commit `6f415e41f` over Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Durable features and packaging fix are committed; tracked state is clean |
+| `/work/dev/mindroom-nio` | `docs/durable-ingestion-rewrite-plan` | Prepared-gap fix `af8eab819a501518c860e6dbb8581d411eec15d9`; Task 8 lost-wakeup fix `3b1f93bf31384261b7498c6ff67c3bdd4bce7724`; hydration fix `a3ab35fe341f0c3bf92000173b08dba8e303a5ff`, bearer-auth fix `2ba7b04a90c5191cbf488459bd4c48107ac07714`, invite/knock bridge `9624ccffe164a4b20ba8a397fbfb634693deb4c2`, docs blocker `bc015263202b770d96f217411eb070656b449a33`, and first fix `1c6bd92e42a7c8633c0a84bb2dff2978713cc3d3` remain historical evidence | Prepared-gap fix is locally GREEN (complete ingest 1720/1720 plus scoped statics). Exact-wheel `sliding-restart` evidence SHA `afba053c...` proves SIGKILL/reopen connection rotation, stable drain to Frame=0/Work=0, the first fixed 35-second unchanged-count idle window, and live position advance. Exact-wheel `sliding-unknown-pos` evidence SHA `8bce17e5...` proves real server HTTP 400 `M_UNKNOWN_POS`, source reset, replay invariance, zero Frame/Work, and the second live 35-second idle window. Independent review requires final-wheel Classic and a separate SIGKILL on a post-freeze-revalidated nio outstanding descriptor before Task 8 completion. This ledger remains the only intentional tracked edit. |
+| `/work/dev/mindroom` | `wip/matrix-journal-ingress-cutover` | restart fix `934bebfbbe1a4b174aef2c075d00e971a29697f6` over packaging commit `6f415e41f675d7a42e67ecc8cd53305351745004` and Task 7 `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` | Consumer creation-seed fix is committed, exact-wheel verified, and tracked-clean; preserve the listed unrelated untracked files. Its wheel SHA is `a0028fc69809c774cf572c6428883b881204838486de11d0b685d5b47eee0eac`. Current external failures have been resolved without another MindRoom edit; do not change MindRoom unless the remaining batch-interruption gate supplies new product evidence |
 
 Do not push, amend, rebase, force-push, merge, release, or claim cutover. Use
 ordinary commits only after a complete reviewed slice is green. Preserve the
@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | In progress | Exact diagnostics resolved binary `leave/0` versus authenticated `invite/0`, mixed query/Bearer auth, the retained-Frame/HELD hydration deadlock, and the later post-hydration lost wake. Hydration fix `a3ab35f...` and exact wheel SHA `52e574...` provide the current Classic PASS. The second strict-TDD slice is locally GREEN; next commit it, build a fresh exact wheel, and rerun Sliding from reset disposable volumes |
+| Task 8 | External gate deferred | Exact diagnostics and candidate fixes are locally complete. Final-wheel Classic, `sliding-restart`, and genuine current-position `sliding-unknown-pos` PASS with evidence SHAs `b81418a...`, `afba053c...`, and `8bce17e5...`. Independent review still requires a separate SIGKILL on a post-freeze-revalidated non-null nio outstanding descriptor. The user deferred this system-level capture work on 2026-08-15; do not resume it implicitly. |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2131,7 +2131,716 @@ waits for the authenticated pending intent to disappear, proves the two
 post-lifecycle Work rows are READY, and pins the cleared progress event before
 requiring the rearmed pump to wake. The exact node and 23-case focused selector
 remain GREEN, and the configured three-path pre-commit stack is GREEN after
-that hardening. Compute the final patch identity and commit next.
+that hardening. The exact three-file binary patch SHA-256 is
+`97f1aa83ae2c35365260280cb584a2bed29060ab2a567c235ddfb56359e853bf`.
+It is committed as `3b1f93bf31384261b7498c6ff67c3bdd4bce7724` with subject
+`fix: wake Work pump after hydration commit`. Build and inspect a detached exact
+wheel from this commit next; do not reuse the prior `52e574...` wheel for the
+Sliding rerun.
+
+That exact artifact is now built from detached worktree
+`/tmp/mindroom-task8-wheels.2FeteO/nio-3b1f93b` into
+`/tmp/mindroom-task8-wheels.2FeteO/wheels-3b1f93b/mindroom_nio-0.39.0-py3-none-any.whl`.
+Its SHA-256 is
+`53105375068824d17056348905bad739e40361a8cb85a33aec2836406653835b`
+and its size is 391,949 bytes. Fresh Python 3.13.14 environment
+`/tmp/mindroom-task8-wheels.2FeteO/venv-3b1f93b` contains 154 packages from
+that nio wheel plus the unchanged MindRoom wheel SHA `ab70ef8c...`; both imports
+resolve from the environment's `site-packages`, and inspected installed source
+contains the exact non-`None` hydration-commit signal. The ordinary canary
+harness is pinned to this environment and hash. Reset only the disposable
+`mindroom-task8-canary` volumes, start the pinned stack, and run `sliding` next.
+
+The separately reset ordinary Sliding rerun is now **PASS**. Evidence is stored
+at `/tmp/mindroom-task8-wheels.2FeteO/evidence/sliding.json`. It produced two
+canonical application replies
+(`$FgoZ5OmDB6Ouu4HHBBCLS3WWI_nbOVnvESfYCt-prBc` and
+`$wVRp8FxXLlzhbm5uC3b-U0yD0xVSBI-NphmPVtErwUk`) in room
+`!aUULRALOQqpqgMoFEM:task8.local`, with measured turn 3.168 seconds,
+`crashes=0`, `event_loop_stalls=0`, `degraded_conversation_reads=0`, and
+`restart_drain_incomplete=0`. Both general and router owned databases end at
+`NioIngestFrame=0` / `NioIngestWork=0`; the application journal has 24 events,
+123 receipts, four response-outbox rows, and eight visible messages. The exact
+wheel hashes are nio `53105375068824d17056348905bad739e40361a8cb85a33aec2836406653835b`
+and unchanged MindRoom `ab70ef8c61762992c3e5317b12adacbc47c3cd7fe13288c9e910bcfb7c7be65f`.
+This closes the ordinary Sliding fate that previously deadlocked, but the run
+reports `restarts=0` and `interruptions_with_work_outstanding=0`. Task 8 still
+requires its explicit outstanding-batch process kill/restart, fresh
+connection-scoped position, replay-without-second-effect, exact current-position
+`M_UNKNOWN_POS` reset, and two bounded idle observations. Inspect the existing
+operator/harness capabilities and execute those remaining external gates next;
+do not relabel Task 8 complete from this basic PASS alone.
+
+The remaining operator design was materially ambiguous, so the user-requested
+Claude Fable tie-breaker ran read-only through `agent-cli dev` against detached
+exact commit `3b1f93bf...`; the original task is preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/nio-3b1f93b/.claude/TASK-1786804692-2eaa.md`
+and the successful facts-only judgment at `TASK-1786805730-cbd6.md`. Fable's
+verdict is:
+
+- adapt the existing `restart-regression` profile to Sliding and retain its real
+  SIGKILL/pending-obligation/one-callback/one-answer proof, but replace its
+  Classic `sync_continuity/<agent>.json` checkpoint probe with exact
+  authenticated Sliding Source state;
+- before kill require a nonempty current position and connection identity;
+  after reopen require a different connection identity, the first request
+  positionless, exactly one recovered canonical answer, no second semantic or
+  application effect, and Frame=0/Work=0;
+- for real `M_UNKNOWN_POS`, first restart only pinned Synapse while MindRoom
+  holds a current positioned request. A proxy-injected 400, fabricated/stale
+  position, or normal MindRoom-reopen positionless request is inadmissible gate
+  evidence. If pinned Synapse does not emit the real error, the gate remains
+  unproven until a genuine server expiry mechanism is found;
+- the two idle observations may be split across two separately reset runs.
+  Each fixed window must start at a committed transition, keep Frame/Work empty
+  and dispatch/effect counts unchanged, and prove the Sliding loop is live via
+  advancing authenticated positions. Bare sleep or log absence is false-green.
+
+Implement only this external operator evidence. Do not add product hooks,
+tables, latches, or a proxy. Run the Sliding restart profile on fresh volumes
+first, then the separate real-server unknown-position attempt.
+
+The disposable wrapper now has a `sliding-restart` mode. It keeps the shared
+real restart oracle, but its checkpoint probe reads the sole active general
+`NioIngestSourceState` row, verifies `sha256(payload) == payload_sha256`, checks
+the clear columns against the canonical source payload, and requires a nonempty
+position to advance on the same connection before SIGKILL. It records the
+pre-kill Source, requires source epoch and connection identity to rotate after
+reopen, then runs a fixed 35-second post-recovery idle window requiring the same
+connection to advance requests/position while all allowlisted database counts
+remain exact and every owned Frame/Work count stays zero. The wrapper compiles
+and Ruff `--no-fix` is clean. Reset only the disposable volumes and run
+`task8_canary.py sliding-restart` next; preserve any failure before changing the
+operator or product.
+
+That first fresh-volume Sliding restart run is now preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786806231`. It
+fails before the intended SIGKILL, during the profile's ordinary configuration
+replacement. Both old Bot instances cancel and close cleanly. Each replacement
+Bot then generates a fresh UUID creation candidate and calls
+`open_owned_matrix_session()`, while
+`EventJournalStore.load_or_create_ingestion_consumer()` correctly retains and
+returns the principal's established persistent generation because its insert
+uses `ON CONFLICT DO NOTHING`. `_owned_session.py` incorrectly treats that
+established identity as foreign merely because it differs from the unused
+candidate, so both replacement bots remain down with
+`ValueError("ingestion consumer generation is invalid")`. This is a causal
+MindRoom product RED, not an nio Source or operator failure.
+
+Root-cause tracing is complete. The MindRoom consumer-generation row is durable
+store identity, not a per-process lease: its unit and reopen tests explicitly
+require later candidates to preserve the established generation, admission CAS
+and receipts bind the durable generation/stream/frontier, and nio independently
+stores the same generation in `NioIngestMeta` and rejects a different one
+byte-identically. nio rotates `writer_epoch` on ownership handoff and rotates
+Sliding source connection/epoch on reopen; those are the live-owner and source
+restart fences. Rotating the durable consumer generation, resetting its
+frontier, or changing only one database would corrupt this contract. The
+`new_consumer_generation` argument is therefore a creation seed only. The
+factory must accept the exact established `IngestionConsumer` returned by the
+principal-bound store, validate its exact field types, reopen nio with that
+identity, and retain the exact stream-binding equality check.
+
+This boundary was materially ambiguous, so the user-requested Claude Fable
+review ran read-only through `agent-cli dev` against detached exact MindRoom
+commit `6f415e41f...`; its prompt is preserved at
+`/tmp/mindroom-task8-fable.6f415e4/.claude/TASK-1786806680-1961.md` and session
+`1b869fee-a7a8-4f17-b5a0-bd318812fdad`. Fable independently selected the same
+creation-seed/established-identity contract and rejected both generation
+rotation and Bot-side identity caching. The temporary detached worktree is
+evidence only; never copy its bytes over either live repository.
+
+Strict TDD is now causal in the MindRoom tree. New real-SQLite/factory test
+`test_owned_matrix_session_factory_reopens_with_established_consumer_identity`
+first opens and binds candidate A, closes the real owned session, snapshots the
+complete `matrix_sync_consumers` row, then reopens with candidate B. Before the
+production edit, the exact node failed solely at `_owned_session.py:261` with
+`ValueError("ingestion consumer generation is invalid")`. The minimal edit
+replaces candidate equality with exact `IngestionConsumer`/UUID/optional-stream
+shape validation. The same node is GREEN, and the full factory file plus
+`TestIngestionConsumer` are 45/45 GREEN across configured SQLite/PostgreSQL
+fixtures. `git diff --check`, production Ruff `--no-fix`, and `py_compile` are
+clean. The default `uv run` initially installed the public 0.39 package lacking
+`nio.ingest`; it was not a product failure. The MindRoom `.venv` was restored
+to exact nio wheel SHA `53105375...`, and all stated tests use
+`.venv/bin/pytest` until the exact MindRoom wheel replaces the environment.
+The post-comment full MindRoom run collected 14,119 nodes and completed at
+100% with exit 0; only the recorded pre-existing dependency/pytest warnings
+remain. A subsequent configured affected-file pre-commit run passed every
+applicable hook, including Ruff check/format, full ty, vulture, Tach, and
+Privata. After that hook's expected public-nio resync, the exact nio wheel was
+restored and the causal node passed again. The exact two-file binary patch is
+`066d6c54a90fc5441b846036df943798cc6919e535912e0b0689c55a3a26f60b`
+(production +7/-1, test +86/-0). It is committed ordinarily as
+`934bebfbbe1a4b174aef2c075d00e971a29697f6`, parent exact
+`6f415e41f675d7a42e67ecc8cd53305351745004`; the tracked MindRoom tree is clean.
+The replacement wheel is built from detached worktree
+`/tmp/mindroom-task8-wheels.2FeteO/mindroom-934bebf` at
+`/tmp/mindroom-task8-wheels.2FeteO/wheels-934bebf/mindroom-2026.8.30.post1.dev492+g934bebfbb-py3-none-any.whl`.
+It is 5,046,955 bytes with SHA-256
+`a0028fc69809c774cf572c6428883b881204838486de11d0b685d5b47eee0eac`.
+Fresh Python 3.13.14 environment
+`/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf` contains that exact MindRoom
+wheel plus exact nio wheel SHA `53105375...`; both resolve from site-packages,
+and installed `_owned_session.open_owned_matrix_session` contains the reviewed
+creation-seed/established-consumer validation.
+
+On a session restart, verify the exact repositories and preserve unrelated
+files, then continue in this order:
+
+1. update this living ledger before every new behavioral edit or external run;
+2. diagnose the preserved nio `RecoveryGap` failure below to its exact planner
+   boundary, then write and observe the smallest causal owned-materializer RED;
+3. implement only the planner/reducer fate required by the controlling durable
+   contract, run focused/full nio gates, obtain read-only review, make an
+   ordinary commit, and rebuild the exact nio wheel and combined environment;
+4. reset only the disposable volumes and rerun `sliding-restart`; after it
+   passes, attempt the separate genuine current-position Synapse
+   `M_UNKNOWN_POS` reset and record the bounded idle evidence. Never substitute
+   a proxy error, fabricated position, stale position, or graceful stop for
+   these gates.
+
+#### Task 8 second external RED: post-reopen `RecoveryGap` — 2026-08-15
+
+The exact consumer-fixed disposable environment and harness are:
+
+- harness `/tmp/mindroom-task8-wheels.2FeteO/task8_canary.py`, compiled and
+  Ruff-clean, pinned to `venv-934bebf` and both wheel hashes above;
+- Compose manifest `/tmp/mindroom-task8-wheels.2FeteO/synapse/compose.yaml`,
+  project `mindroom-task8-canary`;
+- preserved failure directory
+  `/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786807826`;
+- first-failure log
+  `/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786807826/mindroom_data/logs/mindroom_20260815_152851.log`.
+
+The fresh-volume command was:
+
+```bash
+/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf/bin/python \
+  /tmp/mindroom-task8-wheels.2FeteO/task8_canary.py sliding-restart
+```
+
+Operator checkpoint: the first post-build attempt was preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786809537`, but it
+never reached nio or Matrix setup. After `docker compose ... down -v`, the
+temporary `PinnedSynapseStack.start()` override started MindRoom directly and
+does not itself call Compose; MindRoom therefore timed out for 90 seconds on
+`http://127.0.0.1:18008/_matrix/client/versions`. Compose `ps -a` was empty and
+the log contains only connection refusal. This is an operator-order failure,
+not a product RED, and must not alter code or count as restart evidence. Start
+the pinned disposable services explicitly, wait for health, then rerun the
+same exact harness bytes:
+
+```bash
+docker compose -p mindroom-task8-canary \
+  -f /tmp/mindroom-task8-wheels.2FeteO/synapse/compose.yaml \
+  up -d --wait
+/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf/bin/python \
+  /tmp/mindroom-task8-wheels.2FeteO/task8_canary.py sliding-restart
+```
+
+The corrected external run (healthy pinned Compose first, identical wheels and
+harness) is preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786809722`. It did
+not reproduce the consumer-generation or `RecoveryGap` failures: ordinary
+setup, replacement, the intended SIGKILL/reopen, and recovered application
+effect all completed. The first and only exception is later in
+`_observe_sliding_idle()`:
+
+```text
+task8_canary.py:253
+assert after_counts == before_counts
+AssertionError
+```
+
+This is progress but not a PASS. Preserve the failure and do not infer a
+product bug from the terminal assertion. Compare the exact authenticated
+Source positions and per-database allowlisted counts around the fixed idle
+window; determine whether the change is unfinished durable drain, legitimate
+E2EE maintenance outside the intended invariant, or a true second effect.
+Instrument only the disposable harness if the pre-window values were not
+printed. Do not change product bytes or weaken the required Frame=0/Work=0,
+one-semantic-effect, or live-position proof.
+
+The fresh diagnostic rerun is preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786809929` and
+printed the exact mismatch. At entry to the supposed idle window, general had
+`Frame=1/Work=62` and router had `Frame=1/Work=83`; journal counts were
+`events=24/receipts=347/outbox=4/visible=11`. At the end, both owned journals
+were exactly `Frame=0/Work=0`, while journal counts had settled to
+`events=34/receipts=491/outbox=4/visible=13`. The window therefore measured
+normal post-recovery durable drain and self-observation, not idle behavior.
+This is an operator boundary defect, not evidence against the gap fix.
+
+The admissible harness correction is condition-based: before starting the
+fixed 35-second window, poll fresh authenticated counts until every discovered
+owned journal has zero Frame/Work and the entire allowlisted count graph is
+unchanged for three consecutive one-second samples, with a bounded timeout.
+Then snapshot Source/counts and retain the original strict fixed-window rules:
+all counts byte-for-byte equivalent, Frame/Work zero, same connection/source
+epoch, advancing request/position, and no second application effect. Do not use
+a guessed pre-idle sleep and do not exclude receipt/event tables merely to
+make the assertion pass.
+
+Fresh-volume external GREEN, 2026-08-15: the condition-based harness completed
+with `status=PASS` and wrote
+`/tmp/mindroom-task8-wheels.2FeteO/evidence/sliding-restart.json` (4263 bytes,
+SHA-256 `afba053c053e0bc93ab57d6490a3a6951987737d2abfcb9bd97dfbfd57c3a243`).
+Exact evidence:
+
+- Synapse `1.158.0` at pinned image digest `sha256:39f47b...`;
+- nio wheel SHA `cd11da3e...` and MindRoom wheel SHA `a0028fc6...`;
+- pre-kill Source epoch 1/connection `1c8fe0b2...`/request 8 with nonempty
+  position `7/s40_6...`;
+- post-reopen Source epoch 2 on different connection `e41778b7...`, proving a
+  real owned-source handoff rather than graceful continuation;
+- restart-regression evaluator `PASS`, historical outputs exactly zero,
+  historical projections present after the recovered answer and on room read;
+- condition-based drain required 25 samples/24.0854 seconds, then both owned
+  journals were exactly Frame=0/Work=0;
+- fixed 35-second idle graph stayed exactly
+  `events=36/receipts=508/outbox=4/visible=13`, while one post-drain connection
+  remained epoch 3 and advanced request 1 -> 2 plus position
+  `12/s53_9... -> 12/s53_15...`;
+- diagnostics: zero degraded conversation reads, event-loop stalls, and
+  incomplete restart drains.
+
+The next gate is not another restart rerun. Preserve this PASS and implement a
+separate fresh-volume operator that holds a genuinely current positioned
+Sliding request while causing Synapse itself to invalidate/expire that exact
+position and emit real HTTP 400 `M_UNKNOWN_POS`. A proxy response, fabricated
+or stale token, process reopen (which intentionally starts positionless), or
+graceful stop is inadmissible. Record exact server mechanism and reset/replay
+evidence, then run the second fixed idle observation.
+
+Synapse 1.158.0 source and a disposable server-only probe establish the exact
+real invalidation mechanism. Native Sliding Sync persists at most the request
+position plus its successor for one `(user, device, conn_id)`; consuming the
+successor deletes older branch positions. The process cache can still serve an
+old branch until Synapse restarts, but PostgreSQL remains authoritative after
+restart. A joined disposable user produced exact nonzero positions
+`P=17/...`, `Q=18/...`, `R=19/...` through ordinary Sliding requests. After a
+pinned Synapse container restart, resubmitting exact P returned real HTTP 400
+body `{"errcode":"M_UNKNOWN_POS","error":"Unknown position"}`. No proxy,
+fabricated token, row deletion, clock skew, or product hook was used.
+
+Temporary harness now has a separate `sliding-unknown-pos` mode. Its frozen
+operator design is:
+
+1. run one ordinary real fuzz root to one exact canonical answer and wait for
+   a stable zero Frame/Work boundary;
+2. capture the authenticated current general Source position and confirm the
+   answer set/outbox count;
+3. pause the entire MindRoom process group while its continuous positioned
+   long-poll is active;
+4. use the same real access token, device, derived conn_id, and exact current P
+   for normal same-connection requests P -> Q -> R, then restart only pinned
+   Synapse so its process cache is rebuilt from PostgreSQL where P was expired;
+5. resume the unchanged MindRoom process. Require nio's durable Source epoch to
+   increment exactly once and its connection UUID to rotate, then independently
+   confirm exact P now returns server HTTP 400 `M_UNKNOWN_POS`;
+6. wait for zero-work drain, require the original response ID set and
+   `response_outbox` count unchanged, then run the second strict 35-second idle
+   window with unchanged full counts and a live advancing new position.
+
+The harness excludes the access token from evidence and is Black-clean,
+Ruff-clean, and bytecode-compilable. Run it only after a fresh disposable
+Compose volume reset/start:
+
+```bash
+docker compose -p mindroom-task8-canary \
+  -f /tmp/mindroom-task8-wheels.2FeteO/synapse/compose.yaml \
+  down -v --remove-orphans
+docker compose -p mindroom-task8-canary \
+  -f /tmp/mindroom-task8-wheels.2FeteO/synapse/compose.yaml \
+  up -d --wait
+/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf/bin/python \
+  /tmp/mindroom-task8-wheels.2FeteO/task8_canary.py sliding-unknown-pos
+```
+
+The first captured operator attempt after session compaction is not product
+evidence. The lost invocation had already created
+`@livefuzzowner:task8.local` in the disposable Synapse volume but did not leave
+a running harness or a result artifact. Rerunning the harness alone generated
+a new temporary password and therefore stopped during MindRoom account
+provisioning with exact `M_FORBIDDEN Invalid username or password`, before any
+owned ingestion or positioned request. Its preserved diagnostics are in
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-unknown-pos-1786810855`.
+Reset only the disposable Compose volumes and execute the full three-command
+block above once; do not interpret this account-collision setup failure as an
+`M_UNKNOWN_POS` or nio result.
+
+The next truly fresh-volume run reached the intended pause/branch boundary and
+is preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-unknown-pos-1786810922`.
+It stopped before restarting Synapse because its first immediate P request
+returned P again: no server stream changed while MindRoom was paused, so the
+harness assertion `branch_position != position` was an invalid operator
+assumption. A disposable server-only probe proved the safe correction: create
+a separate noise user and private room that the managed agent cannot see, emit
+one ordinary room event before each positioned request, and Synapse returns
+distinct Q/R for the managed agent because the global room stream advances.
+This introduces no agent-visible Work or response and does not manipulate a
+position, cache, database row, or clock. Amend only the temporary harness to
+use those two normal invisible-room stimuli, keep P/Q/R exact-distinct
+assertions, then reset the disposable volumes and rerun once.
+
+That temporary-harness correction is now implemented. `_advance_sliding_branch`
+registers one disposable noise user, creates a private room with no managed
+agent membership, sends one ordinary `m.room.message` before P -> Q and a
+second before Q -> R, and records only the non-secret user/room/event IDs plus
+the exact P/Q/R positions. The managed agent access token remains excluded
+from evidence. A server-only runtime probe confirmed that such an invisible
+room-stream update advances the managed agent's normal Sliding position, and
+the amended harness is Black-clean, Ruff `--no-fix` clean, and bytecode
+compilable. No repository source or test file changed. The immediate command
+is the complete fresh-volume three-command block above; do not rerun only the
+harness against the current volume after any partial attempt.
+
+The amended fresh-volume run reached and completed the real pinned-Synapse
+restart, but is not a PASS. It is preserved at
+`/tmp/mindroom-task8-wheels.2FeteO/failure-sliding-unknown-pos-1786855093`.
+The P -> Q -> R branch no longer failed, so the two private-room stimuli did
+advance distinct normal server positions. After the server restart the
+unchanged MindRoom process resumed, but `_wait_for_source_reset()` timed out
+with exact `AssertionError("nio did not reset the expired current Sliding
+position")`; no evidence JSON was accepted. The first diagnostic question is
+whether nio's next managed positioned request actually submitted the captured
+P and received `M_UNKNOWN_POS`, or whether its continuously running request had
+already advanced/committed a different Source position before the process-group
+pause took effect. Inspect the preserved harness metadata, Source/Frame/Work
+database, MindRoom log, and Synapse access log before changing the operator.
+Do not increase the reset timeout or rerun yet: the present failure is at the
+server -> managed-request -> durable-Source boundary, not a proven nio reset
+defect.
+
+Root cause is confirmed from the preserved server and two server-only probes.
+Synapse's access log shows direct P/Q requests at
+`2/s41... -> 2/s48... -> 2/s49...`; they changed only the stream-token suffix,
+while PostgreSQL retained connection position `2`. The managed post-restart
+request therefore legitimately submitted P and received HTTP 200, later
+committing request 23/position `2/s49...` with unchanged Source epoch and
+connection UUID. The operator had requested timeline limits 2 and 3, both
+below the already-established production limit 100, so
+`MutablePerConnectionState.has_updates()` produced no new connection state.
+A distinct `txn_id` alone was proven insufficient on a disposable connection
+(`6 -> 6`), while raising the requested timeline limit above the established
+maximum without a `txn_id` advanced it (`6 -> 7`). On the preserved managed
+connection, ordinary requests at limits 101 and 102 advanced connection
+positions `2 -> 4 -> 5`; after restarting pinned Synapse, exact old P returned
+HTTP 400 `{"errcode":"M_UNKNOWN_POS","error":"Unknown position"}`. This
+isolates the harness defect. Change only the temporary branch/probe limits from
+2/3/2 to 101/102/101, retain exact leading connection-position advancement
+assertions, then use another complete fresh-volume run.
+
+That minimal temporary-harness correction is implemented. The two branch
+requests now use limits 101/102, the independent old-P probe uses 101, and the
+harness requires the three parsed leading connection positions to be strictly
+increasing in addition to requiring three distinct full tokens. Black,
+Ruff `--no-fix`, and exact-environment `py_compile` are clean. Repository
+production/tests remain unchanged. The next action is the full disposable
+volume reset/start/harness block, not a harness-only rerun.
+
+The earlier `ingestion consumer generation is invalid` failure is absent:
+replacement Bots accept the established durable consumer and enter their owned
+sync loops. The new run fails before the intended SIGKILL during replacement
+setup. The first root exception, before later poison retries, is:
+
+```text
+nio/ingest/coordinator.py:617 run
+  -> coordinator.py:646 _run_loop
+  -> coordinator.py:1112 _materialize_oldest_frame
+  -> nio/store/_sync_journal.py:2006 _prepare_and_materialize_oldest_frame
+  -> _canonical_room_aggregate_plaintext(aggregate_value)
+  -> nio/store/_sync_journal_rows.py:249
+ValueError: this checkpoint persists no recovery gap
+```
+
+nio then deliberately poisons the client. Later loop messages saying
+`owned ingestion session is poisoned; reopen with a fresh client` are
+consequences, not the root failure. Configuration reload ultimately reports
+`invariant=replacement_setup_boundary_reached step=3 event_category=lifecycle phase=reload observed=False`.
+Do not diagnose from that terminal invariant or the poison retries; start from
+the first Aggregate-codec exception above.
+
+Known source boundary:
+
+- `ingest.reducer.reduce_room()` legitimately constructs `RecoveryGap` when a
+  trusted baseline meets a usable history discontinuity and returns it in both
+  `RoomProposal.after.gap` and `RoomProposal.recovery`;
+- `_canonical_room_aggregate_plaintext()` intentionally requires
+  `continuity.gap is None` and serializes literal `"gap": null`, because this
+  checkpoint stores no recovery gap;
+- the owned materializer calls `plan_prepared_frame_materialization()` and then
+  serializes every returned `plan.room_values` Aggregate. The external failure
+  therefore proves a proposed gap escaped whatever planner fate should resolve
+  it; it does not yet prove whether the defect is reducer, planner, or fixture
+  state;
+- materializer tests already contain `_prepared_gap_case` and
+  `test_prepared_gap_fallback_persists_loss_release_and_new_hydration`; inspect
+  those completely before proposing a fix. The capacity fallback also clears
+  gap/hydration, but that is not authority for ordinary recovery handling.
+
+The exact local causal RED is now captured against unchanged production:
+
+```bash
+cd /work/dev/mindroom-nio
+.venv/bin/pytest -q \
+  tests/ingest/materializer_test.py::test_prepared_new_gap_is_lost_and_released_without_persisting_gap
+```
+
+Result on 2026-08-15: `1 failed in 0.41s`, solely because the real prepared
+planner returned a `RoomAggregateValue` whose `continuity.gap` reached
+`_canonical_room_aggregate_plaintext()` and raised exact
+`ValueError("this checkpoint persists no recovery gap")`. The test uses a
+Sliding frame with authenticated `join` epoch 3, trusted member baseline
+`$member`/`room-old`, limited timeline successor token `room-new`, and the
+matching real prepared STATE carrier. Its downstream contract requires one
+ready `BASELINE_LOST` Work with boundary `room-old -> room-new`, followed by
+the current STATE Work, a new trusted baseline at `room-new`, and no persisted
+gap or hydration. This is the same planner-to-codec boundary as the external
+failure, without Docker, network, crypto, or consumer noise.
+
+Root-cause conclusion: `_plan_room()` is a transport-neutral reducer and
+legitimately models a recoverable gap. `reduce_prepared_frame()` currently
+passes a newly produced recovery through unchanged, but this durable
+hydration-only checkpoint has no recovery HTTP executor and its schema rejects
+persisted gaps. The established no-bounds branch already expresses the durable
+fate: explicit loss followed by release of the current trusted observation.
+The minimal fix belongs in the prepared-frame adapter only: validate the exact
+fresh-recovery shape, clear `after.gap` while preserving the new trusted
+baseline, replace recovery with one `BASELINE_LOST` proposal carrying the
+exact start/target tokens, set `LOSS_THEN_HELD`, and route the current room
+records `RELEASE_AFTER_LOSS`. Do not relax the Aggregate codec, persist a gap,
+change the generic reducer, or add a recovery executor in this slice.
+
+Local GREEN checkpoint, 2026-08-15: `src/nio/ingest/reducer.py` now performs
+exactly that conversion immediately after `_plan_room()` returns a fresh
+recovery for a no-transition prepared room. It fail-closes unless the result is
+the exact new-gap shape (`after.gap == recovery`, no hydration, retirement,
+losses, or release, and `HOLD_FOR_GAP`), then preserves the newly observed
+baseline, clears only the gap/recovery fields, emits exact `BASELINE_LOST`
+start/target evidence, selects `LOSS_THEN_HELD`, and delegates current records
+as `RELEASE_AFTER_LOSS`. No codec, generic reducer, schema, hydration, or
+MindRoom code changed. The exact causal node is now `1 passed in 0.12s`:
+
+```bash
+.venv/bin/pytest -q \
+  tests/ingest/materializer_test.py::test_prepared_new_gap_is_lost_and_released_without_persisting_gap
+```
+
+The repository is not yet externally GREEN: focused recovery/planner
+regressions, static checks, an exact-wheel rebuild, and the preserved
+`sliding-restart` canary rerun remain mandatory before resuming the genuine
+`M_UNKNOWN_POS` phase.
+
+Local regression checkpoint on the same bytes:
+
+- prepared planner selector: `105 passed, 321 deselected in 0.52s`;
+- complete reducer suite: `48 passed in 0.16s`;
+- complete materializer suite: `378 passed in 52.78s`;
+- complete `tests/ingest` suite: `1720 passed in 259.07s`;
+- Black check for reducer/test, production Ruff `--no-fix`, `py_compile`,
+  targeted mypy (`--follow-imports=skip --ignore-missing-imports`), and
+  `git diff --check`: all clean.
+
+At this checkpoint the only implementation changes are
+`src/nio/ingest/reducer.py` and the causal test in
+`tests/ingest/materializer_test.py`; this ledger is the third intended tracked
+edit. Preserve the unrelated untracked review directory and egg-info.
+
+The implementation/test pair is committed ordinarily as
+`af8eab819a501518c860e6dbb8581d411eec15d9` (`fix: terminalize prepared
+recovery gaps`). Detached exact worktree
+`/tmp/mindroom-task8-wheels.2FeteO/nio-af8eab8` built:
+
+- wheel
+  `/tmp/mindroom-task8-wheels.2FeteO/wheels-af8eab8/mindroom_nio-0.39.0-py3-none-any.whl`;
+- size `392145` bytes;
+- SHA-256 `cd11da3e96313bcd4e228c76799bf6fc7ebe5489276610ca47ac37bc0a8c1a0e`.
+
+That exact wheel replaced SHA `53105375...` in disposable Python 3.13.14
+environment `/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf`, which still
+contains exact MindRoom wheel `934bebfb...`/SHA `a0028fc6...`. Site-packages
+inspection confirms the new prepared-gap guard and release route. Temporary
+harness `/tmp/mindroom-task8-wheels.2FeteO/task8_canary.py` now pins the new
+nio wheel hash; it compiles and Ruff `--no-fix` is clean. The next command is:
+
+```bash
+/tmp/mindroom-task8-wheels.2FeteO/venv-934bebf/bin/python \
+  /tmp/mindroom-task8-wheels.2FeteO/task8_canary.py sliding-restart
+```
+
+Required way of working from a lost session:
+
+1. verify both exact repository commits/statuses and preserve all listed
+   untracked files; do not reset, amend, rebase, force-push, or push;
+2. use systematic root-cause tracing before editing production. Read the
+   reducer result, the full corresponding planner branch, the Aggregate codec,
+   the prepared-gap tests, and the preserved database/source Frame. Record one
+   concrete hypothesis only after that trace;
+3. use strict RED/GREEN TDD. The exact prepared-planner-to-Aggregate-codec RED
+   above is the smallest causal reproduction of the external boundary; keep it
+   red until the adapter fix and never weaken the codec merely to make the
+   payload serializable;
+4. if the correct durable gap fate remains materially ambiguous after code,
+   tests, and design have been exhausted, consult Claude Fable read-only via
+   `agent-cli dev` from a detached exact nio worktree and record the prompt,
+   session/verdict, and adopted/rejected reasoning here; do not pause for user
+   approval;
+5. implement one minimal source-level fix, verify focused then full affected
+   nio suites/statics, request read-only review, commit ordinarily, rebuild the
+   exact wheel/venv, and rerun only fresh disposable Task 8 volumes;
+6. update this ledger after every causal RED, GREEN, commit, exact artifact, or
+   external result so it remains sufficient to restart without conversation
+   state.
+
+Immediate read-only commands:
+
+```bash
+cd /work/dev/mindroom-nio
+git rev-parse HEAD
+git status --short
+rg -n "room_result_by_id|recovery|gap|hydration|RoomAggregateValue" \
+  src/nio/store/_sync_journal_plan.py
+rg -n "prepared_gap|recovery gap|HOLD_FOR_GAP" tests/ingest \
+  src/nio/ingest src/nio/store
+find /tmp/mindroom-task8-wheels.2FeteO/failure-sliding-restart-1786807826 \
+  -type f \( -name '*.db' -o -name '*.sqlite' \) -print
+```
+
+Do not reset the currently running disposable Compose stack merely to gather
+more logs. The preserved failure directory is the evidence source until a
+causal local RED is captured.
+
+#### Task 8 current external gate: real current-position `M_UNKNOWN_POS`
+
+The corrected operator completed on a freshly reset disposable Compose stack
+against exact nio commit `af8eab819a501518c860e6dbb8581d411eec15d9`, nio
+wheel SHA-256 `cd11da3e96313bcd4e228c76799bf6fc7ebe5489276610ca47ac37bc0a8c1a0e`,
+MindRoom commit `934bebfbbe1a4b174aef2c075d00e971a29697f6`, and MindRoom
+wheel SHA-256 `a0028fc69809c774cf572c6428883b881204838486de11d0b685d5b47eee0eac`.
+Pinned Synapse remained version `1.158.0` at digest `sha256:39f47b...`.
+
+The `sliding-unknown-pos` result is **PASS**. Its 7,004-byte evidence JSON has
+SHA-256 `8bce17e59626a603bee77422e794e44229ef58d9149fad8bf19af347654741e0`.
+It is preserved with the complete Task 8 evidence set, exact harness, and
+Compose manifest under
+`~/.codex/worktrees/mindroom-task8-evidence/2026-08-15/`, outside disposable
+temporary storage. Exact evidence:
+
+- the managed current Source began at epoch 0/request 19 on position `2/s41...`;
+- two normal private-room stimuli and timeline limits 101/102 advanced the same
+  server connection through exact leading positions 2 -> 4 -> 5;
+- after restarting only pinned Synapse, the exact old current position produced
+  real HTTP 400 `{"errcode":"M_UNKNOWN_POS","error":"Unknown position"}`;
+- nio atomically reset to source epoch 1/request 1 and continued on a fresh
+  connection instance without changing the original response-event sets or
+  response-outbox count;
+- both owned journals drained to `NioIngestFrame=0` / `NioIngestWork=0`;
+- the second fixed 35-second idle window preserved the full allowlisted graph
+  exactly at events=26/receipts=167/outbox=4/visible=4 while the new live Source
+  advanced request 1 -> 2 and position `6/s49_8... -> 6/s49_10...`;
+- diagnostics remained zero for degraded conversation reads, event-loop stalls,
+  and incomplete restart drains.
+
+This satisfies the genuine current-position reset and second bounded idle
+observation. Independent read-only review confirmed that evidence and both idle
+windows. It originally found two Task 8 blockers. The final-wheel Classic rerun
+is now resolved by the PASS recorded below. One blocker remains:
+`sliding-restart` killed with the durable MindRoom application obligation
+pending, after nio had already settled its batch. It therefore proves process
+recovery, source rotation, one callback/answer, and the first idle window, but
+not the separate requirement to SIGKILL with a non-null authenticated nio
+outstanding-batch descriptor.
+
+The persistent evidence bundle now includes the exact wheels, pinned Synapse
+configuration, base harness, portable operator harness/Compose entrypoints,
+provenance/limitations README, and complete hash manifest. Its `SHA256SUMS`
+SHA-256 is `6d4a3e1b19975d739b8a708e27a7b8498de0c62ca665a3f87f21b0cce402da34`.
+MindRoom's ordinary dependency resolver still selects the public `0.39.0`
+artifact, so Task 9 additionally requires an exact candidate artifact-pinning
+procedure before deployment.
+
+Consulted Claude: whether Task 7 plus the pending-application restart was
+sufficient, or how to capture the real external batch without a product latch
+— it recommended high-frequency read-only SQLite/WAL polling, process-group
+`SIGSTOP`, post-freeze descriptor revalidation, then `SIGKILL`, and rejected
+runtime monkeypatching — adopted. Record the exact descriptor fields and
+database/process identity before kill; after reopen require the first replayed
+batch identity, receipt/application invariance, null descriptor, and zero
+Frame/Work. If the descriptor clears before the stopped-state reread, resume and
+retry a fresh real event rather than accepting the attempt.
+
+#### Task 8 deferred system-level capture notes — 2026-08-15
+
+The user explicitly asked to avoid security- and permission-adjacent work that
+causes repeated blocking. Stop at the current external boundary. Do not resume
+cgroup manipulation, process-freezer work, deployment, credential changes, or
+secret-handling work unless the user later requests that scope explicitly.
+There were no product-source or product-test changes from this investigation.
+The only intentional tracked edit remains this planning ledger.
+
+Current accepted evidence before deferral:
+
+- final-wheel Classic is **PASS** against nio wheel SHA `cd11da3e...` and
+  MindRoom wheel SHA `a0028fc6...`; its persistent `classic.json` SHA-256 is
+  `b81418a02a9c66c109700c9f74b4e5c594f6a24f0eab54a63d6d6c6f43288489`;
+- `sliding-restart` remains **PASS** for process recovery, fresh Source
+  connection/epoch, one application answer, and the first strict idle window,
+  but its kill occurred after nio batch settlement;
+- `sliding-unknown-pos` remains **PASS** for the real Synapse 400 reset and the
+  second strict idle window;
+- fresh local verification at nio `af8eab819...` is GREEN: all 1,720 ingest
+  tests, configured changed-file pre-commit hooks, focused mypy, bytecode
+  compilation, and `git diff --check` passed;
+- the allowlisted evidence and exact candidate artifacts are preserved under
+  `~/.codex/worktrees/mindroom-task8-evidence/2026-08-15/`. Keep durable future
+  evidence there or in another persistent worktree location, never under
+  `/tmp`;
+- that bundle is now self-checking and portable: `README.md` records provenance
+  and the unresolved crash-window limitation, top-level harness/Compose files
+  use bundle-relative defaults, and `sha256sum -c SHA256SUMS` validates every
+  preserved input and result. Original absolute-path copies remain clearly
+  labeled as historical provenance only.
+
+What the unfinished observer investigation established:
+
+1. Reading `NioIngestMeta` and `NioIngestWork` in two SQLite statements can
+   straddle the atomic acknowledgement commit and synthesize a false
+   descriptor-to-missing-Work view. A future observer must use one atomic
+   `LEFT JOIN` snapshot and distinguish no outstanding batch from genuine
+   corruption.
+2. MindRoom's API health endpoint can become ready before startup maintenance
+   finishes. A future live harness must wait for the existing
+   `startup_maintenance.runtime_support` completion marker before sending its
+   warm-up event, or the event may correctly settle as initial history without
+   a reply.
+3. After those two harness defects were corrected, a high-frequency read-only
+   observer still missed the sub-millisecond descriptor window for 20
+   sequential genuine mentioned events. This was an observability failure, not
+   product evidence. The run produced normal replies and must not be reported
+   as a failed durability canary.
+4. Consulted Claude: how to make the sub-millisecond external window observable
+   after 20 misses — it recommended placing only the MindRoom process tree in
+   a dedicated cgroup v2 with a recorded `cpu.max`, then freezing it with
+   `cgroup.freeze`, verifying `cgroup.events` reports `frozen 1`, rereading the
+   exact descriptor, recording `/proc` database identity, and only then sending
+   SIGKILL; freeze/thaw duty-cycle sampling is the fallback — decision: defer
+   this system-level method per the user's instruction and do not execute it.
+
+If the user later reopens this gate, first verify the two repository commits,
+wheel hashes, pinned Synapse digest, persistent evidence contents and manifest,
+and clean tracked states. Rebuild a disposable operator harness from the notes
+above;
+do not reuse unreviewed `/tmp` harness bytes. A valid result must record the
+same authenticated descriptor before and after a confirmed freeze and after
+SIGKILL, then prove the matching post-reopen receipt/batch identity, exactly
+one application response, a cleared descriptor, and zero Frame/Work. Request a
+fresh independent evidence review before marking Task 8 complete.
+
+Do not begin Task 9 deployment or its 24-hour observation without explicit
+deployment authority.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
