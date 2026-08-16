@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | Canary evidence PASS; re-review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the corrected outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `7d5db343...`. The last result authenticates the exact Work payload and binds its EventRecord/source event plus receipt to the measured Matrix event before revalidating the descriptor around the kill; recovery preserves identity, produces one application effect, and reaches stable zero Frame/Work. Controller-dispatched re-review remains before Task 8 completion. |
+| Task 8 | Canary evidence PASS; re-review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the corrected outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `7d5db343...`. The last result authenticates the exact Work payload and binds its EventRecord/source event plus receipt to the measured Matrix event before revalidating the descriptor around the kill; recovery preserves identity, produces one application effect, and reaches stable zero Frame/Work. The seven-test operator suite now directly covers canonical LossRecord authentication/skip as well as measured EventRecord binding. Controller-dispatched re-review remains before Task 8 completion. |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2954,15 +2954,17 @@ source JSON event ID, requires both to equal the measured Matrix event, requires
 the receipt record ID to equal the Work record ID, and only then sends
 `SIGSTOP`. A valid unrelated READY Work/receipt is refused before freeze. Tests
 cover unrelated event payload, unrelated receipt, exact binding, non-target
-Work skip, canonical descriptor/batch identity, and missing-Work rejection.
+EventRecord skip, canonical descriptor/batch identity, and missing-Work
+rejection.
 
 The first live rerun after that change is preserved at
 `run/failure-outstanding-batch-1786900444`. It reached no freeze or kill: a
 canonical unrelated non-event Work appeared first and the initial observer
-treated it as corrupt rather than skipping it. A focused RED reproduced that
-classification error; the GREEN authenticates EventRecord/LossRecord payloads
-without claiming a measured-event binding and keeps waiting unless the exact
-event identity matches. All six focused tests then passed.
+treated it as corrupt rather than skipping it. The GREEN implementation
+authenticates EventRecord/LossRecord payloads without claiming a measured-event
+binding and keeps waiting unless the exact event identity matches. The focused
+test added at that point used an EventRecord with no event ID, so the six-test
+suite did not directly exercise the distinct LossRecord decoder branch.
 
 The corrected fresh-volume live run is **PASS**. Accepted
 `outstanding-batch.json` SHA-256 is
@@ -2991,6 +2993,39 @@ README, and rejected run diagnostics are excluded. `SHA256SUMS` remains the
 complete provenance manifest and no longer carries acceptance semantics. No
 product source/test changed; re-review remains controller-owned; Task 9 remains
 unauthorized.
+
+#### Task 8 LossRecord coverage correction — 2026-08-16
+
+The next independent review found no critical issue and retained the accepted
+live result. Its sole Important finding was accurate: the ledger/report claimed
+direct LossRecord branch coverage, but the supposed non-event fixture always
+constructed EventRecord and only set `event_id=None`.
+
+The focused operator test now builds a genuine candidate `LossRecord` with
+transport origin, room/membership identity, reason, full boundary, canonical
+detail JSON, and deterministic candidate `_loss_id`
+`b2b74a7e-c4ab-5bcc-a0b7-2a0d5cd08e47`. Candidate
+`_canonical_work_plaintext`, `_canonical_internal`, and `_row` produce the exact
+stored Work representation. The operator authenticates and decodes it as
+`kind=loss`, returns the exact loss record ID with null event/source IDs, and
+rejects it only at the measured-event binding boundary. Thus an unrelated
+LossRecord is skipped rather than frozen or classified as corrupt. The focused
+suite is now seven tests; all seven pass, and Ruff, Black, and bytecode
+compilation are clean.
+
+No operator, live result, configuration, wheel, or other accepted evidence byte
+changed, so no live rerun was required. Operator SHA-256 remains
+`03e9af06195d124344962ca2a1853231b479b5c17182535b9e0cb27fa742e992` and
+`outstanding-batch.json` remains
+`7d5db3432e6395edc150fb27e9b065236b117bef23dffb700f06fcc5aa7eb233`.
+The changed focused-test SHA-256 is
+`f1a53629b3b3c9a34f8f00dc8ac735ed18d700a937cbca30bf61a5a48d4787b2`;
+resealed `ACCEPTED_SHA256SUMS` is
+`a8881b46ed2169eb537288ee6dfeaf7cf7cecab3062335249cdcd1a40829a9f2`,
+and resealed complete-provenance `SHA256SUMS` is
+`55badf2560eb7b5c99dd646c0671b5b5a1655bb8b6eea7a6da51650a85f97ee8`.
+No product source or product test changed; re-review remains controller-owned;
+Task 9 remains unauthorized.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
