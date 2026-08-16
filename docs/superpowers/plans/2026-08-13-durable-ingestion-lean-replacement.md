@@ -2985,7 +2985,7 @@ hashes remain bound.
 
 `ACCEPTED_SHA256SUMS` is now the unambiguous accepted-evidence dependency
 manifest (SHA-256
-`c65edec673ac3c23b61019fd33b23adf56d91c99ca6cd876e2059d48c5310f22`).
+`a8881b46ed2169eb537288ee6dfeaf7cf7cecab3062335249cdcd1a40829a9f2`).
 It contains only accepted results, live configuration, operator, focused tests,
 runtime harness dependencies, and the exact wheels. Consultation notes, the
 pre-review harness, historical `sliding.json`, historical exact-Compose copy,
