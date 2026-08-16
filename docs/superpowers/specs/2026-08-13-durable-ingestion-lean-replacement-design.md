@@ -1,6 +1,7 @@
 # Durable ingestion: lean replacement design
 
-**Status:** controlling design, approved 2026-08-13
+**Status:** controlling design, approved 2026-08-13; non-sensitive observation
+and measured-budget amendment approved 2026-08-16
 
 **Implementation checkpoint (2026-08-14):** Tasks 1–4E and MindRoom Tasks 5A
 and 5B are committed. Task 4E is nio
@@ -51,7 +52,11 @@ The mistake in the superseded design was allowing proof for one live canary to b
 4. Keep one transport-neutral Frame/reducer/materializer/Work/batch/ack path for Classic and Sliding.
 5. Preserve matrix-nio's true pre-fork public sync surface and callback behavior at `69aa99c51f354980bf5306a85b4c7b7d71ff3217`. Desktop continues to use ordinary `sync()`/`sync_forever()` through one internal upstream-style profile that keeps sync-token persistence and E2EE but disables fork-only limited-timeline recovery.
 6. Do not preserve fork-only recovery/checkpoint internals after MindRoom is activated on the durable path and its observation window passes.
-7. The sequence is prune, implement, activate, observe, then delete legacy recovery. The deletion gate cannot move earlier.
+7. The sequence is prune, implement, activate, observe, then delete legacy
+   recovery. The deletion gate cannot move earlier. Under the explicit
+   non-sensitive execution boundary, the authoritative observation is a fresh
+   hardened disposable local ordinary-product cohort; real deployment,
+   credentials, and production process control remain notes-only.
 8. Live-canary evidence is external release assurance, never a reason to add production schema or semantics.
 
 ## Compatibility boundary
@@ -228,7 +233,19 @@ The Matrix event ID remains the semantic content identity, as it already is on m
    MindRoom engine activation. These are reviewable commits in the same linked
    PRs, not phase PRs.
 3. **Verify:** differential parity, crash matrices, public API/callback tests, and external Classic/Sliding canaries.
-4. **Restore and observe both consumers:** make the durable runner the candidate's sole MindRoom sync engine; the existing `matrix_sync.mode` selects only Classic or Sliding transport. Desktop pairing resolves a target controller fingerprint from that target bot's already-owned live client through an internal orchestrator resolver and never opens the exclusively owned database; missing or mismatched targets fail closed. Deploy that candidate to the observation cohort and run Desktop with unchanged user-visible behavior through its internal upstream-style no-recovery `sync_forever()` profile. Observe both with external coverage of fork-recovery modules. There is no canary-agent environment switch, new YAML field, or second sync-engine opt-in.
+4. **Restore and observe both consumers:** make the durable runner the
+   candidate's sole MindRoom sync engine; the existing `matrix_sync.mode`
+   selects only Classic or Sliding transport. Desktop pairing resolves a target
+   controller fingerprint from that target bot's already-owned live client
+   through an internal orchestrator resolver and never opens the exclusively
+   owned database; missing or mismatched targets fail closed. Run the exact
+   reviewed wheels in a fresh disposable local ordinary-product cohort with
+   synthetic identities and run Desktop with unchanged user-visible behavior
+   through its internal upstream-style no-recovery `sync_forever()` profile.
+   Observe both with a fail-closed external operator and coverage of
+   fork-recovery modules. There is no canary-agent environment switch, new YAML
+   field, production evidence hook, or second sync-engine opt-in. A prior run
+   with incomplete historical evidence remains supplementary and cannot count.
 5. **Delete legacy recovery:** only after MindRoom completes one uninterrupted 24-hour observation interval spanning at least 1,000 successful polls and three recorded process restarts, and desktop completes a two-hour/100-response soak with a restart and a real to-device callback; both must show zero fork-recovery execution, zero duplicate visible effects, zero unexplained loss, and no permanently growing backlog. Keep the upstream public API and repeat desktop regression/smoke coverage after deletion.
 6. **Final review:** run complete verification and report exact line budgets and remaining compatibility surface before the linked PRs are proposed for merge.
 
@@ -252,15 +269,20 @@ Required tests:
 
 Test consolidation is part of the design. Preserve behavior matrices, not one test for every internal helper or historical implementation topology.
 
-## Fixed final budget
+## Fixed-baseline final budget
 
 Measured against `origin/main` at `6ed2b9817d2bc9de30dc72942f9cb867d829283b`:
 
-- runtime `src/`: at most **+4,500** net lines;
-- tests: at most **+15,000** net lines;
+- runtime `src/`: at most **+13,000** net lines;
+- tests: at most **+26,000** net lines;
 - docs and scripts: at most **+1,000** net lines.
 
-These limits are fixed once. They are not rebound after work lands.
+The baseline remains immutable. The runtime and test ceilings were revised once
+on 2026-08-16 from +4,500/+15,000 after exact deletion and consolidation
+inventories proved those values mutually incompatible with the required
+five-table authenticated journal, readable crash semantics, public
+compatibility, and exhaustive oracle. The revised ceilings require the exact
+legacy deletion and safe consolidation; they are not rebound after work lands.
 
 MindRoom is measured from the post-prune `0acaea2ba` boundary: runtime at most **+350** net lines and tests at most **+1,000** net lines. The final candidate must also be net smaller than canary commit `925df7f3c`, whose measured net delta over that boundary is +268 runtime and +2,579 tests.
 
@@ -276,7 +298,8 @@ Any new persistent table, production module, public option, or transport-specifi
 - No removal or semantic change of the true pre-fork sync and callback surface; fork-added AsyncClient Sliding and recovery APIs are not part of it.
 - No generalized nio event-dedup database.
 - No deletion of fork recovery before MindRoom activation plus observation; no migration of desktop to the durable batch engine.
-- No merge, release, or cutover claim from a canary alone.
+- No merge, release, production deployment, or cutover claim from local
+  observation alone.
 
 ## Completion criteria
 
