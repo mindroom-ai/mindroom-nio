@@ -6,10 +6,12 @@
 
 **Status:** Tasks 1–8 complete and independently accepted. Task 9 is active:
 the first local run is supplementary shakeout evidence only. After its Desktop
-two-hour boundary, stop it intentionally, close it as aborted-with-limitations,
-harden the external operator, and start a fresh authoritative local run. Task
-10A is the documentation consolidation captured by this file; the remaining
-Task 10 gates depend on Task 9.
+gate-failure list is empty—proving two hours, at least 100 responses, one clean
+restart, real authenticated callbacks, and every zero-failure condition—stop
+it intentionally, close it as aborted-with-limitations, harden the external
+operator, and start a fresh authoritative local run. Task 10A is the
+documentation consolidation captured by this file; the remaining Task 10 gates
+depend on Task 9.
 
 **Goal:** Replace fork-specific sync recovery with one crash-safe,
 transport-neutral durable ingestion path while preserving the pre-fork public
@@ -106,7 +108,7 @@ Fresh Task 10A entry measurements on 2026-08-16 were:
 
 - matrix-nio entry: runtime `+19,930`, tests `+56,870`, docs/scripts `+5,260`;
   the 354-line Task 10A consolidation reduced docs/scripts to `+647`, and the
-  current plan/spec/operational amendment leaves the tracked delta at `+694`;
+  current plan/spec/operational amendment leaves the tracked delta at `+699`;
 - MindRoom: runtime `+201`, tests `+2,551`, and `src tests = -95`
   versus canary commit `925df7f3cbcc39d4904140efd9d16b93c77238ea`;
 - the six whole legacy matrix-nio modules listed in Task 9 contain 2,433
@@ -212,13 +214,16 @@ easier.
 
 The current `run-20260816T184150Z` interval remains supplementary because its
 historical source tuples, semantic callback order, and fail-closed database
-samples were not all preserved. Once Desktop crosses two hours and stops
-cleanly, intentionally stop the disposable operator/MindRoom process tree and
-close the run as `SUPPLEMENTARY_ABORTED_AFTER_SHAKEOUT_WITH_LIMITATIONS`.
-Waiting another 22 hours would not advance any authoritative gate. Only a fresh
-run using the independently reviewed hardened operator can satisfy the deletion
-gate. Task 9, legacy deletion, final budgets, PR handoff, merge, release, and
-cutover are not complete.
+samples were not all preserved. Only after `desktop_gate_failures` is empty and
+Desktop stops cleanly—thereby proving its exact duration, response, restart,
+authenticated-callback, duplicate/loss/backlog, and callback/order/
+authentication/response-failure requirements—intentionally stop the disposable
+operator/MindRoom process tree and close the run as
+`SUPPLEMENTARY_ABORTED_AFTER_SHAKEOUT_WITH_LIMITATIONS`. Waiting another 22
+hours would not advance any authoritative gate. Only a fresh run using the
+independently reviewed hardened operator can satisfy the deletion gate. Task 9,
+legacy deletion, final budgets, PR handoff, merge, release, and cutover are not
+complete.
 
 ## Task 9: Activate, observe, then delete legacy recovery
 
