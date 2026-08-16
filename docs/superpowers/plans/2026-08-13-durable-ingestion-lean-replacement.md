@@ -110,7 +110,7 @@ that former dirty-patch hash; do not reset or overwrite unrelated files.
 | Task 5D durable MindRoom activation | Complete | nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047`; full suites/hooks GREEN and final review READY YES |
 | Task 6 | Complete | nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698`; full suites, configured hooks/statics, review, deletion mapping, and fixed-budget evidence GREEN |
 | Task 7 | Complete | nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f`; affected suites/statics and exact crash manifest GREEN |
-| Task 8 | External gate deferred | Exact diagnostics and candidate fixes are locally complete. Final-wheel Classic, `sliding-restart`, and genuine current-position `sliding-unknown-pos` PASS with evidence SHAs `b81418a...`, `afba053c...`, and `8bce17e5...`. Independent review still requires a separate SIGKILL on a post-freeze-revalidated non-null nio outstanding descriptor. The user deferred this system-level capture work on 2026-08-15; do not resume it implicitly. |
+| Task 8 | Canary evidence PASS; review pending | Final-wheel Classic, `sliding-restart`, genuine current-position `sliding-unknown-pos`, and the separate outstanding-batch `SIGKILL` gate PASS with evidence SHAs `b81418a...`, `afba053c...`, `8bce17e5...`, and `cb42b149...`. The last result revalidates one authenticated non-null descriptor around the kill, preserves exact receipt/batch identity across recovery, produces one application effect, and reaches a stable zero-Frame/Work boundary. Independent evidence review remains with the controller before Task 8 is marked complete. |
 | Tasks 9–10 | Not started | Preserve the remaining dependency order |
 
 ### Task 5C completed checkpoint
@@ -2841,6 +2841,97 @@ fresh independent evidence review before marking Task 8 complete.
 
 Do not begin Task 9 deployment or its 24-hour observation without explicit
 deployment authority.
+
+#### Task 8 outstanding-batch gate resumed — 2026-08-16
+
+The user explicitly reopened the one deferred system-level gate and authorized
+process control only for the disposable Task 8 stack and its MindRoom child.
+Repository identity and evidence preflight are exact: nio candidate
+`af8eab819a501518c860e6dbb8581d411eec15d9` is an ancestor of the docs-ledger
+HEAD, MindRoom is clean at `934bebfbbe1a4b174aef2c075d00e971a29697f6`,
+the preserved nio/MindRoom wheels remain SHA-256 `cd11da3e96313bcd4e228c76799bf6fc7ebe5489276610ca47ac37bc0a8c1a0e`
+and `a0028fc69809c774cf572c6428883b881204838486de11d0b685d5b47eee0eac`,
+and Synapse remains pinned to version `1.158.0` at digest
+`sha256:39f47bcea65c544ef3a6d58848ee98e2ea98387e9991df30474d25b54477a0af`.
+The existing bundle manifest validates completely; the preserved consultation
+and pre-review harness remain notes, not accepted evidence.
+
+Direct child-cgroup delegation is unavailable in this user session. The new
+external-only operator therefore uses the narrower unprivileged fallback: one
+atomic read-only SQLite `LEFT JOIN` authenticates the non-null delivery
+descriptor against its exact READY Work row; only the disposable MindRoom
+process group is pinned/niced on one CPU with one operator-owned competitor;
+the observer runs on another CPU; and matching descriptor/receipt detection
+triggers exact process-group `SIGSTOP`, stopped-state confirmation, identical
+descriptor, receipt, and `/proc` database-identity revalidation, then
+`SIGKILL`. The pure descriptor
+reader first passed two tests covering canonical batch-ID derivation and
+missing-Work rejection; Black, Ruff `--no-fix`, and bytecode compilation are
+clean. Reset only the disposable Compose volumes and run this operator next.
+
+The first operator attempt is preserved under the durable evidence bundle at
+`run/failure-outstanding-batch-1786899059`. It reached the confirmed stop,
+SIGKILL, reopen, exact response, settlement, and zero-work drain boundaries;
+the preserved general and router databases both end with a null descriptor and
+`NioIngestFrame=0` / `NioIngestWork=0`. It failed only at the final strict
+35-second liveness assertion because request ID advanced while the authenticated
+Sliding position stayed equal in an otherwise traffic-free window. This is an
+operator stimulus gap, not accepted PASS evidence or a product failure.
+
+The minimal operator-only correction creates a disposable private noise room
+with no managed-agent membership, waits for its setup effects to settle, then
+starts the fixed idle window at one ordinary committed message in that invisible
+room. The full allowlisted database graph must remain byte-identical and both
+owned journals must remain empty while the unchanged managed connection advances
+its authenticated position. The noise token is never serialized. Black, Ruff
+`--no-fix`, bytecode compilation, and the two descriptor tests remain GREEN.
+Reset only the disposable volumes and rerun the exact operator next.
+
+That second fresh-volume run is preserved at
+`run/failure-outstanding-batch-1786899236`. It again reached descriptor capture,
+confirmed stop, SIGKILL, exact recovery receipt, one response, settled target,
+and zero-work drain, but Synapse correctly did not wake the managed filtered
+long-poll for an invisible-room event. Requiring a third advancing-position
+idle window was an operator overconstraint: the brief already accepts the two
+strict live-position idle observations and names this descriptor gate as the
+only missing boundary. The final operator therefore removes the extra liveness
+window, binds the already accepted `sliding-restart.json` SHA-256
+`afba053c053e0bc93ab57d6490a3a6951987737d2abfcb9bd97dfbfd57c3a243` and
+`sliding-unknown-pos.json` SHA-256
+`8bce17e59626a603bee77422e794e44229ef58d9149fad8bf19af347654741e0`,
+and retains the required condition-based post-recovery idle boundary: three
+consecutive unchanged one-second samples with every owned Frame/Work count
+zero, plus no second application effect. Reset only the disposable volumes and
+run that exact acceptance boundary next.
+
+The final fresh-volume outstanding-batch run is **PASS**. Accepted evidence is
+`outstanding-batch.json`, SHA-256
+`cb42b149d541973acae41ab7fee5cc6ec2772a11404cc59566c6d8929b37ce42`,
+in the durable Task 8 evidence bundle. The external-only operator observed
+sequence 47/batch `a1ef6fd7-a28e-568b-a2fc-3ea2543ac044`, authenticated it by
+one atomic SQLite `LEFT JOIN` to READY Work
+`e29e4015-21fc-59f5-84de-30bbfd5b52ed`, stopped only the disposable MindRoom
+process group, confirmed all 38 tasks stopped and the exact database inode open,
+and recorded byte-equivalent descriptors before stop confirmation, after stop
+confirmation, and after `SIGKILL`. Ordinary restart rotated source epoch 0 to 1
+and connection instance `057a8ac6...` to `8cc97035...`; the exact receipt,
+sequence, record, consumer generation, stream, and batch digest were invariant.
+The target journal moved pending to settled, the measured event produced exactly
+one application response and none before the kill, and both owned databases
+held `NioIngestFrame=0` / `NioIngestWork=0` through 12 unchanged samples over
+11.04 seconds. All three diagnostic counters are zero. The result explicitly
+records the cleared post-recovery descriptor and binds the
+already accepted `sliding-restart.json` and `sliding-unknown-pos.json` hashes;
+it does not substitute a third idle test for them.
+
+The accepted allowlist includes the result, exact operator, its focused tests,
+the two final wheels, pinned Compose/configuration, and all previously accepted
+results; `sha256sum -c SHA256SUMS` is GREEN. Pre-acceptance failures and one
+later no-stimulus Compose-start sequencing diagnostic remain clearly labelled
+outside that accepted allowlist. No product source or test changed. Independent
+review is deliberately not self-dispatched; the
+controller owns that final Task 8 acceptance step. Task 9 remains unauthorized
+and must not start.
 
 ### Task 5D completed checkpoint — 2026-08-15
 
