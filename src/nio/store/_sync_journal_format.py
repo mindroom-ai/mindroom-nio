@@ -4,7 +4,10 @@ from typing import Any
 from uuid import UUID
 
 from ..ingest._json import load_internal_json
+from ..ingest.errors import JournalIntegrityError
 from ..ingest.model import TransportKind
+from ..ingest.sliding import _sliding_cursor_from_json, canonical_sliding_cursor
+from ..ingest.source import _classic_cursor_from_json, canonical_classic_cursor
 from ..ingest.state import SourceState
 
 
@@ -66,3 +69,22 @@ def _source_header(source: SourceState) -> bytes:
             source.active,
         ]
     )
+
+
+def _validate_source_cursor(
+    transport_kind: TransportKind,
+    cursor_json: bytes,
+) -> None:
+    try:
+        if transport_kind is TransportKind.CLASSIC:
+            canonical = canonical_classic_cursor(_classic_cursor_from_json(cursor_json))
+        else:
+            canonical = canonical_sliding_cursor(_sliding_cursor_from_json(cursor_json))
+    except (TypeError, ValueError) as error:
+        raise JournalIntegrityError(
+            f"persisted {transport_kind.value} source cursor is invalid"
+        ) from error
+    if canonical != cursor_json:
+        raise JournalIntegrityError(
+            f"persisted {transport_kind.value} source cursor is not canonical"
+        )

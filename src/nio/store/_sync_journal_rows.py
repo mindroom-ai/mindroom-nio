@@ -39,6 +39,7 @@ from ._sync_journal_format import (
 )
 from ._sync_journal_format import _row as _row
 from ._sync_journal_format import _source_header as _source_header
+from ._sync_journal_format import _validate_source_cursor as _validate_source_cursor
 from ._sync_journal_plan import (
     AuthenticatedWork,
     _prepared_metadata_from_plaintext,
@@ -47,7 +48,6 @@ from ._sync_journal_plan import (
 from ._sync_journal_plan import (
     _canonical_work_plaintext as _canonical_work_plaintext,
 )
-from ._sync_journal_preflight import _validate_source_cursor
 from ._sync_journal_values import (
     RoomAggregateValue,
     _LocalMembershipIntent,

@@ -48,7 +48,6 @@ from ..ingest.sliding import (
 )
 from ..ingest.source import (
     ClassicCursor,
-    _classic_cursor_from_json,
     canonical_classic_cursor,
 )
 from ..ingest.state import OwnerView, SourceState, StagedFrame
@@ -59,6 +58,7 @@ from ._sync_journal_format import (
 )
 from ._sync_journal_format import _row as _row
 from ._sync_journal_format import _source_header as _source_header
+from ._sync_journal_format import _validate_source_cursor as _validate_source_cursor
 from ._sync_journal_values import SQLITE_INT_MAX, DeliveryState, RoomAggregateValue
 from .file_trustdb import Ed25519Key, KeyStore
 from .models import (
@@ -779,25 +779,6 @@ def _adopt_populated_store(
     if statement_hook is not None:
         statement_hook("before_commit")
     return stream_id, source_state
-
-
-def _validate_source_cursor(
-    transport_kind: TransportKind,
-    cursor_json: bytes,
-) -> None:
-    try:
-        if transport_kind is TransportKind.CLASSIC:
-            canonical = canonical_classic_cursor(_classic_cursor_from_json(cursor_json))
-        else:
-            canonical = canonical_sliding_cursor(_sliding_cursor_from_json(cursor_json))
-    except (TypeError, ValueError) as error:
-        raise JournalIntegrityError(
-            f"persisted {transport_kind.value} source cursor is invalid"
-        ) from error
-    if canonical != cursor_json:
-        raise JournalIntegrityError(
-            f"persisted {transport_kind.value} source cursor is not canonical"
-        )
 
 
 def _cold_source_cursor(source: SourceConfig) -> bytes:
