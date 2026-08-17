@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from nio.event_provenance import TimelineEventProvenance
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
 from nio.ingest.membership import MembershipObservation
@@ -209,6 +210,50 @@ def _mixed_frame() -> SyncFrame:
         (b'{"event":{"type":"ephemeral"},"room_id":"!room:example.org"}',),
         (b'{"type":"global"}',),
         (b'{"type":"presence"}',),
+    )
+
+
+def _sliding_timeline_frame(
+    event_ids: tuple[str | None, ...],
+    *,
+    initial: bool,
+    live_event_count: int = 0,
+) -> SyncFrame:
+    frame = _mixed_frame()
+    timeline = tuple(
+        (
+            b'{"type":"m.room.message"}'
+            if event_id is None
+            else f'{{"event_id":"{event_id}","type":"m.room.message"}}'.encode()
+        )
+        for event_id in event_ids
+    )
+    segment = replace(
+        frame.room_segments[0],
+        timeline_json=timeline,
+        timeline_prev_batch=None if initial else "live-window",
+        initial=initial,
+        live_event_count=live_event_count,
+        membership_observation=replace(
+            frame.room_segments[0].membership_observation,
+            is_initial=initial,
+        ),
+    )
+    return replace(
+        frame,
+        origin=RecordOrigin(
+            TransportKind.SLIDING,
+            1 if initial else 0,
+            0 if initial else 9,
+            0,
+        ),
+        request_cursor_json=(
+            b'"positionless-reopen"' if initial else frame.request_cursor_json
+        ),
+        candidate_cursor_json=(
+            b'"first-reopened-position"' if initial else frame.candidate_cursor_json
+        ),
+        room_segments=(segment,),
     )
 
 
@@ -800,6 +845,111 @@ def test_trusted_initial_or_expanded_segment_uses_gap_grammar(flag) -> None:
         descriptor.route is DescriptorRoute.HOLD_FOR_GAP
         for descriptor in proposal.descriptors[:5]
     )
+
+
+def test_reopened_sliding_initial_window_recovers_only_after_exact_anchor() -> None:
+    frame = _sliding_timeline_frame(
+        ("$old", "$anchor", "$recovered-1", "$recovered-2"),
+        initial=True,
+    )
+    state = replace(_state(), last_timeline_event_id="$anchor")
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (state,))
+
+    assert proposal.room_proposals[0].recovery is None
+    assert proposal.room_proposals[0].losses == ()
+    assert proposal.room_proposals[0].after.last_timeline_event_id == "$recovered-2"
+    assert [
+        descriptor.provenance
+        for descriptor in proposal.descriptors
+        if descriptor.kind is RecordKind.TIMELINE
+    ] == [
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.RECOVERED,
+        TimelineEventProvenance.RECOVERED,
+    ]
+
+
+def test_reopened_sliding_initial_window_without_anchor_remains_history() -> None:
+    frame = _sliding_timeline_frame(("$old", "$unknown"), initial=True)
+    state = replace(_state(), last_timeline_event_id="$anchor")
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (state,))
+
+    assert proposal.room_proposals[0].losses == (
+        LossProposal(
+            "!room:example.org",
+            0,
+            LossReason.UNVERIFIABLE,
+            LossBoundary(None, None, None, None),
+        ),
+    )
+    assert [
+        descriptor.provenance
+        for descriptor in proposal.descriptors
+        if descriptor.kind is RecordKind.TIMELINE
+    ] == [
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.HISTORY,
+    ]
+
+
+def test_reopened_sliding_anchor_requires_trusted_room_continuity() -> None:
+    frame = _sliding_timeline_frame(("$anchor", "$unknown"), initial=True)
+    state = replace(
+        _state(),
+        baseline=None,
+        last_timeline_event_id="$anchor",
+    )
+
+    proposal = reduce_staged_frame(STREAM_ID, frame.frame_id, frame, (state,))
+
+    assert proposal.room_proposals[0].hydration is not None
+    assert [
+        descriptor.provenance
+        for descriptor in proposal.descriptors
+        if descriptor.kind is RecordKind.TIMELINE
+    ] == [
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.HISTORY,
+    ]
+
+
+def test_unanchorable_live_tail_clears_boundary_before_reopen() -> None:
+    live_frame = _sliding_timeline_frame(
+        ("$seen", None),
+        initial=False,
+        live_event_count=2,
+    )
+    state = replace(_state(), last_timeline_event_id="$anchor")
+
+    live = reduce_staged_frame(
+        STREAM_ID,
+        live_frame.frame_id,
+        live_frame,
+        (state,),
+    )
+
+    assert live.room_proposals[0].after.last_timeline_event_id is None
+    initial_frame = _sliding_timeline_frame(
+        ("$anchor", "$seen", "$new"),
+        initial=True,
+    )
+
+    reopened = reduce_staged_frame(
+        STREAM_ID,
+        initial_frame.frame_id,
+        initial_frame,
+        (live.room_proposals[0].after,),
+    )
+
+    assert reopened.room_proposals[0].losses
+    assert [
+        descriptor.provenance
+        for descriptor in reopened.descriptors
+        if descriptor.kind is RecordKind.TIMELINE
+    ] == [TimelineEventProvenance.HISTORY] * 3
 
 
 @pytest.mark.parametrize("flag", ["initial", "expanded_timeline"])

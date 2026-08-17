@@ -147,6 +147,24 @@ def test_aggregate_codec_round_trips_only_successful_membership_baseline() -> No
     plaintext = _canonical_room_aggregate_plaintext(value)
     assert _room_aggregate_value_from_plaintext(ROOM_ID, 9, None, plaintext) == value
 
+    anchored = replace(
+        value,
+        continuity=replace(
+            value.continuity,
+            last_timeline_event_id="$last-seen",
+        ),
+    )
+    anchored_plaintext = _canonical_room_aggregate_plaintext(anchored)
+    assert (
+        _room_aggregate_value_from_plaintext(
+            ROOM_ID,
+            9,
+            None,
+            anchored_plaintext,
+        )
+        == anchored
+    )
+
     gap = RecoveryGap(uuid4(), ROOM_ID, 0, pending.intent.origin, "a", "b")
     with pytest.raises(ValueError):
         _canonical_room_aggregate_plaintext(

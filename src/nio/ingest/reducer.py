@@ -114,6 +114,7 @@ class RoomContinuity(_ValidatedValue):
     baseline: MembershipBaseline | None
     gap: RecoveryGap | None
     hydration_id: UUID | None
+    last_timeline_event_id: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -219,11 +220,83 @@ def _loss(
     )
 
 
+def _timeline_event_ids(segment: RoomSegment) -> tuple[str | None, ...]:
+    event_ids: list[str | None] = []
+    for payload in segment.timeline_json:
+        try:
+            event = load_json(payload, "timeline event")
+            if type(event) is not dict or canonical_json(event) != payload:
+                raise ValueError("timeline event is not a canonical object")
+        except (TypeError, ValueError) as error:
+            raise ReducerInputError("invalid canonical timeline event") from error
+        event_id = event.get("event_id")
+        event_ids.append(event_id if type(event_id) is str and event_id else None)
+    return tuple(event_ids)
+
+
+def _restart_recovery_start(
+    frame: SyncFrame,
+    segment: RoomSegment,
+    before: RoomContinuity | None,
+    event_ids: tuple[str | None, ...],
+) -> int | None:
+    if (
+        before is None
+        or before.last_timeline_event_id is None
+        or before.gap is not None
+        or before.hydration_id is not None
+        or not _has_trusted_baseline(before, segment)
+        or frame.origin.transport is not TransportKind.SLIDING
+        or frame.origin.source_epoch == 0
+        or not segment.initial
+        or segment.expanded_timeline
+    ):
+        return None
+    matches = tuple(
+        index
+        for index, event_id in enumerate(event_ids)
+        if event_id == before.last_timeline_event_id
+    )
+    return matches[0] + 1 if len(matches) == 1 else None
+
+
+def _timeline_provenance(
+    index: int,
+    history_count: int,
+    recovery_start: int | None,
+) -> TimelineEventProvenance:
+    if index >= history_count:
+        return TimelineEventProvenance.LIVE
+    if recovery_start is not None and index >= recovery_start:
+        return TimelineEventProvenance.RECOVERED
+    return TimelineEventProvenance.HISTORY
+
+
+def _next_timeline_event_id(
+    before: RoomContinuity | None,
+    after: RoomContinuity,
+    segment: RoomSegment,
+    event_ids: tuple[str | None, ...],
+) -> str | None:
+    previous = (
+        before.last_timeline_event_id
+        if before is not None
+        and (before.membership_epoch, before.membership)
+        == (after.membership_epoch, after.membership)
+        else None
+    )
+    if not event_ids or (segment.expanded_timeline and not segment.live_event_count):
+        return previous
+    return event_ids[-1]
+
+
 def _plan_room(
     stream_id: UUID,
     frame: SyncFrame,
     segment: RoomSegment,
     before: RoomContinuity | None,
+    *,
+    verified_restart_boundary: bool = False,
 ) -> tuple[RoomProposal, DescriptorRoute]:
     claim = _membership(segment)
     if before is None:
@@ -337,7 +410,7 @@ def _plan_room(
                 event_id,
                 segment.timeline_prev_batch or before.baseline.window_token,
             )
-            if segment.history_discontinuity:
+            if segment.history_discontinuity and not verified_restart_boundary:
                 bounds = _continuity_bounds(
                     frame, segment, before.baseline.window_token
                 )
@@ -454,13 +527,44 @@ def reduce_staged_frame(
         raise ReducerInputError("rooms must have unique room IDs")
     states = {room.room_id: room for room in rooms}
     plans: dict[str, tuple[RoomProposal, DescriptorRoute]] = {}
+    recovery_start_by_room: dict[str, int | None] = {}
     descriptors: list[RecordDescriptor] = []
     encrypted_timeline = False
 
     for segment in frame.room_segments:
-        plan = _plan_room(stream_id, frame, segment, states.get(segment.room_id))
+        before = states.get(segment.room_id)
+        event_ids = _timeline_event_ids(segment)
+        recovery_start = _restart_recovery_start(
+            frame,
+            segment,
+            before,
+            event_ids,
+        )
+        plan = _plan_room(
+            stream_id,
+            frame,
+            segment,
+            before,
+            verified_restart_boundary=recovery_start is not None,
+        )
+        plan = (
+            replace(
+                plan[0],
+                after=replace(
+                    plan[0].after,
+                    last_timeline_event_id=_next_timeline_event_id(
+                        before,
+                        plan[0].after,
+                        segment,
+                        event_ids,
+                    ),
+                ),
+            ),
+            plan[1],
+        )
         plans[segment.room_id] = plan
         states[segment.room_id] = plan[0].after
+        recovery_start_by_room[segment.room_id] = recovery_start
 
     def append(
         kind: RecordKind,
@@ -509,9 +613,11 @@ def reduce_staged_frame(
                 segment.room_id,
                 payload,
                 (
-                    TimelineEventProvenance.HISTORY
-                    if index < history_count
-                    else TimelineEventProvenance.LIVE
+                    _timeline_provenance(
+                        index,
+                        history_count,
+                        recovery_start_by_room[segment.room_id],
+                    )
                 ),
             )
         for payload in segment.room_account_data_json:
@@ -1245,6 +1351,35 @@ def reduce_prepared_frame(
         raise ReducerInputError("prepared transition has no source room segment")
 
     prior = {room.room_id: room for room in rooms}
+    event_ids_by_room = {
+        segment.room_id: _timeline_event_ids(segment) for segment in frame.room_segments
+    }
+    recovery_start_by_room = {
+        segment.room_id: _restart_recovery_start(
+            frame,
+            segment,
+            prior.get(segment.room_id),
+            event_ids_by_room[segment.room_id],
+        )
+        for segment in frame.room_segments
+    }
+    section_position_by_room = dict(section_boundaries)
+    timeline_provenance_at: dict[int, TimelineEventProvenance] = {}
+    for segment in frame.room_segments:
+        timeline_start = section_position_by_room[segment.room_id] + len(
+            segment.state_json
+        )
+        history_count = len(segment.timeline_json) - segment.live_event_count
+        for index in range(len(segment.timeline_json)):
+            timeline_provenance_at[timeline_start + index] = _timeline_provenance(
+                index,
+                history_count,
+                recovery_start_by_room[segment.room_id],
+            )
+    timeline_provenance_by_record_id = {
+        prepared.records[position].record_id: provenance
+        for position, provenance in timeline_provenance_at.items()
+    }
     room_transitions: dict[str, list[_PreparedMembershipTransition]] = defaultdict(list)
     for transition in prepared.membership_transitions:
         room_transitions[transition.room_id].append(transition)
@@ -1267,7 +1402,15 @@ def reduce_prepared_frame(
                 raise ReducerInputError(
                     "source membership change has no prepared transition"
                 )
-            result, route = _plan_room(stream_id, frame, segment, before)
+            result, route = _plan_room(
+                stream_id,
+                frame,
+                segment,
+                before,
+                verified_restart_boundary=(
+                    recovery_start_by_room[segment.room_id] is not None
+                ),
+            )
             if result.recovery is not None:
                 gap = result.recovery
                 if (
@@ -1298,6 +1441,18 @@ def reduce_prepared_frame(
                     release=RecoveryRelease.LOSS_THEN_HELD,
                 )
                 route = DescriptorRoute.RELEASE_AFTER_LOSS
+            result = replace(
+                result,
+                after=replace(
+                    result.after,
+                    last_timeline_event_id=_next_timeline_event_id(
+                        before,
+                        result.after,
+                        segment,
+                        event_ids_by_room[segment.room_id],
+                    ),
+                ),
+            )
             room_results[segment.room_id] = result
             delegated_routes[segment.room_id] = route
             states[segment.room_id] = (
@@ -1365,7 +1520,6 @@ def reduce_prepared_frame(
         )
 
     recovery_by_room: dict[str, PreparedRecoveryStep] = {}
-    section_position_by_room = dict(section_boundaries)
     for room_id, result in room_results.items():
         if not result.losses:
             continue
@@ -1424,6 +1578,14 @@ def reduce_prepared_frame(
             if type(action) is not _PreparedMembershipTransition:
                 raise ReducerInputError("prepared linear action is invalid")
             transition_action: _PreparedMembershipTransition = action
+            if transition_action.source_record_id is not None:
+                desired_provenance = timeline_provenance_by_record_id.get(
+                    transition_action.source_record_id
+                )
+                if transition_action.timeline_provenance is not desired_provenance:
+                    transition_action = transition_action._replace(
+                        timeline_provenance=desired_provenance
+                    )
             epoch, membership = states[transition_action.room_id]
             if (
                 transition_action.previous_epoch,
@@ -1482,6 +1644,10 @@ def reduce_prepared_frame(
         if position == len(prepared.records):
             continue
         record = prepared.records[position]
+        if (
+            provenance := timeline_provenance_at.get(position)
+        ) is not None and record.provenance is not provenance:
+            record = record._replace(provenance=provenance)
         if record.room_id is None:
             linear_steps.append(PreparedRecordStep(record, DescriptorRoute.READY, None))
             continue
@@ -1513,6 +1679,15 @@ def reduce_prepared_frame(
                 None,
                 final_hydration_id,
             )
+            after = replace(
+                after,
+                last_timeline_event_id=_next_timeline_event_id(
+                    before,
+                    after,
+                    segment,
+                    event_ids_by_room[segment.room_id],
+                ),
+            )
             room_results[segment.room_id] = RoomProposal(
                 None,
                 after,
@@ -1535,6 +1710,15 @@ def reduce_prepared_frame(
                 None,
                 None,
                 None,
+            )
+            after = replace(
+                after,
+                last_timeline_event_id=_next_timeline_event_id(
+                    before,
+                    after,
+                    segment,
+                    event_ids_by_room[segment.room_id],
+                ),
             )
             room_results[segment.room_id] = RoomProposal(
                 before,

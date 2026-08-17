@@ -252,22 +252,25 @@ def _canonical_room_aggregate_plaintext(value: RoomAggregateValue) -> bytes:
         raise ValueError("unsupported Aggregate baseline")
     if baseline is not None and hydration is not None:
         raise ValueError("baseline and pending hydration are mutually exclusive")
+    continuity_payload: dict[str, object] = {
+        "baseline": (
+            {
+                "membership_event_id": baseline.membership_event_id,
+                "window_token": baseline.window_token,
+            }
+            if baseline is not None
+            else None
+        ),
+        "gap": None,
+        "hydration_id": str(hydration.hydration_id) if hydration else None,
+        "membership": continuity.membership,
+        "membership_epoch": continuity.membership_epoch,
+        "room_id": continuity.room_id,
+    }
+    if continuity.last_timeline_event_id is not None:
+        continuity_payload["last_timeline_event_id"] = continuity.last_timeline_event_id
     payload: dict[str, object] = {
-        "continuity": {
-            "baseline": (
-                {
-                    "membership_event_id": baseline.membership_event_id,
-                    "window_token": baseline.window_token,
-                }
-                if baseline is not None
-                else None
-            ),
-            "gap": None,
-            "hydration_id": str(hydration.hydration_id) if hydration else None,
-            "membership": continuity.membership,
-            "membership_epoch": continuity.membership_epoch,
-            "room_id": continuity.room_id,
-        },
+        "continuity": continuity_payload,
         "next_room_sequence": value.next_room_sequence,
         "pending_hydration": (
             {
@@ -347,6 +350,19 @@ def _room_aggregate_value_from_plaintext(
         ):
             raise ValueError("Aggregate fields are not canonical")
         continuity = cast("dict[str, object]", aggregate["continuity"])
+        legacy_continuity_fields = {
+            "baseline",
+            "gap",
+            "hydration_id",
+            "membership",
+            "membership_epoch",
+            "room_id",
+        }
+        if set(continuity) not in (
+            legacy_continuity_fields,
+            legacy_continuity_fields | {"last_timeline_event_id"},
+        ):
+            raise ValueError("Aggregate continuity fields are invalid")
         if continuity["gap"] is not None:
             raise ValueError("Aggregate gap must be null")
         baseline_value = continuity["baseline"]
@@ -375,6 +391,7 @@ def _room_aggregate_value_from_plaintext(
             baseline,
             None,
             hydration_id,
+            cast("str | None", continuity.get("last_timeline_event_id")),
         )
 
         pending_value = aggregate["pending_hydration"]

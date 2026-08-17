@@ -1376,6 +1376,80 @@ def _prepared_planner_fixture(
     )
 
 
+def _prepared_sliding_timeline_case(
+    event_ids: tuple[str | None, ...],
+    *,
+    initial: bool,
+    live_event_count: int,
+) -> _PreparedPlannerFixture:
+    timeline = tuple(
+        _prepared_event("m.room.message", event_id=event_id) for event_id in event_ids
+    )
+    segment = _prepared_segment(
+        _prepared_observation("join", "join", "$member"),
+        section=RoomSection.JOIN,
+        timeline=timeline,
+        live_event_count=live_event_count,
+    )
+    if initial:
+        segment = replace(
+            segment,
+            initial=True,
+            membership_observation=replace(
+                segment.membership_observation,
+                is_initial=True,
+            ),
+        )
+    frame = replace(
+        _prepared_frame(room_segments=(segment,)),
+        origin=RecordOrigin(
+            TransportKind.SLIDING,
+            1 if initial else 0,
+            0 if initial else 1,
+            0,
+        ),
+        request_cursor_json=b"{}",
+        candidate_cursor_json=b"{}",
+    )
+    records = tuple(
+        _prepared_record(
+            index,
+            RecordKind.TIMELINE,
+            source_json,
+            event_type="m.room.message",
+            room=True,
+            event_id=event_id,
+            provenance=(
+                TimelineEventProvenance.HISTORY
+                if initial
+                else TimelineEventProvenance.LIVE
+            ),
+            route=_CallbackRoute.EVENT,
+        )._replace(origin=replace(frame.origin, frame_index=index))
+        for index, (event_id, source_json) in enumerate(
+            zip(event_ids, timeline, strict=True)
+        )
+    )
+    aggregate = _prepared_aggregate(
+        epoch=3,
+        membership="join",
+        next_sequence=4,
+        baseline=MembershipBaseline("$member", "room-old"),
+    )
+    aggregate = replace(
+        aggregate,
+        continuity=replace(
+            aggregate.continuity,
+            last_timeline_event_id="$anchor",
+        ),
+    )
+    return _PreparedPlannerFixture(
+        frame,
+        _prepared_payload(frame, records)._replace(compatibility_token=None),
+        aggregate,
+    )
+
+
 def test_prepared_reduction_preserves_linear_transition_order_and_epochs() -> None:
     case = _prepared_planner_fixture()
 
@@ -1410,7 +1484,13 @@ def test_prepared_reduction_preserves_linear_transition_order_and_epochs() -> No
         ("PreparedRecordStep", _PREPARED_RECORD_IDS[8], None),
     ]
     assert reduction.room_results[0].after == RoomContinuity(
-        _PREPARED_ROOM_ID, 7, "ban", None, None, None
+        _PREPARED_ROOM_ID,
+        7,
+        "ban",
+        None,
+        None,
+        None,
+        last_timeline_event_id="$ban",
     )
 
 
@@ -1517,7 +1597,15 @@ def test_prepared_reduction_consumes_first_seen_hydration_on_departure() -> None
     assert reduction.room_results == (
         RoomProposal(
             None,
-            RoomContinuity(_PREPARED_ROOM_ID, 1, "leave", None, None, None),
+            RoomContinuity(
+                _PREPARED_ROOM_ID,
+                1,
+                "leave",
+                None,
+                None,
+                None,
+                last_timeline_event_id="$leave",
+            ),
             None,
             None,
             None,
@@ -2947,7 +3035,15 @@ def test_prepared_plan_preserves_all_task4c_record_ids_metadata_and_transition_o
         )
     assert plan.room_values == (
         RoomAggregateValue(
-            RoomContinuity(_PREPARED_ROOM_ID, 7, "ban", None, None, None),
+            RoomContinuity(
+                _PREPARED_ROOM_ID,
+                7,
+                "ban",
+                None,
+                None,
+                None,
+                last_timeline_event_id="$ban",
+            ),
             17,
             3,
             None,
@@ -3628,7 +3724,15 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
         if value.continuity.room_id == _PREPARED_ROOM_ID
     )
     assert primary_value == RoomAggregateValue(
-        RoomContinuity(_PREPARED_ROOM_ID, 7, "ban", None, None, None),
+        RoomContinuity(
+            _PREPARED_ROOM_ID,
+            7,
+            "ban",
+            None,
+            None,
+            None,
+            last_timeline_event_id="$ban",
+        ),
         case.aggregate.next_room_sequence + 4,
         3,
         None,
@@ -4031,6 +4135,53 @@ def test_prepared_new_gap_is_lost_and_released_without_persisting_gap() -> None:
         event_item.value.membership_epoch,
         event_item.value.room_sequence,
     ) == (record.record_id, 3, 4)
+
+
+def test_prepared_reopened_initial_window_materializes_exact_recovered_suffix() -> None:
+    case = _prepared_sliding_timeline_case(
+        ("$old", "$anchor", "$recovered-1", "$recovered-2"),
+        initial=True,
+        live_event_count=0,
+    )
+
+    plan = _plan_prepared(case)
+
+    assert plan is not None
+    assert not any(type(item.value) is LossRecord for item in plan.work_inserts)
+    assert [
+        item.value.provenance
+        for item in plan.work_inserts
+        if type(item.value) is EventRecord
+    ] == [
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.HISTORY,
+        TimelineEventProvenance.RECOVERED,
+        TimelineEventProvenance.RECOVERED,
+    ]
+    assert plan.room_values == (
+        replace(
+            case.aggregate,
+            continuity=replace(
+                case.aggregate.continuity,
+                last_timeline_event_id="$recovered-2",
+            ),
+            next_room_sequence=8,
+            updated_revision=3,
+        ),
+    )
+
+
+def test_prepared_unanchorable_live_tail_clears_timeline_boundary() -> None:
+    case = _prepared_sliding_timeline_case(
+        ("$seen", None),
+        initial=False,
+        live_event_count=2,
+    )
+
+    plan = _plan_prepared(case)
+
+    assert plan is not None
+    assert plan.room_values[0].continuity.last_timeline_event_id is None
 
 
 def test_prepared_empty_gap_barrier_precedes_later_accountwide_work() -> None:
