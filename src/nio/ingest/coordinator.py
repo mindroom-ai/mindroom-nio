@@ -569,6 +569,8 @@ class IngestionSession:
         self._close_task: asyncio.Task[None] | None = None
         self._running: asyncio.Task[None] | None = None
         self._terminal: BaseException | None = None
+        self._source_commit_generation = 0
+        self._quiesce_source_commit_target: int | None = None
 
     def next_batch(
         self,
@@ -630,6 +632,32 @@ class IngestionSession:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._cleanup())
         await asyncio.shield(self._close_task)
+
+    async def _quiesce(self) -> None:
+        """Commit and drain one final source response before clean shutdown."""
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None:
+            raise LocalProtocolError("ingestion session is closed")
+        if self._terminal is not None:
+            raise self._terminal
+        if (
+            self._quiesce_source_commit_target is not None
+            and self._source_commit_generation >= self._quiesce_source_commit_target
+        ):
+            return
+        if not self._journal.load_source().active:
+            return
+        running = self._running
+        if running is None:
+            raise LocalProtocolError("ingestion source is not running")
+        if running is asyncio.current_task():
+            raise LocalProtocolError("ingestion runner cannot quiesce itself")
+        if self._quiesce_source_commit_target is None:
+            self._quiesce_source_commit_target = self._source_commit_generation + 1
+            self._signal_progress()
+        await asyncio.shield(running)
+        if self._source_commit_generation < self._quiesce_source_commit_target:
+            raise LocalProtocolError("ingestion source stopped before quiescing")
 
     async def _cleanup(self) -> None:
         if self._running is not None:
@@ -709,6 +737,11 @@ class IngestionSession:
             # fmt: on
             if await self._advance_local_membership_intent():
                 continue
+            if (
+                self._quiesce_source_commit_target is not None
+                and self._source_commit_generation >= self._quiesce_source_commit_target
+            ):
+                return
             prior = self._journal.load_source()
             decision = plan_source_poll(
                 self._source,
@@ -761,6 +794,7 @@ class IngestionSession:
                 prior.active,
             )
             self._journal.stage_source_response(source=successor, frame=frame)
+            self._source_commit_generation += 1
 
     @staticmethod
     def _network_result(
@@ -995,6 +1029,8 @@ class _OwnedIngestionSession(IngestionSession):
         self._close_task: asyncio.Task[None] | None = None
         self._running: asyncio.Task[None] | None = None
         self._terminal: BaseException | None = None
+        self._source_commit_generation = 0
+        self._quiesce_source_commit_target: int | None = None
         self._settlement_lock = asyncio.Lock()
         self._settlement_task: asyncio.Task[object] | None = None
         self._local_membership_command: _LocalMembershipCommand | None = None

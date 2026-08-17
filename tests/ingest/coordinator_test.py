@@ -176,6 +176,60 @@ class SecondRequestHoldingClient(RecordingClient):
         raise AssertionError("unreachable")
 
 
+class QuiesceBarrierClient(RecordingClient):
+    def __init__(self, response: FakeResponse) -> None:
+        super().__init__()
+        self.response = response
+        self.first_request_entered = asyncio.Event()
+        self.release_first_request = asyncio.Event()
+
+    async def send(self, *args: object, **kwargs: object) -> FakeResponse:
+        self.send_count += 1
+        self.send_calls.append((args, kwargs))
+        if self.send_count != 1:
+            raise AssertionError("quiesced ingestion issued another source request")
+        self.first_request_entered.set()
+        await self.release_first_request.wait()
+        return self.response
+
+
+class QuiesceResetBarrierClient(RecordingClient):
+    def __init__(self, event_source: dict[str, object]) -> None:
+        super().__init__()
+        self.event_source = event_source
+        self.first_request_entered = asyncio.Event()
+        self.release_first_request = asyncio.Event()
+        self.second_request_entered = asyncio.Event()
+
+    async def send(self, *args: object, **kwargs: object) -> FakeResponse:
+        self.send_count += 1
+        self.send_calls.append((args, kwargs))
+        if self.send_count == 1:
+            self.first_request_entered.set()
+            await self.release_first_request.wait()
+            return FakeResponse(400, b'{"errcode":"M_UNKNOWN_POS"}')
+        if self.send_count != 2:
+            raise AssertionError("quiesced ingestion issued another source request")
+        request_body = args[2]
+        assert type(request_body) is bytes
+        self.second_request_entered.set()
+        return FakeResponse(
+            200,
+            canonical_json(
+                {
+                    "extensions": {
+                        "account_data": {"global": [self.event_source], "rooms": {}},
+                        "to_device": {"events": [], "next_batch": "td-after-reset"},
+                    },
+                    "lists": {RESERVED_ALL_ROOMS_LIST: {"count": 0}},
+                    "pos": "after-reset",
+                    "rooms": {},
+                    "txn_id": json.loads(request_body)["txn_id"],
+                }
+            ),
+        )
+
+
 class FailingContent:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error or ClientConnectionError()
@@ -12305,6 +12359,195 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
         await asyncio.gather(run_task, return_exceptions=True)
         await client.close()
     assert client.second_request_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_commits_one_final_source_response_and_drains_its_work(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    event_source = {
+        "content": {"value": "shutdown-barrier"},
+        "type": "org.example.shutdown-barrier",
+    }
+    response = FakeResponse(
+        200,
+        canonical_json(
+            {
+                "account_data": {"events": [event_source]},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {},
+                "device_unused_fallback_key_types": [],
+                "next_batch": "shutdown-barrier",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": []},
+            }
+        ),
+    )
+    client = owned_client(tmp_path, client_type=lambda: QuiesceBarrierClient(response))
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    source_before = session._journal.load_source()
+    runner = asyncio.create_task(session.run())
+    pump: asyncio.Task[None] | None = None
+    quiesce: asyncio.Task[None] | None = None
+
+    async def settle_final_response() -> None:
+        batch = session.next_batch(max_records=1)
+        while batch is None:
+            await session._wait_for_work()
+            batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+        assert record.source_json == canonical_json(event_source)
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+    try:
+        await asyncio.wait_for(client.first_request_entered.wait(), timeout=2)
+        pump = asyncio.create_task(settle_final_response())
+        quiesce = asyncio.create_task(session._quiesce())
+        client.release_first_request.set()
+        await asyncio.wait_for(pump, timeout=2)
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+        await session._quiesce()
+
+        source_after = session._journal.load_source()
+        assert source_after.next_request_id == source_before.next_request_id + 1
+        assert session._journal.list_frames(1) == ()
+        assert session.next_batch(max_records=1) is None
+        assert client.send_count == 1
+    finally:
+        client.release_first_request.set()
+        for task in (quiesce, pump, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, pump, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_rejects_active_source_without_a_runner(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+
+    try:
+        with pytest.raises(LocalProtocolError, match="source is not running"):
+            await session._quiesce()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_surfaces_the_runner_terminal_error(tmp_path) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(200, b"{}"))
+    session = open_owned_session(client, bootstrap, generation)
+
+    try:
+        with pytest.raises(nio.IngestionSourceError) as runner_failure:
+            await session.run()
+        with pytest.raises(nio.IngestionSourceError) as quiesce_failure:
+            await session._quiesce()
+        assert quiesce_failure.value is runner_failure.value
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_requires_a_frame_commit_after_sliding_reset(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    config = sliding_config()
+    bootstrap, _account = open_owned_bootstrap(
+        tmp_path,
+        generation,
+        source=config.source,
+    )
+    stage_sliding_position(bootstrap)
+    assert (
+        bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    event_source = {
+        "content": {"value": "after-reset"},
+        "type": "org.example.after-reset",
+    }
+    client = owned_client(
+        tmp_path,
+        client_type=lambda: QuiesceResetBarrierClient(event_source),
+    )
+    session = open_owned_session(client, bootstrap, generation, config=config)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    source_before = session._journal.load_source()
+    runner = asyncio.create_task(session.run())
+    pump: asyncio.Task[None] | None = None
+    quiesce: asyncio.Task[None] | None = None
+
+    async def settle_final_response() -> None:
+        batch = session.next_batch(max_records=1)
+        while batch is None:
+            await session._wait_for_work()
+            batch = session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+        assert record.source_json == canonical_json(event_source)
+        await session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+
+    try:
+        await asyncio.wait_for(client.first_request_entered.wait(), timeout=2)
+        pump = asyncio.create_task(settle_final_response())
+        quiesce = asyncio.create_task(session._quiesce())
+        client.release_first_request.set()
+        await asyncio.wait_for(client.second_request_entered.wait(), timeout=2)
+        await asyncio.wait_for(pump, timeout=2)
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+
+        source_after = session._journal.load_source()
+        assert source_after.source_epoch == source_before.source_epoch + 1
+        assert source_after.next_request_id == 1
+        assert session._journal.list_frames(1) == ()
+        assert session.next_batch(max_records=1) is None
+        assert client.send_count == 2
+    finally:
+        client.release_first_request.set()
+        for task in (quiesce, pump, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, pump, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
 
 
 @pytest.mark.asyncio
