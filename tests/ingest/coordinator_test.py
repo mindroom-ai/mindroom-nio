@@ -193,6 +193,30 @@ class QuiesceBarrierClient(RecordingClient):
         return self.response
 
 
+class TimedIdleQuiesceClient(RecordingClient):
+    def __init__(self, response: FakeResponse, *, server_wait_seconds: float) -> None:
+        super().__init__()
+        self.response = response
+        self.server_wait_seconds = server_wait_seconds
+        self.first_request_entered = asyncio.Event()
+        self.deadline_expired = asyncio.Event()
+
+    async def send(self, *args: object, **kwargs: object) -> FakeResponse:
+        self.send_count += 1
+        self.send_calls.append((args, kwargs))
+        self.first_request_entered.set()
+        timeout_seconds = args[5]
+        assert type(timeout_seconds) is float
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.sleep(self.server_wait_seconds)
+                await asyncio.sleep(self.server_wait_seconds)
+        except TimeoutError:
+            self.deadline_expired.set()
+            raise
+        return self.response
+
+
 class QuiesceResetBarrierClient(RecordingClient):
     def __init__(self, event_source: dict[str, object]) -> None:
         super().__init__()
@@ -3273,7 +3297,7 @@ async def test_owned_local_membership_http_uses_only_bearer_authentication(
             None,
             {"Authorization": "Bearer secret-token"},
             None,
-            30,
+            45.0,
             {},
         )
         assert "access_token" not in path
@@ -12294,7 +12318,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
                     None,
                     {"Authorization": "Bearer secret-token"},
                     None,
-                    30.0,
+                    45.0,
                 ),
                 {},
             )
@@ -12336,7 +12360,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
                 None,
                 {"Authorization": "Bearer secret-token"},
                 None,
-                30.0,
+                45.0,
             ),
             {},
         )
@@ -12347,7 +12371,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
                 None,
                 {"Authorization": "Bearer secret-token"},
                 None,
-                30.0,
+                45.0,
             ),
             {},
         )
@@ -12450,6 +12474,88 @@ async def test_owned_quiesce_commits_one_final_source_response_for_restart_recov
         assert restored_session.next_batch(max_records=1) is None
     finally:
         await restored_session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_allows_idle_poll_response_delivery_margin(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    source = ClassicSourceConfig(10, b"{}")
+    config = IngestionConfig(source)
+    bootstrap, _account = open_owned_bootstrap(
+        tmp_path,
+        generation,
+        source=source,
+    )
+    response = FakeResponse(200, b'{"next_batch":"idle","rooms":{}}')
+    client = owned_client(
+        tmp_path,
+        client_type=lambda: TimedIdleQuiesceClient(
+            response,
+            server_wait_seconds=0.01,
+        ),
+    )
+    session = open_owned_session(
+        client,
+        bootstrap,
+        generation,
+        config=config,
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+
+    try:
+        await asyncio.wait_for(client.first_request_entered.wait(), timeout=1)
+        quiesce = asyncio.create_task(session._quiesce())
+        await asyncio.wait_for(quiesce, timeout=1)
+        await asyncio.wait_for(runner, timeout=1)
+
+        assert not client.deadline_expired.is_set()
+        assert client.send_count == 1
+        assert client.send_calls[0][0][5] == 15.01
+        assert len(session._journal.list_frames(1)) == 1
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_source_timeout_preserves_unbounded_transport_deadline(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    source = ClassicSourceConfig(0, b"{}")
+    bootstrap, _account = open_owned_bootstrap(
+        tmp_path,
+        generation,
+        source=source,
+    )
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(401, b"{}"))
+    session = open_owned_session(
+        client,
+        bootstrap,
+        generation,
+        config=IngestionConfig(source),
+    )
+
+    try:
+        with pytest.raises(nio.IngestionSourceError):
+            await session.run()
+        assert client.send_calls[0][0][5] == 0
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -12626,7 +12732,7 @@ async def test_raw_attempt_uses_public_send_without_callbacks_and_bounds_read(
                     "X-Diagnostic": "yes",
                 },
                 "trace_request_ctx": None,
-                "timeout": 30.0,
+                "timeout": 45.0,
             },
         )
     ]
@@ -13638,7 +13744,7 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
         "https://example.org" + planned.path + "?timeout=30000",
     )
     assert kwargs["data"] == planned.body
-    assert kwargs["timeout"] == 30.0
+    assert kwargs["timeout"] == 45.0
     client.client_session = None
     await session.close()
 

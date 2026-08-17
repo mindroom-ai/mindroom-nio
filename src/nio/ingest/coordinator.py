@@ -98,6 +98,8 @@ __all__ = (
     "open_ingestion",
 )
 
+_TRANSPORT_RESPONSE_MARGIN_SECONDS = 15.0
+
 
 class IngestionError(LocalProtocolError):
     pass
@@ -833,7 +835,12 @@ class IngestionSession:
                 request.body,
                 {"Authorization": f"Bearer {self._client.access_token}"},
                 None,
-                request.timeout_ms / 1000,
+                (
+                    request.timeout_ms / 1000
+                    + _TRANSPORT_RESPONSE_MARGIN_SECONDS
+                    if request.timeout_ms
+                    else 0
+                ),
             )
             try:
                 remaining = ports.MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES + 1
