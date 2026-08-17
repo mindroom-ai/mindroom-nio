@@ -634,7 +634,7 @@ class IngestionSession:
         await asyncio.shield(self._close_task)
 
     async def _quiesce(self) -> None:
-        """Commit and drain one final source response before clean shutdown."""
+        """Commit one final source response before clean shutdown."""
         self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
             raise LocalProtocolError("ingestion session is closed")
@@ -795,6 +795,11 @@ class IngestionSession:
             )
             self._journal.stage_source_response(source=successor, frame=frame)
             self._source_commit_generation += 1
+            if (
+                self._quiesce_source_commit_target is not None
+                and self._source_commit_generation >= self._quiesce_source_commit_target
+            ):
+                return
 
     @staticmethod
     def _network_result(

@@ -12362,7 +12362,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_owned_quiesce_commits_one_final_source_response_and_drains_its_work(
+async def test_owned_quiesce_commits_one_final_source_response_for_restart_recovery(
     tmp_path,
 ) -> None:
     generation = uuid4()
@@ -12394,50 +12394,62 @@ async def test_owned_quiesce_commits_one_final_source_response_and_drains_its_wo
     client.olm.save_account()
     source_before = session._journal.load_source()
     runner = asyncio.create_task(session.run())
-    pump: asyncio.Task[None] | None = None
     quiesce: asyncio.Task[None] | None = None
-
-    async def settle_final_response() -> None:
-        batch = session.next_batch(max_records=1)
-        while batch is None:
-            await session._wait_for_work()
-            batch = session.next_batch(max_records=1)
-        assert batch is not None and len(batch.records) == 1
-        record = batch.records[0]
-        assert type(record) is EventRecord
-        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
-        assert record.source_json == canonical_json(event_source)
-        await session._settle_batch(
-            batch,
-            receipt_new=True,
-            semantic_event_new=False,
-        )
 
     try:
         await asyncio.wait_for(client.first_request_entered.wait(), timeout=2)
-        pump = asyncio.create_task(settle_final_response())
         quiesce = asyncio.create_task(session._quiesce())
         client.release_first_request.set()
-        await asyncio.wait_for(pump, timeout=2)
         await asyncio.wait_for(quiesce, timeout=2)
         await asyncio.wait_for(runner, timeout=2)
         await session._quiesce()
 
         source_after = session._journal.load_source()
         assert source_after.next_request_id == source_before.next_request_id + 1
-        assert session._journal.list_frames(1) == ()
+        assert len(session._journal.list_frames(1)) == 1
         assert session.next_batch(max_records=1) is None
         assert client.send_count == 1
     finally:
         client.release_first_request.set()
-        for task in (quiesce, pump, runner):
+        for task in (quiesce, runner):
             if task is not None and not task.done():
                 task.cancel()
         await asyncio.gather(
-            *(task for task in (quiesce, pump, runner) if task is not None),
+            *(task for task in (quiesce, runner) if task is not None),
             return_exceptions=True,
         )
         await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(restored_client, reopened, generation)
+    assert restored_client.olm is not None
+    restored_client.olm.account.shared = True
+    restored_client.olm.uploaded_key_count = (
+        restored_client.olm.account.max_one_time_keys
+    )
+    restored_client.olm.save_account()
+    try:
+        assert (
+            restored_session._materialize_oldest_frame(
+                limits=MaterializerLimits()
+            ).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        batch = restored_session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+        assert record.source_json == canonical_json(event_source)
+        await restored_session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert restored_session.next_batch(max_records=1) is None
+    finally:
+        await restored_session.close()
 
 
 @pytest.mark.asyncio
@@ -12503,51 +12515,68 @@ async def test_owned_quiesce_requires_a_frame_commit_after_sliding_reset(
     client.olm.save_account()
     source_before = session._journal.load_source()
     runner = asyncio.create_task(session.run())
-    pump: asyncio.Task[None] | None = None
     quiesce: asyncio.Task[None] | None = None
-
-    async def settle_final_response() -> None:
-        batch = session.next_batch(max_records=1)
-        while batch is None:
-            await session._wait_for_work()
-            batch = session.next_batch(max_records=1)
-        assert batch is not None and len(batch.records) == 1
-        record = batch.records[0]
-        assert type(record) is EventRecord
-        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
-        assert record.source_json == canonical_json(event_source)
-        await session._settle_batch(
-            batch,
-            receipt_new=True,
-            semantic_event_new=False,
-        )
 
     try:
         await asyncio.wait_for(client.first_request_entered.wait(), timeout=2)
-        pump = asyncio.create_task(settle_final_response())
         quiesce = asyncio.create_task(session._quiesce())
         client.release_first_request.set()
         await asyncio.wait_for(client.second_request_entered.wait(), timeout=2)
-        await asyncio.wait_for(pump, timeout=2)
         await asyncio.wait_for(quiesce, timeout=2)
         await asyncio.wait_for(runner, timeout=2)
 
         source_after = session._journal.load_source()
         assert source_after.source_epoch == source_before.source_epoch + 1
         assert source_after.next_request_id == 1
-        assert session._journal.list_frames(1) == ()
+        assert len(session._journal.list_frames(1)) == 1
         assert session.next_batch(max_records=1) is None
         assert client.send_count == 2
     finally:
         client.release_first_request.set()
-        for task in (quiesce, pump, runner):
+        for task in (quiesce, runner):
             if task is not None and not task.done():
                 task.cancel()
         await asyncio.gather(
-            *(task for task in (quiesce, pump, runner) if task is not None),
+            *(task for task in (quiesce, runner) if task is not None),
             return_exceptions=True,
         )
         await session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation, source=config.source)
+    restored_client = owned_client(tmp_path)
+    restored_session = open_owned_session(
+        restored_client,
+        reopened,
+        generation,
+        config=config,
+    )
+    assert restored_client.olm is not None
+    restored_client.olm.account.shared = True
+    restored_client.olm.uploaded_key_count = (
+        restored_client.olm.account.max_one_time_keys
+    )
+    restored_client.olm.save_account()
+    try:
+        assert (
+            restored_session._materialize_oldest_frame(
+                limits=MaterializerLimits()
+            ).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        batch = restored_session.next_batch(max_records=1)
+        assert batch is not None and len(batch.records) == 1
+        record = batch.records[0]
+        assert type(record) is EventRecord
+        assert record.kind is RecordKind.GLOBAL_ACCOUNT_DATA
+        assert record.source_json == canonical_json(event_source)
+        await restored_session._settle_batch(
+            batch,
+            receipt_new=True,
+            semantic_event_new=False,
+        )
+        assert restored_session.next_batch(max_records=1) is None
+    finally:
+        await restored_session.close()
 
 
 @pytest.mark.asyncio
