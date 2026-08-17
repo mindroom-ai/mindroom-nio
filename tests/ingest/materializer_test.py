@@ -12313,7 +12313,7 @@ def test_materializer_bounded_queries_catch_filtered_ordered_or_partial_scan(
             assert "ORDER BY" not in upper
             assert "WHERE" not in upper
             assert upper.endswith("LIMIT ?")
-            assert parameters == (257,)
+            assert parameters == (259,)
         selected_queries = [
             item for item in frame_selects if item not in header_queries
         ]
@@ -12476,7 +12476,7 @@ def test_materializer_exact_max_frame_scan_validates_headers_without_raw_backlog
             assert "ORDER BY" not in upper
             assert "WHERE" not in upper
             assert upper.endswith("LIMIT ?")
-            assert parameters == (257,)
+            assert parameters == (259,)
         selected_queries = [
             item for item in frame_selects if item not in header_queries
         ]
@@ -12704,7 +12704,7 @@ def test_materializer_accepts_exact_24_mib_plaintext_selected_frame(
         bootstrap.close()
 
 
-def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml(
+def test_materializer_limit_258_catches_raw_set_truncation_before_payload_or_dml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12725,12 +12725,38 @@ def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml
             for sequence in range(1, 258)
         )
         assert len(frames) == 257
+        with pytest.raises(
+            JournalIntegrityError,
+            match="staged frame count exceeds the 257 frame cap",
+        ):
+            _stage_discovery_frame(
+                journal,
+                TransportKind.CLASSIC,
+                258,
+            )
+        with sqlite3.connect(tmp_path / "discovery.db") as connection:
+            connection.execute(
+                "INSERT INTO NioIngestFrame ("
+                "account_id, frame_id, source_epoch, request_id, "
+                "staged_revision, payload, payload_sha256, "
+                "drain_header_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    journal.account_id,
+                    str(uuid4()),
+                    0,
+                    258,
+                    1,
+                    b"x",
+                    bytes(32),
+                    bytes(32),
+                ),
+            )
         with journal._owner.read():
             stored_count = journal._execute(
                 "SELECT COUNT(*) FROM NioIngestFrame WHERE account_id = ?",
                 (journal.account_id,),
             ).fetchone()[0]
-        assert stored_count == 257
+        assert stored_count == 258
         owner_before = journal.load_owner()
         payload_decodes: list[tuple[str | None, UUID]] = []
         real_decode_frame_row = journal._decode_frame_row
@@ -12751,13 +12777,16 @@ def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml
             )
 
         def reject_writer(_self: object) -> object:
-            raise AssertionError("257-row discovery entered journal_write")
+            raise AssertionError("258-row discovery entered journal_write")
 
         monkeypatch.setattr(journal, "_decode_frame_row", trace_decode_frame_row)
         monkeypatch.setattr(type(journal._owner), "journal_write", reject_writer)
         statements.clear()
 
-        with pytest.raises(JournalIntegrityError):
+        with pytest.raises(
+            JournalIntegrityError,
+            match="^persisted frame drain row is invalid$",
+        ):
             _materialize(journal)
 
         assert payload_decodes == []
@@ -12768,7 +12797,7 @@ def test_materializer_limit_257_catches_raw_set_truncation_before_payload_or_dml
                     "SELECT COUNT(*) FROM NioIngestFrame WHERE account_id = ?",
                     (journal.account_id,),
                 ).fetchone()[0]
-                == 257
+                == 258
             )
         assert _materializer_dml(statements) == ()
     finally:

@@ -30,11 +30,16 @@ class IngestionJournal(Protocol):
 
     def list_frames(self, limit: int) -> tuple[StagedFrame, ...]: ...
 
+    def has_reserved_quiesce_response(self) -> bool: ...
+
+    def consume_reserved_quiesce_response(self) -> CommitResult | None: ...
+
     def stage_source_response(
         self,
         *,
         source: SourceState,
         frame: StagedFrame,
+        quiesce_reserved: bool = False,
     ) -> CommitResult: ...
 
     def materialize_oldest_frame(

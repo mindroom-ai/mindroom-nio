@@ -73,6 +73,7 @@ _FRAME_FIELDS = (
     "response_body",
     "source_sha256",
 )
+_QUIESCE_FRAME_FIELDS = (*_FRAME_FIELDS, "quiesce_reserved")
 _PREPARED_FRAME_FIELDS = (
     "prepared_version",
     "request_cursor_json",
@@ -128,10 +129,13 @@ _OUTBOUND_ROOM_KEY_CONTEXT_FIELDS = (
     "room_id",
     "algorithm",
 )
-# IngestionConfig caps the staged backlog at 256 frames. Reading one extra row
-# keeps account identity classification bounded while detecting corrupt overflow.
-_MAX_STAGED_FRAMES = 256
-_FRAME_CLASSIFICATION_LIMIT = _MAX_STAGED_FRAMES + 1
+# IngestionConfig caps ordinary staging at 256 frames. Clean shutdown may
+# reserve exactly one additional staged source response, while the oldest
+# Frame can remain prepared until its Work drains. One further row detects
+# corrupt overflow without an unbounded inventory scan.
+_MAX_DURABLE_STAGED_FRAMES = 257
+_MAX_DURABLE_FRAME_ROWS = _MAX_DURABLE_STAGED_FRAMES + 1
+_FRAME_CLASSIFICATION_LIMIT = _MAX_DURABLE_FRAME_ROWS + 1
 _MAX_WORK_PAYLOAD_BYTES = 1024 * 1024
 _MAX_HELD_WORK_COUNT = 10_000
 _MAX_HELD_WORK_CANONICAL_BYTES = 32 * 1024 * 1024
@@ -559,17 +563,34 @@ def _network_request_from_dict(value: object) -> NetworkRequest:
     return request
 
 
-def _frame_envelope(frame: StagedFrame) -> dict[str, object]:
-    return {
+def _frame_envelope(
+    frame: StagedFrame,
+    *,
+    quiesce_reserved: bool = False,
+) -> dict[str, object]:
+    if type(quiesce_reserved) is not bool:
+        raise TypeError("quiesce_reserved must be bool")
+    envelope: dict[str, object] = {
         "normalization_version": _NORMALIZATION_VERSION,
         "request": _network_request_to_dict(frame.response.request),
         "response_body": _encoded_bytes(frame.response.response_body),
         "source_sha256": _encoded_bytes(frame.response.source_sha256),
     }
+    if quiesce_reserved:
+        envelope["quiesce_reserved"] = True
+    return envelope
 
 
-def _frame_payload(frame: StagedFrame, rev: int, owner: _Owner) -> tuple[bytes, bytes]:
-    value = _canonical_internal(_frame_envelope(frame))
+def _frame_payload(
+    frame: StagedFrame,
+    rev: int,
+    owner: _Owner,
+    *,
+    quiesce_reserved: bool = False,
+) -> tuple[bytes, bytes]:
+    value = _canonical_internal(
+        _frame_envelope(frame, quiesce_reserved=quiesce_reserved)
+    )
     stored = _row(owner, "NioIngestFrame", value, header=_frame_header(frame, rev))
     if len(stored[0]) > MAX_STORED_FRAME_PAYLOAD_BYTES:
         raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
@@ -1246,9 +1267,17 @@ def _prepared_frame_payload(
     return stored
 
 
-def _frame_response_from_envelope(value: object) -> StagedSourceResponse:
-    if type(value) is not dict or tuple(value) != _FRAME_FIELDS:
+def _frame_response_from_envelope(
+    value: object,
+) -> tuple[StagedSourceResponse, bool]:
+    if type(value) is not dict or tuple(value) not in (
+        _FRAME_FIELDS,
+        _QUIESCE_FRAME_FIELDS,
+    ):
         raise ValueError("frame authenticated envelope is invalid")
+    quiesce_reserved = tuple(value) == _QUIESCE_FRAME_FIELDS
+    if quiesce_reserved and value["quiesce_reserved"] is not True:
+        raise ValueError("frame quiesce reservation is invalid")
     if type(value["normalization_version"]) is not int or (
         value["normalization_version"] != _NORMALIZATION_VERSION
     ):
@@ -1257,12 +1286,14 @@ def _frame_response_from_envelope(value: object) -> StagedSourceResponse:
     digest = _decoded_bytes(value["source_sha256"], "source digest")
     assert body is not None
     assert digest is not None
-    response = StagedSourceResponse(
-        _network_request_from_dict(value["request"]),
-        body,
-        digest,
+    return (
+        StagedSourceResponse(
+            _network_request_from_dict(value["request"]),
+            body,
+            digest,
+        ),
+        quiesce_reserved,
     )
-    return response
 
 
 def _source_header(source: SourceState) -> bytes:
@@ -1601,8 +1632,6 @@ class JournalRows:
             "FROM NioIngestFrame LIMIT ?",
             (_FRAME_CLASSIFICATION_LIMIT,),
         ).fetchall()
-        if len(rows) > _MAX_STAGED_FRAMES:
-            raise JournalIntegrityError("staged frame count exceeds the 256 frame cap")
         decoded = tuple(
             self._decode_frame_drain_row(
                 cast("Mapping[str, object]", row),
@@ -1614,6 +1643,13 @@ class JournalRows:
         )
         if len({row.frame_id for row in decoded}) != len(decoded):
             raise JournalIntegrityError("frame_id has multiple textual identities")
+        if (
+            sum(row.room_materialized_revision is None for row in decoded)
+            > _MAX_DURABLE_STAGED_FRAMES
+        ):
+            raise JournalIntegrityError("staged frame count exceeds the 257 frame cap")
+        if len(decoded) > _MAX_DURABLE_FRAME_ROWS:
+            raise JournalIntegrityError("Frame row count exceeds the 258 row cap")
         return tuple(
             sorted(
                 decoded,
@@ -2055,14 +2091,14 @@ class JournalRows:
             authenticate=authenticate,
         )
 
-    def _decode_frame_state(
+    def _decode_frame_state_with_reservation(
         self,
         frame_id: UUID,
         row: Mapping[str, object],
         owner: OwnerView,
         *,
         drain_header_authenticated: bool = False,
-    ) -> StagedFrame | _PreparedFrameState:
+    ) -> tuple[StagedFrame | _PreparedFrameState, bool]:
         try:
             drain_row = self._frame_drain_row_from_full(
                 row,
@@ -2086,10 +2122,16 @@ class JournalRows:
                 ),
             )
             value = load_internal_json(payload, "frame envelope")
-            if type(value) is dict and tuple(value) == _FRAME_FIELDS:
-                response = _frame_response_from_envelope(value)
+            if type(value) is dict and tuple(value) in (
+                _FRAME_FIELDS,
+                _QUIESCE_FRAME_FIELDS,
+            ):
+                response, quiesce_reserved = _frame_response_from_envelope(value)
                 frame = StagedFrame(frame_id, response, drain_row.staged_revision)
-                if value != _frame_envelope(frame):
+                if value != _frame_envelope(
+                    frame,
+                    quiesce_reserved=quiesce_reserved,
+                ):
                     raise ValueError("frame envelope is not canonical")
                 request = response.request
                 if (
@@ -2102,20 +2144,38 @@ class JournalRows:
                     drain_row.request_id,
                 ):
                     raise ValueError("frame columns do not match stored metadata")
-                return frame
+                return frame, quiesce_reserved
             if drain_row.room_materialized_revision is None:
                 raise ValueError("prepared frame has no materialized revision")
-            return _prepared_frame_state_from_envelope(
-                value,
-                owner=owner,
-                frame_id=frame_id,
-                source_epoch=drain_row.source_epoch,
-                request_id=drain_row.request_id,
+            return (
+                _prepared_frame_state_from_envelope(
+                    value,
+                    owner=owner,
+                    frame_id=frame_id,
+                    source_epoch=drain_row.source_epoch,
+                    request_id=drain_row.request_id,
+                ),
+                False,
             )
         except JournalIntegrityError:
             raise
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise JournalIntegrityError("persisted Frame is invalid") from error
+
+    def _decode_frame_state(
+        self,
+        frame_id: UUID,
+        row: Mapping[str, object],
+        owner: OwnerView,
+        *,
+        drain_header_authenticated: bool = False,
+    ) -> StagedFrame | _PreparedFrameState:
+        return self._decode_frame_state_with_reservation(
+            frame_id,
+            row,
+            owner,
+            drain_header_authenticated=drain_header_authenticated,
+        )[0]
 
     def _decode_frame_row(
         self,
@@ -2135,15 +2195,12 @@ class JournalRows:
             raise JournalIntegrityError("persisted Frame is not staged")
         return value
 
-    def _classify_frame_ids(self) -> frozenset[UUID]:
+    def _classify_frame_ids(self, owner: OwnerView) -> frozenset[UUID]:
         rows = self._execute(  # type: ignore[attr-defined]
             "SELECT CASE account_id WHEN ? THEN frame_id END AS frame_id "
             "FROM NioIngestFrame LIMIT ?",
             (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
         ).fetchall()
-        if len(rows) > _MAX_STAGED_FRAMES:
-            raise JournalIntegrityError("staged frame count exceeds the 256 frame cap")
-
         classified = tuple(self._parse_frame_id(row) for row in rows)
         identities = [stored_id for _, stored_id in classified]
         if len(identities) != len(set(identities)):
@@ -2151,6 +2208,10 @@ class JournalRows:
         for raw_frame_id, stored_id in classified:
             if raw_frame_id != str(stored_id):
                 raise JournalIntegrityError("persisted frame_id is not canonical")
+        if len(classified) > _MAX_DURABLE_STAGED_FRAMES:
+            headers = self._load_authenticated_frame_headers(owner)
+            if {header.frame_id for header in headers} != set(identities):
+                raise JournalIntegrityError("authenticated Frame inventory changed")
         return frozenset(identities)
 
     def _frame_row(self, frame_id: UUID) -> sqlite3.Row:
@@ -2167,7 +2228,7 @@ class JournalRows:
         frame_id: UUID,
         owner: OwnerView,
     ) -> StagedFrame | None:
-        if frame_id not in self._classify_frame_ids():
+        if frame_id not in self._classify_frame_ids(owner):
             return None
         value = self._decode_frame_state(
             frame_id,
@@ -2181,7 +2242,7 @@ class JournalRows:
         frame_id: UUID,
         owner: OwnerView,
     ) -> _PreparedFrameState | None:
-        if frame_id not in self._classify_frame_ids():
+        if frame_id not in self._classify_frame_ids(owner):
             return None
         value = self._decode_frame_state(
             frame_id,
@@ -2197,16 +2258,19 @@ class JournalRows:
             return self._load_frame_with_owner(frame_id, self.load_owner())
 
     def list_frames(self, limit: int) -> tuple[StagedFrame, ...]:
-        if type(limit) is not int or not 1 <= limit <= 256:
-            raise ValueError("frame limit must be an integer from 1 through 256")
+        if type(limit) is not int or not 1 <= limit <= 257:
+            raise ValueError("frame limit must be an integer from 1 through 257")
         with self._read():  # type: ignore[attr-defined]
             owner = self.load_owner()
-            self._classify_frame_ids()
+            frame_ids = self._classify_frame_ids(owner)
+            headers = self._load_authenticated_frame_headers(owner)
+            if frame_ids != {header.frame_id for header in headers}:
+                raise JournalIntegrityError("authenticated Frame inventory changed")
             rows = self._execute(  # type: ignore[attr-defined]
                 "SELECT * FROM NioIngestFrame WHERE account_id = ? "
                 "ORDER BY staged_revision, source_epoch, request_id, frame_id "
                 "LIMIT ?",
-                (self.account_id, _MAX_STAGED_FRAMES),
+                (self.account_id, _MAX_DURABLE_FRAME_ROWS),
             ).fetchall()
             values = tuple(
                 self._decode_frame_state(self._parse_frame_id(row)[1], row, owner)
@@ -2216,14 +2280,56 @@ class JournalRows:
                 :limit
             ]
 
+    def has_reserved_quiesce_response(self) -> bool:
+        with self._read():  # type: ignore[attr-defined]
+            owner = self.load_owner()
+            headers = self._load_authenticated_frame_headers(owner)
+            staged = tuple(
+                header
+                for header in headers
+                if header.room_materialized_revision is None
+            )
+            if not staged:
+                return False
+            selected = staged[-1]
+            selected_row = cast(
+                "Mapping[str, object]",
+                self._frame_row(selected.frame_id),
+            )
+            if (
+                self._frame_drain_row_from_full(
+                    selected_row,
+                    owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError("reserved Frame header snapshot changed")
+            value, quiesce_reserved = self._decode_frame_state_with_reservation(
+                selected.frame_id,
+                selected_row,
+                owner,
+                drain_header_authenticated=True,
+            )
+            if type(value) is not StagedFrame:
+                raise JournalIntegrityError("reserved Frame is not staged")
+            return quiesce_reserved
+
     def _write_frame(
         self,
         frame: StagedFrame,
         staged_revision: int,
         owner: OwnerView,
         payload_owner: _Owner,
+        *,
+        quiesce_reserved: bool = False,
     ) -> sqlite3.Cursor:
-        payload, digest = _frame_payload(frame, staged_revision, payload_owner)
+        payload, digest = _frame_payload(
+            frame,
+            staged_revision,
+            payload_owner,
+            quiesce_reserved=quiesce_reserved,
+        )
         request = frame.response.request
         drain_header_sha256 = _frame_drain_sha256(
             owner,

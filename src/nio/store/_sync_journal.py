@@ -64,6 +64,8 @@ from ._sync_journal_preflight import (
     open_journal_database,
 )
 from ._sync_journal_rows import (
+    _MAX_DURABLE_FRAME_ROWS,
+    _MAX_DURABLE_STAGED_FRAMES,
     _MAX_TOTAL_WORK_CANONICAL_BYTES,
     _MAX_TOTAL_WORK_COUNT,
     _MAX_WORK_PAYLOAD_BYTES,
@@ -663,20 +665,43 @@ class SqliteIngestionJournal(JournalRows):
         *,
         source: SourceState,
         frame: StagedFrame,
+        quiesce_reserved: bool = False,
     ) -> CommitResult:
+        if type(quiesce_reserved) is not bool:
+            raise TypeError("quiesce_reserved must be bool")
         proposed, frame = self._reconstruct_stage(source, frame)
-        if len(_canonical_internal(_frame_envelope(frame))) > 24 * 1024 * 1024:
+        if (
+            len(
+                _canonical_internal(
+                    _frame_envelope(
+                        frame,
+                        quiesce_reserved=quiesce_reserved,
+                    )
+                )
+            )
+            > 24 * 1024 * 1024
+        ):
             raise JournalIntegrityError("staged frame envelope exceeds 24 MiB")
         request = frame.response.request
         payload_owner = self.account_id, request.stream_id, request.transport
         try:
-            _frame_payload(frame, 2**63 - 1, payload_owner)
+            _frame_payload(
+                frame,
+                2**63 - 1,
+                payload_owner,
+                quiesce_reserved=quiesce_reserved,
+            )
         except JournalIntegrityError:
             with self._read():
                 preflight_owner = self.load_owner()
                 stored = self._load_frame_with_owner(frame.frame_id, preflight_owner)
                 if stored is None or stored.response != frame.response:
-                    _frame_payload(frame, preflight_owner.revision + 1, payload_owner)
+                    _frame_payload(
+                        frame,
+                        preflight_owner.revision + 1,
+                        payload_owner,
+                        quiesce_reserved=quiesce_reserved,
+                    )
 
         with self._transaction():
             owner, current = self._load_stage_snapshot()
@@ -690,7 +715,7 @@ class SqliteIngestionJournal(JournalRows):
                 frame,
             )
 
-            frame_ids = self._classify_frame_ids()
+            frame_ids = self._classify_frame_ids(owner)
             self._transition_hook("frame_collision_probe")
             if frame.frame_id in frame_ids:
                 stored_row = self._frame_row(frame.frame_id)
@@ -737,6 +762,19 @@ class SqliteIngestionJournal(JournalRows):
                     )
                 return CommitResult(stored_revision)
 
+            headers = self._load_authenticated_frame_headers(owner)
+            if frame_ids != {header.frame_id for header in headers}:
+                raise JournalIntegrityError("authenticated Frame inventory changed")
+            if (
+                sum(header.room_materialized_revision is None for header in headers)
+                >= _MAX_DURABLE_STAGED_FRAMES
+            ):
+                raise JournalIntegrityError(
+                    "staged frame count exceeds the 257 frame cap"
+                )
+            if len(headers) >= _MAX_DURABLE_FRAME_ROWS:
+                raise JournalIntegrityError("Frame row count exceeds the 258 row cap")
+
             inventory = self._load_task3_work_inventory(owner)
             if any(
                 item.frame_id == frame.frame_id
@@ -756,7 +794,12 @@ class SqliteIngestionJournal(JournalRows):
                 )
 
             new_revision = read_revision + 1
-            _frame_payload(frame, new_revision, payload_owner)
+            _frame_payload(
+                frame,
+                new_revision,
+                payload_owner,
+                quiesce_reserved=quiesce_reserved,
+            )
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
                 "UPDATE NioIngestMeta SET revision = ? "
@@ -774,10 +817,119 @@ class SqliteIngestionJournal(JournalRows):
             self._write_source(proposed, owner)
             self._transition_hook("source_state_upsert")
             try:
-                self._write_frame(frame, new_revision, owner, payload_owner)
+                self._write_frame(
+                    frame,
+                    new_revision,
+                    owner,
+                    payload_owner,
+                    quiesce_reserved=quiesce_reserved,
+                )
             except (sqlite3.IntegrityError, IntegrityError) as error:
                 raise JournalIntegrityError("staged frame insert collided") from error
             self._transition_hook("frame_insert")
+        self._transition_hook("commit")
+        return CommitResult(new_revision)
+
+    def consume_reserved_quiesce_response(self) -> CommitResult | None:
+        with self._transaction():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            staged = tuple(
+                header
+                for header in headers
+                if header.room_materialized_revision is None
+            )
+            if not staged:
+                return None
+            selected = staged[-1]
+            selected_row = cast(
+                "Mapping[str, object]",
+                self._frame_row(selected.frame_id),
+            )
+            if (
+                self._frame_drain_row_from_full(
+                    selected_row,
+                    owner,
+                    authenticate=False,
+                )
+                != selected
+            ):
+                raise JournalIntegrityError("reserved Frame header snapshot changed")
+            value, quiesce_reserved = self._decode_frame_state_with_reservation(
+                selected.frame_id,
+                selected_row,
+                owner,
+                drain_header_authenticated=True,
+            )
+            if type(value) is not StagedFrame:
+                raise JournalIntegrityError("reserved Frame is not staged")
+            if not quiesce_reserved:
+                return None
+            if owner.revision == SQLITE_INT_MAX:
+                raise LocalProtocolError("quiesce reservation revision is exhausted")
+            payload_owner = (
+                self.account_id,
+                owner.stream_id,
+                owner.transport_kind,
+            )
+            payload, digest = _frame_payload(
+                value,
+                selected.staged_revision,
+                payload_owner,
+            )
+            new_revision = owner.revision + 1
+            cursor = self._transition_execute(
+                "quiesce_reservation_meta_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    new_revision,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalConflictError(
+                    "quiesce reservation compare-and-swap failed"
+                )
+            proof = _frame_drain_sha256(
+                owner,
+                frame_id=selected.frame_id,
+                source_epoch=selected.source_epoch,
+                request_id=selected.request_id,
+                staged_revision=selected.staged_revision,
+                payload_sha256=digest,
+                payload_length=len(payload),
+                room_materialized_revision=None,
+                callbacks_claimed_revision=None,
+            )
+            cursor = self._transition_execute(
+                "quiesce_reservation_frame_update",
+                "UPDATE NioIngestFrame SET payload = ?, payload_sha256 = ?, "
+                "drain_header_sha256 = ? WHERE account_id = ? AND frame_id = ? "
+                "AND source_epoch = ? AND request_id = ? AND staged_revision = ? "
+                "AND payload = ? AND payload_sha256 = ? "
+                "AND room_materialized_revision IS NULL "
+                "AND callbacks_claimed_revision IS NULL "
+                "AND drain_header_sha256 = ?",
+                (
+                    payload,
+                    digest,
+                    proof,
+                    selected_row["account_id"],
+                    selected_row["frame_id"],
+                    selected_row["source_epoch"],
+                    selected_row["request_id"],
+                    selected_row["staged_revision"],
+                    selected_row["payload"],
+                    selected_row["payload_sha256"],
+                    selected_row["drain_header_sha256"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalIntegrityError("reserved Frame update failed")
+            self._transition_hook("before_commit")
         self._transition_hook("commit")
         return CommitResult(new_revision)
 

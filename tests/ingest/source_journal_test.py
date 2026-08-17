@@ -70,13 +70,19 @@ SLIDING_SOURCE = SlidingSourceConfig(
 )
 OWN_USER_ID = "@alice:example.org"
 CRASH_EXIT_CODE = 86
-FRAME_CLASSIFICATION_LIMIT = 257
+FRAME_CLASSIFICATION_LIMIT = 259
 LARGE_PAYLOAD_PLACEHOLDER_BYTES = 64 * 1024
 CLASSIFY_FRAME_IDS_SQL = (
     "SELECT CASE account_id WHEN ? THEN frame_id END AS frame_id "
     "FROM NioIngestFrame LIMIT ?"
 )
 LOAD_FRAME_SQL = "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?"
+LOAD_FRAME_HEADERS_SQL = (
+    "SELECT account_id, frame_id, source_epoch, request_id, staged_revision, "
+    "payload_sha256, LENGTH(payload) AS payload_length, "
+    "room_materialized_revision, callbacks_claimed_revision, "
+    "drain_header_sha256 FROM NioIngestFrame LIMIT ?"
+)
 LIST_FRAMES_SQL = (
     "SELECT * FROM NioIngestFrame WHERE account_id = ? "
     "ORDER BY staged_revision, source_epoch, request_id, frame_id LIMIT ?"
@@ -1198,6 +1204,50 @@ def test_plan_source_poll_returns_ready_or_inactive_from_adapter() -> None:
     assert (ready_source.plan_calls, inactive_source.plan_calls) == (1, 1)
 
 
+def test_plan_source_poll_reserves_one_quiesce_frame_at_maximum_capacity() -> None:
+    from nio.ingest.source import SourceScheduleStatus, plan_source_poll
+
+    state = SourceState(0, TransportKind.CLASSIC, b'{"next_batch":null}', 0, True)
+    request = NetworkRequest(
+        uuid4(),
+        TransportKind.CLASSIC,
+        0,
+        0,
+        "GET",
+        "/_matrix/client/v3/sync",
+        (),
+        None,
+        30_000,
+        state.cursor_json,
+    )
+    source = _PlanningSource(request)
+    staged = _frame_for_request(request, canonical_json({"next_batch": "s1"}))
+    full = (staged,) * 256
+
+    ordinary = plan_source_poll(source, state, 0, full, 256)
+    quiescing = plan_source_poll(
+        source,
+        state,
+        0,
+        full,
+        256,
+        reserved_staged_frames=1,
+    )
+    reserved_full = plan_source_poll(
+        source,
+        state,
+        0,
+        (*full, staged),
+        256,
+        reserved_staged_frames=1,
+    )
+
+    assert ordinary.status is SourceScheduleStatus.AT_CAPACITY
+    assert quiescing.status is SourceScheduleStatus.READY
+    assert reserved_full.status is SourceScheduleStatus.AT_CAPACITY
+    assert source.plan_calls == 1
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid"),
     (
@@ -1210,6 +1260,9 @@ def test_plan_source_poll_returns_ready_or_inactive_from_adapter() -> None:
         ("max_staged_frames", True),
         ("max_staged_frames", 0),
         ("max_staged_frames", 257),
+        ("reserved_staged_frames", True),
+        ("reserved_staged_frames", -1),
+        ("reserved_staged_frames", 2),
     ),
 )
 def test_plan_source_poll_exact_validates_every_input(
@@ -1225,6 +1278,7 @@ def test_plan_source_poll_exact_validates_every_input(
         "request_id": 0,
         "staged_frames": (),
         "max_staged_frames": 2,
+        "reserved_staged_frames": 0,
     }
     values[field_name] = invalid
     with pytest.raises((TypeError, ValueError), match=field_name):
@@ -2030,6 +2084,65 @@ def test_stage_is_atomic_and_exact_restage_is_write_free(
         bootstrap.close()
 
 
+@pytest.mark.parametrize(
+    ("boundary", "committed"),
+    (
+        ("quiesce_reservation_meta_cas", False),
+        ("quiesce_reservation_frame_update", False),
+        ("before_commit", False),
+        ("commit", True),
+    ),
+)
+def test_quiesce_reservation_consumption_is_atomic_and_replayable(
+    tmp_path: Path,
+    boundary: str,
+    committed: bool,
+) -> None:
+    class ReservationAbort(BaseException):
+        pass
+
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    proposal = _stage_proposal(journal, CLASSIC_SOURCE, 1)
+    journal.stage_source_response(
+        source=proposal.successor_source,
+        frame=proposal.frame,
+        quiesce_reserved=True,
+    )
+    owner_before = journal.load_owner()
+    observed: list[str] = []
+    sentinel = ReservationAbort(boundary)
+
+    def abort_at_boundary(label: str) -> None:
+        observed.append(label)
+        if label == boundary:
+            raise sentinel
+
+    journal.set_transition_statement_hook(abort_at_boundary)
+    try:
+        with pytest.raises(ReservationAbort) as failure:
+            journal.consume_reserved_quiesce_response()
+        assert failure.value is sentinel
+        assert observed[-1] == boundary
+    finally:
+        journal.set_transition_statement_hook(None)
+        bootstrap.close()
+
+    reopened = _open(tmp_path)
+    try:
+        assert reopened._journal.load_owner().revision == (
+            owner_before.revision + int(committed)
+        )
+        assert reopened._journal.has_reserved_quiesce_response() is not committed
+        if not committed:
+            assert reopened._journal.consume_reserved_quiesce_response() == (
+                CommitResult(owner_before.revision + 1)
+            )
+            assert not reopened._journal.has_reserved_quiesce_response()
+    finally:
+        reopened.close()
+
+
 def test_stage_uses_source_predecessor_after_unrelated_revision_advance(
     tmp_path: Path,
 ) -> None:
@@ -2643,14 +2756,17 @@ def test_list_frames_accepts_exact_limits_and_uses_deterministic_drain_order(
                 )
             ),
             _normalized_sql(
+                LOAD_FRAME_HEADERS_SQL.replace("?", str(FRAME_CLASSIFICATION_LIMIT), 1)
+            ),
+            _normalized_sql(
                 LIST_FRAMES_SQL.replace("?", f"'{ACCOUNT_ID}'", 1).replace(
-                    "?", "256", 1
+                    "?", "258", 1
                 )
             ),
         ]
-        for limit in range(1, 257):
+        for limit in range(1, 258):
             assert reopened._journal.list_frames(limit) == expected[:limit]
-        for invalid_limit in (0, 257, True, 1.0):
+        for invalid_limit in (0, 258, True, 1.0):
             with pytest.raises(ValueError, match="frame limit"):
                 reopened._journal.list_frames(invalid_limit)
         with sqlite3.connect(tmp_path / "journal.db") as connection:

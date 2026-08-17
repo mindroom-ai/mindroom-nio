@@ -642,24 +642,34 @@ class IngestionSession:
             raise LocalProtocolError("ingestion session is closed")
         if self._terminal is not None:
             raise self._terminal
-        if (
-            self._quiesce_source_commit_target is not None
-            and self._source_commit_generation >= self._quiesce_source_commit_target
-        ):
-            return
         if not self._journal.load_source().active:
             return
         running = self._running
+        if self._quiesce_source_commit_target is None:
+            reservation_committed = self._journal.has_reserved_quiesce_response()
+            if not reservation_committed:
+                if running is None:
+                    raise LocalProtocolError("ingestion source is not running")
+                if running is asyncio.current_task():
+                    raise LocalProtocolError("ingestion runner cannot quiesce itself")
+                frames = self._journal.list_frames(self._config.max_staged_frames + 1)
+                if len(frames) > self._config.max_staged_frames:
+                    raise IngestionBlockedError(frames[0].frame_id)
+            self._quiesce_source_commit_target = self._source_commit_generation + (
+                0 if reservation_committed else 1
+            )
+            self._signal_progress()
         if running is None:
+            if self._source_commit_generation >= self._quiesce_source_commit_target:
+                self._journal.consume_reserved_quiesce_response()
+                return
             raise LocalProtocolError("ingestion source is not running")
         if running is asyncio.current_task():
             raise LocalProtocolError("ingestion runner cannot quiesce itself")
-        if self._quiesce_source_commit_target is None:
-            self._quiesce_source_commit_target = self._source_commit_generation + 1
-            self._signal_progress()
         await asyncio.shield(running)
         if self._source_commit_generation < self._quiesce_source_commit_target:
             raise LocalProtocolError("ingestion source stopped before quiescing")
+        self._journal.consume_reserved_quiesce_response()
 
     async def _cleanup(self) -> None:
         if self._running is not None:
@@ -679,11 +689,17 @@ class IngestionSession:
         while self._close_task is None:
             while True:
                 await _cooperative_sleep(0)
+                if (
+                    self._quiesce_source_commit_target is not None
+                    and self._source_commit_generation
+                    >= self._quiesce_source_commit_target
+                ):
+                    return
                 if self._quiesce_source_commit_target is not None:
                     frames = self._journal.list_frames(
                         self._config.max_staged_frames + 1
                     )
-                    if len(frames) < self._config.max_staged_frames:
+                    if len(frames) <= self._config.max_staged_frames:
                         break
                 materialized = self._materialize_oldest_frame(
                     limits=MaterializerLimits()
@@ -757,6 +773,9 @@ class IngestionSession:
                 prior.next_request_id,
                 frames,
                 self._config.max_staged_frames,
+                reserved_staged_frames=(
+                    1 if self._quiesce_source_commit_target is not None else 0
+                ),
             )
             if decision.status is SourceScheduleStatus.INACTIVE:
                 return
@@ -801,7 +820,11 @@ class IngestionSession:
                 request.request_id + 1,
                 prior.active,
             )
-            self._journal.stage_source_response(source=successor, frame=frame)
+            self._journal.stage_source_response(
+                source=successor,
+                frame=frame,
+                quiesce_reserved=self._quiesce_source_commit_target is not None,
+            )
             self._source_commit_generation += 1
             if (
                 self._quiesce_source_commit_target is not None

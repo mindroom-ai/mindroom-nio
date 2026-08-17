@@ -1300,7 +1300,7 @@ def _authenticate_full_ingestion_graph(
         headers
     ) or len({header.staged_revision for header in headers}) != len(headers):
         raise JournalIntegrityError("persisted Frame ordering identity is duplicated")
-    frame_ids = rows._classify_frame_ids()
+    frame_ids = rows._classify_frame_ids(owner)
     if frame_ids != {header.frame_id for header in headers}:
         raise JournalIntegrityError("authenticated Frame inventory changed")
     authenticated_frames = []

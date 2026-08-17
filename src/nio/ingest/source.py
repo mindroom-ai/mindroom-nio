@@ -178,6 +178,8 @@ def plan_source_poll(
     request_id: int,
     staged_frames: tuple[StagedFrame, ...],
     max_staged_frames: int,
+    *,
+    reserved_staged_frames: int = 0,
 ) -> SourceScheduleDecision:
     if not isinstance(source, SyncSource):
         raise TypeError("source must satisfy SyncSource")
@@ -191,8 +193,15 @@ def plan_source_poll(
     _require_exact(max_staged_frames, int, "max_staged_frames")
     if not 1 <= max_staged_frames <= 256:
         raise ValueError("max_staged_frames must be from 1 through 256")
+    _require_exact(
+        reserved_staged_frames,
+        int,
+        "reserved_staged_frames",
+    )
+    if reserved_staged_frames not in (0, 1):
+        raise ValueError("reserved_staged_frames must be zero or one")
 
-    if len(staged_frames) >= max_staged_frames:
+    if len(staged_frames) >= max_staged_frames + reserved_staged_frames:
         return SourceScheduleDecision(SourceScheduleStatus.AT_CAPACITY, None)
     request = source.plan_request(state, request_id)
     if request is None:

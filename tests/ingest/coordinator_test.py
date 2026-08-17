@@ -403,7 +403,12 @@ def reopen_owned_bootstrap(tmp_path, generation: UUID, *, source=None):
     )
 
 
-def stage_classic(bootstrap, body: dict[str, object]) -> StagedFrame:
+def stage_classic(
+    bootstrap,
+    body: dict[str, object],
+    *,
+    quiesce_reserved: bool = False,
+) -> StagedFrame:
     journal = bootstrap._journal
     owner = journal.load_owner()
     prior = journal.load_source()
@@ -441,6 +446,7 @@ def stage_classic(bootstrap, body: dict[str, object]) -> StagedFrame:
             prior.active,
         ),
         frame=frame,
+        quiesce_reserved=quiesce_reserved,
     )
     return frame
 
@@ -12523,6 +12529,410 @@ async def test_owned_quiesce_prioritizes_final_source_commit_over_materializatio
 
 
 @pytest.mark.asyncio
+async def test_owned_quiesce_reserves_one_final_frame_at_full_capacity(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    config = IngestionConfig(
+        classic_config().source,
+        max_staged_frames=2,
+    )
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(200, b'{"next_batch":"quiesced","rooms":{}}'))
+    session = open_owned_session(
+        client,
+        bootstrap,
+        generation,
+        config=config,
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    first = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"value": "blocks-oldest-frame"},
+                        "type": "org.example.quiesce-capacity",
+                    }
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    materialize_calls = 0
+    materialize = session._materialize_oldest_frame
+
+    def count_materialization(*, limits: MaterializerLimits) -> MaterializeResult:
+        nonlocal materialize_calls
+        materialize_calls += 1
+        return materialize(limits=limits)
+
+    session._materialize_oldest_frame = count_materialization  # type: ignore[method-assign]
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(2):
+            while materialize_calls < 2:
+                await asyncio.sleep(0)
+        assert session._journal._oldest_prepared_frame_has_work(first.frame_id)
+        stage_classic(bootstrap, {"next_batch": "s2", "rooms": {}})
+        stage_classic(bootstrap, {"next_batch": "s3", "rooms": {}})
+        calls_before_quiesce = materialize_calls
+        assert len(session._journal.list_frames(3)) == 2
+
+        quiesce = asyncio.create_task(session._quiesce())
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+        await session._quiesce()
+
+        assert materialize_calls == calls_before_quiesce
+        assert len(session._journal.list_frames(4)) == 3
+        assert client.send_count == 1
+        await asyncio.wait_for(session.run(), timeout=2)
+        assert materialize_calls == calls_before_quiesce
+        assert client.send_count == 1
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_allows_prepared_plus_maximum_staged_frames(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    config = IngestionConfig(
+        classic_config().source,
+        max_staged_frames=256,
+    )
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(200, b'{"next_batch":"quiesced","rooms":{}}'))
+    session = open_owned_session(
+        client,
+        bootstrap,
+        generation,
+        config=config,
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    first = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"value": "blocks-oldest-frame"},
+                        "type": "org.example.quiesce-capacity",
+                    }
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert session._journal._oldest_prepared_frame_has_work(first.frame_id)
+    for sequence in range(2, 258):
+        stage_classic(
+            bootstrap,
+            {"next_batch": f"s{sequence}", "rooms": {}},
+        )
+    assert len(session._journal.list_frames(257)) == 256
+
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(2):
+            while session._running is None:
+                await asyncio.sleep(0)
+        quiesce = asyncio.create_task(session._quiesce())
+        await asyncio.wait_for(quiesce, timeout=5)
+        await asyncio.wait_for(runner, timeout=5)
+
+        headers = session._journal._load_authenticated_frame_headers(
+            session._journal.load_owner()
+        )
+        assert len(headers) == 258
+        assert sum(row.room_materialized_revision is None for row in headers) == 257
+        assert sum(row.room_materialized_revision is not None for row in headers) == 1
+        assert client.send_count == 1
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_recovers_persisted_reserved_frame_after_reopen(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    config = IngestionConfig(
+        classic_config().source,
+        max_staged_frames=2,
+    )
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    seed_client = owned_client(tmp_path)
+    seed_session = open_owned_session(
+        seed_client,
+        bootstrap,
+        generation,
+        config=config,
+    )
+    assert seed_client.olm is not None
+    seed_client.olm.account.shared = True
+    seed_client.olm.uploaded_key_count = seed_client.olm.account.max_one_time_keys
+    seed_client.olm.save_account()
+    first = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"value": "blocks-oldest-frame"},
+                        "type": "org.example.quiesce-capacity",
+                    }
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        seed_session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert seed_session._journal._oldest_prepared_frame_has_work(first.frame_id)
+    for sequence in range(2, 4):
+        stage_classic(
+            bootstrap,
+            {"next_batch": f"s{sequence}", "rooms": {}},
+        )
+    stage_classic(
+        bootstrap,
+        {"next_batch": "s4", "rooms": {}},
+        quiesce_reserved=True,
+    )
+    assert seed_session._journal.has_reserved_quiesce_response()
+    await seed_session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(
+        client,
+        reopened,
+        generation,
+        config=config,
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(2):
+            while session._running is None:
+                await asyncio.sleep(0)
+        quiesce = asyncio.create_task(session._quiesce())
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+
+        assert len(session._journal.list_frames(3)) == 3
+        assert not session._journal.has_reserved_quiesce_response()
+        assert client.send_count == 0
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_quiesce_consumes_durable_reservation(tmp_path) -> None:
+    generation = uuid4()
+    config = IngestionConfig(
+        classic_config().source,
+        max_staged_frames=2,
+    )
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(200, b'{"next_batch":"quiesced","rooms":{}}'))
+    session = open_owned_session(
+        client,
+        bootstrap,
+        generation,
+        config=config,
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    first = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"value": "blocks-oldest-frame"},
+                        "type": "org.example.quiesce-capacity",
+                    }
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert session._journal._oldest_prepared_frame_has_work(first.frame_id)
+    for sequence in range(2, 4):
+        stage_classic(
+            bootstrap,
+            {"next_batch": f"s{sequence}", "rooms": {}},
+        )
+
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(2):
+            while session._running is None:
+                await asyncio.sleep(0)
+        quiesce = asyncio.create_task(session._quiesce())
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+
+        assert len(session._journal.list_frames(3)) == 3
+        assert not session._journal.has_reserved_quiesce_response()
+        assert client.send_count == 1
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_quiesce_does_not_infer_reservation_after_limit_reduction(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    seed_config = IngestionConfig(
+        classic_config().source,
+        max_staged_frames=4,
+    )
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    seed_client = owned_client(tmp_path)
+    seed_session = open_owned_session(
+        seed_client,
+        bootstrap,
+        generation,
+        config=seed_config,
+    )
+    assert seed_client.olm is not None
+    seed_client.olm.account.shared = True
+    seed_client.olm.uploaded_key_count = seed_client.olm.account.max_one_time_keys
+    seed_client.olm.save_account()
+    first = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"value": "blocks-oldest-frame"},
+                        "type": "org.example.quiesce-capacity",
+                    }
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        seed_session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert seed_session._journal._oldest_prepared_frame_has_work(first.frame_id)
+    for sequence in range(2, 5):
+        stage_classic(
+            bootstrap,
+            {"next_batch": f"s{sequence}", "rooms": {}},
+        )
+    await seed_session.close()
+
+    reopened = reopen_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(
+        client,
+        reopened,
+        generation,
+        config=IngestionConfig(
+            classic_config().source,
+            max_staged_frames=2,
+        ),
+    )
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    runner = asyncio.create_task(session.run())
+    quiesce: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(2):
+            while session._running is None:
+                await asyncio.sleep(0)
+        quiesce = asyncio.create_task(session._quiesce())
+        with pytest.raises(nio.IngestionBlockedError):
+            await asyncio.wait_for(quiesce, timeout=2)
+
+        assert len(session._journal.list_frames(3)) == 3
+        assert client.send_count == 0
+        assert not runner.done()
+    finally:
+        for task in (quiesce, runner):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (quiesce, runner) if task is not None),
+            return_exceptions=True,
+        )
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_quiesce_allows_idle_poll_response_delivery_margin(
     tmp_path,
 ) -> None:
@@ -12614,6 +13024,7 @@ async def test_owned_quiesce_rejects_active_source_without_a_runner(tmp_path) ->
     try:
         with pytest.raises(LocalProtocolError, match="source is not running"):
             await session._quiesce()
+        assert session._quiesce_source_commit_target is None
     finally:
         await session.close()
 
