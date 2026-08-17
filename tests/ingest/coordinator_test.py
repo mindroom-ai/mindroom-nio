@@ -12477,6 +12477,52 @@ async def test_owned_quiesce_commits_one_final_source_response_for_restart_recov
 
 
 @pytest.mark.asyncio
+async def test_owned_quiesce_prioritizes_final_source_commit_over_materialization_backlog(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    client.responses.append(FakeResponse(200, b'{"next_batch":"quiesced","rooms":{}}'))
+    session = open_owned_session(client, bootstrap, generation)
+    remaining = 500
+    materialized_before_source: list[int] = []
+
+    def materialize_synchronously(*, limits: MaterializerLimits) -> MaterializeResult:
+        nonlocal remaining
+        assert limits == MaterializerLimits()
+        if remaining:
+            remaining -= 1
+            return MaterializeResult(
+                MaterializeStatus.MATERIALIZED,
+                uuid4(),
+                500 - remaining,
+            )
+        return MaterializeResult(MaterializeStatus.IDLE, None, None)
+
+    session._materialize_oldest_frame = materialize_synchronously  # type: ignore[method-assign]
+    client.on_send = lambda: materialized_before_source.append(500 - remaining)
+    runner = asyncio.create_task(session.run())
+    while session._running is None:
+        await asyncio.sleep(0)
+    quiesce = asyncio.create_task(session._quiesce())
+
+    try:
+        await asyncio.wait_for(quiesce, timeout=2)
+        await asyncio.wait_for(runner, timeout=2)
+        assert len(materialized_before_source) == 1
+        assert materialized_before_source[0] <= 1
+        assert remaining >= 499
+        assert len(session._journal.list_frames(1)) == 1
+    finally:
+        for task in (quiesce, runner):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(quiesce, runner, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_quiesce_allows_idle_poll_response_delivery_margin(
     tmp_path,
 ) -> None:

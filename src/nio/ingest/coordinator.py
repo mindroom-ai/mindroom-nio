@@ -679,6 +679,12 @@ class IngestionSession:
         while self._close_task is None:
             while True:
                 await _cooperative_sleep(0)
+                if self._quiesce_source_commit_target is not None:
+                    frames = self._journal.list_frames(
+                        self._config.max_staged_frames + 1
+                    )
+                    if len(frames) < self._config.max_staged_frames:
+                        break
                 materialized = self._materialize_oldest_frame(
                     limits=MaterializerLimits()
                 )
