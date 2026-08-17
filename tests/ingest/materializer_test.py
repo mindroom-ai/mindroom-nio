@@ -481,6 +481,56 @@ def _expected_planned_stored_work_payload(
     )
 
 
+def test_stored_work_release_row_keeps_authenticated_identity_and_exact_envelope() -> (
+    None
+):
+    """A release retains its authenticated frame and creation revision."""
+
+    value = _event_record()
+    plaintext = _expected_event_work_plaintext(value)
+    frame_id = UUID("12345678-1234-5678-1234-567812345680")
+    stored = journal_plan_module._stored_work_release_row(
+        journal_plan_module.PlannedWork(value, plaintext, 7),
+        AuthenticatedWork(
+            value,
+            "held",
+            1,
+            plaintext=plaintext,
+            frame_id=frame_id,
+            created_revision=3,
+        ),
+        revision=11,
+    )
+
+    assert stored == journal_plan_module._StoredWorkRow(
+        value.record_id,
+        "event",
+        "ready",
+        frame_id,
+        None,
+        None,
+        None,
+        11,
+        7,
+        3,
+        plaintext,
+    )
+    expected = _expected_stored_work_payload(
+        account_id=_PLANNER_ACCOUNT_ID,
+        stream_id=_STREAM_ID,
+        transport_kind=TransportKind.CLASSIC,
+        frame_id=frame_id,
+        value=value,
+        status="ready",
+        ready_revision=11,
+        ready_ordinal=7,
+        created_revision=3,
+    )
+    assert journal_plan_module._stored_work_size(
+        (_PLANNER_ACCOUNT_ID, _STREAM_ID, TransportKind.CLASSIC), stored
+    ) == len(expected)
+
+
 def _pending_hydration_planner_case(
     *,
     global_ready_count: int = 0,

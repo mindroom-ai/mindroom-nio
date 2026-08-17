@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from operator import itemgetter
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, cast
 from uuid import UUID, uuid5
 
 from ..ingest._json import canonical_json, load_internal_json, load_json
@@ -14,6 +14,7 @@ from ..ingest.model import (
     LossRecord,
     RecordKind,
     RoomSnapshot,
+    TransportKind,
     _CallbackRoute,
     _DecryptedToDeviceKind,
     _DecryptionDisposition,
@@ -59,6 +60,36 @@ class PlannedWork(NamedTuple):
 
 
 @dataclass(frozen=True, slots=True)
+class _StoredWorkRow:
+    work_id: str
+    kind: Literal["event", "loss"]
+    status: Literal["ready", "held"]
+    frame_id: UUID
+    room_id: str | None
+    membership_epoch: int | None
+    room_sequence: int | None
+    ready_revision: int | None
+    ready_ordinal: int | None
+    created_revision: int
+    plaintext: bytes
+
+    @property
+    def clear_values(self) -> tuple[object, ...]:
+        return (
+            self.work_id,
+            self.kind,
+            self.status,
+            str(self.frame_id),
+            self.room_id,
+            self.membership_epoch,
+            self.room_sequence,
+            self.ready_revision,
+            self.ready_ordinal,
+            self.created_revision,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AuthenticatedWork:
     value: EventRecord | LossRecord
     status: Literal["ready", "held"]
@@ -98,6 +129,71 @@ class MaterializationPlan:
     work_inserts: tuple[PlannedWork, ...]
     work_releases: tuple[PlannedWork, ...]
     crypto_deferred: bool
+
+
+def _stored_work_insert_row(
+    item: PlannedWork,
+    frame_id: UUID,
+    revision: int,
+) -> _StoredWorkRow:
+    value, plaintext, ordinal = item
+    is_event = type(value) is EventRecord
+    return _StoredWorkRow(
+        _work_id(value),
+        "event" if is_event else "loss",
+        "held" if ordinal is None else "ready",
+        frame_id,
+        value.room_id,
+        value.membership_epoch,
+        cast("EventRecord", value).room_sequence if is_event else None,
+        None if ordinal is None else revision,
+        ordinal,
+        revision,
+        plaintext,
+    )
+
+
+def _stored_work_release_row(
+    item: PlannedWork,
+    existing: AuthenticatedWork,
+    revision: int,
+) -> _StoredWorkRow:
+    value, plaintext, ordinal = item
+    if (
+        type(value) is not EventRecord
+        or type(existing.value) is not EventRecord
+        or value.record_id != existing.value.record_id
+        or existing.frame_id is None
+        or existing.created_revision is None
+    ):
+        raise ValueError("released Work lacks authenticated row identity")
+    return _StoredWorkRow(
+        existing.value.record_id,
+        "event",
+        "ready",
+        existing.frame_id,
+        existing.value.room_id,
+        existing.value.membership_epoch,
+        existing.value.room_sequence,
+        revision,
+        ordinal,
+        existing.created_revision,
+        plaintext,
+    )
+
+
+def _stored_work_size(
+    owner: tuple[str, UUID, TransportKind],
+    stored: _StoredWorkRow,
+) -> int:
+    return len(
+        _row(
+            owner,
+            "NioIngestWork",
+            stored.plaintext,
+            header=_canonical_internal(stored.clear_values),
+        )[0]
+    )
 
 
 def _canonical_work_plaintext(
@@ -389,26 +485,9 @@ def plan_frame_materialization(
     work_by_id = {_work_id(item.value): item for item in work}
 
     def planned_size(item: PlannedWork) -> int:
-        value, plaintext, ordinal = item
-        clear = (
-            _work_id(value),
-            "event" if isinstance(value, EventRecord) else "loss",
-            "held" if ordinal is None else "ready",
-            str(frame.frame_id),
-            value.room_id,
-            value.membership_epoch,
-            value.room_sequence if isinstance(value, EventRecord) else None,
-            revision if ordinal is not None else None,
-            ordinal,
-            revision,
-        )
-        return len(
-            _row(
-                (account_id, stream_id, frame.origin.transport),
-                "NioIngestWork",
-                plaintext,
-                header=_canonical_internal(clear),
-            )[0]
+        return _stored_work_size(
+            (account_id, stream_id, frame.origin.transport),
+            _stored_work_insert_row(item, frame.frame_id, revision),
         )
 
     def bounded_work(value: EventRecord | LossRecord, ordinal: int) -> PlannedWork:
@@ -835,25 +914,9 @@ def plan_frame_materialization(
             existing_release.frame_id is not None
             and existing_release.created_revision is not None
         ):
-            clear = (
-                release_value.record_id,
-                "event",
-                "ready",
-                str(existing_release.frame_id),
-                release_value.room_id,
-                release_value.membership_epoch,
-                release_value.room_sequence,
-                revision,
-                release_ordinal,
-                existing_release.created_revision,
-            )
-            size = len(
-                _row(
-                    (account_id, stream_id, frame.origin.transport),
-                    "NioIngestWork",
-                    legacy_release.plaintext,
-                    header=_canonical_internal(clear),
-                )[0]
+            size = _stored_work_size(
+                (account_id, stream_id, frame.origin.transport),
+                _stored_work_release_row(legacy_release, existing_release, revision),
             )
         else:
             size = (
@@ -1099,25 +1162,11 @@ def plan_prepared_frame_materialization(
         plaintext: bytes,
         ordinal: int | None,
     ) -> int:
-        clear = (
-            _work_id(value),
-            "event" if type(value) is EventRecord else "loss",
-            "held" if ordinal is None else "ready",
-            str(frame.frame_id),
-            value.room_id,
-            value.membership_epoch,
-            value.room_sequence if type(value) is EventRecord else None,
-            revision if ordinal is not None else None,
-            ordinal,
-            revision,
-        )
-        return len(
-            _row(
-                (account_id, stream_id, frame.origin.transport),
-                "NioIngestWork",
-                plaintext,
-                header=_canonical_internal(clear),
-            )[0]
+        return _stored_work_size(
+            (account_id, stream_id, frame.origin.transport),
+            _stored_work_insert_row(
+                PlannedWork(value, plaintext, ordinal), frame.frame_id, revision
+            ),
         )
 
     def append_planned(
@@ -1676,25 +1725,9 @@ def plan_prepared_frame_materialization(
         existing_release = existing_by_id[_work_id(final_release_value)]
         assert existing_release.frame_id is not None
         assert existing_release.created_revision is not None
-        clear = (
-            _work_id(final_release_value),
-            "event",
-            "ready",
-            str(existing_release.frame_id),
-            final_release_value.room_id,
-            final_release_value.membership_epoch,
-            final_release_value.room_sequence,
-            revision,
-            final_release.ready_ordinal,
-            existing_release.created_revision,
-        )
-        release_size = len(
-            _row(
-                (account_id, stream_id, frame.origin.transport),
-                "NioIngestWork",
-                final_release.plaintext,
-                header=_canonical_internal(clear),
-            )[0]
+        release_size = _stored_work_size(
+            (account_id, stream_id, frame.origin.transport),
+            _stored_work_release_row(final_release, existing_release, revision),
         )
         if release_size > hard_limits.max_record_canonical_bytes:
             raise ValueError("released Work record exceeds the immutable byte limit")

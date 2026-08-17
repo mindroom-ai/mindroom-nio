@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import os
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid5
@@ -51,7 +51,10 @@ from ..ingest.source import SyncFrame, _frame_room_ids, renormalize_staged_frame
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
     AuthenticatedWork,
+    MaterializationPlan,
     _canonical_work_plaintext,
+    _stored_work_insert_row,
+    _stored_work_release_row,
     _work_id,
     plan_frame_materialization,
     plan_prepared_frame_materialization,
@@ -130,6 +133,14 @@ _DELIVERY_UPDATE = (
     + " WHERE account_id = ? AND revision = ? AND writer_epoch = ? AND "
     + " AND ".join(f"{name} IS ?" for name in _DELIVERY_COLUMNS)
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializationWriteSet:
+    aggregate_rows: tuple[tuple[object, ...], ...]
+    existing_aggregate_rooms: frozenset[str]
+    work_insert_rows: tuple[tuple[object, ...], ...]
+    work_release_args: tuple[tuple[object, ...], ...]
 
 
 def _ready_member(
@@ -327,6 +338,136 @@ class SqliteIngestionJournal(JournalRows):
         cursor = self._execute(statement, parameters)
         self._transition_hook(label)
         return cursor
+
+    def _materialization_write_set(
+        self,
+        *,
+        owner: OwnerView,
+        plan: MaterializationPlan,
+        frame_id: UUID,
+        revision: int,
+        inventory: _Task3WorkInventory | None,
+        existing_aggregate_rooms: set[str],
+        release_error: type[Exception],
+    ) -> _MaterializationWriteSet:
+        aggregate_rows: list[tuple[object, ...]] = []
+        for aggregate_value in plan.room_values:
+            room_id = aggregate_value.continuity.room_id
+            intent_kind = "hydration" if aggregate_value.pending_hydration else None
+            plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
+            payload, digest = self._payload(
+                owner,
+                "NioIngestRoomAggregate",
+                plaintext,
+                header=_canonical_internal([room_id, revision, intent_kind]),
+            )
+            aggregate_rows.append(
+                (self.account_id, room_id, revision, intent_kind, payload, digest)
+            )
+
+        work_insert_rows: list[tuple[object, ...]] = []
+        for item in plan.work_inserts:
+            stored = _stored_work_insert_row(item, frame_id, revision)
+            payload, digest = self._payload(
+                owner,
+                "NioIngestWork",
+                stored.plaintext,
+                header=_canonical_internal(stored.clear_values),
+            )
+            work_insert_rows.append(
+                (self.account_id, *stored.clear_values, payload, digest)
+            )
+
+        authenticated_by_id = (
+            {_work_id(item.value): item for item in inventory.work}
+            if inventory is not None
+            else {}
+        )
+        work_release_args: list[tuple[object, ...]] = []
+        for item in plan.work_releases:
+            if type(item.value) is not EventRecord:
+                raise release_error("released Work must be an event")
+            stored = _stored_work_release_row(
+                item,
+                authenticated_by_id[item.value.record_id],
+                revision,
+            )
+            payload, digest = self._payload(
+                owner,
+                "NioIngestWork",
+                stored.plaintext,
+                header=_canonical_internal(stored.clear_values),
+            )
+            work_release_args.append(
+                (
+                    revision,
+                    stored.ready_ordinal,
+                    payload,
+                    digest,
+                    self.account_id,
+                    stored.work_id,
+                )
+            )
+
+        return _MaterializationWriteSet(
+            tuple(aggregate_rows),
+            frozenset(existing_aggregate_rooms),
+            tuple(work_insert_rows),
+            tuple(work_release_args),
+        )
+
+    def _apply_materialization_write_set(
+        self,
+        write_set: _MaterializationWriteSet,
+    ) -> None:
+        try:
+            for row in write_set.aggregate_rows:
+                if row[1] in write_set.existing_aggregate_rooms:
+                    aggregate_cursor = self._transition_execute(
+                        "aggregate_update",
+                        "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
+                        "intent_kind = ?, payload = ?, "
+                        "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
+                        (*row[2:], row[0], row[1]),
+                    )
+                else:
+                    aggregate_cursor = self._transition_execute(
+                        "aggregate_insert",
+                        "INSERT INTO NioIngestRoomAggregate("
+                        "account_id, room_id, updated_revision, intent_kind, "
+                        "payload, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+                if aggregate_cursor.rowcount != 1:
+                    raise JournalIntegrityError(
+                        "Aggregate write did not affect one row"
+                    )
+            for row in write_set.work_insert_rows:
+                work_cursor = self._transition_execute(
+                    "work_insert",
+                    "INSERT INTO NioIngestWork("
+                    "account_id, work_id, kind, status, frame_id, room_id, "
+                    "membership_epoch, room_sequence, ready_revision, "
+                    "ready_ordinal, created_revision, payload, "
+                    "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?)",
+                    row,
+                )
+                if work_cursor.rowcount != 1:
+                    raise JournalIntegrityError("Work insert did not write a row")
+            for args in write_set.work_release_args:
+                work_cursor = self._transition_execute(
+                    "work_release",
+                    "UPDATE NioIngestWork SET status = 'ready', "
+                    "ready_revision = ?, ready_ordinal = ?, payload = ?, "
+                    "payload_sha256 = ? "
+                    "WHERE account_id = ? AND work_id = ? AND status = 'held'",
+                    args,
+                )
+                if work_cursor.rowcount != 1:
+                    raise JournalIntegrityError("Work release did not update a row")
+        except (sqlite3.IntegrityError, IntegrityError) as error:
+            raise JournalIntegrityError("planned materialization collided") from error
 
     def _reset_sliding_source(
         self,
@@ -2201,84 +2342,15 @@ class SqliteIngestionJournal(JournalRows):
                 except (TypeError, ValueError) as error:
                     raise JournalIntegrityError(str(error)) from error
 
-                planned_aggregates: list[tuple[object, ...]] = []
-                for aggregate_value in plan.room_values:
-                    room_id = aggregate_value.continuity.room_id
-                    intent_kind = (
-                        "hydration" if aggregate_value.pending_hydration else None
-                    )
-                    plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
-                    payload, digest = self._payload(
-                        owner,
-                        "NioIngestRoomAggregate",
-                        plaintext,
-                        header=_canonical_internal(
-                            [room_id, new_revision, intent_kind]
-                        ),
-                    )
-                    planned_aggregates.append(
-                        (
-                            self.account_id,
-                            room_id,
-                            new_revision,
-                            intent_kind,
-                            payload,
-                            digest,
-                        )
-                    )
-
-                planned_rows: list[tuple[object, ...]] = []
-                for value, plaintext, ordinal in plan.work_inserts:
-                    work_id = _work_id(value)
-                    is_event = isinstance(value, EventRecord)
-                    kind = "event" if is_event else "loss"
-                    room_sequence = (
-                        cast("EventRecord", value).room_sequence if is_event else None
-                    )
-                    status = "held" if ordinal is None else "ready"
-                    clear_values = (
-                        work_id,
-                        kind,
-                        status,
-                        str(staged.frame_id),
-                        value.room_id,
-                        value.membership_epoch,
-                        room_sequence,
-                        None if ordinal is None else new_revision,
-                        ordinal,
-                        new_revision,
-                    )
-                    payload, digest = self._payload(
-                        owner,
-                        "NioIngestWork",
-                        plaintext,
-                        header=_canonical_internal(clear_values),
-                    )
-                    planned_rows.append(
-                        (self.account_id, *clear_values, payload, digest)
-                    )
-
-                storage_by_id = {row[1]: row for row in inventory.storage_rows}
-                planned_releases: list[tuple[object, ...]] = []
-                for value, plaintext, ordinal in plan.work_releases:
-                    if type(value) is not EventRecord:
-                        raise JournalIntegrityError("released Work must be an event")
-                    old = storage_by_id[value.record_id]
-                    clear = (
-                        *old[1:3],
-                        "ready",
-                        *old[4:8],
-                        new_revision,
-                        ordinal,
-                        old[10],
-                    )
-                    payload, digest = self._payload(
-                        owner,
-                        "NioIngestWork",
-                        plaintext,
-                        header=_canonical_internal(clear),
-                    )
-                    planned_releases.append((ordinal, payload, digest, value.record_id))
+                write_set = self._materialization_write_set(
+                    owner=owner,
+                    plan=plan,
+                    frame_id=staged.frame_id,
+                    revision=new_revision,
+                    inventory=inventory,
+                    existing_aggregate_rooms=existing_aggregate_rooms,
+                    release_error=JournalIntegrityError,
+                )
 
                 prepared_payload, prepared_digest = _prepared_frame_payload(
                     owner=(
@@ -2313,68 +2385,7 @@ class SqliteIngestionJournal(JournalRows):
                         "owned materializer compare-and-swap failed"
                     )
 
-                try:
-                    for row in planned_aggregates:
-                        if row[1] in existing_aggregate_rooms:
-                            aggregate_cursor = self._transition_execute(
-                                "aggregate_update",
-                                "UPDATE NioIngestRoomAggregate SET "
-                                "updated_revision = ?, intent_kind = ?, payload = ?, "
-                                "payload_sha256 = ? WHERE account_id = ? "
-                                "AND room_id = ?",
-                                (*row[2:], row[0], row[1]),
-                            )
-                        else:
-                            aggregate_cursor = self._transition_execute(
-                                "aggregate_insert",
-                                "INSERT INTO NioIngestRoomAggregate("
-                                "account_id, room_id, updated_revision, intent_kind, "
-                                "payload, payload_sha256) VALUES (?, ?, ?, ?, ?, ?)",
-                                row,
-                            )
-                        if aggregate_cursor.rowcount != 1:
-                            raise JournalIntegrityError(
-                                "Aggregate write did not affect one row"
-                            )
-                    for row in planned_rows:
-                        work_cursor = self._transition_execute(
-                            "work_insert",
-                            "INSERT INTO NioIngestWork("
-                            "account_id, work_id, kind, status, frame_id, room_id, "
-                            "membership_epoch, room_sequence, ready_revision, "
-                            "ready_ordinal, created_revision, payload, "
-                            "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                            "?, ?, ?, ?)",
-                            row,
-                        )
-                        if work_cursor.rowcount != 1:
-                            raise JournalIntegrityError(
-                                "Work insert did not write a row"
-                            )
-                    for row in planned_releases:
-                        work_cursor = self._transition_execute(
-                            "work_release",
-                            "UPDATE NioIngestWork SET status = 'ready', "
-                            "ready_revision = ?, ready_ordinal = ?, payload = ?, "
-                            "payload_sha256 = ? WHERE account_id = ? AND "
-                            "work_id = ? AND status = 'held'",
-                            (
-                                new_revision,
-                                row[0],
-                                row[1],
-                                row[2],
-                                self.account_id,
-                                row[3],
-                            ),
-                        )
-                        if work_cursor.rowcount != 1:
-                            raise JournalIntegrityError(
-                                "Work release did not update a row"
-                            )
-                except (sqlite3.IntegrityError, IntegrityError) as error:
-                    raise JournalIntegrityError(
-                        "planned materialization collided"
-                    ) from error
+                self._apply_materialization_write_set(write_set)
 
                 proof = _frame_drain_sha256(
                     owner,
@@ -2581,72 +2592,15 @@ class SqliteIngestionJournal(JournalRows):
                     None,
                 )
 
-            planned_aggregates: list[tuple[object, ...]] = []
-            for aggregate_value in plan.room_values:
-                room_id = aggregate_value.continuity.room_id
-                intent_kind = "hydration" if aggregate_value.pending_hydration else None
-                plaintext = _canonical_room_aggregate_plaintext(aggregate_value)
-                payload, digest = self._payload(
-                    owner,
-                    "NioIngestRoomAggregate",
-                    plaintext,
-                    header=_canonical_internal([room_id, new_revision, intent_kind]),
-                )
-                planned_aggregates.append(
-                    (
-                        self.account_id,
-                        room_id,
-                        new_revision,
-                        intent_kind,
-                        payload,
-                        digest,
-                    )
-                )
-
-            planned_rows: list[tuple[object, ...]] = []
-            for value, plaintext, ordinal in plan.work_inserts:
-                work_id = _work_id(value)
-                is_event = isinstance(value, EventRecord)
-                kind = "event" if is_event else "loss"
-                room_sequence = (
-                    value.room_sequence if isinstance(value, EventRecord) else None
-                )
-                status = "held" if ordinal is None else "ready"
-                clear_values = (
-                    work_id,
-                    kind,
-                    status,
-                    str(staged.frame_id),
-                    value.room_id,
-                    value.membership_epoch,
-                    room_sequence,
-                    None if ordinal is None else new_revision,
-                    ordinal,
-                    new_revision,
-                )
-                payload, digest = self._payload(
-                    owner,
-                    "NioIngestWork",
-                    plaintext,
-                    header=_canonical_internal(clear_values),
-                )
-                planned_rows.append((self.account_id, *clear_values, payload, digest))
-
-            stored_rows = inventory.storage_rows if inventory is not None else ()
-            storage_by_id = {row[1]: row for row in stored_rows}
-            planned_releases: list[tuple[object, ...]] = []
-            for value, plaintext, ordinal in plan.work_releases:
-                if type(value) is not EventRecord:
-                    raise ValueError("released Work must be an event")
-                old = storage_by_id[value.record_id]
-                clear = (*old[1:3], "ready", *old[4:8], new_revision, ordinal, old[10])
-                payload, digest = self._payload(
-                    owner,
-                    "NioIngestWork",
-                    plaintext,
-                    header=_canonical_internal(clear),
-                )
-                planned_releases.append((ordinal, payload, digest, value.record_id))
+            write_set = self._materialization_write_set(
+                owner=owner,
+                plan=plan,
+                frame_id=staged.frame_id,
+                revision=new_revision,
+                inventory=inventory,
+                existing_aggregate_rooms=existing_aggregate_rooms,
+                release_error=ValueError,
+            )
 
         with self._transaction():
             write_owner = self._decode_owner_row(
@@ -2703,57 +2657,7 @@ class SqliteIngestionJournal(JournalRows):
                     "journal materializer compare-and-swap failed"
                 )
 
-            try:
-                for row in planned_aggregates:
-                    if row[1] in existing_aggregate_rooms:
-                        aggregate_cursor = self._transition_execute(
-                            "aggregate_update",
-                            "UPDATE NioIngestRoomAggregate SET updated_revision = ?, "
-                            "intent_kind = ?, payload = ?, "
-                            "payload_sha256 = ? WHERE account_id = ? AND room_id = ?",
-                            (*row[2:], row[0], row[1]),
-                        )
-                    else:
-                        aggregate_cursor = self._transition_execute(
-                            "aggregate_insert",
-                            "INSERT INTO NioIngestRoomAggregate("
-                            "account_id, room_id, updated_revision, intent_kind, "
-                            "payload, payload_sha256) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            row,
-                        )
-                    if aggregate_cursor.rowcount != 1:
-                        raise JournalIntegrityError(
-                            "Aggregate write did not affect one row"
-                        )
-                for row in planned_rows:
-                    work_cursor = self._transition_execute(
-                        "work_insert",
-                        "INSERT INTO NioIngestWork("
-                        "account_id, work_id, kind, status, frame_id, room_id, "
-                        "membership_epoch, room_sequence, ready_revision, "
-                        "ready_ordinal, created_revision, payload, "
-                        "payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                        "?, ?, ?, ?)",
-                        row,
-                    )
-                    if work_cursor.rowcount != 1:
-                        raise JournalIntegrityError("Work insert did not write a row")
-                for row in planned_releases:
-                    work_cursor = self._transition_execute(
-                        "work_release",
-                        "UPDATE NioIngestWork SET status = 'ready', "
-                        "ready_revision = ?, ready_ordinal = ?, payload = ?, "
-                        "payload_sha256 = ? "
-                        "WHERE account_id = ? AND work_id = ? AND status = 'held'",
-                        (new_revision, row[0], row[1], row[2], self.account_id, row[3]),
-                    )
-                    if work_cursor.rowcount != 1:
-                        raise JournalIntegrityError("Work release did not update a row")
-            except (sqlite3.IntegrityError, IntegrityError) as error:
-                raise JournalIntegrityError(
-                    "planned materialization collided"
-                ) from error
+            self._apply_materialization_write_set(write_set)
 
             row_predicate = (
                 write_selected_row["account_id"],
