@@ -791,7 +791,13 @@ def test_no_ready_work_returns_none_without_writer_or_revision(
         sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
         for sql in statements
     )
-    assert any("FROM NioIngestWork LIMIT 20001" in sql for sql in statements)
+    assert any(
+        "FROM NioIngestWork WHERE account_id = " in sql
+        and "AND status = 'ready'" in sql
+        and "ORDER BY ready_revision, ready_ordinal, work_id LIMIT 1" in sql
+        for sql in statements
+    )
+    assert not any("FROM NioIngestWork LIMIT 20001" in sql for sql in statements)
     bootstrap.close()
 
 
@@ -834,8 +840,13 @@ def test_claims_only_minimum_ready_key_and_replays_identically(
     assert tuple(row for row in _raw_delivery_graph(database_path)[1:]) == before_work
     assert transitions == ["delivery_claim_meta_cas", "before_commit", "commit"]
     selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
-    assert any("FROM NioIngestWork LIMIT 20001" in sql for sql in selects)
-    assert not any("NioIngestWork" in sql and "WHERE" in sql for sql in selects)
+    assert any(
+        "FROM NioIngestWork WHERE account_id = " in sql
+        and "AND status = 'ready'" in sql
+        and "ORDER BY ready_revision, ready_ordinal, work_id LIMIT 1" in sql
+        for sql in selects
+    )
+    assert not any("FROM NioIngestWork LIMIT 20001" in sql for sql in selects)
 
     frozen_payload = canonical_batch_payload(batch)
     frozen_graph = _raw_delivery_graph(database_path)
@@ -865,6 +876,58 @@ def test_claims_only_minimum_ready_key_and_replays_identically(
     reopened._journal.acknowledge_batch(batch.ref)
     assert appended in _raw_delivery_graph(reopened.database_path)[1:]
     reopened.close()
+
+
+def test_one_delivery_cycle_authenticates_constant_work_with_large_ready_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    for index in range(1, 501):
+        record = replace(
+            _ready_event(index),
+            kind=RecordKind.PRESENCE,
+            room_id=None,
+            membership_epoch=None,
+            room_sequence=None,
+            provenance=None,
+        )
+        _seed_work(
+            journal,
+            record,
+            ready_revision=1,
+            ready_ordinal=index - 1,
+        )
+
+    authenticated_work = 0
+    real_payload = journal._payload
+
+    def counting_payload(owner: object, *args: object, **kwargs: object) -> object:
+        nonlocal authenticated_work
+        if args and args[0] == "NioIngestWork" and len(args) >= 3:
+            authenticated_work += 1
+        return real_payload(owner, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(journal, "_payload", counting_payload)
+
+    batch = journal.next_batch(max_records=1)
+    assert batch is not None
+    assert batch.records == (
+        replace(
+            _ready_event(1),
+            kind=RecordKind.PRESENCE,
+            room_id=None,
+            membership_epoch=None,
+            room_sequence=None,
+            provenance=None,
+        ),
+    )
+    assert journal._load_batch_settlement(batch) is not None  # type: ignore[attr-defined]
+    journal.acknowledge_batch(batch.ref)
+
+    assert 0 < authenticated_work <= 5
+    bootstrap.close()
 
 
 def test_claim_enforces_exact_caller_limits_before_writer(
@@ -1032,6 +1095,35 @@ def test_foreign_account_work_is_rejected_by_global_inventory_before_claim(
         journal.next_batch()
     assert _raw_delivery_graph(bootstrap.database_path) == before
     assert transitions == []
+    bootstrap.close()
+
+
+def test_full_inventory_rejects_non_text_work_id_before_sort_without_mutation(
+    tmp_path: Path,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    stored = list(
+        _seed_work(journal, _ready_event(10), ready_revision=1, ready_ordinal=0)
+    )
+    stored[1] = b"non-text-work-id"
+    stored[9] = 1
+    with sqlite3.connect(bootstrap.database_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "INSERT INTO NioIngestWork VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            stored,
+        )
+        assert connection.execute(
+            "SELECT typeof(work_id) FROM NioIngestWork WHERE typeof(work_id) <> 'text'"
+        ).fetchone() == ("blob",)
+    before = _raw_delivery_graph(bootstrap.database_path)
+    owner = journal.load_owner()
+
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_task3_work_inventory(owner)
+
+    assert _raw_delivery_graph(bootstrap.database_path) == before
     bootstrap.close()
 
 

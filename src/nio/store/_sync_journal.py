@@ -108,6 +108,10 @@ def _hydration_final_total(storage, releases) -> int:  # type: ignore[no-untyped
 type _DeliveryMember = tuple[
     tuple[int, int, str], tuple[object, ...], EventRecord | LossRecord
 ]
+type _DeliveryLoadedMember = tuple[
+    *_DeliveryMember,
+    AuthenticatedWork,
+]
 _DELIVERY_COLUMNS = tuple(f"delivery_{name}" for name in DeliveryState._fields)
 _DELIVERY_UPDATE = (
     "UPDATE NioIngestMeta SET revision = ?, "
@@ -343,11 +347,27 @@ class SqliteIngestionJournal(JournalRows):
     def _delivery_snapshot(self):  # type: ignore[no-untyped-def]
         row = self._meta()
         owner = self._decode_owner_row(cast("Mapping[str, object]", row))
+        state = _decode_delivery_state(row, owner)
+        work_count = self._load_delivery_work_count()
+        loaded = self._load_delivery_work(owner, state.outstanding_work_id)
+        member: _DeliveryLoadedMember | None = None
+        if loaded is not None and loaded[1].status == "ready":
+            storage, work = loaded
+            member = cast(
+                "_DeliveryLoadedMember",
+                (
+                    (storage[8], storage[9], storage[1]),
+                    storage,
+                    work.value,
+                    work,
+                ),
+            )
         return (
             tuple(row),
             owner,
-            _decode_delivery_state(row, owner),
-            self._load_task3_work_inventory(owner),
+            state,
+            member,
+            work_count,
         )
 
     def _delivery_cas(
@@ -372,12 +392,14 @@ class SqliteIngestionJournal(JournalRows):
         if cursor.rowcount != 1:
             raise JournalConflictError(f"{label} failed")
 
-    def _delivery_writer_snapshot(self, meta, inventory):  # type: ignore[no-untyped-def]
+    def _delivery_writer_snapshot(  # type: ignore[no-untyped-def]
+        self, meta, member, work_count
+    ):
         try:
             current = self._delivery_snapshot()
         except JournalIntegrityError as error:
             raise JournalConflictError("delivery snapshot changed") from error
-        if current[0] != meta or current[3].storage_rows != inventory.storage_rows:
+        if current[0] != meta or current[3] != member or current[4] != work_count:
             raise JournalConflictError("delivery snapshot changed")
         return current
 
@@ -385,13 +407,12 @@ class SqliteIngestionJournal(JournalRows):
         self,
         owner: OwnerView,
         state: DeliveryState,
-        inventory: _Task3WorkInventory,
-    ) -> tuple[SyncBatch, tuple[object, ...]]:
+        member: _DeliveryLoadedMember | None,
+    ) -> tuple[SyncBatch, tuple[object, ...], AuthenticatedWork]:
         work_id, ready_revision, ordinal, digest = cast(
             "tuple[str, int, int, bytes]", state[2:]
         )
-        member = _ready_member(inventory, (ready_revision, ordinal, work_id))
-        if member is None:
+        if member is None or member[0] != (ready_revision, ordinal, work_id):
             raise JournalIntegrityError("claimed Work is missing or moved")
         batch = batch_from_records(
             account_id=owner.account_id,
@@ -404,7 +425,7 @@ class SqliteIngestionJournal(JournalRows):
         )
         if not hmac.compare_digest(batch.ref.sha256, digest):
             raise JournalIntegrityError("claimed Work does not match batch digest")
-        return batch, member[1]
+        return batch, member[1], member[3]
 
     def _load_batch_settlement(
         self,
@@ -414,7 +435,7 @@ class SqliteIngestionJournal(JournalRows):
             raise LocalProtocolError("settlement batch must be a SyncBatch")
         _validate_batch(batch)
         with self._read():
-            _meta, owner, state, inventory = self._delivery_snapshot()
+            _meta, owner, state, member, _work_count = self._delivery_snapshot()
             if batch.ref.stream_id != owner.stream_id:
                 raise LocalProtocolError("settlement batch stream is invalid")
             outstanding = state.outstanding_work_id is not None
@@ -430,14 +451,9 @@ class SqliteIngestionJournal(JournalRows):
                 return None
             if not outstanding or batch.ref.sequence != state.next_sequence - 1:
                 raise LocalProtocolError("settlement batch is not FIFO")
-            expected_batch, storage = self._replay_batch(owner, state, inventory)
+            expected_batch, _storage, work = self._replay_batch(owner, state, member)
             if batch != expected_batch:
                 raise ingest_errors.BatchIntegrityError("outstanding batch changed")
-            try:
-                index = inventory.storage_rows.index(storage)
-            except ValueError as error:
-                raise JournalIntegrityError("settlement Work disappeared") from error
-            work = inventory.work[index]
             room: RoomAggregateValue | None = None
             if type(work.value) is EventRecord and work.value.room_id is not None:
                 loaded = self._load_room_aggregate(owner, work.value.room_id)
@@ -486,10 +502,9 @@ class SqliteIngestionJournal(JournalRows):
         ):
             raise LocalProtocolError("delivery limits are invalid")
         with self._read():
-            meta, owner, state, inventory = self._delivery_snapshot()
+            meta, owner, state, member, work_count = self._delivery_snapshot()
             if state.outstanding_work_id is not None:
-                return self._replay_batch(owner, state, inventory)[0]
-            member = _ready_member(inventory)
+                return self._replay_batch(owner, state, member)[0]
             if member is None:
                 return None
             if SQLITE_INT_MAX in (owner.revision, state.next_sequence):
@@ -515,9 +530,7 @@ class SqliteIngestionJournal(JournalRows):
             )
 
         with self._transaction():
-            current = self._delivery_writer_snapshot(meta, inventory)
-            if _ready_member(current[3]) != member:
-                raise JournalConflictError("delivery claim snapshot changed")
+            self._delivery_writer_snapshot(meta, member, work_count)
             self._delivery_cas("delivery_claim_meta_cas", owner, state, successor)
             self._transition_hook("before_commit")
         self._transition_hook("commit")
@@ -527,10 +540,10 @@ class SqliteIngestionJournal(JournalRows):
         if type(ref) is not BatchRef:
             raise LocalProtocolError("acknowledgement must be a BatchRef")
         with self._read():
-            meta, owner, state, inventory = self._delivery_snapshot()
+            meta, owner, state, member, work_count = self._delivery_snapshot()
             outstanding = state.outstanding_work_id is not None
             if outstanding:
-                batch, storage = self._replay_batch(owner, state, inventory)
+                batch, storage, _work = self._replay_batch(owner, state, member)
             if ref.stream_id != owner.stream_id:
                 raise LocalProtocolError("acknowledgement stream is invalid")
             acknowledged = state.acknowledged_sha256
@@ -554,7 +567,7 @@ class SqliteIngestionJournal(JournalRows):
             )
 
         with self._transaction():
-            self._delivery_writer_snapshot(meta, inventory)
+            self._delivery_writer_snapshot(meta, member, work_count)
             cursor = self._transition_execute(
                 "delivery_work_delete",
                 "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",

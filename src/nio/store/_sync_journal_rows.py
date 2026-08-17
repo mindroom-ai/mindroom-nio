@@ -1609,6 +1609,252 @@ class JournalRows:
             )
         )
 
+    def _validate_task3_work_row(
+        self,
+        owner: OwnerView,
+        row: tuple[object, ...],
+    ) -> None:
+        try:
+            (
+                account_id,
+                work_id,
+                kind,
+                status,
+                raw_frame_id,
+                room_id,
+                membership_epoch,
+                room_sequence,
+                ready_revision,
+                ready_ordinal,
+                created_revision,
+                payload,
+                digest,
+            ) = row
+            if (
+                account_id != self.account_id
+                or type(work_id) is not str
+                or work_id != str(UUID(work_id))
+                or type(raw_frame_id) is not str
+                or raw_frame_id != str(UUID(raw_frame_id))
+                or kind not in ("event", "loss")
+                or status not in ("ready", "held")
+                or type(created_revision) is not int
+                or not 1 <= created_revision <= owner.revision
+                or type(payload) is not bytes
+                or not 0 < len(payload) <= _MAX_WORK_PAYLOAD_BYTES
+                or type(digest) is not bytes
+                or len(digest) != 32
+            ):
+                raise ValueError("Work columns are invalid")
+            if status == "ready":
+                if (
+                    type(ready_revision) is not int
+                    or not created_revision <= ready_revision <= owner.revision
+                    or type(ready_ordinal) is not int
+                    or ready_ordinal < 0
+                ):
+                    raise ValueError("READY Work columns are invalid")
+            elif (
+                kind != "event"
+                or type(room_id) is not str
+                or not room_id
+                or type(membership_epoch) is not int
+                or membership_epoch < 0
+                or type(room_sequence) is not int
+                or room_sequence < 0
+                or ready_revision is not None
+                or ready_ordinal is not None
+            ):
+                raise ValueError("HELD Work columns are invalid")
+        except (AttributeError, TypeError, ValueError) as error:
+            raise JournalIntegrityError("invalid Work row") from error
+
+    def _decode_task3_work_row(
+        self,
+        owner: OwnerView,
+        row: tuple[object, ...],
+    ) -> AuthenticatedWork:
+        self._validate_task3_work_row(owner, row)
+        (
+            _account_id,
+            work_id,
+            kind,
+            status,
+            raw_frame_id,
+            room_id,
+            membership_epoch,
+            room_sequence,
+            ready_revision,
+            ready_ordinal,
+            created_revision,
+            payload,
+            digest,
+        ) = row
+        local_header_invalid = False
+        try:
+            plaintext = self._payload(
+                owner,
+                "NioIngestWork",
+                payload,
+                digest,
+                header=_canonical_internal(row[1:11]),
+            )
+            decoded = _decode_work_plaintext(
+                owner.stream_id,
+                work_id,
+                kind,
+                plaintext,
+            )
+            value = decoded.value
+            origin = value.origin
+            if type(origin) is RecordOrigin:
+                valid_origin = (
+                    origin.transport is owner.transport_kind
+                    and min(
+                        origin.source_epoch,
+                        origin.request_id,
+                        origin.frame_index,
+                    )
+                    >= 0
+                )
+            elif type(origin) is SystemOrigin:
+                valid_origin = (
+                    type(value) is EventRecord
+                    and origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
+                    and value.kind is RecordKind.ROOM_LIFECYCLE
+                    and status == "ready"
+                    and raw_frame_id == str(origin.operation_id)
+                    and decoded.metadata is None
+                )
+                local_header_invalid = valid_origin and (
+                    ready_revision != created_revision or ready_ordinal != 0
+                )
+            else:
+                valid_origin = False
+            if not valid_origin:
+                raise ValueError("Work origin is invalid")
+            if type(value) is LossRecord:
+                if (
+                    status != "ready"
+                    or not value.room_id
+                    or value.membership_epoch < 0
+                    or (value.room_id, value.membership_epoch, None)
+                    != (room_id, membership_epoch, room_sequence)
+                    or value.detail_json != b"{}"
+                ):
+                    raise ValueError("READY loss Work value is invalid")
+            elif type(value) is EventRecord:
+                room_value = (
+                    value.room_id,
+                    value.membership_epoch,
+                    value.room_sequence,
+                )
+                room_kinds = (
+                    RecordKind.STATE,
+                    RecordKind.TIMELINE,
+                    RecordKind.EPHEMERAL,
+                    RecordKind.ROOM_ACCOUNT_DATA,
+                )
+                if decoded.metadata is None and (
+                    value.event_id is not None or value.clear_json is not None
+                ):
+                    raise ValueError("Work event value is invalid")
+                if status == "held":
+                    valid = value.kind in room_kinds and room_value == (
+                        room_id,
+                        membership_epoch,
+                        room_sequence,
+                    )
+                elif value.room_id is None:
+                    valid = value.kind in (
+                        RecordKind.GLOBAL_ACCOUNT_DATA,
+                        RecordKind.PRESENCE,
+                        *(
+                            (RecordKind.TO_DEVICE,)
+                            if decoded.metadata is not None
+                            else ()
+                        ),
+                    ) and room_value == (None, None, None)
+                else:
+                    valid = (
+                        bool(value.room_id)
+                        and value.membership_epoch is not None
+                        and value.membership_epoch >= 0
+                        and value.room_sequence is not None
+                        and value.room_sequence >= 0
+                        and value.kind in (*room_kinds, RecordKind.ROOM_LIFECYCLE)
+                        and room_value == (room_id, membership_epoch, room_sequence)
+                    )
+                if not valid or (
+                    (value.kind is RecordKind.TIMELINE)
+                    != (value.provenance is not None)
+                ):
+                    raise ValueError("Work event value is invalid")
+            else:
+                raise ValueError("unsupported Work value")
+        except (TypeError, ValueError) as error:
+            raise JournalIntegrityError("invalid Work value") from error
+        if local_header_invalid:
+            raise JournalIntegrityError("local READY Work header is invalid")
+        return AuthenticatedWork(
+            value,
+            cast("Literal['ready', 'held']", status),
+            len(payload),
+            decoded.metadata,
+            plaintext,
+            UUID(raw_frame_id),
+            created_revision,
+        )
+
+    def _load_delivery_work(
+        self,
+        owner: OwnerView,
+        work_id: str | None,
+    ) -> tuple[tuple[object, ...], AuthenticatedWork] | None:
+        foreign = self._execute(  # type: ignore[attr-defined]
+            "SELECT account_id FROM NioIngestWork WHERE account_id < ? "
+            "UNION ALL SELECT account_id FROM NioIngestWork WHERE account_id > ? "
+            "LIMIT 1",
+            (self.account_id, self.account_id),
+        ).fetchone()
+        if foreign is not None:
+            raise JournalIntegrityError("invalid Work row")
+        columns = (
+            "account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload, payload_sha256 "
+        )
+        if work_id is None:
+            row = self._execute(  # type: ignore[attr-defined]
+                f"SELECT {columns}FROM NioIngestWork "
+                "WHERE account_id = ? AND status = 'ready' "
+                "ORDER BY ready_revision, ready_ordinal, work_id LIMIT 1",
+                (self.account_id,),
+            ).fetchone()
+        else:
+            row = self._execute(  # type: ignore[attr-defined]
+                f"SELECT {columns}FROM NioIngestWork "
+                "WHERE account_id = ? AND work_id = ? LIMIT 1",
+                (self.account_id, work_id),
+            ).fetchone()
+        if row is None:
+            return None
+        stored = tuple(row)
+        return stored, self._decode_task3_work_row(owner, stored)
+
+    def _load_delivery_work_count(self) -> int:
+        row = self._execute(  # type: ignore[attr-defined]
+            "SELECT COUNT(*) FROM NioIngestWork"
+        ).fetchone()
+        if (
+            row is None
+            or len(row) != 1
+            or type(row[0]) is not int
+            or not 0 <= row[0] <= _MAX_TOTAL_WORK_COUNT
+        ):
+            raise JournalIntegrityError("total Work exceeds immutable capacity")
+        return row[0]
+
     def _load_task3_work_inventory(
         self,
         owner: OwnerView,
@@ -1623,62 +1869,9 @@ class JournalRows:
         payload_bytes = 0
         while (fetched := cursor.fetchone()) is not None:
             row = tuple(fetched)
-            try:
-                (
-                    account_id,
-                    work_id,
-                    kind,
-                    status,
-                    raw_frame_id,
-                    room_id,
-                    membership_epoch,
-                    room_sequence,
-                    ready_revision,
-                    ready_ordinal,
-                    created_revision,
-                    payload,
-                    digest,
-                ) = row
-                if (
-                    account_id != self.account_id
-                    or type(work_id) is not str
-                    or work_id != str(UUID(work_id))
-                    or type(raw_frame_id) is not str
-                    or raw_frame_id != str(UUID(raw_frame_id))
-                    or kind not in ("event", "loss")
-                    or status not in ("ready", "held")
-                    or type(created_revision) is not int
-                    or not 1 <= created_revision <= owner.revision
-                    or type(payload) is not bytes
-                    or not 0 < len(payload) <= _MAX_WORK_PAYLOAD_BYTES
-                    or type(digest) is not bytes
-                    or len(digest) != 32
-                ):
-                    raise ValueError("Work columns are invalid")
-                if status == "ready":
-                    if (
-                        type(ready_revision) is not int
-                        or not created_revision <= ready_revision <= owner.revision
-                        or type(ready_ordinal) is not int
-                        or ready_ordinal < 0
-                    ):
-                        raise ValueError("READY Work columns are invalid")
-                elif (
-                    kind != "event"
-                    or type(room_id) is not str
-                    or not room_id
-                    or type(membership_epoch) is not int
-                    or membership_epoch < 0
-                    or type(room_sequence) is not int
-                    or room_sequence < 0
-                    or ready_revision is not None
-                    or ready_ordinal is not None
-                ):
-                    raise ValueError("HELD Work columns are invalid")
-            except (AttributeError, TypeError, ValueError) as error:
-                raise JournalIntegrityError("invalid Work row") from error
+            self._validate_task3_work_row(owner, row)
             storage_rows.append(row)
-            payload_bytes += len(payload)
+            payload_bytes += len(cast("bytes", row[11]))
             if (
                 len(storage_rows) > _MAX_TOTAL_WORK_COUNT
                 or payload_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
@@ -1686,125 +1879,7 @@ class JournalRows:
                 break
 
         storage_rows.sort(key=lambda row: cast("str", row[1]))
-        canonical_bytes = 0
-        work: list[AuthenticatedWork] = []
-        for row in storage_rows:
-            local_header_invalid = False
-            try:
-                plaintext = self._payload(
-                    owner,
-                    "NioIngestWork",
-                    row[11],
-                    row[12],
-                    header=_canonical_internal(row[1:11]),
-                )
-                decoded = _decode_work_plaintext(
-                    owner.stream_id,
-                    cast("str", row[1]),
-                    cast("str", row[2]),
-                    plaintext,
-                )
-                value = decoded.value
-                origin = value.origin
-                if type(origin) is RecordOrigin:
-                    valid_origin = (
-                        origin.transport is owner.transport_kind
-                        and min(
-                            origin.source_epoch,
-                            origin.request_id,
-                            origin.frame_index,
-                        )
-                        >= 0
-                    )
-                elif type(origin) is SystemOrigin:
-                    valid_origin = (
-                        type(value) is EventRecord
-                        and origin.kind is SystemOriginKind.MEMBERSHIP_CHANGE
-                        and value.kind is RecordKind.ROOM_LIFECYCLE
-                        and row[3] == "ready"
-                        and row[4] == str(origin.operation_id)
-                        and decoded.metadata is None
-                    )
-                    local_header_invalid = valid_origin and (
-                        row[8] != row[10] or row[9] != 0
-                    )
-                else:
-                    valid_origin = False
-                if not valid_origin:
-                    raise ValueError("Work origin is invalid")
-                if type(value) is LossRecord:
-                    if (
-                        row[3] != "ready"
-                        or not value.room_id
-                        or value.membership_epoch < 0
-                        or (value.room_id, value.membership_epoch, None)
-                        != tuple(row[5:8])
-                        or value.detail_json != b"{}"
-                    ):
-                        raise ValueError("READY loss Work value is invalid")
-                elif type(value) is EventRecord:
-                    room_value = (
-                        value.room_id,
-                        value.membership_epoch,
-                        value.room_sequence,
-                    )
-                    room_kinds = (
-                        RecordKind.STATE,
-                        RecordKind.TIMELINE,
-                        RecordKind.EPHEMERAL,
-                        RecordKind.ROOM_ACCOUNT_DATA,
-                    )
-                    if decoded.metadata is None and (
-                        value.event_id is not None or value.clear_json is not None
-                    ):
-                        raise ValueError("Work event value is invalid")
-                    if row[3] == "held":
-                        valid = value.kind in room_kinds and room_value == tuple(
-                            row[5:8]
-                        )
-                    elif value.room_id is None:
-                        valid = value.kind in (
-                            RecordKind.GLOBAL_ACCOUNT_DATA,
-                            RecordKind.PRESENCE,
-                            *(
-                                (RecordKind.TO_DEVICE,)
-                                if decoded.metadata is not None
-                                else ()
-                            ),
-                        ) and room_value == (None, None, None)
-                    else:
-                        valid = (
-                            bool(value.room_id)
-                            and value.membership_epoch is not None
-                            and value.membership_epoch >= 0
-                            and value.room_sequence is not None
-                            and value.room_sequence >= 0
-                            and value.kind in (*room_kinds, RecordKind.ROOM_LIFECYCLE)
-                            and room_value == tuple(row[5:8])
-                        )
-                    if not valid or (
-                        (value.kind is RecordKind.TIMELINE)
-                        != (value.provenance is not None)
-                    ):
-                        raise ValueError("Work event value is invalid")
-                else:
-                    raise ValueError("unsupported Work value")
-            except (TypeError, ValueError) as error:
-                raise JournalIntegrityError("invalid Work value") from error
-            if local_header_invalid:
-                raise JournalIntegrityError("local READY Work header is invalid")
-            work.append(
-                AuthenticatedWork(
-                    value,
-                    cast("Literal['ready', 'held']", row[3]),
-                    len(cast("bytes", row[11])),
-                    decoded.metadata,
-                    plaintext,
-                    UUID(cast("str", row[4])),
-                    cast("int", row[10]),
-                )
-            )
-            canonical_bytes += len(cast("bytes", row[11]))
+        work = tuple(self._decode_task3_work_row(owner, row) for row in storage_rows)
         held = tuple(item for item in work if item.status == "held")
         if (
             len(held) > _MAX_HELD_WORK_COUNT
@@ -1814,10 +1889,10 @@ class JournalRows:
             raise JournalIntegrityError("HELD Work exceeds immutable capacity")
         if (
             len(storage_rows) > _MAX_TOTAL_WORK_COUNT
-            or canonical_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
+            or payload_bytes > _MAX_TOTAL_WORK_CANONICAL_BYTES
         ):
             raise JournalIntegrityError("total Work exceeds immutable capacity")
-        return _Task3WorkInventory(tuple(storage_rows), tuple(work))
+        return _Task3WorkInventory(tuple(storage_rows), work)
 
     def _load_room_aggregate(
         self,
