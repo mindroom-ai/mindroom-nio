@@ -603,6 +603,10 @@ class IngestionSession:
     def _signal_progress(self) -> None:
         """Public sessions have no progress waiters."""
 
+    def _signal_durable_progress(self) -> None:
+        """Public sessions have no private durable-progress observer."""
+        self._signal_progress()
+
     async def run(self) -> None:
         self._client._assert_ingestion_not_poisoned()
         if self._close_task is not None:
@@ -699,7 +703,7 @@ class IngestionSession:
                 )
                 hydration_retries = 0
                 if committed is not None:
-                    self._signal_progress()
+                    self._signal_durable_progress()
                 continue
             hydration_retries = 0
             # fmt: on
@@ -995,6 +999,7 @@ class _OwnedIngestionSession(IngestionSession):
         self._settlement_task: asyncio.Task[object] | None = None
         self._local_membership_command: _LocalMembershipCommand | None = None
         self._progress_generation = 0
+        self._durable_progress_generation = 0
         self._progress_event = asyncio.Event()
         self._detached = False
         self._revoked = False
@@ -1117,7 +1122,7 @@ class _OwnedIngestionSession(IngestionSession):
                 limits=limits,
             )
             if result.status is MaterializeStatus.MATERIALIZED:
-                self._signal_progress()
+                self._signal_durable_progress()
             return result
         except BaseException:
             if preparation_started:
@@ -1546,6 +1551,7 @@ class _OwnedIngestionSession(IngestionSession):
             if apply_started:
                 self._client._poison_ingestion()
             raise
+        self._signal_durable_progress()
         return True
 
     async def _advance_local_membership_intent(self) -> bool:
@@ -1597,7 +1603,7 @@ class _OwnedIngestionSession(IngestionSession):
                 if not command.completion.done():
                     command.completion.set_result(True)
                 self._local_membership_command = None
-                self._signal_progress()
+                self._signal_durable_progress()
                 return True
         if len(pending) != 1:
             raise JournalIntegrityError("multiple local membership intents are pending")
@@ -1692,7 +1698,7 @@ class _OwnedIngestionSession(IngestionSession):
                         command.completion.set_result(False)
                     self._local_membership_command = None
                     command = None
-                self._signal_progress()
+                self._signal_durable_progress()
                 return True
             retries += 1
             delay = (
@@ -1751,8 +1757,12 @@ class _OwnedIngestionSession(IngestionSession):
             if not command.completion.done():
                 command.completion.set_result(True)
             self._local_membership_command = None
-        self._signal_progress()
+        self._signal_durable_progress()
         return True
+
+    def _signal_durable_progress(self) -> None:
+        self._durable_progress_generation += 1
+        self._signal_progress()
 
     def _signal_progress(self) -> None:
         self._progress_generation += 1
@@ -1822,7 +1832,7 @@ class _OwnedIngestionSession(IngestionSession):
                 settlement = self._journal._load_batch_settlement(batch)
                 if settlement is None:
                     self._journal.acknowledge_batch(batch.ref)
-                    self._signal_progress()
+                    self._signal_durable_progress()
                     return
 
                 work, room = settlement
@@ -2492,7 +2502,7 @@ class _OwnedIngestionSession(IngestionSession):
                 if self._close_task is not None or self._closed:
                     raise LocalProtocolError("ingestion session is closed")
                 self._journal.acknowledge_batch(batch.ref)
-                self._signal_progress()
+                self._signal_durable_progress()
             finally:
                 self._settlement_task = None
 
@@ -2503,7 +2513,7 @@ class _OwnedIngestionSession(IngestionSession):
         if self._settlement_task is not None:
             raise LocalProtocolError("cannot acknowledge during settlement")
         self._journal.acknowledge_batch(ref)
-        self._signal_progress()
+        self._signal_durable_progress()
 
     def _publish_local_membership_transition(
         self,

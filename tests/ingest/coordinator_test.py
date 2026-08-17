@@ -2874,6 +2874,83 @@ async def test_owned_materializer_enforces_exact_authenticated_prepared_frame_ca
 
 
 @pytest.mark.asyncio
+async def test_owned_progress_generation_excludes_enqueue_only_membership_command(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    transition = asyncio.create_task(
+        session._run_local_membership_transition(
+            operation_id=uuid4(),
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+    )
+    try:
+        durable_before = session._durable_progress_generation
+        waiter_before = session._progress_generation
+        await asyncio.sleep(0)
+
+        assert session._progress_generation == waiter_before + 1
+        assert session._durable_progress_generation == durable_before
+        assert session._journal._load_pending_local_membership_intents(limit=1) == ()
+    finally:
+        transition.cancel()
+        await asyncio.gather(transition, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_durable_progress_generation_advances_after_commits(
+    tmp_path,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    event_source = {
+        "content": {"value": "durable-progress"},
+        "type": "org.example.task9.progress",
+    }
+    try:
+        stage_classic(
+            bootstrap,
+            {
+                "account_data": {"events": [event_source]},
+                "device_lists": {"changed": [], "left": []},
+                "device_one_time_keys_count": {
+                    "signed_curve25519": client.olm.account.max_one_time_keys,
+                },
+                "device_unused_fallback_key_types": [],
+                "next_batch": "s1",
+                "presence": {"events": []},
+                "rooms": {},
+                "to_device": {"events": []},
+            },
+        )
+        before = session._durable_progress_generation
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        assert session._durable_progress_generation == before + 1
+        batch = session.next_batch(max_records=1)
+        assert batch is not None
+        session.acknowledge_batch(batch.ref)
+        assert session._durable_progress_generation == before + 2
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_local_membership_intent_is_durable_before_http(
     tmp_path,
 ) -> None:
