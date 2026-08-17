@@ -481,9 +481,7 @@ def _expected_planned_stored_work_payload(
     )
 
 
-def test_stored_work_release_row_keeps_authenticated_identity_and_exact_envelope() -> (
-    None
-):
+def test_stored_work_release_row_keeps_authenticated_identity() -> None:
     """A release retains its authenticated frame and creation revision."""
 
     value = _event_record()
@@ -515,20 +513,100 @@ def test_stored_work_release_row_keeps_authenticated_identity_and_exact_envelope
         3,
         plaintext,
     )
-    expected = _expected_stored_work_payload(
-        account_id=_PLANNER_ACCOUNT_ID,
-        stream_id=_STREAM_ID,
-        transport_kind=TransportKind.CLASSIC,
-        frame_id=frame_id,
-        value=value,
-        status="ready",
-        ready_revision=11,
-        ready_ordinal=7,
-        created_revision=3,
+
+
+def test_materializer_release_preserves_authenticated_envelope_bytes(
+    tmp_path: Path,
+) -> None:
+    """A released HELD event keeps its original authenticated row identity."""
+
+    case = _prepare_materializer_atomicity_case(
+        tmp_path,
+        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
     )
-    assert journal_plan_module._stored_work_size(
-        (_PLANNER_ACCOUNT_ID, _STREAM_ID, TransportKind.CLASSIC), stored
-    ) == len(expected)
+    bootstrap = case.bootstrap
+    journal = bootstrap._journal
+    try:
+        first = case.first
+        first_normalized = case.first_normalized
+        assert first is not None
+        assert first_normalized is not None
+        held = EventRecord(
+            str(uuid5(first.frame_id, f"event:frame:{first.frame_id}:0")),
+            RecordKind.TIMELINE,
+            first_normalized.origin,
+            "!unsupported:example.org",
+            0,
+            0,
+            None,
+            TimelineEventProvenance.HISTORY,
+            b'{"content":{"body":"held","msgtype":"m.text"},'
+            b'"type":"m.room.message"}',
+            None,
+        )
+        owner_before = journal.load_owner()
+        release_revision = owner_before.revision + 1
+
+        assert _materialize(journal) == MaterializeResult(
+            MaterializeStatus.MATERIALIZED,
+            case.selected.frame_id,
+            release_revision,
+        )
+        row = next(row for row in _work_rows(journal) if row[0] == held.record_id)
+        expected_payload = _expected_plaintext_materializer_envelope(
+            row_kind="work",
+            owner=owner_before,
+            clear_fields=(
+                ("work_id", held.record_id),
+                ("kind", "event"),
+                ("status", "ready"),
+                ("frame_id", str(first.frame_id)),
+                ("room_id", "!unsupported:example.org"),
+                ("membership_epoch", 0),
+                ("room_sequence", 0),
+                ("ready_revision", release_revision),
+                ("ready_ordinal", 1),
+                ("created_revision", 2),
+            ),
+            value={
+                "kind": "event",
+                "value": {
+                    "clear_json": None,
+                    "event_id": None,
+                    "kind": "timeline",
+                    "membership_epoch": 0,
+                    "origin": {
+                        "frame_index": 0,
+                        "origin_type": "transport",
+                        "request_id": 0,
+                        "source_epoch": 0,
+                        "transport": "sliding",
+                    },
+                    "provenance": "history",
+                    "record_id": held.record_id,
+                    "record_type": "event",
+                    "room_id": "!unsupported:example.org",
+                    "room_sequence": 0,
+                    "source_json": base64.b64encode(held.source_json).decode("ascii"),
+                },
+            },
+        )
+        assert row[:10] == (
+            held.record_id,
+            "event",
+            "ready",
+            str(first.frame_id),
+            "!unsupported:example.org",
+            0,
+            0,
+            release_revision,
+            1,
+            2,
+        )
+        assert row[10] == expected_payload
+        assert row[11] == hashlib.sha256(expected_payload).digest()
+    finally:
+        bootstrap.close()
 
 
 def _pending_hydration_planner_case(
