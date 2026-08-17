@@ -10714,6 +10714,49 @@ async def test_owned_local_membership_idle_waits_for_durable_progress(
 
 
 @pytest.mark.asyncio
+async def test_runner_yields_before_synchronous_materialization_catchup(
+    tmp_path,
+) -> None:
+    backlog_size = 500
+    generation = uuid4()
+    bootstrap = open_bootstrap(tmp_path, generation)
+    client = RecordingClient()
+    session = nio.open_ingestion(
+        client,
+        bootstrap,
+        config=classic_config(),
+        consumer_generation=generation,
+        stream_id=bootstrap.stream_id,
+    )
+    frame_id = uuid4()
+    remaining = [
+        MaterializeResult(MaterializeStatus.MATERIALIZED, frame_id, revision)
+        for revision in range(1, backlog_size + 1)
+    ]
+
+    def materialize_synchronously(*, limits: MaterializerLimits) -> MaterializeResult:
+        assert limits == MaterializerLimits()
+        if remaining:
+            return remaining.pop()
+        return MaterializeResult(MaterializeStatus.AT_CAPACITY, frame_id, None)
+
+    session._materialize_oldest_frame = materialize_synchronously  # type: ignore[method-assign]
+    runner = asyncio.create_task(session.run())
+
+    async def competing_ready_task() -> int:
+        return len(remaining)
+
+    competing = asyncio.create_task(competing_ready_task())
+    try:
+        assert await asyncio.wait_for(competing, timeout=2) == backlog_size
+    finally:
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_runner_uses_private_materializer_in_fifo_order(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

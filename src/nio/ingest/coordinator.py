@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from asyncio import sleep as _cooperative_sleep
 from hashlib import sha256
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote, urlencode
@@ -643,6 +644,7 @@ class IngestionSession:
         hydration_retries = 0
         while self._close_task is None:
             while True:
+                await _cooperative_sleep(0)
                 materialized = self._materialize_oldest_frame(
                     limits=MaterializerLimits()
                 )
