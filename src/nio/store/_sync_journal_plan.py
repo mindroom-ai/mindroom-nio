@@ -34,7 +34,7 @@ from ..ingest.reducer import (
 )
 from ..ingest.serialization import _loss_id, _record_to_dict
 from ..ingest.source import SyncFrame
-from ._sync_journal_preflight import _canonical_internal, _row
+from ._sync_journal_format import _canonical_internal, _row
 from ._sync_journal_values import MaterializerLimits, RoomAggregateValue
 
 

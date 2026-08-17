@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import sqlite3
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
@@ -35,6 +34,11 @@ from ..ingest.serialization import (
 )
 from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES
 from ..ingest.state import OwnerView, SourceState, StagedFrame
+from ._sync_journal_format import (
+    _canonical_internal as _canonical_internal,
+)
+from ._sync_journal_format import _row as _row
+from ._sync_journal_format import _source_header as _source_header
 from ._sync_journal_plan import (
     AuthenticatedWork,
     _prepared_metadata_from_plaintext,
@@ -43,7 +47,7 @@ from ._sync_journal_plan import (
 from ._sync_journal_plan import (
     _canonical_work_plaintext as _canonical_work_plaintext,
 )
-from ._sync_journal_preflight import _row, _validate_source_cursor
+from ._sync_journal_preflight import _validate_source_cursor
 from ._sync_journal_values import (
     RoomAggregateValue,
     _LocalMembershipIntent,
@@ -143,15 +147,6 @@ _MAX_HELD_WORK_CANONICAL_BYTES = 32 * 1024 * 1024
 _MAX_TOTAL_WORK_COUNT = 20_000
 _MAX_TOTAL_WORK_CANONICAL_BYTES = 64 * 1024 * 1024
 _Owner = tuple[str, UUID, TransportKind]
-
-
-def _canonical_internal(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
 
 
 class _DecodedWork(NamedTuple):
@@ -1294,16 +1289,6 @@ def _frame_response_from_envelope(
             digest,
         ),
         quiesce_reserved,
-    )
-
-
-def _source_header(source: SourceState) -> bytes:
-    return _canonical_internal(
-        [
-            source.source_epoch,
-            source.next_request_id,
-            source.active,
-        ]
     )
 
 
