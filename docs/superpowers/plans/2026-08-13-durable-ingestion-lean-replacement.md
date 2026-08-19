@@ -4,12 +4,115 @@
 > `baspowers:test-driven-development` for every behavior change, and use
 > `baspowers:verification-before-completion` before any completion claim.
 
-**Status:** Tasks 1–8 complete and independently accepted. Task 9 is active:
-the first local run is supplementary shakeout evidence only. After its Desktop
-gate-failure list is empty—proving two hours, at least 100 responses, one clean
-restart, real authenticated callbacks, and every zero-failure condition—stop
-it intentionally, close it as aborted-with-limitations, harden the external
-operator, and start a fresh authoritative local run. Task 10A is the
+**Status:** Tasks 1–8 complete and independently accepted. Task 9 is active.
+The restored Desktop gate passed separately. The user replaced the obsolete
+long-duration/tiny-message MindRoom observation with one hard 30-minute
+saturation gate. The first reviewed 16-lane attempt failed closed at its
+second loaded restart with 29 response owners still live. A diagnostic-only
+candidate then passed preflight, but its full attempt failed closed at the
+first restart after entering deferred response-owner cleanup; its aggregate
+snapshot was placed after that blocked await. Commit `18dfbdb` moves only the
+fixed-label integer snapshot before that await. Its fresh preflight produced an
+accepted 80/80 operator/sibling pair; the restart snapshot reported five
+`recovery_proof` plus six `response_execution` owners and cleanup completed.
+Its authorized full attempt then failed closed at restart 0. Bounded quiesce,
+sync cancellation, and bot stop completed, after which 32 owners remained: 15
+`recovery_proof`, 13 `response_execution`, and 4 `streaming_response`.
+Deferred cleanup did not return before the 60-second clean-stop bound. Commit
+`2bdfbfb` adds periodic count snapshots and fixed resource-release phase
+markers without changing cancellation, proof, release, or timeout behavior.
+Its strict binding RED, product suites, complete 293-test load suite, frozen
+70-test reuse suite, static checks, exact wheel/venv identity, and independent
+product review pass. Independent bundle review authorized one preflight, but it
+failed before stack creation when a transient later reuse of an archived
+Desktop PID triggered the replay tool's raw `/proc`-existence guard. The
+diagnostic product candidate did not run. A strict harness-only correction now
+compares boot-relative process start time with the sealed generation stop time,
+still failing closed for the original lifetime, invalid clock data, or any
+unreadable live/global state; only disappearance during the per-PID stat read
+proves absence. Both operator and sibling bind the corrected replay source.
+The focused PID/replay tests, complete 293-test load suite, frozen 70-test reuse
+suite, Ruff, compileall, and exact installed-candidate verifier pass after the
+final rebind. That failed launch is consumed and produced no verdict;
+independent review then authorized one replacement preflight. The replacement
+at `runs/preflight-20260819T031210Z` produced an accepted 96/96
+operator/sibling pair with one loaded restart, final Work zero, COMPLETE
+four-phase durable evidence, and absent recorded processes/Compose scope. No
+additional preflight is authorized. Independent review found no findings and
+authorized exactly one fresh 16-lane/30-minute full run. That authorization
+was consumed by `runs/full-20260819T033127Z`, which failed closed at its first
+loaded restart. Quiesce, sync cancellation, and bounded bot stop completed;
+periodic fixed-count diagnostics then showed 14 bots leave recovery proof while
+two remained in journal-dispatcher release until the external 60-second stop
+deadline. The exact trace localized both to cancellation while awaiting queued
+pre-model agent construction on the shared default executor. MindRoom commit
+`258216c` moves that construction to a lazy bounded four-worker executor and
+retains the raw concurrent future: queued work cancels atomically, while
+already-running work keeps the prior cancellation-resistant join and cleanup.
+Focused product suites, the 202-test journal selection, 121-test shutdown
+selection, complete 293-test load suite, frozen 70-test reuse suite, static
+checks, exact wheel/venv verifier, and independent product review pass. The
+load operator and sibling are rebound. Independent static review authorized
+one short preflight; `runs/preflight-20260819T041151Z` produced an accepted
+85/85 operator/sibling pair, crossed its loaded restart in 12.55 seconds,
+completed exact drain with final Work zero, and left all recorded processes
+absent. Independent accepted-pair review authorized exactly one full run. That
+authorization was consumed by `runs/full-20260819T042710Z`, which failed closed
+at its first loaded restart. Fifteen `bot_stop` phases started, fourteen
+completed, and all sixteen bots emitted the expected typed bounded-response
+timeout; no pre-deferred/deferred owner snapshot, stopped-bot event, or
+queued-build cancellation appeared before the external stop deadline. The
+isolated project and recorded processes are absent, and no full verdict exists.
+Commit `9c9739b` adds only fixed resource-release phases for every ordinary and
+deferred stop plus periodic count-only observation around the unchanged initial
+bot-stop gather. It preserves first/second cancellation behavior and changes no
+timeout, cleanup, proof, ownership, or journal predicate. Strict TDD, the full
+affected shutdown modules, explicit typing/static checks, the 293-test load
+suite, 70-test frozen suite, exact wheel/venv verifier, and independent product
+review pass. The harness is rebound, and independent review of the stable
+seven-file diagnostic bundle found no finding and authorized exactly one fresh
+non-authoritative 90-second preflight. That authorization was consumed by
+`runs/preflight-20260819T050105Z`, which produced an accepted 96/96
+operator/sibling pair, crossed one loaded restart, reached final Work and
+outstanding zero with COMPLETE four-phase durable evidence, and left all
+recorded processes/Compose scope absent. Independent accepted-pair review found
+no finding and authorized exactly one fresh 16-lane/30-minute full run. That
+authorization was consumed by `runs/full-20260819T051741Z`. The run sustained
+the 1,800-second load window and completed all three loaded restarts. Exact
+response drain reached zero after 935 samples, but the controller then waited
+for every source to poll again before draining the remaining 19 Frames/2,559
+Work. All 17 active source counters remained unchanged for five minutes and the
+run failed closed with `FAILED/observation/TimeoutError`; no full verdict exists
+and the isolated project/processes are absent. Harness TDD now preserves the
+final all-source proof after three spaced zero-backlog samples instead of before
+the backlog drain. The complete load suite passes 294 and frozen reuse passes
+70. Independent launch-readiness review authorized one refreshed preflight;
+`runs/preflight-20260819T062719Z` produced an accepted 96/96 operator/sibling
+pair with zero final outstanding/Work/failures, three spaced zero-backlog
+samples before final authenticated progress, COMPLETE four-phase durable
+evidence with three stable/usable snapshots, and absent processes/Compose
+scope. Independent accepted-pair review found no finding and authorizes exactly
+one fresh 16-lane/30-minute full run. That authorization was consumed by
+`runs/full-20260819T064702Z`, which failed closed at its first loaded restart.
+Source quiescence, sync cancellation, and bounded bot stop returned, but 35
+response owners remained through deferred cleanup: 15 `recovery_proof`, 7
+`response_execution`, and 13 `streaming_response`. The external 60-second
+clean-stop guard killed only the isolated process group; the isolated Compose
+scope and all recorded processes are absent. Archived count-only logs contain
+no sync-recovery delivery-retry marker. They do show repeated synchronous
+traceback rendering from process-cancelled response/stream diagnostics, typing
+retries on the already fenced transport, and exact shutdown-time coalescing
+admission refusal through the deadline. MindRoom commit `35b58dcb` removes
+traceback rendering only on those exact process-shutdown paths while preserving
+warnings, retries, durable failure handoff, ownership, and every deadline.
+Product TDD, complete affected suites, hooks, and independent product review
+pass. Candidate-binding TDD failed 9 selected cases against the prior identity
+and then passed all 80; the complete load suite passes 294, frozen reuse passes
+70, Ruff and compileall pass, and the exact active venv authenticates 802/79
+payloads with Coverage 7.15.2/CTracer. No live verdict exists for this
+candidate. No preflight, full run, deletion, or security action is authorized;
+deletion remains locked.
+Task 10A is the
 documentation consolidation captured by this file; the remaining Task 10 gates
 depend on Task 9.
 
@@ -236,14 +339,101 @@ canary-agent variable, new YAML setting, or production evidence hook.
 
 ### MindRoom observation gate
 
-Run one uninterrupted 24-hour interval that includes:
+Run one uninterrupted 30-minute saturation interval that includes:
 
-- at least 1,000 successful source polls;
-- three recorded clean process restarts;
+- sustained 16-lane load with the reviewed bounded outstanding window;
+- every scheduled loaded process restart;
+- exact-response drain followed by three spaced zero-Frame/Work samples, then
+  one final authenticated progress proof from every source;
 - zero duplicate visible effects;
 - zero unexplained event loss;
 - no permanently growing Frame/Work backlog;
 - external coverage showing zero execution of fork-recovery code.
+
+### Loaded-restart shutdown discriminator
+
+Before another live attempt, add fixed-label response-owner phase diagnostics.
+This is generic operational logging, not a canary product hook, and must not
+change cancellation, proof, cleanup, or timeout semantics.
+
+**Files:**
+
+- MindRoom create: `src/mindroom/response_shutdown_diagnostics.py`
+- MindRoom modify: `src/mindroom/response_runner.py`
+- MindRoom modify: `src/mindroom/delivery_gateway.py`
+- MindRoom modify: `src/mindroom/pre_model_preparation.py`
+- MindRoom modify: `src/mindroom/orchestrator.py`
+- MindRoom test: `tests/test_response_runner_focused.py`
+- MindRoom test: `tests/test_response_runner_team_streaming.py`
+- MindRoom test: `tests/test_pre_model_preparation.py`
+- MindRoom test: `tests/test_sync_task_cancellation.py`
+
+1. Write a failing real-response test that tracks a response blocked in
+   `prepare_prompt_branches()` and expects the runner's pending-owner aggregate
+   to report exactly `{"agent_preparation": 1}`. The mutation it catches is
+   losing the child-task phase while the outer runner retains ownership.
+2. Run that test and require failure because the phase surface does not exist.
+3. Add an event-loop-local phase trace inherited by child tasks. It stores only
+   fixed labels, uses nested tokens so the deepest active boundary wins, and is
+   retained with process-shutdown ownership until recovery is consumed.
+4. Mark real pre-model preparation with `agent_preparation`, streaming model
+   generation with `streaming_response`, and terminal publication with
+   `final_delivery`; retain a generic `response_execution` fallback for all
+   other live response work and `recovery_proof` for a terminal response's
+   live proof.
+5. Add failing orchestrator and real-bot tests that block deferred cleanup,
+   expect periodic fixed-label owner counts, and expose the exact current
+   release phase: recovery proof, router overdue tasks, journal dispatcher,
+   ingestion session, journal store, or Matrix client. The mutation they catch
+   is a deferred phase that retains ownership without identifying its current
+   awaited resource boundary.
+6. Emit the initial aggregate mapping synchronously after bounded bot stop and
+   periodic mappings while the single owned deferred gather remains pending.
+   Mark each real resource-release await with one fixed label, then clear the
+   marker after successful release. Retain the existing shared-journal warning
+   as a later check. Do not add identifiers, exception strings, stack frames,
+   prompt/model content, or a new evidence file.
+7. Run the focused response/pre-model/orchestrator tests, complete affected
+   shutdown suites, Ruff, compileall, `git diff --check`, and repository
+   pre-commit hooks. Independently review the fixed-label/privacy boundary
+   before rebuilding a candidate.
+8. Rebind the external Task 9 operator and sibling to the reviewed wheel, run
+   exactly one fresh preflight, and allow a new 30-minute attempt only after an
+   independently accepted pair. If the full gate fails again, the periodic
+   owner and resource-release phase snapshots are the sole authority for
+   selecting the next behavioral fix; do not weaken the 5-second preparation,
+   15-second finalization, durable proof, or resource-ownership gates.
+
+Result: the fixed-label snapshots localized one full-run failure to two
+`journal_dispatcher` releases waiting on queued pre-model agent construction.
+The reviewed `258216c` fix gives that construction a dedicated bounded executor
+and raw-future queued-cancellation boundary without changing any timeout or
+running-work ownership. Its exact operator/sibling rebind passed one reviewed
+85/85 preflight and the loaded restart. The separately reviewed full run then
+failed earlier, inside the initial `bot_stop` gather: that phase was the sole
+started-not-completed phase, but ordinary release subphases were not yet
+observable. The reviewed `9c9739b` diagnostic therefore applies the same fixed
+resource phases to every ordinary/deferred release and wraps the unchanged
+initial gather with periodic integer counts. The independently reviewed
+90-second preflight produced an accepted 96/96 pair. Separate accepted-pair
+review authorized one 16-lane/30-minute run. That run sustained the complete
+load/restart window and exact-response drain, then failed closed because the
+controller required final all-source progress before draining remaining
+durable Work. A strict harness RED reproduced the circular ordering. GREEN
+moves only that proof after three spaced zero-backlog samples; no threshold,
+timeout, product, or deletion predicate changed. The independently reviewed
+refreshed preflight then produced an accepted 96/96 operator/sibling pair and
+proved final source progress only after zero backlog. Separate accepted-pair
+review authorized exactly one fresh 16-lane/30-minute full run. The resulting
+`runs/full-20260819T064702Z` attempt failed closed at its first loaded restart
+with 35 retained response/proof owners and no full verdict. The fixed phase
+logs rule out the sync-recovery retry ladder and directly show synchronous
+process-shutdown traceback storms until the external stop deadline. The
+reviewed `35b58dcb` correction changes only traceback rendering/classification
+for those exact process-shutdown paths; all waits, retries, ownership, and
+deadlines remain unchanged. Its static harness rebind passes 80 selected and
+294 complete load tests plus 70 frozen reuse tests. No live run is authorized
+for the new candidate and deletion remains locked.
 
 ### Desktop observation gate
 

@@ -188,6 +188,59 @@ PREPARE -> HYDRATE_IF_REQUIRED -> WAIT_FOR_RECORD_ACK
 
 No rotation ledger is needed. The committed Source row and its frozen request are the authority.
 
+## Loaded-restart shutdown diagnostics
+
+Task 9's local saturation gate may fail closed while response tasks still own
+MindRoom runtime resources. Diagnose that boundary before changing executor,
+timeout, or cleanup behavior. Each runner-owned response carries an
+event-loop-local phase trace through child tasks. The trace exposes only one
+fixed phase label per owner; aggregate shutdown logs expose only label-to-count
+mappings. Prompts, Matrix identifiers, model inputs, exception text, task
+names, and coroutine stacks are never part of this diagnostic surface.
+
+The phase trace is diagnostic ownership state, not a cleanup escape hatch.
+Cancellation-resistant work remains owned until terminal, recovery proof
+requirements remain unchanged, and the 5-second preparation plus 15-second
+finalization budgets do not change. A deterministic test must first prove that
+a blocked real response boundary appears under the expected fixed phase. The
+initial aggregate snapshot must be emitted synchronously after bounded bot stop
+and before the first deferred response-owner await. While that single owned
+deferred gather remains pending, bounded periodic snapshots report only fixed
+integer owner counts and each bot's fixed resource-release phase: recovery
+proof, router overdue tasks, journal dispatcher, ingestion session, journal
+store, or Matrix client. A snapshot placed only at the later
+shared-journal-close warning cannot diagnose a deferred phase that exhausts the
+harness stop bound. The same fixed resource phases apply to ordinary and
+deferred release. The unchanged initial bot-stop gather also has a periodic
+count-only observer because it can retain ordinary releases before any bot is
+classified for deferred cleanup. That observer must preserve the existing
+first-cancellation shield, second-cancellation propagation, task ownership,
+and deadline behavior. Only the phase observed in a later failed gate may
+authorize a behavioral fix.
+
+The later loaded run completed source quiescence, sync cancellation, and
+bounded bot stop but retained 35 response/proof owners through the 60-second
+external clean-stop bound. Fixed count logs showed no sync-recovery
+delivery-retry marker. The directly observed hot boundary was repeated
+synchronous traceback rendering from process-marked response/stream
+cancellation, typing retries rejected by the already fenced transport, and
+exact shutdown-time coalescing admission refusal. The bounded correction may
+omit traceback formatting only for those exact process-shutdown cases while
+retaining warnings, typing retry, durable coalescing failure handoff, source
+ownership, cancellation provenance, and all existing deadlines. Ordinary
+cancellation and non-shutdown failures retain their existing traceback
+behavior. Static success does not authorize another live run or deletion.
+
+The diagnosed pre-model construction boundary distinguishes queued work from
+running work. Agent construction uses a dedicated bounded executor and retains
+the raw concurrent future. Shutdown may cancel a future only while the executor
+still owns it in the queue; successful cancellation proves the callable never
+started. If a worker wins that race, shutdown joins the existing work through
+repeated cancellation and closes any constructed agent not returned to its
+caller. This preserves resource ownership without allowing unrelated default-
+executor saturation to turn never-started construction into a clean-restart
+blocker.
+
 On reopening an existing Sliding stream, one journal transaction:
 
 - rotates writer and source epochs;
@@ -248,7 +301,24 @@ The Matrix event ID remains the semantic content identity, as it already is on m
    fork-recovery modules. There is no canary-agent environment switch, new YAML
    field, production evidence hook, or second sync-engine opt-in. A prior run
    with incomplete historical evidence remains supplementary and cannot count.
-5. **Delete legacy recovery:** only after MindRoom completes one uninterrupted 24-hour observation interval spanning at least 1,000 successful polls and three recorded process restarts, and desktop completes a two-hour/100-response soak with a restart and a real to-device callback; both must show zero fork-recovery execution, zero duplicate visible effects, zero unexplained loss, and no permanently growing backlog. Keep the upstream public API and repeat desktop regression/smoke coverage after deletion.
+   Frozen-process replay binds a recorded lifetime, not a PID number forever:
+   `/proc` boot-relative start time at or before the sealed stop remains live
+   and fails closed, a provably later start is ordinary PID reuse, and an
+   unreadable process or global boot-time source remains fail closed. Only a
+   per-PID stat record that disappears during its direct read proves absence;
+   malformed fields, missing boot time, and nonpositive clock ticks never
+   certify reuse.
+5. **Delete legacy recovery:** only after MindRoom completes one uninterrupted
+   30-minute saturation interval spanning the reviewed 16-lane bounded load and
+   every scheduled loaded process restart, and desktop completes a
+   two-hour/100-response soak with a restart and a real to-device callback;
+   both must show zero fork-recovery execution, zero duplicate visible effects,
+   zero unexplained loss, and no permanently growing backlog. Keep the upstream
+   public API and repeat desktop regression/smoke coverage after deletion. The
+   saturation controller must drain exact responses, prove three spaced
+   zero-Frame/Work samples, and only then require final authenticated progress
+   from every source; requiring that poll while durable catch-up still owns Work
+   creates a circular harness wait and is not an accepted observation.
 6. **Final review:** run complete verification and report exact line budgets and remaining compatibility surface before the linked PRs are proposed for merge.
 
 If observation fails, fix the durable path or restore Task 6's old-engine connections inside these linked branches before rerunning verification. The candidate has no hidden runtime fallback, and legacy source deletion is never based on forecasted confidence.
