@@ -433,7 +433,7 @@ def _expected_stored_work_payload(
         if type(value) is EventRecord
         else _expected_loss_work_plaintext(value)
     )
-    return _canonical_internal(
+    return json.dumps(
         {
             "schema_version": 1,
             "row_kind": "work",
@@ -455,8 +455,11 @@ def _expected_stored_work_payload(
             "ready_ordinal": ready_ordinal,
             "created_revision": created_revision,
             "value": json.loads(inner),
-        }
-    )
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _expected_planned_stored_work_payload(
