@@ -10606,6 +10606,52 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
 
 
 @pytest.mark.asyncio
+async def test_blocked_frame_probes_do_not_scan_unrelated_work_inventory(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = uuid4()
+    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    assert client.olm is not None
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    staged = stage_classic(
+        bootstrap,
+        {
+            "account_data": {
+                "events": [
+                    {
+                        "content": {"sequence": index},
+                        "type": "org.example.bounded-frame-probe",
+                    }
+                    for index in range(500)
+                ]
+            },
+            "next_batch": "s1",
+            "rooms": {},
+        },
+    )
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+
+    monkeypatch.setattr(
+        session._journal,
+        "_load_task3_work_inventory",
+        lambda *_args, **_kwargs: pytest.fail("blocked-frame probe scanned all Work"),
+    )
+    try:
+        assert session._journal._load_ready_outbound_maintenance() is None
+        assert session._journal._oldest_prepared_frame_has_work(staged.frame_id)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_owned_runner_hydrates_held_work_before_waiting_for_pump(
     tmp_path,
 ) -> None:

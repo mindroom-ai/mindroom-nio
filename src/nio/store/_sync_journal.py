@@ -258,6 +258,33 @@ class SqliteIngestionJournal(JournalRows):
     ) -> sqlite3.Cursor:
         return self._owner.database.execute_sql(statement, parameters)
 
+    def _load_frame_work(
+        self,
+        owner: OwnerView,
+        frame_id: UUID,
+    ) -> tuple[tuple[object, ...], AuthenticatedWork] | None:
+        if type(frame_id) is not UUID:
+            raise TypeError("Frame ID must be UUID")
+        foreign = self._execute(
+            "SELECT account_id FROM NioIngestWork WHERE account_id < ? "
+            "UNION ALL SELECT account_id FROM NioIngestWork WHERE account_id > ? "
+            "LIMIT 1",
+            (self.account_id, self.account_id),
+        ).fetchone()
+        if foreign is not None:
+            raise JournalIntegrityError("invalid Work row")
+        row = self._execute(
+            "SELECT account_id, work_id, kind, status, frame_id, room_id, "
+            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
+            "created_revision, payload, payload_sha256 FROM NioIngestWork "
+            "WHERE account_id = ? AND frame_id = ? LIMIT 1",
+            (self.account_id, str(frame_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        stored = tuple(row)
+        return stored, self._decode_task3_work_row(owner, stored)
+
     def _read(self):
         return self._owner.read()
 
@@ -1626,8 +1653,7 @@ class SqliteIngestionJournal(JournalRows):
         )
         if prepared is None:
             return None
-        inventory = self._load_task3_work_inventory(owner)
-        if any(work.frame_id == selected.frame_id for work in inventory.work):
+        if self._load_frame_work(owner, selected.frame_id) is not None:
             return None
         for index, operation in enumerate(prepared.outbound_maintenance.operations):
             if operation.state == "pending":
@@ -1793,8 +1819,7 @@ class SqliteIngestionJournal(JournalRows):
         )
         if prepared is None:
             return None
-        inventory = self._load_task3_work_inventory(owner)
-        if any(work.frame_id == selected.frame_id for work in inventory.work):
+        if self._load_frame_work(owner, selected.frame_id) is not None:
             return None
         if any(
             operation.state != "settled"
@@ -1822,8 +1847,7 @@ class SqliteIngestionJournal(JournalRows):
             self._authenticate_blocking_frame(owner, selected)
             if self._load_prepared_frame_with_owner(frame_id, owner) is None:
                 return False
-            inventory = self._load_task3_work_inventory(owner)
-            return any(work.frame_id == frame_id for work in inventory.work)
+            return self._load_frame_work(owner, frame_id) is not None
 
     def _completion_claim_is_ready(self) -> bool:
         with self._read():

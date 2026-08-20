@@ -930,6 +930,124 @@ def test_one_delivery_cycle_authenticates_constant_work_with_large_ready_invento
     bootstrap.close()
 
 
+def test_frame_work_lookup_authenticates_only_one_matching_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    bootstrap = _open(tmp_path, statement_observer=statements.append)
+    journal = bootstrap._journal
+    target_record = _ready_event(1)
+    target = _seed_work(
+        journal,
+        target_record,
+        ready_revision=1,
+        ready_ordinal=0,
+    )
+    for index in range(2, 502):
+        _seed_work(
+            journal,
+            _ready_event(index),
+            ready_revision=1,
+            ready_ordinal=index - 1,
+        )
+
+    decoded_work_ids: list[str] = []
+    real_decode = journal._decode_task3_work_row
+
+    def record_decode(owner: object, row: tuple[object, ...]) -> AuthenticatedWork:
+        decoded_work_ids.append(str(row[1]))
+        return real_decode(owner, row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(journal, "_decode_task3_work_row", record_decode)
+    owner = journal.load_owner()
+    statements.clear()
+
+    with journal._owner.read():
+        loaded = journal._load_frame_work(owner, UUID(str(target[4])))
+
+    assert loaded is not None
+    assert loaded[0] == target
+    assert loaded[1].value == target_record
+    assert decoded_work_ids == [target_record.record_id]
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert any(
+        "FROM NioIngestWork WHERE account_id = " in sql
+        and "AND frame_id = " in sql
+        and "LIMIT 1" in sql
+        for sql in selects
+    )
+    assert not any("FROM NioIngestWork LIMIT 20001" in sql for sql in selects)
+    bootstrap.close()
+
+
+def test_frame_work_lookup_returns_none_without_decoding_unrelated_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    for index in range(1, 51):
+        _seed_work(
+            journal,
+            _ready_event(index),
+            ready_revision=1,
+            ready_ordinal=index - 1,
+        )
+
+    monkeypatch.setattr(
+        journal,
+        "_decode_task3_work_row",
+        lambda *_args, **_kwargs: pytest.fail("unrelated Work was decoded"),
+    )
+    owner = journal.load_owner()
+    with journal._owner.read():
+        assert journal._load_frame_work(owner, UUID(int=9_999)) is None
+    bootstrap.close()
+
+
+def test_frame_work_lookup_rejects_corrupt_matching_row(tmp_path: Path) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    stored = _seed_work(
+        journal,
+        _ready_event(1),
+        ready_revision=1,
+        ready_ordinal=0,
+    )
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestWork SET payload = ? WHERE account_id = ? AND work_id = ?",
+            (_same_length_tamper(stored[11]), journal.account_id, stored[1]),
+        )
+
+    owner = journal.load_owner()
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_frame_work(owner, UUID(str(stored[4])))
+    bootstrap.close()
+
+
+def test_frame_work_lookup_rejects_foreign_account_work(tmp_path: Path) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    stored = _seed_work(
+        journal,
+        _ready_event(1),
+        ready_revision=1,
+        ready_ordinal=0,
+    )
+    with sqlite3.connect(bootstrap.database_path) as connection:
+        connection.execute(
+            "INSERT INTO NioIngestWork VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("@mallory:example.org", *stored[1:]),
+        )
+
+    owner = journal.load_owner()
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_frame_work(owner, UUID(str(stored[4])))
+    bootstrap.close()
+
+
 def test_claim_enforces_exact_caller_limits_before_writer(
     tmp_path: Path,
 ) -> None:
