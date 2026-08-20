@@ -4514,10 +4514,40 @@ def test_prepared_room_capacity_uses_final_wrapped_row_and_terminal_loss(
     )
 
 
-def test_materializer_ready_capacity_counts_final_stored_work_payload() -> None:
-    """RED: admission bytes are the complete durable Work row, not its value."""
+@dataclass(frozen=True)
+class _FinalRowCapacityCase:
+    case_id: str
+    status: str
+    limit_delta: int
+    plan_is_admitted: bool
+    loss_reason: LossReason | None
 
-    account_id = "@planner-outer:example.org"
+
+_FINAL_ROW_CAPACITY_CASES = (
+    _FinalRowCapacityCase("exact-final-ready-row", "ready", 0, True, None),
+    _FinalRowCapacityCase("one-over-final-ready-row", "ready", -1, False, None),
+    _FinalRowCapacityCase("exact-final-held-row", "held", 0, True, None),
+    _FinalRowCapacityCase(
+        "one-over-final-held-row",
+        "held",
+        -1,
+        True,
+        LossReason.EVENT_LIMIT,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _FINAL_ROW_CAPACITY_CASES,
+    ids=lambda case: case.case_id,
+)
+def test_materializer_final_ready_row_capacity_matrix(
+    case: _FinalRowCapacityCase,
+) -> None:
+    """Each named READY/HELD case owns its final Work-row byte boundary."""
+
+    account_id = "@matrix-final-ready:example.org"
     frame, aggregate, held = _pending_hydration_planner_case(
         global_ready_count=1,
         account_id=account_id,
@@ -4531,158 +4561,79 @@ def test_materializer_ready_capacity_counts_final_stored_work_payload() -> None:
     descriptor_index, descriptor = next(
         (index, descriptor)
         for index, descriptor in enumerate(proposal.descriptors)
-        if descriptor.room_id is None
+        if (descriptor.room_id is None) is (case.status == "ready")
     )
     expected = EventRecord(
         str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}")),
         descriptor.kind,
         replace(frame.origin, frame_index=descriptor_index),
+        descriptor.room_id if case.status == "held" else None,
+        aggregate.continuity.membership_epoch if case.status == "held" else None,
+        aggregate.next_room_sequence if case.status == "held" else None,
         None,
-        None,
-        None,
-        None,
-        None,
+        descriptor.provenance if case.status == "held" else None,
         descriptor.source_json,
         None,
     )
-    inner = _expected_event_work_plaintext(expected)
-    outer = _expected_stored_work_payload(
+    final_row = _expected_stored_work_payload(
         account_id=account_id,
         stream_id=_STREAM_ID,
         transport_kind=TransportKind.CLASSIC,
         frame_id=frame.frame_id,
         value=expected,
-        status="ready",
-        ready_revision=2,
-        ready_ordinal=0,
+        status=case.status,
+        ready_revision=2 if case.status == "ready" else None,
+        ready_ordinal=0 if case.status == "ready" else None,
         created_revision=2,
     )
-    assert len(inner) < len(outer)
+    assert len(_expected_event_work_plaintext(expected)) < len(final_row)
+    existing_work: tuple[AuthenticatedWork, ...] = (held,)
+    limits = replace(
+        MaterializerLimits(),
+        max_ready_work_canonical_bytes=len(final_row) + case.limit_delta,
+    )
+    if case.status == "held":
+        old_row = _expected_stored_work_payload(
+            account_id=account_id,
+            stream_id=_STREAM_ID,
+            transport_kind=TransportKind.CLASSIC,
+            frame_id=_PLANNER_EXISTING_FRAME_ID,
+            value=held.value,
+            status="held",
+            ready_revision=None,
+            ready_ordinal=None,
+            created_revision=1,
+        )
+        existing_work = (replace(held, canonical_size=len(old_row)),)
+        limits = replace(
+            MaterializerLimits(),
+            max_held_work_canonical_bytes=(
+                len(old_row) + len(final_row) + case.limit_delta
+            ),
+        )
 
-    exact = plan_frame_materialization(
+    plan = plan_frame_materialization(
         account_id=account_id,
         stream_id=_STREAM_ID,
         frame=frame,
         aggregates=(aggregate,),
-        work=(held,),
+        work=existing_work,
         revision=2,
-        limits=replace(
-            MaterializerLimits(),
-            max_ready_work_canonical_bytes=len(outer),
-        ),
-    )
-    assert exact is not None
-
-    one_over = plan_frame_materialization(
-        account_id=account_id,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(held,),
-        revision=2,
-        limits=replace(
-            MaterializerLimits(),
-            max_ready_work_canonical_bytes=len(outer) - 1,
-        ),
+        limits=limits,
     )
 
-    assert one_over is None
-
-
-def test_materializer_held_capacity_counts_final_stored_work_payload() -> None:
-    """RED: room HELD admission includes the complete durable Work rows."""
-
-    account_id = "@planner-held-outer:example.org"
-    frame, aggregate, held = _pending_hydration_planner_case(account_id=account_id)
-    old_frame_id = _PLANNER_EXISTING_FRAME_ID
-    old_payload = _expected_stored_work_payload(
-        account_id=account_id,
-        stream_id=_STREAM_ID,
-        transport_kind=TransportKind.CLASSIC,
-        frame_id=old_frame_id,
-        value=held.value,
-        status="held",
-        ready_revision=None,
-        ready_ordinal=None,
-        created_revision=1,
-    )
-    stored_held = replace(
-        held,
-        canonical_size=len(old_payload),
-    )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    descriptor_index, descriptor = next(
-        (index, descriptor)
-        for index, descriptor in enumerate(proposal.descriptors)
-        if descriptor.room_id is not None
-    )
-    expected = EventRecord(
-        str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}")),
-        descriptor.kind,
-        replace(frame.origin, frame_index=descriptor_index),
-        descriptor.room_id,
-        aggregate.continuity.membership_epoch,
-        aggregate.next_room_sequence,
-        None,
-        descriptor.provenance,
-        descriptor.source_json,
-        None,
-    )
-    inner = _expected_event_work_plaintext(expected)
-    outer = _expected_stored_work_payload(
-        account_id=account_id,
-        stream_id=_STREAM_ID,
-        transport_kind=TransportKind.CLASSIC,
-        frame_id=frame.frame_id,
-        value=expected,
-        status="held",
-        ready_revision=None,
-        ready_ordinal=None,
-        created_revision=2,
-    )
-    assert len(inner) < len(outer)
-
-    exact = plan_frame_materialization(
-        account_id=account_id,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(stored_held,),
-        revision=2,
-        limits=replace(
-            MaterializerLimits(),
-            max_held_work_canonical_bytes=len(old_payload) + len(outer),
-        ),
-    )
-    assert exact is not None
-    assert not any(
-        type(value) is LossRecord and value.reason is LossReason.EVENT_LIMIT
-        for value, _payload, _ordinal in exact.work_inserts
-    )
-
-    one_over = plan_frame_materialization(
-        account_id=account_id,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(stored_held,),
-        revision=2,
-        limits=replace(
-            MaterializerLimits(),
-            max_held_work_canonical_bytes=len(old_payload) + len(outer) - 1,
-        ),
-    )
-
-    assert one_over is not None
-    assert any(
-        type(value) is LossRecord and value.reason is LossReason.EVENT_LIMIT
-        for value, _payload, _ordinal in one_over.work_inserts
-    )
+    assert (plan is not None) is case.plan_is_admitted
+    if case.loss_reason is not None:
+        assert plan is not None
+        assert any(
+            type(value) is LossRecord and value.reason is case.loss_reason
+            for value, _payload, _ordinal in plan.work_inserts
+        )
+    elif plan is not None:
+        assert not any(
+            type(value) is LossRecord and value.reason is LossReason.EVENT_LIMIT
+            for value, _payload, _ordinal in plan.work_inserts
+        )
 
 
 def test_materializer_record_limit_counts_final_stored_work_payload() -> None:
