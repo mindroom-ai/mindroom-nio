@@ -4542,7 +4542,7 @@ _FINAL_ROW_CAPACITY_CASES = (
     _FINAL_ROW_CAPACITY_CASES,
     ids=lambda case: case.case_id,
 )
-def test_materializer_final_ready_row_capacity_matrix(
+def test_materializer_final_row_capacity_matrix(
     case: _FinalRowCapacityCase,
 ) -> None:
     """Each named READY/HELD case owns its final Work-row byte boundary."""
