@@ -111,7 +111,9 @@ type _DeliveryMember = tuple[
     tuple[int, int, str], tuple[object, ...], EventRecord | LossRecord
 ]
 type _DeliveryLoadedMember = tuple[
-    *_DeliveryMember,
+    tuple[int, int, str],
+    tuple[object, ...],
+    EventRecord | LossRecord,
     AuthenticatedWork,
 ]
 _DELIVERY_COLUMNS = tuple(f"delivery_{name}" for name in DeliveryState._fields)
@@ -414,7 +416,10 @@ class SqliteIngestionJournal(JournalRows):
         work_id, ready_revision, ordinal, digest = cast(
             "tuple[str, int, int, bytes]", state[2:]
         )
-        if member is None or member[0] != (ready_revision, ordinal, work_id):
+        if member is None:
+            raise JournalIntegrityError("claimed Work is missing or moved")
+        member_key, stored, record, authenticated = member
+        if member_key != (ready_revision, ordinal, work_id):
             raise JournalIntegrityError("claimed Work is missing or moved")
         batch = batch_from_records(
             account_id=owner.account_id,
@@ -423,11 +428,11 @@ class SqliteIngestionJournal(JournalRows):
             stream_id=owner.stream_id,
             sequence=state.next_sequence - 1,
             created_revision=ready_revision,
-            records=(member[2],),
+            records=(record,),
         )
         if not hmac.compare_digest(batch.ref.sha256, digest):
             raise JournalIntegrityError("claimed Work does not match batch digest")
-        return batch, member[1], member[3]
+        return batch, stored, authenticated
 
     def _load_batch_settlement(
         self,
