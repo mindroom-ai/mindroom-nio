@@ -1,7 +1,7 @@
 """Cycle-neutral strict Matrix JSON loading and canonical encoding."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 MATRIX_CANONICAL_INTEGER_MAX = (1 << 53) - 1
@@ -36,27 +36,23 @@ def _object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _validate_json_nesting(text: str, field_name: str) -> None:
-    depth = 0
-    in_string = False
-    escaped = False
-    for character in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
+def _validate_json_nesting(value: Any, field_name: str) -> None:
+    if type(value) not in (list, dict):
+        return
+    stack: list[Iterator[Any]] = [
+        iter(value.values() if type(value) is dict else value)
+    ]
+    while stack:
+        try:
+            child = next(stack[-1])
+        except StopIteration:
+            stack.pop()
             continue
-        if character == '"':
-            in_string = True
-        elif character in "[{":
-            depth += 1
-            if depth > _MAX_JSON_CONTAINER_DEPTH:
-                raise ValueError(f"{field_name} exceeds the JSON nesting limit")
-        elif character in "]}":
-            depth -= 1
+        if type(child) not in (list, dict):
+            continue
+        if len(stack) >= _MAX_JSON_CONTAINER_DEPTH:
+            raise ValueError(f"{field_name} exceeds the JSON nesting limit")
+        stack.append(iter(child.values() if type(child) is dict else child))
 
 
 def _load_json(
@@ -69,14 +65,15 @@ def _load_json(
         raise TypeError(f"{field_name} must be bytes")
     try:
         text = data.decode("utf-8")
-        _validate_json_nesting(text, field_name)
-        return json.loads(
+        value = json.loads(
             text,
             parse_constant=_reject_json_constant,
             parse_float=_reject_json_float,
             parse_int=parse_integer,
             object_pairs_hook=_object_from_pairs,
         )
+        _validate_json_nesting(value, field_name)
+        return value
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError(f"{field_name} must contain valid UTF-8 JSON") from error
 
