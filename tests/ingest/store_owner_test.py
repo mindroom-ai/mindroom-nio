@@ -1702,21 +1702,16 @@ EXPECTED_METHOD_SCOPES = {
             _get_account _load_persisted_sessions
             _load_persisted_inbound_group_sessions load_device_keys load_encrypted_rooms
             load_outgoing_key_requests load_sync_token
-            load_sync_recovery has_real_recovery_gap load_sliding_window_tokens
         """.split()},
     **{("SqliteStore", name): "read" for name in """
             is_device_verified is_device_blacklisted is_device_ignored load_device_keys
         """.split()},
     **{("MatrixStore", name): "write" for name in """
-            upgrade_to_v2 upgrade_to_v3 upgrade_to_v5 upgrade_to_v6 upgrade_to_v7
-            upgrade_to_v8 upgrade_to_v9 upgrade_to_v10
-            _repair_v10_recovery_abandonments save_account load_sessions save_session
+            upgrade_to_v2 save_account load_sessions save_session
             load_inbound_group_sessions save_inbound_group_session save_device_keys
             add_outgoing_key_request
             remove_outgoing_key_request save_encrypted_rooms save_sync_token
-            _clear_sync_recovery save_recovery clear_recovery_abandonment
-            accept_recovery_event save_sliding_window_tokens
-            forget_sliding_window_token finish_recovery delete_encrypted_room
+            delete_encrypted_room
         """.split()},
     **{("SqliteStore", name): "write" for name in """
             verify_device unverify_device blacklist_device unblacklist_device

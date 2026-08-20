@@ -83,11 +83,7 @@ FRESH_STORE_BOUNDARIES = (
     "ordinary_schema_keys",
     "ordinary_schema_olmsessions",
     "ordinary_schema_outgoingkeyrequests",
-    "ordinary_schema_pendingtimelineevents",
-    "ordinary_schema_slidingwindowtokens",
     "ordinary_schema_storeversion",
-    "ordinary_schema_syncrecoveryabandonedrooms",
-    "ordinary_schema_syncrecoverygaps",
     "ordinary_schema_synctokens",
     "insert_store_version",
     "insert_account",
@@ -633,7 +629,7 @@ def test_fresh_owned_store_process_death_is_empty_or_complete_and_reopenable(
 
     master, rows = graph
     table_names = {name for kind, name, _table, _sql in master if kind == "table"}
-    assert len(table_names) == 20
+    assert len(table_names) == 16
     assert {
         "NioIngestMeta",
         "NioIngestSourceState",

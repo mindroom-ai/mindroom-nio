@@ -18,11 +18,7 @@ from nio.ingest.state import SourceState, StagedFrame
 from nio.exceptions import LocalProtocolError
 from nio.store import (
     DefaultStore,
-    PendingTimelineEvents,
-    SlidingWindowTokens,
     SqliteStore,
-    SyncRecoveryAbandonedRooms,
-    SyncRecoveryGaps,
 )
 from nio.store._sync_journal_rows import (
     _canonical_internal,
@@ -56,11 +52,7 @@ FRESH_BOUNDARIES = (
     "ordinary_schema_keys",
     "ordinary_schema_olmsessions",
     "ordinary_schema_outgoingkeyrequests",
-    "ordinary_schema_pendingtimelineevents",
-    "ordinary_schema_slidingwindowtokens",
     "ordinary_schema_storeversion",
-    "ordinary_schema_syncrecoveryabandonedrooms",
-    "ordinary_schema_syncrecoverygaps",
     "ordinary_schema_synctokens",
     "insert_store_version",
     "insert_account",
@@ -71,6 +63,41 @@ FRESH_BOUNDARIES = (
     "foreign_key_check",
     "before_commit",
     "commit",
+)
+HISTORICAL_RECOVERY_SCHEMA_SQL = (
+    'CREATE TABLE "pendingtimelineevents" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"sequence" INTEGER NOT NULL, "event_id" TEXT NOT NULL, '
+    '"event_payload" BLOB NOT NULL, "is_live" INTEGER NOT NULL, '
+    '"was_encrypted" INTEGER NOT NULL, "was_completed" INTEGER NOT NULL, '
+    '"admission_accepted" INTEGER NOT NULL, "provenance" TEXT NOT NULL, '
+    '"apply_room_state" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,event_id))",
+    'CREATE TABLE "slidingwindowtokens" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "token" TEXT NOT NULL, '
+    '"membership_event_id" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id))",
+    'CREATE TABLE "syncrecoveryabandonedrooms" ('
+    '"id" INTEGER NOT NULL PRIMARY KEY, "room_id" TEXT NOT NULL, '
+    '"reason" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,reason))",
+    'CREATE TABLE "syncrecoverygaps" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"target_token" TEXT NOT NULL, "cursor_token" TEXT, '
+    '"membership_bound" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,generation))",
+    'CREATE INDEX "pendingtimelineevents_account_id" '
+    'ON "pendingtimelineevents" ("account_id")',
+    'CREATE INDEX "slidingwindowtokens_account_id" '
+    'ON "slidingwindowtokens" ("account_id")',
+    'CREATE INDEX "syncrecoveryabandonedrooms_account_id" '
+    'ON "syncrecoveryabandonedrooms" ("account_id")',
+    'CREATE INDEX "syncrecoverygaps_account_id" '
+    'ON "syncrecoverygaps" ("account_id")',
 )
 
 
@@ -123,22 +150,32 @@ def _configured_open(
 
 
 def _add_historical_recovery_schema(tmp_path: Path) -> None:
-    historical_models = (
-        PendingTimelineEvents,
-        SlidingWindowTokens,
-        SyncRecoveryAbandonedRooms,
-        SyncRecoveryGaps,
-    )
-    store = SqliteStore(
-        ACCOUNT_ID,
-        DEVICE_ID,
-        str(tmp_path),
-        pickle_key=PICKLE_KEY,
-        database_name="journal.db",
-    )
-    with store.database.bind_ctx(historical_models):
-        store.database.create_tables(historical_models)
-    store.database.close()
+    database_path = tmp_path / "journal.db"
+    with sqlite3.connect(database_path) as connection:
+        for statement in HISTORICAL_RECOVERY_SCHEMA_SQL:
+            connection.execute(statement)
+        account_id = connection.execute("SELECT id FROM accounts").fetchone()[0]
+        connection.execute(
+            "INSERT INTO pendingtimelineevents VALUES "
+            "(1, '!room:example.org', 1, 1, '$event', x'01', 1, 0, 0, 1, "
+            "'live', 1, ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO slidingwindowtokens VALUES "
+            "(1, '!room:example.org', 'token', '$membership', ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO syncrecoveryabandonedrooms VALUES "
+            "(1, '!room:example.org', 'historical', ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO syncrecoverygaps VALUES "
+            "(1, '!room:example.org', 1, 'target', 'cursor', 1, ?)",
+            (account_id,),
+        )
 
 
 def _table_names(path: Path) -> set[str]:
@@ -192,11 +229,7 @@ def test_fresh_owned_store_bootstrap_is_one_atomic_full_graph(
         "megolminboundsessions",
         "olmsessions",
         "outgoingkeyrequests",
-        "pendingtimelineevents",
-        "slidingwindowtokens",
         "storeversion",
-        "syncrecoveryabandonedrooms",
-        "syncrecoverygaps",
         "synctokens",
         "NioIngestMeta",
         "NioIngestSourceState",
@@ -271,7 +304,7 @@ def test_fresh_owned_store_retries_empty_database_residue(
             assert connection.execute("SELECT * FROM sqlite_master").fetchall() == []
 
     bootstrap = _fresh_open(tmp_path)
-    assert len(_table_names(database_path)) == 20
+    assert len(_table_names(database_path)) == 16
     bootstrap.close()
 
 
@@ -358,11 +391,11 @@ def test_fresh_owned_store_hook_failure_is_all_absent_or_complete(
     if boundary != "commit":
         assert master == ()
         retried = _fresh_open(tmp_path)
-        assert len(_table_names(database_path)) == 20
+        assert len(_table_names(database_path)) == 16
         retried.close()
         return
 
-    assert len(_table_names(database_path)) == 20
+    assert len(_table_names(database_path)) == 16
     with sqlite3.connect(database_path) as connection:
         account_before = connection.execute(
             "SELECT account, shared FROM accounts"
@@ -403,6 +436,29 @@ def _logical_graph(path: Path) -> tuple[object, ...]:
             for table in tables
         )
     return master, rows
+
+
+def _historical_recovery_graph(path: Path) -> tuple[object, ...]:
+    tables = (
+        "pendingtimelineevents",
+        "slidingwindowtokens",
+        "syncrecoveryabandonedrooms",
+        "syncrecoverygaps",
+    )
+    placeholders = ", ".join("?" for _ in tables)
+    with sqlite3.connect(path) as connection:
+        schema = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                f"WHERE tbl_name IN ({placeholders}) ORDER BY type, name",
+                tables,
+            )
+        )
+        rows = tuple(
+            (table, tuple(connection.execute(f'SELECT * FROM "{table}"')))
+            for table in tables
+        )
+    return schema, rows
 
 
 def _stage_classic(
@@ -1227,6 +1283,20 @@ def test_configured_adoption_accepts_exact_historical_v10_alter_layouts(
 
     adopted = _configured_open(tmp_path, SqliteStore)
     adopted.close()
+
+
+def test_configured_adoption_preserves_historical_recovery_schema_and_rows(
+    tmp_path: Path,
+) -> None:
+    _seed_populated_store(tmp_path, SqliteStore)
+    _add_historical_recovery_schema(tmp_path)
+    database_path = tmp_path / "journal.db"
+    before = _historical_recovery_graph(database_path)
+
+    adopted = _configured_open(tmp_path, SqliteStore)
+    adopted.close()
+
+    assert _historical_recovery_graph(database_path) == before
 
 
 def test_configured_adoption_rejects_reordered_nonmigrated_columns(

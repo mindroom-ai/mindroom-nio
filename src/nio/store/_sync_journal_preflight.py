@@ -69,11 +69,7 @@ from .models import (
     MegolmInboundSessions,
     OlmSessions,
     OutgoingKeyRequests,
-    PendingTimelineEvents,
-    SlidingWindowTokens,
     StoreVersion,
-    SyncRecoveryAbandonedRooms,
-    SyncRecoveryGaps,
     SyncTokens,
 )
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
@@ -111,13 +107,49 @@ _ACTIVE_ORDINARY_MODELS = (
     Keys,
     SyncTokens,
 )
-_RETIRED_RECOVERY_MODELS = (
-    SyncRecoveryGaps,
-    SyncRecoveryAbandonedRooms,
-    PendingTimelineEvents,
-    SlidingWindowTokens,
+_RETIRED_RECOVERY_SCHEMA_SQL = (
+    'CREATE TABLE "pendingtimelineevents" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"sequence" INTEGER NOT NULL, "event_id" TEXT NOT NULL, '
+    '"event_payload" BLOB NOT NULL, "is_live" INTEGER NOT NULL, '
+    '"was_encrypted" INTEGER NOT NULL, "was_completed" INTEGER NOT NULL, '
+    '"admission_accepted" INTEGER NOT NULL, "provenance" TEXT NOT NULL, '
+    '"apply_room_state" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,event_id))",
+    'CREATE TABLE "slidingwindowtokens" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "token" TEXT NOT NULL, '
+    '"membership_event_id" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id))",
+    'CREATE TABLE "syncrecoveryabandonedrooms" ('
+    '"id" INTEGER NOT NULL PRIMARY KEY, "room_id" TEXT NOT NULL, '
+    '"reason" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,reason))",
+    'CREATE TABLE "syncrecoverygaps" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"target_token" TEXT NOT NULL, "cursor_token" TEXT, '
+    '"membership_bound" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,generation))",
+    'CREATE INDEX "pendingtimelineevents_account_id" '
+    'ON "pendingtimelineevents" ("account_id")',
+    'CREATE INDEX "slidingwindowtokens_account_id" '
+    'ON "slidingwindowtokens" ("account_id")',
+    'CREATE INDEX "syncrecoveryabandonedrooms_account_id" '
+    'ON "syncrecoveryabandonedrooms" ("account_id")',
+    'CREATE INDEX "syncrecoverygaps_account_id" '
+    'ON "syncrecoverygaps" ("account_id")',
 )
-_ORDINARY_MODELS = _ACTIVE_ORDINARY_MODELS + _RETIRED_RECOVERY_MODELS
+_RETIRED_RECOVERY_TABLES = frozenset(
+    {
+        "pendingtimelineevents",
+        "slidingwindowtokens",
+        "syncrecoveryabandonedrooms",
+        "syncrecoverygaps",
+    }
+)
 _TRUST_SIDECAR_SUFFIXES = (
     "trusted_devices",
     "blacklisted_devices",
@@ -385,6 +417,8 @@ def validate_schema_topology(connection: SqliteDatabase) -> None:
 
 def _model_contract(
     models: tuple[type, ...],
+    *,
+    extra_schema_sql: tuple[str, ...] = (),
 ) -> tuple[object, ...]:
     database = SqliteDatabase(":memory:")
     database.connect()
@@ -392,9 +426,12 @@ def _model_contract(
         database.execute_sql("PRAGMA foreign_keys = ON")
         with database.bind_ctx(models):
             database.create_tables(models)
+            for statement in extra_schema_sql:
+                database.execute_sql(statement)
             return _capture_named_contract(
                 database,
-                frozenset(cast("Any", model)._meta.table_name for model in models),
+                frozenset(cast("Any", model)._meta.table_name for model in models)
+                | (_RETIRED_RECOVERY_TABLES if extra_schema_sql else frozenset()),
             )
     finally:
         database.close()
@@ -464,11 +501,16 @@ def _ordinary_contract(
     include_trust: bool,
     include_retired_recovery: bool,
 ) -> tuple[object, ...]:
-    ordinary_models = (
-        _ORDINARY_MODELS if include_retired_recovery else _ACTIVE_ORDINARY_MODELS
+    models = (
+        *_ACTIVE_ORDINARY_MODELS,
+        *((DeviceTrustState,) if include_trust else ()),
     )
-    models = (*ordinary_models, *((DeviceTrustState,) if include_trust else ()))
-    return _model_contract(models)
+    return _model_contract(
+        models,
+        extra_schema_sql=(
+            _RETIRED_RECOVERY_SCHEMA_SQL if include_retired_recovery else ()
+        ),
+    )
 
 
 def _ordinary_table_names(connection: SqliteDatabase) -> frozenset[str]:
@@ -491,7 +533,7 @@ def _validate_ordinary_topology(
     active_tables = frozenset(
         model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS
     )
-    historical_tables = frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
+    historical_tables = active_tables | _RETIRED_RECOVERY_TABLES
     trust_table = DeviceTrustState._meta.table_name
     actual_tables = _ordinary_table_names(connection)
     accepted_tables: tuple[frozenset[str], ...]
@@ -1068,7 +1110,7 @@ def _create_fresh_owned_store(
     if statement_hook is not None:
         statement_hook("account_pickled")
 
-    models = tuple(sort_models((*_ORDINARY_MODELS, DeviceTrustState)))
+    models = tuple(sort_models((*_ACTIVE_ORDINARY_MODELS, DeviceTrustState)))
     with connection.bind_ctx(models):
         for model in models:
             model.create_table(safe=False)
@@ -1150,7 +1192,7 @@ def _inspect_existing(
     active_ordinary_tables = {
         model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS
     }
-    historical_ordinary_tables = {model._meta.table_name for model in _ORDINARY_MODELS}
+    historical_ordinary_tables = active_ordinary_tables | set(_RETIRED_RECOVERY_TABLES)
     allowed_borrowed: tuple[set[str], ...] = (
         set(),
         set(_E2EE_TABLES),
@@ -1740,8 +1782,10 @@ def open_journal_database(
                 frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS),
                 frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS)
                 | {DeviceTrustState._meta.table_name},
-                frozenset(model._meta.table_name for model in _ORDINARY_MODELS),
-                frozenset(model._meta.table_name for model in _ORDINARY_MODELS)
+                frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS)
+                | _RETIRED_RECOVERY_TABLES,
+                frozenset(model._meta.table_name for model in _ACTIVE_ORDINARY_MODELS)
+                | _RETIRED_RECOVERY_TABLES
                 | {DeviceTrustState._meta.table_name},
             }:
                 raise FreshIngestionRequired(

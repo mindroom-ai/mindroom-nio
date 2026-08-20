@@ -52,6 +52,7 @@ from ._sync_journal_values import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from contextlib import AbstractContextManager
 
 
 _NORMALIZATION_VERSION = 1
@@ -1363,17 +1364,41 @@ class _Task3WorkInventory(NamedTuple):
     work: tuple[AuthenticatedWork, ...]
 
 
+class _Task3WorkRow(NamedTuple):
+    account_id: str
+    work_id: str
+    kind: Literal["event", "loss"]
+    status: Literal["ready", "held"]
+    raw_frame_id: str
+    room_id: str | None
+    membership_epoch: int | None
+    room_sequence: int | None
+    ready_revision: int | None
+    ready_ordinal: int | None
+    created_revision: int
+    payload: bytes
+    digest: bytes
+
+
 class JournalRows:
     account_id: str
     device_id: str
+
+    if TYPE_CHECKING:
+
+        def _execute(
+            self,
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor: ...
+
+        def _read(self) -> AbstractContextManager[None]: ...
 
     def _payload(self, o: OwnerView, *args: Any, **kwargs: Any) -> Any:
         return _row((self.account_id, o.stream_id, o.transport_kind), *args, **kwargs)
 
     def _meta(self) -> sqlite3.Row:
-        rows = self._execute(  # type: ignore[attr-defined]
-            "SELECT * FROM NioIngestMeta LIMIT 2"
-        ).fetchall()
+        rows = self._execute("SELECT * FROM NioIngestMeta LIMIT 2").fetchall()
         if len(rows) != 1:
             raise JournalIntegrityError(
                 "ingestion-v1 marker row cardinality is not one"
@@ -1408,11 +1433,11 @@ class JournalRows:
         return owner
 
     def load_owner(self) -> OwnerView:
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             return self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
 
     def _load_stage_snapshot(self) -> tuple[OwnerView, SourceState]:
-        rows = self._execute(  # type: ignore[attr-defined]
+        rows = self._execute(
             "SELECT m.*, s.account_id AS joined_source_account_id, "
             "s.source_epoch AS joined_source_epoch, "
             "s.payload AS joined_payload, "
@@ -1477,11 +1502,9 @@ class JournalRows:
             raise JournalIntegrityError("persisted source state is invalid") from error
 
     def load_source(self) -> SourceState:
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             owner = self.load_owner()
-            rows = self._execute(  # type: ignore[attr-defined]
-                "SELECT * FROM NioIngestSourceState"
-            ).fetchall()
+            rows = self._execute("SELECT * FROM NioIngestSourceState").fetchall()
             if len(rows) != 1:
                 raise JournalIntegrityError(
                     "ingestion source row cardinality is not one"
@@ -1496,7 +1519,7 @@ class JournalRows:
             source.cursor_json,
             header=_source_header(source),
         )
-        return self._execute(  # type: ignore[attr-defined]
+        return self._execute(
             "INSERT INTO NioIngestSourceState ("
             "account_id, source_epoch, payload, payload_sha256, "
             "next_request_id, active) VALUES (?, ?, ?, ?, ?, ?) "
@@ -1623,7 +1646,7 @@ class JournalRows:
         self,
         owner: OwnerView,
     ) -> tuple[_FrameDrainRow, ...]:
-        rows = self._execute(  # type: ignore[attr-defined]
+        rows = self._execute(
             "SELECT account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload_sha256, "
             "LENGTH(payload) AS payload_length, "
@@ -1666,7 +1689,7 @@ class JournalRows:
         self,
         owner: OwnerView,
         row: tuple[object, ...],
-    ) -> None:
+    ) -> _Task3WorkRow:
         try:
             (
                 account_id,
@@ -1721,13 +1744,14 @@ class JournalRows:
                 raise ValueError("HELD Work columns are invalid")
         except (AttributeError, TypeError, ValueError) as error:
             raise JournalIntegrityError("invalid Work row") from error
+        return cast("_Task3WorkRow", row)
 
     def _decode_task3_work_row(
         self,
         owner: OwnerView,
         row: tuple[object, ...],
     ) -> AuthenticatedWork:
-        self._validate_task3_work_row(owner, row)
+        stored = self._validate_task3_work_row(owner, row)
         (
             _account_id,
             work_id,
@@ -1742,7 +1766,7 @@ class JournalRows:
             created_revision,
             payload,
             digest,
-        ) = row
+        ) = stored
         local_header_invalid = False
         try:
             plaintext = self._payload(
@@ -1750,7 +1774,7 @@ class JournalRows:
                 "NioIngestWork",
                 payload,
                 digest,
-                header=_canonical_internal(row[1:11]),
+                header=_canonical_internal(stored[1:11]),
             )
             decoded = _decode_work_plaintext(
                 owner.stream_id,
@@ -1864,7 +1888,7 @@ class JournalRows:
         owner: OwnerView,
         work_id: str | None,
     ) -> tuple[tuple[object, ...], AuthenticatedWork] | None:
-        foreign = self._execute(  # type: ignore[attr-defined]
+        foreign = self._execute(
             "SELECT account_id FROM NioIngestWork WHERE account_id < ? "
             "UNION ALL SELECT account_id FROM NioIngestWork WHERE account_id > ? "
             "LIMIT 1",
@@ -1878,14 +1902,14 @@ class JournalRows:
             "created_revision, payload, payload_sha256 "
         )
         if work_id is None:
-            row = self._execute(  # type: ignore[attr-defined]
+            row = self._execute(
                 f"SELECT {columns}FROM NioIngestWork "
                 "WHERE account_id = ? AND status = 'ready' "
                 "ORDER BY ready_revision, ready_ordinal, work_id LIMIT 1",
                 (self.account_id,),
             ).fetchone()
         else:
-            row = self._execute(  # type: ignore[attr-defined]
+            row = self._execute(
                 f"SELECT {columns}FROM NioIngestWork "
                 "WHERE account_id = ? AND work_id = ? LIMIT 1",
                 (self.account_id, work_id),
@@ -1896,9 +1920,7 @@ class JournalRows:
         return stored, self._decode_task3_work_row(owner, stored)
 
     def _load_delivery_work_count(self) -> int:
-        row = self._execute(  # type: ignore[attr-defined]
-            "SELECT COUNT(*) FROM NioIngestWork"
-        ).fetchone()
+        row = self._execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()
         if (
             row is None
             or len(row) != 1
@@ -1912,7 +1934,7 @@ class JournalRows:
         self,
         owner: OwnerView,
     ) -> _Task3WorkInventory:
-        cursor = self._execute(  # type: ignore[attr-defined]
+        cursor = self._execute(
             "SELECT account_id, work_id, kind, status, frame_id, room_id, "
             "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
             "created_revision, payload, payload_sha256 "
@@ -1952,7 +1974,7 @@ class JournalRows:
         owner: OwnerView,
         room_id: str,
     ) -> tuple[tuple[object, ...], RoomAggregateValue] | None:
-        row = self._execute(  # type: ignore[attr-defined]
+        row = self._execute(
             "SELECT account_id, room_id, updated_revision, intent_kind, "
             "payload, payload_sha256 "
             "FROM NioIngestRoomAggregate WHERE account_id = ? AND room_id = ?",
@@ -2013,9 +2035,9 @@ class JournalRows:
             raise TypeError("limit must be int")
         if not 1 <= limit <= 2:
             raise ValueError("limit must be between 1 and 2")
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
-            rows = self._execute(  # type: ignore[attr-defined]
+            rows = self._execute(
                 "SELECT account_id, room_id, updated_revision, intent_kind, "
                 "payload, payload_sha256 FROM NioIngestRoomAggregate "
                 "WHERE account_id = ? AND intent_kind = 'local_membership' "
@@ -2046,9 +2068,9 @@ class JournalRows:
             raise TypeError("limit must be int")
         if not 1 <= limit <= 2:
             raise ValueError("limit must be between 1 and 2")
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
-            rows = self._execute(  # type: ignore[attr-defined]
+            rows = self._execute(
                 "SELECT account_id, room_id, updated_revision, intent_kind, "
                 "payload, payload_sha256 FROM NioIngestRoomAggregate "
                 "WHERE account_id = ? AND intent_kind = 'hydration' "
@@ -2196,7 +2218,7 @@ class JournalRows:
         return value
 
     def _classify_frame_ids(self, owner: OwnerView) -> frozenset[UUID]:
-        rows = self._execute(  # type: ignore[attr-defined]
+        rows = self._execute(
             "SELECT CASE account_id WHEN ? THEN frame_id END AS frame_id "
             "FROM NioIngestFrame LIMIT ?",
             (self.account_id, _FRAME_CLASSIFICATION_LIMIT),
@@ -2215,7 +2237,7 @@ class JournalRows:
         return frozenset(identities)
 
     def _frame_row(self, frame_id: UUID) -> sqlite3.Row:
-        row = self._execute(  # type: ignore[attr-defined]
+        row = self._execute(
             "SELECT * FROM NioIngestFrame WHERE account_id = ? AND frame_id = ?",
             (self.account_id, str(frame_id)),
         ).fetchone()
@@ -2254,19 +2276,19 @@ class JournalRows:
     def load_frame(self, frame_id: UUID) -> StagedFrame | None:
         if type(frame_id) is not UUID:
             raise TypeError("frame_id must be UUID")
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             return self._load_frame_with_owner(frame_id, self.load_owner())
 
     def list_frames(self, limit: int) -> tuple[StagedFrame, ...]:
         if type(limit) is not int or not 1 <= limit <= 257:
             raise ValueError("frame limit must be an integer from 1 through 257")
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             owner = self.load_owner()
             frame_ids = self._classify_frame_ids(owner)
             headers = self._load_authenticated_frame_headers(owner)
             if frame_ids != {header.frame_id for header in headers}:
                 raise JournalIntegrityError("authenticated Frame inventory changed")
-            rows = self._execute(  # type: ignore[attr-defined]
+            rows = self._execute(
                 "SELECT * FROM NioIngestFrame WHERE account_id = ? "
                 "ORDER BY staged_revision, source_epoch, request_id, frame_id "
                 "LIMIT ?",
@@ -2281,7 +2303,7 @@ class JournalRows:
             ]
 
     def has_reserved_quiesce_response(self) -> bool:
-        with self._read():  # type: ignore[attr-defined]
+        with self._read():
             owner = self.load_owner()
             headers = self._load_authenticated_frame_headers(owner)
             staged = tuple(
@@ -2342,7 +2364,7 @@ class JournalRows:
             room_materialized_revision=None,
             callbacks_claimed_revision=None,
         )
-        return self._execute(  # type: ignore[attr-defined]
+        return self._execute(
             "INSERT INTO NioIngestFrame ("
             "account_id, frame_id, source_epoch, request_id, "
             "staged_revision, payload, payload_sha256, "

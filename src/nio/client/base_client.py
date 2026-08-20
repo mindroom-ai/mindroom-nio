@@ -103,7 +103,6 @@ from ..responses import (
     RoomKeyRequestResponse,
     RoomMessagesResponse,
     ShareGroupSessionResponse,
-    SlidingSyncResponse,
     SyncResponse,
     ToDeviceResponse,
     WhoamiResponse,
@@ -789,8 +788,6 @@ class _IngestionStoreSnapshot:
     encrypted_rooms: set[str]
     next_batch: str
     loaded_sync_token: str | None
-    recovery: object | None
-    sliding_tokens: object | None
 
 
 def logged_in(func):
@@ -1212,8 +1209,6 @@ class Client:
         previous_encrypted_rooms = self.encrypted_rooms
         previous_next_batch = self.next_batch
         previous_loaded_sync_token = self.loaded_sync_token
-        previous_recovery = getattr(self, "_recovery", None)
-        previous_sliding_tokens = getattr(self, "_sliding_room_prev_batch", None)
         snapshot = _IngestionStoreSnapshot(
             previous_store,
             previous_olm,
@@ -1222,8 +1217,6 @@ class Client:
             previous_encrypted_rooms,
             previous_next_batch,
             previous_loaded_sync_token,
-            previous_recovery,
-            previous_sliding_tokens,
         )
         try:
             self.store = store
@@ -1237,26 +1230,11 @@ class Client:
             loaded_sync_token = previous_loaded_sync_token
             if self.config.store_sync_tokens:
                 loaded_sync_token = store.load_sync_token()
-            recovery = previous_recovery
-            sliding_tokens = previous_sliding_tokens
-            recovery_enabled = getattr(self, "_recovery_persistence_enabled", False)
-            if previous_recovery is not None and recovery_enabled:
-                from .sync_recovery import RecoveryState, load_recovery_state
-
-                recovery = RecoveryState(
-                    max_held_events=self.config.backfill_max_events  # type: ignore[attr-defined]
-                )
-                load_recovery_state(recovery, *store.load_sync_recovery())
-                sliding_tokens = dict(store.load_sliding_window_tokens())
             self.olm = olm
             self.rooms = attached_rooms
             self.invited_rooms = attached_invited_rooms
             self.encrypted_rooms = encrypted_rooms
             self.loaded_sync_token = loaded_sync_token
-            if previous_recovery is not None:
-                setattr(self, "_recovery", recovery)
-            if previous_sliding_tokens is not None:
-                setattr(self, "_sliding_room_prev_batch", sliding_tokens)
             self._ingestion_store_snapshot = snapshot
         except BaseException:
             self.olm = previous_olm
@@ -1266,10 +1244,6 @@ class Client:
             self.encrypted_rooms = previous_encrypted_rooms
             self.next_batch = previous_next_batch
             self.loaded_sync_token = previous_loaded_sync_token
-            if previous_recovery is not None:
-                setattr(self, "_recovery", previous_recovery)
-            if previous_sliding_tokens is not None:
-                setattr(self, "_sliding_room_prev_batch", previous_sliding_tokens)
             raise
 
     def _detach_ingestion_store(self, store: MatrixStore) -> None:
@@ -1289,10 +1263,6 @@ class Client:
         self.encrypted_rooms = snapshot.encrypted_rooms
         self.next_batch = snapshot.next_batch
         self.loaded_sync_token = cast(Any, snapshot.loaded_sync_token)
-        if snapshot.recovery is not None:
-            setattr(self, "_recovery", snapshot.recovery)
-        if snapshot.sliding_tokens is not None:
-            setattr(self, "_sliding_room_prev_batch", snapshot.sliding_tokens)
         self._ingestion_store_snapshot = None
 
     def restore_login(
@@ -2116,14 +2086,14 @@ class Client:
     def _replace_decrypted_to_device(
         self,
         decrypted_events: list[tuple[int, ToDeviceEvent]],
-        response: SyncResponse | SlidingSyncResponse,
+        response: SyncResponse,
     ):
         # Replace the encrypted to_device events with decrypted ones
         for decrypted_event in decrypted_events:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
-    def _handle_to_device(self, response: SyncResponse | SlidingSyncResponse):
+    def _handle_to_device(self, response: SyncResponse):
         decrypted_to_device = []
 
         for index, to_device_event in enumerate(response.to_device_events):
@@ -2293,7 +2263,7 @@ class Client:
         for event in expired_verifications:
             self._on_expired_verifications(event)
 
-    def _handle_olm_events(self, response: SyncResponse | SlidingSyncResponse) -> None:
+    def _handle_olm_events(self, response: SyncResponse) -> None:
         assert self.olm
 
         changed_users = set()

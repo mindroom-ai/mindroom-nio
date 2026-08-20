@@ -1900,7 +1900,6 @@ async def test_owned_factory_does_not_fabricate_snapshotless_encrypted_room(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     try:
         _operation_id, _committed, aggregate, _work = _publish_fresh_local_join(session)
@@ -1914,7 +1913,6 @@ async def test_owned_factory_does_not_fabricate_snapshotless_encrypted_room(
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     try:
@@ -11613,7 +11611,6 @@ async def test_owned_factory_post_creation_failure_restores_tombstones_and_reope
     client.config = replace(
         client.config,
         store_sync_tokens=True,
-        backfill_limited_timelines=True,
     )
     previous = (
         client.store,
@@ -14260,7 +14257,6 @@ async def test_owned_settle_global_account_data_callbacks_before_ack_outside_sto
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     event_source = {
@@ -14399,18 +14395,9 @@ async def test_owned_settle_global_account_data_callbacks_before_ack_outside_sto
             forbidden_callbacks.append("event")
             raise AssertionError("settlement invoked an event callback")
 
-        async def forbidden_admission(
-            _room: object,
-            _event: object,
-            _provenance: object,
-        ) -> None:
-            forbidden_callbacks.append("admission")
-            raise AssertionError("settlement invoked event admission")
-
         client.add_global_account_data_callback(on_global_account_data, None)
         client.add_response_callback(forbidden_response, None)
         client.add_event_callback(forbidden_event, None)
-        monkeypatch.setattr(client, "_on_event_admission", forbidden_admission)
         real_on_global_account_data = client._on_global_account_data
         routed_events: list[object] = []
 
@@ -14502,7 +14489,6 @@ async def test_owned_settle_source_to_device_reconstructs_without_crypto_replay(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     event_source = {
@@ -14637,11 +14623,6 @@ async def test_owned_settle_source_to_device_reconstructs_without_crypto_replay(
         client.add_to_device_callback(on_to_device, None)
         client.add_response_callback(wrong_callback("response"), None)
         client.add_event_callback(wrong_callback("event"), None)
-        monkeypatch.setattr(
-            client,
-            "_on_event_admission",
-            wrong_callback("admission"),
-        )
         client.add_ephemeral_callback(wrong_callback("ephemeral"), None)
         client.add_room_account_data_callback(
             wrong_callback("room-account-data"),
@@ -14697,17 +14678,13 @@ async def test_owned_settle_source_to_device_reconstructs_without_crypto_replay(
                 "_handle_timeline_event",
                 "_invalidate_session_for_member_event",
                 "_collect_key_requests",
-                "_publish_recovery_outcome",
             ):
                 patch.setattr(client, name, forbid_sync(f"client.{name}"))
             for name in (
-                "_dispatch_timeline_event",
                 "_handle_expired_verifications",
                 "_handle_sync",
                 "_handle_to_device",
-                "_on_event_admission",
                 "_on_response",
-                "_pump_sync_recovery",
             ):
                 patch.setattr(client, name, forbid_async(f"client.{name}"))
             for name in (
@@ -14770,7 +14747,6 @@ async def test_owned_settle_source_to_device_without_callback_is_ack_only(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     request_id = "settlement-untrusted-request"
@@ -14993,17 +14969,14 @@ async def test_owned_settle_source_to_device_without_callback_is_ack_only(
                 "_handle_decrypt_to_device",
                 "_handle_olm_events",
                 "_collect_key_requests",
-                "_publish_recovery_outcome",
             ):
                 patch.setattr(client, name, forbid_sync(f"client.{name}"))
             for name in (
                 "_handle_expired_verifications",
                 "_handle_sync",
                 "_handle_to_device",
-                "_on_event_admission",
                 "_on_response",
                 "_on_to_device",
-                "_pump_sync_recovery",
             ):
                 patch.setattr(client, name, forbid_async(f"client.{name}"))
             for name in (
@@ -15079,7 +15052,6 @@ async def test_owned_settle_synthetic_to_device_phase_callbacks_without_replay(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     request_id = "settlement-synthetic-request"
@@ -15232,7 +15204,6 @@ async def test_owned_settle_synthetic_to_device_phase_callbacks_without_replay(
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     restored_connection = restored_session._owned_store.database.connection()
@@ -15437,7 +15408,6 @@ async def test_owned_settle_remaining_decrypted_to_device_exact_classes(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     outer_sender_key = "settlement-outer-sender-key"
@@ -15587,7 +15557,6 @@ async def test_owned_settle_remaining_decrypted_to_device_exact_classes(
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     restored_connection = restored_session._owned_store.database.connection()
@@ -15766,9 +15735,7 @@ async def test_owned_settle_remaining_decrypted_to_device_exact_classes(
                 patch.setattr(UnknownBadEvent, "__init__", observe_unknown_bad_init)
             for name in (
                 "receive_response",
-                "_receive_sync_family",
                 "_handle_sync",
-                "_handle_sliding_sync",
                 "_handle_to_device",
                 "_handle_decrypt_to_device",
                 "_handle_olm_events",
@@ -15848,7 +15815,6 @@ def _claimed_owned_global_settlement(tmp_path):
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     assert client.olm is not None
     olm = client.olm
@@ -16689,14 +16655,6 @@ def _install_owned_settlement_callback_tripwires(
         forbidden.append("room-event")
         raise AssertionError("settlement invoked a room callback")
 
-    async def admission(
-        _room: object,
-        _event: object,
-        _provenance: object,
-    ) -> None:
-        forbidden.append("admission")
-        raise AssertionError("settlement invoked event admission")
-
     async def response(_response: object) -> None:
         forbidden.append("response")
         raise AssertionError("settlement invoked a response callback")
@@ -16707,7 +16665,6 @@ def _install_owned_settlement_callback_tripwires(
     client.add_event_callback(room_event, None)
     client.add_ephemeral_callback(room_event, None)
     client.add_room_account_data_callback(room_event, None)
-    client._on_event_admission = admission  # type: ignore[method-assign]
     client.add_response_callback(response, None)
 
 
@@ -16776,7 +16733,6 @@ async def test_owned_settle_room_lifecycle_overlays_snapshot_then_acks_without_c
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     try:
@@ -16968,7 +16924,6 @@ async def test_owned_settle_terminal_loss_acks_without_state_parse_or_callbacks(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     connection = session._owned_store.database.connection()
     try:
@@ -17162,7 +17117,6 @@ async def _open_claimed_owned_live_timeline(tmp_path):
     )
 
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     try:
         event_source = {
@@ -17257,7 +17211,6 @@ async def _open_claimed_owned_live_timeline(tmp_path):
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     try:
@@ -17420,9 +17373,7 @@ async def test_owned_settle_live_timeline_none_truth_table_restores_snapshot_bef
 
         for method_name in (
             "receive_response",
-            "_receive_sync_family",
             "_handle_sync",
-            "_handle_sliding_sync",
             "_handle_timeline_event",
             "_on_to_device",
             "_on_global_account_data",
@@ -17460,16 +17411,11 @@ async def test_owned_settle_live_timeline_none_truth_table_restores_snapshot_bef
             assert_outside_owner_transaction()
             callbacks.append(event)
 
-        async def forbid_admission(*_args: object) -> None:
-            forbidden.append("admission")
-            raise AssertionError("timeline settlement invoked event admission")
-
         async def forbid_response(*_args: object) -> None:
             forbidden.append("response")
             raise AssertionError("timeline settlement invoked a response callback")
 
         client.add_event_callback(observe_event_callback, None)
-        monkeypatch.setattr(client, "_on_event_admission", forbid_admission)
         client.add_response_callback(forbid_response, None)
         acknowledgements: list[BatchRef] = []
         real_acknowledge = session._journal.acknowledge_batch
@@ -17597,7 +17543,6 @@ async def _open_claimed_owned_decrypted_settlement(tmp_path, target: str):
     )
 
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     sender_store: SqliteMemoryStore | None = None
     try:
@@ -17703,7 +17648,6 @@ async def _open_claimed_owned_decrypted_settlement(tmp_path, target: str):
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     restored_connection = restored_session._owned_store.database.connection()
@@ -18068,16 +18012,12 @@ async def test_owned_settle_reconstructs_decrypted_events_without_crypto_replay(
 
         client_forbidden = (
             "receive_response",
-            "_receive_sync_family",
             "_handle_sync",
-            "_handle_sliding_sync",
             "_handle_to_device",
-            "_dispatch_timeline_event",
             "_handle_decrypt_to_device",
             "_handle_olm_events",
             "_handle_timeline_event",
             "decrypt_event",
-            "_on_event_admission",
             "_on_response",
         )
         olm_forbidden = (
@@ -18115,8 +18055,6 @@ async def test_owned_settle_reconstructs_decrypted_events_without_crypto_replay(
             "remove_outgoing_key_request",
             "save_encrypted_rooms",
             "save_sync_token",
-            "save_recovery",
-            "save_sliding_window_tokens",
             "delete_encrypted_room",
             "blacklist_device",
             "verify_device",
@@ -18479,15 +18417,11 @@ async def test_owned_settle_failed_megolm_without_crypto_or_rerequest_replay(
 
         client_forbidden = (
             "receive_response",
-            "_receive_sync_family",
             "_handle_sync",
-            "_handle_sliding_sync",
             "_handle_timeline_event",
-            "_dispatch_timeline_event",
             "_handle_decrypt_to_device",
             "decrypt_event",
             "_prepare_ingestion_frame",
-            "_on_event_admission",
             "_on_response",
         )
         olm_forbidden = (
@@ -18605,7 +18539,6 @@ async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     try:
         if target == "invite":
@@ -18707,7 +18640,6 @@ async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     connection = restored_session._owned_store.database.connection()
@@ -18967,13 +18899,10 @@ async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
 
             live_paths = (
                 "receive_response",
-                "_receive_sync_family",
                 "_handle_sync",
-                "_handle_sliding_sync",
                 "_handle_invited_rooms",
                 "_handle_joined_rooms",
                 "_handle_joined_state",
-                "_dispatch_timeline_event",
                 "_handle_timeline_event",
                 "_prepare_ingestion_frame",
                 "_on_event",
@@ -18982,7 +18911,6 @@ async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
                 "_on_presence",
                 "_on_global_account_data",
                 "_on_to_device",
-                "_on_event_admission",
                 "_on_response",
             )
             for name in live_paths:
@@ -19035,7 +18963,6 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     client = owned_client(tmp_path)
-    client.config = replace(client.config, backfill_limited_timelines=True)
     session = open_owned_session(client, bootstrap, generation)
     try:
         assert client.olm is not None
@@ -19131,7 +19058,6 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
     restored_client = owned_client(tmp_path)
     restored_client.config = replace(
         restored_client.config,
-        backfill_limited_timelines=True,
     )
     restored_session = open_owned_session(restored_client, reopened, generation)
     connection = restored_session._owned_store.database.connection()
@@ -19499,20 +19425,16 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
 
             live_paths = (
                 "receive_response",
-                "_receive_sync_family",
                 "_handle_sync",
-                "_handle_sliding_sync",
                 "_handle_invited_rooms",
                 "_handle_joined_rooms",
                 "_handle_joined_state",
-                "_dispatch_timeline_event",
                 "_handle_timeline_event",
                 "_prepare_ingestion_frame",
                 "_on_event",
                 "_on_invited_rooms",
                 "_on_to_device",
                 "_on_global_account_data",
-                "_on_event_admission",
                 "_on_response",
             )
             for name in live_paths:

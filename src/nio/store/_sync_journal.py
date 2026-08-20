@@ -116,6 +116,13 @@ type _DeliveryLoadedMember = tuple[
     EventRecord | LossRecord,
     AuthenticatedWork,
 ]
+type _DeliverySnapshot = tuple[
+    tuple[object, ...],
+    OwnerView,
+    DeliveryState,
+    _DeliveryLoadedMember | None,
+    int,
+]
 _DELIVERY_COLUMNS = tuple(f"delivery_{name}" for name in DeliveryState._fields)
 _DELIVERY_UPDATE = (
     "UPDATE NioIngestMeta SET revision = ?, "
@@ -375,10 +382,10 @@ class SqliteIngestionJournal(JournalRows):
         self._transition_hook("commit")
         return CommitResult(owner.revision + 1)
 
-    def _delivery_snapshot(self):  # type: ignore[no-untyped-def]
+    def _delivery_snapshot(self) -> _DeliverySnapshot:
         row = self._meta()
         owner = self._decode_owner_row(cast("Mapping[str, object]", row))
-        state = _decode_delivery_state(row, owner)
+        state = _decode_delivery_state(cast("Mapping[str, object]", row), owner)
         work_count = self._load_delivery_work_count()
         loaded = self._load_delivery_work(owner, state.outstanding_work_id)
         member: _DeliveryLoadedMember | None = None
@@ -423,9 +430,12 @@ class SqliteIngestionJournal(JournalRows):
         if cursor.rowcount != 1:
             raise JournalConflictError(f"{label} failed")
 
-    def _delivery_writer_snapshot(  # type: ignore[no-untyped-def]
-        self, meta, member, work_count
-    ):
+    def _delivery_writer_snapshot(
+        self,
+        meta: tuple[object, ...],
+        member: _DeliveryLoadedMember | None,
+        work_count: int,
+    ) -> _DeliverySnapshot:
         try:
             current = self._delivery_snapshot()
         except JournalIntegrityError as error:

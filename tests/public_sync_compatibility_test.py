@@ -1,21 +1,21 @@
 """Retained public sync contract at the exact pre-fork boundary."""
 
 from inspect import Parameter, signature
+import importlib.util
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 
 import nio
 import pytest
+from nio.crypto import OlmAccount
 from nio.store import (
-    PendingTimelineEvents,
-    SlidingWindowTokens,
     SqliteMemoryStore,
     SqliteStore,
-    SyncRecoveryAbandonedRooms,
-    SyncRecoveryGaps,
 )
+from peewee import SqliteDatabase
 
 _RETAINED_METHOD_PARAMETERS = {
     "add_response_callback": ("self", "func", "cb_filter"),
@@ -57,6 +57,47 @@ _FORK_ONLY_ASYNC_CLIENT_MEMBERS = (
     "reset_classic_sync_state",
     "has_uncommitted_classic_sync_state",
     "clear_persisted_sync_recovery",
+)
+_HISTORICAL_RECOVERY_SCHEMA_SQL = (
+    'CREATE TABLE "pendingtimelineevents" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"sequence" INTEGER NOT NULL, "event_id" TEXT NOT NULL, '
+    '"event_payload" BLOB NOT NULL, "is_live" INTEGER NOT NULL, '
+    '"was_encrypted" INTEGER NOT NULL, "was_completed" INTEGER NOT NULL, '
+    '"admission_accepted" INTEGER NOT NULL, "provenance" TEXT NOT NULL, '
+    '"apply_room_state" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,event_id))",
+    'CREATE TABLE "slidingwindowtokens" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "token" TEXT NOT NULL, '
+    '"membership_event_id" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id))",
+    'CREATE TABLE "syncrecoveryabandonedrooms" ('
+    '"id" INTEGER NOT NULL PRIMARY KEY, "room_id" TEXT NOT NULL, '
+    '"reason" TEXT NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,reason))",
+    'CREATE TABLE "syncrecoverygaps" ("id" INTEGER NOT NULL PRIMARY KEY, '
+    '"room_id" TEXT NOT NULL, "generation" INTEGER NOT NULL, '
+    '"target_token" TEXT NOT NULL, "cursor_token" TEXT, '
+    '"membership_bound" INTEGER NOT NULL, "account_id" INTEGER NOT NULL, '
+    'FOREIGN KEY ("account_id") REFERENCES "accounts" ("id") '
+    "ON DELETE CASCADE, UNIQUE(account_id,room_id,generation))",
+    'CREATE INDEX "pendingtimelineevents_account_id" '
+    'ON "pendingtimelineevents" ("account_id")',
+    'CREATE INDEX "slidingwindowtokens_account_id" '
+    'ON "slidingwindowtokens" ("account_id")',
+    'CREATE INDEX "syncrecoveryabandonedrooms_account_id" '
+    'ON "syncrecoveryabandonedrooms" ("account_id")',
+    'CREATE INDEX "syncrecoverygaps_account_id" '
+    'ON "syncrecoverygaps" ("account_id")',
+)
+_HISTORICAL_RECOVERY_TABLES = (
+    "pendingtimelineevents",
+    "slidingwindowtokens",
+    "syncrecoveryabandonedrooms",
+    "syncrecoverygaps",
 )
 
 
@@ -149,7 +190,6 @@ async def test_classic_event_callback_can_reenter_receive_response() -> None:
         "https://example.org",
         "@alice:example.org",
         "DEVICE",
-        config=nio.AsyncClientConfig(backfill_limited_timelines=True),
     )
     callback_events: list[str] = []
     nested = _classic_response("s2")
@@ -359,17 +399,13 @@ async def test_response_callback_exception_stops_later_callbacks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_classic_sync_ignores_retired_recovery_configuration(aioresponse) -> None:
-    """Fork-only recovery ownership cannot block an ordinary desktop sync."""
+async def test_classic_sync_uses_ordinary_configuration(aioresponse) -> None:
+    """An ordinary desktop configuration applies a Classic sync response."""
     client = nio.AsyncClient(
         "https://example.org",
         "@alice:example.org",
         "DEVICE",
-        config=nio.AsyncClientConfig(
-            backfill_limited_timelines=True,
-            backfill_persist_recovery=False,
-            store_sync_tokens=True,
-        ),
+        config=nio.AsyncClientConfig(store_sync_tokens=True),
     )
     client.access_token = "token"
     aioresponse.get(
@@ -397,26 +433,20 @@ async def test_classic_sync_ignores_retired_recovery_configuration(aioresponse) 
 
 def test_ordinary_store_open_does_not_read_retired_recovery_state(monkeypatch) -> None:
     """Opening the desktop store loads active crypto/token state only."""
+    statements: list[str] = []
+    execute_sql = SqliteDatabase.execute_sql
 
-    def forbid_recovery_read(_store) -> None:
-        raise AssertionError("ordinary store open read retired recovery state")
+    def record_sql(database, sql, *args, **kwargs):
+        statements.append(sql)
+        return execute_sql(database, sql, *args, **kwargs)
 
-    def forbid_sliding_read(_store) -> None:
-        raise AssertionError("ordinary store open read retired Sliding state")
-
-    monkeypatch.setattr(SqliteMemoryStore, "load_sync_recovery", forbid_recovery_read)
-    monkeypatch.setattr(
-        SqliteMemoryStore,
-        "load_sliding_window_tokens",
-        forbid_sliding_read,
-    )
+    monkeypatch.setattr(SqliteDatabase, "execute_sql", record_sql)
 
     client = nio.AsyncClient(
         "https://example.org",
         "@alice:example.org",
         "DEVICE",
         config=nio.AsyncClientConfig(
-            backfill_limited_timelines=True,
             store=SqliteMemoryStore,
             store_sync_tokens=True,
         ),
@@ -427,6 +457,11 @@ def test_ordinary_store_open_does_not_read_retired_recovery_state(monkeypatch) -
 
     assert type(client.store) is SqliteMemoryStore
     assert client.olm is not None
+    assert all(
+        table not in statement.casefold()
+        for statement in statements
+        for table in _HISTORICAL_RECOVERY_TABLES
+    )
 
 
 def test_fresh_desktop_store_creates_only_active_tables() -> None:
@@ -445,21 +480,55 @@ def test_fresh_desktop_store_creates_only_active_tables() -> None:
 
 def test_existing_desktop_store_retains_inert_recovery_tables(tmp_path) -> None:
     """Opening an old higher-version store is nondestructive."""
-    historical_models = (
-        PendingTimelineEvents,
-        SlidingWindowTokens,
-        SyncRecoveryAbandonedRooms,
-        SyncRecoveryGaps,
-    )
     first = SqliteStore(
         "@alice:example.org",
         "DEVICE",
         str(tmp_path),
         database_name="matrix.db",
     )
-    with first.database.bind_ctx(historical_models):
-        first.database.create_tables(historical_models)
+    first.save_account(OlmAccount())
     first.database.close()
+    database_path = tmp_path / "matrix.db"
+    with sqlite3.connect(database_path) as connection:
+        for statement in _HISTORICAL_RECOVERY_SCHEMA_SQL:
+            connection.execute(statement)
+        account_id = connection.execute("SELECT id FROM accounts").fetchone()[0]
+        connection.execute(
+            "INSERT INTO pendingtimelineevents VALUES "
+            "(1, '!room:example.org', 1, 1, '$event', x'01', 1, 0, 0, 1, "
+            "'live', 1, ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO slidingwindowtokens VALUES "
+            "(1, '!room:example.org', 'token', '$membership', ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO syncrecoveryabandonedrooms VALUES "
+            "(1, '!room:example.org', 'historical', ?)",
+            (account_id,),
+        )
+        connection.execute(
+            "INSERT INTO syncrecoverygaps VALUES "
+            "(1, '!room:example.org', 1, 'target', 'cursor', 1, ?)",
+            (account_id,),
+        )
+        placeholders = ", ".join("?" for _ in _HISTORICAL_RECOVERY_TABLES)
+        before_schema = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                f"WHERE tbl_name IN ({placeholders}) ORDER BY type, name",
+                _HISTORICAL_RECOVERY_TABLES,
+            )
+        )
+        before_rows = tuple(
+            (
+                table,
+                tuple(connection.execute(f'SELECT * FROM "{table}"')),
+            )
+            for table in _HISTORICAL_RECOVERY_TABLES
+        )
 
     reopened = SqliteStore(
         "@alice:example.org",
@@ -468,11 +537,25 @@ def test_existing_desktop_store_retains_inert_recovery_tables(tmp_path) -> None:
         database_name="matrix.db",
     )
 
-    assert {model._meta.table_name for model in historical_models} <= set(
-        reopened.database.get_tables()
-    )
     assert reopened.load_sync_token() is None
     reopened.database.close()
+    with sqlite3.connect(database_path) as connection:
+        after_schema = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                f"WHERE tbl_name IN ({placeholders}) ORDER BY type, name",
+                _HISTORICAL_RECOVERY_TABLES,
+            )
+        )
+        after_rows = tuple(
+            (
+                table,
+                tuple(connection.execute(f'SELECT * FROM "{table}"')),
+            )
+            for table in _HISTORICAL_RECOVERY_TABLES
+        )
+    assert after_schema == before_schema
+    assert after_rows == before_rows
 
 
 def test_desktop_import_and_client_construction_do_not_execute_recovery_modules() -> (
@@ -535,3 +618,99 @@ print(json.dumps(executed, sort_keys=True))
         "/recovery_abandonment.py": [],
         "/sliding_sync_tokens.py": [],
     }
+
+
+def test_ingestion_preflight_imports_without_retired_recovery_models() -> None:
+    """Historical topology authentication does not depend on retired ORM types."""
+    program = r"""
+import importlib
+import sys
+
+import nio.store.models as models
+
+for name in (
+    "PendingTimelineEvents",
+    "SlidingWindowTokens",
+    "SyncRecoveryAbandonedRooms",
+    "SyncRecoveryGaps",
+):
+    if hasattr(models, name):
+        delattr(models, name)
+sys.modules.pop("nio.store._sync_journal_preflight", None)
+importlib.import_module("nio.store._sync_journal_preflight")
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", program],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_retired_recovery_modules_and_owners_are_absent() -> None:
+    """The superseded recovery engine has no importable or executable owner."""
+    modules = (
+        "nio.client.sliding_membership",
+        "nio.client.sync_recovery",
+        "nio.client.sync_reset_fence",
+        "nio.client.sync_response_ordering",
+        "nio.recovery_abandonment",
+        "nio.sliding_sync_tokens",
+    )
+    assert (
+        tuple(name for name in modules if importlib.util.find_spec(name) is not None)
+        == ()
+    )
+
+    from nio.store import MatrixStore, SqliteStore
+    import nio.store as store_package
+    import nio.store.models as store_models
+
+    assert (
+        tuple(
+            name
+            for name in (
+                "_legacy_clear_persisted_sync_recovery",
+                "_legacy_has_uncommitted_classic_sync_state",
+                "_legacy_acknowledge_classic_sync",
+                "_legacy_reset_classic_sync_state",
+                "_legacy_add_event_admission_callback",
+                "_pump_sync_recovery",
+                "_legacy_sliding_sync",
+                "_legacy_sliding_sync_forever",
+            )
+            if hasattr(nio.AsyncClient, name)
+        )
+        == ()
+    )
+    assert (
+        tuple(
+            name
+            for name in (
+                "_clear_sync_recovery",
+                "save_recovery",
+                "clear_recovery_abandonment",
+                "load_sync_recovery",
+                "load_sliding_window_tokens",
+                "save_sliding_window_tokens",
+                "forget_sliding_window_token",
+                "finish_recovery",
+            )
+            if hasattr(MatrixStore, name) or hasattr(SqliteStore, name)
+        )
+        == ()
+    )
+    assert (
+        tuple(
+            name
+            for name in (
+                "PendingTimelineEvents",
+                "SlidingWindowTokens",
+                "SyncRecoveryAbandonedRooms",
+                "SyncRecoveryGaps",
+            )
+            if hasattr(store_models, name) or hasattr(store_package, name)
+        )
+        == ()
+    )
