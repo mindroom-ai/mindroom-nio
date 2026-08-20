@@ -5657,26 +5657,64 @@ def test_materializer_terminal_plan_obeys_immutable_total_exact_boundary(
     )
 
 
-@pytest.mark.parametrize(
-    ("case", "successor_count", "global_count"),
-    [
-        pytest.param("pre-capacity-exact", 9_997, 1, id="pre-capacity-exact"),
-        pytest.param("pre-capacity-one-over", 9_998, 1, id="pre-capacity-one-over"),
-        pytest.param("replacement-one-over", 1, 9_998, id="replacement-one-over"),
-    ],
+@dataclass(frozen=True)
+class _RetirementCase:
+    case_id: str
+    metric: str
+    successor_count: int
+    global_count: int
+    excess: int
+    outcome: str
+    room_body_length: int = 0
+    tuned_padding: int = 0
+
+
+_RETIREMENT_CAPACITY_CASES = (
+    _RetirementCase("addition-count-exact", "count", 9_997, 1, 0, "normal"),
+    _RetirementCase("addition-count-one-over", "count", 9_998, 1, 1, "replacement"),
+    _RetirementCase("replacement-count-one-over", "count", 1, 9_998, 1, "error"),
+    _RetirementCase("addition-bytes-exact", "bytes", 63, 1, 0, "normal", 257_677, 47),
+    _RetirementCase(
+        "addition-bytes-four-over", "bytes", 63, 1, 4, "replacement", 257_677, 50
+    ),
+    _RetirementCase("total-bytes-exact", "total-bytes", 1, 1, 0, "replacement"),
+    _RetirementCase("total-bytes-one-over", "total-bytes", 1, 1, 1, "capacity"),
 )
-def test_materializer_retirement_immutable_addition_count_boundary(
+
+
+@pytest.mark.parametrize(
+    "case",
+    _RETIREMENT_CAPACITY_CASES,
+    ids=lambda case: case.case_id,
+)
+def test_materializer_plain_retirement_capacity_matrix(
     monkeypatch: pytest.MonkeyPatch,
-    case: str,
-    successor_count: int,
-    global_count: int,
+    case: _RetirementCase,
 ) -> None:
-    room_id = "!planner-retire:example.org"
-    successor_payload = b'{"content":{"body":"successor"},"type":"m.room.message"}'
+    ordinary = b'{"content":{"body":"successor"},"type":"m.room.message"}'
+    if case.metric == "bytes":
+        room_id = f"!{'r' * case.room_body_length}:example.org"
+        tuned = (
+            b'{"content":{"body":"'
+            + (b"x" * case.tuned_padding)
+            + b'"},"type":"m.room.message"}'
+        )
+        successor_json = (ordinary,) * 62 + (tuned,)
+    elif case.metric == "total-bytes":
+        room_id = "!planner-retire:example.org"
+        successor_json = (
+            b'{"content":{"body":"' + (b"x" * 512) + b'"},"type":"m.room.message"}',
+        )
+    else:
+        assert case.metric == "count"
+        room_id = "!planner-retire:example.org"
+        successor_json = (ordinary,) * case.successor_count
     global_payload = b'{"content":{"generation":2},"type":"m.push_rules"}'
-    successor_json = (successor_payload,) * successor_count
-    global_json = (global_payload,) * global_count
-    frame, aggregate, held = _retirement_capacity_planner_case(successor_json)
+    global_json = (global_payload,) * case.global_count
+    frame, aggregate, held = _retirement_capacity_planner_case(
+        successor_json,
+        room_id=room_id,
+    )
     frame = replace(frame, global_account_data_json=global_json)
     proposal = reduce_staged_frame(
         _STREAM_ID,
@@ -5684,21 +5722,17 @@ def test_materializer_retirement_immutable_addition_count_boundary(
         frame,
         (aggregate.continuity,),
     )
-    successor_continuity = RoomContinuity(
-        room_id,
-        1,
-        "leave",
-        None,
-        None,
-        None,
-    )
+    successor_continuity = RoomContinuity(room_id, 1, "leave", None, None, None)
     assert len(proposal.room_proposals) == 1
     room = proposal.room_proposals[0]
     assert room.before == aggregate.continuity
     assert room.after == successor_continuity
-    assert room.hydration is None
-    assert room.recovery is None
-    assert room.retirement_epoch == 0
+    assert (room.hydration, room.recovery, room.retirement_epoch, room.release) == (
+        None,
+        None,
+        0,
+        RecoveryRelease.LOSS_THEN_HELD,
+    )
     assert room.losses == (
         LossProposal(
             room_id,
@@ -5707,28 +5741,17 @@ def test_materializer_retirement_immutable_addition_count_boundary(
             LossBoundary(None, None, None, None),
         ),
     )
-    assert room.release is RecoveryRelease.LOSS_THEN_HELD
-    assert tuple(
-        (
-            descriptor.kind,
-            descriptor.room_id,
-            descriptor.source_json,
-            descriptor.provenance,
-            descriptor.descriptor_key,
-            descriptor.route,
-        )
-        for descriptor in proposal.descriptors
-    ) == (
+    expected_descriptors = (
         *(
             (
                 RecordKind.TIMELINE,
                 room_id,
-                successor_payload,
+                payload,
                 TimelineEventProvenance.LIVE,
                 f"frame:{_FRAME_ID}:{index}",
                 DescriptorRoute.HOLD_FOR_RETIREMENT,
             )
-            for index in range(successor_count)
+            for index, payload in enumerate(successor_json)
         ),
         *(
             (
@@ -5736,40 +5759,136 @@ def test_materializer_retirement_immutable_addition_count_boundary(
                 None,
                 global_payload,
                 None,
-                f"frame:{_FRAME_ID}:{successor_count + index}",
+                f"frame:{_FRAME_ID}:{len(successor_json) + index}",
                 DescriptorRoute.READY,
             )
-            for index in range(global_count)
+            for index in range(case.global_count)
         ),
     )
+    assert (
+        tuple(
+            (
+                item.kind,
+                item.room_id,
+                item.source_json,
+                item.provenance,
+                item.descriptor_key,
+                item.route,
+            )
+            for item in proposal.descriptors
+        )
+        == expected_descriptors
+    )
     old_loss, lifecycle, successors, globals_, capacity_loss = (
-        _expected_retirement_capacity_records(successor_json, global_json)
+        _expected_retirement_capacity_records(
+            successor_json,
+            global_json,
+            room_id=room_id,
+            capacity_reason=(
+                LossReason.OVERSIZED_EVENT
+                if case.metric == "total-bytes"
+                else LossReason.EVENT_LIMIT
+            ),
+        )
     )
-    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
-    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
-    successor_plaintexts = tuple(
-        _expected_event_work_plaintext(record) for record in successors
+    normal_work = (
+        (old_loss, 0),
+        (lifecycle, 2),
+        *((record, index + 3) for index, record in enumerate(successors)),
+        *(
+            (record, len(successors) + index + 3)
+            for index, record in enumerate(globals_)
+        ),
     )
-    global_plaintexts = tuple(
-        _expected_event_work_plaintext(record) for record in globals_
+    replacement_work = (
+        (old_loss, 0),
+        (lifecycle, 2),
+        (capacity_loss, 3),
+        *((record, index + 4) for index, record in enumerate(globals_)),
     )
-    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
     hard = MaterializerLimits()
-    assert hard.max_held_work_count == 10_000
-    pre_capacity_count = 2 + len(successors) + len(globals_)
-    replacement_count = 3 + len(globals_)
-    if case == "pre-capacity-exact":
-        assert pre_capacity_count == hard.max_held_work_count
-        assert replacement_count == 4
-    elif case == "pre-capacity-one-over":
-        assert pre_capacity_count == hard.max_held_work_count + 1
-        assert replacement_count == 4
+    work: tuple[AuthenticatedWork, ...] = (held,)
+    max_record_bytes = hard.max_record_canonical_bytes
+
+    def stored_payload(value: EventRecord | LossRecord, ordinal: int) -> bytes:
+        return _expected_planned_stored_work_payload(
+            account_id=_PLANNER_ACCOUNT_ID,
+            frame=frame,
+            value=value,
+            ordinal=ordinal,
+            revision=2,
+        )
+
+    if case.metric == "count":
+        assert hard.max_held_work_count == 10_000
+        assert 2 + len(successors) + len(globals_) == 10_000 + int(case.excess > 0)
+        assert 3 + len(globals_) == (10_001 if case.outcome == "error" else 4)
+    elif case.metric == "bytes":
+        normal_payloads = tuple(stored_payload(*item) for item in normal_work)
+        replacement_payloads = tuple(stored_payload(*item) for item in replacement_work)
+        assert hard.max_record_canonical_bytes == 1 * 1024 * 1024
+        assert hard.max_held_work_canonical_bytes == 32 * 1024 * 1024
+        assert len(normal_payloads) == 66
+        assert all(
+            len(payload) <= hard.max_record_canonical_bytes
+            for payload in normal_payloads
+        )
+        assert sum(map(len, normal_payloads)) == (
+            hard.max_held_work_canonical_bytes + case.excess
+        )
+        assert sum(map(len, replacement_payloads)) < (
+            hard.max_held_work_canonical_bytes
+        )
     else:
-        assert case == "replacement-one-over"
-        assert pre_capacity_count == hard.max_held_work_count + 1
-        assert replacement_count == hard.max_held_work_count + 1
+        assert case.metric == "total-bytes"
+        replacement_payloads = tuple(stored_payload(*item) for item in replacement_work)
+        release_payload_size = len(
+            _expected_stored_work_payload(
+                account_id=_PLANNER_ACCOUNT_ID,
+                stream_id=_STREAM_ID,
+                transport_kind=frame.origin.transport,
+                frame_id=_PLANNER_EXISTING_FRAME_ID,
+                value=held.value,
+                status="ready",
+                ready_revision=2,
+                ready_ordinal=1,
+                created_revision=1,
+            )
+        )
+        successor_payload_size = len(stored_payload(successors[0], 3))
+        max_record_bytes = max(release_payload_size, *map(len, replacement_payloads))
+        assert successor_payload_size > max_record_bytes
+        assert hard.max_total_work_canonical_bytes == 64 * 1024 * 1024
+        remaining = (
+            hard.max_total_work_canonical_bytes
+            - release_payload_size
+            - sum(map(len, replacement_payloads))
+        )
+        ready_sizes: list[int] = []
+        while remaining:
+            size = min(hard.max_record_canonical_bytes, remaining)
+            ready_sizes.append(size)
+            remaining -= size
+        assert len(ready_sizes) == 64
+        assert ready_sizes[-1] < hard.max_record_canonical_bytes
+        ready_sizes[-1] += case.excess
+        assert all(1 <= size <= hard.max_record_canonical_bytes for size in ready_sizes)
+        ready = tuple(
+            _planner_ready_work(frame, index, canonical_size=size)
+            for index, size in enumerate(ready_sizes)
+        )
+        work = (held, *ready)
+        assert len({item.value.record_id for item in work}) == len(work)
+        assert (
+            sum(item.canonical_size for item in ready)
+            + release_payload_size
+            + sum(map(len, replacement_payloads))
+            == hard.max_total_work_canonical_bytes + case.excess
+        )
+
     caller_limits = replace(
         hard,
+        max_record_canonical_bytes=max_record_bytes,
         max_held_work_count=1,
         max_held_work_canonical_bytes=1,
         max_ready_work_count=1,
@@ -5777,30 +5896,19 @@ def test_materializer_retirement_immutable_addition_count_boundary(
         max_total_work_count=1,
         max_total_work_canonical_bytes=1,
     )
-
-    if case == "replacement-one-over":
+    if case.outcome == "error":
         planner_module = importlib.import_module("nio.store._sync_journal_plan")
-        real_canonical_work_plaintext = getattr(
-            planner_module,
-            "_canonical_work_plaintext",
-        )
+        real_encode = getattr(planner_module, "_canonical_work_plaintext")
         encoded_work_ids: list[str] = []
 
-        def observe_canonical_work_plaintext(
-            kind: str,
-            value: EventRecord | LossRecord,
-        ) -> bytes:
+        def observe_encode(kind: str, value: EventRecord | LossRecord) -> bytes:
             encoded_work_ids.append(
                 value.record_id if type(value) is EventRecord else value.loss_id
             )
-            return real_canonical_work_plaintext(kind, value)
+            return real_encode(kind, value)
 
         with monkeypatch.context() as guard:
-            guard.setattr(
-                planner_module,
-                "_canonical_work_plaintext",
-                observe_canonical_work_plaintext,
-            )
+            guard.setattr(planner_module, "_canonical_work_plaintext", observe_encode)
             with pytest.raises(
                 ValueError,
                 match="selected frame Work exceeds the hard addition envelope",
@@ -5810,7 +5918,7 @@ def test_materializer_retirement_immutable_addition_count_boundary(
                     stream_id=_STREAM_ID,
                     frame=frame,
                     aggregates=(aggregate,),
-                    work=(held,),
+                    work=work,
                     revision=2,
                     limits=caller_limits,
                 )
@@ -5822,458 +5930,40 @@ def test_materializer_retirement_immutable_addition_count_boundary(
         stream_id=_STREAM_ID,
         frame=frame,
         aggregates=(aggregate,),
-        work=(held,),
-        revision=2,
-        limits=caller_limits,
-    )
-
-    assert plan is not None
-    assert plan.work_releases == (
-        (held.value, _expected_event_work_plaintext(held.value), 1),
-    )
-    if case == "pre-capacity-exact":
-        assert plan.room_values == (
-            RoomAggregateValue(
-                successor_continuity,
-                2 + successor_count,
-                2,
-                None,
-            ),
-        )
-        assert plan.work_inserts == (
-            (old_loss, old_loss_plaintext, 0),
-            (lifecycle, lifecycle_plaintext, 2),
-            *(
-                (record, plaintext, index + 3)
-                for index, (record, plaintext) in enumerate(
-                    zip(successors, successor_plaintexts, strict=True)
-                )
-            ),
-            *(
-                (record, plaintext, successor_count + index + 3)
-                for index, (record, plaintext) in enumerate(
-                    zip(globals_, global_plaintexts, strict=True)
-                )
-            ),
-        )
-    else:
-        assert case == "pre-capacity-one-over"
-        assert plan.room_values == (
-            RoomAggregateValue(successor_continuity, 2, 2, None),
-        )
-        assert plan.work_inserts == (
-            (old_loss, old_loss_plaintext, 0),
-            (lifecycle, lifecycle_plaintext, 2),
-            (capacity_loss, capacity_loss_plaintext, 3),
-            *(
-                (record, plaintext, index + 4)
-                for index, (record, plaintext) in enumerate(
-                    zip(globals_, global_plaintexts, strict=True)
-                )
-            ),
-        )
-    assert plan.crypto_deferred is False
-
-
-@pytest.mark.parametrize(
-    ("room_body_length", "tuned_padding", "excess"),
-    [
-        pytest.param(257_677, 47, 0, id="exact"),
-        pytest.param(257_677, 50, 4, id="over"),
-    ],
-)
-def test_materializer_retirement_immutable_addition_byte_boundary(
-    room_body_length: int,
-    tuned_padding: int,
-    excess: int,
-) -> None:
-    room_id = f"!{'r' * room_body_length}:example.org"
-    ordinary_successor = b'{"content":{"body":"successor"},"type":"m.room.message"}'
-    tuned_successor = (
-        b'{"content":{"body":"'
-        + (b"x" * tuned_padding)
-        + b'"},"type":"m.room.message"}'
-    )
-    successor_json = (ordinary_successor,) * 62 + (tuned_successor,)
-    global_json = (b'{"content":{"generation":2},"type":"m.push_rules"}',)
-    frame, aggregate, held = _retirement_capacity_planner_case(
-        successor_json,
-        room_id=room_id,
-    )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert len(proposal.room_proposals) == 1
-    room = proposal.room_proposals[0]
-    successor_continuity = RoomContinuity(
-        room_id,
-        1,
-        "leave",
-        None,
-        None,
-        None,
-    )
-    assert room.before == aggregate.continuity
-    assert room.after == successor_continuity
-    assert room.hydration is None
-    assert room.recovery is None
-    assert room.retirement_epoch == 0
-    assert room.losses == (
-        LossProposal(
-            room_id,
-            0,
-            LossReason.UNVERIFIABLE,
-            LossBoundary(None, None, None, None),
-        ),
-    )
-    assert room.release is RecoveryRelease.LOSS_THEN_HELD
-    assert tuple(
-        (
-            descriptor.kind,
-            descriptor.room_id,
-            descriptor.source_json,
-            descriptor.provenance,
-            descriptor.descriptor_key,
-            descriptor.route,
-        )
-        for descriptor in proposal.descriptors
-    ) == (
-        *(
-            (
-                RecordKind.TIMELINE,
-                room_id,
-                source_json,
-                TimelineEventProvenance.LIVE,
-                f"frame:{_FRAME_ID}:{index}",
-                DescriptorRoute.HOLD_FOR_RETIREMENT,
-            )
-            for index, source_json in enumerate(successor_json)
-        ),
-        (
-            RecordKind.GLOBAL_ACCOUNT_DATA,
-            None,
-            global_json[0],
-            None,
-            f"frame:{_FRAME_ID}:63",
-            DescriptorRoute.READY,
-        ),
-    )
-    old_loss, lifecycle, successors, globals_, capacity_loss = (
-        _expected_retirement_capacity_records(
-            successor_json,
-            global_json,
-            room_id=room_id,
-        )
-    )
-    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
-    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
-    successor_plaintexts = tuple(
-        _expected_event_work_plaintext(record) for record in successors
-    )
-    global_plaintexts = tuple(
-        _expected_event_work_plaintext(record) for record in globals_
-    )
-    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
-    normal_work = (
-        (old_loss, 0),
-        (lifecycle, 2),
-        *((record, index + 3) for index, record in enumerate(successors)),
-        (globals_[0], 66),
-    )
-    replacement_work = (
-        (old_loss, 0),
-        (lifecycle, 2),
-        (capacity_loss, 3),
-        (globals_[0], 4),
-    )
-    normal_payloads = tuple(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=value,
-            ordinal=ordinal,
-            revision=2,
-        )
-        for value, ordinal in normal_work
-    )
-    replacement_payloads = tuple(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=value,
-            ordinal=ordinal,
-            revision=2,
-        )
-        for value, ordinal in replacement_work
-    )
-    hard = MaterializerLimits()
-    assert hard.max_record_canonical_bytes == 1 * 1024 * 1024
-    assert hard.max_held_work_canonical_bytes == 32 * 1024 * 1024
-    assert len(normal_payloads) == 66
-    assert all(
-        len(payload) <= hard.max_record_canonical_bytes for payload in normal_payloads
-    )
-    assert sum(map(len, normal_payloads)) == (
-        hard.max_held_work_canonical_bytes + excess
-    )
-    assert sum(map(len, replacement_payloads)) < (hard.max_held_work_canonical_bytes)
-    caller_limits = replace(
-        hard,
-        max_held_work_count=1,
-        max_held_work_canonical_bytes=1,
-        max_ready_work_count=1,
-        max_ready_work_canonical_bytes=1,
-        max_total_work_count=1,
-        max_total_work_canonical_bytes=1,
-    )
-
-    plan = plan_frame_materialization(
-        account_id=_PLANNER_ACCOUNT_ID,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(held,),
-        revision=2,
-        limits=caller_limits,
-    )
-
-    assert plan is not None
-    assert plan.work_releases == (
-        (held.value, _expected_event_work_plaintext(held.value), 1),
-    )
-    if excess == 0:
-        assert plan.room_values == (
-            RoomAggregateValue(
-                successor_continuity,
-                65,
-                2,
-                None,
-            ),
-        )
-        assert plan.work_inserts == (
-            (old_loss, old_loss_plaintext, 0),
-            (lifecycle, lifecycle_plaintext, 2),
-            *(
-                (record, plaintext, index + 3)
-                for index, (record, plaintext) in enumerate(
-                    zip(successors, successor_plaintexts, strict=True)
-                )
-            ),
-            (globals_[0], global_plaintexts[0], 66),
-        )
-    else:
-        assert excess == 4
-        assert plan.room_values == (
-            RoomAggregateValue(successor_continuity, 2, 2, None),
-        )
-        assert plan.work_inserts == (
-            (old_loss, old_loss_plaintext, 0),
-            (lifecycle, lifecycle_plaintext, 2),
-            (capacity_loss, capacity_loss_plaintext, 3),
-            (globals_[0], global_plaintexts[0], 4),
-        )
-    assert plan.crypto_deferred is False
-
-
-@pytest.mark.parametrize("excess", [0, 1], ids=("exact", "one-over"))
-def test_materializer_retirement_replacement_obeys_immutable_total_byte_boundary(
-    excess: int,
-) -> None:
-    room_id = "!planner-retire:example.org"
-    successor_json = (
-        b'{"content":{"body":"' + (b"x" * 512) + b'"},"type":"m.room.message"}',
-    )
-    global_json = (b'{"content":{"generation":2},"type":"m.push_rules"}',)
-    frame, aggregate, held = _retirement_capacity_planner_case(successor_json)
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert len(proposal.room_proposals) == 1
-    room = proposal.room_proposals[0]
-    successor_continuity = RoomContinuity(
-        room_id,
-        1,
-        "leave",
-        None,
-        None,
-        None,
-    )
-    assert room.before == aggregate.continuity
-    assert room.after == successor_continuity
-    assert room.hydration is None
-    assert room.recovery is None
-    assert room.retirement_epoch == 0
-    assert room.losses == (
-        LossProposal(
-            room_id,
-            0,
-            LossReason.UNVERIFIABLE,
-            LossBoundary(None, None, None, None),
-        ),
-    )
-    assert room.release is RecoveryRelease.LOSS_THEN_HELD
-    assert tuple(
-        (
-            descriptor.kind,
-            descriptor.room_id,
-            descriptor.source_json,
-            descriptor.provenance,
-            descriptor.descriptor_key,
-            descriptor.route,
-        )
-        for descriptor in proposal.descriptors
-    ) == (
-        (
-            RecordKind.TIMELINE,
-            room_id,
-            successor_json[0],
-            TimelineEventProvenance.LIVE,
-            f"frame:{_FRAME_ID}:0",
-            DescriptorRoute.HOLD_FOR_RETIREMENT,
-        ),
-        (
-            RecordKind.GLOBAL_ACCOUNT_DATA,
-            None,
-            global_json[0],
-            None,
-            f"frame:{_FRAME_ID}:1",
-            DescriptorRoute.READY,
-        ),
-    )
-    old_loss, lifecycle, successors, globals_, capacity_loss = (
-        _expected_retirement_capacity_records(
-            successor_json,
-            global_json,
-            capacity_reason=LossReason.OVERSIZED_EVENT,
-        )
-    )
-    old_loss_plaintext = _expected_loss_work_plaintext(old_loss)
-    lifecycle_plaintext = _expected_event_work_plaintext(lifecycle)
-    global_plaintext = _expected_event_work_plaintext(globals_[0])
-    capacity_loss_plaintext = _expected_loss_work_plaintext(capacity_loss)
-    replacement_work = (
-        (old_loss, 0),
-        (lifecycle, 2),
-        (capacity_loss, 3),
-        (globals_[0], 4),
-    )
-    replacement_payloads = tuple(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=value,
-            ordinal=ordinal,
-            revision=2,
-        )
-        for value, ordinal in replacement_work
-    )
-    release_payload_size = len(
-        _expected_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            stream_id=_STREAM_ID,
-            transport_kind=frame.origin.transport,
-            frame_id=_PLANNER_EXISTING_FRAME_ID,
-            value=held.value,
-            status="ready",
-            ready_revision=2,
-            ready_ordinal=1,
-            created_revision=1,
-        )
-    )
-    successor_payload_size = len(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=successors[0],
-            ordinal=3,
-            revision=2,
-        )
-    )
-    max_record_bytes = max(
-        release_payload_size,
-        *(map(len, replacement_payloads)),
-    )
-    assert successor_payload_size > max_record_bytes
-    hard = MaterializerLimits()
-    assert hard.max_record_canonical_bytes == 1 * 1024 * 1024
-    assert hard.max_total_work_canonical_bytes == 64 * 1024 * 1024
-    exact_ready_bytes = (
-        hard.max_total_work_canonical_bytes
-        - release_payload_size
-        - sum(map(len, replacement_payloads))
-    )
-    ready_sizes: list[int] = []
-    remaining = exact_ready_bytes
-    while remaining:
-        size = min(hard.max_record_canonical_bytes, remaining)
-        ready_sizes.append(size)
-        remaining -= size
-    assert len(ready_sizes) == 64
-    assert ready_sizes[-1] < hard.max_record_canonical_bytes
-    ready_sizes[-1] += excess
-    assert all(1 <= size <= hard.max_record_canonical_bytes for size in ready_sizes)
-    ready = tuple(
-        _planner_ready_work(frame, index, canonical_size=size)
-        for index, size in enumerate(ready_sizes)
-    )
-    work = (held, *ready)
-    assert all(type(item.value) is EventRecord for item in work)
-    work_ids = tuple(
-        item.value.record_id for item in work if type(item.value) is EventRecord
-    )
-    assert len(set(work_ids)) == len(work)
-    assert (
-        sum(item.canonical_size for item in ready)
-        + release_payload_size
-        + sum(map(len, replacement_payloads))
-        == hard.max_total_work_canonical_bytes + excess
-    )
-    caller_limits = replace(
-        hard,
-        max_record_canonical_bytes=max_record_bytes,
-        max_held_work_count=1,
-        max_held_work_canonical_bytes=1,
-        max_ready_work_count=1,
-        max_ready_work_canonical_bytes=1,
-        max_total_work_count=1,
-        max_total_work_canonical_bytes=1,
-    )
-
-    plan = plan_frame_materialization(
-        account_id=_PLANNER_ACCOUNT_ID,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
         work=work,
         revision=2,
         limits=caller_limits,
     )
-
-    if excess:
+    if case.outcome == "capacity":
         assert plan is None
         return
     assert plan is not None
-    assert plan.room_values == (RoomAggregateValue(successor_continuity, 2, 2, None),)
-    assert plan.work_inserts == (
-        (old_loss, old_loss_plaintext, 0),
-        (lifecycle, lifecycle_plaintext, 2),
-        (capacity_loss, capacity_loss_plaintext, 3),
-        (globals_[0], global_plaintext, 4),
+    expected_work = normal_work if case.outcome == "normal" else replacement_work
+    assert plan.room_values == (
+        RoomAggregateValue(
+            successor_continuity,
+            2 + (len(successors) if case.outcome == "normal" else 0),
+            2,
+            None,
+        ),
     )
+    assert len(plan.work_inserts) == len(expected_work)
+    for actual, (value, ordinal) in zip(plan.work_inserts, expected_work, strict=True):
+        expected_plaintext = (
+            _expected_event_work_plaintext(value)
+            if type(value) is EventRecord
+            else _expected_loss_work_plaintext(value)
+        )
+        assert actual == (value, expected_plaintext, ordinal)
     assert plan.work_releases == (
         (held.value, _expected_event_work_plaintext(held.value), 1),
     )
-    assert successors[0].record_id not in {
-        item.record_id
-        for item, _plaintext, _ordinal in plan.work_inserts
-        if type(item) is EventRecord
-    }
+    if case.outcome == "replacement":
+        assert not {record.record_id for record in successors} & {
+            value.record_id
+            for value, _payload, _ordinal in plan.work_inserts
+            if type(value) is EventRecord
+        }
     assert plan.crypto_deferred is False
 
 
