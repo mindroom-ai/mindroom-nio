@@ -4970,149 +4970,386 @@ def test_materializer_rebuilt_release_obeys_immutable_record_limit(
     assert plan.work_releases == ((value, _expected_event_work_plaintext(value), 1),)
 
 
-def test_materializer_empty_pending_hydration_ignores_existing_held_watermark() -> None:
-    frame, aggregate, selected_held = _pending_hydration_planner_case()
-    frame = replace(
-        frame,
-        room_segments=(replace(frame.room_segments[0], room_account_data_json=()),),
-    )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert proposal.descriptors == ()
-    assert len(proposal.room_proposals) == 1
-    room = proposal.room_proposals[0]
-    assert room.before == aggregate.continuity == room.after
-    assert room.hydration is not None
-    unrelated_value = replace(
-        selected_held.value,
-        record_id=str(uuid5(frame.frame_id, "planner-unrelated-held")),
-        room_id="!planner-unrelated:example.org",
-    )
-    unrelated_held = replace(
-        selected_held,
-        value=unrelated_value,
-        canonical_size=len(
-            _expected_stored_work_payload(
-                account_id=_PLANNER_ACCOUNT_ID,
-                stream_id=_STREAM_ID,
-                transport_kind=frame.origin.transport,
-                frame_id=_PLANNER_EXISTING_FRAME_ID,
-                value=unrelated_value,
-                status="held",
-                ready_revision=None,
-                ready_ordinal=None,
-                created_revision=1,
-            )
-        ),
-    )
-
-    plan = plan_frame_materialization(
-        account_id=_PLANNER_ACCOUNT_ID,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(selected_held, unrelated_held),
-        revision=2,
-        limits=replace(MaterializerLimits(), max_held_work_count=1),
-    )
-
-    assert plan is not None
-    assert plan.room_values == ()
-    assert plan.work_inserts == ()
-    assert plan.work_releases == ()
-    assert plan.crypto_deferred is False
+@dataclass(frozen=True)
+class _HydrationMaterializerCase:
+    case_id: str
+    scenario: str
+    pending: bool
+    expected_routes: tuple[str, ...] | None
+    expected_error: str | None
 
 
-def test_materializer_null_ephemeral_only_ignores_unrelated_held_watermark() -> None:
-    frame, pending, selected_held = _pending_hydration_ephemeral_planner_case()
-    aggregate = replace(
+_HYDRATION_MATERIALIZER_CASES = (
+    _HydrationMaterializerCase(
+        "hydration-empty-pending-owner", "empty-pending", True, (), None
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ephemeral-null-owner", "ephemeral-null", False, ("ready",), None
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ephemeral-overflow-pending",
+        "room-overflow",
+        True,
+        ("hold_for_hydration", "hold_for_hydration"),
+        None,
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ephemeral-overflow-null",
+        "room-overflow",
+        False,
+        ("ready", "ready"),
+        None,
+    ),
+    _HydrationMaterializerCase(
+        "hydration-global-oversize-precedence",
+        "global-overflow",
+        True,
+        ("hold_for_hydration", "ready"),
+        "planned Work record exceeds the canonical byte limit",
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ambiguous-owner-absent-aggregate",
+        "absent-aggregate",
+        True,
+        None,
+        "room descriptor has no continuity",
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ambiguous-owner-two-rooms",
+        "two-rooms",
+        False,
+        None,
+        "selected frame has inconsistent room ownership",
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ambiguous-owner-segment-and-ephemeral",
+        "segment-and-ephemeral",
+        True,
+        None,
+        "selected frame has inconsistent room ownership",
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ambiguous-owner-recovery-gap",
+        "recovery-gap",
+        False,
+        ("hold_for_gap",),
+        "invalid ephemeral-only room ownership",
+    ),
+    _HydrationMaterializerCase(
+        "hydration-ambiguous-owner-null-with-held",
+        "null-with-held",
+        False,
+        ("ready",),
+        "READY ephemeral room has orphan HELD Work",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _HYDRATION_MATERIALIZER_CASES,
+    ids=lambda case: case.case_id,
+)
+def test_materializer_hydration_ownership_matrix(
+    case: _HydrationMaterializerCase,
+) -> None:
+    """Each named hydration case owns its literal route, capacity, and owner result."""
+
+    base, pending, selected_held = _pending_hydration_ephemeral_planner_case()
+    first_room = pending.continuity.room_id
+    null = replace(
         pending,
         continuity=replace(pending.continuity, hydration_id=None),
         pending_hydration=None,
     )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert proposal.room_proposals == ()
-    assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
-        DescriptorRoute.READY,
-    )
-    unrelated_values = tuple(
-        replace(
+    aggregate = pending if case.pending else null
+    frame = base
+    aggregates: tuple[RoomAggregateValue, ...] = (aggregate,)
+    work: tuple[AuthenticatedWork, ...] = (selected_held,) if case.pending else ()
+    limits = MaterializerLimits()
+    expected_event: EventRecord | None = None
+    expected_loss: LossRecord | None = None
+    loss_payload_size: int | None = None
+
+    def unrelated_held(index: int) -> AuthenticatedWork:
+        value = replace(
             selected_held.value,
             record_id=str(uuid5(frame.frame_id, f"unrelated-held:{index}")),
             room_id=f"!unrelated-held-{index}:example.org",
         )
-        for index in range(2)
-    )
-    unrelated = tuple(
-        replace(
-            selected_held,
-            value=value,
-            canonical_size=len(
-                _expected_stored_work_payload(
-                    account_id=_PLANNER_ACCOUNT_ID,
-                    stream_id=_STREAM_ID,
-                    transport_kind=frame.origin.transport,
-                    frame_id=_PLANNER_EXISTING_FRAME_ID,
-                    value=value,
-                    status="held",
-                    ready_revision=None,
-                    ready_ordinal=None,
-                    created_revision=1,
-                )
+        return replace(selected_held, value=value)
+
+    if case.scenario == "empty-pending":
+        frame, aggregate, selected_held = _pending_hydration_planner_case()
+        frame = replace(
+            frame,
+            room_segments=(replace(frame.room_segments[0], room_account_data_json=()),),
+        )
+        aggregates = (aggregate,)
+        work = (selected_held, unrelated_held(0))
+        limits = replace(MaterializerLimits(), max_held_work_count=1)
+    elif case.scenario == "ephemeral-null":
+        work = (unrelated_held(0), unrelated_held(1))
+        limits = replace(
+            MaterializerLimits(),
+            max_held_work_count=1,
+            max_ready_work_count=1,
+            max_total_work_count=3,
+        )
+    elif case.scenario in {"room-overflow", "global-overflow"}:
+        ephemeral = (
+            _ephemeral_envelope(
+                first_room,
+                {
+                    "content": (
+                        {"padding": "x" * 512}
+                        if case.scenario == "room-overflow"
+                        else {}
+                    ),
+                    "type": "m.typing",
+                },
             ),
         )
-        for value in unrelated_values
+        if case.scenario == "room-overflow":
+            ephemeral += (
+                _ephemeral_envelope(
+                    first_room,
+                    {"content": {}, "type": "m.x"},
+                ),
+            )
+        frame = replace(
+            base,
+            room_segments=(),
+            ephemeral_json=ephemeral,
+            global_account_data_json=(
+                (
+                    canonical_json(
+                        {
+                            "content": {"padding": "x" * 512},
+                            "type": "m.push_rules",
+                        }
+                    ),
+                )
+                if case.scenario == "global-overflow"
+                else ()
+            ),
+        )
+    elif case.scenario == "absent-aggregate":
+        frame = replace(base, room_segments=())
+        aggregates = ()
+        work = ()
+    elif case.scenario == "two-rooms":
+        second_room = "!planner-ephemeral-second:example.org"
+        second = RoomAggregateValue(
+            RoomContinuity(second_room, 0, "join", None, None, None),
+            0,
+            1,
+            None,
+        )
+        frame = replace(
+            base,
+            room_segments=(),
+            ephemeral_json=(
+                _ephemeral_envelope(first_room, {"content": {}, "type": "m.typing"}),
+                _ephemeral_envelope(second_room, {"content": {}, "type": "m.receipt"}),
+            ),
+        )
+        aggregates = (null, second)
+        work = ()
+    elif case.scenario == "segment-and-ephemeral":
+        segment_base, _, _ = _pending_hydration_planner_case()
+        second_room = "!planner-ephemeral-second:example.org"
+        second = RoomAggregateValue(
+            RoomContinuity(second_room, 0, "join", None, None, None),
+            0,
+            1,
+            None,
+        )
+        frame = replace(
+            base,
+            room_segments=segment_base.room_segments,
+            ephemeral_json=(
+                _ephemeral_envelope(second_room, {"content": {}, "type": "m.typing"}),
+            ),
+        )
+        aggregates = (pending, second)
+        work = (selected_held,)
+    elif case.scenario == "recovery-gap":
+        gap = RecoveryGap(
+            uuid5(base.frame_id, "planner-ephemeral-gap"),
+            first_room,
+            null.continuity.membership_epoch,
+            replace(base.origin, request_id=1),
+            "p0",
+            "p1",
+        )
+        aggregates = (replace(null, continuity=replace(null.continuity, gap=gap)),)
+        work = ()
+    else:
+        assert case.scenario == "null-with-held"
+        frame = replace(base, room_segments=())
+        aggregates = (null,)
+        work = (selected_held,)
+
+    proposal = (
+        None
+        if case.scenario == "absent-aggregate"
+        else reduce_staged_frame(
+            _STREAM_ID,
+            frame.frame_id,
+            frame,
+            tuple(item.continuity for item in aggregates),
+        )
     )
-    descriptor = proposal.descriptors[0]
-    expected = EventRecord(
-        str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}")),
-        RecordKind.EPHEMERAL,
-        frame.origin,
-        aggregate.continuity.room_id,
-        aggregate.continuity.membership_epoch,
-        aggregate.next_room_sequence,
-        None,
-        None,
-        descriptor.source_json,
-        None,
-    )
-    plaintext = _expected_event_work_plaintext(expected)
+    if case.expected_routes is not None and proposal is not None:
+        assert (
+            tuple(item.route.value for item in proposal.descriptors)
+            == case.expected_routes
+        )
+
+    if case.scenario in {"ephemeral-null", "room-overflow"}:
+        assert proposal is not None
+        records = tuple(
+            EventRecord(
+                str(uuid5(frame.frame_id, f"event:{descriptor.descriptor_key}")),
+                descriptor.kind,
+                replace(frame.origin, frame_index=index),
+                descriptor.room_id,
+                (
+                    aggregate.continuity.membership_epoch
+                    if descriptor.room_id is not None
+                    else None
+                ),
+                (
+                    aggregate.next_room_sequence
+                    if descriptor.room_id is not None
+                    else None
+                ),
+                None,
+                None,
+                descriptor.source_json,
+                None,
+            )
+            for index, descriptor in enumerate(proposal.descriptors)
+        )
+        expected_event = records[0]
+        if case.scenario == "room-overflow":
+            loss_without_id = LossRecord(
+                "",
+                frame.origin,
+                first_room,
+                aggregate.continuity.membership_epoch,
+                LossReason.OVERSIZED_EVENT,
+                LossBoundary(None, None, None, None),
+                b"{}",
+            )
+            expected_loss = replace(
+                loss_without_id,
+                loss_id=_loss_id(_STREAM_ID, loss_without_id),
+            )
+            loss_payload_size = 850
+            assert len(records[0].source_json) > len(records[1].source_json)
+            limits = replace(
+                MaterializerLimits(),
+                max_record_canonical_bytes=loss_payload_size,
+                max_held_work_count=1,
+                max_ready_work_count=1,
+                max_ready_work_canonical_bytes=1,
+                max_total_work_count=1,
+                max_total_work_canonical_bytes=1,
+            )
+    elif case.scenario == "global-overflow":
+        limits = replace(
+            MaterializerLimits(),
+            max_record_canonical_bytes=855,
+            max_held_work_count=1,
+        )
+
+    if case.expected_error is not None:
+        with pytest.raises(ValueError, match=case.expected_error):
+            plan_frame_materialization(
+                account_id=_PLANNER_ACCOUNT_ID,
+                stream_id=_STREAM_ID,
+                frame=frame,
+                aggregates=aggregates,
+                work=work,
+                revision=2,
+                limits=limits,
+            )
+        return
 
     plan = plan_frame_materialization(
         account_id=_PLANNER_ACCOUNT_ID,
         stream_id=_STREAM_ID,
         frame=frame,
-        aggregates=(aggregate,),
-        work=unrelated,
+        aggregates=aggregates,
+        work=work,
         revision=2,
-        limits=replace(
-            MaterializerLimits(),
-            max_held_work_count=1,
-            max_ready_work_count=1,
-            max_total_work_count=3,
-        ),
+        limits=limits,
     )
 
     assert plan is not None
-    assert plan.room_values == (
-        replace(
-            aggregate,
-            next_room_sequence=aggregate.next_room_sequence + 1,
-            updated_revision=2,
-        ),
-    )
-    assert plan.work_inserts == ((expected, plaintext, 0),)
-    assert plan.work_releases == ()
     assert plan.crypto_deferred is False
+
+    if case.scenario == "empty-pending":
+        assert plan.room_values == ()
+        assert plan.work_inserts == ()
+        assert plan.work_releases == ()
+    elif case.scenario == "ephemeral-null":
+        assert expected_event is not None
+        assert plan.work_releases == ()
+        assert plan.work_inserts == (
+            (expected_event, _expected_event_work_plaintext(expected_event), 0),
+        )
+        assert plan.room_values == (
+            replace(
+                aggregate,
+                next_room_sequence=aggregate.next_room_sequence + 1,
+                updated_revision=2,
+            ),
+        )
+    elif case.scenario == "room-overflow":
+        assert expected_loss is not None
+        assert loss_payload_size is not None
+        assert plan.work_inserts == (
+            (expected_loss, _expected_loss_work_plaintext(expected_loss), 0),
+        )
+        assert plan.work_releases == (
+            (
+                (
+                    selected_held.value,
+                    _expected_event_work_plaintext(selected_held.value),
+                    1,
+                ),
+            )
+            if case.pending
+            else ()
+        )
+        assert plan.room_values == (
+            (
+                RoomAggregateValue(
+                    replace(aggregate.continuity, hydration_id=None),
+                    aggregate.next_room_sequence,
+                    2,
+                    None,
+                ),
+            )
+            if case.pending
+            else ()
+        )
+        with pytest.raises(ValueError, match="canonical byte limit"):
+            plan_frame_materialization(
+                account_id=_PLANNER_ACCOUNT_ID,
+                stream_id=_STREAM_ID,
+                frame=frame,
+                aggregates=aggregates,
+                work=work,
+                revision=2,
+                limits=replace(
+                    limits,
+                    max_record_canonical_bytes=loss_payload_size - 1,
+                ),
+            )
 
 
 @pytest.mark.parametrize(
@@ -5942,422 +6179,6 @@ def test_materializer_terminal_replacement_obeys_hard_addition_count_boundary() 
             work=(selected_held,),
             revision=2,
             limits=limits,
-        )
-
-
-@pytest.mark.parametrize("pending", [True, False], ids=("pending", "null"))
-def test_materializer_ephemeral_only_room_oversize_is_a_room_loss(
-    pending: bool,
-) -> None:
-    base, pending_aggregate, selected_held = _pending_hydration_ephemeral_planner_case()
-    aggregate = (
-        pending_aggregate
-        if pending
-        else replace(
-            pending_aggregate,
-            continuity=replace(
-                pending_aggregate.continuity,
-                hydration_id=None,
-            ),
-            pending_hydration=None,
-        )
-    )
-    frame = replace(
-        base,
-        room_segments=(),
-        ephemeral_json=(
-            _ephemeral_envelope(
-                aggregate.continuity.room_id,
-                {"content": {"padding": "x" * 512}, "type": "m.typing"},
-            ),
-            _ephemeral_envelope(
-                aggregate.continuity.room_id,
-                {"content": {}, "type": "m.x"},
-            ),
-        ),
-    )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert frame.room_segments == ()
-    assert proposal.room_proposals == ()
-    expected_route = (
-        DescriptorRoute.HOLD_FOR_HYDRATION if pending else DescriptorRoute.READY
-    )
-    assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
-        expected_route,
-        expected_route,
-    )
-    incoming = tuple(
-        EventRecord(
-            str(uuid5(frame.frame_id, f"event:frame:{frame.frame_id}:{index}")),
-            RecordKind.EPHEMERAL,
-            replace(frame.origin, frame_index=index),
-            aggregate.continuity.room_id,
-            aggregate.continuity.membership_epoch,
-            aggregate.next_room_sequence + index,
-            None,
-            None,
-            descriptor.source_json,
-            None,
-        )
-        for index, descriptor in enumerate(proposal.descriptors)
-    )
-    loss_without_id = LossRecord(
-        "",
-        frame.origin,
-        aggregate.continuity.room_id,
-        aggregate.continuity.membership_epoch,
-        LossReason.OVERSIZED_EVENT,
-        LossBoundary(None, None, None, None),
-        b"{}",
-    )
-    expected_loss = replace(
-        loss_without_id,
-        loss_id=_loss_id(_STREAM_ID, loss_without_id),
-    )
-    loss_plaintext = _expected_loss_work_plaintext(expected_loss)
-    loss_payload_size = len(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=expected_loss,
-            ordinal=0,
-            revision=2,
-        )
-    )
-    incoming_sizes = tuple(
-        len(
-            _expected_planned_stored_work_payload(
-                account_id=_PLANNER_ACCOUNT_ID,
-                frame=frame,
-                value=record,
-                ordinal=None if pending else index,
-                revision=2,
-            )
-        )
-        for index, record in enumerate(incoming)
-    )
-    assert incoming_sizes[0] > loss_payload_size
-    assert incoming_sizes[1] <= loss_payload_size
-    limits = replace(
-        MaterializerLimits(),
-        max_record_canonical_bytes=loss_payload_size,
-        max_held_work_count=1,
-        max_ready_work_count=1,
-        max_ready_work_canonical_bytes=1,
-        max_total_work_count=1,
-        max_total_work_canonical_bytes=1,
-    )
-
-    plan = plan_frame_materialization(
-        account_id=_PLANNER_ACCOUNT_ID,
-        stream_id=_STREAM_ID,
-        frame=frame,
-        aggregates=(aggregate,),
-        work=(selected_held,) if pending else (),
-        revision=2,
-        limits=limits,
-    )
-
-    assert plan is not None
-    assert plan.work_inserts == ((expected_loss, loss_plaintext, 0),)
-    assert plan.work_releases == (
-        (
-            (
-                selected_held.value,
-                _expected_event_work_plaintext(selected_held.value),
-                1,
-            ),
-        )
-        if pending
-        else ()
-    )
-    assert plan.room_values == (
-        (
-            RoomAggregateValue(
-                replace(aggregate.continuity, hydration_id=None),
-                aggregate.next_room_sequence,
-                2,
-                None,
-            ),
-        )
-        if pending
-        else ()
-    )
-    assert plan.crypto_deferred is False
-    with pytest.raises(ValueError, match="canonical byte limit"):
-        plan_frame_materialization(
-            account_id=_PLANNER_ACCOUNT_ID,
-            stream_id=_STREAM_ID,
-            frame=frame,
-            aggregates=(aggregate,),
-            work=(selected_held,) if pending else (),
-            revision=2,
-            limits=replace(
-                limits,
-                max_record_canonical_bytes=loss_payload_size - 1,
-            ),
-        )
-
-
-def test_materializer_ephemeral_only_terminal_candidate_does_not_swallow_global_oversize() -> (
-    None
-):
-    base, aggregate, selected_held = _pending_hydration_ephemeral_planner_case()
-    frame = replace(
-        base,
-        room_segments=(),
-        ephemeral_json=(
-            _ephemeral_envelope(
-                aggregate.continuity.room_id,
-                {"content": {}, "type": "m.typing"},
-            ),
-        ),
-        global_account_data_json=(
-            canonical_json({"content": {"padding": "x" * 512}, "type": "m.push_rules"}),
-        ),
-    )
-    proposal = reduce_staged_frame(
-        _STREAM_ID,
-        frame.frame_id,
-        frame,
-        (aggregate.continuity,),
-    )
-    assert proposal.room_proposals == ()
-    assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
-        DescriptorRoute.HOLD_FOR_HYDRATION,
-        DescriptorRoute.READY,
-    )
-    records = tuple(
-        EventRecord(
-            str(uuid5(frame.frame_id, f"event:frame:{frame.frame_id}:{index}")),
-            descriptor.kind,
-            replace(frame.origin, frame_index=index),
-            descriptor.room_id,
-            (
-                aggregate.continuity.membership_epoch
-                if descriptor.room_id is not None
-                else None
-            ),
-            aggregate.next_room_sequence if descriptor.room_id is not None else None,
-            None,
-            None,
-            descriptor.source_json,
-            None,
-        )
-        for index, descriptor in enumerate(proposal.descriptors)
-    )
-    room_bytes = len(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=records[0],
-            ordinal=None,
-            revision=2,
-        )
-    )
-    global_bytes = len(
-        _expected_planned_stored_work_payload(
-            account_id=_PLANNER_ACCOUNT_ID,
-            frame=frame,
-            value=records[1],
-            ordinal=0,
-            revision=2,
-        )
-    )
-    loss_without_id = LossRecord(
-        "",
-        frame.origin,
-        aggregate.continuity.room_id,
-        aggregate.continuity.membership_epoch,
-        LossReason.EVENT_LIMIT,
-        LossBoundary(None, None, None, None),
-        b"{}",
-    )
-    loss = replace(loss_without_id, loss_id=_loss_id(_STREAM_ID, loss_without_id))
-    assert (
-        len(
-            _expected_planned_stored_work_payload(
-                account_id=_PLANNER_ACCOUNT_ID,
-                frame=frame,
-                value=loss,
-                ordinal=0,
-                revision=2,
-            )
-        )
-        <= room_bytes
-    )
-    assert room_bytes < global_bytes
-
-    with pytest.raises(ValueError, match="canonical byte limit"):
-        plan_frame_materialization(
-            account_id=_PLANNER_ACCOUNT_ID,
-            stream_id=_STREAM_ID,
-            frame=frame,
-            aggregates=(aggregate,),
-            work=(selected_held,),
-            revision=2,
-            limits=replace(
-                MaterializerLimits(),
-                max_record_canonical_bytes=room_bytes,
-                max_held_work_count=1,
-            ),
-        )
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "absent-aggregate",
-        "two-rooms",
-        "segment-and-ephemeral",
-        "recovery-gap",
-        "null-with-held",
-    ],
-    ids=(
-        "absent-aggregate",
-        "two-rooms",
-        "segment-and-e",
-        "recovery-gap",
-        "null-with-held",
-    ),
-)
-def test_materializer_ephemeral_only_rejects_ambiguous_ownership(case: str) -> None:
-    base, pending, selected_held = _pending_hydration_ephemeral_planner_case()
-    first_room = pending.continuity.room_id
-    null = replace(
-        pending,
-        continuity=replace(pending.continuity, hydration_id=None),
-        pending_hydration=None,
-    )
-    second_room = "!planner-ephemeral-second:example.org"
-    second = RoomAggregateValue(
-        RoomContinuity(second_room, 0, "join", None, None, None),
-        0,
-        1,
-        None,
-    )
-    if case == "absent-aggregate":
-        frame = replace(
-            base,
-            room_segments=(),
-            ephemeral_json=(
-                _ephemeral_envelope(
-                    first_room,
-                    {"content": {}, "type": "m.typing"},
-                ),
-            ),
-        )
-        aggregates: tuple[RoomAggregateValue, ...] = ()
-        work: tuple[AuthenticatedWork, ...] = ()
-    elif case == "two-rooms":
-        frame = replace(
-            base,
-            room_segments=(),
-            ephemeral_json=(
-                _ephemeral_envelope(
-                    first_room,
-                    {"content": {}, "type": "m.typing"},
-                ),
-                _ephemeral_envelope(
-                    second_room,
-                    {"content": {}, "type": "m.receipt"},
-                ),
-            ),
-        )
-        aggregates = (null, second)
-        work = ()
-        proposal = reduce_staged_frame(
-            _STREAM_ID,
-            frame.frame_id,
-            frame,
-            tuple(item.continuity for item in aggregates),
-        )
-        assert proposal.room_proposals == ()
-        assert {descriptor.room_id for descriptor in proposal.descriptors} == {
-            first_room,
-            second_room,
-        }
-    elif case == "segment-and-ephemeral":
-        segment_base, _, _ = _pending_hydration_planner_case()
-        frame = replace(
-            base,
-            room_segments=segment_base.room_segments,
-            ephemeral_json=(
-                _ephemeral_envelope(
-                    second_room,
-                    {"content": {}, "type": "m.typing"},
-                ),
-            ),
-        )
-        aggregates = (pending, second)
-        work = (selected_held,)
-        proposal = reduce_staged_frame(
-            _STREAM_ID,
-            frame.frame_id,
-            frame,
-            tuple(item.continuity for item in aggregates),
-        )
-        assert len(proposal.room_proposals) == 1
-        assert {descriptor.room_id for descriptor in proposal.descriptors} == {
-            first_room,
-            second_room,
-        }
-    elif case == "recovery-gap":
-        gap = RecoveryGap(
-            uuid5(base.frame_id, "planner-ephemeral-gap"),
-            first_room,
-            null.continuity.membership_epoch,
-            replace(base.origin, request_id=1),
-            "p0",
-            "p1",
-        )
-        frame = base
-        aggregates = (
-            replace(
-                null,
-                continuity=replace(null.continuity, gap=gap),
-            ),
-        )
-        work = ()
-        proposal = reduce_staged_frame(
-            _STREAM_ID,
-            frame.frame_id,
-            frame,
-            tuple(item.continuity for item in aggregates),
-        )
-        assert proposal.room_proposals == ()
-        assert tuple(descriptor.route for descriptor in proposal.descriptors) == (
-            DescriptorRoute.HOLD_FOR_GAP,
-        )
-    else:
-        assert case == "null-with-held"
-        frame = replace(
-            base,
-            room_segments=(),
-            ephemeral_json=(
-                _ephemeral_envelope(
-                    first_room,
-                    {"content": {}, "type": "m.typing"},
-                ),
-            ),
-        )
-        aggregates = (null,)
-        work = (selected_held,)
-
-    with pytest.raises(ValueError, match=r".+"):
-        plan_frame_materialization(
-            account_id=_PLANNER_ACCOUNT_ID,
-            stream_id=_STREAM_ID,
-            frame=frame,
-            aggregates=aggregates,
-            work=work,
-            revision=2,
-            limits=MaterializerLimits(),
         )
 
 
