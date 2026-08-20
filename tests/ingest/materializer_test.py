@@ -5259,6 +5259,154 @@ def test_materializer_hydration_ownership_matrix(
                 max_total_work_canonical_bytes=1,
             )
     elif case.scenario == "global-overflow":
+        assert proposal is not None
+        room_descriptor, global_descriptor = proposal.descriptors
+        assert (room_descriptor.kind, global_descriptor.kind) == (
+            RecordKind.EPHEMERAL,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+        )
+        room_record = EventRecord(
+            str(uuid5(frame.frame_id, f"event:{room_descriptor.descriptor_key}")),
+            RecordKind.EPHEMERAL,
+            replace(frame.origin, frame_index=0),
+            first_room,
+            aggregate.continuity.membership_epoch,
+            aggregate.next_room_sequence,
+            None,
+            None,
+            room_descriptor.source_json,
+            None,
+        )
+        global_record = EventRecord(
+            str(uuid5(frame.frame_id, f"event:{global_descriptor.descriptor_key}")),
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            replace(frame.origin, frame_index=1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            global_descriptor.source_json,
+            None,
+        )
+        terminal_without_id = LossRecord(
+            "",
+            frame.origin,
+            first_room,
+            aggregate.continuity.membership_epoch,
+            LossReason.EVENT_LIMIT,
+            LossBoundary(None, None, None, None),
+            b"{}",
+        )
+        terminal_loss = replace(
+            terminal_without_id,
+            loss_id=_loss_id(_STREAM_ID, terminal_without_id),
+        )
+
+        def literal_event_stored_bytes(
+            record: EventRecord,
+            ordinal: int | None,
+        ) -> bytes:
+            return json.dumps(
+                {
+                    "schema_version": 1,
+                    "row_kind": "work",
+                    "account_id": _PLANNER_ACCOUNT_ID,
+                    "stream_id": str(_STREAM_ID),
+                    "transport_kind": "sliding",
+                    "work_id": record.record_id,
+                    "kind": "event",
+                    "status": "held" if ordinal is None else "ready",
+                    "frame_id": str(frame.frame_id),
+                    "room_id": record.room_id,
+                    "membership_epoch": record.membership_epoch,
+                    "room_sequence": record.room_sequence,
+                    "ready_revision": None if ordinal is None else 2,
+                    "ready_ordinal": ordinal,
+                    "created_revision": 2,
+                    "value": {
+                        "kind": "event",
+                        "value": {
+                            "record_type": "event",
+                            "record_id": record.record_id,
+                            "kind": record.kind.value,
+                            "origin": {
+                                "origin_type": "transport",
+                                "transport": "sliding",
+                                "source_epoch": 1,
+                                "request_id": 2,
+                                "frame_index": record.origin.frame_index,
+                            },
+                            "room_id": record.room_id,
+                            "membership_epoch": record.membership_epoch,
+                            "room_sequence": record.room_sequence,
+                            "event_id": None,
+                            "provenance": None,
+                            "source_json": base64.b64encode(record.source_json).decode(
+                                "ascii"
+                            ),
+                            "clear_json": None,
+                        },
+                    },
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        room_payload = literal_event_stored_bytes(room_record, None)
+        global_payload = literal_event_stored_bytes(global_record, 0)
+        terminal_payload = json.dumps(
+            {
+                "schema_version": 1,
+                "row_kind": "work",
+                "account_id": _PLANNER_ACCOUNT_ID,
+                "stream_id": str(_STREAM_ID),
+                "transport_kind": "sliding",
+                "work_id": terminal_loss.loss_id,
+                "kind": "loss",
+                "status": "ready",
+                "frame_id": str(frame.frame_id),
+                "room_id": first_room,
+                "membership_epoch": aggregate.continuity.membership_epoch,
+                "room_sequence": None,
+                "ready_revision": 2,
+                "ready_ordinal": 0,
+                "created_revision": 2,
+                "value": {
+                    "kind": "loss",
+                    "value": {
+                        "record_type": "loss",
+                        "loss_id": terminal_loss.loss_id,
+                        "origin": {
+                            "origin_type": "transport",
+                            "transport": "sliding",
+                            "source_epoch": 1,
+                            "request_id": 2,
+                            "frame_index": 0,
+                        },
+                        "room_id": first_room,
+                        "membership_epoch": aggregate.continuity.membership_epoch,
+                        "reason": "event_limit",
+                        "boundary": {
+                            "prior_event_id": None,
+                            "prior_origin_server_ts": None,
+                            "start_token": None,
+                            "target_token": None,
+                        },
+                        "detail_json": "e30=",
+                    },
+                },
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert len(room_payload) == 855
+        assert len(terminal_payload) == 846
+        assert len(terminal_payload) <= 855
+        assert len(global_payload) == 1522
+        assert len(global_payload) > 855
         limits = replace(
             MaterializerLimits(),
             max_record_canonical_bytes=855,
