@@ -117,7 +117,7 @@ class RoomContinuity(_ValidatedValue):
     last_timeline_event_id: str | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        _ValidatedValue.__post_init__(self)
         if self.gap is not None and (
             self.gap.room_id != self.room_id
             or self.gap.membership_epoch != self.membership_epoch
@@ -171,7 +171,7 @@ class FrameProposal(_ValidatedValue):
     crypto_deferred: bool
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        _ValidatedValue.__post_init__(self)
         if len(self.source_sha256) != 32:
             raise ValueError("source_sha256 must be exactly 32 bytes")
 
