@@ -3913,6 +3913,21 @@ def test_prepared_mandatory_barrier_uses_immutable_capacity_envelope(
     assert any(item.value == held.value for item in plan.work_releases)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("max_ready_work_count", 2_049),
+        ("max_ready_work_canonical_bytes", 16 * 1024 * 1024 + 1),
+    ),
+)
+def test_materializer_ready_limits_cannot_exceed_the_immutable_envelope(
+    field_name: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        replace(MaterializerLimits(), **{field_name: value})
+
+
 def test_prepared_terminal_reordinal_rechecks_final_immutable_record_size() -> None:
     case = _prepared_pending_room_case()
     aggregate = replace(case.aggregate, next_room_sequence=999)

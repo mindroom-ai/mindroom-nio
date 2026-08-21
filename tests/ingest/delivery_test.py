@@ -2,7 +2,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, closing, contextmanager
 from dataclasses import fields, replace
 from pathlib import Path
 from uuid import UUID, uuid5
@@ -120,7 +120,7 @@ def _open(tmp_path: Path, **kwargs: object):
 
 
 def _meta_row(database_path: Path) -> sqlite3.Row:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute("SELECT * FROM NioIngestMeta LIMIT 2").fetchall()
     assert len(rows) == 1
@@ -210,7 +210,7 @@ def _seed_room_aggregates(
 
 
 def _raw_delivery_graph(database_path: Path) -> tuple[tuple[object, ...], ...]:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         return tuple(
             tuple(row)
             for table in ("NioIngestMeta", "NioIngestWork")
@@ -221,7 +221,7 @@ def _raw_delivery_graph(database_path: Path) -> tuple[tuple[object, ...], ...]:
 def _raw_journal_graph(
     database_path: Path,
 ) -> tuple[tuple[str, tuple[object, ...]], ...]:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         tables = tuple(
             row[0]
             for row in connection.execute(

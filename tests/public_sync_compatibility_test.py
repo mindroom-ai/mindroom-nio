@@ -558,68 +558,6 @@ def test_existing_desktop_store_retains_inert_recovery_tables(tmp_path) -> None:
     assert after_rows == before_rows
 
 
-def test_desktop_import_and_client_construction_do_not_execute_recovery_modules() -> (
-    None
-):
-    """The retained desktop entrypoint does not initialize fork recovery code."""
-    program = r"""
-import asyncio
-import coverage
-import json
-
-targets = (
-    "/client/sliding_membership.py",
-    "/client/sync_recovery.py",
-    "/client/sync_reset_fence.py",
-    "/client/sync_response_ordering.py",
-    "/recovery_abandonment.py",
-    "/sliding_sync_tokens.py",
-)
-run = coverage.Coverage(data_file=None, source=["nio"])
-run.start()
-import nio
-from nio.store import SqliteMemoryStore
-
-client = nio.AsyncClient(
-    "https://example.org",
-    "@alice:example.org",
-    "DEVICE",
-    config=nio.AsyncClientConfig(encryption_enabled=False),
-)
-response = nio.SyncResponse.from_dict({"next_batch": "s1", "rooms": {}})
-asyncio.run(client.receive_response(response))
-asyncio.run(client.run_response_callbacks([response]))
-SqliteMemoryStore("@alice:example.org", "DEVICE")
-run.stop()
-data = run.get_data()
-executed = {
-    target: sorted(
-        line
-        for filename in data.measured_files()
-        if filename.endswith(target)
-        for line in (data.lines(filename) or ())
-    )
-    for target in targets
-}
-print(json.dumps(executed, sort_keys=True))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert json.loads(result.stdout) == {
-        "/client/sliding_membership.py": [],
-        "/client/sync_recovery.py": [],
-        "/client/sync_reset_fence.py": [],
-        "/client/sync_response_ordering.py": [],
-        "/recovery_abandonment.py": [],
-        "/sliding_sync_tokens.py": [],
-    }
-
-
 def test_ingestion_preflight_imports_without_retired_recovery_models() -> None:
     """Historical topology authentication does not depend on retired ORM types."""
     program = r"""

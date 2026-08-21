@@ -828,6 +828,7 @@ def test_non_json_retryable_http_body_is_retained_exactly(
         b"[]",
         b"{}",
         b'{"next_batch":7}',
+        b'{"next_batch":""}',
         b'{"next_batch":"s","rooms":[]}',
         b'{"next_batch":"s","rooms":{"future":{}}}',
         (

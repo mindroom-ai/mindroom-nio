@@ -109,6 +109,8 @@ That conversion is scoped to MindRoom identities entering the durable engine.
 Desktop remains on its ordinary upstream-style profile and keeps its existing
 DefaultStore and sidecars; this change does not migrate Desktop storage.
 
+Remove:
+
 - diagnostic scope, list-observation, event-receipt, event-occurrence, and source-rotation tables;
 - `DiagnosticIngestionScope` and diagnostic row codecs;
 - control-room and `probe` product configuration;

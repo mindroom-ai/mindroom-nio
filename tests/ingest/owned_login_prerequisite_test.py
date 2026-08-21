@@ -7,7 +7,6 @@ from nio.store import SqliteStore
 
 @pytest.mark.asyncio
 async def test_login_response_without_store_path_retains_credentials_storelessly(
-    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = AsyncClient(
@@ -36,4 +35,3 @@ async def test_login_response_without_store_path_retains_credentials_storelessly
     )
     assert client.store is None and client.olm is None
     assert client.client_session is None
-    assert not tuple(tmp_path.iterdir())

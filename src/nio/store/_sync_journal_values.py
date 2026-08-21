@@ -59,20 +59,19 @@ class MaterializerLimits:
     max_total_work_canonical_bytes: int = 64 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        for field, ceiling in zip(
-            fields(self),
-            (
-                1 * 1024 * 1024,
-                10_000,
-                32 * 1024 * 1024,
-                20_000,
-                64 * 1024 * 1024,
-                20_000,
-                64 * 1024 * 1024,
-            ),
-            strict=True,
-        ):
-            _require_bounded_positive(getattr(self, field.name), field.name, ceiling)
+        ceilings = {
+            "max_record_canonical_bytes": 1 * 1024 * 1024,
+            "max_held_work_count": 10_000,
+            "max_held_work_canonical_bytes": 32 * 1024 * 1024,
+            "max_ready_work_count": 2_048,
+            "max_ready_work_canonical_bytes": 16 * 1024 * 1024,
+            "max_total_work_count": 20_000,
+            "max_total_work_canonical_bytes": 64 * 1024 * 1024,
+        }
+        for field in fields(self):
+            _require_bounded_positive(
+                getattr(self, field.name), field.name, ceilings[field.name]
+            )
 
 
 @dataclass(frozen=True, slots=True)

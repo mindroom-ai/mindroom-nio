@@ -205,6 +205,8 @@ class ClassicSource:
         root = load_json(body, "sync response")
         root = require_json_object(root, "sync response")
         next_batch = require_json_string(root.get("next_batch"), "next_batch")
+        if not next_batch:
+            raise ValueError("next_batch must be a nonempty string")
         source_json = canonical_json(root)
         request_cursor = _classic_cursor_from_json(request.request_cursor_json)
         request_cursor_json = canonical_classic_cursor(request_cursor)
