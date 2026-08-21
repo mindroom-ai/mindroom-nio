@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from collections import defaultdict
 
 from .events import (
@@ -369,14 +368,8 @@ class MatrixRoom:
 
         if isinstance(event, ReceiptEvent):
             for receipt in event.receipts:
-                if sys.version_info < (3, 12):
-                    try:
-                        ReceiptType(receipt.receipt_type)
-                    except (TypeError, ValueError):
-                        continue
-                else:
-                    if receipt.receipt_type not in ReceiptType:
-                        continue
+                if receipt.receipt_type not in ReceiptType:
+                    continue
                 if receipt.thread_id:
                     self.threaded_read_receipts.setdefault(receipt.user_id, {})[
                         receipt.thread_id

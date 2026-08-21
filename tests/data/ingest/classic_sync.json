@@ -1,0 +1,183 @@
+{
+  "presence": {
+    "events": [
+      {
+        "type": "m.presence",
+        "sender": "@alice:example.org",
+        "content": {"presence": "online", "status_msg": "Café"}
+      },
+      {
+        "type": "m.presence",
+        "sender": "@bob:example.org",
+        "content": {"presence": "unavailable", "last_active_ago": 42}
+      },
+      {
+        "type": "m.presence",
+        "sender": "@bob:example.org",
+        "content": {"presence": "unavailable", "last_active_ago": 42}
+      }
+    ]
+  },
+  "rooms": {
+    "leave": {
+      "!leave:example.org": {
+        "timeline": {
+          "prev_batch": "leave-prev",
+          "limited": false,
+          "events": [
+            {
+              "type": "m.room.message",
+              "event_id": "$leave-message",
+              "content": {"msgtype": "m.text", "body": "left"}
+            }
+          ]
+        },
+        "account_data": {
+          "events": [
+            {"type": "m.tag", "content": {"tags": {"u.left": {}}}}
+          ]
+        },
+        "state": {
+          "events": [
+            {
+              "type": "m.room.member",
+              "state_key": "@me:example.org",
+              "event_id": "$left",
+              "content": {"membership": "leave"}
+            }
+          ]
+        }
+      }
+    },
+    "join": {
+      "!z-join:example.org": {
+        "ephemeral": {
+          "events": [
+            {
+              "type": "m.typing",
+              "content": {"user_ids": ["@bob:example.org"]}
+            },
+            {
+              "type": "m.receipt",
+              "content": {"$z-live-2": {"m.read": {"@me:example.org": {"ts": 7}}}}
+            },
+            {
+              "type": "m.receipt",
+              "content": {"$z-live-2": {"m.read": {"@me:example.org": {"ts": 7}}}}
+            }
+          ]
+        },
+        "timeline": {
+          "events": [
+            {
+              "event_id": "$z-live-1",
+              "type": "m.room.message",
+              "content": {"body": "first", "msgtype": "m.text"}
+            },
+            {
+              "event_id": "$z-live-2",
+              "type": "m.room.message",
+              "content": {"body": "second", "msgtype": "m.text"}
+            }
+          ],
+          "limited": true,
+          "prev_batch": "z-prev"
+        },
+        "state": {
+          "events": [
+            {
+              "event_id": "$z-name",
+              "type": "m.room.name",
+              "state_key": "",
+              "content": {"name": "Zed"}
+            }
+          ]
+        },
+        "account_data": {
+          "events": [
+            {"type": "m.fully_read", "content": {"event_id": "$z-live-2"}}
+          ]
+        }
+      },
+      "!a-join:example.org": {
+        "timeline": {
+          "events": [
+            {
+              "type": "m.room.message",
+              "event_id": "$a-live",
+              "content": {"body": "alpha", "msgtype": "m.text"}
+            }
+          ]
+        },
+        "state": {"events": []},
+        "account_data": {"events": []},
+        "ephemeral": {"events": []}
+      }
+    },
+    "invite": {
+      "!z-invite:example.org": {
+        "invite_state": {
+          "events": [
+            {
+              "type": "m.room.member",
+              "state_key": "@me:example.org",
+              "content": {"membership": "invite"}
+            }
+          ]
+        }
+      },
+      "!a-invite:example.org": {
+        "invite_state": {"events": []}
+      }
+    },
+    "knock": {
+      "!knock:example.org": {
+        "knock_state": {
+          "events": [
+            {
+              "type": "m.room.member",
+              "state_key": "@me:example.org",
+              "content": {"membership": "knock"}
+            }
+          ]
+        }
+      }
+    }
+  },
+  "device_unused_fallback_key_types": ["signed_curve25519"],
+  "account_data": {
+    "events": [
+      {"type": "m.ignored_user_list", "content": {"ignored_users": {"@spam:example.org": {}}}},
+      {"type": "m.direct", "content": {"@alice:example.org": ["!a-join:example.org"]}},
+      {"type": "m.direct", "content": {"@alice:example.org": ["!a-join:example.org"]}}
+    ]
+  },
+  "to_device": {
+    "events": [
+      {
+        "type": "m.room_key",
+        "sender": "@alice:example.org",
+        "content": {"room_id": "!z-join:example.org", "session_id": "SESSION"}
+      },
+      {
+        "type": "m.room_key_request",
+        "sender": "@bob:example.org",
+        "content": {"action": "request_cancellation", "request_id": "REQ"}
+      },
+      {
+        "type": "m.room_key_request",
+        "sender": "@bob:example.org",
+        "content": {"action": "request_cancellation", "request_id": "REQ"}
+      }
+    ]
+  },
+  "device_lists": {
+    "left": ["@old:example.org"],
+    "changed": ["@alice:example.org", "@bob:example.org"]
+  },
+  "next_batch": "s-next",
+  "device_one_time_keys_count": {
+    "signed_curve25519": 5,
+    "curve25519": 3
+  }
+}
