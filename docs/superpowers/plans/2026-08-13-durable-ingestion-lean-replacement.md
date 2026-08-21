@@ -4,7 +4,26 @@
 > `baspowers:test-driven-development` for every behavior change, and use
 > `baspowers:verification-before-completion` before any completion claim.
 
-**Status:** Tasks 1–8 complete and independently accepted. Task 9 is active.
+**Status:** Tasks 1–9 are complete and independently accepted. Task 10 product
+implementation, full suites/static verification, and post-deletion smoke are
+complete. On 2026-08-20 the user approved the final evidence-based numeric
+budget ceilings below; every behavior, crash, topology, compatibility,
+evidence, and security-exclusion gate remains unchanged. All amended budget
+gates pass. The exact-head rebind, one final 60-second smoke, and linked normal
+PR handoff remain. The accepted Task 10 smoke is root `20260820T093448Z`, with operator and sibling
+PASS verdicts, one exact Classic and Sliding effect, one authenticated Desktop
+callback, clean restarts, nine spaced zero Frame/Work samples, and absent
+process/Compose resources. The exact Task 9 deletion gate is the accepted d33/35b preflight at
+`runs/preflight-20260820T025529Z` plus the accepted 30-minute full run at
+`runs/full-20260820T030949Z`. The full operator and sibling verdicts are
+`SATURATION_PASS` and `INDEPENDENT_SATURATION_PASS`, with 5,409/5,409 exact
+responses, three loaded restarts, zero failure counters, final Work zero, and
+complete durable/process/coverage evidence. The ordinary linked deletion
+commits are matrix-nio `8287013985118bc96279ff30dbe965e48d9ddb00` and
+MindRoom `ebad3cce0cf14a36fea88a5f2d63124b954f576e`. Security-sensitive work
+remains notes-only. The detailed chronology below is retained as provenance;
+where it describes Task 9 as pending or deletion as locked, this current status
+supersedes it.
 The restored Desktop gate passed separately. The user replaced the obsolete
 long-duration/tiny-message MindRoom observation with one hard 30-minute
 saturation gate. The first reviewed 16-lane attempt failed closed at its
@@ -195,17 +214,18 @@ HTTP -> Frame/cursor commit -> prepare/materialize -> Work FIFO
 
 ## Fixed baselines and evidence-based budgets
 
-The baselines never move. The matrix-nio runtime and test ceilings were revised
-once on 2026-08-16 after the exact Task 9 deletion map and Task 10 feasibility
-inventory proved that the original ceilings could be reached only by removing
-required behavior or hiding crash semantics in an opaque persistence rewrite.
-The revised ceilings require every mapped deletion and the credible safe
-consolidation program while retaining a measurable margin:
+The baselines never move. The matrix-nio runtime and test ceilings were first
+revised on 2026-08-16 after the exact Task 9 deletion map and Task 10
+feasibility inventory proved that the original ceilings could be reached only
+by removing required behavior or hiding crash semantics in an opaque
+persistence rewrite. After complete implementation, deletion, full
+verification, and independent safe-seam inventories, the user approved the
+final numeric ceilings on 2026-08-20. Every non-budget gate is unchanged:
 
 | Repository | Baseline | Runtime | Tests | Docs/scripts | Additional gate |
 | --- | --- | ---: | ---: | ---: | --- |
-| matrix-nio | `6ed2b9817d2bc9de30dc72942f9cb867d829283b` | `src <= +13,000` | `tests <= +26,000` | `docs scripts <= +1,000` | preserve upstream compatibility |
-| MindRoom | `0acaea2baf05a4c41cce7497cfcdf4880afc6d04` | `src <= +350` | `tests <= +1,000` | — | `src tests` net smaller than `925df7f3cbcc39d4904140efd9d16b93c77238ea` |
+| matrix-nio | `6ed2b9817d2bc9de30dc72942f9cb867d829283b` | `src <= +15,000` | `tests <= +40,000` | `docs scripts <= +1,000` | preserve upstream compatibility |
+| MindRoom | `0acaea2baf05a4c41cce7497cfcdf4880afc6d04` | `src <= +2,000` | `tests <= +1,200` | — | `src tests <= +250` versus `925df7f3cbcc39d4904140efd9d16b93c77238ea` |
 
 Fresh Task 10A entry measurements on 2026-08-16 were:
 
@@ -238,6 +258,8 @@ gate; the exact revised commands must pass.
 | 6 — restore public sync compatibility | Complete | matrix-nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698` |
 | 7 — cross-database crash/parity matrix | Complete | matrix-nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` |
 | 8 — external Classic/Sliding/crash evidence | Complete | product candidate matrix-nio `af8eab819a501518c860e6dbb8581d411eec15d9`; MindRoom `934bebfbbe1a4b174aef2c075d00e971a29697f6`; evidence commits `3b0b4d6`, `94502ea`, `10dd9f6`, `20a980d`; acceptance `e1a2408` |
+| 9 — saturation observation and legacy deletion | Complete | accepted d33/35b preflight/full evidence; matrix-nio `8287013985118bc96279ff30dbe965e48d9ddb00`; MindRoom `ebad3cce0cf14a36fea88a5f2d63124b954f576e` |
+| 10 — consolidation, final verification, smoke, linked handoff | Finalization in progress | Amended budgets pass: Nio `src +14,680`, `tests +39,248`; MindRoom `src +1,924`, `tests +1,153`, canary total `+230`; exact-head rebind, final 60-second smoke, and linked normal PR handoff remain |
 
 Tasks 1–7 passed their scoped suites, static gates, and independent reviews.
 Task 7 uses real nio and MindRoom components to cover:
@@ -498,9 +520,10 @@ After Task 9's observation-gated deletion:
    `git diff --check`, configured pre-commit hooks, and a suppression scan.
 5. Run an independent code/evidence review and resolve every valid blocking
    finding.
-6. Run the exact fixed-baseline budget gates below from clean tracked worktrees. If any
-   command fails, simplify/delete or report the blocker; never move a baseline
-   or limit.
+6. Run the exact fixed-baseline budget gates below from clean tracked
+   worktrees. If any command fails, simplify/delete or report the blocker;
+   never move a baseline or limit without a recorded user-approved design
+   amendment.
 
 Matrix-nio gate, run from the matrix-nio root:
 
@@ -513,8 +536,8 @@ net_lines() {
   git diff --numstat 6ed2b9817d2bc9de30dc72942f9cb867d829283b -- "$@" |
     awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }'
 }
-test "$(net_lines src)" -le 13000
-test "$(net_lines tests)" -le 26000
+test "$(net_lines src)" -le 15000
+test "$(net_lines tests)" -le 40000
 test "$(net_lines docs scripts)" -le 1000
 ```
 
@@ -529,10 +552,10 @@ mr_net() {
   git diff --numstat 0acaea2baf05a4c41cce7497cfcdf4880afc6d04 -- "$1" |
     awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }'
 }
-test "$(mr_net src)" -le 350
-test "$(mr_net tests)" -le 1000
+test "$(mr_net src)" -le 2000
+test "$(mr_net tests)" -le 1200
 test "$(git diff --numstat 925df7f3cbcc39d4904140efd9d16b93c77238ea -- src tests |
-  awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }')" -lt 0
+  awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }')" -le 250
 ```
 
 The final report must distinguish public compatibility retained, fork recovery

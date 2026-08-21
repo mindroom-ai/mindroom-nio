@@ -1,7 +1,7 @@
 # Durable ingestion: lean replacement design
 
 **Status:** controlling design, approved 2026-08-13; non-sensitive observation
-and measured-budget amendment approved 2026-08-16
+and measured-budget amendments approved 2026-08-16 and 2026-08-20
 
 **Implementation checkpoint (2026-08-14):** Tasks 1–4E and MindRoom Tasks 5A
 and 5B are committed. Task 4E is nio
@@ -347,18 +347,24 @@ Test consolidation is part of the design. Preserve behavior matrices, not one te
 
 Measured against `origin/main` at `6ed2b9817d2bc9de30dc72942f9cb867d829283b`:
 
-- runtime `src/`: at most **+13,000** net lines;
-- tests: at most **+26,000** net lines;
+- runtime `src/`: at most **+15,000** net lines;
+- tests: at most **+40,000** net lines;
 - docs and scripts: at most **+1,000** net lines.
 
-The baseline remains immutable. The runtime and test ceilings were revised once
-on 2026-08-16 from +4,500/+15,000 after exact deletion and consolidation
-inventories proved those values mutually incompatible with the required
-five-table authenticated journal, readable crash semantics, public
-compatibility, and exhaustive oracle. The revised ceilings require the exact
-legacy deletion and safe consolidation; they are not rebound after work lands.
+The baseline remains immutable. The runtime and test ceilings were first
+revised on 2026-08-16 from +4,500/+15,000 after exact deletion and
+consolidation inventories proved those values mutually incompatible with the
+required five-table authenticated journal, readable crash semantics, public
+compatibility, and exhaustive oracle. On 2026-08-20, after the complete
+implementation, legacy deletion, full verification, and independent safe-seam
+inventories were available, the user approved the final numeric ceilings above.
+No behavior, crash, topology, compatibility, evidence, or security-exclusion
+gate changed. The final ceilings are fixed at this amendment.
 
-MindRoom is measured from the post-prune `0acaea2ba` boundary: runtime at most **+350** net lines and tests at most **+1,000** net lines. The final candidate must also be net smaller than canary commit `925df7f3c`, whose measured net delta over that boundary is +268 runtime and +2,579 tests.
+MindRoom is measured from the post-prune `0acaea2ba` boundary: runtime at most
+**+2,000** net lines and tests at most **+1,200** net lines. The final
+candidate's combined runtime-and-test net delta from canary commit `925df7f3c`
+must be at most **+250** lines.
 
 The fixed post-prune baseline at `679e949` is +8,807 runtime, +32,098 tests, and +523 docs/scripts. The measured fork-legacy production deletion pool is about 5,572 lines. Meeting the budget therefore requires real deletion and test consolidation, not credit for planned future work.
 
