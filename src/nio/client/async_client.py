@@ -1225,6 +1225,9 @@ class AsyncClient(Client):
             return
 
         room_ids = tuple(rooms)
+        if not room_ids:
+            return
+
         if not store.supports_threaded_encrypted_room_writes:
             store.save_encrypted_rooms(room_ids)
             return

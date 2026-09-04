@@ -2698,6 +2698,22 @@ class TestClass:
         await receive_task
         assert TEST_ROOM_ID in async_client.store.load_encrypted_rooms()
 
+    async def test_empty_encrypted_room_save_skips_thread_dispatch(
+        self, async_client, monkeypatch
+    ):
+        """An empty save must not schedule SQLite work on a worker thread."""
+
+        def unexpected_save(*args):
+            raise AssertionError("empty encrypted-room save reached worker thread")
+
+        monkeypatch.setattr(
+            async_client,
+            "_save_encrypted_rooms_in_thread",
+            unexpected_save,
+        )
+
+        await async_client._save_encrypted_rooms(())
+
     async def test_encrypted_room_store_write_closes_worker_connection(
         self, async_client, monkeypatch
     ):
