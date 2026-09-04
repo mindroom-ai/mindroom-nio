@@ -1217,7 +1217,33 @@ class AsyncClient(Client):
         self.encrypted_rooms.update(encrypted_rooms)
 
         if self.store:
-            self.store.save_encrypted_rooms(encrypted_rooms)
+            await self._save_encrypted_rooms(encrypted_rooms)
+
+    async def _save_encrypted_rooms(self, rooms: Iterable[str]) -> None:
+        store = self.store
+        if store is None:
+            return
+
+        room_ids = tuple(rooms)
+        if not store.supports_threaded_encrypted_room_writes:
+            store.save_encrypted_rooms(room_ids)
+            return
+
+        await _run_to_completion(
+            asyncio.to_thread(
+                self._save_encrypted_rooms_in_thread,
+                store,
+                room_ids,
+            )
+        )
+
+    @staticmethod
+    def _save_encrypted_rooms_in_thread(
+        store: "MatrixStore",
+        rooms: tuple[str, ...],
+    ) -> None:
+        with store.database.connection_context():
+            store.save_encrypted_rooms(rooms)
 
     async def _process_timeline(
         self,
@@ -1289,12 +1315,12 @@ class AsyncClient(Client):
             if decrypted:
                 event = decrypted
             if self.store and isinstance(event, RoomEncryptionEvent):
-                self.store.save_encrypted_rooms({room_id})
+                await self._save_encrypted_rooms({room_id})
         elif isinstance(event, RoomEncryptionEvent) and not state_suppressed:
             self.encrypted_rooms.add(room_id)
             room.handle_event(event)
             if self.store:
-                self.store.save_encrypted_rooms({room_id})
+                await self._save_encrypted_rooms({room_id})
             if self.olm:
                 self.olm.update_tracked_users(room)
         elif isinstance(event, MegolmEvent) and self.olm:
@@ -1674,7 +1700,7 @@ class AsyncClient(Client):
                         self.encrypted_rooms,
                     )
             if self.store:
-                self.store.save_encrypted_rooms(self.encrypted_rooms)
+                await self._save_encrypted_rooms(self.encrypted_rooms)
         else:
             self.next_batch = response.next_batch
             if self.config.store_sync_tokens and self.store:
@@ -1874,7 +1900,7 @@ class AsyncClient(Client):
                     room_id, room, self.encrypted_rooms
                 )
             if self.store:
-                self.store.save_encrypted_rooms(self.encrypted_rooms)
+                await self._save_encrypted_rooms(self.encrypted_rooms)
         await self._handle_to_device(response)
         if self.config.backfill_limited_timelines:
             for room_id, room in response.rooms.items():
@@ -2130,7 +2156,7 @@ class AsyncClient(Client):
         self.encrypted_rooms.update(encrypted_rooms)
 
         if self.store:
-            self.store.save_encrypted_rooms(encrypted_rooms)
+            await self._save_encrypted_rooms(encrypted_rooms)
         for room_id, room in response.rooms.items():
             is_current_membership_reset = self._room_component_is_current(room_id) and (
                 sliding_room_is_invite(room) or room.membership in ("leave", "ban")
