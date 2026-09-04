@@ -2,7 +2,9 @@ import copy
 import os
 import sqlite3
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from helpers import faker
@@ -25,6 +27,7 @@ from nio.sliding_sync_tokens import SlidingWindowToken
 from nio.store import (
     DefaultStore,
     Ed25519Key,
+    EncryptedRooms,
     Key,
     KeyStore,
     MatrixStore,
@@ -80,6 +83,43 @@ def test_disk_store_uses_fast_secure_delete(sqlstore):
     cursor = sqlstore.database.execute_sql("PRAGMA secure_delete")
 
     assert cursor.fetchone() == (2,)
+
+
+def test_concurrent_encrypted_room_saves_keep_databases_isolated(tmp_path, monkeypatch):
+    """Concurrent stores must never borrow another store's model binding."""
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    first_path.mkdir()
+    second_path.mkdir()
+    first_store = SqliteStore("@first:example.org", "FIRST", str(first_path))
+    second_store = SqliteStore("@second:example.org", "SECOND", str(second_path))
+    first_store.save_account(OlmAccount())
+    second_store.save_account(OlmAccount())
+    insert_barrier = Barrier(2)
+    original_insert_many = EncryptedRooms.insert_many
+
+    def synchronized_insert_many(cls, *args, **kwargs):
+        insert_barrier.wait(timeout=5)
+        return original_insert_many(*args, **kwargs)
+
+    monkeypatch.setattr(
+        EncryptedRooms,
+        "insert_many",
+        classmethod(synchronized_insert_many),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_save = executor.submit(
+            first_store.save_encrypted_rooms, {"!first:example.org"}
+        )
+        second_save = executor.submit(
+            second_store.save_encrypted_rooms, {"!second:example.org"}
+        )
+        first_save.result(timeout=10)
+        second_save.result(timeout=10)
+
+    assert first_store.load_encrypted_rooms() == {"!first:example.org"}
+    assert second_store.load_encrypted_rooms() == {"!second:example.org"}
 
 
 def seed_v5_recovery_state(sqlstore):

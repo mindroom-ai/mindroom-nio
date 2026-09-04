@@ -132,6 +132,7 @@ class MatrixStore:
 
     supports_atomic_recovery: ClassVar[bool] = False
     supports_recovery_abandonment_reasons: ClassVar[bool] = False
+    supports_threaded_encrypted_room_writes: ClassVar[bool] = True
     models = [
         Accounts,
         OlmSessions,
@@ -163,6 +164,8 @@ class MatrixStore:
             cls.supports_atomic_recovery = False
         if "supports_recovery_abandonment_reasons" not in cls.__dict__:
             cls.supports_recovery_abandonment_reasons = False
+        if "supports_threaded_encrypted_room_writes" not in cls.__dict__:
+            cls.supports_threaded_encrypted_room_writes = False
 
     def _create_database(self):
         return SqliteDatabase(
@@ -729,20 +732,41 @@ class MatrixStore:
         if db_key_request:
             db_key_request.delete_instance()
 
-    @use_database_atomic
-    def save_encrypted_rooms(self, rooms):
+    def save_encrypted_rooms(self, rooms: Iterable[str]) -> None:
         """Save the set of room ids for this account."""
-        account = self._get_account()
 
-        assert account
+        def save() -> None:
+            try:
+                account = (
+                    Accounts.select()
+                    .where(
+                        Accounts.user_id == self.user_id,
+                        Accounts.device_id == self.device_id,
+                    )
+                    .get(self.database)
+                )
+            except DoesNotExist:
+                account = None
 
-        data = [(room_id, account) for room_id in rooms]
+            assert account
 
-        for idx in range(0, len(data), 400):
-            rows = data[idx : idx + 400]
-            EncryptedRooms.insert_many(
-                rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
-            ).on_conflict_ignore().execute()
+            data = [(room_id, account) for room_id in rooms]
+            for idx in range(0, len(data), 400):
+                rows = data[idx : idx + 400]
+                (
+                    EncryptedRooms.insert_many(
+                        rows,
+                        fields=[EncryptedRooms.room_id, EncryptedRooms.account],
+                    )
+                    .on_conflict_ignore()
+                    .execute(self.database)
+                )
+
+        if isinstance(self.database, SqliteQueueDatabase):
+            save()
+        else:
+            with self.database.atomic():
+                save()
 
     @use_database
     def save_sync_token(self, token: str) -> None:
@@ -1516,6 +1540,7 @@ class DefaultStore(MatrixStore):
 
     supports_atomic_recovery: ClassVar[bool] = True
     supports_recovery_abandonment_reasons: ClassVar[bool] = True
+    supports_threaded_encrypted_room_writes: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
 
@@ -1656,6 +1681,7 @@ class SqliteStore(MatrixStore):
 
     supports_atomic_recovery: ClassVar[bool] = True
     supports_recovery_abandonment_reasons: ClassVar[bool] = True
+    supports_threaded_encrypted_room_writes: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
     def _get_device(self, device):
