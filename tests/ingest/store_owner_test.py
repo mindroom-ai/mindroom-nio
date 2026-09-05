@@ -1866,3 +1866,70 @@ def test_production_database_reach_through_stays_in_exact_allowlist() -> None:
             if forbidden or forbidden_call:
                 violations.append(f"{relative}:{getattr(node, 'lineno', 0)}")
     assert violations == []
+
+
+def test_default_trust_reads_reuse_open_connection_lease(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Sidecar trust checks must not reopen SQLite or re-lock per call."""
+    import nio.store.database as database_module
+
+    store = DefaultStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(tmp_path),
+        database_name="journal.db",
+    )
+    device = OlmDevice(BOB_ID, BOB_DEVICE, OlmAccount().identity_keys)
+    store.save_account(OlmAccount())
+    store.save_device_keys({BOB_ID: {BOB_DEVICE: device}})
+    store.verify_device(device)
+    assert not store.database.is_closed()
+
+    connects = 0
+    leases = 0
+    real_connect = database_module.sqlite3.connect
+    real_lock = database_module.StableFileLock
+
+    def counting_connect(*args, **kwargs):
+        nonlocal connects
+        connects += 1
+        return real_connect(*args, **kwargs)
+
+    def counting_lock(*args, **kwargs):
+        nonlocal leases
+        leases += 1
+        return real_lock(*args, **kwargs)
+
+    monkeypatch.setattr(database_module.sqlite3, "connect", counting_connect)
+    monkeypatch.setattr(database_module, "StableFileLock", counting_lock)
+
+    for _ in range(3):
+        assert store.is_device_verified(device)
+        assert not store.is_device_blacklisted(device)
+        assert not store.is_device_ignored(device)
+
+    assert connects == 0
+    assert leases == 0
+
+
+def test_default_closed_store_trust_read_rejects_adopted_database(
+    tmp_path: Path,
+) -> None:
+    """The closed-database fallback still probes the ingestion marker."""
+    store = DefaultStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(tmp_path),
+        database_name="journal.db",
+    )
+    device = OlmDevice(BOB_ID, BOB_DEVICE, OlmAccount().identity_keys)
+    store.save_account(OlmAccount())
+    store.database.close()
+    with sqlite3.connect(tmp_path / "journal.db") as raw:
+        raw.execute("CREATE TABLE NioIngestMeta (account_id TEXT PRIMARY KEY)")
+    raw.close()
+
+    with pytest.raises(LocalProtocolError, match="unavailable after adoption"):
+        store.is_device_verified(device)

@@ -309,7 +309,7 @@ def _semantic_indexes(
     table: str,
 ) -> tuple[tuple[object, ...], ...]:
     indexes: list[tuple[object, ...]] = []
-    for row in _execute(connection, f'PRAGMA index_list("{table}")'):
+    for row in _execute(connection, f"PRAGMA index_list({_quoted_identifier(table)})"):
         _sequence, name, unique, origin, partial = tuple(row)
         columns = tuple(
             (item[2], item[3], item[4], item[5])
@@ -337,12 +337,20 @@ def _table_flags(
     return rows[0]
 
 
+def _quoted_identifier(name: str) -> str:
+    """Quote one SQLite identifier read back from ``sqlite_master``."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _pragma_rows(
     connection: sqlite3.Connection | SqliteDatabase,
     pragma: str,
     name: str,
 ) -> tuple[tuple[object, ...], ...]:
-    return tuple(tuple(row) for row in _execute(connection, f'{pragma}("{name}")'))
+    return tuple(
+        tuple(row)
+        for row in _execute(connection, f"{pragma}({_quoted_identifier(name)})")
+    )
 
 
 def _execute(
@@ -386,7 +394,9 @@ def _capture_contract(
                         tuple(row),
                         _pragma_rows(connection, "PRAGMA index_xinfo", row[1]),
                     )
-                    for row in _execute(connection, f'PRAGMA index_list("{table}")')
+                    for row in _execute(
+                        connection, f"PRAGMA index_list({_quoted_identifier(table)})"
+                    )
                 )
             ),
         )
@@ -487,7 +497,8 @@ def _capture_named_contract(
                 sorted(
                     tuple(row)[2:]
                     for row in _execute(
-                        connection, f'PRAGMA foreign_key_list("{table}")'
+                        connection,
+                        f"PRAGMA foreign_key_list({_quoted_identifier(table)})",
                     )
                 )
             ),

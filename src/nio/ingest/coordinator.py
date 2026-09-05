@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from asyncio import sleep as _cooperative_sleep
 from hashlib import sha256
 from typing import TYPE_CHECKING, NamedTuple
@@ -932,13 +931,13 @@ async def _drain_owned_cleanup(
         task.result()
     except BaseException:
         caller = asyncio.current_task()
-        if caller is not None and sys.version_info >= (3, 11):
+        if caller is not None:
             for _ in range(cancellations):
                 caller.uncancel()
         raise
     if deferred_error is not None:
         caller = asyncio.current_task()
-        if caller is not None and sys.version_info >= (3, 11):
+        if caller is not None:
             for _ in range(cancellations):
                 caller.uncancel()
         raise deferred_error

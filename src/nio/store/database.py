@@ -53,7 +53,11 @@ from . import (
     StoreVersion,
     SyncTokens,
 )
-from ._ingestion_store_owner import LeasedSqliteDatabase, StableFileLock
+from ._ingestion_store_owner import (
+    LeasedSqliteDatabase,
+    StableFileLock,
+    _LifetimeLeasedConnection,
+)
 
 if TYPE_CHECKING:
 
@@ -138,11 +142,22 @@ def use_database_atomic(fn):
 
 
 def use_default_trust_sidecars(fn):
-    """Hold one shared store lease across a semantic sidecar operation."""
+    """Hold one shared store lease across a mutating sidecar operation."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self._trust_sidecar_guard():
+        with self._trust_sidecar_guard(mutating=True):
+            return fn(self, *args, **kwargs)
+
+    return inner
+
+
+def use_default_trust_sidecar_reads(fn):
+    """Guard a read-only sidecar lookup without acquiring a transient lease."""
+
+    @wraps(fn)
+    def inner(self, *args, **kwargs):
+        with self._trust_sidecar_guard(mutating=False):
             return fn(self, *args, **kwargs)
 
     return inner
@@ -845,7 +860,7 @@ class DefaultStore(MatrixStore):
     _trust_sidecar_coordinated: bool = field(default=False, init=False, repr=False)
 
     @contextmanager
-    def _trust_sidecar_guard(self):
+    def _trust_sidecar_guard(self, *, mutating: bool = True):
         if not self._trust_sidecar_coordinated:
             yield
             return
@@ -863,27 +878,52 @@ class DefaultStore(MatrixStore):
                     self._trust_guard_depth -= 1
                 return
 
-            lease = StableFileLock(Path(self.database_path), exclusive=False)
-            try:
-                if not isinstance(self.database, LeasedSqliteDatabase):
+            if not isinstance(self.database, LeasedSqliteDatabase):
+                raise LocalProtocolError(
+                    "ordinary trust database has no built-in lease"
+                )
+            # While the ordinary connection is open it already holds the shared
+            # lifetime lease, and its connect-time marker probe proved the
+            # database is not ingestion-owned. An exclusive adopter cannot
+            # acquire the lease (and so cannot add the marker) until that
+            # connection closes, so the per-call read-only SQLite probe is only
+            # needed when the connection is closed. Read-only lookups borrow
+            # the connection lease outright; mutations still take their own
+            # transient shared lease so a reentrant database close inside the
+            # operation cannot hand exclusion to another owner mid-write.
+            owned_lease: StableFileLock | None = None
+            connection_open = not self.database.is_closed()
+            if connection_open:
+                connection = self.database.connection()
+                if not isinstance(connection, _LifetimeLeasedConnection):
                     raise LocalProtocolError(
-                        "ordinary trust database has no built-in lease"
+                        "ordinary trust database connection has no lifetime lease"
                     )
-                self.database._remember_lifetime_identity(lease.database_identity)
-                lease.assert_identity()
-                uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
-                with closing(sqlite3.connect(uri, uri=True)) as connection:
-                    marked = connection.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                        "AND name = 'NioIngestMeta' COLLATE NOCASE"
-                    ).fetchone()
-                if marked:
-                    raise LocalProtocolError(
-                        "legacy trust sidecars are unavailable after adoption"
-                    )
-            except BaseException:
-                lease.close()
-                raise
+                connection._assert_lifetime_lease()
+            if connection_open and not mutating:
+                connection_lease = connection._lifetime_lease
+                assert connection_lease is not None
+                lease = connection_lease
+            else:
+                owned_lease = StableFileLock(Path(self.database_path), exclusive=False)
+                lease = owned_lease
+                try:
+                    self.database._remember_lifetime_identity(lease.database_identity)
+                    lease.assert_identity()
+                    if not connection_open:
+                        uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
+                        with closing(sqlite3.connect(uri, uri=True)) as probe:
+                            marked = probe.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                                "AND name = 'NioIngestMeta' COLLATE NOCASE"
+                            ).fetchone()
+                        if marked:
+                            raise LocalProtocolError(
+                                "legacy trust sidecars are unavailable after adoption"
+                            )
+                except BaseException:
+                    lease.close()
+                    raise
             self._trust_guard_lease = lease
             self._trust_guard_depth = 1
             self._trust_guard_thread = threading.get_ident()
@@ -894,7 +934,8 @@ class DefaultStore(MatrixStore):
                 self._trust_guard_depth = 0
                 self._trust_guard_thread = None
                 self._trust_guard_lease = None
-                lease.close()
+                if owned_lease is not None:
+                    owned_lease.close()
 
     def _assert_trust_sidecar_owner(self) -> None:
         if not self._trust_sidecar_coordinated:
@@ -975,12 +1016,12 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.verified
         return self.trust_db.add(key)
 
-    @use_default_trust_sidecars
+    @use_default_trust_sidecar_reads
     def is_device_verified(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.trust_db
 
-    @use_default_trust_sidecars
+    @use_default_trust_sidecar_reads
     def is_device_blacklisted(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.blacklist_db
@@ -1026,7 +1067,7 @@ class DefaultStore(MatrixStore):
 
         return
 
-    @use_default_trust_sidecars
+    @use_default_trust_sidecar_reads
     def is_device_ignored(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.ignore_db
