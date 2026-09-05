@@ -14,5 +14,9 @@ class JournalConflictError(RuntimeError):
     """Raised when a journal compare-and-swap or ordered operation is stale."""
 
 
+class JournalCapacityError(RuntimeError):
+    """Raised when freshly prepared output exceeds a hard resource bound."""
+
+
 class JournalIntegrityError(ValueError):
     """Raised when authenticated or relational journal state is inconsistent."""

@@ -21,6 +21,7 @@ from nio.events import Event, MegolmEvent, RoomKeyRequest, ToDeviceEvent
 from nio.exceptions import LocalProtocolError
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, IngestionConfig
+from nio.ingest.errors import JournalCapacityError
 from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.source import canonical_json
 from nio.ingest.state import SourceState, StagedFrame
@@ -700,6 +701,61 @@ def test_owned_materializer_success_matches_exact_dml_manifest(
     )
 
     assert observed == OWNED_MATERIALIZER_DML_MANIFEST
+
+
+def test_owned_oversized_output_rolls_back_real_crypto_and_stays_rejected_on_restart(
+    tmp_path: Path,
+) -> None:
+    seed_store = SqliteStore(
+        ACCOUNT_ID,
+        DEVICE_ID,
+        str(tmp_path),
+        pickle_key=PICKLE_KEY,
+        database_name=DATABASE_NAME,
+    )
+    seed_store.save_account(OlmAccount())
+    seed_store.database.close()
+    client, session = _open_owned_session(tmp_path)
+    sender_store = None
+    try:
+        body, sender_store = _owned_crypto_classic_body(client)
+        body["account_data"] = {
+            "events": [
+                {
+                    "type": "m.push_rules",
+                    "content": {"global": {}, "padding": "x" * 800_000},
+                }
+            ]
+        }
+        staged = _stage_classic(session, body)
+        source = session._journal.load_source()
+    finally:
+        if sender_store is not None:
+            sender_store.database.close()
+        _close_owned_session(session)
+
+    for _attempt in range(2):
+        client, session = _open_owned_session(tmp_path)
+        observed: list[DmlSignature] = []
+        database, real_execute = _capture_owner_dml(session, observed)
+        before = _logical_sqlite_graph(tmp_path / DATABASE_NAME)
+        try:
+            with pytest.raises(JournalCapacityError, match="immutable byte limit"):
+                session._materialize_oldest_frame(limits=MaterializerLimits())
+            assert any('INTO "olmsessions"' in statement for statement, _ in observed)
+            assert any(
+                'INTO "megolminboundsessions"' in statement for statement, _ in observed
+            )
+            assert _logical_sqlite_graph(tmp_path / DATABASE_NAME) == before
+            assert session._journal.list_frames(1)[0] == staged
+            assert session._journal.load_source() == source
+            with pytest.raises(LocalProtocolError, match="poisoned"):
+                session._materialize_oldest_frame(limits=MaterializerLimits())
+            with pytest.raises(LocalProtocolError, match="poisoned"):
+                session.next_batch()
+        finally:
+            database.execute_sql = real_execute
+            _close_owned_session(session)
 
 
 @pytest.mark.parametrize(

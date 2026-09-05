@@ -14,6 +14,10 @@ from ..ingest.model import (
 from ..ingest.reducer import HydrationIntent, RoomContinuity
 
 SQLITE_INT_MAX = 2**63 - 1
+# Promotion replaces "held" with "ready" and two JSON nulls with integers.
+_HELD_PROMOTION_RESERVE_BYTES = (
+    len("ready") - len("held") + 2 * (len(str(SQLITE_INT_MAX)) - len("null"))
+)
 
 
 class DeliveryState(NamedTuple):
@@ -53,8 +57,6 @@ class MaterializerLimits:
     max_record_canonical_bytes: int = 1 * 1024 * 1024
     max_held_work_count: int = 10_000
     max_held_work_canonical_bytes: int = 32 * 1024 * 1024
-    max_ready_work_count: int = 2_048
-    max_ready_work_canonical_bytes: int = 16 * 1024 * 1024
     max_total_work_count: int = 20_000
     max_total_work_canonical_bytes: int = 64 * 1024 * 1024
 
@@ -63,8 +65,6 @@ class MaterializerLimits:
             "max_record_canonical_bytes": 1 * 1024 * 1024,
             "max_held_work_count": 10_000,
             "max_held_work_canonical_bytes": 32 * 1024 * 1024,
-            "max_ready_work_count": 2_048,
-            "max_ready_work_canonical_bytes": 16 * 1024 * 1024,
             "max_total_work_count": 20_000,
             "max_total_work_canonical_bytes": 64 * 1024 * 1024,
         }

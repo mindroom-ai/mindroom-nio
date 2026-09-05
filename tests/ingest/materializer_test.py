@@ -18,7 +18,7 @@ from nio.event_provenance import TimelineEventProvenance
 from nio.ingest import source
 from nio.ingest.classic import ClassicSource
 from nio.ingest.config import ClassicSourceConfig, SlidingSourceConfig
-from nio.ingest.errors import JournalIntegrityError
+from nio.ingest.errors import JournalCapacityError, JournalIntegrityError
 from nio.ingest.membership import MembershipObservation
 from nio.ingest.model import (
     EventRecord,
@@ -3113,8 +3113,6 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
     ("limited_field", "unrelated_count"),
     (
         ("max_record_canonical_bytes", 0),
-        ("max_ready_work_count", 0),
-        ("max_ready_work_canonical_bytes", 0),
         ("max_held_work_count", 2),
         ("max_held_work_canonical_bytes", 1),
         ("max_total_work_count", 0),
@@ -3150,21 +3148,6 @@ def test_prepared_mandatory_barrier_uses_immutable_capacity_envelope(
         for item in ordered
     )
     assert any(item.value == held.value for item in plan.work_releases)
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    (
-        ("max_ready_work_count", 2_049),
-        ("max_ready_work_canonical_bytes", 16 * 1024 * 1024 + 1),
-    ),
-)
-def test_materializer_ready_limits_cannot_exceed_the_immutable_envelope(
-    field_name: str,
-    value: int,
-) -> None:
-    with pytest.raises(ValueError, match=field_name):
-        replace(MaterializerLimits(), **{field_name: value})
 
 
 def test_prepared_terminal_reordinal_rechecks_final_immutable_record_size() -> None:
@@ -3226,7 +3209,7 @@ def test_prepared_terminal_reordinal_rechecks_final_immutable_record_size() -> N
         for index in range(999)
     )
 
-    with pytest.raises(ValueError, match="immutable"):
+    with pytest.raises(JournalCapacityError, match="immutable"):
         _plan_prepared(
             case,
             frame=frame,
@@ -3690,6 +3673,74 @@ def _prepared_prior_held(
     )
 
 
+def test_prepared_held_admission_reserves_largest_promotion_header() -> None:
+    case = _prepared_pending_room_case(include_global=False)
+    held_plan = _plan_prepared(case)
+    assert held_plan is not None
+    item = held_plan.work_inserts[0]
+    assert item.ready_ordinal is None
+    stored = journal_plan_module._stored_work_insert_row(item, case.frame.frame_id, 3)
+    owner = (_PLANNER_ACCOUNT_ID, _STREAM_ID, case.frame.origin.transport)
+    held_size = journal_plan_module._stored_work_size(owner, stored)
+    promoted_size = journal_plan_module._stored_work_size(
+        owner,
+        replace(
+            stored, status="ready", ready_revision=2**63 - 1, ready_ordinal=2**63 - 1
+        ),
+    )
+    assert promoted_size == held_size + 31
+
+    under = _plan_prepared(
+        case,
+        limits=replace(
+            MaterializerLimits(), max_record_canonical_bytes=promoted_size - 1
+        ),
+    )
+    assert under is not None
+    assert len(under.work_inserts) == 1
+    assert type(under.work_inserts[0].value) is LossRecord
+    assert under.work_inserts[0].value.reason is LossReason.OVERSIZED_EVENT
+    exact = _plan_prepared(
+        case,
+        limits=replace(MaterializerLimits(), max_record_canonical_bytes=promoted_size),
+    )
+    assert exact is not None
+    assert exact.work_inserts == held_plan.work_inserts
+
+
+@pytest.mark.parametrize("existing_held", (False, True))
+def test_prepared_total_admission_reserves_all_remaining_held(
+    existing_held: bool,
+) -> None:
+    case = _prepared_pending_room_case(include_global=False)
+    work = ()
+    if existing_held:
+        case, held = _prepared_prior_held(case)
+        work = (held,)
+    baseline = _plan_prepared(case, work=work)
+    assert baseline is not None
+    actual_size = sum(item.canonical_size for item in work) + sum(
+        _prepared_stored_work_size(case.frame, item) for item in baseline.work_inserts
+    )
+    reserved_size = actual_size + 31 * (len(work) + len(baseline.work_inserts))
+    exact = _plan_prepared(
+        case,
+        work=work,
+        limits=replace(
+            MaterializerLimits(), max_total_work_canonical_bytes=reserved_size
+        ),
+    )
+    assert exact == baseline
+    with pytest.raises(JournalCapacityError, match="total"):
+        _plan_prepared(
+            case,
+            work=work,
+            limits=replace(
+                MaterializerLimits(), max_total_work_canonical_bytes=reserved_size - 1
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("limited_field", "reason"),
     (
@@ -3717,6 +3768,8 @@ def test_prepared_room_capacity_uses_final_wrapped_row_and_terminal_loss(
     )
     if held is not None:
         exact_size += held.canonical_size
+    if limited_field == "max_record_canonical_bytes":
+        exact_size += 31  # Admit the largest possible READY promotion header.
     exact_limits = replace(MaterializerLimits(), **{limited_field: exact_size})
 
     exact = _plan_prepared(

@@ -7,6 +7,7 @@ from typing import Literal, NamedTuple, cast
 from uuid import UUID
 
 from ..ingest._json import canonical_json, load_json
+from ..ingest.errors import JournalCapacityError
 from ..ingest.model import (
     EventRecord,
     LossBoundary,
@@ -33,7 +34,11 @@ from ..ingest.reducer import (
 from ..ingest.serialization import _loss_id, _record_to_dict
 from ..ingest.source import SyncFrame
 from ._sync_journal_format import _canonical_internal, _row
-from ._sync_journal_values import MaterializerLimits, RoomAggregateValue
+from ._sync_journal_values import (
+    _HELD_PROMOTION_RESERVE_BYTES,
+    MaterializerLimits,
+    RoomAggregateValue,
+)
 
 
 class _PreparedWorkMetadata(NamedTuple):
@@ -358,7 +363,7 @@ def plan_prepared_frame_materialization(
     work: tuple[AuthenticatedWork, ...],
     revision: int,
     limits: MaterializerLimits,
-) -> MaterializationPlan | None:
+) -> MaterializationPlan:
     """Plan Task4C output without regenerating records or transition order."""
     if type(account_id) is not str or not account_id:
         raise ValueError("account_id must be a nonempty string")
@@ -523,7 +528,9 @@ def plan_prepared_frame_materialization(
             stored_size(value, plaintext, ordinal)
             > hard_limits.max_record_canonical_bytes
         ):
-            raise ValueError("planned Work record exceeds the immutable byte limit")
+            raise JournalCapacityError(
+                "planned Work record exceeds the immutable byte limit"
+            )
         inserts.append(item)
         if metadata is None:
             mandatory_work_ids.add(work_id)
@@ -742,13 +749,21 @@ def plan_prepared_frame_materialization(
         work_id = _work_id(candidate_insert.value)
         if (
             work_id not in source_work_ids
-            or preliminary_sizes[work_id] <= limits.max_record_canonical_bytes
+            or preliminary_sizes[work_id]
+            + (
+                _HELD_PROMOTION_RESERVE_BYTES
+                if candidate_insert.ready_ordinal is None
+                else 0
+            )
+            <= limits.max_record_canonical_bytes
         ):
             continue
         candidate_value = candidate_insert.value
         assert type(candidate_value) is EventRecord
         if candidate_value.room_id is None:
-            raise ValueError("planned Work record exceeds the canonical byte limit")
+            raise JournalCapacityError(
+                "planned Work record exceeds the canonical byte limit"
+            )
         capacity_reasons[candidate_value.room_id] = LossReason.OVERSIZED_EVENT
 
     preliminary_remaining_held = tuple(
@@ -819,7 +834,7 @@ def plan_prepared_frame_materialization(
             admitted_count > limits.max_held_work_count
             or admitted_bytes > limits.max_held_work_canonical_bytes
         ):
-            raise ValueError("planned HELD Work exceeds global HELD capacity")
+            raise JournalCapacityError("planned HELD Work exceeds global HELD capacity")
 
     if capacity_reasons:
         original_insert_positions = {
@@ -903,7 +918,9 @@ def plan_prepared_frame_materialization(
                 stored_size(loss, loss_plaintext, anchor)
                 > hard_limits.max_record_canonical_bytes
             ):
-                raise ValueError("planned Work record exceeds the immutable byte limit")
+                raise JournalCapacityError(
+                    "planned Work record exceeds the immutable byte limit"
+                )
 
             terminal_releases: list[PlannedWork] = []
 
@@ -1050,14 +1067,6 @@ def plan_prepared_frame_materialization(
                     (buffered_value.room_id, buffered_value.membership_epoch)
                 ].append(index)
 
-    existing_ready = tuple(
-        ready_item for ready_item in work if ready_item.status == "ready"
-    )
-    planned_ready = tuple(
-        ready_insert
-        for ready_insert in inserts
-        if ready_insert.ready_ordinal is not None
-    )
     release_sizes: dict[str, int] = {}
     for final_release in releases:
         final_release_value = final_release.value
@@ -1071,7 +1080,9 @@ def plan_prepared_frame_materialization(
             _stored_work_release_row(final_release, existing_release, revision),
         )
         if release_size > hard_limits.max_record_canonical_bytes:
-            raise ValueError("released Work record exceeds the immutable byte limit")
+            raise JournalCapacityError(
+                "released Work record exceeds the immutable byte limit"
+            )
         release_sizes[_work_id(final_release_value)] = release_size
 
     planned_sizes = {
@@ -1083,25 +1094,15 @@ def plan_prepared_frame_materialization(
         for final_insert in inserts
     }
     if any(
-        size > hard_limits.max_record_canonical_bytes for size in planned_sizes.values()
+        planned_sizes[_work_id(item.value)]
+        + (_HELD_PROMOTION_RESERVE_BYTES if item.ready_ordinal is None else 0)
+        > hard_limits.max_record_canonical_bytes
+        for item in inserts
     ):
-        raise ValueError("final planned Work exceeds the immutable record limit")
-    ready_count = len(existing_ready) + len(planned_ready) + len(releases)
-    ready_bytes = (
-        sum(ready_item.canonical_size for ready_item in existing_ready)
-        + sum(
-            planned_sizes[_work_id(ready_insert.value)]
-            for ready_insert in planned_ready
+        raise JournalCapacityError(
+            "final planned Work exceeds the immutable record limit"
         )
-        + sum(release_sizes.values())
-    )
     final_limits = hard_limits if mandatory_work_ids or releases else limits
-    if ready_count > final_limits.max_ready_work_count or (
-        ready_bytes > final_limits.max_ready_work_canonical_bytes
-    ):
-        if final_limits is hard_limits:
-            raise ValueError("mandatory READY Work exceeds the immutable envelope")
-        return None
     remaining_existing_held = tuple(
         held_item
         for held_item in work
@@ -1150,7 +1151,7 @@ def plan_prepared_frame_materialization(
         held_bytes > final_limits.max_held_work_canonical_bytes
     ):
         suffix = "immutable envelope" if final_limits is hard_limits else "capacity"
-        raise ValueError(f"planned HELD Work exceeds global HELD {suffix}")
+        raise JournalCapacityError(f"planned HELD Work exceeds global HELD {suffix}")
     total_count = len(work) + len(inserts)
     total_bytes = (
         sum(work_item.canonical_size for work_item in work)
@@ -1159,13 +1160,16 @@ def plan_prepared_frame_materialization(
         )
         + sum(release_sizes.values())
         + sum(planned_sizes.values())
+        + held_count * _HELD_PROMOTION_RESERVE_BYTES
     )
     if total_count > final_limits.max_total_work_count or (
         total_bytes > final_limits.max_total_work_canonical_bytes
     ):
         if final_limits is hard_limits:
-            raise ValueError("mandatory Work exceeds the immutable total envelope")
-        return None
+            raise JournalCapacityError(
+                "mandatory Work exceeds the immutable total envelope"
+            )
+        raise JournalCapacityError("planned Work exceeds global total capacity")
 
     room_values_list: list[RoomAggregateValue] = []
     for room_id, result in room_result_by_id.items():

@@ -2221,8 +2221,6 @@ class SqliteIngestionJournal(JournalRows):
             limits.max_record_canonical_bytes,
             limits.max_held_work_count,
             limits.max_held_work_canonical_bytes,
-            limits.max_ready_work_count,
-            limits.max_ready_work_canonical_bytes,
             limits.max_total_work_count,
             limits.max_total_work_canonical_bytes,
         )
@@ -2324,8 +2322,6 @@ class SqliteIngestionJournal(JournalRows):
                         revision=new_revision,
                         limits=limits,
                     )
-                    if plan is None:
-                        raise ValueError("prepared frame is at capacity")
                     outbound = freeze_outbound(normalized, prepared)
                     if type(outbound) is not _OutboundMaintenance:
                         raise TypeError("outbound freezer returned an invalid plan")
