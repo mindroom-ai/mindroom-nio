@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from peewee import SqliteDatabase
@@ -428,8 +428,13 @@ class _LifetimeLeasedConnection(sqlite3.Connection):
 class LeasedSqliteDatabase(SqliteDatabase):
     """Ordinary MatrixStore database with one shared lease per connection."""
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
+    if TYPE_CHECKING:
+        _timeout: float
+
+        def _add_conn_hooks(self, connection: sqlite3.Connection) -> None: ...
+
+    def __init__(self, database: str | None, *args: Any, **kwargs: Any) -> None:
+        super().__init__(database, *args, **kwargs)
         self._lifetime_pid = os.getpid()
         self._lifetime_identity: FileIdentity | None = None
         self._lifetime_identity_lock = threading.Lock()

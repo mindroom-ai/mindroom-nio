@@ -132,6 +132,9 @@ markers = [
     "expects_anonymous_recovery_clear: exercises the UNKNOWN clear-cause backstop",
 ]
 
+[tool.mypy]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/stubs"
+
 [dependency-groups]
 dev = [
     "mindroom-nio[e2e]",
@@ -150,4 +153,7 @@ dev = [
     "pytest-asyncio>=0.26.0",
     "pytest-benchmark>=4.0.0",
     "pytest-cov>=2.12.1",
+    "types-aiofiles>=25.1.0.20260518",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-peewee>=4.4.0.20260827",
 ]

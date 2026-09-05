@@ -256,7 +256,9 @@ class Olm:
         # encrypted messages. This is a dict holding a tuple of the
         # sender_key, the session id and message index as the key and a tuple
         # of the event_id and origin server timestamp as the dict values.
-        self.message_index_store = LRUCache(self._message_index_store_size)
+        self.message_index_store: LRUCache[
+            tuple[str | None, str | None, int], tuple[str, int]
+        ] = LRUCache(self._message_index_store_size)
 
         self.store = store
 
@@ -1532,7 +1534,7 @@ class Olm:
         new_event.verified = verified
         new_event.sender_key = event.sender_key
         new_event.session_id = event.session_id
-        new_event.room_id = room_id
+        setattr(new_event, "room_id", room_id)
 
         return new_event
 

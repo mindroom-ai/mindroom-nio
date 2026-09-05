@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
+import peewee
 from peewee import DatabaseError as PeeweeDatabaseError
-from peewee import SqliteDatabase, sort_models
+from peewee import SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import OlmAccount, TrustState
@@ -77,9 +78,18 @@ from .models import (
 from .sync_journal_schema import META_TABLE_SQL, SCHEMA_SQL, SCHEMA_VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
+    from typing import Protocol
+
+    from peewee import Model
 
     from .database import MatrixStore
+
+    class _SortModels(Protocol):
+        def __call__(self, models: Iterable[type[Model]], /) -> list[type[Model]]: ...
+
+
+sort_models = cast("_SortModels", getattr(peewee, "sort_models"))
 
 
 _E2EE_TABLES = frozenset(
@@ -177,8 +187,9 @@ def database_path(database: str | os.PathLike[str] | SqliteDatabase) -> Path:
             "SqliteQueueDatabase cannot provide atomic ingestion transactions"
         )
     if isinstance(database, SqliteDatabase):
-        database = database.database
-    path = os.fspath(database)
+        path = os.fspath(cast("str | os.PathLike[str]", database.database))
+    else:
+        path = os.fspath(database)
     if path == ":memory:":
         raise LocalProtocolError("the ingestion journal requires an on-disk database")
     return Path(os.path.abspath(path))

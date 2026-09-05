@@ -44,7 +44,10 @@ Checker = FormatChecker()
 
 
 @Checker.checks("user_id", ValueError)
-def check_user_id(value: str) -> bool:
+def check_user_id(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+
     if not value.startswith("@"):
         raise ValueError("UserIDs start with @")
 
@@ -55,7 +58,10 @@ def check_user_id(value: str) -> bool:
 
 
 @Checker.checks("http_url", ValueError)
-def check_http_url(value: str) -> bool:
+def check_http_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+
     if not re.match(r"^https?://.+", value):
         raise ValueError("Must be http://... or https://... URL")
 
