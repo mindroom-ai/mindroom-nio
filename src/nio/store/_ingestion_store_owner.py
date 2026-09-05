@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import os
 import sqlite3
 import stat
@@ -42,6 +41,13 @@ class StableFileLock:
         require_database: bool = False,
         require_regular_path: bool = False,
     ) -> None:
+        try:
+            import fcntl
+        except ImportError as error:
+            raise LocalProtocolError(
+                "store filesystem ownership requires fcntl support"
+            ) from error
+        self._fcntl = fcntl
         self.owner_pid = os.getpid()
         self.database_path = Path(os.path.abspath(database_path))
         self.exclusive = exclusive
@@ -86,9 +92,9 @@ class StableFileLock:
                 self._database_fd = -1
             raise
         os.set_inheritable(self._fd, False)
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        operation = self._fcntl.LOCK_EX if exclusive else self._fcntl.LOCK_SH
         try:
-            fcntl.flock(self._fd, operation | fcntl.LOCK_NB)
+            self._fcntl.flock(self._fd, operation | self._fcntl.LOCK_NB)
         except BlockingIOError as error:
             os.close(self._fd)
             self._fd = -1
@@ -103,9 +109,9 @@ class StableFileLock:
         self.database_identity: FileIdentity | None = None
         self._database_link_count: int | None = None
         if self._database_fd >= 0:
-            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            operation = self._fcntl.LOCK_EX if exclusive else self._fcntl.LOCK_SH
             try:
-                fcntl.flock(self._database_fd, operation | fcntl.LOCK_NB)
+                self._fcntl.flock(self._database_fd, operation | self._fcntl.LOCK_NB)
             except BlockingIOError as error:
                 os.close(self._database_fd)
                 self._database_fd = -1
@@ -149,9 +155,9 @@ class StableFileLock:
                 "owned ingestion requires a regular database path"
             ) from error
         os.set_inheritable(descriptor, False)
-        operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        operation = self._fcntl.LOCK_EX if self.exclusive else self._fcntl.LOCK_SH
         try:
-            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            self._fcntl.flock(descriptor, operation | self._fcntl.LOCK_NB)
         except BlockingIOError as error:
             os.close(descriptor)
             raise LocalProtocolError(
@@ -159,7 +165,7 @@ class StableFileLock:
             ) from error
         locked = os.fstat(descriptor)
         if self.require_regular_path and locked.st_nlink != 1:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            self._fcntl.flock(descriptor, self._fcntl.LOCK_UN)
             os.close(descriptor)
             raise LocalProtocolError(
                 "owned ingestion requires a singly linked database file"
@@ -170,7 +176,7 @@ class StableFileLock:
         try:
             self.assert_identity()
         except BaseException:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            self._fcntl.flock(descriptor, self._fcntl.LOCK_UN)
             os.close(descriptor)
             self._database_fd = -1
             self.database_identity = None
@@ -238,11 +244,11 @@ class StableFileLock:
         if self._fd < 0:
             return
         if self._database_fd >= 0:
-            fcntl.flock(self._database_fd, fcntl.LOCK_UN)
+            self._fcntl.flock(self._database_fd, self._fcntl.LOCK_UN)
             os.close(self._database_fd)
             self._database_fd = -1
             self._database_link_count = None
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fcntl.flock(self._fd, self._fcntl.LOCK_UN)
         os.close(self._fd)
         self._fd = -1
 
@@ -255,7 +261,7 @@ class StableFileLock:
                 continue
             try:
                 if same_process:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    self._fcntl.flock(descriptor, self._fcntl.LOCK_UN)
                 os.close(descriptor)
             except OSError:
                 pass
@@ -343,21 +349,17 @@ class _LifetimeLeasedConnection(sqlite3.Connection):
         lease.assert_identity()
 
     def cursor(self, factory=None):  # type: ignore[no-untyped-def]
-        self._assert_lifetime_lease()
         if factory is not None:
             raise LocalProtocolError("custom ordinary SQLite cursors are unsupported")
         return super().cursor(_LifetimeLeasedCursor)
 
     def execute(self, *args: object, **kwargs: object):
-        self._assert_lifetime_lease()
         return self.cursor().execute(*args, **kwargs)
 
     def executemany(self, *args: object, **kwargs: object):
-        self._assert_lifetime_lease()
         return self.cursor().executemany(*args, **kwargs)
 
     def executescript(self, *args: object, **kwargs: object):
-        self._assert_lifetime_lease()
         return self.cursor().executescript(*args, **kwargs)
 
     def commit(self) -> None:
@@ -473,7 +475,6 @@ class LeasedSqliteDatabase(SqliteDatabase):
             )
             try:
                 self._add_conn_hooks(connection)
-                connection._assert_lifetime_lease()
                 marker = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                     "AND name = 'NioIngestMeta' COLLATE NOCASE"

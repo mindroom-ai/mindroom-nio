@@ -80,7 +80,7 @@ class _OwnedStoreCandidate:
             raise LocalProtocolError("owned ingestion store candidate was consumed")
         if self.__store is None:
             raise LocalProtocolError("owned ingestion store candidate has no store")
-        self.__bootstrap._validate_owned_candidate(self, self.__store)
+        self.__bootstrap._validate_owned_candidate(self)
         return self.__store
 
     def _prepare_transfer(self, store: MatrixStore) -> _OwnedStoreLease:
@@ -92,7 +92,7 @@ class _OwnedStoreCandidate:
             raise LocalProtocolError(
                 "owned ingestion store transfer was already prepared"
             )
-        self.__bootstrap._validate_owned_candidate(self, store)
+        self.__bootstrap._validate_owned_candidate(self)
         lease = _OwnedStoreLease(self.__bootstrap, store, self._journal)
         self.__prepared_lease = lease
         return lease
@@ -110,7 +110,6 @@ class _OwnedStoreCandidate:
             raise LocalProtocolError("owned ingestion store transfer is foreign")
         self.__bootstrap._transfer_owned_candidate(
             self,
-            store,
             lease._token_for_transfer(),
         )
         self.__active = False
@@ -137,8 +136,6 @@ class StoreBootstrap:
         self.__authenticated_pickle_key = authenticated_pickle_key
         self.__bound_source: SourceConfig | None = None
         self.__bound_sqlite_busy_timeout_ms: int | None = None
-        self._store_revoked = False
-        self._session_claimed = False
         self._owned_candidate: _OwnedStoreCandidate | None = None
         self._owned_lease_token: object | None = None
 
@@ -180,11 +177,7 @@ class StoreBootstrap:
             raise LocalProtocolError(
                 "owned ingestion requires an authenticated pickle key"
             )
-        if (
-            self._session_claimed
-            or self._owned_candidate is not None
-            or self._owned_lease_token is not None
-        ):
+        if self._owned_candidate is not None or self._owned_lease_token is not None:
             raise LocalProtocolError("StoreBootstrap already has a store or session")
         candidate = _OwnedStoreCandidate(self)
         self._owned_candidate = candidate
@@ -207,7 +200,6 @@ class StoreBootstrap:
             pass
         if (
             self._owned_candidate is not candidate
-            or self._session_claimed
             or self._owned_lease_token is not None
         ):
             raise LocalProtocolError("owned ingestion store candidate is foreign")
@@ -215,25 +207,22 @@ class StoreBootstrap:
     def _validate_owned_candidate(
         self,
         candidate: _OwnedStoreCandidate,
-        store: MatrixStore,
     ) -> None:
         with self._journal._owner.read():
             pass
         if self._owned_candidate is not candidate:
             raise LocalProtocolError("owned ingestion store candidate is foreign")
-        if self._session_claimed or self._owned_lease_token is not None:
+        if self._owned_lease_token is not None:
             raise LocalProtocolError("owned ingestion store candidate was consumed")
 
     def _transfer_owned_candidate(
         self,
         candidate: _OwnedStoreCandidate,
-        store: MatrixStore,
         lease_token: object,
     ) -> None:
-        self._validate_owned_candidate(candidate, store)
+        self._validate_owned_candidate(candidate)
         self._owned_candidate = None
         self._owned_lease_token = lease_token
-        self._session_claimed = True
 
     def _tombstone_owned_candidate(
         self,
@@ -242,9 +231,8 @@ class StoreBootstrap:
     ) -> None:
         if self._owned_candidate is not candidate:
             raise LocalProtocolError("owned ingestion store candidate is foreign")
-        if store is not None and not self._store_revoked:
+        if store is not None and not store._ingestion_revoked:
             store._revoke_ingestion_lease()
-            self._store_revoked = True
         self._journal.close()
         self._owned_candidate = None
 
@@ -255,9 +243,8 @@ class StoreBootstrap:
     ) -> None:
         if self._owned_lease_token is not lease_token:
             raise LocalProtocolError("owned ingestion store lease is foreign")
-        if not self._store_revoked:
+        if not store._ingestion_revoked:
             store._revoke_ingestion_lease()
-            self._store_revoked = True
 
     @property
     def database_path(self) -> Path:

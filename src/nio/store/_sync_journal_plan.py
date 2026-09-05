@@ -6,7 +6,7 @@ from operator import itemgetter
 from typing import Literal, NamedTuple, cast
 from uuid import UUID
 
-from ..ingest._json import canonical_json, load_internal_json, load_json
+from ..ingest._json import canonical_json, load_json
 from ..ingest.model import (
     EventRecord,
     LossBoundary,
@@ -50,10 +50,7 @@ class PlannedWork(NamedTuple):
     value: EventRecord | LossRecord
     plaintext: bytes
     ready_ordinal: int | None
-
-    @property
-    def metadata(self) -> _PreparedWorkMetadata | None:
-        return _prepared_metadata_from_plaintext(self.value, self.plaintext)
+    metadata: _PreparedWorkMetadata | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +85,8 @@ class _StoredWorkRow:
 
 @dataclass(frozen=True, slots=True)
 class AuthenticatedWork:
+    """Immutable Work already validated at the journal's disk boundary."""
+
     value: EventRecord | LossRecord
     status: Literal["ready", "held"]
     canonical_size: int
@@ -95,29 +94,6 @@ class AuthenticatedWork:
     plaintext: bytes | None = None
     frame_id: UUID | None = None
     created_revision: int | None = None
-
-    def __post_init__(self) -> None:
-        if type(self.value) not in (EventRecord, LossRecord):
-            raise TypeError("authenticated Work value is invalid")
-        if self.status not in ("ready", "held"):
-            raise ValueError("authenticated Work status is invalid")
-        if type(self.canonical_size) is not int or self.canonical_size < 1:
-            raise ValueError("authenticated Work canonical size is invalid")
-        if self.plaintext is None:
-            if self.metadata is not None:
-                raise ValueError("authenticated Work metadata requires plaintext")
-        elif (
-            type(self.plaintext) is not bytes
-            or _prepared_metadata_from_plaintext(self.value, self.plaintext)
-            != self.metadata
-        ):
-            raise ValueError("authenticated Work plaintext is invalid")
-        if self.frame_id is not None and type(self.frame_id) is not UUID:
-            raise TypeError("authenticated Work frame_id is invalid")
-        if self.created_revision is not None and (
-            type(self.created_revision) is not int or self.created_revision < 1
-        ):
-            raise ValueError("authenticated Work created revision is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +109,7 @@ def _stored_work_insert_row(
     frame_id: UUID,
     revision: int,
 ) -> _StoredWorkRow:
-    value, plaintext, ordinal = item
+    value, plaintext, ordinal = item.value, item.plaintext, item.ready_ordinal
     is_event = type(value) is EventRecord
     return _StoredWorkRow(
         _work_id(value),
@@ -155,7 +131,7 @@ def _stored_work_release_row(
     existing: AuthenticatedWork,
     revision: int,
 ) -> _StoredWorkRow:
-    value, plaintext, ordinal = item
+    value, plaintext, ordinal = item.value, item.plaintext, item.ready_ordinal
     if (
         type(value) is not EventRecord
         or type(existing.value) is not EventRecord
@@ -329,23 +305,11 @@ def _validate_prepared_metadata_semantics(
         raise ValueError("prepared Work metadata is invalid") from error
 
 
-def _prepared_metadata_from_plaintext(
-    value: EventRecord | LossRecord,
-    plaintext: bytes,
-) -> _PreparedWorkMetadata | None:
+def _decode_prepared_metadata(
+    value: EventRecord,
+    preparation: object,
+) -> _PreparedWorkMetadata:
     try:
-        wrapper = load_internal_json(plaintext, "Work plaintext")
-        if type(wrapper) is not dict:
-            raise ValueError
-        keys = set(wrapper)
-        if keys == {"kind", "value"}:
-            kind = "event" if type(value) is EventRecord else "loss"
-            if plaintext != _canonical_work_plaintext(kind, value):
-                raise ValueError
-            return None
-        if keys != {"kind", "preparation", "value"} or type(value) is not EventRecord:
-            raise ValueError
-        preparation = wrapper["preparation"]
         if type(preparation) is not dict or set(preparation) != {
             "record_id",
             "preparation_phase",
@@ -375,8 +339,6 @@ def _prepared_metadata_from_plaintext(
             _CallbackRoute(callback_route) if callback_route is not None else None,
         )
         _validate_prepared_metadata_semantics(value, metadata)
-        if plaintext != _canonical_work_plaintext("event", value, metadata):
-            raise ValueError
         return metadata
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("Work plaintext metadata is invalid") from error
@@ -556,7 +518,7 @@ def plan_prepared_frame_materialization(
             value,
             metadata,
         )
-        item = PlannedWork(value, plaintext, ordinal)
+        item = PlannedWork(value, plaintext, ordinal, metadata)
         if (
             stored_size(value, plaintext, ordinal)
             > hard_limits.max_record_canonical_bytes
@@ -612,7 +574,11 @@ def plan_prepared_frame_materialization(
                 plaintext = candidate.plaintext or _canonical_work_plaintext(
                     "event", candidate.value
                 )
-                releases.append(PlannedWork(candidate.value, plaintext, ready_ordinal))
+                releases.append(
+                    PlannedWork(
+                        candidate.value, plaintext, ready_ordinal, candidate.metadata
+                    )
+                )
             else:
                 if type(candidate) is not int:
                     raise ValueError("prepared HELD release candidate is invalid")
@@ -978,6 +944,7 @@ def plan_prepared_frame_materialization(
                         release_candidate.plaintext
                         or _canonical_work_plaintext("event", release_candidate.value),
                         anchor + offset,
+                        release_candidate.metadata,
                     )
                 )
             terminal_specs.append(
@@ -1020,6 +987,7 @@ def plan_prepared_frame_materialization(
                     room_value,
                     _canonical_work_plaintext("event", room_value, room_item.metadata),
                     room_item.ready_ordinal,
+                    room_item.metadata,
                 )
             room_sequences[room_id] = next_sequence
 

@@ -42,7 +42,7 @@ from ._sync_journal_format import _source_header as _source_header
 from ._sync_journal_format import _validate_source_cursor as _validate_source_cursor
 from ._sync_journal_plan import (
     AuthenticatedWork,
-    _prepared_metadata_from_plaintext,
+    _decode_prepared_metadata,
     _PreparedWorkMetadata,
 )
 from ._sync_journal_plan import (
@@ -152,6 +152,7 @@ _Owner = tuple[str, UUID, TransportKind]
 class _DecodedWork(NamedTuple):
     value: EventRecord | LossRecord
     metadata: _PreparedWorkMetadata | None
+    plaintext: bytes
 
 
 class _OutboundOperation(NamedTuple):
@@ -206,7 +207,17 @@ def _decode_work_plaintext(
         if type(wrapper) is not dict or wrapper.get("kind") != kind:
             raise ValueError("work wrapper kind is invalid")
         value = _record_from_dict(wrapper.get("value"), exact=False)
-        metadata = _prepared_metadata_from_plaintext(value, plaintext)
+        if set(wrapper) == {"kind", "value"}:
+            metadata = None
+        elif (
+            set(wrapper) == {"kind", "preparation", "value"}
+            and type(value) is EventRecord
+        ):
+            metadata = _decode_prepared_metadata(value, wrapper["preparation"])
+        else:
+            raise ValueError("work wrapper shape is invalid")
+        if plaintext != _canonical_work_plaintext(kind, value, metadata):
+            raise ValueError("work plaintext is not canonical")
         identity = value.record_id if isinstance(value, EventRecord) else value.loss_id
         if (
             type(value) not in (EventRecord, LossRecord)
@@ -216,7 +227,7 @@ def _decode_work_plaintext(
             and _loss_id(stream_id, value) != work_id
         ):
             raise ValueError("work plaintext is not canonical")
-        return _DecodedWork(value, metadata)
+        return _DecodedWork(value, metadata, plaintext)
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("Work plaintext is invalid") from error
 
@@ -1862,7 +1873,7 @@ class JournalRows:
             cast("Literal['ready', 'held']", status),
             len(payload),
             decoded.metadata,
-            plaintext,
+            decoded.plaintext,
             UUID(raw_frame_id),
             created_revision,
         )

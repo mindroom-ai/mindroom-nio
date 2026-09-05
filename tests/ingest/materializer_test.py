@@ -472,22 +472,20 @@ def _prepared_planned_record(
         provenance=record.provenance,
         clear_json=record.clear_json,
     )
+    metadata = _prepared_metadata(
+        record.record_id,
+        record.effective_event_type,
+        record.callback_route,
+        phase=record.preparation_phase,
+        decryption=record.decryption,
+        verified=record.decryption_verified,
+        decrypted_kind=record.decrypted_to_device_kind,
+    )
     return journal_plan_module.PlannedWork(
         value,
-        journal_plan_module._canonical_work_plaintext(
-            "event",
-            value,
-            _prepared_metadata(
-                record.record_id,
-                record.effective_event_type,
-                record.callback_route,
-                phase=record.preparation_phase,
-                decryption=record.decryption,
-                verified=record.decryption_verified,
-                decrypted_kind=record.decrypted_to_device_kind,
-            ),
-        ),
+        journal_plan_module._canonical_work_plaintext("event", value, metadata),
         ready_ordinal,
+        metadata,
     )
 
 
@@ -2652,14 +2650,33 @@ def _prepared_work_decode_case() -> tuple[
     return item.value, item.metadata, item.plaintext
 
 
-def test_prepared_work_decoder_round_trips_without_changing_legacy_api() -> None:
+def test_prepared_work_decoder_returns_validated_value_metadata_and_bytes(
+    monkeypatch,
+) -> None:
     value, metadata, plaintext = _prepared_work_decode_case()
+    real_loads = json.loads
+    wrapper_decodes = 0
+
+    def counted_loads(data, *args, **kwargs):
+        nonlocal wrapper_decodes
+        if data == plaintext.decode("utf-8"):
+            wrapper_decodes += 1
+        return real_loads(data, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", counted_loads)
 
     decoded = journal_rows_module._decode_work_plaintext(
         _STREAM_ID, value.record_id, "event", plaintext
     )
 
-    assert tuple(decoded) == (value, metadata)
+    assert decoded.value == value
+    assert decoded.metadata == metadata
+    authenticated = AuthenticatedWork(
+        decoded.value, "ready", len(plaintext), decoded.metadata, plaintext
+    )
+    assert authenticated.value == value
+    assert wrapper_decodes == 1
+    assert decoded.plaintext == plaintext
     assert (
         journal_rows_module._work_value_from_plaintext(
             _STREAM_ID, value.record_id, "event", plaintext

@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,35 @@ BOB_ONETIME = "6QlQw3mGUveS735k/JDaviuoaih5eEi6S1J65iHjfgU"
 SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 CONSUMER_GENERATION = UUID("22222222-2222-4222-8222-222222222222")
 ROOT = Path(__file__).parents[2]
+
+
+def test_ordinary_import_without_filesystem_lock_support(tmp_path: Path) -> None:
+    script = """
+import sys
+from pathlib import Path
+
+sys.modules["fcntl"] = None
+from nio import AsyncClient
+from nio.exceptions import LocalProtocolError
+from nio.store._ingestion_store_owner import StableFileLock
+
+client = AsyncClient("https://example.org", "@alice:example.org")
+assert client.homeserver == "https://example.org"
+try:
+    StableFileLock(Path(sys.argv[1]) / "store.db")
+except LocalProtocolError as error:
+    assert "filesystem ownership requires fcntl" in str(error)
+else:
+    raise AssertionError("filesystem ownership silently ran without locks")
+assert not tuple(Path(sys.argv[1]).iterdir())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _open(path: Path, statements: list[str] | None = None, *, timeout: int = 2_000):

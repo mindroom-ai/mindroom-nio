@@ -726,18 +726,10 @@ def _adopt_populated_store(
         else ()
     )
 
-    # The caller holds the exclusive lifetime lease. Recheck the complete
-    # ordinary snapshot after BEGIN IMMEDIATE, immediately before conversion.
+    # BEGIN IMMEDIATE already protects the authenticated database snapshot.
+    # Trust sidecars live outside that transaction and still need a race check.
     if (
-        _authenticate_ordinary_store(
-            connection,
-            source_store_class=source_store_class,
-            account_id=account_id,
-            device_id=device_id,
-            pickle_key=pickle_key,
-        )
-        != include_trust
-        or source_store_class is DefaultStore
+        source_store_class is DefaultStore
         and _sidecar_snapshot(sidecar_paths) != sidecar_before
     ):
         raise FreshIngestionRequired(

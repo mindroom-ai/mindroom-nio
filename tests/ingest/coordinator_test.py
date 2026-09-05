@@ -11694,7 +11694,6 @@ async def test_custom_authorization_rejected_without_consuming_bootstrap(
             stream_id=bootstrap.stream_id,
         )
 
-    assert bootstrap._session_claimed is False
     assert client.send_count == 0
     safe_client = RecordingClient()
     session = open_test_session(
