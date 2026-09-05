@@ -146,8 +146,9 @@ missing-jsonschema-stubs diagnostic was added at a new import site and seven
 original diagnostics disappeared.
 
 All four task reviews and the whole-branch implementation review passed with no
-Critical or Important findings. This documentation-only update awaits scoped
-review. Before deployment or cutover, resolve the companion MindRoom
+Critical or Important findings. Scoped documentation review is complete; its
+final wording clarification makes explicit that transient fanout uses the current
+task. Before deployment or cutover, resolve the companion MindRoom
 integration's current base conflict and run its integration suite against an
 artifact built from the accepted Nio revision; those integration steps remain
 outside this local change.

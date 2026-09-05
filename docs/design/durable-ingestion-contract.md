@@ -92,7 +92,7 @@ mixed envelopes retain their normal validation.
 
 Callback exceptions are isolated from durable progress. Within the owned
 engine's transient path, `asyncio.timeout(1)` encloses sequential callback
-awaits; it does not create a task per callback or fanout item. A timeout can
+awaits in the current task; it creates no separate task for the fanout. A timeout can
 cancel a callback at an await after its projection update or earlier callback
 side effects. Those effects are not rolled back, and the unfinished fanout is
 discarded. Callbacks must cooperate with cancellation, clean up resources, and
