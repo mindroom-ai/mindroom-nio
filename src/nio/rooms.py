@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import cast
 
 from .events import (
     AccountDataEvent,
@@ -160,7 +161,7 @@ class MatrixRoom:
         except ValueError:
             users = [
                 u
-                for u in sorted(self.users, key=lambda u: self.user_name(u))
+                for u in sorted(self.users, key=lambda u: cast(str, self.user_name(u)))
                 if u != self.own_user_id
             ]
             empty = not users
@@ -225,7 +226,9 @@ class MatrixRoom:
                 return self.avatar_url(
                     next(
                         u
-                        for u in sorted(self.users, key=lambda u: self.user_name(u))
+                        for u in sorted(
+                            self.users, key=lambda u: cast(str, self.user_name(u))
+                        )
                         if u != self.own_user_id
                     )
                 )

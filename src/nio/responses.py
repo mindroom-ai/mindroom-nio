@@ -21,7 +21,7 @@ from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Self
 
 from jsonschema.exceptions import SchemaError, ValidationError
 
@@ -346,7 +346,12 @@ class FileResponse(Response):
             return f"content type: {self.content_type}, location: {self.body}"
 
     @classmethod
-    def from_data(cls, data: bytes | os.PathLike | dict, content_type, filename=None):
+    def from_data(
+        cls,
+        data: bytes | os.PathLike | dict[Any, Any],
+        content_type,
+        filename=None,
+    ):
         """Create a FileResponse from file content returned by the server.
 
         Args:
@@ -406,7 +411,7 @@ class ErrorResponse(Response):
         return f"{self.__class__.__name__}: {e}"
 
     @classmethod
-    def from_dict(cls, parsed_dict: dict[Any, Any]) -> ErrorResponse:
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> Self:
         try:
             validate_json(parsed_dict, Schemas.error)
         except (SchemaError, ValidationError):
@@ -769,10 +774,10 @@ class RegisterInteractiveResponse(Response):
     stages: list[str] = field()
     params: dict[str, Any] = field()
     session: str = field()
-    completed: list[str] = field()
-    user_id: str = field()
-    device_id: str = field()
-    access_token: str = field()
+    completed: list[str] | None = field()
+    user_id: str | None = field()
+    device_id: str | None = field()
+    access_token: str | None = field()
 
     @classmethod
     @verify(Schemas.register_flows, RegisterInteractiveError)
@@ -944,7 +949,7 @@ class DownloadResponse(FileResponse):
     @classmethod
     def from_data(
         cls,
-        data: os.PathLike | bytes,
+        data: os.PathLike | bytes | dict[Any, Any],
         content_type: str,
         filename: str | None = None,
     ) -> DownloadResponse | DownloadError:
@@ -987,7 +992,10 @@ class ThumbnailResponse(FileResponse):
 
     @classmethod
     def from_data(
-        cls, data: bytes, content_type: str, filename: str | None = None
+        cls,
+        data: bytes | os.PathLike | dict[Any, Any],
+        content_type: str,
+        filename: str | None = None,
     ) -> ThumbnailResponse | ThumbnailError:
         if not content_type.startswith("image/"):
             return ThumbnailError(f"invalid content type: {content_type}")
@@ -1283,7 +1291,7 @@ class SpaceGetHierarchyResponse(Response):
         rooms: The rooms in the space.
     """
 
-    next_batch: str = field()
+    next_batch: str | None = field()
     rooms: list = field()
 
     @classmethod
@@ -1445,7 +1453,7 @@ class RoomMessagesResponse(Response):
 
     chunk: list[Event | BadEventType] = field()
     start: str = field()
-    end: str = field(default=None)
+    end: str | None = field(default=None)
 
     @classmethod
     @verify(Schemas.room_messages, RoomMessagesError)

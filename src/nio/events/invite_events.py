@@ -120,7 +120,7 @@ class InviteMemberEvent(InviteEvent):
 
     state_key: str = field()
     membership: str = field()
-    prev_membership: str = field()
+    prev_membership: str | None = field()
     content: dict = field()
     prev_content: dict = field(default_factory=dict)
 
