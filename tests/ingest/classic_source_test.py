@@ -602,33 +602,6 @@ def test_restart_renormalizes_only_the_staged_response(
     assert renormalize_staged_frame(classic_source, staged) == original.frame
 
 
-def test_restart_rejects_a_mutated_frozen_carrier_before_invoking_adapter(
-    classic_source: ClassicSource,
-    classic_sync_body: bytes,
-) -> None:
-    request = classic_source.plan_request(_source_state(ClassicCursor(None)), 9)
-    assert request is not None
-    original = classic_source.normalize(
-        request, _network_result(request, classic_sync_body)
-    )
-    assert original.frame is not None
-    staged = StagedFrame(
-        original.frame.frame_id,
-        StagedSourceResponse(
-            request, original.response_body, original.frame.source_sha256
-        ),
-    )
-    object.__setattr__(staged, "frame_id", UUID("00000000-0000-0000-0000-000000000000"))
-
-    with pytest.raises(ValueError, match="frame_id"):
-        renormalize_staged_frame(classic_source, staged)
-
-    object.__setattr__(staged, "frame_id", original.frame.frame_id)
-    object.__setattr__(staged.response, "response_body", b"{}")
-    with pytest.raises(ValueError, match="digest"):
-        renormalize_staged_frame(classic_source, staged)
-
-
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [

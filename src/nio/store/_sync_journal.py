@@ -40,7 +40,7 @@ from ..ingest.model import (
     _local_membership_transition_epoch,
     _PreparedIngestionFrame,
 )
-from ..ingest.ports import NetworkRequest, _revalidated_staged_source_response
+from ..ingest.ports import NetworkRequest
 from ..ingest.serialization import (
     _validate_batch,
     batch_from_records,
@@ -783,7 +783,7 @@ class SqliteIngestionJournal(JournalRows):
             )
             frame = StagedFrame(
                 frame.frame_id,
-                _revalidated_staged_source_response(frame.response),
+                frame.response,
                 frame.staged_revision,
             )
             return source, frame

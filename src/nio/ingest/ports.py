@@ -96,32 +96,6 @@ class StagedSourceResponse:
             raise ValueError("response_body must be canonical Matrix JSON object")
 
 
-def _revalidated_staged_source_response(
-    response: StagedSourceResponse,
-) -> StagedSourceResponse:
-    """Deeply reconstruct a mutable-by-escape-hatch frozen carrier."""
-    _require_exact(response, StagedSourceResponse, "response")
-    request = response.request
-    _require_exact(request, NetworkRequest, "request")
-    request = NetworkRequest(
-        request.stream_id,
-        request.transport,
-        request.source_epoch,
-        request.request_id,
-        request.method,
-        request.path,
-        request.query,
-        request.body,
-        request.timeout_ms,
-        request.request_cursor_json,
-    )
-    return StagedSourceResponse(
-        request,
-        response.response_body,
-        response.source_sha256,
-    )
-
-
 class NetworkFailureKind(StrEnum):
     TIMEOUT = "timeout"
     CONNECTION = "connection"

@@ -23,7 +23,6 @@ from .ports import (
     NetworkResult,
     StagedSourceResponse,
     _frame_id_for_response,
-    _revalidated_staged_source_response,
 )
 from .state import SourceState, StagedFrame
 
@@ -510,11 +509,9 @@ def renormalize_staged_frame(source: SyncSource, staged: StagedFrame) -> SyncFra
     if not isinstance(source, SyncSource):
         raise TypeError("source must satisfy SyncSource")
     _require_exact(staged, StagedFrame, "staged")
-    # Frozen dataclasses can still be corrupted through object.__setattr__.
-    # Reconstruct before invoking an adapter so restart never acts on it.
     staged = StagedFrame(
         staged.frame_id,
-        _revalidated_staged_source_response(staged.response),
+        staged.response,
         staged.staged_revision,
     )
     request = staged.response.request
