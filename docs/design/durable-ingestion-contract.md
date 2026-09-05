@@ -319,6 +319,12 @@ speedups do not establish full application throughput improvements.
 
 ### History decision boundary
 
+The Classic actionable-gap exclusion below is superseded by
+[`classic-gap-recovery-and-capacity.md`](classic-gap-recovery-and-capacity.md)
+following the measured missed-request failure and the user's instruction to
+fix recovery and performance. That amendment defines bounded capture through
+the existing journal owner. Its initial-history and Sliding limits are explicit.
+
 The current prepared engine detects discontinuities and emits explicit loss; it
 does not fetch missed messages through a Nio `/messages` backfill loop. Companion
 MindRoom context hydration can fetch history later, but installing context is
