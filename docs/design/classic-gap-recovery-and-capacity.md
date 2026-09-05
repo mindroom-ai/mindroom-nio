@@ -139,7 +139,7 @@ independently owned worker. Shutdown wakes the waiter and stops admission.
 
 ## Bounds and failure
 
-Owned Classic polling requests at most 500 timeline events, retaining any
+Owned Classic polling requests at most 100 timeline events, retaining any
 smaller user limit and other filter settings. If a successful response exceeds
 the wire or canonical byte bound, halve the requested limit and retry from the
 same cursor, down to one. Never truncate JSON, skip a sync token, or discard
@@ -215,6 +215,21 @@ projection cache or new authority: callbacks, admission, claims, acknowledgement
 SQLite transactions, and recovery ordering remain unchanged. Keep all recovered
 streaming revisions; discarding intermediate edits would change durable event
 delivery and is outside this performance correction.
+
+The original 500-event request ceiling still allowed retained sync responses of
+8.25 MiB during the Synapse workload. Repeated processing of that large tail
+made otherwise bounded recovery expensive. A matched local benchmark with three
+owned journals sharing one event loop delivered 3,000 ordered events with
+22.79 seconds of recovery time and a 2.236-second maximum heartbeat pause.
+Requesting 100 events reduced those measurements to 13.66 and 0.723 seconds.
+Select the smaller fixed request ceiling; existing pages already use 100.
+Keep oversize halving and all persistence, ownership, and replay checks.
+
+Ordinary CPU throughput was approximately unchanged, with more sync requests;
+real network latency can add cost. This is a measured workload tradeoff, not
+a universal event-loop latency bound. Large individual events, state/global
+sections, and other application tasks remain separate limits. The local pause
+reproduction does not by itself establish the live health timeout's cause.
 
 ## Verification and remaining limits
 

@@ -50,7 +50,8 @@ Tests: owned recovery, phase, journal, completion, and existing source suites.
 Files: `src/nio/ingest/recovery.py`, `classic.py`, `coordinator.py`.
 Tests: owned recovery and existing Classic/coordinator suites.
 
-- [x] Bound owned Classic windows to 500, preserving smaller user limits.
+- [x] Bound owned Classic windows, preserving smaller user limits. The initial
+  ceiling was 500; Task 5 selects 100 after measuring retained-body latency.
 - [x] Halve oversized successful responses at the same cursor down to one.
   Preserve other filter selections and recover limited history after narrowing.
 - [x] Bound pages to 100 events and 2 MiB; narrow oversized pages at the same
@@ -102,6 +103,25 @@ admission, owned sessions, bot readiness, crypto, and desktop integration.
 - [ ] Review final changes, commit, push authorized branches, and verify remote
   checks. Report remaining limits without claiming unrelated gaps are closed.
 
+## Task 5: Resolve remaining measured capacity limits
+
+The subsequent unchanged controls distinguish corrected recovery from remaining
+latency and workload-shape limits. Neither control passed every acceptance
+predicate. Do not weaken the 180-second workload deadline, two-second health
+read, 45-second full visible overlap, exact replies, fence, or drain checks.
+
+- [x] Measure synchronous Nio processing against the actual large Synapse event
+  shape; distinguish maximum event-loop blockage from total throughput before
+  selecting a smaller source window or another performance change.
+- [ ] Reduce the fixed Classic request ceiling to 100, preserving oversize
+  halving, smaller user limits, and all recovery/cursor behavior; verify tests
+  and repeat live controls.
+- [ ] Diagnose MindRoom's serial dispatch preparation with targeted timing.
+  Preserve durable pending-turn recording and ordering. Fresh roots already
+  skip thread-history reads and text debounce; do not delete imaginary work.
+- [ ] Benchmark any selected change, test its real behavioral boundaries,
+  rerun unchanged live acceptance, then update the final results and publish.
+
 ## Measured results
 
 Baseline: Nio `1021de4`, 45,038 production Python lines. The earlier successful
@@ -136,6 +156,28 @@ The final encoding, size bounds, authentication, and transaction rollback
 remain. Thirteen targeted atomic staging, crash, restage, and identity cases
 passed with both the probe and actual production deletion.
 
+The separate immutable decoded Frame cache adds 18 net production lines.
+Three alternating recovery pairs reduced median delivery from 5.137 to 4.187
+seconds, with a median paired improvement of 18.51% (17.13–19.28%). This
+avoids repeated persisted Frame decoding, not original-response normalization.
+A ten-Frame ordinary delivery control showed no speedup: medians were 1.909
+and 1.919 seconds, with paired changes within approximately one percent.
+These local measurements do not establish live application capacity.
+
+The implementation keeps full actual-row equality and current-owner validation,
+and excludes prepared state containing mutable outbound operations. Ten added
+behavioral cases cover changed persisted columns, owner identity/revision,
+rollback/restage/reopen, and mutable outbound context reload. All 314 focused
+source/journal/recovery cases passed; mypy and changed-file hooks passed.
+
+Review also found outbound readiness polled before checking the same Frame's
+remaining Work, although outbound cannot run until that Work drains. Checking
+authenticated Work first avoids this redundant probe while preserving pending
+hydration progress. Three alternating pairs on top of decoded Frame reuse
+measured a further 1.36% median reduction (0.69–3.97%; median elapsed 4.163
+versus 4.089 seconds). The reorder adds two net source lines and no state.
+This small local improvement remains separate from the live acceptance result.
+
 ### Capacity correction and regression verification
 
 The first Tuwunel rerun completed 200 canonical replies and initial drain, then
@@ -156,20 +198,31 @@ real capacity results follow.
 
 ### Local checks and production cost
 
-The final Python 3.14.7 suite passed 2,147 tests, skipped three, and reported
+Before the final two optimizations, the Python 3.14.7 suite passed 2,147 tests,
+skipped three, and reported
 three existing fork-with-threads deprecation warnings in 213.06 seconds.
 Full mypy reported zero issues in 71 source files. All repository hooks passed,
 including explicit checks of the new, not-yet-tracked source and tests.
+
+The final production-source full run passed 2,155 tests, skipped three, and
+failed two test synchronization cases in 213.59 seconds. Both cases waited
+for the outbound probe that Work-first scheduling correctly skips. Their hook
+now observes and delegates the actual progress wait. Both corrected cases pass,
+preserving the original no-write, no-network, exact-retry, acknowledgement-wake,
+and completion assertions. Production code did not change after that full run.
+This verifies 2,157 cases across the full run and corrected reruns; it is not
+a claim that the first full command exited successfully.
 
 Companion validation against this local Nio source passed all 694 selected
 admission, journal ingress, bot readiness, client, and desktop tests. Its six
 changed-file hooks passed, including full source/test typing and module-boundary
 checks. The original checkout's dependency edits were preserved.
 
-Production Python totals are 45,841 lines in 71 files: 803 net lines above
-`1021de4`, and 381 below the original simplification baseline `742806f`.
+Production Python totals are 45,861 lines in 71 files: 823 net lines above
+`1021de4`, and 361 below the original simplification baseline `742806f`.
 The new continuation and journal integration account for the increase; the
-three performance simplifications remove 57 production lines. This is a real
+three performance simplifications remove 57 production lines; decoded Frame
+reuse and Work-first scheduling add 20. This is a real
 correctness feature with maintenance cost, justified by the reproduced lost
 requests and whole-backlog stall, not a source-size reduction.
 
@@ -202,7 +255,10 @@ projection errors, restarts, watchdog stalls, or degraded reads, but still
 failed the unchanged post-load fence. Reply latency was 74.275 seconds median,
 85.855 seconds p95, and 87.013 seconds from first input to last reply. All
 402 outbox rows were acknowledged. Catch-up settled 16,744 companion events;
-the fence had not reached any of the three syncing principals by the deadline.
+the fence had not been admitted by any of the three syncing principals by the
+deadline. All three retained final tails contained the exact fence reaction.
+The 16,747 total companion rows represented 5,586 distinct event IDs processed
+by three principals, not runaway duplicate admission.
 These numbers establish reply delivery, not passing capacity acceptance.
 
 Removing restart delay was therefore necessary but insufficient. Re-examining
@@ -210,3 +266,49 @@ the recovery architecture identifies repeated frame decoding during per-event
 delivery as the next measured target. Keep every recovered revision in order;
 do not skip edits, weaken the fence, enlarge the deadline, or add a second
 admission path to make this workload pass. Synapse remains unrun.
+
+### Live results after decoded Frame reuse and Work-first scheduling
+
+The next Tuwunel run completed all 200 replies, the exact post-load fence across
+all three principals, subsequent sync advancement, zero-debt drain, and clean
+shutdown. It reported no sync/projection errors or stalls. All 402 outgoing
+initial/final deliveries were acknowledged and 17,016 companion rows settled.
+Reply median was 74.007 seconds, p95 84.778 seconds, and the last reply completed
+85.853 seconds after the first input.
+
+The full run nevertheless failed its final overlap predicate: all 200 visible
+streams overlapped for 43.297 seconds, below the unchanged 45-second minimum.
+Roots were released in 0.171 seconds; initial Matrix replies spread over
+20.402 seconds, while individual visible streams lasted 63.563–66.080 seconds.
+The earlier slow Synapse control's longer streams also increased overlap, so
+overlap alone is not a throughput metric. Preserve this failed qualification
+alongside the passing recovery/fence result.
+
+Current Tuwunel logs attribute the startup spread to one requester/coalescing
+key: 200 serial flushes consumed 20.288 seconds with only 0.136 seconds of gaps.
+Callback-to-enqueue averaged 1.9 milliseconds. The interval containing dispatch
+preparation, planning, pending-turn persistence, and scheduling averaged
+97.87 milliseconds; existing logs do not separate those costs. Visible Matrix
+placeholder timestamps and the streaming-entry log do not establish actual
+provider invocation times. No further production change follows from these
+logs alone.
+
+The first unchanged Synapse 5,000-window control failed a two-second health
+HTTP read during terminal waiting, before reaching the fence. Its forced-stop
+snapshot retained 133 acknowledged load replies, pending recovery for all
+three principals, 7,692 settled companion rows, and 41 pending rows. There
+were no sync/projection errors; the shutdown traceback came from forced
+lifespan termination. This establishes a responsiveness failure but does not
+identify which synchronous operation caused it. Partial-cohort reply times
+are not compared with complete-cohort results. Both runs preserved source
+files and the user's dependency edits byte-for-byte.
+
+Matched local SQLite measurements reproduce the large-response latency risk.
+Three owned sessions sharing one loop use the observed 8.25/5.06/5.06 MiB
+response shapes and verify 3,000 ordered records and callbacks. A 100-event
+window reduces recovery from 22.79 to 13.66 seconds and maximum heartbeat pause
+from 2.236 to 0.723 seconds. Ordinary delivery changes from 9.77 to 10.01
+seconds, with pause reduced from 1.399 to 0.392 seconds. Network results yield
+but have no simulated latency; smaller windows need more requests. This
+justifies changing the existing constant, without extra cache or batching
+machinery, while keeping live attribution and acceptance separate.
