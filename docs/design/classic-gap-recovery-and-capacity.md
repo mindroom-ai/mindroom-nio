@@ -40,14 +40,19 @@ cursor remains; after staging, restart uses the retained pages without HTTP.
 
 For a limited Classic JOIN/LEAVE timeline with a trusted prior joined-room
 baseline, fetch `/messages` forwards from the request's `since` token to the
-new timeline's `prev_batch`. Both tokens are opaque. Preserve the source
-filter's event-selection semantics. Initial sync and rooms without a trusted
+new timeline's `prev_batch`. Both tokens are opaque. Keep source filters
+unchanged on sync retries. Recovery supports timeline limit and lazy-member
+settings; selectors such as `types`, `not_types`, or sender filters cannot
+prove intervening state ordering and fail explicitly before cursor commit.
+MindRoom's unfiltered timeline is supported. Initial sync and rooms without a trusted
 prior baseline do not acquire actionable cold history through this path.
 
 The Matrix endpoint accepts sync tokens as both bounds. Tuwunel uses exclusive
 forward bounds; its `end` usually identifies the last returned event rather
 than equalling `to`. Continue until `end` is absent or reaches the target.
-An empty chunk with a progressing `end` is not exhaustion. Reject stalled or
+An empty chunk with a progressing `end` is not exhaustion. Recovery covers
+server-visible events; it cannot restore history hidden by access controls.
+Reject stalled or
 cyclic tokens, malformed pages, and mismatched page starts. See the
 [Matrix pagination contract](https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv3roomsroomidmessages).
 
@@ -119,3 +124,52 @@ Record actual suite counts, benchmarks, production size, integration results,
 and unresolved limits in the accompanying implementation plan. Do not call the
 cutover complete solely because internal tests pass. The separately documented
 interactive key-share restart gap remains a separate task.
+
+## Measured correction: bounded chunks instead of one whole interval
+
+The first Tuwunel 200-conversation rerun completed all 200 canonical replies
+and drained existing queues, but failed the post-load reaction/sync fence.
+Recovery repeatedly exceeded the combined 16 MiB capture bound. The tested
+server enforces the requested forward bound, and recovery pages contain no
+duplicated lazy-member state. The retained evidence points to a genuine backlog
+of streaming edits; exact failed page sizes were not retained. Raising the
+aggregate cap would preserve the same stall mechanism.
+
+This supersedes the whole-interval capture and total-byte policy above. Freeze
+the original bounded sync response once in a singleton authenticated
+`NioIngestRecovery` row. Keep a small continuation in the existing Classic
+source cursor; its global `next_batch` remains unchanged. The continuation
+pins the response digest, eligible rooms, phase, current room, page position,
+and pagination progress. Do not put the response body inside the cursor,
+refetch a moving sync target, or add another crypto writer.
+
+Drain normal, independently identified child Frames through the existing owner:
+
+1. A prologue processes retained to-device events and device-key updates once.
+2. Recovery pages contain only recovered timeline events, with no later sync
+   state, fresh tail, or fabricated room-section membership. Persist each page
+   and its successor continuation atomically before preparation or callbacks.
+3. The final Frame applies retained state and fresh timelines after recovered
+   history, along with the remaining sync sections. It commits the original
+   next_batch and removes the pending recovery row atomically.
+
+Each child remains independently replayable from its authenticated payload.
+Keep one child active at a time; the singleton is a retained input, not another
+delivery queue. Reuse ordinary Frame preparation, Work bounds, acknowledgement,
+and retirement. Internal children do not emit completed-sync callbacks or
+satisfy quiescence; those belong to the final Frame.
+
+Bound page requests and retained page bytes, narrowing an oversized page at
+the same position. Drain between pages so interval size does not become
+in-memory Work size. Keep a finite pagination watchdog and reject stalled
+tokens. Recovery eligibility stays pinned across recovered leave/rejoin
+events; membership epochs and permission snapshots still follow event order.
+Local membership operations must not interleave with an older pending
+interval in a way that restores departed authority.
+
+Tests must exercise restart around page staging, keys needed by recovered
+encrypted messages, membership/state changes across page boundaries, multiple
+rooms, final callback timing, and the original end-to-end capacity criteria.
+This change adds a real continuation state machine because the workload exposed
+a need for it; redundant internal validation and duplicate delivery mechanisms
+remain excluded.

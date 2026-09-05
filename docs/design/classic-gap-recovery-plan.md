@@ -74,10 +74,10 @@ Files: `src/nio/ingest/ports.py`, `source.py`,
 
 - [x] Measure alternating real-SQLite workloads before implementation. Chosen
   change improves the two tested shapes by 2.64% and 1.85% median.
-- [ ] Delete `_revalidated_staged_source_response` and its two internal calls.
+- [x] Delete `_revalidated_staged_source_response` and its two internal calls.
   Keep network/disk constructors and identity checks. Remove only the test of
   the excluded frozen-object escape hatch; retain actual corruption tests.
-- [ ] Run Classic/Sliding/source-journal tests, formatting, and type checks.
+- [x] Run Classic/Sliding/source-journal tests, formatting, and type checks.
   Review the final diff and commit without adding cache machinery.
 
 ## Task 4: Companion acceptance and real capacity verification
@@ -99,5 +99,42 @@ Files: companion `src/mindroom/matrix/durable_ingestion.py` and
 ## Measured results
 
 Baseline: Nio `1021de4`, 45,038 production Python lines. Earlier capacity
-control passed 200 conversations only on Synapse's 500-event window. New
-recovery and final application measurements are pending execution.
+control passed 200 conversations only on Synapse's 500-event window.
+
+Performance simplification committed as `44f7b91`: 29 production lines and the
+27-line unsupported mutation test removed; 491 Classic/Sliding/source-journal
+tests passed. No cache or runtime dependency was added.
+
+Recovery verification before the live controls: 434 source/reducer/preparation
+tests passed; 22 owned recovery/boundary tests passed; mypy found zero issues in
+71 source files. The broader coordinator/materializer run passed 541 tests and
+found four expectations of old polling behavior. After updating those three
+filter expectations and testing terminal oversize at the minimum window, all
+29 selected recovery and affected coordinator cases passed. Real capacity
+controls and final full-suite verification are in progress.
+
+The second performance experiment removed repeat event canonicalization during
+callback settlement and deferred caller-batch validation to acknowledged
+retries, where retained Work is unavailable. Outstanding settlement still
+reconstructs authenticated Work and requires full batch equality. Five paired
+runs with 1,000 messages and 4,800-character bodies improved by a median 4.67%
+(all pairs 3.79–5.75%). Short-message results were noisy. The change removes
+22 production lines and adds no dependency or cache; 101 focused tests passed
+for each tested variant.
+
+
+## Corrective task: drain bounded recovery chunks
+
+The first Tuwunel rerun passed 200 replies and initial drain, then failed the
+post-load fence at the recovery byte bound. Follow the measured-correction
+section of the design before claiming completion.
+
+- [ ] Retain the frozen sync response separately and checkpoint small phase
+  progress in the source cursor, using the existing owner transaction.
+- [ ] Process crypto prologue, bounded recovered pages, and final sync tail
+  through ordinary independently identified Frames.
+- [ ] Add regressions for page restart, encrypted messages, cross-page
+  membership/state changes, local departures, multi-room ordering, and final
+  completion timing. Verify their failures before implementation.
+- [ ] Repeat both real capacity controls without changing acceptance criteria.
+- [ ] Re-run full checks, review production cost, commit, and push.
