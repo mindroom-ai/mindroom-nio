@@ -377,7 +377,7 @@ class MatrixRoom:
                 else:
                     self.read_receipts[receipt.user_id] = receipt
 
-    def handle_event(self, event: Event) -> None:
+    def handle_event(self, event: Event | BadEventType) -> None:
         logger.info(
             f"Room {self.room_id} handling event of type {type(event).__name__}"
         )
@@ -532,7 +532,7 @@ class MatrixInvitedRoom(MatrixRoom):
 
         return super().handle_membership(event)
 
-    def handle_event(self, event: Event) -> None:
+    def handle_event(self, event: Event | BadEventType) -> None:
         logger.info(
             f"Room {self.room_id} handling event of type {type(event).__name__}"
         )
