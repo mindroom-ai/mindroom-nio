@@ -454,7 +454,7 @@ def _attached_client(root: Path) -> Iterator[AsyncClient]:
         pickle_key=PICKLE_KEY,
         database_name="owned.db",
     )
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     client = AsyncClient(
         "https://example.org",
         ACCOUNT,

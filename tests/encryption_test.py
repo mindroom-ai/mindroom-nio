@@ -629,7 +629,7 @@ class TestClass:
             database_name=database_name,
         )
         try:
-            store = bootstrap.open_matrix_store(SqliteStore)
+            store = bootstrap._open_owned_store_candidate()._store_for_attachment()
             alice = Olm(
                 AliceId,
                 Alice_device,

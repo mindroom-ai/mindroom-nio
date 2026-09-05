@@ -1,3 +1,4 @@
+from ingestion_helpers import materialize_journal, retire_completed_frame
 import base64
 import hashlib
 import importlib.util
@@ -53,7 +54,7 @@ from nio.store._sync_journal_values import (
     MaterializerLimits,
     MaterializeStatus,
 )
-from nio.store.sync_journal import open_ingestion_store
+from ingestion_helpers import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
@@ -199,6 +200,7 @@ def _stage_proposal(
     *,
     to_device_since: str | None = None,
     global_account_data_sequence: int | None = None,
+    include_rooms: bool = True,
 ) -> _StageProposal:
     owner = journal.load_owner()  # type: ignore[attr-defined]
     prior_source = journal.load_source()  # type: ignore[attr-defined]
@@ -206,6 +208,12 @@ def _stage_proposal(
     request = adapter.plan_request(prior_source, prior_source.next_request_id)
     assert request is not None
     body = _successful_body(request, sequence)
+    if not include_rooms:
+        decoded = json.loads(body)
+        decoded["rooms"] = {}
+        if "lists" in decoded:
+            decoded["lists"][RESERVED_ALL_ROOMS_LIST]["count"] = 0
+        body = canonical_json(decoded)
     if request.transport is TransportKind.SLIDING and (
         to_device_since is not None or global_account_data_sequence is not None
     ):
@@ -339,16 +347,18 @@ def _seed_sliding_reopen_inventory(journal: object) -> None:
             sequence,
             to_device_since=f"td{sequence}",
             global_account_data_sequence=sequence,
+            include_rooms=sequence != 1,
         )
         _stage(journal, proposal=proposal)
-        materialized = journal.materialize_oldest_frame(  # type: ignore[attr-defined]
-            limits=MaterializerLimits()
+        materialized = materialize_journal(
+            journal, limits=MaterializerLimits()  # type: ignore[attr-defined]
         )
         assert materialized.revision is not None
         batch = journal.next_batch()  # type: ignore[attr-defined]
         assert batch is not None
         if sequence == 1:
             journal.acknowledge_batch(batch.ref)  # type: ignore[attr-defined]
+            retire_completed_frame(journal)
 
     retained = _stage_proposal(
         journal,
@@ -1128,7 +1138,7 @@ def test_v1_authenticated_callback_claim_prevents_rematerialization_writes(
                 "(SELECT COUNT(*) FROM NioIngestWork) FROM NioIngestMeta"
             ).fetchone()
         )
-        result = reopened._journal.materialize_oldest_frame(limits=MaterializerLimits())
+        result = materialize_journal(reopened._journal, limits=MaterializerLimits())
         after = tuple(
             reopened._journal._execute(
                 "SELECT revision, "
@@ -1136,7 +1146,7 @@ def test_v1_authenticated_callback_claim_prevents_rematerialization_writes(
                 "(SELECT COUNT(*) FROM NioIngestWork) FROM NioIngestMeta"
             ).fetchone()
         )
-        assert result.status is MaterializeStatus.IDLE
+        assert result.status is MaterializeStatus.BLOCKED
         assert after == before
     finally:
         reopened.close()
@@ -2155,7 +2165,8 @@ def test_stage_uses_source_predecessor_after_unrelated_revision_advance(
         source_predecessor = journal.load_source()
         owner_before_materialize = journal.load_owner()
 
-        materialized = journal.materialize_oldest_frame(
+        materialized = materialize_journal(
+            journal,
             limits=MaterializerLimits(),
         )
 
@@ -3206,7 +3217,7 @@ def _kill_nested_e2ee_stage(
 ) -> None:
     bootstrap = _open(store_path)
     journal = bootstrap._journal
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
 
     def kill_after_frame_insert(label: str) -> None:
         with sequence_path.open("a", encoding="utf-8") as sequence:
@@ -3327,7 +3338,7 @@ def test_nested_real_e2ee_write_rolls_back_with_crashed_source_stage(
 ) -> None:
     store_path = tmp_path / "nested-e2ee"
     bootstrap = _open(store_path)
-    bootstrap.open_matrix_store(SqliteStore)
+    bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = bootstrap._journal.load_owner()
     proposal = _stage_proposal(bootstrap._journal, CLASSIC_SOURCE, 1)
     bootstrap.close()
@@ -3353,7 +3364,7 @@ def test_nested_real_e2ee_write_rolls_back_with_crashed_source_stage(
 
     reopened = _open(store_path)
     try:
-        store = reopened.open_matrix_store(SqliteStore)
+        store = reopened._open_owned_store_candidate()._store_for_attachment()
         assert (
             reopened._journal.load_owner().revision,
             reopened._journal.load_source(),
@@ -3953,11 +3964,14 @@ def test_v1_exact_limit_restage_ignores_later_journal_revision(tmp_path: Path) -
     journal = bootstrap._journal
     try:
         for sequence in range(1, 5):
-            proposal = _stage_proposal(journal, CLASSIC_SOURCE, sequence)
-            assert _stage(journal, proposal=proposal).revision == sequence * 2 - 1
-            result = journal.materialize_oldest_frame(limits=MaterializerLimits())
-            assert result.revision == sequence * 2
-        assert journal.load_owner().revision == 8
+            proposal = _stage_proposal(
+                journal, CLASSIC_SOURCE, sequence, include_rooms=False
+            )
+            assert _stage(journal, proposal=proposal).revision == sequence * 4 - 3
+            result = materialize_journal(journal, limits=MaterializerLimits())
+            assert result.revision == sequence * 4 - 2
+            retire_completed_frame(journal)
+        assert journal.load_owner().revision == 16
 
         _source, _frame, base_payload = _plaintext_frame_capacity_proposal(journal, 0)
         source, frame, payload = _plaintext_frame_capacity_proposal(
@@ -3966,12 +3980,12 @@ def test_v1_exact_limit_restage_ignores_later_journal_revision(tmp_path: Path) -
         )
         assert len(payload) == 24 * 1024 * 1024
         committed = journal.stage_source_response(source=source, frame=frame)
-        assert committed == CommitResult(9)
-        assert journal.load_owner().revision == 9
+        assert committed == CommitResult(17)
+        assert journal.load_owner().revision == 17
         statements.clear()
 
         assert journal.stage_source_response(source=source, frame=frame) == committed
         assert _business_dml(statements) == []
-        assert journal.load_frame(frame.frame_id) == replace(frame, staged_revision=9)
+        assert journal.load_frame(frame.frame_id) == replace(frame, staged_revision=17)
     finally:
         bootstrap.close()

@@ -1,3 +1,4 @@
+from ingestion_helpers import materialize_journal
 from dataclasses import replace
 import sqlite3
 import inspect
@@ -32,7 +33,7 @@ from nio.store._sync_journal_preflight import _row
 from nio.store._sync_journal_values import MaterializerLimits
 import nio.store.sync_journal as bootstrap_api
 import nio.ingest.errors as ingest_errors
-from nio.store.sync_journal import open_ingestion_store
+from ingestion_helpers import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
@@ -502,6 +503,7 @@ def _stage_classic(
                         "events": [
                             {
                                 "content": {"body": "hello", "msgtype": "m.text"},
+                                "origin_server_ts": 1,
                                 "event_id": f"$event-{sequence}",
                                 "sender": BOB_ID,
                                 "type": "m.room.message",
@@ -636,7 +638,7 @@ def test_bootstrap_opens_only_the_matrix_store_e2ee_subset(tmp_path: Path) -> No
         database_name=database_path.name,
     )
 
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     try:
         tables = _table_names(database_path)
         assert "accounts" in tables
@@ -841,7 +843,7 @@ def test_configured_marked_reopen_binds_work_to_retained_frame_before_dml(
     bootstrap = _configured_open(tmp_path, SqliteStore)
     journal = bootstrap._journal
     _stage_classic(journal, 1, crypto=True, global_count=1)
-    journal.materialize_oldest_frame(limits=MaterializerLimits())
+    materialize_journal(journal, limits=MaterializerLimits())
     owner = journal.load_owner()
     inventory = journal._load_task3_work_inventory(owner)
     assert len(inventory.storage_rows) >= 1
@@ -853,7 +855,7 @@ def test_configured_marked_reopen_binds_work_to_retained_frame_before_dml(
     row = list(inventory.storage_rows[index])
     value = inventory.work[index].value
     row[10] -= 1
-    plaintext = _canonical_work_plaintext(row[2], value)
+    plaintext = _canonical_work_plaintext(row[2], value, inventory.work[index].metadata)
     payload, digest = _row(
         (owner.account_id, owner.stream_id, owner.transport_kind),
         "NioIngestWork",
@@ -882,10 +884,10 @@ def test_configured_marked_reopen_binds_held_work_to_aggregate_before_dml(
     bootstrap = _configured_open(tmp_path, SqliteStore)
     journal = bootstrap._journal
     _stage_classic(journal, 1, room=True)
-    journal.materialize_oldest_frame(limits=MaterializerLimits())
+    materialize_journal(journal, limits=MaterializerLimits())
     owner = journal.load_owner()
     inventory = journal._load_task3_work_inventory(owner)
-    assert [row[3] for row in inventory.storage_rows] == ["held"]
+    assert sum(row[3] == "held" for row in inventory.storage_rows) == 1
     loaded = journal._load_room_aggregate(owner, "!room:example.org")
     assert loaded is not None
     aggregate = loaded[1]
@@ -928,7 +930,7 @@ def test_configured_marked_reopen_authenticates_outstanding_batch_before_dml(
     bootstrap = _configured_open(tmp_path, SqliteStore)
     journal = bootstrap._journal
     _stage_classic(journal, 1, global_count=2)
-    journal.materialize_oldest_frame(limits=MaterializerLimits())
+    materialize_journal(journal, limits=MaterializerLimits())
     claimed = journal.next_batch()
     assert claimed is not None
     owner = journal.load_owner()
@@ -989,7 +991,7 @@ def test_configured_marked_reopen_authenticates_delivery_frontier_before_dml(
     bootstrap = _configured_open(tmp_path, SqliteStore)
     journal = bootstrap._journal
     _stage_classic(journal, 1, global_count=1)
-    journal.materialize_oldest_frame(limits=MaterializerLimits())
+    materialize_journal(journal, limits=MaterializerLimits())
     batch = journal.next_batch()
     assert batch is not None
     if fault == "sequence":

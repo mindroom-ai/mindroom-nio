@@ -1,3 +1,5 @@
+from ingestion_helpers import materialize_journal
+
 """On-disk restart and schema kill-point coverage for ingestion v1."""
 
 import hashlib
@@ -474,7 +476,7 @@ def _seed_positioned_sliding(bootstrap) -> None:
         ),
     )
     assert (
-        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        materialize_journal(journal, limits=MaterializerLimits()).status
         is MaterializeStatus.MATERIALIZED
     )
 

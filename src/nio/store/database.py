@@ -62,24 +62,7 @@ from ._ingestion_store_owner import (
 if TYPE_CHECKING:
 
     from ._ingestion_store_owner import IngestionStoreOwner
-    from .sync_journal import StoreBootstrap, _OwnedStoreCandidate
-
-
-def _open_matrix_store_from_ingestion(
-    bootstrap: StoreBootstrap,
-    store_class: type[MatrixStore],
-    pickle_key: str,
-) -> MatrixStore:
-    if store_class is not SqliteStore:
-        raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
-    return store_class(
-        bootstrap._journal.account_id,
-        bootstrap._journal.device_id,
-        str(bootstrap.database_path.parent),
-        pickle_key=pickle_key,
-        database_name=bootstrap.database_path.name,
-        _ingestion_bootstrap=bootstrap,
-    )
+    from .sync_journal import _OwnedStoreCandidate
 
 
 def _open_matrix_store_from_owned_candidate(
@@ -188,9 +171,7 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
-    _ingestion_bootstrap: StoreBootstrap | _OwnedStoreCandidate | None = field(
-        default=None, repr=False
-    )
+    _ingestion_bootstrap: _OwnedStoreCandidate | None = field(default=None, repr=False)
     _ingestion_owner: IngestionStoreOwner | None = field(
         default=None, init=False, repr=False
     )
@@ -276,9 +257,7 @@ class MatrixStore:
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
 
-    def _post_init_ingestion_store(
-        self, bootstrap: StoreBootstrap | _OwnedStoreCandidate
-    ) -> None:
+    def _post_init_ingestion_store(self, bootstrap: _OwnedStoreCandidate) -> None:
         if self._ingestion_initialized:
             raise LocalProtocolError("borrowed ingestion store is already initialized")
         owner = self._ingestion_owner

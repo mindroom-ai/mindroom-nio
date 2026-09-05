@@ -128,16 +128,6 @@ class RoomContinuity(_ValidatedValue):
 
 
 @dataclass(frozen=True, slots=True)
-class RecordDescriptor(_ValidatedValue):
-    kind: RecordKind
-    room_id: str | None
-    source_json: bytes
-    provenance: TimelineEventProvenance | None
-    descriptor_key: str
-    route: DescriptorRoute
-
-
-@dataclass(frozen=True, slots=True)
 class LossProposal(_ValidatedValue):
     room_id: str
     membership_epoch: int
@@ -160,20 +150,6 @@ class RoomProposal(_ValidatedValue):
     retirement_epoch: int | None
     losses: tuple[LossProposal, ...]
     release: RecoveryRelease
-
-
-@dataclass(frozen=True, slots=True)
-class FrameProposal(_ValidatedValue):
-    frame_id: UUID
-    source_sha256: bytes
-    room_proposals: tuple[RoomProposal, ...]
-    descriptors: tuple[RecordDescriptor, ...]
-    crypto_deferred: bool
-
-    def __post_init__(self) -> None:
-        _ValidatedValue.__post_init__(self)
-        if len(self.source_sha256) != 32:
-            raise ValueError("source_sha256 must be exactly 32 bytes")
 
 
 def _membership(segment: RoomSegment) -> str | None:
@@ -505,147 +481,6 @@ def _plan_room(
             RecoveryRelease.NONE,
         ),
         DescriptorRoute.HOLD_FOR_HYDRATION,
-    )
-
-
-def reduce_staged_frame(
-    stream_id: UUID,
-    staged_frame_id: UUID,
-    frame: SyncFrame,
-    rooms: tuple[RoomContinuity, ...],
-) -> FrameProposal:
-    _exact(stream_id, UUID, "stream_id")
-    _exact(staged_frame_id, UUID, "staged_frame_id")
-    _exact(frame, SyncFrame, "frame")
-    _exact(rooms, tuple, "rooms")
-    if any(type(room) is not RoomContinuity for room in rooms):
-        raise TypeError("rooms elements must be RoomContinuity")
-    if staged_frame_id != frame.frame_id:
-        raise ReducerInputError("staged frame identity does not match frame")
-    room_ids = tuple(room.room_id for room in rooms)
-    if len(room_ids) != len(set(room_ids)):
-        raise ReducerInputError("rooms must have unique room IDs")
-    states = {room.room_id: room for room in rooms}
-    plans: dict[str, tuple[RoomProposal, DescriptorRoute]] = {}
-    recovery_start_by_room: dict[str, int | None] = {}
-    descriptors: list[RecordDescriptor] = []
-    encrypted_timeline = False
-
-    for segment in frame.room_segments:
-        before = states.get(segment.room_id)
-        event_ids = _timeline_event_ids(segment)
-        recovery_start = _restart_recovery_start(
-            frame,
-            segment,
-            before,
-            event_ids,
-        )
-        plan = _plan_room(
-            stream_id,
-            frame,
-            segment,
-            before,
-            verified_restart_boundary=recovery_start is not None,
-        )
-        plan = (
-            replace(
-                plan[0],
-                after=replace(
-                    plan[0].after,
-                    last_timeline_event_id=_next_timeline_event_id(
-                        before,
-                        plan[0].after,
-                        segment,
-                        event_ids,
-                    ),
-                ),
-            ),
-            plan[1],
-        )
-        plans[segment.room_id] = plan
-        states[segment.room_id] = plan[0].after
-        recovery_start_by_room[segment.room_id] = recovery_start
-
-    def append(
-        kind: RecordKind,
-        room_id: str | None,
-        source_json: bytes,
-        provenance: TimelineEventProvenance | None = None,
-    ) -> None:
-        state = states.get(room_id) if room_id is not None else None
-        if room_id is None:
-            route = DescriptorRoute.READY
-        elif room_id in plans:
-            route = plans[room_id][1]
-        elif state is None:
-            raise ReducerInputError("room descriptor has no continuity")
-        elif state.gap is not None:
-            route = DescriptorRoute.HOLD_FOR_GAP
-        elif state.hydration_id is not None:
-            route = DescriptorRoute.HOLD_FOR_HYDRATION
-        else:
-            route = DescriptorRoute.READY
-        descriptors.append(
-            RecordDescriptor(
-                kind,
-                room_id,
-                source_json,
-                provenance,
-                f"frame:{frame.frame_id}:{len(descriptors)}",
-                route,
-            )
-        )
-
-    for segment in frame.room_segments:
-        for payload in segment.state_json:
-            append(RecordKind.STATE, segment.room_id, payload)
-        history_count = len(segment.timeline_json) - segment.live_event_count
-        for index, payload in enumerate(segment.timeline_json):
-            try:
-                event = load_json(payload, "timeline event")
-                if type(event) is not dict or canonical_json(event) != payload:
-                    raise ValueError("timeline event is not a canonical object")
-            except (TypeError, ValueError) as error:
-                raise ReducerInputError("invalid canonical timeline event") from error
-            encrypted_timeline = encrypted_timeline or event.get("type") == "m.room.encrypted"  # fmt: skip
-            append(
-                RecordKind.TIMELINE,
-                segment.room_id,
-                payload,
-                (
-                    _timeline_provenance(
-                        index,
-                        history_count,
-                        recovery_start_by_room[segment.room_id],
-                    )
-                ),
-            )
-        for payload in segment.room_account_data_json:
-            append(RecordKind.ROOM_ACCOUNT_DATA, segment.room_id, payload)
-    try:
-        ephemeral = _normalized_ephemeral_envelopes(frame.ephemeral_json)
-    except (TypeError, ValueError) as error:
-        raise ReducerInputError("invalid canonical ephemeral envelope") from error
-    for room_id, source_json in ephemeral:
-        append(RecordKind.EPHEMERAL, room_id, source_json)
-    for payload in frame.global_account_data_json:
-        append(RecordKind.GLOBAL_ACCOUNT_DATA, None, payload)
-    for payload in frame.presence_json:
-        append(RecordKind.PRESENCE, None, payload)
-    room_proposals = tuple(plans[segment.room_id][0] for segment in frame.room_segments)
-    crypto_deferred = (
-        encrypted_timeline
-        or bool(frame.to_device_json)
-        or frame.device_list_delta_json != b'{"changed":[],"left":[]}'
-        or frame.one_time_key_counts_json != b"{}"
-        or frame.unused_fallback_key_types_json not in (b"null", b"[]")
-    )
-    return FrameProposal(
-        frame.frame_id,
-        frame.source_sha256,
-        room_proposals,
-        tuple(descriptors),
-        crypto_deferred,
     )
 
 

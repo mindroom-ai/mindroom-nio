@@ -132,7 +132,6 @@ def test_public_ingest_exports_only_stable_contract_and_batch_helper() -> None:
         "IngestionBlockedError",
         "IngestionError",
         "IngestionHydrationError",
-        "IngestionSession",
         "IngestionSourceError",
         "LossBoundary",
         "LossReason",
@@ -148,7 +147,6 @@ def test_public_ingest_exports_only_stable_contract_and_batch_helper() -> None:
         "TimelineEventProvenance",
         "TransportKind",
         "canonical_batch_payload",
-        "open_ingestion",
     }
     assert not hasattr(ingest, "batch_from_records")
     assert not hasattr(ingest, "batch_from_payload")

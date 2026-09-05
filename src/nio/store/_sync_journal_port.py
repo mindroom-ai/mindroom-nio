@@ -6,7 +6,6 @@ from uuid import UUID
 from ..ingest.hydration import HydrationResult, PendingHydration
 from ..ingest.model import BatchRef, SyncBatch
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
-from ._sync_journal_values import MaterializeResult, MaterializerLimits
 
 
 @runtime_checkable
@@ -41,12 +40,6 @@ class IngestionJournal(Protocol):
         frame: StagedFrame,
         quiesce_reserved: bool = False,
     ) -> CommitResult: ...
-
-    def materialize_oldest_frame(
-        self,
-        *,
-        limits: MaterializerLimits,
-    ) -> MaterializeResult: ...
 
     def load_pending_hydrations(
         self, *, limit: int

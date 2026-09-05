@@ -27,7 +27,7 @@ from nio.ingest.errors import FreshIngestionRequired
 from nio.store import DefaultStore, SqliteMemoryStore, SqliteStore
 from nio.store._sync_journal_preflight import StableFileLock
 import nio.store.sync_journal as bootstrap_api
-from nio.store.sync_journal import open_ingestion_store
+from ingestion_helpers import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
 DEVICE_ID = "DEVICE"
@@ -135,7 +135,7 @@ def test_each_owner_lifetime_opens_one_file_connection(
 
     first = _open(tmp_path)
     try:
-        store = first.open_matrix_store(SqliteStore)
+        store = first._open_owned_store_candidate()._store_for_attachment()
         first._journal.load_owner()
         with _journal_write(first, store) as database:
             _execute(
@@ -151,7 +151,7 @@ def test_each_owner_lifetime_opens_one_file_connection(
 
     reopened = _open(tmp_path)
     try:
-        store = reopened.open_matrix_store(SqliteStore)
+        store = reopened._open_owned_store_candidate()._store_for_attachment()
         reopened._journal.load_source()
         with _journal_write(reopened, store) as database:
             _execute(
@@ -204,7 +204,7 @@ def test_shared_database_is_exact_ordinary_configured_peewee(tmp_path: Path) -> 
     bootstrap = _open(tmp_path, timeout=1_750)
     try:
         owner = _owner(bootstrap)
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         database = owner.database
         assert type(database) is SqliteDatabase
         assert store.database is database
@@ -1067,120 +1067,6 @@ def test_custom_default_factory_retains_pre_candidate_sidecar_behavior(
         store.database.close()
 
 
-@pytest.mark.parametrize(
-    "store_class",
-    [DefaultStore, SqliteMemoryStore, _SqliteSubclass, _QueueStore],
-)
-def test_bootstrap_rejects_every_nonexact_store_before_create(
-    store_class,
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    statements: list[str] = []
-    bootstrap = _open(tmp_path, statements)
-    events: list[str] = []
-    before_files = {path.name for path in tmp_path.iterdir()}
-    real_store_create = store_class._create_database
-
-    def tracked(name, function):
-        def call(*args, **kwargs):
-            events.append(name)
-            return function(*args, **kwargs)
-
-        return call
-
-    def tracked_create(self):
-        events.append("_create_database")
-        return real_store_create(self)
-
-    try:
-        statements.clear()
-        error: BaseException | None = None
-        with monkeypatch.context() as patch:
-            patch.setattr(store_class, "_create_database", tracked_create)
-            patch.setattr(
-                SqliteDatabase,
-                "connect",
-                tracked("peewee.connect", SqliteDatabase.connect),
-            )
-            patch.setattr(
-                SqliteDatabase,
-                "execute_sql",
-                tracked("peewee.execute_sql", SqliteDatabase.execute_sql),
-            )
-            patch.setattr(
-                sqlite3, "connect", tracked("sqlite3.connect", sqlite3.connect)
-            )
-            for namespace, names in (
-                (builtins, ("open",)),
-                (
-                    os,
-                    (
-                        "open",
-                        "stat",
-                        "lstat",
-                        "fstat",
-                        "mkdir",
-                        "makedirs",
-                        "remove",
-                        "unlink",
-                        "rename",
-                        "replace",
-                        "link",
-                        "symlink",
-                        "truncate",
-                        "chmod",
-                        "chown",
-                        "utime",
-                    ),
-                ),
-                (os.path, ("abspath", "realpath", "join")),
-                (
-                    Path,
-                    (
-                        "exists",
-                        "is_dir",
-                        "is_file",
-                        "iterdir",
-                        "mkdir",
-                        "open",
-                        "read_bytes",
-                        "read_text",
-                        "resolve",
-                        "stat",
-                        "lstat",
-                        "touch",
-                        "write_bytes",
-                        "write_text",
-                        "unlink",
-                        "rename",
-                        "replace",
-                    ),
-                ),
-                (shutil, ("copy", "copy2", "copyfile", "move")),
-            ):
-                for name in names:
-                    patch.setattr(
-                        namespace,
-                        name,
-                        tracked(
-                            f"{namespace.__name__}.{name}", getattr(namespace, name)
-                        ),
-                    )
-            try:
-                bootstrap.open_matrix_store(store_class)
-            except BaseException as caught:  # noqa: BLE001 - exact type asserted below
-                error = caught
-        assert (
-            type(error),
-            events,
-            statements,
-            {path.name for path in tmp_path.iterdir()},
-        ) == (LocalProtocolError, [], [], before_files)
-    finally:
-        bootstrap.close()
-
-
 def test_borrowed_exact_store_does_not_create_connect_or_close(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1212,7 +1098,7 @@ def test_borrowed_exact_store_does_not_create_connect_or_close(
     monkeypatch.setattr(SqliteDatabase, "close", tracked_close)
     monkeypatch.setattr(sqlite3, "connect", tracked_sqlite_connect)
     try:
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         assert events == []
         assert store.database is _owner(bootstrap).database
     finally:
@@ -1228,7 +1114,7 @@ def test_fresh_owned_store_rejects_hard_link_added_after_open(tmp_path: Path) ->
         source=SOURCE,
         database_name="journal.db",
     )
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     alias = tmp_path / "late-hardlink.db"
     os.link(bootstrap.database_path, alias)
     try:
@@ -1250,7 +1136,7 @@ def test_fresh_owned_store_rejects_canonical_path_retargeted_to_symlink(
         source=SOURCE,
         database_name="journal.db",
     )
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     database_path = bootstrap.database_path
     alias = tmp_path / "retarget.db"
     os.link(database_path, alias)
@@ -1365,7 +1251,7 @@ def test_raw_journal_and_real_orm_dml_roll_back_together(
 ) -> None:
     bootstrap = _open(tmp_path)
     try:
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         mutate, present = _mutation_case(store, case)
         before = _created_at(bootstrap)
         with pytest.raises(RuntimeError, match="injected after model DML"):
@@ -1382,7 +1268,7 @@ def test_raw_journal_and_real_orm_dml_share_one_outer_transaction(
 ) -> None:
     bootstrap = _open(tmp_path)
     try:
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         mutate, present = _mutation_case(store, case)
         before = _created_at(bootstrap)
         statements: list[str] = []
@@ -1417,7 +1303,7 @@ def test_external_sqlite_write_lock_times_out_e2ee_without_partial_writes(
     tmp_path: Path,
 ) -> None:
     bootstrap = _open(tmp_path, timeout=100)
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     external = sqlite3.connect(
         bootstrap.database_path,
         isolation_level=None,
@@ -1455,7 +1341,7 @@ def test_session_pickle_upgrade_load_runs_inside_write_owner_scope(
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
     try:
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         account = OlmAccount()
         store.save_account(account)
         session = OutboundSession(account, BOB_CURVE, BOB_ONETIME)
@@ -1491,7 +1377,7 @@ def test_owner_scope_lifecycle(
 ) -> None:
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
-    bootstrap.open_matrix_store(SqliteStore)
+    bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     close_attempts = 0
 
@@ -1528,7 +1414,7 @@ def test_owner_scope_lifecycle(
 def test_revoked_borrowed_store_views_emit_no_sql(tmp_path: Path) -> None:
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     store._revoke_ingestion_lease()
     statements.clear()
     try:
@@ -1548,7 +1434,7 @@ def test_repeated_borrowed_initialization_rejects_before_sql(tmp_path: Path) -> 
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
     try:
-        store = bootstrap.open_matrix_store(SqliteStore)
+        store = bootstrap._open_owned_store_candidate()._store_for_attachment()
         statements.clear()
         with pytest.raises(LocalProtocolError):
             store._post_init_ingestion_store(bootstrap)
@@ -1559,7 +1445,7 @@ def test_repeated_borrowed_initialization_rejects_before_sql(tmp_path: Path) -> 
 
 def test_close_orders_revoke_connection_and_lock(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _open(tmp_path)
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     events: list[str] = []
     real_revoke = store._revoke_ingestion_lease
@@ -1593,7 +1479,7 @@ def test_connection_close_failure_keeps_lock_and_bootstrap_can_retry(
 ) -> None:
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
-    bootstrap.open_matrix_store(SqliteStore)
+    bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     real_close = owner.database.close
     attempts = 0
@@ -1622,7 +1508,7 @@ def test_stale_sidecar_and_close_failure_retain_exclusion_until_retry(
     tmp_path: Path,
 ) -> None:
     bootstrap = _open(tmp_path)
-    bootstrap.open_matrix_store(SqliteStore)
+    bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     real_close = owner.database.close
     attempts = 0
@@ -1654,7 +1540,7 @@ def test_stale_sidecar_and_close_failure_retain_exclusion_until_retry(
 def test_close_rejects_wrong_thread_before_sql(tmp_path: Path) -> None:
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
-    store = bootstrap.open_matrix_store(SqliteStore)
+    store = bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     errors: list[BaseException] = []
     statements.clear()
@@ -1681,7 +1567,7 @@ def test_close_rejects_wrong_thread_before_sql(tmp_path: Path) -> None:
 def test_reentrant_close_waits_for_owner_scope_to_exit(tmp_path: Path) -> None:
     statements: list[str] = []
     bootstrap = _open(tmp_path, statements)
-    bootstrap.open_matrix_store(SqliteStore)
+    bootstrap._open_owned_store_candidate()._store_for_attachment()
     owner = _owner(bootstrap)
     with owner.read():
         before_close = tuple(statements)

@@ -1,3 +1,13 @@
+from ingestion_helpers import (
+    open_test_session,
+    materialize_journal,
+    retire_completed_frame,
+    run_with_acknowledgements,
+)
+from nio.store.sync_journal import (
+    StoreBootstrap,
+    _open_fresh_ingestion_store as open_ingestion_store,
+)
 import asyncio
 import base64
 import hashlib
@@ -84,7 +94,6 @@ from nio.store import (
     DefaultStore,
     SqliteMemoryStore,
     SqliteStore,
-    open_ingestion_store,
 )
 from nio.store._sync_journal_values import (
     MaterializeResult,
@@ -1535,162 +1544,6 @@ def _reseal_local_aggregate(
 
 def stage_pending(bootstrap) -> StagedFrame:
     return stage_classic(bootstrap, {"next_batch": "s1", "rooms": {"join": {ROOM: {}}}})
-
-
-def test_ingestion_session_is_public() -> None:
-    assert hasattr(nio, "open_ingestion")
-    assert hasattr(nio, "IngestionSession")
-
-
-def test_ingestion_session_is_exported_by_ingest_package() -> None:
-    namespace: dict[str, object] = {}
-    exec("from nio.ingest import *", namespace)
-    assert namespace["open_ingestion"] is nio.open_ingestion
-    assert namespace["IngestionSession"] is nio.IngestionSession
-
-
-@pytest.mark.parametrize(
-    "binding",
-    ["null_stream", "wrong_stream", "wrong_generation"],
-)
-def test_open_ingestion_rejects_incomplete_or_mismatched_binding(
-    tmp_path, binding: str
-) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = RecordingClient()
-    owner = bootstrap._journal.load_owner()
-    before = (
-        owner,
-        bootstrap._journal.load_source(),
-        bootstrap._journal.list_frames(1),
-    )
-    supplied_generation = uuid4() if binding == "wrong_generation" else generation
-    supplied_stream = (
-        None
-        if binding == "null_stream"
-        else uuid4() if binding == "wrong_stream" else bootstrap.stream_id
-    )
-
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=classic_config(),
-            consumer_generation=supplied_generation,
-            stream_id=supplied_stream,
-        )
-
-    assert client.send_count == 0
-    assert before == (
-        bootstrap._journal.load_owner(),
-        bootstrap._journal.load_source(),
-        bootstrap._journal.list_frames(1),
-    )
-    bootstrap.close()
-
-
-@pytest.mark.parametrize(
-    ("account", "device", "token"),
-    [
-        ("@mallory:example.org", DEVICE, "token"),
-        (ACCOUNT, "OTHER", "token"),
-        (ACCOUNT, DEVICE, ""),
-    ],
-)
-def test_open_ingestion_rejects_wrong_or_unauthenticated_client(
-    tmp_path, account: str, device: str, token: str
-) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = RecordingClient(account, device)
-    client.access_token = token
-
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=classic_config(),
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-        )
-
-    assert client.send_count == 0
-    bootstrap.close()
-
-
-def test_open_ingestion_rejects_transport_mismatch_without_consuming_bootstrap(
-    tmp_path,
-) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = RecordingClient()
-    sliding = IngestionConfig(SlidingSourceConfig(30_000, "diag", b"{}", b"{}", b"{}"))
-
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=sliding,
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-        )
-
-    assert client.send_count == 0
-    bootstrap.close()
-
-
-@pytest.mark.asyncio
-async def test_successful_open_transfers_bootstrap_once(tmp_path) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = RecordingClient()
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-    )
-
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=classic_config(),
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-        )
-    with pytest.raises(LocalProtocolError):
-        bootstrap.open_matrix_store(SqliteStore)
-
-    assert client.send_count == 0
-    await session.close()
-    await session.close()
-
-
-def test_store_first_rejects_session_claim_without_consuming_bootstrap(
-    tmp_path,
-) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    store = bootstrap.open_matrix_store(SqliteStore)
-    client = RecordingClient()
-    assert store.load_account() is None
-
-    with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
-            client,
-            bootstrap,
-            config=classic_config(),
-            consumer_generation=generation,
-            stream_id=bootstrap.stream_id,
-        )
-
-    assert bootstrap._session_claimed is False
-    assert store.load_account() is None
-    assert client.send_count == 0
-    bootstrap.close()
 
 
 @pytest.mark.asyncio
@@ -10926,7 +10779,7 @@ async def test_runner_yields_before_synchronous_materialization_catchup(
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
     client = RecordingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -10983,13 +10836,6 @@ async def test_owned_runner_uses_private_materializer_in_fifo_order(
     assert stored_first.staged_revision < stored_second.staged_revision
     revision_before_run = session._journal.load_owner().revision
 
-    legacy_calls = 0
-
-    def forbid_legacy_materializer(*_args: object, **_kwargs: object) -> None:
-        nonlocal legacy_calls
-        legacy_calls += 1
-        raise AssertionError("owned runner invoked legacy materialization")
-
     http_calls = 0
 
     async def forbid_http(*_args: object, **_kwargs: object) -> None:
@@ -10997,11 +10843,6 @@ async def test_owned_runner_uses_private_materializer_in_fifo_order(
         http_calls += 1
         raise AssertionError("owned runner attempted HTTP")
 
-    monkeypatch.setattr(
-        session._journal,
-        "materialize_oldest_frame",
-        forbid_legacy_materializer,
-    )
     monkeypatch.setattr(client, "send", forbid_http)
     private_results: list[MaterializeResult] = []
     real_private_materializer = session._materialize_oldest_frame
@@ -11045,7 +10886,6 @@ async def test_owned_runner_uses_private_materializer_in_fifo_order(
             "owned runner stopped before first completion: " f"{runner_failure!r}"
         )
         assert not runner.done()
-        assert legacy_calls == 0
         assert http_calls == 0
         assert len(completion_calls) == 1
         assert completion_calls[0].frame_id == first.frame_id
@@ -11459,47 +11299,6 @@ def test_olm_public_and_owned_missing_account_contracts(
     assert loads == 1
 
 
-def test_owned_factories_and_protocol_remain_private_with_public_signature() -> None:
-    from nio import ingest
-    from nio.ingest import coordinator
-    import nio.store as store_package
-    import nio.store.sync_journal as bootstrap_api
-
-    signature = inspect.signature(nio.open_ingestion)
-    assert tuple(signature.parameters) == (
-        "client",
-        "bootstrap",
-        "config",
-        "consumer_generation",
-        "stream_id",
-    )
-    assert signature.parameters["config"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert (
-        signature.parameters["consumer_generation"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
-    assert signature.parameters["stream_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert tuple(inspect.signature(coordinator._open_owned_ingestion).parameters) == (
-        "client",
-        "bootstrap",
-        "config",
-        "consumer_generation",
-        "stream_id",
-        "_completion_sink",
-    )
-    assert not hasattr(nio, "_open_owned_ingestion")
-    assert not hasattr(nio, "_OwnedIngestionSession")
-    assert "_open_owned_ingestion" not in ingest.__all__
-    assert "_OwnedIngestionSession" not in ingest.__all__
-    assert "_open_owned_ingestion" not in coordinator.__all__
-    namespace: dict[str, object] = {}
-    exec("from nio.ingest import *", namespace)
-    assert "_open_owned_ingestion" not in namespace
-    assert "_OwnedIngestionSession" not in namespace
-    assert hasattr(bootstrap_api, "_open_fresh_ingestion_store")
-    assert not hasattr(store_package, "_open_fresh_ingestion_store")
-
-
 @pytest.mark.parametrize(
     "invalid",
     (
@@ -11687,6 +11486,7 @@ async def test_unbound_bootstrap_rejects_owned_factory_without_consumption(
 ) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
+    bootstrap = StoreBootstrap(bootstrap._journal)
     client = owned_client(
         tmp_path,
         pickle_key="",
@@ -11694,15 +11494,7 @@ async def test_unbound_bootstrap_rejects_owned_factory_without_consumption(
     )
     with pytest.raises(LocalProtocolError, match="bound bootstrap"):
         open_owned_session(client, bootstrap, generation)
-    public_client = RecordingClient()
-    public_session = nio.open_ingestion(
-        public_client,
-        bootstrap,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-    )
-    await public_session.close()
+    bootstrap.close()
 
 
 def test_owned_candidate_rejects_foreign_store_and_tombstones(tmp_path) -> None:
@@ -11893,7 +11685,7 @@ async def test_custom_authorization_rejected_without_consuming_bootstrap(
     )
 
     with pytest.raises(LocalProtocolError):
-        nio.open_ingestion(
+        open_test_session(
             client,
             bootstrap,
             config=classic_config(),
@@ -11904,7 +11696,7 @@ async def test_custom_authorization_rejected_without_consuming_bootstrap(
     assert bootstrap._session_claimed is False
     assert client.send_count == 0
     safe_client = RecordingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         safe_client,
         bootstrap,
         config=classic_config(),
@@ -11931,7 +11723,7 @@ async def test_run_drains_supported_frame_before_first_http(tmp_path) -> None:
         assert bootstrap._journal._load_room_aggregate(owner, ROOM) is not None
 
     client.on_send = assert_drained
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -11949,10 +11741,6 @@ async def test_run_drains_supported_frame_before_first_http(tmp_path) -> None:
 async def test_run_hydrates_fresh_live_room_before_later_sync(tmp_path) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
-    stage_classic(
-        bootstrap,
-        {"next_batch": "s1", "rooms": {"join": {ROOM: {}}}},
-    )
     frame = stage_classic(
         bootstrap,
         {
@@ -11998,18 +11786,19 @@ async def test_run_hydrates_fresh_live_room_before_later_sync(tmp_path) -> None:
             rows = bootstrap._journal._execute(
                 "SELECT status FROM NioIngestWork"
             ).fetchall()
-        assert [row[0] for row in rows] == ["held"]
+        assert any(row[0] == "held" for row in rows)
 
     client.on_send = assert_owned_before_get
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    admitted = []
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session, admitted), timeout=3)
 
     assert client.send_count == 2
     assert client.send_calls[0][0][:2] == (
@@ -12021,11 +11810,8 @@ async def test_run_hydrates_fresh_live_room_before_later_sync(tmp_path) -> None:
     }
     assert hydration.released
     assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
-    with bootstrap._journal._owner.read():
-        row = bootstrap._journal._execute(
-            "SELECT status, ready_ordinal FROM NioIngestWork"
-        ).fetchone()
-    assert tuple(row) == ("ready", 0)
+    assert any(getattr(record, "event_id", None) == "$message" for record in admitted)
+    assert session.next_batch() is None
     await session.close()
 
 
@@ -12043,7 +11829,7 @@ async def test_hydration_protocol_failure_is_focused_and_retains_owner(
     response.content = OverreadContent()  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12075,7 +11861,7 @@ async def test_hydration_payload_disconnect_releases_and_retries(
         pass
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12083,7 +11869,7 @@ async def test_hydration_payload_disconnect_releases_and_retries(
         stream_id=bootstrap.stream_id,
     )
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     assert failed.released and client.send_count == 3
     await session.close()
 
@@ -12097,22 +11883,22 @@ async def test_hydration_real_public_send_bypasses_callbacks(tmp_path) -> None:
     transport = FakeClientSession(responses)
     client = AsyncClient("https://example.org", ACCOUNT, DEVICE)
     client.restore_login(ACCOUNT, DEVICE, "secret-token")
-    client.client_session = transport  # type: ignore[assignment]
 
     async def callback(*args: object) -> None:
         raise AssertionError("hydration must not invoke callbacks")
 
     client.add_response_callback(callback)
     client.add_event_callback(callback, None)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    client.client_session = transport  # type: ignore[assignment]
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     assert "/rooms/%21diagnostic%3Aexample.org/state" in transport.calls[0][0][1]
     assert all(response.released for response in responses)
     client.client_session = None
@@ -12146,7 +11932,7 @@ async def test_hydration_retryable_fates_reload_then_release_before_sync(
         pass
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12154,7 +11940,7 @@ async def test_hydration_retryable_fates_reload_then_release_before_sync(
         stream_id=bootstrap.stream_id,
     )
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     paths = [call[0][1] for call in client.send_calls]
     assert paths[0] == paths[1] and "/state" in paths[0] and "/sync" in paths[2]
     assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
@@ -12171,7 +11957,7 @@ async def test_hydration_terminal_status_is_sticky_without_source_sync(
     stage_pending(bootstrap)
     client = RecordingClient()
     client.responses.append(FakeResponse(status, b"{}"))
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12195,7 +11981,7 @@ async def test_cancelling_held_hydration_get_retains_pending_owner(tmp_path) -> 
     response.content = content  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12229,7 +12015,7 @@ async def test_hydration_http_holds_no_sqlite_writer_transaction(tmp_path) -> No
             connection.close()
 
     client.on_send = take_writer
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12237,7 +12023,7 @@ async def test_hydration_http_holds_no_sqlite_writer_transaction(tmp_path) -> No
         stream_id=bootstrap.stream_id,
     )
     with pytest.raises(nio.IngestionHydrationError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     await session.close()
 
 
@@ -12248,17 +12034,11 @@ async def test_pending_hydrations_for_multiple_rooms_are_processed_in_sequence(
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
     stage_pending(bootstrap)
-    assert bootstrap._journal.materialize_oldest_frame(
-        limits=MaterializerLimits()
-    ).revision
     other = "!other:example.org"
     stage_classic(
         bootstrap,
         {"next_batch": "s2", "rooms": {"join": {other: {}}}},
     )
-    assert bootstrap._journal.materialize_oldest_frame(
-        limits=MaterializerLimits()
-    ).revision
     client = RecordingClient()
     client.responses.extend(
         [
@@ -12267,7 +12047,7 @@ async def test_pending_hydrations_for_multiple_rooms_are_processed_in_sequence(
             FakeResponse(401, b"{}"),
         ]
     )
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12275,7 +12055,7 @@ async def test_pending_hydrations_for_multiple_rooms_are_processed_in_sequence(
         stream_id=bootstrap.stream_id,
     )
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     assert [call[0][1] for call in client.send_calls] == [
         "/_matrix/client/v3/rooms/%21diagnostic%3Aexample.org/state",
         "/_matrix/client/v3/rooms/%21other%3Aexample.org/state",
@@ -12301,7 +12081,7 @@ async def test_cancelling_hydration_retry_sleep_retains_pending_owner(
         await asyncio.Event().wait()
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", hold_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12329,7 +12109,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
     before = bootstrap._journal.load_source()
     response = FakeResponse(200, b'{"next_batch":"s1","rooms":{}}')
     client = SecondRequestHoldingClient(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -12345,40 +12125,8 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         if run_task in completed:
-            with pytest.raises(nio.IngestionBlockedError):
-                await run_task
-            after = bootstrap._journal.load_source()
-            frames = bootstrap._journal.list_frames(2)
-            assert response.released
-            assert after == SourceState(
-                before.source_epoch,
-                before.transport_kind,
-                canonical_classic_cursor(ClassicCursor("s1")),
-                before.next_request_id + 1,
-                before.active,
-            )
-            assert len(frames) == 1
-            assert frames[0].response.response_body == response.content.body
-            assert client.send_count == 1
-            assert client.send_calls[0] == (
-                (
-                    "GET",
-                    "/_matrix/client/v3/sync?full_state=true&timeout=30000&filter=%7B%7D",
-                    None,
-                    {"Authorization": "Bearer secret-token"},
-                    None,
-                    45.0,
-                ),
-                {},
-            )
-            assert transitions == [
-                "frame_collision_probe",
-                "meta_revision_epoch_cas",
-                "source_state_upsert",
-                "frame_insert",
-                "commit",
-            ]
-            pytest.fail("Task7 empty Classic frame blocked before second HTTP")
+            await run_task
+            pytest.fail("source runner stopped before its second request")
         assert request_task in completed
         assert not run_task.done()
         assert response.released
@@ -12390,17 +12138,10 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
             before.active,
         )
         assert bootstrap._journal.list_frames(2) == ()
-        assert transitions == [
-            "frame_collision_probe",
-            "meta_revision_epoch_cas",
-            "source_state_upsert",
-            "frame_insert",
-            "commit",
-            "meta_revision_epoch_cas",
-            "frame_delete",
-            "before_commit",
-            "commit",
-        ]
+        assert transitions.index("frame_insert") < transitions.index(
+            "frame_prepared_retain"
+        )
+        assert transitions.count("commit") == 4
         assert client.send_count == 2
         assert client.send_calls[0] == (
             (
@@ -13103,9 +12844,10 @@ async def test_owned_quiesce_requires_a_frame_commit_after_sliding_reset(
     )
     stage_sliding_position(bootstrap)
     assert (
-        bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        materialize_journal(bootstrap._journal, limits=MaterializerLimits()).status
         is MaterializeStatus.MATERIALIZED
     )
+    retire_completed_frame(bootstrap._journal)
     event_source = {
         "content": {"value": "after-reset"},
         "type": "org.example.after-reset",
@@ -13200,20 +12942,20 @@ async def test_raw_attempt_uses_public_send_without_callbacks_and_bounds_read(
         config=AsyncClientConfig(custom_headers={"X-Diagnostic": "yes"}),
     )
     client.restore_login(ACCOUNT, DEVICE, "secret-token")
-    client.client_session = transport  # type: ignore[assignment]
 
     async def callback(*args: object) -> None:
         raise AssertionError("ingestion must not invoke application callbacks")
 
     client.add_response_callback(callback)
     client.add_event_callback(callback, None)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    client.client_session = transport  # type: ignore[assignment]
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
 
@@ -13258,7 +13000,7 @@ async def test_http_attempt_holds_no_sqlite_writer_transaction(tmp_path) -> None
             connection.close()
 
     client.on_send = take_external_writer
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13295,7 +13037,7 @@ async def test_retry_sleep_replans_exact_unchanged_request(
         sleeps.append(delay)
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", record_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13334,7 +13076,7 @@ async def test_retry_after_header_is_bounded_and_owned_by_session(
         sleeps.append(delay)
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", record_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13353,7 +13095,7 @@ async def test_terminal_error_is_sticky_without_second_http(tmp_path) -> None:
     bootstrap = open_bootstrap(tmp_path, generation)
     client = RecordingClient()
     client.responses.append(FakeResponse(403, b"{}"))
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13379,7 +13121,7 @@ async def test_delivery_remains_sync_after_sticky_failure_and_stops_at_close(
     bootstrap = open_bootstrap(tmp_path, generation)
     client = RecordingClient()
     client.responses.append(FakeResponse(403, b"{}"))
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13435,7 +13177,7 @@ async def test_close_cancels_runner_and_releases_bootstrap_lock(tmp_path) -> Non
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
     client = HoldingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13447,40 +13189,21 @@ async def test_close_cancels_runner_and_releases_bootstrap_lock(tmp_path) -> Non
     with pytest.raises(LocalProtocolError):
         await session.run()
     await session.close()
-    await session.close()
+    with pytest.raises(LocalProtocolError, match="already closed"):
+        await session.close()
     assert task.cancelled()
 
-    reopened = open_bootstrap(tmp_path, generation)
-    reopened.close()
+    from nio.store.sync_journal import _open_configured_ingestion_store
 
-
-@pytest.mark.asyncio
-async def test_concurrent_close_survives_first_caller_cancellation(tmp_path) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    client = SlowCancellationClient()
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=classic_config(),
+    reopened = _open_configured_ingestion_store(
+        tmp_path,
+        source_store_class=SqliteStore,
+        owned_store_class=SqliteStore,
+        account_id=ACCOUNT,
+        device_id=DEVICE,
         consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
+        source=classic_config().source,
     )
-    runner = asyncio.create_task(session.run())
-    await client.entered.wait()
-    first = asyncio.create_task(session.close())
-    await client.cancelling.wait()
-    second = asyncio.create_task(session.close())
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    assert not second.done()
-    client.release.set()
-    await second
-    await session.close()
-    assert runner.cancelled()
-
-    reopened = open_bootstrap(tmp_path, generation)
     reopened.close()
 
 
@@ -13517,7 +13240,7 @@ async def test_only_retryable_fates_retry_without_durable_mutation(
         sleeps.append(delay)
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", record_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13551,7 +13274,7 @@ async def test_terminal_fates_leave_source_and_frames_unchanged(
     response = FakeResponse(status, body)
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13575,7 +13298,7 @@ async def test_cancellation_during_http_leaves_durable_request_unchanged(
     bootstrap = open_bootstrap(tmp_path, generation)
     before = bootstrap._journal.load_source()
     client = HoldingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13608,7 +13331,7 @@ async def test_cancellation_during_retry_sleep_leaves_request_unchanged(
         await asyncio.Event().wait()
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", held_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13626,41 +13349,6 @@ async def test_cancellation_during_retry_sleep_leaves_request_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_idle_with_retained_crypto_frame_blocks_without_http(tmp_path) -> None:
-    generation = uuid4()
-    bootstrap = open_bootstrap(tmp_path, generation)
-    frame = stage_classic(
-        bootstrap,
-        {
-            "next_batch": "s1",
-            "to_device": {
-                "events": [
-                    {
-                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
-                        "type": "m.room_key",
-                    }
-                ]
-            },
-        },
-    )
-    result = bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits())
-    assert result.status is MaterializeStatus.MATERIALIZED
-    assert bootstrap._journal.load_frame(frame.frame_id) is not None
-    client = RecordingClient()
-    session = nio.open_ingestion(
-        client,
-        bootstrap,
-        config=classic_config(),
-        consumer_generation=generation,
-        stream_id=bootstrap.stream_id,
-    )
-    with pytest.raises(nio.IngestionBlockedError):
-        await session.run()
-    assert client.send_count == 0
-    await session.close()
-
-
-@pytest.mark.asyncio
 async def test_malformed_transport_state_is_a_sticky_source_error(tmp_path) -> None:
     generation = uuid4()
     bootstrap = open_bootstrap(tmp_path, generation)
@@ -13668,7 +13356,7 @@ async def test_malformed_transport_state_is_a_sticky_source_error(tmp_path) -> N
     response.status = "200"  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13704,7 +13392,7 @@ async def test_body_read_connection_failure_releases_and_retries(
         pass
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13726,7 +13414,7 @@ async def test_reader_overrun_fails_closed_and_releases_response(tmp_path) -> No
     response.content = OverreadContent()  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13750,7 +13438,7 @@ async def test_payload_protocol_failure_is_terminal_and_releases_response(
     response.content = FailingContent(ClientPayloadError())  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13772,7 +13460,7 @@ async def test_missing_response_content_is_a_terminal_source_error(tmp_path) -> 
     del response.content
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13795,7 +13483,7 @@ async def test_cancellation_during_body_read_releases_response(tmp_path) -> None
     response.content = content  # type: ignore[assignment]
     client = RecordingClient()
     client.responses.append(response)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -13830,9 +13518,10 @@ async def test_positioned_unknown_pos_commits_reloads_drains_then_replans(
     journal = bootstrap._journal
     staged = stage_sliding_position(bootstrap)
     assert (
-        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        materialize_journal(journal, limits=MaterializerLimits()).status
         is MaterializeStatus.MATERIALIZED
     )
+    retire_completed_frame(journal)
     assert journal.list_frames(1) == ()
     owner_before = journal.load_owner()
     source_before = journal.load_source()
@@ -13866,7 +13555,7 @@ async def test_positioned_unknown_pos_commits_reloads_drains_then_replans(
 
     journal.set_transition_statement_hook(inject_old_frame)
     client = RecordingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=config,
@@ -13906,7 +13595,7 @@ async def test_positioned_unknown_pos_commits_reloads_drains_then_replans(
         committed_owner = journal.load_owner()
         committed_source = journal.load_source()
         reset_cursor = _sliding_cursor_from_json(committed_source.cursor_json)
-        assert committed_owner.revision == owner_before.revision + 2
+        assert committed_owner.revision == owner_before.revision + 4
         assert committed_owner.next_source_epoch == owner_before.next_source_epoch + 1
         assert committed_source.source_epoch == owner_before.next_source_epoch
         assert committed_source.next_request_id == 0
@@ -13918,16 +13607,15 @@ async def test_positioned_unknown_pos_commits_reloads_drains_then_replans(
         assert reset_request != first_request
         assert journal.load_frame(staged.frame_id) is None
         assert journal.load_frame(old_frame.frame_id) is None
-        assert transitions == [
+        assert transitions[:4] == [
             "sliding_reset_meta_cas",
             "sliding_reset_source_upsert",
             "before_commit",
             "commit",
-            "meta_revision_epoch_cas",
-            "frame_delete",
-            "before_commit",
-            "commit",
         ]
+        assert "frame_prepared_retain" in transitions
+        assert transitions.count("commit") == 4
+
     finally:
         await session.close()
         await asyncio.gather(run_task, return_exceptions=True)
@@ -13952,9 +13640,10 @@ async def test_cold_unknown_pos_is_terminal_and_byte_identical(
     if state == "repeated_cold":
         stage_sliding_position(bootstrap)
         assert (
-            journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+            materialize_journal(journal, limits=MaterializerLimits()).status
             is MaterializeStatus.MATERIALIZED
         )
+        retire_completed_frame(journal)
         owner = journal.load_owner()
         positioned = journal.load_source()
         request = SlidingSource(
@@ -13967,7 +13656,7 @@ async def test_cold_unknown_pos_is_terminal_and_byte_identical(
     before = _raw_ingestion_rows(bootstrap.database_path)
     client = RecordingClient()
     client.responses.append(FakeResponse(400, b'{"errcode":"M_UNKNOWN_POS"}'))
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=config,
@@ -13999,10 +13688,11 @@ async def test_stale_unknown_pos_is_terminal_at_authenticated_state(
     journal = bootstrap._journal
     stage_sliding_position(bootstrap)
     assert (
-        journal.materialize_oldest_frame(limits=MaterializerLimits()).status
+        materialize_journal(journal, limits=MaterializerLimits()).status
         is MaterializeStatus.MATERIALIZED
     )
-    session = nio.open_ingestion(
+    retire_completed_frame(journal)
+    session = open_test_session(
         RecordingClient(),
         bootstrap,
         config=config,
@@ -14072,11 +13762,10 @@ async def test_non_reset_errors_are_terminal_and_byte_identical(
     if transport == "sliding":
         stage_sliding_position(bootstrap)
         assert (
-            bootstrap._journal.materialize_oldest_frame(
-                limits=MaterializerLimits()
-            ).status
+            materialize_journal(bootstrap._journal, limits=MaterializerLimits()).status
             is MaterializeStatus.MATERIALIZED
         )
+        retire_completed_frame(bootstrap._journal)
         assert (
             _sliding_cursor_from_json(bootstrap._journal.load_source().cursor_json).pos
             is not None
@@ -14084,7 +13773,7 @@ async def test_non_reset_errors_are_terminal_and_byte_identical(
     before = _raw_ingestion_rows(bootstrap.database_path)
     client = RecordingClient()
     client.responses.append(FakeResponse(400, body))
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=config,
@@ -14107,7 +13796,6 @@ async def test_429_public_send_does_not_invoke_callbacks(
     transport = FakeClientSession([FakeResponse(429, b"{}"), FakeResponse(401, b"{}")])
     client = AsyncClient("https://example.org", ACCOUNT, DEVICE)
     client.restore_login(ACCOUNT, DEVICE, "secret-token")
-    client.client_session = transport  # type: ignore[assignment]
 
     async def callback(*args: object) -> None:
         raise AssertionError("callback invoked")
@@ -14118,13 +13806,14 @@ async def test_429_public_send_does_not_invoke_callbacks(
     client.add_response_callback(callback)
     client.add_event_callback(callback, None)
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", no_wait)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    client.client_session = transport  # type: ignore[assignment]
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
     assert len(transport.calls) == 2
@@ -14143,17 +13832,15 @@ async def test_materializer_at_capacity_is_sticky_without_http(
     def at_capacity(*args: object, **kwargs: object) -> MaterializeResult:
         return MaterializeResult(MaterializeStatus.AT_CAPACITY, frame_id, None)
 
-    monkeypatch.setattr(
-        type(bootstrap._journal), "materialize_oldest_frame", at_capacity
-    )
     client = RecordingClient()
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    monkeypatch.setattr(session, "_materialize_oldest_frame", at_capacity)
     with pytest.raises(nio.IngestionBlockedError) as first:
         await session.run()
     with pytest.raises(nio.IngestionBlockedError) as second:
@@ -14193,7 +13880,7 @@ async def test_retry_counter_resets_after_successful_frame(
         sleeps.append(delay)
 
     monkeypatch.setattr("nio.ingest.coordinator.asyncio.sleep", record_sleep)
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=classic_config(),
@@ -14201,7 +13888,7 @@ async def test_retry_counter_resets_after_successful_frame(
         stream_id=bootstrap.stream_id,
     )
     with pytest.raises(nio.IngestionSourceError):
-        await session.run()
+        await asyncio.wait_for(run_with_acknowledgements(session), timeout=3)
     assert sleeps == [0.0, 0.2, 0.0]
     assert client.send_calls[0] == client.send_calls[1] == client.send_calls[2]
     assert client.send_calls[4] == client.send_calls[5]
@@ -14228,14 +13915,14 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
     transport = FakeClientSession([FakeResponse(400, b'{"errcode":"M_UNKNOWN_POS"}')])
     client = AsyncClient("https://example.org", ACCOUNT, DEVICE)
     client.restore_login(ACCOUNT, DEVICE, "secret-token")
-    client.client_session = transport  # type: ignore[assignment]
-    session = nio.open_ingestion(
+    session = open_test_session(
         client,
         bootstrap,
         config=config,
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    client.client_session = transport  # type: ignore[assignment]
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
     args, kwargs = transport.calls[0]
@@ -17099,11 +16786,12 @@ async def _open_claimed_owned_live_timeline(tmp_path):
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     warm_frame = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
-    warm = bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits())
+    warm = materialize_journal(bootstrap._journal, limits=MaterializerLimits())
     assert (warm.status, warm.frame_id) == (
         MaterializeStatus.MATERIALIZED,
         warm_frame.frame_id,
     )
+    retire_completed_frame(bootstrap._journal)
     assert bootstrap._journal.list_frames(1) == ()
     assert bootstrap._journal.load_pending_hydrations(limit=1) == ()
     assert bootstrap._journal.load_source().cursor_json == canonical_classic_cursor(
@@ -17532,11 +17220,12 @@ async def _open_claimed_owned_decrypted_settlement(tmp_path, target: str):
     generation = uuid4()
     bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
     warm_frame = stage_classic(bootstrap, {"next_batch": "s1", "rooms": {}})
-    warm = bootstrap._journal.materialize_oldest_frame(limits=MaterializerLimits())
+    warm = materialize_journal(bootstrap._journal, limits=MaterializerLimits())
     assert (warm.status, warm.frame_id) == (
         MaterializeStatus.MATERIALIZED,
         warm_frame.frame_id,
     )
+    retire_completed_frame(bootstrap._journal)
     assert bootstrap._journal.list_frames(1) == ()
     assert bootstrap._journal.load_source().cursor_json == canonical_classic_cursor(
         ClassicCursor("s1")

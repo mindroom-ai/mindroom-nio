@@ -92,9 +92,7 @@ __all__ = (
     "IngestionBlockedError",
     "IngestionError",
     "IngestionHydrationError",
-    "IngestionSession",
     "IngestionSourceError",
-    "open_ingestion",
 )
 
 _TRANSPORT_RESPONSE_MARGIN_SECONDS = 15.0
@@ -552,26 +550,174 @@ def _initial_outbound_maintenance(
     return maintenance
 
 
-class IngestionSession:
+async def _drain_owned_cleanup(
+    operation: Coroutine[object, object, None],
+) -> None:
+    """Finish owned cleanup before propagating caller cancellation."""
+    task = asyncio.create_task(operation)
+    cancellations = 0
+    deferred_error: BaseException | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:  # noqa: PERF203
+            cancellations += 1
+        except BaseException as error:
+            if deferred_error is None:
+                deferred_error = error
+    try:
+        task.result()
+    except BaseException:
+        caller = asyncio.current_task()
+        if caller is not None:
+            for _ in range(cancellations):
+                caller.uncancel()
+        raise
+    if deferred_error is not None:
+        caller = asyncio.current_task()
+        if caller is not None:
+            for _ in range(cancellations):
+                caller.uncancel()
+        raise deferred_error
+    if cancellations:
+        raise asyncio.CancelledError
+
+
+def _apply_room_lifecycle_snapshot(
+    client: AsyncClient,
+    record: EventRecord,
+    aggregate: RoomAggregateValue,
+) -> None:
+    from ..client.base_client import _overlay_room_snapshot
+    from ..rooms import MatrixInvitedRoom, MatrixRoom
+
+    continuity = aggregate.continuity
+    room_id = record.room_id
+    membership = continuity.membership
+    snapshot = aggregate.room_snapshot
+    if (
+        type(room_id) is not str
+        or not room_id
+        or continuity.room_id != room_id
+        or membership not in {None, "invite", "join", "knock", "leave", "ban"}
+        or type(client.user_id) is not str
+        or not client.user_id
+        or type(client.rooms) is not dict
+        or type(client.invited_rooms) is not dict
+    ):
+        raise JournalIntegrityError("room lifecycle Aggregate identity is invalid")
+    if snapshot is not None and (
+        snapshot.room_id != room_id or snapshot.own_user_id != client.user_id
+    ):
+        raise JournalIntegrityError("room lifecycle snapshot identity is invalid")
+
+    invited = membership in {"invite", "knock"}
+    desired = client.invited_rooms if invited else client.rooms
+    opposite = client.rooms if invited else client.invited_rooms
+    desired_room = desired.get(room_id)
+    opposite_room = opposite.get(room_id)
+    if desired_room is not None and opposite_room is not None:
+        raise LocalProtocolError("owned room projection has duplicate routing")
+    desired_type = MatrixInvitedRoom if invited else MatrixRoom
+    opposite_type = MatrixRoom if invited else MatrixInvitedRoom
+
+    def validate_live_room(room: MatrixRoom, expected_type: type[MatrixRoom]) -> None:
+        if type(room) is not expected_type or (
+            room.room_id,
+            room.own_user_id,
+        ) != (room_id, client.user_id):
+            raise LocalProtocolError("owned room projection identity is invalid")
+
+    if desired_room is not None:
+        validate_live_room(desired_room, desired_type)
+    if opposite_room is not None:
+        validate_live_room(opposite_room, opposite_type)
+    if snapshot is None:
+        if opposite_room is not None:
+            opposite.pop(room_id)
+        return
+
+    try:
+        projected = _overlay_room_snapshot(
+            desired_room if desired_room is not None else opposite_room,
+            snapshot,
+            invited=invited,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise JournalIntegrityError("room lifecycle snapshot is invalid") from error
+    if type(projected) is not desired_type or (
+        projected.room_id,
+        projected.own_user_id,
+    ) != (room_id, client.user_id):
+        raise JournalIntegrityError("room lifecycle projection identity is invalid")
+    if desired_room is not None and projected is not desired_room:
+        raise JournalIntegrityError("room lifecycle overlay replaced a routed room")
+    if opposite_room is not None:
+        opposite.pop(room_id)
+    if invited:
+        if type(projected) is not MatrixInvitedRoom:
+            raise JournalIntegrityError(
+                "room lifecycle invited projection has the wrong type"
+            )
+        client.invited_rooms[room_id] = projected
+    else:
+        if type(projected) is not MatrixRoom:
+            raise JournalIntegrityError(
+                "room lifecycle current projection has the wrong type"
+            )
+        client.rooms[room_id] = projected
+
+
+def _load_settlement_event(
+    payload: bytes,
+    field_name: str,
+    invalid_message: str,
+) -> dict[str, object]:
+    try:
+        value = load_json(payload, field_name)
+        if type(value) is not dict or canonical_json(value) != payload:
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise JournalIntegrityError(invalid_message) from error
+    return value
+
+
+class _OwnedIngestionSession:
+    """Private ingestion session holding the exact journal/store close token."""
+
     def __init__(
         self,
         client: AsyncClient,
-        bootstrap: StoreBootstrap,
         config: IngestionConfig,
+        lease: _OwnedStoreLease,
+        store: MatrixStore,
+        journal: _SqliteIngestionJournal,
+        source: ClassicSource | SlidingSource,
+        completion_sink: Callable[[_FrameCompletion], Awaitable[None]] | None = None,
     ) -> None:
         self._client = client
-        self._bootstrap = bootstrap
         self._config = config
-        self._journal = bootstrap._claim_session()
-        owner = self._journal.load_owner()
-        classic = owner.transport_kind is TransportKind.CLASSIC
-        source_type = ClassicSource if classic else SlidingSource
-        self._source = source_type(owner.stream_id, config.source, owner.account_id)  # type: ignore[arg-type]
+        self._journal = journal
+        self._source = source
+        if completion_sink is not None and not callable(completion_sink):
+            raise TypeError("completion sink must be callable")
+        self._completion_sink = completion_sink
+        self._lease = lease
+        self._owned_store = store
         self._close_task: asyncio.Task[None] | None = None
         self._running: asyncio.Task[None] | None = None
         self._terminal: BaseException | None = None
         self._source_commit_generation = 0
         self._quiesce_source_commit_target: int | None = None
+        self._settlement_lock = asyncio.Lock()
+        self._settlement_task: asyncio.Task[object] | None = None
+        self._local_membership_command: _LocalMembershipCommand | None = None
+        self._progress_generation = 0
+        self._durable_progress_generation = 0
+        self._progress_event = asyncio.Event()
+        self._detached = False
+        self._revoked = False
+        self._closed = False
 
     def next_batch(
         self,
@@ -585,30 +731,6 @@ class IngestionSession:
         limits = {"max_records": max_records}
         limits["max_canonical_bytes"] = max_canonical_bytes
         return self._journal.next_batch(**limits)
-
-    def acknowledge_batch(self, ref: BatchRef) -> None:
-        self._client._assert_ingestion_not_poisoned()
-        if self._close_task is not None:
-            raise LocalProtocolError("ingestion session is closed")
-        self._journal.acknowledge_batch(ref)
-
-    def _materialize_oldest_frame(
-        self, *, limits: MaterializerLimits
-    ) -> MaterializeResult:
-        return self._journal.materialize_oldest_frame(limits=limits)
-
-    async def _advance_blocked_frame(self, frame_id: UUID) -> bool:
-        return False
-
-    async def _advance_local_membership_intent(self) -> bool:
-        return False
-
-    def _signal_progress(self) -> None:
-        """Public sessions have no progress waiters."""
-
-    def _signal_durable_progress(self) -> None:
-        """Public sessions have no private durable-progress observer."""
-        self._signal_progress()
 
     async def run(self) -> None:
         self._client._assert_ingestion_not_poisoned()
@@ -628,11 +750,6 @@ class IngestionSession:
             raise
         finally:
             self._running = None
-
-    async def close(self) -> None:
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._cleanup())
-        await asyncio.shield(self._close_task)
 
     async def _quiesce(self) -> None:
         """Commit one final source response before clean shutdown."""
@@ -670,13 +787,7 @@ class IngestionSession:
             raise LocalProtocolError("ingestion source stopped before quiescing")
         self._journal.consume_reserved_quiesce_response()
 
-    async def _cleanup(self) -> None:
-        if self._running is not None:
-            self._running.cancel()
-            await asyncio.gather(self._running, return_exceptions=True)
-        self._bootstrap.close()
-
-    async def __aenter__(self) -> IngestionSession:
+    async def __aenter__(self) -> _OwnedIngestionSession:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -850,8 +961,9 @@ class IngestionSession:
             retry_after,
         )
 
-    # fmt: off
-    async def _request(self, request: ports.NetworkRequest, *, body_disconnect_retry: bool = False) -> ports.NetworkResult:
+    async def _request(
+        self, request: ports.NetworkRequest, *, body_disconnect_retry: bool = False
+    ) -> ports.NetworkResult:
         # fmt: on
         path = request.path
         if request.query:
@@ -864,8 +976,7 @@ class IngestionSession:
                 {"Authorization": f"Bearer {self._client.access_token}"},
                 None,
                 (
-                    request.timeout_ms / 1000
-                    + _TRANSPORT_RESPONSE_MARGIN_SECONDS
+                    request.timeout_ms / 1000 + _TRANSPORT_RESPONSE_MARGIN_SECONDS
                     if request.timeout_ms
                     else 0
                 ),
@@ -906,180 +1017,12 @@ class IngestionSession:
             return self._network_result(request, None, b"", failure)
         except ClientPayloadError as error:
             if body_disconnect_retry:
-                return self._network_result(request, None, b"", ports.NetworkFailureKind.CONNECTION)
+                return self._network_result(
+                    request, None, b"", ports.NetworkFailureKind.CONNECTION
+                )
             raise IngestionSourceError("malformed response body") from error
         except ClientError as error:
             raise IngestionSourceError("malformed response body") from error
-
-
-async def _drain_owned_cleanup(
-    operation: Coroutine[object, object, None],
-) -> None:
-    """Finish owned cleanup before propagating caller cancellation."""
-    task = asyncio.create_task(operation)
-    cancellations = 0
-    deferred_error: BaseException | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:  # noqa: PERF203
-            cancellations += 1
-        except BaseException as error:
-            if deferred_error is None:
-                deferred_error = error
-    try:
-        task.result()
-    except BaseException:
-        caller = asyncio.current_task()
-        if caller is not None:
-            for _ in range(cancellations):
-                caller.uncancel()
-        raise
-    if deferred_error is not None:
-        caller = asyncio.current_task()
-        if caller is not None:
-            for _ in range(cancellations):
-                caller.uncancel()
-        raise deferred_error
-    if cancellations:
-        raise asyncio.CancelledError
-
-
-def _apply_room_lifecycle_snapshot(
-    client: AsyncClient,
-    record: EventRecord,
-    aggregate: RoomAggregateValue,
-) -> None:
-    from ..client.base_client import _overlay_room_snapshot
-    from ..rooms import MatrixInvitedRoom, MatrixRoom
-
-    continuity = aggregate.continuity
-    room_id = record.room_id
-    membership = continuity.membership
-    snapshot = aggregate.room_snapshot
-    if (
-        type(room_id) is not str
-        or not room_id
-        or continuity.room_id != room_id
-        or membership not in {None, "invite", "join", "knock", "leave", "ban"}
-        or type(client.user_id) is not str
-        or not client.user_id
-        or type(client.rooms) is not dict
-        or type(client.invited_rooms) is not dict
-    ):
-        raise JournalIntegrityError("room lifecycle Aggregate identity is invalid")
-    if snapshot is not None and (
-        snapshot.room_id != room_id or snapshot.own_user_id != client.user_id
-    ):
-        raise JournalIntegrityError("room lifecycle snapshot identity is invalid")
-
-    invited = membership in {"invite", "knock"}
-    desired = client.invited_rooms if invited else client.rooms
-    opposite = client.rooms if invited else client.invited_rooms
-    desired_room = desired.get(room_id)
-    opposite_room = opposite.get(room_id)
-    if desired_room is not None and opposite_room is not None:
-        raise LocalProtocolError("owned room projection has duplicate routing")
-    desired_type = MatrixInvitedRoom if invited else MatrixRoom
-    opposite_type = MatrixRoom if invited else MatrixInvitedRoom
-
-    def validate_live_room(room: MatrixRoom, expected_type: type[MatrixRoom]) -> None:
-        if type(room) is not expected_type or (
-            room.room_id,
-            room.own_user_id,
-        ) != (room_id, client.user_id):
-            raise LocalProtocolError("owned room projection identity is invalid")
-
-    if desired_room is not None:
-        validate_live_room(desired_room, desired_type)
-    if opposite_room is not None:
-        validate_live_room(opposite_room, opposite_type)
-    if snapshot is None:
-        if opposite_room is not None:
-            opposite.pop(room_id)
-        return
-
-    try:
-        projected = _overlay_room_snapshot(
-            desired_room if desired_room is not None else opposite_room,
-            snapshot,
-            invited=invited,
-        )
-    except (AttributeError, TypeError, ValueError) as error:
-        raise JournalIntegrityError("room lifecycle snapshot is invalid") from error
-    if type(projected) is not desired_type or (
-        projected.room_id,
-        projected.own_user_id,
-    ) != (room_id, client.user_id):
-        raise JournalIntegrityError("room lifecycle projection identity is invalid")
-    if desired_room is not None and projected is not desired_room:
-        raise JournalIntegrityError("room lifecycle overlay replaced a routed room")
-    if opposite_room is not None:
-        opposite.pop(room_id)
-    if invited:
-        if type(projected) is not MatrixInvitedRoom:
-            raise JournalIntegrityError(
-                "room lifecycle invited projection has the wrong type"
-            )
-        client.invited_rooms[room_id] = projected
-    else:
-        if type(projected) is not MatrixRoom:
-            raise JournalIntegrityError(
-                "room lifecycle current projection has the wrong type"
-            )
-        client.rooms[room_id] = projected
-
-
-def _load_settlement_event(
-    payload: bytes,
-    field_name: str,
-    invalid_message: str,
-) -> dict[str, object]:
-    try:
-        value = load_json(payload, field_name)
-        if type(value) is not dict or canonical_json(value) != payload:
-            raise ValueError
-    except (TypeError, ValueError) as error:
-        raise JournalIntegrityError(invalid_message) from error
-    return value
-
-
-class _OwnedIngestionSession(IngestionSession):
-    """Private ingestion session holding the exact journal/store close token."""
-
-    def __init__(
-        self,
-        client: AsyncClient,
-        config: IngestionConfig,
-        lease: _OwnedStoreLease,
-        store: MatrixStore,
-        journal: _SqliteIngestionJournal,
-        source: ClassicSource | SlidingSource,
-        completion_sink: Callable[[_FrameCompletion], Awaitable[None]] | None = None,
-    ) -> None:
-        self._client = client
-        self._config = config
-        self._journal = journal
-        self._source = source
-        if completion_sink is not None and not callable(completion_sink):
-            raise TypeError("completion sink must be callable")
-        self._completion_sink = completion_sink
-        self._lease = lease
-        self._owned_store = store
-        self._close_task: asyncio.Task[None] | None = None
-        self._running: asyncio.Task[None] | None = None
-        self._terminal: BaseException | None = None
-        self._source_commit_generation = 0
-        self._quiesce_source_commit_target: int | None = None
-        self._settlement_lock = asyncio.Lock()
-        self._settlement_task: asyncio.Task[object] | None = None
-        self._local_membership_command: _LocalMembershipCommand | None = None
-        self._progress_generation = 0
-        self._durable_progress_generation = 0
-        self._progress_event = asyncio.Event()
-        self._detached = False
-        self._revoked = False
-        self._closed = False
 
     def _materialize_oldest_frame(
         self, *, limits: MaterializerLimits
@@ -2843,42 +2786,3 @@ def _open_owned_ingestion(
         finally:
             candidate._tombstone()
         raise
-
-
-def open_ingestion(
-    client: AsyncClient,
-    bootstrap: StoreBootstrap,
-    *,
-    config: IngestionConfig,
-    consumer_generation: UUID,
-    stream_id: UUID | None,
-) -> IngestionSession:
-    from ..client.async_client import AsyncClient
-    from ..store.sync_journal import StoreBootstrap
-
-    if not isinstance(client, AsyncClient):
-        raise LocalProtocolError("ingestion requires an AsyncClient")
-    authenticated = client.access_token and client.user_id and client.device_id
-    if not authenticated or any(
-        key.lower() == "authorization" for key in client.config.custom_headers or {}
-    ):
-        raise LocalProtocolError("ingestion requires an authenticated client")
-    if type(bootstrap) is not StoreBootstrap:
-        raise LocalProtocolError("ingestion requires a StoreBootstrap")
-    if type(config) is not IngestionConfig:
-        raise LocalProtocolError("config must be IngestionConfig")
-    if type(consumer_generation) is not UUID:
-        raise LocalProtocolError("consumer_generation must be UUID")
-    if type(stream_id) is not UUID:
-        raise LocalProtocolError("stream_id must be a bound UUID")
-    owner = bootstrap._journal.load_owner()
-    if (client.user_id, client.device_id) != (owner.account_id, owner.device_id):
-        raise LocalProtocolError("client identity does not match ingestion owner")
-    if (consumer_generation, stream_id) != (
-        owner.consumer_generation,
-        owner.stream_id,
-    ):
-        raise LocalProtocolError("consumer generation/stream binding does not match")
-    if source_transport(config.source) is not owner.transport_kind:
-        raise LocalProtocolError("source transport does not match ingestion owner")
-    return IngestionSession(client, bootstrap, config)

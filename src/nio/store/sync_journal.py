@@ -137,7 +137,6 @@ class StoreBootstrap:
         self.__authenticated_pickle_key = authenticated_pickle_key
         self.__bound_source: SourceConfig | None = None
         self.__bound_sqlite_busy_timeout_ms: int | None = None
-        self._store: MatrixStore | None = None
         self._store_revoked = False
         self._session_claimed = False
         self._owned_candidate: _OwnedStoreCandidate | None = None
@@ -170,38 +169,6 @@ class StoreBootstrap:
         self.__bound_sqlite_busy_timeout_ms = sqlite_busy_timeout_ms
         return self
 
-    @contextmanager
-    def _claim_store(self, store: MatrixStore) -> Iterator[None]:
-        with self._journal._owner.read():
-            pass
-        if (
-            self._session_claimed
-            or self._owned_candidate is not None
-            or self._owned_lease_token is not None
-        ):
-            raise LocalProtocolError("StoreBootstrap belongs to an ingestion session")
-        if self._store is not None:
-            raise LocalProtocolError("StoreBootstrap can open MatrixStore only once")
-        self._store = store
-        try:
-            yield
-        except BaseException:
-            self._store = None
-            raise
-
-    def _claim_session(self) -> _SqliteIngestionJournal:
-        with self._journal._owner.read():
-            pass
-        if (
-            self._session_claimed
-            or self._store is not None
-            or self._owned_candidate is not None
-            or self._owned_lease_token is not None
-        ):
-            raise LocalProtocolError("StoreBootstrap already has a store or session")
-        self._session_claimed = True
-        return self._journal
-
     def _open_owned_store_candidate(self) -> _OwnedStoreCandidate:
         from .database import SqliteStore, _open_matrix_store_from_owned_candidate
 
@@ -215,7 +182,6 @@ class StoreBootstrap:
             )
         if (
             self._session_claimed
-            or self._store is not None
             or self._owned_candidate is not None
             or self._owned_lease_token is not None
         ):
@@ -243,7 +209,6 @@ class StoreBootstrap:
             self._owned_candidate is not candidate
             or self._session_claimed
             or self._owned_lease_token is not None
-            or self._store is not None
         ):
             raise LocalProtocolError("owned ingestion store candidate is foreign")
 
@@ -306,48 +271,13 @@ class StoreBootstrap:
     def stream_id(self) -> UUID:
         return self._journal.stream_id
 
-    def open_matrix_store(
-        self,
-        store_class: type[MatrixStore],
-        *,
-        pickle_key: str | None = None,
-    ) -> MatrixStore:
-        from .database import SqliteStore, _open_matrix_store_from_ingestion
-
-        if store_class is not SqliteStore:
-            raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
-        if (
-            self._owned_store_class is not None
-            and store_class is not self._owned_store_class
-        ):
-            raise LocalProtocolError("configured ingestion store class does not match")
-        if (
-            self._authenticated_pickle_key is not None
-            and pickle_key is not None
-            and pickle_key != self._authenticated_pickle_key
-        ):
-            raise LocalProtocolError("configured ingestion pickle key does not match")
-
-        return _open_matrix_store_from_ingestion(
-            self,
-            store_class,
-            (
-                self._authenticated_pickle_key
-                if pickle_key is None and self._authenticated_pickle_key is not None
-                else self._journal.pickle_key if pickle_key is None else pickle_key
-            ),
-        )
-
     def close(self) -> None:
         if self._owned_lease_token is not None:
             raise LocalProtocolError("owned ingestion session holds the close token")
+        self._journal._owner.prepare_close()
         if self._owned_candidate is not None:
             self._owned_candidate._tombstone()
             return
-        self._journal._owner.prepare_close()
-        if self._store is not None and not self._store_revoked:
-            self._store._revoke_ingestion_lease()
-            self._store_revoked = True
         self._journal.close()
 
 
