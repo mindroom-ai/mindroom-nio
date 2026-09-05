@@ -316,6 +316,29 @@ Changing that behavior or deleting the remaining gap-planning representation
 requires a separate explicit decision. The capacity, ownership, and decoding
 changes do not depend on that decision.
 
+### Protocol and crypto-queue corrections from final review
+
+These correct violations of the existing required guarantees; they do not add a
+new persistence or delivery guarantee. Raw HTTP JSON need not use the internal
+canonical serialization. Validate its bounded decoded value and response schema;
+reserve canonical-byte equality for the internal/persisted representations that
+actually require it. Valid join/leave responses and Matrix error codes must not
+change meaning because of whitespace, key order, or JSON escapes.
+
+Room-state hydration accepts ordinary `m.room.encryption` configuration state.
+It rejects an `m.room.encrypted` envelope in the state snapshot, duplicate state
+keys, and membership that contradicts its pending intent. Encryption projection
+and tracking must survive publication and restart.
+
+Crypto maintenance handles the normal lists already frozen by preparation:
+multiple queued shares, several waiting key requests for one device, multiple
+session rerequests, and a device that is both waiting and wedged. Consume the
+matching operation while preserving other queued messages. Apply the same
+per-session rerequest deduplication policy to live and frozen values. Persist
+all generated follow-ups within the existing ordered operation list, with exact
+bodies/transaction IDs and atomic crypto response application. No singleton-only
+restriction, new schema, queue manager, or retry state machine is warranted.
+
 ## Verification
 
 - Real owned-engine Classic/Sliding processing, replay, acknowledgement, and

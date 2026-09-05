@@ -341,3 +341,29 @@ automatic spooling or chunking was not added. The companion integration still
 needs conflict resolution and testing against the accepted Nio artifact before
 deployment. Released fork admission APIs are intentionally replaced, requiring
 coordinated consumer migration and release communication.
+
+## Final-review repair addendum
+
+Independent review at `a055bac` found three supported-workload blockers in the
+broader PR. The targeted hardening changes had no additional blocker. Repair
+these together before the final push; they enforce the existing contract.
+
+- [ ] R1: Accept valid noncanonical wire JSON in membership success and the two
+  maintenance/membership error parsers. Keep bounded strict decoding, schemas,
+  response identity, and internal canonical validation. Verify real owned
+  join/leave progress and retry/terminal classification with ordinary JSON.
+- [ ] R2: Accept `m.room.encryption` state during hydration; correct the encrypted
+  envelope rejection to `m.room.encrypted`. Preserve duplicate-key, membership,
+  and intent checks. Verify a real encrypted-room hydration, delivery, settlement,
+  and restart, including encryption projection and crypto tracking.
+- [ ] R3: Remove executor-only singleton assumptions from queued shares, waiting
+  claims, dummy rerequests, and simultaneous waiting/wedged devices. Consume only
+  the matching live message, preserve other messages, allow multiple valid
+  follow-ups per device, and align per-session deduplication. Keep existing
+  operation storage, exact retry bytes/IDs, atomic application, and poison rules.
+  Cover ordinary Olm-generated multi-message workloads and restart around sends.
+- [ ] Run focused regressions and crash/replay checks, then the full interpreter
+  matrix and hooks after the behavioral corrections. Compare normalized mypy
+  diagnostics and update final production-size measurements.
+- [ ] Independently re-review the complete fix diff against R1–R3 and check it for
+  new breakage before push. Record the verdict and remaining cutover limits.
