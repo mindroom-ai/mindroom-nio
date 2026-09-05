@@ -1414,15 +1414,15 @@ class JournalRows:
     def _decode_owner_row(self, row: Mapping[str, object]) -> OwnerView:
         try:
             owner = OwnerView(
-                row["account_id"],
-                row["device_id"],
-                row["schema_version"],
+                cast("str", row["account_id"]),
+                cast("str", row["device_id"]),
+                cast("int", row["schema_version"]),
                 UUID(cast("str", row["stream_id"])),
                 UUID(cast("str", row["consumer_generation"])),
                 TransportKind(cast("str", row["transport_kind"])),
-                row["revision"],
+                cast("int", row["revision"]),
                 UUID(cast("str", row["writer_epoch"])),
-                row["next_source_epoch"],
+                cast("int", row["next_source_epoch"]),
             )
             if type(row["created_at_ns"]) is not int or row["created_at_ns"] < 0:
                 raise ValueError("created_at_ns is invalid")
@@ -1478,10 +1478,10 @@ class JournalRows:
             if type(active) is not int or active not in (0, 1):
                 raise ValueError("source active column is invalid")
             clear = SourceState(
-                row["source_epoch"],
+                cast("int", row["source_epoch"]),
                 owner.transport_kind,
                 b"",
-                row["next_request_id"],
+                cast("int", row["next_request_id"]),
                 bool(active),
             )
             cursor_json = self._payload(
@@ -1880,7 +1880,7 @@ class JournalRows:
             raise JournalIntegrityError("local READY Work header is invalid")
         return AuthenticatedWork(
             value,
-            cast("Literal['ready', 'held']", status),
+            status,
             len(payload),
             decoded.metadata,
             decoded.plaintext,

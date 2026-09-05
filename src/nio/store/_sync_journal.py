@@ -877,8 +877,13 @@ class SqliteIngestionJournal(JournalRows):
         except JournalIntegrityError:
             with self._read():
                 preflight_owner = self.load_owner()
-                stored = self._load_frame_with_owner(frame.frame_id, preflight_owner)
-                if stored is None or stored.response != frame.response:
+                preflight_staged = self._load_frame_with_owner(
+                    frame.frame_id, preflight_owner
+                )
+                if (
+                    preflight_staged is None
+                    or preflight_staged.response != frame.response
+                ):
                     _frame_payload(
                         frame,
                         preflight_owner.revision + 1,
@@ -902,16 +907,17 @@ class SqliteIngestionJournal(JournalRows):
             self._transition_hook("frame_collision_probe")
             if frame.frame_id in frame_ids:
                 stored_row = self._frame_row(frame.frame_id)
-                stored = self._decode_frame_state(
+                stored_state = self._decode_frame_state(
                     frame.frame_id,
                     cast("Mapping[str, object]", stored_row),
                     owner,
                 )
-                if type(stored) is StagedFrame:
-                    staged_stored = cast("StagedFrame", stored)
+                if type(stored_state) is StagedFrame:
+                    staged_stored = stored_state
                     stored_revision = staged_stored.staged_revision
                     same_contents = staged_stored.response == frame.response
                 else:
+                    prepared_stored = cast("_PreparedFrameState", stored_state)
                     normalized = self._renormalized_frame(owner, frame)
                     candidate = load_json(
                         normalized.candidate_cursor_json,
@@ -925,12 +931,13 @@ class SqliteIngestionJournal(JournalRows):
                     )
                     stored_revision = stored_row["staged_revision"]
                     same_contents = (
-                        stored.request_cursor_json
+                        prepared_stored.request_cursor_json
                         == frame.response.request.request_cursor_json
-                        and stored.candidate_cursor_json
+                        and prepared_stored.candidate_cursor_json
                         == normalized.candidate_cursor_json
-                        and stored.source_sha256 == frame.response.source_sha256
-                        and stored.compatibility_token == compatibility_token
+                        and prepared_stored.source_sha256
+                        == frame.response.source_sha256
+                        and prepared_stored.compatibility_token == compatibility_token
                     )
                 if not same_contents or frame.staged_revision not in (
                     0,

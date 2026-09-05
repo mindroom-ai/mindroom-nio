@@ -819,10 +819,12 @@ def _decode_delivery_state(
     row: Mapping[str, object], owner: OwnerView
 ) -> DeliveryState:
     try:
-        state = DeliveryState(
-            *(row[f"delivery_{name}"] for name in DeliveryState._fields)
-        )
-        sequence, acknowledged, work_id, ready_revision, ordinal, batch_sha256 = state
+        sequence = row["delivery_next_sequence"]
+        acknowledged = row["delivery_acknowledged_sha256"]
+        work_id = row["delivery_outstanding_work_id"]
+        ready_revision = row["delivery_outstanding_ready_revision"]
+        ordinal = row["delivery_outstanding_ready_ordinal"]
+        batch_sha256 = row["delivery_outstanding_batch_sha256"]
         present = work_id is not None
         digests = acknowledged, batch_sha256
         if (
@@ -832,7 +834,10 @@ def _decode_delivery_state(
                 value is not None and (type(value) is not bytes or len(value) != 32)
                 for value in digests
             )
-            or any((value is None) == present for value in state[2:])
+            or any(
+                (value is None) == present
+                for value in (work_id, ready_revision, ordinal, batch_sha256)
+            )
             or (sequence == 0 and (acknowledged is not None or present))
             or (
                 sequence > 0 and acknowledged is None and (sequence != 1 or not present)
@@ -849,7 +854,14 @@ def _decode_delivery_state(
             or not 0 <= ordinal <= SQLITE_INT_MAX
         ):
             raise ValueError("delivery outstanding value is invalid")
-        return state
+        return DeliveryState(
+            sequence,
+            cast("bytes | None", acknowledged),
+            cast("str | None", work_id),
+            cast("int | None", ready_revision),
+            cast("int | None", ordinal),
+            cast("bytes | None", batch_sha256),
+        )
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise JournalIntegrityError("persisted delivery state is invalid") from error
 
@@ -1246,7 +1258,7 @@ def _authenticate_full_ingestion_graph(
     # Imported lazily because the row codec imports the pure preflight helpers.
     from ..ingest.serialization import batch_from_records
     from ._sync_journal import _ready_member, _renormalized_frame
-    from ._sync_journal_rows import JournalRows
+    from ._sync_journal_rows import JournalRows, _PreparedFrameState
 
     class BootstrapRows(JournalRows):
         def __init__(self) -> None:
@@ -1310,13 +1322,14 @@ def _authenticate_full_ingestion_graph(
             drain_header_authenticated=True,
         )
         if type(state) is StagedFrame:
-            staged_state = cast("StagedFrame", state)
+            staged_state = state
             normalized = _renormalized_frame(owner, staged_state)
             request_cursor = staged_state.response.request.request_cursor_json
             candidate_cursor = normalized.candidate_cursor_json
         else:
-            request_cursor = state.request_cursor_json
-            candidate_cursor = state.candidate_cursor_json
+            prepared_state = cast("_PreparedFrameState", state)
+            request_cursor = prepared_state.request_cursor_json
+            candidate_cursor = prepared_state.candidate_cursor_json
         authenticated_frames.append((header, request_cursor, candidate_cursor))
     if any(
         (successor[0].source_epoch, successor[0].request_id)

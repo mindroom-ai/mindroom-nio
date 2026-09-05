@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import cast
 from uuid import UUID
 
 from .model import TransportKind
@@ -15,7 +16,7 @@ def _require_exact(value: object, expected: type, field_name: str) -> None:
 
 def _require_nonnegative(value: object, field_name: str) -> None:
     _require_exact(value, int, field_name)
-    if value < 0:
+    if cast("int", value) < 0:
         raise ValueError(f"{field_name} must be nonnegative")
 
 

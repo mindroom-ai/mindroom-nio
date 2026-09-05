@@ -5,7 +5,7 @@ import logging
 import os
 from asyncio import sleep as _cooperative_sleep
 from hashlib import sha256
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid5
 
@@ -35,6 +35,7 @@ from ..responses import (
     KeysClaimResponse,
     KeysQueryResponse,
     KeysUploadResponse,
+    Response,
     RoomLeaveResponse,
     ToDeviceResponse,
 )
@@ -1329,6 +1330,8 @@ class _OwnedIngestionSession:
             value = load_json(network.body, "outbound maintenance response")
             if type(value) is not dict:
                 raise ValueError
+            response: Response
+            expected_type: type[Response]
             if operation.kind == "key_upload":
                 response = KeysUploadResponse.from_dict(value)
                 expected_type = KeysUploadResponse
@@ -2248,8 +2251,8 @@ class _OwnedIngestionSession:
                             raise JournalIntegrityError(
                                 "decrypted to-device event is invalid"
                             )
-                        sender = source["sender"]
-                        sender_key = source_content["sender_key"]
+                        sender = cast("str", source["sender"])
+                        sender_key = cast("str", source_content["sender_key"])
 
                     if decrypted_room_key:
                         clear_content = clear.get("content")
@@ -2268,13 +2271,16 @@ class _OwnedIngestionSession:
                             raise JournalIntegrityError(
                                 "decrypted room-key event is invalid"
                             )
+                        room_id = cast("str", clear_content["room_id"])
+                        session_id = cast("str", clear_content["session_id"])
+                        algorithm = cast("str", clear_content["algorithm"])
                         event = RoomKeyEvent(
                             clear,
                             sender,
                             sender_key,
-                            clear_content["room_id"],
-                            clear_content["session_id"],
-                            clear_content["algorithm"],
+                            room_id,
+                            session_id,
+                            algorithm,
                         )
                     elif remaining_decrypted_to_device:
                         if (
@@ -2297,13 +2303,16 @@ class _OwnedIngestionSession:
                                 raise JournalIntegrityError(
                                     "decrypted forwarded room-key event is invalid"
                                 )
+                            room_id = cast("str", clear_content["room_id"])
+                            session_id = cast("str", clear_content["session_id"])
+                            algorithm = cast("str", clear_content["algorithm"])
                             event = ForwardedRoomKeyEvent(
                                 clear,
                                 sender,
                                 sender_key,
-                                clear_content["room_id"],
-                                clear_content["session_id"],
-                                clear_content["algorithm"],
+                                room_id,
+                                session_id,
+                                algorithm,
                             )
                         elif (
                             metadata.decrypted_to_device_kind

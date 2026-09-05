@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from ._json import (
@@ -149,7 +149,8 @@ def _require_exact(value: object, expected: type, field_name: str) -> None:
 
 def _require_json_bytes_tuple(value: object, field_name: str) -> None:
     _require_exact(value, tuple, field_name)
-    if any(type(item) is not bytes for item in value):
+    items = cast("tuple[object, ...]", value)
+    if any(type(item) is not bytes for item in items):
         raise TypeError(f"{field_name} elements must be bytes")
 
 
@@ -443,6 +444,7 @@ class SourceResult:
 
         if self.kind is SourceResultKind.FRAME:
             _require_exact(self.frame, SyncFrame, "frame")
+            frame = cast("SyncFrame", self.frame)
             if (
                 self.status_code != 200
                 or self.network_failure is not None
@@ -454,15 +456,15 @@ class SourceResult:
             StagedSourceResponse(
                 self.request,
                 self.response_body,
-                self.frame.source_sha256,
+                frame.source_sha256,
             )
             if (
-                self.frame.origin.transport is not self.request.transport
-                or self.frame.origin.source_epoch != self.request.source_epoch
-                or self.frame.origin.request_id != self.request.request_id
-                or self.frame.request_cursor_json != self.request.request_cursor_json
-                or self.frame.frame_id
-                != _frame_id_for_response(self.request, self.frame.source_sha256)
+                frame.origin.transport is not self.request.transport
+                or frame.origin.source_epoch != self.request.source_epoch
+                or frame.origin.request_id != self.request.request_id
+                or frame.request_cursor_json != self.request.request_cursor_json
+                or frame.frame_id
+                != _frame_id_for_response(self.request, frame.source_sha256)
             ):
                 raise ValueError("frame does not match its network request")
             return

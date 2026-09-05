@@ -21,7 +21,7 @@ from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
 import pytest
-from aiohttp import ClientConnectionError, ClientPayloadError
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientTimeout
 
 import nio
 from nio import AsyncClient, AsyncClientConfig
@@ -12739,13 +12739,13 @@ async def test_raw_attempt_uses_public_send_without_callbacks_and_bounds_read(
             ),
             {
                 "data": None,
-                "ssl": client.ssl,
+                "ssl": True,
                 "headers": {
                     "Authorization": "Bearer secret-token",
                     "X-Diagnostic": "yes",
                 },
                 "trace_request_ctx": None,
-                "timeout": 45.0,
+                "timeout": ClientTimeout(total=45.0),
             },
         )
     ]
@@ -13702,7 +13702,7 @@ async def test_sliding_public_send_preserves_exact_planned_request(tmp_path) -> 
         "https://example.org" + planned.path + "?timeout=30000",
     )
     assert kwargs["data"] == planned.body
-    assert kwargs["timeout"] == 45.0
+    assert kwargs["timeout"] == ClientTimeout(total=45.0)
     client.client_session = None
     await session.close()
 

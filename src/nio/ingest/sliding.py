@@ -450,7 +450,7 @@ class SlidingSource:
                 scoped_lists = [RESERVED_ALL_ROOMS_LIST]
             else:
                 if scope is None:
-                    scoped_lists: list[str] = []
+                    scoped_lists = []
                 else:
                     scoped_lists = list(_array(scope, f"extensions.{name}.lists"))
                     if any(type(item) is not str for item in scoped_lists):
