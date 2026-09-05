@@ -1017,13 +1017,7 @@ class _OwnedIngestionSession:
                         content.get("currently_active"),
                         content.get("status_msg"),
                     )
-                    for room in self._client.rooms.values():
-                        user = room.users.get(presence_event.user_id)
-                        if user is not None:
-                            user.presence = presence_event.presence
-                            user.last_active_ago = presence_event.last_active_ago
-                            user.currently_active = presence_event.currently_active
-                            user.status_msg = presence_event.status_msg
+                    self._client._project_presence(presence_event)
                     await self._client._on_presence(presence_event)
         except Exception:
             # Callback failures, timeout, and malformed transient sections never

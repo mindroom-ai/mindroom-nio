@@ -1859,14 +1859,13 @@ class Client:
                 )
                 if room is not None and isinstance(event, InviteEvent):
                     cast(MatrixInvitedRoom, room).handle_event(cast(Event, event))
-                elif room is not None and isinstance(event, RoomMemberEvent):
-                    if room.handle_membership(event):
-                        self._invalidate_session_for_member_event(segment.room_id)
-                elif room is not None and isinstance(event, RoomEncryptionEvent):
-                    encrypted_room_ids.add(segment.room_id)
-                    room.handle_event(event)
                 elif room is not None and isinstance(event, Event):
-                    room.handle_event(event)
+                    self._handle_joined_state_event(
+                        segment.room_id,
+                        room,
+                        event,
+                        encrypted_room_ids,
+                    )
                 append_record(
                     RecordKind.STATE,
                     payload,
@@ -2007,17 +2006,11 @@ class Client:
             _PreparationPhase.EXPIRED_VERIFICATION,
         )
 
-        signed_curve_count = key_counts.get("signed_curve25519")
-        if signed_curve_count is not None:
-            olm.uploaded_key_count = signed_curve_count
-        changed_user_ids = {
-            user_id
-            for user_id in (*device_list_delta["changed"], *device_list_delta["left"])
-            if any(
-                room.encrypted and user_id in room.users for room in self.rooms.values()
-            )
-        }
-        olm.add_changed_users(changed_user_ids)
+        self._update_olm_sync_state(
+            key_counts.get("signed_curve25519"),
+            device_list_delta["changed"],
+            device_list_delta["left"],
+        )
         append_synthetic_to_device_records(
             olm.collect_key_requests(),
             _PreparationPhase.COLLECTED_KEY_REQUEST,
@@ -2121,20 +2114,29 @@ class Client:
         room = self.rooms[room_id]
 
         for event in join_info.state:
-            if isinstance(event, RoomEncryptionEvent):
-                encrypted_rooms.add(room_id)
-
-            if isinstance(event, RoomMemberEvent):
-                if room.handle_membership(event):
-                    self._invalidate_session_for_member_event(room_id)
-            else:
-                room.handle_event(event)
+            self._handle_joined_state_event(room_id, room, event, encrypted_rooms)
 
         if join_info.summary:
             room.update_summary(join_info.summary)
 
         if join_info.unread_notifications:
             room.update_unread_notifications(join_info.unread_notifications)
+
+    def _handle_joined_state_event(
+        self,
+        room_id: str,
+        room: MatrixRoom,
+        event: Event | BadEventType,
+        encrypted_rooms: set[str],
+    ) -> None:
+        if isinstance(event, RoomEncryptionEvent):
+            encrypted_rooms.add(room_id)
+
+        if isinstance(event, RoomMemberEvent):
+            if room.handle_membership(event):
+                self._invalidate_session_for_member_event(room_id)
+        else:
+            room.handle_event(event)
 
     def _handle_timeline_event(
         self,
@@ -2209,20 +2211,19 @@ class Client:
 
     def _handle_presence_events(self, response: SyncResponse):
         for event in response.presence_events:
-            for room_id in self.rooms.keys():
-                if event.user_id not in self.rooms[room_id].users:
-                    continue
-
-                self.rooms[room_id].users[event.user_id].presence = event.presence
-                self.rooms[room_id].users[
-                    event.user_id
-                ].last_active_ago = event.last_active_ago
-                self.rooms[room_id].users[
-                    event.user_id
-                ].currently_active = event.currently_active
-                self.rooms[room_id].users[event.user_id].status_msg = event.status_msg
-
+            self._project_presence(event)
             self._on_presence(event)
+
+    def _project_presence(self, event: PresenceEvent) -> None:
+        for room in self.rooms.values():
+            user = room.users.get(event.user_id)
+            if user is None:
+                continue
+
+            user.presence = event.presence
+            user.last_active_ago = event.last_active_ago
+            user.currently_active = event.currently_active
+            user.status_msg = event.status_msg
 
     def _handle_global_account_data_events(
         self,
@@ -2238,29 +2239,31 @@ class Client:
             self._on_expired_verifications(event)
 
     def _handle_olm_events(self, response: SyncResponse) -> None:
+        self._update_olm_sync_state(
+            response.device_key_count.signed_curve25519,
+            response.device_list.changed,
+            response.device_list.left,
+        )
+
+    def _update_olm_sync_state(
+        self,
+        uploaded_key_count: int | None,
+        changed_users: list[str],
+        left_users: list[str],
+    ) -> None:
         assert self.olm
 
-        changed_users = set()
-        if response.device_key_count.signed_curve25519 is not None:
-            self.olm.uploaded_key_count = response.device_key_count.signed_curve25519
+        if uploaded_key_count is not None:
+            self.olm.uploaded_key_count = uploaded_key_count
 
-        for user in response.device_list.changed:
-            for room in self.rooms.values():
-                if not room.encrypted:
-                    continue
-
-                if user in room.users:
-                    changed_users.add(user)
-
-        for user in response.device_list.left:
-            for room in self.rooms.values():
-                if not room.encrypted:
-                    continue
-
-                if user in room.users:
-                    changed_users.add(user)
-
-        self.olm.add_changed_users(changed_users)
+        users_for_key_query = {
+            user_id
+            for user_id in (*changed_users, *left_users)
+            if any(
+                room.encrypted and user_id in room.users for room in self.rooms.values()
+            )
+        }
+        self.olm.add_changed_users(users_for_key_query)
 
     def _on_to_device(self, event: ToDeviceEvent):
         for cb in self.to_device_callbacks:

@@ -709,19 +709,7 @@ class AsyncClient(Client):
         response: SyncResponse,
     ) -> None:
         for event in response.presence_events:
-            for room_id in self.rooms.keys():
-                if event.user_id not in self.rooms[room_id].users:
-                    continue
-
-                self.rooms[room_id].users[event.user_id].presence = event.presence
-                self.rooms[room_id].users[
-                    event.user_id
-                ].last_active_ago = event.last_active_ago
-                self.rooms[room_id].users[
-                    event.user_id
-                ].currently_active = event.currently_active
-                self.rooms[room_id].users[event.user_id].status_msg = event.status_msg
-
+            self._project_presence(event)
             await self._on_presence(event)
 
     async def _handle_global_account_data_events(  # type: ignore
