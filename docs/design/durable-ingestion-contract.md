@@ -274,6 +274,14 @@ decode path; clear the cache when closing. This extends internal-value reuse
 across reads only when the complete authenticated input is unchanged. It does
 not cache room projection effects or admit competing raw writers.
 
+The measured follow-up also permits one cached decoded Work value per journal.
+Validate the actual row's columns and revision bounds on every read before
+reusing it; require identical complete stored fields plus account/stream/transport
+identity. Cache only authenticated immutable results, clear on close, and retain
+normal SQLite lookup/deletion behavior. Callback projection and admission are
+not cached. The [type and delivery-cost design](type-correctness-and-delivery-cost.md)
+records the benchmark and scope; claim/acknowledgement transactions stay separate.
+
 Compute encoded Work length from the same canonical envelope prefix used for
 persistence, without constructing and hashing the complete row just to count its
 bytes. Reuse unchanged sizes inside one planning operation where that removes
