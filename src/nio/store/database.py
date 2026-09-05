@@ -92,10 +92,14 @@ def use_database(fn):
         if owner is not None:
             self._assert_ingestion_view()
             with owner.read():
-                with self.database.bind_ctx(self.models):
+                with self.database.bind_ctx(
+                    self.models, bind_refs=False, bind_backrefs=False
+                ):
                     return fn(self, *args, **kwargs)
         with nullcontext():
-            with self.database.bind_ctx(self.models):
+            with self.database.bind_ctx(
+                self.models, bind_refs=False, bind_backrefs=False
+            ):
                 return fn(self, *args, **kwargs)
 
     return inner
@@ -110,11 +114,15 @@ def use_database_atomic(fn):
         if owner is not None:
             self._assert_ingestion_view()
             with owner.e2ee_write():
-                with self.database.bind_ctx(self.models):
+                with self.database.bind_ctx(
+                    self.models, bind_refs=False, bind_backrefs=False
+                ):
                     with self.database.atomic():
                         return fn(self, *args, **kwargs)
         with nullcontext():
-            with self.database.bind_ctx(self.models):
+            with self.database.bind_ctx(
+                self.models, bind_refs=False, bind_backrefs=False
+            ):
                 if isinstance(self.database, SqliteQueueDatabase):
                     return fn(self, *args, **kwargs)
                 else:
