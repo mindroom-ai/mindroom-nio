@@ -252,7 +252,7 @@ needs recording; no unreviewed production changes in this task.
 - [x] Record source-size deltas and precise verification/performance results.
   Keep context recovery versus actionable replay explicit; any change in that
   product decision gets its own contract amendment before implementation.
-- [ ] Commit tracked results, privacy-scan outgoing content/metadata, check remote
+- [x] Commit tracked results, privacy-scan outgoing content/metadata, check remote
   drift, and push non-forcibly to the existing PR branch. Confirm remote HEAD.
 
 ## Design self-review
@@ -447,3 +447,11 @@ They also requested inspection of PR #57's performance ideas, with benchmarks on
 this PR #55 before deciding whether any optimization merits adoption. Both are
 separate follow-ups after the current repairs, verification, review, and push.
 PR #57 has not yet been evaluated as part of this hardening pass.
+
+### Publication
+
+The repaired source and final design/results document were pushed non-forcibly
+to PR #55 in `aaa1671`; the remote branch was read back and matched that commit.
+Local verification and independent review are recorded above. Remote CI was
+running when this publication receipt was written. No merge or deployment was
+performed.
