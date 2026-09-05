@@ -4122,8 +4122,8 @@ async def test_owned_local_membership_http_fate_preserves_exact_restart_state(
         if fate == "retry" and len(requests) == 1:
             return session._network_result(
                 request,
-                429,
-                canonical_json({"errcode": "M_LIMIT_EXCEEDED"}),
+                400,
+                b'{ "error": "slow", "errcode": "M_LIMIT_EXCEEDED" }\n',
                 retry_after=0,
             )
         if fate == "retry" and len(requests) == 2:
@@ -4156,8 +4156,8 @@ async def test_owned_local_membership_http_fate_preserves_exact_restart_state(
         if fate == "auth":
             return session._network_result(
                 request,
-                401,
-                canonical_json({"errcode": "M_UNKNOWN_TOKEN"}),
+                400,
+                b'{ "errcode": "M_UNKNOWN_TOKEN" }\n',
             )
         if fate == "malformed":
             return session._network_result(
@@ -4168,7 +4168,7 @@ async def test_owned_local_membership_http_fate_preserves_exact_restart_state(
         return session._network_result(
             request,
             200,
-            canonical_json({"room_id": ROOM}),
+            json.dumps({"room_id": ROOM}).encode(),
         )
 
     session._request = respond  # type: ignore[method-assign]
@@ -9632,7 +9632,7 @@ async def test_owned_maintenance_retry_reuses_exact_authenticated_request(
     (
         (401, canonical_json({}), "M_UNKNOWN_TOKEN"),
         (403, canonical_json({"errcode": "M_FORBIDDEN"}), "M_FORBIDDEN"),
-        (400, canonical_json({"errcode": "M_UNKNOWN_TOKEN"}), "M_UNKNOWN_TOKEN"),
+        (400, b'{ "errcode": "M_UNKNOWN_TOKEN" }\n', "M_UNKNOWN_TOKEN"),
     ),
 )
 @pytest.mark.asyncio
@@ -19291,3 +19291,532 @@ async def test_unidentified_classic_ephemeral_remains_strict(tmp_path, ephemeral
             assert session._journal.load_source() == before
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", (False, True))
+@pytest.mark.parametrize("membership", ("join", "leave"))
+async def test_owned_membership_accepts_wire_json(tmp_path, restart, membership):
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    if membership == "leave":
+        session._journal._publish_local_membership_transition(
+            operation_id=uuid4(),
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        batch = session.next_batch()
+        assert batch is not None
+        await session._settle_batch(batch, receipt_new=True, semantic_event_new=False)
+    session._journal._record_local_membership_intent(
+        operation_id=uuid4(),
+        room_id=ROOM,
+        previous_membership="leave" if membership == "join" else "join",
+        previous_epoch=0,
+        current_membership=membership,
+    )
+    if restart:
+        await session.close()
+        bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+        client = owned_client(tmp_path)
+        session = open_owned_session(client, bootstrap, generation)
+    body = (
+        b'{ "extra": "\\u0061", "room_id": "' + ROOM.encode() + b'" }\n'
+        if membership == "join"
+        else b"{ \n }\n"
+    )
+    client.responses.append(FakeResponse(200, body))
+    try:
+        assert await session._advance_local_membership_intent()
+        assert session._journal._load_pending_local_membership_intents(limit=2) == ()
+        batch = session.next_batch()
+        assert batch is not None
+        await session._settle_batch(batch, receipt_new=True, semantic_event_new=False)
+        assert session.next_batch() is None
+        owner = session._journal.load_owner()
+        with session._journal._owner.read():
+            aggregate = session._journal._load_room_aggregate(owner, ROOM)
+        assert aggregate is not None
+        assert aggregate[1].continuity.membership == membership
+    finally:
+        await session.close()
+    bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        assert session._journal._load_pending_local_membership_intents(limit=2) == ()
+        assert session.next_batch() is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", (False, True))
+async def test_owned_encryption_config_hydrates_and_settles(tmp_path, restart):
+    class Ready(Exception):
+        pass
+
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    olm = client.olm
+    assert olm is not None
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.save_account()
+    encryption = {
+        "type": "m.room.encryption",
+        "state_key": "",
+        "event_id": "$encryption",
+        "sender": ACCOUNT,
+        "origin_server_ts": 1,
+        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+    }
+    body = _local_room_body()
+    body["rooms"]["join"][ROOM]["state"] = {"events": [encryption]}
+    olm.create_outbound_group_session(ROOM)
+    olm.outbound_group_sessions[ROOM].shared = True
+    body["rooms"]["join"][ROOM]["timeline"]["events"] = [
+        {
+            "type": "m.room.encrypted",
+            "event_id": "$hydrated-ciphertext",
+            "sender": ACCOUNT,
+            "origin_server_ts": 2,
+            "content": olm.group_encrypt(
+                ROOM,
+                {
+                    "type": "m.room.message",
+                    "content": {"msgtype": "m.text", "body": "hydrated secret"},
+                },
+            ),
+        }
+    ]
+    staged = stage_classic(bootstrap, body)
+    assert (
+        session._materialize_oldest_frame(limits=MaterializerLimits()).status
+        is MaterializeStatus.MATERIALIZED
+    )
+    assert len(session._journal.load_pending_hydrations(limit=2)) == 1
+    if restart:
+        await session.close()
+        bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+        client = owned_client(tmp_path)
+        session = open_owned_session(client, bootstrap, generation)
+    received = []
+
+    async def receive(room, event):
+        assert room.encrypted
+        received.append(event.body)
+
+    client.add_event_callback(receive, nio.RoomMessageText)
+    state = json.loads(hydration_state()) + [encryption]
+    client.responses.append(FakeResponse(200, json.dumps(state).encode()))
+
+    async def ready(_generation):
+        raise Ready
+
+    session._wait_for_progress = ready
+    try:
+        with pytest.raises(Ready):
+            await session.run()
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+        assert received == []
+        records = []
+        while (batch := session.next_batch()) is not None:
+            records.extend(batch.records)
+            await session._settle_batch(
+                batch, receipt_new=True, semantic_event_new=True
+            )
+        assert records
+        assert received == ["hydrated secret"]
+        assert client.rooms[ROOM].encrypted
+        assert ROOM in client.encrypted_rooms
+        assert ROOM in client.store.load_encrypted_rooms()
+        assert await session._advance_blocked_frame(staged.frame_id)
+        assert session._journal.load_frame(staged.frame_id) is None
+    finally:
+        await session.close()
+    bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    try:
+        assert client.rooms[ROOM].encrypted
+        assert ROOM in client.encrypted_rooms
+        assert session.next_batch() is None
+        assert session._journal.load_pending_hydrations(limit=2) == ()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "restart", "abort_at"),
+    [
+        (mode, restart, None)
+        for mode in ("ready", "waiting", "wedged", "both", "dummy")
+        for restart in ("none", "prepared", "every", "send")
+    ]
+    + [
+        ("both", "claim", None),
+        ("both", "retry", None),
+        ("ready", "generic", "queue_mutation"),
+        ("unverified", "none", None),
+        ("unverified", "prepared", None),
+    ]
+    + [
+        (mode, kind, boundary)
+        for mode, kind in (
+            ("waiting", "claim"),
+            ("both", "claim"),
+            ("both", "dummy"),
+            ("dummy", "dummy"),
+        )
+        for boundary in ("outbound_frame_settle", "commit")
+    ],
+)
+async def test_owned_multi_message_crypto_drains(tmp_path, mode, restart, abort_at):
+    from datetime import datetime, timedelta
+
+    class Interrupted(BaseException):
+        pass
+
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    remote_store = SqliteMemoryStore(ACCOUNT, "OTHER", "remote-secret")
+    remote = Olm(ACCOUNT, "OTHER", remote_store)
+    olm = client.olm
+    assert olm is not None
+    olm.account.shared = True
+    olm.uploaded_key_count = olm.account.max_one_time_keys
+    olm.save_account()
+    remote_device = OlmDevice(ACCOUNT, "OTHER", remote.account.identity_keys)
+    local_device = OlmDevice(ACCOUNT, DEVICE, olm.account.identity_keys)
+    for machine, device in ((olm, remote_device), (remote, local_device)):
+        machine.device_store.add(device)
+        machine.store.save_device_keys({device.user_id: {device.id: device}})
+        if mode != "unverified" or machine is remote:
+            machine.verify_device(device)
+    remote.account.generate_one_time_keys(2)
+    shared = remote.share_keys()
+    keys = list(shared["one_time_keys"].items())
+    claim_body = canonical_json(
+        {"failures": {}, "one_time_keys": {ACCOUNT: {"OTHER": dict(keys[1:])}}}
+    )
+    has_shares = mode in {"ready", "waiting", "both", "unverified"}
+    has_dummy = mode in {"wedged", "both", "dummy"}
+    request_sources = []
+    expected_groups = {}
+    missing_sessions = []
+    if has_shares:
+        for index in range(2):
+            room_id = f"!share-{index}:example.org"
+            olm.create_outbound_group_session(room_id)
+            group = olm.outbound_group_sessions[room_id]
+            group.shared = True
+            encrypted = olm.group_encrypt(
+                room_id,
+                {
+                    "type": "m.room.message",
+                    "content": {"msgtype": "m.text", "body": f"secret-{index}"},
+                },
+            )
+            expected_groups[group.id] = (room_id, encrypted, f"secret-{index}")
+            content = {
+                "action": "request",
+                "request_id": group.id,
+                "requesting_device_id": "OTHER",
+                "body": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "room_id": room_id,
+                    "sender_key": local_device.curve25519,
+                    "session_id": group.id,
+                },
+            }
+            request_sources.append(
+                {"type": "m.room_key_request", "sender": ACCOUNT, "content": content}
+            )
+            request = RoomKeyRequestMessage(
+                "m.room_key_request",
+                ACCOUNT,
+                DEVICE,
+                content,
+                group.id,
+                group.id,
+                room_id,
+                "m.megolm.v1.aes-sha2",
+            )
+            remote.outgoing_to_device_messages.append(request)
+            remote.handle_response(ToDeviceResponse.from_dict({}, request))
+    if mode == "both":
+        # Ordinary collection first records both waiting requests without a session.
+        for source in request_sources:
+            olm.handle_to_device_event(ToDeviceEvent.parse_event(source))
+        assert olm.collect_key_requests() == []
+        assert len(olm.key_requests_waiting_for_session[(ACCOUNT, "OTHER")]) == 2
+        request_sources = []
+    if mode not in {"waiting", "unverified"}:
+        old_session = olm.create_session(keys[0][1]["key"], remote_device.curve25519)
+        old_session.creation_time = datetime.now() - timedelta(days=2)
+        olm.save_session(remote_device.curve25519, old_session)
+    if has_dummy:
+        olm.wedged_devices.append(remote_device)
+        for index in range(2):
+            room_id = f"!missing-{index}:example.org"
+            remote.create_outbound_group_session(room_id)
+            remote.outbound_group_sessions[room_id].shared = True
+            missing_sessions.append(remote.outbound_group_sessions[room_id].id)
+            for duplicate in range(2):
+                source = {
+                    "type": "m.room.encrypted",
+                    "sender": ACCOUNT,
+                    "event_id": f"$missing-{index}-{duplicate}",
+                    "origin_server_ts": 1,
+                    "content": remote.group_encrypt(
+                        room_id,
+                        {
+                            "type": "m.room.message",
+                            "content": {"msgtype": "m.text", "body": "missing"},
+                        },
+                    ),
+                }
+                event = Event.parse_event(source)
+                assert type(event) is MegolmEvent
+                event.room_id = room_id
+                assert olm.decrypt_event(event) is None
+        assert len(olm.key_re_requests_events[(ACCOUNT, "OTHER")]) == 4
+        if mode == "dummy":
+            olm.wedged_devices.remove(remote_device)
+            olm._queue_dummy_message(old_session, remote_device)
+    staged = stage_classic(
+        bootstrap,
+        {
+            "next_batch": "s1",
+            "rooms": {},
+            "to_device": {"events": request_sources},
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {
+                "signed_curve25519": olm.account.max_one_time_keys
+            },
+            "device_unused_fallback_key_types": [],
+        },
+    )
+    sent = {}
+    decrypted_shares = []
+    decrypted_dummies = []
+    rerequests = []
+    attempts = []
+    seen_operations = {}
+    interrupted = False
+
+    async def reopen():
+        nonlocal bootstrap, client, session
+        await session.close()
+        bootstrap = reopen_owned_bootstrap(tmp_path, generation)
+        client = owned_client(tmp_path)
+        session = open_owned_session(client, bootstrap, generation)
+
+    async def respond(request, **kwargs):
+        nonlocal interrupted
+        assert kwargs == {"body_disconnect_retry": True}
+        assert not session._owned_store.database.connection().in_transaction
+        assert request.body == pending.body_json
+        if pending.kind == "to_device":
+            assert request.path.endswith(
+                f"/{pending.event_type}/{pending.transaction_id}"
+            )
+        attempts.append((request.path, request.body))
+        if request.path.endswith("/keys/claim"):
+            return session._network_result(request, 200, claim_body)
+        assert "/sendToDevice/" in request.path
+        if restart == "retry" and not interrupted:
+            interrupted = True
+            return session._network_result(
+                request,
+                400,
+                b'{ "error": "slow", "errcode": "M_LIMIT_EXCEEDED" }\n',
+                retry_after=0,
+            )
+        previous = sent.get(request.path)
+        if previous is not None:
+            assert previous == request.body
+        else:
+            sent[request.path] = request.body
+            content = json.loads(request.body)["messages"][ACCOUNT]["OTHER"]
+            if "/m.room.encrypted/" in request.path:
+                event = ToDeviceEvent.parse_event(
+                    {"type": "m.room.encrypted", "sender": ACCOUNT, "content": content}
+                )
+                decrypted = remote.decrypt_event(event)
+                if type(decrypted) is DummyEvent:
+                    decrypted_dummies.append(decrypted)
+                else:
+                    assert type(decrypted) is ForwardedRoomKeyEvent
+                    decrypted_shares.append(decrypted.session_id)
+                    room_id, encrypted, plaintext = expected_groups[
+                        decrypted.session_id
+                    ]
+                    event = Event.parse_event(
+                        {
+                            "type": "m.room.encrypted",
+                            "sender": ACCOUNT,
+                            "event_id": f"$clear-{len(decrypted_shares)}",
+                            "origin_server_ts": 1,
+                            "content": encrypted,
+                        }
+                    )
+                    event.room_id = room_id
+                    assert remote.decrypt_event(event).body == plaintext
+            else:
+                assert "/m.room_key_request/" in request.path
+                rerequests.append(content["body"]["session_id"])
+        if restart == "send" and not interrupted:
+            interrupted = True
+            raise Interrupted
+        return session._network_result(request, 200, b"{}")
+
+    try:
+        assert (
+            session._materialize_oldest_frame(limits=MaterializerLimits()).status
+            is MaterializeStatus.MATERIALIZED
+        )
+        if mode == "unverified":
+            owner = session._journal.load_owner()
+            with session._journal._owner.read():
+                prepared = session._journal._load_prepared_frame_with_owner(
+                    staged.frame_id, owner
+                )
+            assert prepared.outbound_maintenance.operations == ()
+            assert client.olm.key_request_devices_no_session == []
+            assert not client.olm.key_requests_waiting_for_session
+            assert client.olm.outgoing_to_device_messages == []
+            assert client.olm.session_store.get(remote_device.curve25519) is None
+            if restart == "prepared":
+                await reopen()
+            callbacks = []
+
+            async def on_request(event):
+                callbacks.append(event.request_id)
+
+            client.add_to_device_callback(on_request, RoomKeyRequest)
+            while (batch := session.next_batch()) is not None:
+                await session._settle_batch(
+                    batch, receipt_new=True, semantic_event_new=False
+                )
+            assert sorted(callbacks) == sorted(expected_groups)
+            assert client.olm.outgoing_to_device_messages == []
+            assert client.olm.session_store.get(remote_device.curve25519) is None
+            assert not client.olm.device_store[ACCOUNT]["OTHER"].verified
+            assert await session._advance_blocked_frame(staged.frame_id)
+            assert session._journal.load_frame(staged.frame_id) is None
+            assert client.send_count == 0
+            await reopen()
+            assert session.next_batch() is None
+            assert session._journal.load_frame(staged.frame_id) is None
+            return
+        while (batch := session.next_batch()) is not None:
+            await session._settle_batch(
+                batch, receipt_new=True, semantic_event_new=False
+            )
+        if restart in {"prepared", "every"}:
+            await reopen()
+        for _ in range(15):
+            owner = session._journal.load_owner()
+            with session._journal._owner.read():
+                prepared = session._journal._load_prepared_frame_with_owner(
+                    staged.frame_id, owner
+                )
+            assert prepared is not None
+            operations = prepared.outbound_maintenance.operations
+            for index, operation in enumerate(operations):
+                identity = (
+                    operation.kind,
+                    operation.body_json,
+                    operation.transaction_id,
+                    operation.event_type,
+                )
+                assert seen_operations.setdefault(index, identity) == identity
+            pending = next(
+                (operation for operation in operations if operation.state == "pending"),
+                None,
+            )
+            if pending is None:
+                break
+            target = (
+                "claim" if pending.kind == "key_claim" else pending.context["subtype"]
+            )
+            inject = abort_at is not None and target == restart and not interrupted
+            connection = session._owned_store.database.connection()
+            before = tuple(connection.iterdump())
+
+            def abort(label):
+                if inject and label == abort_at:
+                    raise Interrupted
+
+            session._journal.set_transition_statement_hook(abort)
+            session._request = respond
+            if inject and abort_at == "queue_mutation":
+                real_handle = client.olm.handle_response
+
+                def corrupt_queue(response):
+                    real_handle(response)
+                    # Simulate an application bug dropping the unrelated share.
+                    client.olm.outgoing_to_device_messages.clear()
+
+                client.olm.handle_response = corrupt_queue
+            try:
+                assert await session._advance_blocked_frame(staged.frame_id)
+            except (Interrupted, JournalIntegrityError) as error:
+                if isinstance(error, JournalIntegrityError):
+                    assert inject and abort_at == "queue_mutation"
+                    assert "queued prefix" in str(error)
+                if inject:
+                    interrupted = True
+                    with pytest.raises(LocalProtocolError, match="poisoned"):
+                        client._assert_ingestion_not_poisoned()
+                    if abort_at in {"outbound_frame_settle", "queue_mutation"}:
+                        assert tuple(connection.iterdump()) == before
+                    else:
+                        assert (
+                            session._journal.load_owner().revision == owner.revision + 1
+                        )
+                else:
+                    client._assert_ingestion_not_poisoned()
+                    assert tuple(connection.iterdump()) == before
+                session._journal.set_transition_statement_hook(None)
+                await reopen()
+                continue
+            session._journal.set_transition_statement_hook(None)
+            if restart == "every" or (
+                restart == "claim" and abort_at is None and target == "claim"
+            ):
+                await reopen()
+        else:
+            pytest.fail("maintenance did not drain")
+        if abort_at is not None or restart in {"send", "retry"}:
+            assert interrupted
+        assert sorted(decrypted_shares) == sorted(expected_groups)
+        assert len(decrypted_dummies) == int(has_dummy)
+        assert sorted(rerequests) == sorted(missing_sessions)
+        assert len(sent) == len(expected_groups) + int(has_dummy) + len(
+            missing_sessions
+        )
+        assert client.olm.outgoing_to_device_messages == []
+        assert set(client.olm.outgoing_key_requests) == set(missing_sessions)
+        if restart in {"send", "retry"}:
+            assert len(attempts) == len(set(attempts)) + 1
+        assert await session._advance_blocked_frame(staged.frame_id)
+        assert session._journal.load_frame(staged.frame_id) is None
+        await reopen()
+        assert session.next_batch() is None
+        assert session._journal.load_frame(staged.frame_id) is None
+        assert set(client.olm.outgoing_key_requests) == set(missing_sessions)
+    finally:
+        await session.close()
+        remote_store.database.close()

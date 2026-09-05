@@ -99,7 +99,7 @@ def test_private_hydration_values_are_frozen_slotted_and_deeply_revalidated() ->
             [
                 _member_event(),
                 {
-                    "type": "m.room.encryption",
+                    "type": "m.room.encrypted",
                     "state_key": "",
                     "content": {},
                     "event_id": "$e",

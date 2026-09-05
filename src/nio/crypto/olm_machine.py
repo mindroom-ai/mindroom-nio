@@ -556,6 +556,14 @@ class Olm:
                 f"Failed to re-share key {event.session_id} with {event.sender}: "
                 f"Unknown requesting device {event.requesting_device_id}."
             )
+        # Surface unverified requests during collection, before key claiming.
+        if not device.verified:
+            raise OlmUnverifiedDeviceError(
+                device,
+                f"Failed to re-share key {event.session_id} with {event.sender}: "
+                f"Device {event.requesting_device_id} is not verified",
+            )
+
         session = self.session_store.get(device.curve25519)
 
         if not session:
@@ -573,13 +581,6 @@ class Olm:
 
             raise EncryptionError(
                 f"No Olm session found for {device.user_id} and device {device.id}"
-            )
-
-        if not device.verified:
-            raise OlmUnverifiedDeviceError(
-                device,
-                f"Failed to re-share key {event.session_id} with {event.sender}: "
-                f"Device {event.requesting_device_id} is not verified",
             )
 
         logger.debug(

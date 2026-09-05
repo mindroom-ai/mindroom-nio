@@ -319,6 +319,35 @@ def _same_key_claim_rerequest(first: MegolmEvent, second: MegolmEvent) -> bool:
     )
 
 
+def _restore_rerequests(
+    live: list[MegolmEvent], expected: tuple[MegolmEvent, ...]
+) -> None:
+    """Match the first event per session, as preparation and ordinary Olm do."""
+    if not live:
+        live.extend(expected)
+        return
+    unique: dict[str, MegolmEvent] = {}
+    for event in live:
+        if type(event) is not MegolmEvent:
+            raise JournalIntegrityError("key-claim rerequest state changed")
+        unique.setdefault(event.session_id, event)
+    if len(unique) != len(expected) or any(
+        not _same_key_claim_rerequest(first, second)
+        for first, second in zip(unique.values(), expected, strict=True)
+    ):
+        raise JournalIntegrityError("key-claim rerequest state changed")
+
+
+def _new_to_device_messages(
+    queued: list[ToDeviceMessage], retained: tuple[ToDeviceMessage, ...]
+) -> tuple[ToDeviceMessage, ...]:
+    """Keep existing operations in order and return only newly appended replies."""
+    messages = tuple(queued)
+    if messages[: len(retained)] != retained:
+        raise JournalIntegrityError("to-device changed the queued prefix")
+    return messages[len(retained) :]
+
+
 def _to_device_message(
     operation: _OutboundOperation,
 ) -> tuple[ToDeviceMessage, tuple[MegolmEvent, ...]]:
@@ -363,7 +392,6 @@ def _to_device_message(
             tuple(context) == ("subtype", "rerequest_events")
             and context["subtype"] == "dummy"
             and type(context["rerequest_events"]) is list
-            and len(context["rerequest_events"]) <= 1
             and operation.event_type == "m.room.encrypted"
         ):
             message = DummyMessage(
@@ -1251,7 +1279,6 @@ class _OwnedIngestionSession:
                 )
                 if (
                     type(error_value) is dict
-                    and canonical_json(error_value) == network.body
                     and type(error_value.get("errcode")) is str
                 ):
                     error_code = error_value["errcode"]
@@ -1330,7 +1357,8 @@ class _OwnedIngestionSession:
             nonlocal apply_started
             apply_started = True
             claim_targets: list[tuple[str, str]] = []
-            claim_was_waiting: set[tuple[str, str]] = set()
+            claim_waiting_counts: dict[tuple[str, str], int] = {}
+            claim_was_wedged: set[tuple[str, str]] = set()
             claim_rerequest_contexts: dict[tuple[str, str], list[dict[str, object]]] = (
                 {}
             )
@@ -1355,12 +1383,10 @@ class _OwnedIngestionSession:
                         }
                         or type(claim["was_wedged"]) is not bool
                         or type(claim["was_waiting"]) is not bool
-                        or claim["was_wedged"] == claim["was_waiting"]
+                        or not (claim["was_wedged"] or claim["was_waiting"])
                         or type(claim["waiting_key_requests"]) is not list
-                        or len(claim["waiting_key_requests"]) > 1
-                        or bool(claim["waiting_key_requests"]) != claim["was_waiting"]
+                        or (claim["waiting_key_requests"] and not claim["was_waiting"])
                         or type(claim["rerequest_events"]) is not list
-                        or len(claim["rerequest_events"]) > 1
                         or (
                             bool(claim["rerequest_events"])
                             and claim["was_wedged"] is not True
@@ -1374,7 +1400,11 @@ class _OwnedIngestionSession:
                         raise JournalIntegrityError("key-claim context is unsupported")
                     claim_targets.append(target)
                     if claim["was_waiting"]:
-                        claim_was_waiting.add(target)
+                        claim_waiting_counts[target] = len(
+                            claim["waiting_key_requests"]
+                        )
+                    if claim["was_wedged"]:
+                        claim_was_wedged.add(target)
                     try:
                         device = olm.device_store[target[0]][target[1]]
                     except KeyError as error:
@@ -1401,24 +1431,10 @@ class _OwnedIngestionSession:
                         dict(value) for value in claim["rerequest_events"]
                     ]
                     if reconstructed_rerequests:
-                        live_rerequests = olm.key_re_requests_events[target]
-                        if live_rerequests:
-                            if len(live_rerequests) != len(
-                                reconstructed_rerequests
-                            ) or any(
-                                not _same_key_claim_rerequest(live, expected)
-                                for live, expected in zip(
-                                    live_rerequests,
-                                    reconstructed_rerequests,
-                                    strict=True,
-                                )
-                            ):
-                                raise JournalIntegrityError(
-                                    "key-claim rerequest state changed"
-                                )
-                        else:
-                            live_rerequests.extend(reconstructed_rerequests)
-                    if target in claim_was_waiting:
+                        _restore_rerequests(
+                            olm.key_re_requests_events[target], reconstructed_rerequests
+                        )
+                    if target in claim_waiting_counts:
                         if device not in olm.key_request_devices_no_session:
                             olm.key_request_devices_no_session.append(device)
                         live_waiting = olm.key_requests_waiting_for_session[target]
@@ -1440,51 +1456,48 @@ class _OwnedIngestionSession:
                                 (event.request_id, event)
                                 for event in reconstructed_waiting
                             )
-                    elif device not in olm.wedged_devices:
+                    if claim["was_wedged"] and device not in olm.wedged_devices:
                         olm.wedged_devices.append(device)
                 queued_before = tuple(olm.outgoing_to_device_messages)
             elif operation.kind == "to_device":
                 assert to_device_message is not None
                 live_messages = olm.outgoing_to_device_messages
-                if live_messages:
-                    if live_messages != [to_device_message]:
-                        raise JournalIntegrityError("to-device live queue changed")
-                elif type(to_device_message) in {DummyMessage, RoomKeyRequestMessage}:
+                # Reopen can leave the current stored operation absent while
+                # earlier operations have already appended live follow-ups.
+                if to_device_message not in live_messages:
                     live_messages.append(to_device_message)
+                retained = list(live_messages)
+                retained.remove(to_device_message)
+                queued_before = tuple(retained)
                 if type(to_device_message) is DummyMessage:
                     target = (
                         to_device_message.recipient,
                         to_device_message.recipient_device,
                     )
-                    live_rerequests = olm.key_re_requests_events[target]
-                    if live_rerequests:
-                        if len(live_rerequests) != len(to_device_rerequests) or any(
-                            not _same_key_claim_rerequest(live, expected)
-                            for live, expected in zip(
-                                live_rerequests,
-                                to_device_rerequests,
-                                strict=True,
-                            )
-                        ):
-                            raise JournalIntegrityError("dummy rerequest state changed")
-                    else:
-                        live_rerequests.extend(to_device_rerequests)
-                queued_before = tuple(live_messages)
+                    _restore_rerequests(
+                        olm.key_re_requests_events[target], to_device_rerequests
+                    )
             else:
                 queued_before = ()
             olm.handle_response(response)
             if operation.kind == "to_device":
                 assert to_device_message is not None
+                generated = _new_to_device_messages(
+                    olm.outgoing_to_device_messages, queued_before
+                )
                 if type(to_device_message) is not DummyMessage:
-                    if olm.outgoing_to_device_messages:
+                    if generated:
                         raise JournalIntegrityError(
-                            "generic to-device queue was not consumed"
+                            "generic to-device generated unexpected follow-ups"
                         )
                     return ()
-                generated = tuple(olm.outgoing_to_device_messages)
-                if len(generated) != len(to_device_rerequests) or any(
-                    type(message) is not RoomKeyRequestMessage for message in generated
-                ):
+                expected_requests = tuple(
+                    event.as_key_request(
+                        event.sender, olm.device_id, event.session_id, event.device_id
+                    )
+                    for event in to_device_rerequests
+                )
+                if generated != expected_requests:
                     raise JournalIntegrityError(
                         "dummy to-device follow-ups are invalid"
                     )
@@ -1519,37 +1532,39 @@ class _OwnedIngestionSession:
                 return tuple(dummy_follow_ups)
             if operation.kind != "key_claim":
                 return ()
-            if claim_was_waiting and olm.collect_key_requests() != []:
+            if claim_waiting_counts and olm.collect_key_requests() != []:
                 raise JournalIntegrityError(
                     "waiting key claim generated unsupported callback Work"
                 )
-            queued_after = tuple(olm.outgoing_to_device_messages)
-            if queued_after[: len(queued_before)] != queued_before:
-                raise JournalIntegrityError("key-claim changed the queued prefix")
+            generated = _new_to_device_messages(
+                olm.outgoing_to_device_messages, queued_before
+            )
             follow_ups: list[_OutboundOperation] = []
-            generated = queued_after[len(queued_before) :]
-            generated_targets: set[tuple[str, str]] = set()
+            generated_dummies: set[tuple[str, str]] = set()
+            generated_shares: dict[tuple[str, str], int] = {}
             for offset, message in enumerate(generated):
                 target = (message.recipient, message.recipient_device)
-                if target not in claim_targets or target in generated_targets:
+                if target not in claim_targets:
                     raise JournalIntegrityError(
                         "key-claim generated a follow-up for another target"
                     )
-                generated_targets.add(target)
                 if type(message) is DummyMessage:
-                    if target in claim_was_waiting:
+                    if target not in claim_was_wedged or target in generated_dummies:
                         raise JournalIntegrityError(
-                            "waiting key claim generated a dummy"
+                            "key-claim generated an unexpected dummy"
                         )
+                    generated_dummies.add(target)
                     follow_up_context: dict[str, object] = {
                         "subtype": "dummy",
                         "rerequest_events": claim_rerequest_contexts[target],
                     }
                 elif type(message) is ToDeviceMessage:
-                    if target not in claim_was_waiting:
+                    count = generated_shares.get(target, 0) + 1
+                    if count > claim_waiting_counts.get(target, 0):
                         raise JournalIntegrityError(
-                            "wedged key claim generated a share"
+                            "key-claim generated an unexpected share"
                         )
+                    generated_shares[target] = count
                     follow_up_context = {"subtype": "generic"}
                 else:
                     raise JournalIntegrityError(
@@ -1574,9 +1589,12 @@ class _OwnedIngestionSession:
                         follow_up_context,
                     )
                 )
-            if not claim_was_waiting.issubset(generated_targets):
+            if any(
+                generated_shares.get(target, 0) != count
+                for target, count in claim_waiting_counts.items()
+            ):
                 raise JournalIntegrityError(
-                    "waiting key claim did not generate one share"
+                    "waiting key claim did not generate the expected shares"
                 )
             return tuple(follow_ups)
 
@@ -1699,7 +1717,6 @@ class _OwnedIngestionSession:
                 )
                 if (
                     type(error_value) is dict
-                    and canonical_json(error_value) == network.body
                     and type(error_value.get("errcode")) is str
                 ):
                     error_code = error_value["errcode"]
@@ -1763,7 +1780,7 @@ class _OwnedIngestionSession:
                 raise conflict
         try:
             value = load_json(network.body, "local membership response")
-            if type(value) is not dict or canonical_json(value) != network.body:
+            if type(value) is not dict:
                 raise ValueError
             if candidate.intent.current_membership == "join":
                 response = JoinResponse.from_dict(value)

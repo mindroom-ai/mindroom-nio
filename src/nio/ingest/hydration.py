@@ -64,7 +64,7 @@ def _verified_body(pending: PendingHydration, own_user_id: str, body: bytes) -> 
         content = cast("dict[str, Any]", content)
         event_id = cast("str", event_id)
         key = (event_type, state_key)
-        if key in seen or event_type == "m.room.encryption":
+        if key in seen or event_type == "m.room.encrypted":
             raise ValueError("duplicate or encrypted hydration state")
         seen.add(key)
         if key == ("m.room.member", own_user_id):

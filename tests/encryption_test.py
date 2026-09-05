@@ -1831,7 +1831,7 @@ class TestClass:
 
         alice.device_store.add(bob_device)
         bob.device_store.add(alice_device)
-        # bob.verify_device(alice_device)
+        bob.verify_device(alice_device)
 
         bob.create_outbound_group_session(TEST_ROOM)
         session = bob.outbound_group_sessions[TEST_ROOM]
@@ -1955,7 +1955,8 @@ class TestClass:
         # The key request is now waiting to be collected again.
         assert key_request_event in bob.received_key_requests.values()
 
-        # Let us collect it now.
+        # Remove trust before collection to exercise unverified cancellation.
+        bob.unverify_device(alice_device)
         bob.collect_key_requests()
 
         # Still no, device isn't verified.
@@ -2081,3 +2082,97 @@ class TestClass:
         assert not bob.outgoing_to_device_messages
         bob.collect_key_requests()
         assert not bob.outgoing_to_device_messages
+
+
+def test_unverified_own_device_without_session_is_collected_before_claim(
+    alice_account_pair,
+):
+    recipient, sender = alice_account_pair
+    recipient_device = sender.device_store[recipient.user_id][recipient.device_id]
+    sender.unverify_device(recipient_device)
+    sender.create_outbound_group_session(TEST_ROOM)
+    group = sender.outbound_group_sessions[TEST_ROOM]
+    group.shared = True
+    encrypted = sender.group_encrypt(
+        TEST_ROOM,
+        {
+            "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "verified secret"},
+        },
+    )
+    request = RoomKeyRequest.from_dict(
+        {
+            "type": "m.room_key_request",
+            "sender": recipient.user_id,
+            "content": {
+                "action": "request",
+                "request_id": group.id,
+                "requesting_device_id": recipient.device_id,
+                "body": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "room_id": TEST_ROOM,
+                    "session_id": group.id,
+                    "sender_key": sender.account.identity_keys["curve25519"],
+                },
+            },
+        }
+    )
+    sender.handle_to_device_event(request)
+    assert sender.collect_key_requests() == [request]
+    assert sender.get_active_key_requests(recipient.user_id, recipient.device_id) == [
+        request
+    ]
+    cancellation = RoomKeyRequestCancellation(
+        {}, request.sender, request.requesting_device_id, request.request_id
+    )
+    sender.handle_to_device_event(cancellation)
+    assert sender.collect_key_requests() == [cancellation]
+    assert sender.get_active_key_requests(recipient.user_id, recipient.device_id) == []
+    assert sender.key_request_devices_no_session == []
+    assert sender.outgoing_to_device_messages == []
+    sender.handle_to_device_event(request)
+    assert sender.collect_key_requests() == [request]
+    assert not sender.continue_key_share(request)
+    assert sender.key_request_devices_no_session == []
+    assert not any(sender.key_requests_waiting_for_session.values())
+    assert sender.outgoing_to_device_messages == []
+    assert sender.session_store.get(recipient_device.curve25519) is None
+
+    sender.verify_device(recipient_device)
+    assert sender.continue_key_share(request)
+    assert sender.key_request_devices_no_session == [recipient_device]
+    assert sender.outgoing_to_device_messages == []
+    recipient.account.generate_one_time_keys(1)
+    response = KeysClaimResponse.from_dict(
+        {
+            "failures": {},
+            "one_time_keys": {
+                recipient.user_id: {
+                    recipient.device_id: recipient.share_keys()["one_time_keys"]
+                }
+            },
+        }
+    )
+    sender.handle_response(response)
+    assert sender.collect_key_requests() == []
+    assert len(sender.outgoing_to_device_messages) == 1
+    recipient.outgoing_key_requests[group.id] = OutgoingKeyRequest(
+        group.id, group.id, TEST_ROOM, "m.megolm.v1.aes-sha2"
+    )
+    forwarded = ToDeviceEvent.parse_event(
+        TestClass.olm_message_to_event(
+            sender.outgoing_to_device_messages[0].as_dict(), recipient, sender
+        )
+    )
+    assert type(recipient.decrypt_event(forwarded)) is ForwardedRoomKeyEvent
+    event = MegolmEvent.from_dict(
+        {
+            "type": "m.room.encrypted",
+            "sender": sender.user_id,
+            "event_id": "$verified",
+            "origin_server_ts": 1,
+            "room_id": TEST_ROOM,
+            "content": encrypted,
+        }
+    )
+    assert recipient.decrypt_event(event).body == "verified secret"
