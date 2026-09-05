@@ -86,8 +86,9 @@ admission, owned sessions, bot readiness, crypto, and desktop integration.
   the user's dependency pins.
 - [ ] Reproduce pending delivery projection at the real admission boundary;
   preserve rollback and the outstanding batch while the pump awaits its
-  existing outbox recovery task. Test success, no busy retry, cancellation,
-  and propagation of unrelated admission errors.
+  existing outbox worker's next progress signal. Test success, no busy retry,
+  cancellation, unrelated outbox debt, and propagation of unrelated admission
+  errors.
 - [ ] Run uninstrumented 200-conversation Tuwunel and Synapse 5,000-window
   controls. Require exact replies, zero duplicates, drained queues, and
   continued post-load sync, with the existing deadline unchanged.
@@ -163,3 +164,9 @@ the deadline, and its final retained tail still contained that reaction.
 This identifies a real admission retry defect and does not establish that
 removing restart delay alone will satisfy capacity. Preserve the exact fence
 and deadline for the next run. Synapse remains unrun.
+
+Review reproduced a liveness defect in the first proposed wait: the relevant
+edit was projected, but an unrelated room's failed send kept the complete
+outbox task running and the pump parked. The corrected design wakes on each
+recovery pass and rechecks the admission barrier, preserving the worker's
+existing backoff and ownership.

@@ -124,11 +124,18 @@ Cold context repair remains non-actionable.
 An interactive source may reach admission while an attempted outgoing edit is
 still awaiting durable projection. Keep the existing atomic admission rollback
 and prompt-selection barrier. The companion pump must treat the specific
-`DeliveryProjectionPendingError` as a wait for its existing outbox recovery
-task, then retry the same unacknowledged batch. It must not restart transport,
-acknowledge early, create a second recovery queue, or repeatedly poll admission.
-Other admission errors still propagate. Cancellation stops the pump promptly
-without cancelling the independently owned outbox recovery task.
+`DeliveryProjectionPendingError` as a wait for progress from its existing
+outbox recovery worker, then retry the same unacknowledged batch. A single
+bot-owned event signals each completed recovery pass; the sole admission pump
+consumes that signal and rechecks the authoritative admission barrier.
+Do not wait for all outbox debt: an unrelated failed delivery must not keep
+an already-projectable source parked. Starting a wait must not reset an active
+worker's retry backoff.
+
+The pump must not restart transport, acknowledge early, create a second
+recovery queue, or repeatedly poll admission. Other admission errors still
+propagate. Cancellation stops the pump promptly without cancelling the
+independently owned worker. Shutdown wakes the waiter and stops admission.
 
 ## Bounds and failure
 
