@@ -585,20 +585,6 @@ class SqliteIngestionJournal(JournalRows):
         if cursor.rowcount != 1:
             raise JournalConflictError(f"{label} failed")
 
-    def _delivery_writer_snapshot(
-        self,
-        meta: tuple[object, ...],
-        member: _DeliveryLoadedMember | None,
-        work_count: int,
-    ) -> _DeliverySnapshot:
-        try:
-            current = self._delivery_snapshot()
-        except JournalIntegrityError as error:
-            raise JournalConflictError("delivery snapshot changed") from error
-        if current[0] != meta or current[3] != member or current[4] != work_count:
-            raise JournalConflictError("delivery snapshot changed")
-        return current
-
     def _replay_batch(
         self,
         owner: OwnerView,
@@ -700,8 +686,8 @@ class SqliteIngestionJournal(JournalRows):
             or not 1 <= max_canonical_bytes <= 16 * 1024 * 1024
         ):
             raise LocalProtocolError("delivery limits are invalid")
-        with self._read():
-            meta, owner, state, member, work_count = self._delivery_snapshot()
+        with self._transaction():
+            _meta, owner, state, member, _work_count = self._delivery_snapshot()
             if state.outstanding_work_id is not None:
                 return self._replay_batch(owner, state, member)[0]
             if member is None:
@@ -727,9 +713,6 @@ class SqliteIngestionJournal(JournalRows):
                 member[0][1],
                 batch.ref.sha256,
             )
-
-        with self._transaction():
-            self._delivery_writer_snapshot(meta, member, work_count)
             self._delivery_cas("delivery_claim_meta_cas", owner, state, successor)
             self._transition_hook("before_commit")
         self._transition_hook("commit")
@@ -738,8 +721,8 @@ class SqliteIngestionJournal(JournalRows):
     def acknowledge_batch(self, ref: BatchRef) -> None:
         if type(ref) is not BatchRef:
             raise LocalProtocolError("acknowledgement must be a BatchRef")
-        with self._read():
-            meta, owner, state, member, work_count = self._delivery_snapshot()
+        with self._transaction():
+            _meta, owner, state, member, _work_count = self._delivery_snapshot()
             outstanding = state.outstanding_work_id is not None
             if outstanding:
                 batch, storage, _work = self._replay_batch(owner, state, member)
@@ -764,9 +747,6 @@ class SqliteIngestionJournal(JournalRows):
             successor = DeliveryState(
                 state.next_sequence, ref.sha256, None, None, None, None
             )
-
-        with self._transaction():
-            self._delivery_writer_snapshot(meta, member, work_count)
             cursor = self._transition_execute(
                 "delivery_work_delete",
                 "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",
@@ -1958,7 +1938,7 @@ class SqliteIngestionJournal(JournalRows):
         self,
         owner: OwnerView,
         selected: _FrameDrainRow,
-    ) -> None:
+    ) -> StagedFrame | _PreparedFrameState:
         row = cast("Mapping[str, object]", self._frame_row(selected.frame_id))
         if (
             self._frame_drain_row_from_full(
@@ -1969,7 +1949,7 @@ class SqliteIngestionJournal(JournalRows):
             != selected
         ):
             raise JournalIntegrityError("blocked frame header snapshot changed")
-        self._decode_frame_state(
+        return self._decode_frame_state(
             selected.frame_id,
             row,
             owner,
@@ -1986,12 +1966,8 @@ class SqliteIngestionJournal(JournalRows):
             or selected.callbacks_claimed_revision is not None
         ):
             return None
-        self._authenticate_blocking_frame(owner, selected)
-        prepared = self._load_prepared_frame_with_owner(
-            selected.frame_id,
-            owner,
-        )
-        if prepared is None:
+        prepared = self._authenticate_blocking_frame(owner, selected)
+        if type(prepared) is not _PreparedFrameState:
             return None
         if self._load_frame_work(owner, selected.frame_id) is not None:
             return None
@@ -2152,12 +2128,8 @@ class SqliteIngestionJournal(JournalRows):
     ) -> _PreparedFrameState | None:
         if selected.room_materialized_revision is None:
             return None
-        self._authenticate_blocking_frame(owner, selected)
-        prepared = self._load_prepared_frame_with_owner(
-            selected.frame_id,
-            owner,
-        )
-        if prepared is None:
+        prepared = self._authenticate_blocking_frame(owner, selected)
+        if type(prepared) is not _PreparedFrameState:
             return None
         if self._load_frame_work(owner, selected.frame_id) is not None:
             return None
@@ -2184,8 +2156,8 @@ class SqliteIngestionJournal(JournalRows):
                 or selected.callbacks_claimed_revision is not None
             ):
                 return False
-            self._authenticate_blocking_frame(owner, selected)
-            if self._load_prepared_frame_with_owner(frame_id, owner) is None:
+            prepared = self._authenticate_blocking_frame(owner, selected)
+            if type(prepared) is not _PreparedFrameState:
                 return False
             return self._load_frame_work(owner, frame_id) is not None
 

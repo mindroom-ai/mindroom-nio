@@ -763,7 +763,7 @@ def test_live_delivery_rejects_noncanonical_owner_uuid_before_dml(
     bootstrap.close()
 
 
-def test_no_ready_work_returns_none_without_writer_or_revision(
+def test_no_ready_work_returns_none_without_mutation_or_revision(
     tmp_path: Path,
 ) -> None:
     statements: list[str] = []
@@ -1432,103 +1432,6 @@ def test_full_inventory_rejects_non_text_work_id_before_sort_without_mutation(
         journal._load_task3_work_inventory(owner)
 
     assert _raw_delivery_graph(bootstrap.database_path) == before
-    bootstrap.close()
-
-
-@pytest.mark.parametrize("race", ("meta", "state", "inventory", "ready_head"))
-def test_claim_rejects_coherent_writer_entry_snapshot_races(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    race: str,
-) -> None:
-    transitions: list[str] = []
-    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
-    journal = bootstrap._journal
-    _seed_work(journal, _ready_event(50), ready_revision=2, ready_ordinal=0)
-    real_transaction = journal._transaction
-    raced: tuple[tuple[object, ...], ...] = ()
-
-    @contextmanager
-    def racing_transaction():
-        nonlocal raced
-        if race in ("meta", "state"):
-            owner = journal.load_owner()
-            with journal._owner.journal_write():
-                if race == "meta":
-                    journal._execute(
-                        "UPDATE NioIngestMeta SET revision = ?", (owner.revision + 1,)
-                    )
-                else:
-                    journal._execute(
-                        "UPDATE NioIngestMeta SET revision = ?, "
-                        "delivery_next_sequence = 1, "
-                        "delivery_acknowledged_sha256 = ?",
-                        (owner.revision + 1, b"r" * 32),
-                    )
-        elif race == "inventory":
-            _seed_work(
-                journal,
-                _ready_event(51),
-                ready_revision=None,
-                ready_ordinal=None,
-                status="held",
-            )
-        else:
-            _seed_work(journal, _ready_event(52), ready_revision=1, ready_ordinal=0)
-        raced = _raw_delivery_graph(bootstrap.database_path)
-        with real_transaction():
-            yield
-
-    monkeypatch.setattr(journal, "_transaction", racing_transaction)
-    with pytest.raises(JournalConflictError):
-        journal.next_batch()
-    assert _raw_delivery_graph(bootstrap.database_path) == raced
-    assert transitions == []
-    bootstrap.close()
-
-
-@pytest.mark.parametrize("race", ("meta", "inventory"))
-def test_ack_rejects_coherent_writer_entry_snapshot_races(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    race: str,
-) -> None:
-    transitions: list[str] = []
-    bootstrap = _open(tmp_path, transition_statement_hook=transitions.append)
-    journal = bootstrap._journal
-    _seed_work(journal, _ready_event(60), ready_revision=1, ready_ordinal=0)
-    batch = journal.next_batch()
-    assert batch is not None
-    transitions.clear()
-    real_transaction = journal._transaction
-    raced: tuple[tuple[object, ...], ...] = ()
-
-    @contextmanager
-    def racing_transaction():
-        nonlocal raced
-        if race == "meta":
-            revision = journal.load_owner().revision
-            with journal._owner.journal_write():
-                journal._execute(
-                    "UPDATE NioIngestMeta SET revision = ?", (revision + 1,)
-                )
-        else:
-            _seed_work(
-                journal,
-                _ready_event(61),
-                ready_revision=None,
-                ready_ordinal=None,
-                status="held",
-            )
-        raced = _raw_delivery_graph(bootstrap.database_path)
-        with real_transaction():
-            yield
-
-    monkeypatch.setattr(journal, "_transaction", racing_transaction)
-    with pytest.raises(JournalConflictError):
-        journal.acknowledge_batch(batch.ref)
-    assert _raw_delivery_graph(bootstrap.database_path) == raced
-    assert transitions == []
     bootstrap.close()
 
 

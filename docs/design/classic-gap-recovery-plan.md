@@ -419,3 +419,13 @@ repeat both unchanged real capacity controls with frozen source and idle CPUs.
 Do not add local percentage gains or promise an application result from them.
 Publish the companion against the final pushed Nio revision from an isolated
 checkout, preserving the user's original dependency edits byte-for-byte.
+
+Both simplifications are implemented and independently reviewed. They remove
+28 production lines and 97 test lines; the six removed parametrized cases
+were the unsupported writer-entry injections described above. The fresh full
+locked suite passes 2,153 tests, skips three, and reports three existing fork
+warnings in 206.80 seconds. All 617 focused cases, full mypy across 71 files,
+and all repository hooks pass. Production now totals 45,833 Python lines:
+795 above the profiling baseline and 389 below the original simplification
+baseline. The companion correction adds 24 net production lines. Real capacity
+qualification still requires the next unchanged controls.
