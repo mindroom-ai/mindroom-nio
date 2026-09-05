@@ -32,7 +32,7 @@ from ..ingest.serialization import (
     _room_snapshot_from_dict,
     _room_snapshot_to_dict,
 )
-from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES
+from ..ingest.source import MAX_STORED_FRAME_PAYLOAD_BYTES, _classic_cursor_from_json
 from ..ingest.state import OwnerView, SourceState, StagedFrame
 from ._sync_journal_format import (
     _canonical_internal as _canonical_internal,
@@ -79,6 +79,13 @@ _FRAME_FIELDS = (
     "source_sha256",
 )
 _QUIESCE_FRAME_FIELDS = (*_FRAME_FIELDS, "quiesce_reserved")
+_RECOVERY_FRAME_FIELDS = (*_FRAME_FIELDS, "recovery_json")
+_FRAME_ENVELOPES = (
+    _FRAME_FIELDS,
+    _QUIESCE_FRAME_FIELDS,
+    _RECOVERY_FRAME_FIELDS,
+    (*_RECOVERY_FRAME_FIELDS, "quiesce_reserved"),
+)
 _PREPARED_FRAME_FIELDS = (
     "prepared_version",
     "request_cursor_json",
@@ -583,6 +590,8 @@ def _frame_envelope(
         "response_body": _encoded_bytes(frame.response.response_body),
         "source_sha256": _encoded_bytes(frame.response.source_sha256),
     }
+    if frame.response.recovery_json is not None:
+        envelope["recovery_json"] = _encoded_bytes(frame.response.recovery_json)
     if quiesce_reserved:
         envelope["quiesce_reserved"] = True
     return envelope
@@ -1209,14 +1218,12 @@ def _prepared_frame_state_from_envelope(
         raise ValueError("prepared frame source identity is invalid")
     _validate_source_cursor(owner.transport_kind, request_cursor)
     _validate_source_cursor(owner.transport_kind, candidate_cursor)
-    candidate_value = load_json(candidate_cursor, "prepared candidate cursor")
     if owner.transport_kind is TransportKind.CLASSIC:
+        classic_cursor = _classic_cursor_from_json(candidate_cursor)
         if (
-            type(candidate_value) is not dict
-            or tuple(candidate_value) != ("next_batch",)
-            or type(candidate_value["next_batch"]) is not str
-            or not candidate_value["next_batch"]
-            or compatibility_token != candidate_value["next_batch"]
+            type(classic_cursor.next_batch) is not str
+            or not classic_cursor.next_batch
+            or compatibility_token != classic_cursor.next_batch
         ):
             raise ValueError("prepared Classic compatibility token is invalid")
     elif compatibility_token is not None:
@@ -1277,12 +1284,9 @@ def _prepared_frame_payload(
 def _frame_response_from_envelope(
     value: object,
 ) -> tuple[StagedSourceResponse, bool]:
-    if type(value) is not dict or tuple(value) not in (
-        _FRAME_FIELDS,
-        _QUIESCE_FRAME_FIELDS,
-    ):
+    if type(value) is not dict or tuple(value) not in _FRAME_ENVELOPES:
         raise ValueError("frame authenticated envelope is invalid")
-    quiesce_reserved = tuple(value) == _QUIESCE_FRAME_FIELDS
+    quiesce_reserved = "quiesce_reserved" in value
     if quiesce_reserved and value["quiesce_reserved"] is not True:
         raise ValueError("frame quiesce reservation is invalid")
     if type(value["normalization_version"]) is not int or (
@@ -1298,6 +1302,9 @@ def _frame_response_from_envelope(
             _network_request_from_dict(value["request"]),
             body,
             digest,
+            _decoded_bytes(
+                value.get("recovery_json"), "history capture", optional=True
+            ),
         ),
         quiesce_reserved,
     )
@@ -1381,6 +1388,14 @@ class JournalRows:
     device_id: str
 
     def __init__(self) -> None:
+        self._frame_cache: (
+            tuple[
+                _Owner,
+                tuple[tuple[str, object], ...],
+                tuple[StagedFrame | _PreparedFrameState, bool],
+            ]
+            | None
+        ) = None
         self._work_cache: (
             tuple[
                 tuple[str, UUID, TransportKind],
@@ -2161,6 +2176,11 @@ class JournalRows:
             )
             if drain_row.frame_id != frame_id:
                 raise ValueError("selected frame identity changed")
+            authentication = owner.account_id, owner.stream_id, owner.transport_kind
+            stored = tuple((key, row[key]) for key in row.keys())
+            cached = self._frame_cache
+            if cached is not None and cached[:2] == (authentication, stored):
+                return cached[2]
             payload = self._payload(
                 owner,
                 "NioIngestFrame",
@@ -2176,10 +2196,7 @@ class JournalRows:
                 ),
             )
             value = load_internal_json(payload, "frame envelope")
-            if type(value) is dict and tuple(value) in (
-                _FRAME_FIELDS,
-                _QUIESCE_FRAME_FIELDS,
-            ):
+            if type(value) is dict and tuple(value) in _FRAME_ENVELOPES:
                 response, quiesce_reserved = _frame_response_from_envelope(value)
                 frame = StagedFrame(frame_id, response, drain_row.staged_revision)
                 if value != _frame_envelope(
@@ -2198,19 +2215,23 @@ class JournalRows:
                     drain_row.request_id,
                 ):
                     raise ValueError("frame columns do not match stored metadata")
+                self._frame_cache = authentication, stored, (frame, quiesce_reserved)
                 return frame, quiesce_reserved
             if drain_row.room_materialized_revision is None:
                 raise ValueError("prepared frame has no materialized revision")
-            return (
-                _prepared_frame_state_from_envelope(
-                    value,
-                    owner=owner,
-                    frame_id=frame_id,
-                    source_epoch=drain_row.source_epoch,
-                    request_id=drain_row.request_id,
-                ),
-                False,
+            prepared = _prepared_frame_state_from_envelope(
+                value,
+                owner=owner,
+                frame_id=frame_id,
+                source_epoch=drain_row.source_epoch,
+                request_id=drain_row.request_id,
             )
+            self._frame_cache = (
+                (authentication, stored, (prepared, False))
+                if not prepared.outbound_maintenance.operations
+                else None
+            )
+            return prepared, False
         except JournalIntegrityError:
             raise
         except (AttributeError, KeyError, TypeError, ValueError) as error:

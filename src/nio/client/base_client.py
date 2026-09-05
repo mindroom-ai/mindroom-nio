@@ -84,6 +84,7 @@ from ..ingest.source import (
     RoomSection,
     RoomSegment,
     SyncFrame,
+    _classic_cursor_from_json,
     _normalized_ephemeral_envelopes,
 )
 from ..responses import (
@@ -1547,13 +1548,11 @@ class Client:
             raise ValueError("prior_continuities must have unique room IDs")
 
         _canonical_ingestion_object(frame.request_cursor_json, "request cursor")
-        candidate_cursor = _canonical_ingestion_object(
-            frame.candidate_cursor_json, "candidate cursor"
-        )
+        _canonical_ingestion_object(frame.candidate_cursor_json, "candidate cursor")
         if frame.origin.transport is TransportKind.CLASSIC:
-            if set(candidate_cursor) != {"next_batch"}:
-                raise ValueError("Classic candidate cursor is invalid")
-            compatibility_token = candidate_cursor["next_batch"]
+            compatibility_token = _classic_cursor_from_json(
+                frame.candidate_cursor_json
+            ).next_batch
             if type(compatibility_token) is not str or not compatibility_token:
                 raise ValueError("Classic candidate token must be nonempty")
         else:
@@ -1793,9 +1792,15 @@ class Client:
                 room = self.rooms.get(segment.room_id) or self.invited_rooms.get(
                     segment.room_id
                 )
-            callback_room = (
-                segment.section in {RoomSection.JOIN, RoomSection.UNCHANGED}
-                and segment.room_id in self.rooms
+            callback_room = segment.section in {
+                RoomSection.JOIN,
+                RoomSection.UNCHANGED,
+            } and (
+                segment.room_id in self.rooms
+                or (
+                    segment.recovered_event_count > 0
+                    and segment.room_id in self.invited_rooms
+                )
             )
 
             def append_transition(
@@ -1895,9 +1900,13 @@ class Client:
             history_count = len(timeline) - segment.live_event_count
             for timeline_index, (payload, raw, event) in enumerate(timeline):
                 timeline_provenance = (
-                    TimelineEventProvenance.HISTORY
-                    if timeline_index < history_count
-                    else TimelineEventProvenance.LIVE
+                    TimelineEventProvenance.RECOVERED
+                    if timeline_index < segment.recovered_event_count
+                    else (
+                        TimelineEventProvenance.HISTORY
+                        if timeline_index < history_count
+                        else TimelineEventProvenance.LIVE
+                    )
                 )
                 decrypted_room_event = None
                 if room is not None and isinstance(event, (Event, BadEventType)):

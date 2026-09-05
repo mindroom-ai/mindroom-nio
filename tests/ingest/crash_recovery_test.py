@@ -100,6 +100,7 @@ FRESH_STORE_BOUNDARIES = (
     "schema_6",
     "schema_7",
     "schema_8",
+    "schema_9",
     "insert_source",
     "foreign_key_check",
     "before_commit",
@@ -631,13 +632,14 @@ def test_fresh_owned_store_process_death_is_empty_or_complete_and_reopenable(
 
     master, rows = graph
     table_names = {name for kind, name, _table, _sql in master if kind == "table"}
-    assert len(table_names) == 16
+    assert len(table_names) == 17
     assert {
         "NioIngestMeta",
         "NioIngestSourceState",
         "NioIngestFrame",
         "NioIngestRoomAggregate",
         "NioIngestWork",
+        "NioIngestRecovery",
     } <= table_names
     assert {table: len(table_rows) for table, table_rows in rows if table_rows} == {
         "accounts": 1,
@@ -723,6 +725,7 @@ def test_configured_adoption_process_death_is_exact_old_or_complete_new_graph(
             "NioIngestFrame",
             "NioIngestRoomAggregate",
             "NioIngestWork",
+            "NioIngestRecovery",
         }
         assert "devicetruststate" in {
             name for kind, name, _table, _sql in graph_after[0] if kind == "table"
@@ -743,6 +746,9 @@ def test_configured_adoption_process_death_is_exact_old_or_complete_new_graph(
             assert connection.execute(
                 "SELECT COUNT(*) FROM NioIngestSourceState"
             ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM NioIngestRecovery"
+            ).fetchone() == (0,)
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert (
         tuple(
@@ -812,7 +818,9 @@ def test_configured_sqlite_adoption_crash_preserves_exact_populated_graph(
             "NioIngestFrame",
             "NioIngestRoomAggregate",
             "NioIngestWork",
+            "NioIngestRecovery",
         }
+        assert dict(graph_after[1])["NioIngestRecovery"] == ()
     else:
         assert graph_after == graph_before
 

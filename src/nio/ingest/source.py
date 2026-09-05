@@ -85,26 +85,40 @@ def require_json_event_container(
 @dataclass(frozen=True, slots=True)
 class ClassicCursor:
     next_batch: str | None
+    recovery_json: bytes | None = None
 
     def __post_init__(self) -> None:
         if self.next_batch is not None and type(self.next_batch) is not str:
             raise TypeError("next_batch must be str or None")
+        if self.recovery_json is not None:
+            value = load_json(self.recovery_json, "classic recovery")
+            if not self.next_batch or type(value) is not dict:
+                raise ValueError("classic recovery requires an object and since token")
+            if canonical_json(value) != self.recovery_json:
+                raise ValueError("classic recovery must be canonical")
 
 
 def canonical_classic_cursor(cursor: ClassicCursor) -> bytes:
     if type(cursor) is not ClassicCursor:
         raise TypeError("cursor must be ClassicCursor")
-    return canonical_json({"next_batch": cursor.next_batch})
+    value: dict[str, Any] = {"next_batch": cursor.next_batch}
+    if cursor.recovery_json is not None:
+        value["recovery"] = load_json(cursor.recovery_json, "classic recovery")
+    return canonical_json(value)
 
 
 def _classic_cursor_from_json(data: bytes) -> ClassicCursor:
     value = load_json(data, "classic cursor")
-    if type(value) is not dict or set(value) != {"next_batch"}:
-        raise ValueError("classic cursor must contain only next_batch")
+    if type(value) is not dict or set(value) not in (
+        {"next_batch"},
+        {"next_batch", "recovery"},
+    ):
+        raise ValueError("classic cursor fields are invalid")
     next_batch = value["next_batch"]
     if next_batch is not None and type(next_batch) is not str:
         raise ValueError("classic cursor next_batch must be a string or null")
-    return ClassicCursor(next_batch)
+    recovery = canonical_json(value["recovery"]) if "recovery" in value else None
+    return ClassicCursor(next_batch, recovery)
 
 
 class RoomSection(StrEnum):
@@ -223,6 +237,7 @@ class RoomSegment:
     expanded_timeline: bool
     live_event_count: int
     membership_observation: MembershipObservation
+    recovered_event_count: int = 0
 
     @property
     def history_discontinuity(self) -> bool:
@@ -256,6 +271,13 @@ class RoomSegment:
             raise ValueError("room_id must not be empty")
         if not 0 <= self.live_event_count <= len(self.timeline_json):
             raise ValueError("live_event_count must index the timeline suffix")
+        if (
+            type(self.recovered_event_count) is not int
+            or not 0
+            <= self.recovered_event_count
+            <= len(self.timeline_json) - self.live_event_count
+        ):
+            raise ValueError("recovered_event_count must index the history prefix")
         observation = self.membership_observation
         if observation.is_initial is not self.initial:
             raise ValueError("membership observation initial flag must match segment")
@@ -278,24 +300,31 @@ class RoomSegment:
             )
         if self.section is RoomSection.UNCHANGED and (
             self.state_json
+            or self.recovered_event_count != len(self.timeline_json)
             or self.timeline_json
-            or not self.room_account_data_json
+            and self.room_account_data_json
             or self.timeline_limited
             or self.timeline_prev_batch is not None
             or self.initial
             or self.expanded_timeline
             or self.live_event_count
         ):
-            raise ValueError("unchanged room segments must be account-data-only")
-        if self.section is RoomSection.UNCHANGED and (
-            observation.event_membership is not None
-            or observation.event_id is not None
-            or observation.previous_membership is not None
-            or observation.replaces_state is not None
-            or observation.is_live
-            or observation.is_initial
-            or observation.is_expanded_timeline
-            or observation.is_unparsed
+            raise ValueError(
+                "unchanged room segments must be account-data-only or recovered history"
+            )
+        if (
+            self.section is RoomSection.UNCHANGED
+            and not self.timeline_json
+            and (
+                observation.event_membership is not None
+                or observation.event_id is not None
+                or observation.previous_membership is not None
+                or observation.replaces_state is not None
+                or observation.is_live
+                or observation.is_initial
+                or observation.is_expanded_timeline
+                or observation.is_unparsed
+            )
         ):
             raise ValueError("unchanged room membership observation must be neutral")
 

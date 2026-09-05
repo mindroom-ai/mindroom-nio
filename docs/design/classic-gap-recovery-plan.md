@@ -75,7 +75,7 @@ Files: source carriers, coordinator settlement, and journal settlement.
 - [x] Reject cache machinery without a convincing measured benefit.
 - [x] Run focused ownership, retry, source, and settlement tests for both
   measured variants. Keep standard-library JSON.
-- [ ] Measure and implement one immutable decoded Frame entry, after the
+- [x] Measure and implement one immutable decoded Frame entry, after the
   error-free live run exposed remaining catch-up cost. Preserve full-row,
   authentication, current-owner revision, mutable-outbound exclusion, and close
   behavior; verify changed disk data and normal delivery before rerunning live.
@@ -116,7 +116,7 @@ read, 45-second full visible overlap, exact replies, fence, or drain checks.
 - [ ] Reduce the fixed Classic request ceiling to 100, preserving oversize
   halving, smaller user limits, and all recovery/cursor behavior; verify tests
   and repeat live controls.
-- [ ] Diagnose MindRoom's serial dispatch preparation with targeted timing.
+- [x] Diagnose MindRoom's serial dispatch preparation with targeted timing.
   Preserve durable pending-turn recording and ordering. Fresh roots already
   skip thread-history reads and text debounce; do not delete imaginary work.
 - [ ] Benchmark any selected change, test its real behavioral boundaries,
@@ -204,12 +204,13 @@ three existing fork-with-threads deprecation warnings in 213.06 seconds.
 Full mypy reported zero issues in 71 source files. All repository hooks passed,
 including explicit checks of the new, not-yet-tracked source and tests.
 
-The final production-source full run passed 2,155 tests, skipped three, and
+The pre-ceiling-change full run passed 2,155 tests, skipped three, and
 failed two test synchronization cases in 213.59 seconds. Both cases waited
 for the outbound probe that Work-first scheduling correctly skips. Their hook
 now observes and delegates the actual progress wait. Both corrected cases pass,
 preserving the original no-write, no-network, exact-retry, acknowledgement-wake,
-and completion assertions. Production code did not change after that full run.
+and completion assertions. That correction changed tests only; the later
+100-event ceiling has its own fresh full-suite result below.
 This verifies 2,157 cases across the full run and corrected reruns; it is not
 a claim that the first full command exited successfully.
 
@@ -312,3 +313,46 @@ seconds, with pause reduced from 1.399 to 0.392 seconds. Network results yield
 but have no simulated latency; smaller windows need more requests. This
 justifies changing the existing constant, without extra cache or batching
 machinery, while keeping live attribution and acceptance separate.
+
+The 100-event ceiling is implemented. Default and larger caller limits retry
+100 then 50 on oversize; a smaller limit of 24 retries 24 then 12. Existing
+cursor, filter, and recovered-delivery assertions remain. The fresh full suite
+passes 2,159 tests, skips three, and reports three existing fork warnings in
+205.75 seconds. All 488 focused tests, full mypy (71 files), repository hooks,
+and explicit checks of new files pass. Live acceptance remains pending.
+
+### Dispatch timing and proposed writer experiment
+
+A diagnostic run timed the same 200-root Tuwunel workload without changing
+production behavior. Its 200 serial dispatches consumed 21.314 seconds;
+pending-turn persistence accounted for 20.337 seconds (95.4%). That includes
+8.297 seconds waiting for the shared ledger lock and 11.836 seconds awaiting
+the database: 10.259 before execution, 0.607 executing transactions, and 0.969
+returning to the caller. Preparation and planning were small. The pre-execution
+interval includes queueing and scheduling, so it is not all removable overhead.
+
+This instrumented run completed all replies, the fence, and final drain, but
+failed full overlap (41.433 seconds) and its wrapper's clean-shutdown check.
+Application logs reached shutdown completion; the wrapper did not retain the
+exit status needed to explain that discrepancy. It is diagnostic evidence,
+not a passing capacity control.
+
+Benchmark replacing the asynchronous SQLite writer queue with one serial
+executor before selecting another production change. Preserve one FULL
+transaction per operation, FIFO admission, rollback, cancellation settlement,
+cross-loop callers, queued-write refusal on close, and drain before connection
+teardown. Do not remove the shared ledger lock or either pending-turn write:
+one freezes response context, the other binds the visible Matrix reply ID.
+A prototype result alone does not authorize changing these semantics.
+
+Two alternating-order pairs rejected this proposed backend change for the
+current performance task. With 200 real pending-turn records, eight concurrent
+write producers, and production JSON work on a retained response, mean elapsed
+time fell only from 8.394 to 8.116 seconds (3.30%). Idle runs improved 4.16%.
+Both variants committed 1,800 operations independently and passed rollback,
+repeated-cancellation settlement, and queued-close refusal probes. Worker idle
+time while writes were queued fell substantially, but execution wall time rose
+under concurrent JSON processing; most cost moved rather than disappearing.
+Cross-loop production support would require additional future/drain changes.
+Keep the existing backend; these results do not justify that architecture change
+or establish a fix for the live dispatch ramp.

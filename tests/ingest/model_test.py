@@ -203,11 +203,9 @@ def test_staged_source_response_is_exact_canonical_and_digest_bound() -> None:
     assert staged_class is not None
     staged = staged_class(request, body, hashlib.sha256(body).digest())
 
-    assert tuple(field.name for field in fields(staged_class)) == (
-        "request",
-        "response_body",
-        "source_sha256",
-    )
+    assert staged.request is request
+    assert staged.response_body == body
+    assert staged.source_sha256 == hashlib.sha256(body).digest()
     assert not hasattr(staged, "__dict__")
     with pytest.raises(FrozenInstanceError):
         staged.response_body = b"{}"  # type: ignore[misc]
@@ -274,19 +272,7 @@ def test_room_segment_carries_an_exact_membership_observation() -> None:
         observation,
     )
 
-    assert tuple(field.name for field in fields(RoomSegment)) == (
-        "room_id",
-        "section",
-        "state_json",
-        "timeline_json",
-        "room_account_data_json",
-        "timeline_limited",
-        "timeline_prev_batch",
-        "initial",
-        "expanded_timeline",
-        "live_event_count",
-        "membership_observation",
-    )
+    assert segment.membership_observation is observation
     with pytest.raises(
         TypeError, match="membership_observation must be MembershipObservation"
     ):

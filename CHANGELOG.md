@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file.
 
 ### Error handling and platform support
 
+- Owned Classic ingestion drains server-visible gaps through bounded, durable
+  pages before advancing its sync cursor. Recovered events use normal admission;
+  restart replays a staged page or resumes after the last settled page. Cold
+  history remains non-actionable. Unsupported filters, unavailable history, and
+  per-page or pagination bounds fail with progress retained.
+- Owned Classic polling requests at most 100 timeline events and retries
+  oversized responses with a smaller window at the same cursor. Intrinsically
+  oversized data at the minimum window still requires intervention.
 - Prepared ingestion output exceeding the hard capacity bounds raises
   `nio.ingest.errors.JournalCapacityError` and stops the owned session.
 - Import the package without `fcntl`; attempting filesystem ownership where it
@@ -39,6 +47,20 @@ All notable changes to this project will be documented in this file.
 
 ### Performance and development checks
 
+- Remove redundant internal reconstruction of already validated source
+  responses. Five paired SQLite benchmarks measured 1.85–2.64% lower total
+  delivery time across two frame shapes, with 29 fewer production lines.
+- Remove repeated settlement event encoding and redundant validation before
+  authenticated batch comparison. Five paired long-message SQLite benchmarks
+  measured 4.67% median lower delivery time, with 22 fewer production lines.
+  This does not establish a whole-application throughput gain.
+- Encode staged Frame payloads once in their transaction. Three paired
+  large-response recovery benchmarks measured a 2.63% median improvement,
+  with six fewer production lines and unchanged authentication/size bounds.
+- Reuse one immutable decoded Frame when its complete stored row and owner
+  identity are unchanged. Retain actual-row validation and exclude mutable
+  outbound contexts. Three paired local recovery benchmarks measured 18.51%
+  median lower delivery time; ordinary delivery showed no measured speedup.
 - Reuse one authenticated Work value when its complete stored row and owner
   identity are unchanged, retaining per-read validation and existing transactions.
   Five paired local delivery benchmarks measured about 33% less time for 1,000

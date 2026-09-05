@@ -75,6 +75,7 @@ class StagedSourceResponse:
     request: NetworkRequest
     response_body: bytes
     source_sha256: bytes
+    recovery_json: bytes | None = None
 
     def __post_init__(self) -> None:
         _require_exact(self.request, NetworkRequest, "request")
@@ -94,6 +95,19 @@ class StagedSourceResponse:
             ) from error
         if type(value) is not dict or canonical_json(value) != self.response_body:
             raise ValueError("response_body must be canonical Matrix JSON object")
+        if self.recovery_json is not None:
+            _require_exact(self.recovery_json, bytes, "recovery_json")
+            if (
+                len(self.response_body) + len(self.recovery_json)
+                > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
+            ):
+                raise ValueError("source and recovery exceed 16 MiB")
+            evidence = load_json(self.recovery_json, "history capture")
+            if (
+                type(evidence) is not dict
+                or canonical_json(evidence) != self.recovery_json
+            ):
+                raise ValueError("history capture must be a canonical object")
 
 
 class NetworkFailureKind(StrEnum):

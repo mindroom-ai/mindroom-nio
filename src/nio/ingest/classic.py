@@ -115,6 +115,8 @@ class ClassicSource:
             frame, response_body = self._normalize_frame(request, result.body)
         except (TypeError, ValueError) as error:
             return malformed_success_result(request, result.body, error)
+        if len(response_body) > MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES:
+            return oversized_success_result(request, response_body)
         return SourceResult(
             kind=SourceResultKind.FRAME,
             request=request,

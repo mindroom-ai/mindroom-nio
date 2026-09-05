@@ -209,4 +209,21 @@ SCHEMA_SQL = (
     account_id, room_id, membership_epoch, status, room_sequence, work_id)""",
     """CREATE INDEX NioIngestWork_frame_kind ON NioIngestWork(
     account_id, frame_id, kind)""",
+    """CREATE TABLE NioIngestRecovery (
+    account_id TEXT PRIMARY KEY REFERENCES NioIngestMeta(account_id) CHECK (
+        typeof(account_id) = 'text' AND length(account_id) > 0
+    ),
+    source_epoch INTEGER NOT NULL CHECK (
+        typeof(source_epoch) = 'integer' AND source_epoch >= 0
+    ),
+    request_id INTEGER NOT NULL CHECK (
+        typeof(request_id) = 'integer' AND request_id >= 0
+    ),
+    payload BLOB NOT NULL CHECK (
+        typeof(payload) = 'blob' AND length(payload) > 0
+        AND length(payload) <= 24 * 1024 * 1024
+    ),
+    payload_sha256 BLOB NOT NULL CHECK (
+        typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32
+    ))""",
 )

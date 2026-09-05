@@ -10144,16 +10144,14 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
         completion_calls.append(completion)
 
     session._completion_sink = completion_sink  # type: ignore[attr-defined]
-    maintenance_checked = asyncio.Event()
-    real_load_maintenance = session._journal._load_ready_outbound_maintenance
+    work_wait = asyncio.Event()
+    real_wait_for_progress = session._wait_for_progress
 
-    def observe_maintenance_check():
-        pending = real_load_maintenance()
-        assert pending is None
-        maintenance_checked.set()
-        return pending
+    async def observe_work_wait(observed_generation: int) -> None:
+        work_wait.set()
+        await real_wait_for_progress(observed_generation)
 
-    session._journal._load_ready_outbound_maintenance = observe_maintenance_check
+    session._wait_for_progress = observe_work_wait  # type: ignore[method-assign]
     source_entered = asyncio.Event()
     never_release = asyncio.Event()
     requests: list[object] = []
@@ -10172,16 +10170,16 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
     statements: list[str] = []
     connection.set_trace_callback(statements.append)
     runner = asyncio.create_task(session.run())
-    maintenance_wait = asyncio.create_task(maintenance_checked.wait())
+    progress_wait = asyncio.create_task(work_wait.wait())
     source_wait = asyncio.create_task(source_entered.wait())
     try:
         done, _pending = await asyncio.wait(
-            (runner, maintenance_wait),
+            (runner, progress_wait),
             timeout=2,
             return_when=asyncio.FIRST_COMPLETED,
         )
         runner_failure = runner.exception() if runner.done() else None
-        assert maintenance_wait in done, (
+        assert progress_wait in done, (
             "runner stopped before the Work wait boundary: " f"{runner_failure!r}"
         )
         await asyncio.sleep(0)
@@ -10221,10 +10219,10 @@ async def test_owned_runner_waits_read_only_for_record_ack_then_resumes(
         if not runner.done():
             runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
-        for waiter in (maintenance_wait, source_wait):
+        for waiter in (progress_wait, source_wait):
             if not waiter.done():
                 waiter.cancel()
-        await asyncio.gather(maintenance_wait, source_wait, return_exceptions=True)
+        await asyncio.gather(progress_wait, source_wait, return_exceptions=True)
         await session.close()
 
 
@@ -11830,7 +11828,7 @@ async def test_pending_hydrations_for_multiple_rooms_are_processed_in_sequence(
     assert [call[0][1] for call in client.send_calls] == [
         "/_matrix/client/v3/rooms/%21diagnostic%3Aexample.org/state",
         "/_matrix/client/v3/rooms/%21other%3Aexample.org/state",
-        "/_matrix/client/v3/sync?since=s2&timeout=30000&filter=%7B%7D",
+        "/_matrix/client/v3/sync?since=s2&timeout=30000&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A100%7D%7D%7D",
     ]
     assert bootstrap._journal.load_pending_hydrations(limit=2) == ()
     await session.close()
@@ -11917,7 +11915,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
         assert client.send_calls[0] == (
             (
                 "GET",
-                "/_matrix/client/v3/sync?full_state=true&timeout=30000&filter=%7B%7D",
+                "/_matrix/client/v3/sync?full_state=true&timeout=30000&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A100%7D%7D%7D",
                 None,
                 {"Authorization": "Bearer secret-token"},
                 None,
@@ -11928,7 +11926,7 @@ async def test_success_retires_empty_frame_before_second_http(tmp_path) -> None:
         assert client.send_calls[1] == (
             (
                 "GET",
-                "/_matrix/client/v3/sync?since=s1&timeout=30000&filter=%7B%7D",
+                "/_matrix/client/v3/sync?since=s1&timeout=30000&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A100%7D%7D%7D",
                 None,
                 {"Authorization": "Bearer secret-token"},
                 None,
@@ -12735,7 +12733,7 @@ async def test_raw_attempt_uses_public_send_without_callbacks_and_bounds_read(
             (
                 "GET",
                 "https://example.org/_matrix/client/v3/sync?"
-                "full_state=true&timeout=30000&filter=%7B%7D",
+                "full_state=true&timeout=30000&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A100%7D%7D%7D",
             ),
             {
                 "data": None,
@@ -13052,6 +13050,8 @@ async def test_terminal_fates_leave_source_and_frames_unchanged(
         consumer_generation=generation,
         stream_id=bootstrap.stream_id,
     )
+    # An oversized response is terminal only at the minimum timeline window.
+    session._classic_timeline_limit = 1
     with pytest.raises(nio.IngestionSourceError):
         await session.run()
     assert client.send_count == 1

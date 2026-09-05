@@ -40,14 +40,24 @@ from ..ingest.model import (
     _local_membership_transition_epoch,
     _PreparedIngestionFrame,
 )
-from ..ingest.ports import NetworkRequest
+from ..ingest.ports import NetworkRequest, StagedSourceResponse, _frame_id_for_response
+from ..ingest.recovery import (
+    apply_classic_recovery,
+    recovery_progress,
+    start_classic_recovery,
+)
 from ..ingest.serialization import (
     _validate_batch,
     batch_from_records,
     canonical_batch_payload,
 )
 from ..ingest.sliding import SlidingSource, _sliding_cursor_from_json
-from ..ingest.source import SyncFrame, _frame_room_ids, renormalize_staged_frame
+from ..ingest.source import (
+    SyncFrame,
+    _classic_cursor_from_json,
+    _frame_room_ids,
+    renormalize_staged_frame,
+)
 from ..ingest.state import CommitResult, OwnerView, SourceState, StagedFrame
 from ._sync_journal_plan import (
     AuthenticatedWork,
@@ -77,6 +87,7 @@ from ._sync_journal_rows import (
     _frame_drain_sha256,
     _frame_envelope,
     _frame_payload,
+    _frame_response_from_envelope,
     _FrameDrainRow,
     _OutboundMaintenance,
     _OutboundOperation,
@@ -180,7 +191,10 @@ def _renormalized_frame(owner: OwnerView, frame: StagedFrame) -> SyncFrame:
             owner.account_id,
         )
     try:
-        return renormalize_staged_frame(adapter, frame)
+        normalized = renormalize_staged_frame(adapter, frame)
+        return apply_classic_recovery(
+            normalized, frame.response.recovery_json, owner.account_id
+        )
     except (TypeError, ValueError) as error:
         raise JournalIntegrityError("staged response does not re-normalize") from error
 
@@ -618,7 +632,6 @@ class SqliteIngestionJournal(JournalRows):
     ) -> tuple[AuthenticatedWork, RoomAggregateValue | None] | None:
         if type(batch) is not SyncBatch:
             raise LocalProtocolError("settlement batch must be a SyncBatch")
-        _validate_batch(batch)
         with self._read():
             _meta, owner, state, member, _work_count = self._delivery_snapshot()
             if batch.ref.stream_id != owner.stream_id:
@@ -627,6 +640,7 @@ class SqliteIngestionJournal(JournalRows):
             acknowledged_sequence = state.next_sequence - (2 if outstanding else 1)
             acknowledged = state.acknowledged_sha256
             if acknowledged is not None and batch.ref.sequence == acknowledged_sequence:
+                _validate_batch(batch)
                 name = f"{acknowledged_sequence}:{acknowledged.hex()}"
                 expected = acknowledged, uuid5(owner.stream_id, name)
                 if (batch.ref.sha256, batch.ref.batch_id) != expected:
@@ -797,6 +811,162 @@ class SqliteIngestionJournal(JournalRows):
     ) -> SyncFrame:
         return _renormalized_frame(owner, frame)
 
+    def _classic_recovery_rooms(self, frame: SyncFrame) -> tuple[str, ...]:
+        if frame.origin.transport is not TransportKind.CLASSIC:
+            return ()
+        with self._read():
+            owner = self.load_owner()
+            rooms = []
+            for segment in frame.room_segments:
+                if segment.initial or not segment.timeline_limited:
+                    continue
+                loaded = self._load_room_aggregate(owner, segment.room_id)
+                if loaded is not None:
+                    prior = loaded[1].continuity
+                    if (
+                        prior.membership == "join"
+                        and prior.baseline is not None
+                        and prior.hydration_id is None
+                    ):
+                        rooms.append(segment.room_id)
+            return tuple(rooms)
+
+    def _load_classic_recovery(self) -> StagedSourceResponse | None:
+        """Authenticate the frozen response paired with the current continuation."""
+        with self._read():
+            owner, source = self._load_stage_snapshot()
+            rows = self._execute("SELECT * FROM NioIngestRecovery LIMIT 2").fetchall()
+            progress = (
+                recovery_progress(source.cursor_json)
+                if source.transport_kind is TransportKind.CLASSIC
+                else None
+            )
+            if not rows and progress is None:
+                return None
+            if len(rows) != 1 or progress is None:
+                raise JournalIntegrityError("recovery input and continuation disagree")
+            row = rows[0]
+            try:
+                if (
+                    row["account_id"] != owner.account_id
+                    or row["source_epoch"] != source.source_epoch
+                    or type(row["request_id"]) is not int
+                    or not 0 <= row["request_id"] <= source.next_request_id
+                    or type(row["payload"]) is not bytes
+                    or len(row["payload"]) > 24 * 1024 * 1024
+                ):
+                    raise ValueError("recovery source identity changed")
+                payload = self._payload(
+                    owner,
+                    "NioIngestRecovery",
+                    row["payload"],
+                    row["payload_sha256"],
+                    header=_canonical_internal(
+                        [row["source_epoch"], row["request_id"]]
+                    ),
+                )
+                response, reserved = _frame_response_from_envelope(
+                    load_json(payload, "retained recovery input")
+                )
+                request = response.request
+                if (
+                    reserved
+                    or response.recovery_json is not None
+                    or request.stream_id != owner.stream_id
+                    or request.transport is not TransportKind.CLASSIC
+                    or request.source_epoch != row["source_epoch"]
+                    or request.request_id != row["request_id"]
+                    or recovery_progress(request.request_cursor_json) is not None
+                    or _classic_cursor_from_json(request.request_cursor_json).next_batch
+                    != _classic_cursor_from_json(source.cursor_json).next_batch
+                    or progress["source_sha256"] != response.source_sha256.hex()
+                ):
+                    raise ValueError("retained recovery response changed")
+                return response
+            except (KeyError, TypeError, ValueError) as error:
+                raise JournalIntegrityError(
+                    "persisted recovery input is invalid"
+                ) from error
+
+    def _begin_classic_recovery(
+        self, *, response: StagedSourceResponse, cursor_json: bytes
+    ) -> None:
+        """Freeze input and publish its initial continuation in one transaction."""
+        with self._transaction():
+            owner, source = self._load_stage_snapshot()
+            request = response.request
+            try:
+                if (
+                    source.transport_kind is not TransportKind.CLASSIC
+                    or not source.active
+                    or request.transport is not source.transport_kind
+                    or request.stream_id != owner.stream_id
+                    or request.source_epoch != source.source_epoch
+                    or request.request_id != source.next_request_id
+                    or request.request_cursor_json != source.cursor_json
+                    or response.recovery_json is not None
+                    or recovery_progress(source.cursor_json) is not None
+                ):
+                    raise ValueError("recovery input does not match current source")
+                progress = recovery_progress(cursor_json)
+                if progress is None:
+                    raise ValueError("recovery continuation is missing")
+                frame = StagedFrame(
+                    _frame_id_for_response(request, response.source_sha256), response
+                )
+                normalized = self._renormalized_frame(owner, frame)
+                if (
+                    start_classic_recovery(normalized, tuple(progress["rooms"]))
+                    != cursor_json
+                ):
+                    raise ValueError("recovery continuation does not match response")
+                if self._load_classic_recovery() is not None:
+                    raise ValueError("a recovery input is already retained")
+                payload, digest = self._payload(
+                    owner,
+                    "NioIngestRecovery",
+                    _canonical_internal(_frame_envelope(frame)),
+                    header=_canonical_internal(
+                        [request.source_epoch, request.request_id]
+                    ),
+                )
+                if len(payload) > 24 * 1024 * 1024:
+                    raise ValueError("retained recovery envelope exceeds 24 MiB")
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
+                raise JournalIntegrityError(
+                    "recovery staging proposal is invalid"
+                ) from error
+
+            updated = self._transition_execute(
+                "meta_revision_epoch_cas",
+                "UPDATE NioIngestMeta SET revision = ? "
+                "WHERE account_id = ? AND revision = ? AND writer_epoch = ?",
+                (
+                    owner.revision + 1,
+                    self.account_id,
+                    owner.revision,
+                    str(owner.writer_epoch),
+                ),
+            )
+            if updated.rowcount != 1:
+                raise JournalConflictError("journal recovery compare-and-swap failed")
+            self._execute(
+                "INSERT INTO NioIngestRecovery "
+                "(account_id, source_epoch, request_id, payload, payload_sha256) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    self.account_id,
+                    request.source_epoch,
+                    request.request_id,
+                    payload,
+                    digest,
+                ),
+            )
+            self._transition_hook("recovery_insert")
+            self._write_source(replace(source, cursor_json=cursor_json), owner)
+            self._transition_hook("source_state_upsert")
+        self._transition_hook("commit")
+
     def _validate_stage_relationship(
         self,
         owner: OwnerView,
@@ -903,6 +1073,25 @@ class SqliteIngestionJournal(JournalRows):
                 frame,
             )
 
+            finishing_recovery = False
+            if current.transport_kind is TransportKind.CLASSIC:
+                progress = recovery_progress(current.cursor_json)
+                if progress is not None:
+                    retained = self._load_classic_recovery()
+                    if (
+                        retained is None
+                        or frame.response.source_sha256 != retained.source_sha256
+                        or frame.response.response_body != retained.response_body
+                    ):
+                        raise JournalIntegrityError(
+                            "recovery child changed retained sync input"
+                        )
+                    finishing_recovery = recovery_progress(proposed.cursor_json) is None
+                    if finishing_recovery and progress["phase"] != "tail":
+                        raise JournalIntegrityError(
+                            "recovery completed before its final phase"
+                        )
+
             frame_ids = self._classify_frame_ids(owner)
             self._transition_hook("frame_collision_probe")
             if frame.frame_id in frame_ids:
@@ -984,12 +1173,6 @@ class SqliteIngestionJournal(JournalRows):
                 )
 
             new_revision = read_revision + 1
-            _frame_payload(
-                frame,
-                new_revision,
-                payload_owner,
-                quiesce_reserved=quiesce_reserved,
-            )
             cursor = self._transition_execute(
                 "meta_revision_epoch_cas",
                 "UPDATE NioIngestMeta SET revision = ? "
@@ -1017,6 +1200,12 @@ class SqliteIngestionJournal(JournalRows):
             except (sqlite3.IntegrityError, IntegrityError) as error:
                 raise JournalIntegrityError("staged frame insert collided") from error
             self._transition_hook("frame_insert")
+            if finishing_recovery:
+                self._execute(
+                    "DELETE FROM NioIngestRecovery WHERE account_id = ?",
+                    (self.account_id,),
+                )
+                self._transition_hook("recovery_delete")
         self._transition_hook("commit")
         return CommitResult(new_revision)
 
@@ -2030,6 +2219,20 @@ class SqliteIngestionJournal(JournalRows):
             claimed_revision,
         )
 
+    def _completion_is_partial_recovery(self, completion: _FrameCompletion) -> bool:
+        with self._read():
+            owner = self._decode_owner_row(cast("Mapping[str, object]", self._meta()))
+            headers = self._load_authenticated_frame_headers(owner)
+            if not headers or self._frame_completion(owner, headers[0]) != completion:
+                raise JournalConflictError("claimed Frame completion changed")
+            prepared = self._load_prepared_frame_with_owner(completion.frame_id, owner)
+            if prepared is None:
+                raise JournalIntegrityError("completed Frame is not prepared")
+            return (
+                owner.transport_kind is TransportKind.CLASSIC
+                and recovery_progress(prepared.candidate_cursor_json) is not None
+            )
+
     def _claim_frame_completion(self) -> _FrameCompletion | None:
         if not self._completion_claim_is_ready():
             return None
@@ -2490,6 +2693,7 @@ class SqliteIngestionJournal(JournalRows):
     # fmt: on
 
     def close(self) -> None:
+        self._frame_cache = None
         self._work_cache = None
         self._room_aggregate_cache = None
         self._owner.close()

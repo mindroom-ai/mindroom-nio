@@ -32,9 +32,11 @@ from .model import (
     _PreparedWaitingKeyRequest,
     _QueuedToDeviceSubtype,
 )
+from .recovery import recovery_progress
 from .source import (
     RoomSegment,
     SyncFrame,
+    _classic_cursor_from_json,
     _continuity_bounds,
     _normalized_ephemeral_envelopes,
 )
@@ -182,6 +184,36 @@ def _has_trusted_baseline(state: RoomContinuity, segment: RoomSegment) -> bool:
     )
 
 
+def _recovered_membership_baseline(
+    frame: SyncFrame, segment: RoomSegment, before: RoomContinuity
+) -> MembershipBaseline | None:
+    observation = segment.membership_observation
+    if (
+        frame.origin.transport is not TransportKind.CLASSIC
+        or before.baseline is None
+        or before.baseline.membership_event_id is None
+        or before.gap is not None
+        or before.hydration_id is not None
+        or not segment.recovered_event_count
+        or segment.recovered_event_count != len(segment.timeline_json)
+        or observation.is_unparsed
+        or observation.event_membership is None
+        or not observation.event_id
+    ):
+        return None
+    progress = recovery_progress(frame.request_cursor_json)
+    if (
+        progress is None
+        or progress["phase"] != "page"
+        or segment.room_id not in progress["rooms"]
+    ):
+        return None
+    return MembershipBaseline(
+        observation.event_id,
+        _classic_cursor_from_json(frame.request_cursor_json).next_batch,
+    )
+
+
 def _loss(
     state: RoomContinuity,
     reason: LossReason,
@@ -240,7 +272,10 @@ def _timeline_provenance(
     index: int,
     history_count: int,
     recovery_start: int | None,
+    recovered_event_count: int = 0,
 ) -> TimelineEventProvenance:
+    if index < recovered_event_count:
+        return TimelineEventProvenance.RECOVERED
     if index >= history_count:
         return TimelineEventProvenance.LIVE
     if recovery_start is not None and index >= recovery_start:
@@ -374,7 +409,10 @@ def _plan_room(
                 DescriptorRoute.HOLD_FOR_HYDRATION,
             )
 
-        if _has_trusted_baseline(before, segment):
+        if (
+            _has_trusted_baseline(before, segment)
+            or _recovered_membership_baseline(frame, segment, before) is not None
+        ):
             assert before.baseline is not None
             observation = segment.membership_observation
             event_id = (
@@ -603,9 +641,13 @@ def _prepared_source_records(
                 segment.room_id,
                 source_json,
                 (
-                    TimelineEventProvenance.HISTORY
-                    if index < history_count
-                    else TimelineEventProvenance.LIVE
+                    TimelineEventProvenance.RECOVERED
+                    if index < segment.recovered_event_count
+                    else (
+                        TimelineEventProvenance.HISTORY
+                        if index < history_count
+                        else TimelineEventProvenance.LIVE
+                    )
                 ),
             )
             for index, source_json in enumerate(segment.timeline_json)
@@ -899,15 +941,18 @@ def _validate_prepared_frame_identity(
     minimum_staged_revision = frame.origin.source_epoch + frame.origin.request_id + 1
     if prepared.staged_revision < minimum_staged_revision:
         raise ReducerInputError("prepared staged revision is invalid")
-    candidate = _canonical_prepared_object(
+    _canonical_prepared_object(
         prepared.candidate_cursor_json,
         "prepared candidate cursor",
     )
     expected_token: str | None
     if prepared.transport is TransportKind.CLASSIC:
-        if set(candidate) != {"next_batch"}:
-            raise ReducerInputError("prepared Classic candidate cursor is invalid")
-        token = candidate["next_batch"]
+        try:
+            token = _classic_cursor_from_json(prepared.candidate_cursor_json).next_batch
+        except (TypeError, ValueError) as error:
+            raise ReducerInputError(
+                "prepared Classic candidate cursor is invalid"
+            ) from error
         if type(token) is not str or not token:
             raise ReducerInputError("prepared Classic compatibility token is invalid")
         expected_token = token
@@ -1205,6 +1250,7 @@ def reduce_prepared_frame(
                 index,
                 history_count,
                 recovery_start_by_room[segment.room_id],
+                segment.recovered_event_count,
             )
     timeline_provenance_by_record_id = {
         prepared.records[position].record_id: provenance
@@ -1537,7 +1583,7 @@ def reduce_prepared_frame(
                 segment.room_id,
                 epoch,
                 membership,
-                None,
+                _recovered_membership_baseline(frame, segment, before),
                 None,
                 None,
             )

@@ -59,7 +59,7 @@ FRESH_BOUNDARIES = (
     "insert_account",
     "create_meta",
     "insert_meta",
-    *(f"schema_{index}" for index in range(9)),
+    *(f"schema_{index}" for index in range(10)),
     "insert_source",
     "foreign_key_check",
     "before_commit",
@@ -237,6 +237,7 @@ def test_fresh_owned_store_bootstrap_is_one_atomic_full_graph(
         "NioIngestFrame",
         "NioIngestRoomAggregate",
         "NioIngestWork",
+        "NioIngestRecovery",
     }
     assert len(pickle_calls) == 1
     identity_keys, shared, used_key, pickled = pickle_calls[0]
@@ -305,7 +306,7 @@ def test_fresh_owned_store_retries_empty_database_residue(
             assert connection.execute("SELECT * FROM sqlite_master").fetchall() == []
 
     bootstrap = _fresh_open(tmp_path)
-    assert len(_table_names(database_path)) == 16
+    assert len(_table_names(database_path)) == 17
     bootstrap.close()
 
 
@@ -392,11 +393,11 @@ def test_fresh_owned_store_hook_failure_is_all_absent_or_complete(
     if boundary != "commit":
         assert master == ()
         retried = _fresh_open(tmp_path)
-        assert len(_table_names(database_path)) == 16
+        assert len(_table_names(database_path)) == 17
         retried.close()
         return
 
-    assert len(_table_names(database_path)) == 16
+    assert len(_table_names(database_path)) == 17
     with sqlite3.connect(database_path) as connection:
         account_before = connection.execute(
             "SELECT account, shared FROM accounts"

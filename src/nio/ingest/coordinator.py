@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 from asyncio import sleep as _cooperative_sleep
+from dataclasses import replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, NamedTuple, cast
 from urllib.parse import quote, urlencode
@@ -79,9 +80,24 @@ from .model import (
     _PreparedWaitingKeyRequest,
     _QueuedToDeviceSubtype,
 )
+from .recovery import (
+    apply_classic_recovery,
+    bounded_classic_request,
+    capture_classic_recovery,
+    recovery_progress,
+    start_classic_recovery,
+    validate_classic_recovery_request,
+)
 from .reducer import RoomContinuity
 from .sliding import SlidingSource
-from .source import SourceResultKind, SourceScheduleStatus, SyncFrame, plan_source_poll
+from .source import (
+    SourceResult,
+    SourceResultKind,
+    SourceScheduleStatus,
+    SyncFrame,
+    _classic_cursor_from_json,
+    plan_source_poll,
+)
 from .state import CommitResult, SourceState, StagedFrame
 
 if TYPE_CHECKING:
@@ -723,15 +739,9 @@ def _settlement_room(
 def _load_settlement_event(
     payload: bytes,
     field_name: str,
-    invalid_message: str,
 ) -> dict[str, object]:
-    try:
-        value = load_json(payload, field_name)
-        if type(value) is not dict or canonical_json(value) != payload:
-            raise ValueError
-    except (TypeError, ValueError) as error:
-        raise JournalIntegrityError(invalid_message) from error
-    return value
+    """Decode an immutable event already validated by the Work decoder."""
+    return cast("dict[str, object]", load_json(payload, field_name))
 
 
 class _OwnedIngestionSession:
@@ -751,6 +761,7 @@ class _OwnedIngestionSession:
         self._config = config
         self._journal = journal
         self._source = source
+        self._classic_timeline_limit = 100
         if completion_sink is not None and not callable(completion_sink):
             raise TypeError("completion sink must be callable")
         self._completion_sink = completion_sink
@@ -848,7 +859,9 @@ class _OwnedIngestionSession:
     async def _run_loop(self) -> None:
         retries = 0
         hydration_retries = 0
+        captured: SourceResult | None = None
         while self._close_task is None:
+            recovering = self._classic_recovery_active()
             while True:
                 await _cooperative_sleep(0)
                 if (
@@ -857,7 +870,11 @@ class _OwnedIngestionSession:
                     >= self._quiesce_source_commit_target
                 ):
                     return
-                if self._quiesce_source_commit_target is not None:
+                if (
+                    self._quiesce_source_commit_target is not None
+                    and not recovering
+                    and captured is None
+                ):
                     frames = self._journal.list_frames(
                         self._config.max_staged_frames + 1
                     )
@@ -921,7 +938,11 @@ class _OwnedIngestionSession:
                 continue
             hydration_retries = 0
             # fmt: on
-            if await self._advance_local_membership_intent():
+            if (
+                not recovering
+                and captured is None
+                and await self._advance_local_membership_intent()
+            ):
                 continue
             if (
                 self._quiesce_source_commit_target is not None
@@ -946,9 +967,51 @@ class _OwnedIngestionSession:
             request = decision.request
             assert request is not None
             try:
-                result = self._source.normalize(request, await self._request(request))
+                if captured is not None:
+                    result = captured
+                    captured = None
+                    request = result.request
+                    timeline_limit = 1
+                elif recovering:
+                    retained = self._journal._load_classic_recovery()
+                    assert retained is not None
+                    request = replace(
+                        retained.request,
+                        request_id=prior.next_request_id,
+                        request_cursor_json=prior.cursor_json,
+                    )
+                    network = ports.NetworkResult(
+                        request.stream_id,
+                        request.transport,
+                        request.source_epoch,
+                        request.request_id,
+                        200,
+                        retained.response_body,
+                        None,
+                        None,
+                    )
+                    timeline_limit = 1
+                    result = self._source.normalize(request, network)
+                else:
+                    request, timeline_limit = bounded_classic_request(
+                        request, self._classic_timeline_limit
+                    )
+                    network = await self._request(request)
+                    result = self._source.normalize(request, network)
             except (AttributeError, TypeError, ValueError) as error:
                 raise IngestionSourceError("malformed source result") from error
+            if (
+                request.transport is TransportKind.CLASSIC
+                and result.status_code == 200
+                and len(result.response_body)
+                > ports.MAX_CANONICAL_STAGED_RESPONSE_BODY_BYTES
+            ):
+                if timeline_limit > 1:
+                    self._classic_timeline_limit = max(1, timeline_limit // 2)
+                    continue
+                raise IngestionSourceError(
+                    "Classic response exceeds 16 MiB at the minimum timeline limit; source cursor retained"
+                )
             if result.kind is SourceResultKind.RETRYABLE_ERROR:
                 retries += 1
                 delay = result.retry_after_ms / 1000 if result.retry_after_ms else 0.0
@@ -967,33 +1030,95 @@ class _OwnedIngestionSession:
                 raise IngestionSourceError(result.detail or result.kind.value)
             retries = 0
             assert result.frame is not None
+            try:
+                if not recovering:
+                    if (
+                        request.transport is TransportKind.CLASSIC
+                        and frames
+                        and any(
+                            segment.timeline_limited and not segment.initial
+                            for segment in result.frame.room_segments
+                        )
+                    ):
+                        # Quiesce may poll before older Frames drain. Retain this
+                        # bounded reply while their membership becomes current.
+                        captured = result
+                        continue
+                    rooms = self._journal._classic_recovery_rooms(result.frame)
+                    if rooms:
+                        validate_classic_recovery_request(request)
+                        self._journal._begin_classic_recovery(
+                            response=ports.StagedSourceResponse(
+                                request,
+                                result.response_body,
+                                result.frame.source_sha256,
+                            ),
+                            cursor_json=start_classic_recovery(result.frame, rooms),
+                        )
+                        continue
+                progress = recovery_progress(prior.cursor_json) if recovering else None
+                recovery_json = await capture_classic_recovery(
+                    request,
+                    result.frame,
+                    result.response_body,
+                    tuple(progress["rooms"]) if progress is not None else (),
+                    lambda page: self._request(page, body_disconnect_retry=True),
+                )
+                normalized = apply_classic_recovery(
+                    result.frame, recovery_json, self._client.user_id
+                )
+            except (TypeError, ValueError) as error:
+                raise IngestionSourceError(
+                    "Classic history recovery failed; source cursor retained"
+                ) from error
             frame = StagedFrame(
                 result.frame.frame_id,
                 ports.StagedSourceResponse(
                     request,
                     result.response_body,
                     result.frame.source_sha256,
+                    recovery_json,
                 ),
             )
             successor = SourceState(
                 prior.source_epoch,
                 prior.transport_kind,
-                result.frame.candidate_cursor_json,
+                normalized.candidate_cursor_json,
                 request.request_id + 1,
                 prior.active,
             )
             self._journal.stage_source_response(
                 source=successor,
                 frame=frame,
-                quiesce_reserved=self._quiesce_source_commit_target is not None,
+                quiesce_reserved=(
+                    self._quiesce_source_commit_target is not None
+                    and not (
+                        request.transport is TransportKind.CLASSIC
+                        and _classic_cursor_from_json(
+                            normalized.candidate_cursor_json
+                        ).recovery_json
+                        is not None
+                    )
+                ),
             )
-            self._source_commit_generation += 1
-            await self._deliver_transient_observations(result.response_body)
+            if not self._classic_recovery_active():
+                self._source_commit_generation += 1
+                await self._deliver_transient_observations(result.response_body)
             if (
                 self._quiesce_source_commit_target is not None
                 and self._source_commit_generation >= self._quiesce_source_commit_target
             ):
                 return
+
+    def _classic_recovery_active(self) -> bool:
+        if type(self._source) is not ClassicSource:
+            return False
+        return (
+            _classic_cursor_from_json(
+                self._journal.load_source().cursor_json
+            ).recovery_json
+            is not None
+        )
 
     async def _deliver_transient_observations(self, response_body: bytes) -> None:
         """Best-effort observations from fresh, committed responses only."""
@@ -1198,13 +1323,15 @@ class _OwnedIngestionSession:
 
     async def _advance_blocked_frame(self, frame_id: UUID) -> bool:
         progress_generation = self._progress_generation
+        if self._journal._oldest_prepared_frame_has_work(frame_id):
+            if self._journal.load_pending_hydrations(limit=1):
+                return False
+            await self._wait_for_progress(progress_generation)
+            return True
         pending = self._journal._load_ready_outbound_maintenance()
         if pending is None:
             if self._journal.load_pending_hydrations(limit=1):
                 return False
-            if self._journal._oldest_prepared_frame_has_work(frame_id):
-                await self._wait_for_progress(progress_generation)
-                return True
             completion = self._journal._claim_frame_completion()
             if completion is None:
                 claimed = self._journal._load_claimed_frame_completion()
@@ -1220,7 +1347,10 @@ class _OwnedIngestionSession:
                 raise JournalIntegrityError(
                     "completion claim does not own the blocked Frame"
                 )
-            if self._completion_sink is not None:
+            if (
+                self._completion_sink is not None
+                and not self._journal._completion_is_partial_recovery(completion)
+            ):
                 await self._completion_sink(completion)
             self._journal._retire_claimed_frame(completion)
             return True
@@ -1948,7 +2078,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "invite STATE event",
-                            "invite STATE event source is invalid",
                         )
                         if source.get("type") != metadata.effective_event_type:
                             raise JournalIntegrityError(
@@ -1985,7 +2114,6 @@ class _OwnedIngestionSession:
                     source = _load_settlement_event(
                         record.source_json,
                         "ephemeral event",
-                        "ephemeral event source is invalid",
                     )
                     if source.get("type") != metadata.effective_event_type:
                         raise JournalIntegrityError("ephemeral event source is invalid")
@@ -2009,7 +2137,6 @@ class _OwnedIngestionSession:
                     source = _load_settlement_event(
                         record.source_json,
                         "room account-data event",
-                        "room account-data source is invalid",
                     )
                     if source.get("type") != metadata.effective_event_type:
                         raise JournalIntegrityError(
@@ -2037,7 +2164,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "timeline event",
-                            "timeline event source is invalid",
                         )
                         event = Event.parse_event(source)
                         await self._client._on_event(event, projected_room)
@@ -2064,12 +2190,10 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "encrypted timeline event",
-                            "encrypted timeline event source is invalid",
                         )
                         clear = _load_settlement_event(
                             record.clear_json,
                             "decrypted timeline event",
-                            "decrypted timeline event is invalid",
                         )
                         source_content = source.get("content")
                         if (
@@ -2119,7 +2243,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "failed Megolm event",
-                            "failed Megolm event source is invalid",
                         )
                         source_content = source.get("content")
                         if (
@@ -2229,12 +2352,10 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "encrypted to-device event",
-                            "encrypted to-device source is invalid",
                         )
                         clear = _load_settlement_event(
                             record.clear_json,
                             "decrypted to-device event",
-                            "decrypted to-device event is invalid",
                         )
                         source_content = source.get("content")
                         if (
@@ -2367,7 +2488,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "expired verification",
-                            "expired verification source is invalid",
                         )
                         if source.get("type") not in (
                             None,
@@ -2387,7 +2507,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             "collected key request",
-                            "collected key-request source is invalid",
                         )
                         if source.get("type") != metadata.effective_event_type:
                             raise JournalIntegrityError(
@@ -2410,11 +2529,6 @@ class _OwnedIngestionSession:
                         source = _load_settlement_event(
                             record.source_json,
                             source_name,
-                            (
-                                "global account-data source is invalid"
-                                if global_account_data
-                                else "to-device source is invalid"
-                            ),
                         )
                         if global_account_data:
                             event = AccountDataEvent.parse_event(source)
