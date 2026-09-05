@@ -1,5 +1,11 @@
 # Durable Ingestion Simplification Implementation Plan
 
+This completed plan records the first simplification checkpoint. Subsequent
+[cutover hardening](durable-ingestion-cutover-hardening-plan.md) and
+[type correctness and Work reuse](type-correctness-and-work-reuse-plan.md)
+record later changes and current verification. The 144-error result below is
+historical; the follow-up requires zero errors and enforces that in CI.
+
 > **For agentic workers:** Use baspowers:subagent-driven-development task by task.
 > Do not restore excluded guarantees during review. Read the contract first.
 
@@ -108,6 +114,10 @@ Files: coordinator.py, base_client.py and only directly related codec helpers/te
   results. Commit only intended files. Report final branch/commit and any limits.
 
 ## Measured changes and verification
+
+These are measurements at completion of this simplification pass. See the
+[follow-up execution record](type-correctness-and-work-reuse-plan.md#execution-record)
+for the latest combined source totals and verification.
 
 Raw Python source totals are 46,222 lines at `742806f` and 44,788 after
 simplification. The change removes 1,434 net production lines; the earlier

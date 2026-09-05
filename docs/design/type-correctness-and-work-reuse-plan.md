@@ -287,17 +287,20 @@ return value
 
 Controller owns tracked results and integration; no unreviewed production or CI
 edits in this task. Task 4 provides the CI type-check gate.
-- [ ] Review task reports and covering checks. Run final complete suites on
+- [x] Review task reports and covering checks. Run final complete suites on
   Python 3.12/3.13/3.14, repository pre-commit hooks, locked install/check, and
   canonical mypy. Re-run broader tests only for actual subsequent behavior changes.
-- [ ] Independently review the entire follow-up delta from bd320ab against this
+- [x] Independently review the entire follow-up delta from bd320ab against this
   spec and the existing durable contract. The previously completed PR-wide review
   remains recorded in the hardening plan; do not silently expand this follow-up
   into a new architecture or unrelated repair campaign.
-- [ ] Record zero-error command/result, meaningful test changes, dependency and
+- [x] Record zero-error command/result, meaningful test changes, dependency and
   production-line deltas, benchmark boundaries/results, and unchanged cutover
-  limitations. Commit results, scan outgoing content/metadata, check remote
-  drift, push non-forcibly to PR #55, and verify remote HEAD/CI.
+  limitations. Commit results and scan outgoing content/metadata.
+
+Publication gate: check remote drift, push non-forcibly to PR #55, and verify
+remote HEAD/CI. Publication status belongs to the PR checks and completion report;
+these local results do not claim that a release or live cutover occurred.
 
 ## Plan self-review
 
@@ -311,8 +314,9 @@ No new guarantee or delivery representation is required.
 
 ## Execution record
 
-Tasks 1–5 are implemented and reviewed. The combined final gate remains
-in progress.
+Implementation, combined verification, and review are complete. Final review's
+type-boundary correction and callback documentation polish are committed and
+passed scoped re-review, with one documented minor static inference limitation.
 
 | Task | Commits | Verification |
 | --- | --- | --- |
@@ -321,6 +325,7 @@ in progress.
 | 3: client and transport contracts | `9df4016`, `fee3352` | 221 passed; callback repair covered by two real regressions and 10 callback tests |
 | 4: ingestion invariants and CI | `4563c33` | Zero mypy errors in all 70 files; 1,562 ingestion tests passed, then the two corrected transport expectations passed |
 | 5: bounded Work reuse | `6aa0b79` | 296 passed, 1 skipped; five real-store benchmark pairs showed 32.7% median delivery-time reduction for 19 net production lines |
+| Final review correction | `615ad7a` | 225 passed, 1 skipped; malformed encrypted-input callbacks retained in both clients; zero mypy errors |
 
 Review additionally reproduced dropped custom-awaitable work in synchronous
 callbacks. The small adapter in `fee3352` honors the existing callback contract;
@@ -329,6 +334,43 @@ client delivery. Two ingestion test expectations changed only because aiohttp
 already normalizes the timeout and default TLS values that Nio now passes
 explicitly. The design records the evidence and costs of both decisions.
 
-A minor callback-docstring mismatch remains for final review. No blocking task
-review finding remains open. The final three-version full suite, combined
-review, final results, and push are still required.
+The full suites on the combined implementation in `6aa0b79` each passed 2,079
+tests with 3 skipped. Python 3.12.13 completed in 246.36 seconds, Python 3.13.14
+in 244.75 seconds, and Python 3.14.7 in 239.17 seconds. Each reported three
+fork-related deprecation warnings from ownership tests. All processes exited
+successfully. The canonical mypy command reported no issues across all 70 source
+files, with two informational notes about previously untyped function bodies.
+All six repository pre-commit hooks, `uv lock --check`, and
+`uv sync --all-extras --locked` passed. No error baseline or source exclusion
+remains; CI now enforces zero errors.
+
+Final review found that a decrypted malformed room-key event can be an
+`UnknownBadEvent`, while a client cast claimed it was always a `ToDeviceEvent`.
+This is existing runtime behavior, so the correction carries the truthful union
+through both client routes and retains malformed-event callbacks. The same fix
+wave updates four callback docstrings that still described None-only returns.
+No Work-cache or durable-boundary defect was found. The correction in `615ad7a`
+is annotation/docstring-only. Its two real-input characterization tests passed
+before and after; focused client/crypto coverage passed 225 tests with 1 skipped,
+canonical mypy remained clean across 70 files, and changed-file hooks passed.
+Scoped re-review confirmed both findings addressed and no runtime regression.
+It identified one minor static inference limitation: heterogeneous event-filter
+tuples may require callbacks annotated with the full event union. Retain that
+documented limitation rather than adding tuple-specific overloads in this pass;
+the cost is a broader annotation for those callers. No production mypy error
+remains. The exact locked CI command also passed on `615ad7a`.
+
+Final production total at `615ad7a` is 45,038 physical Python lines in 70 files:
+189 more than the follow-up baseline, 1,184 fewer than the originally reviewed
+PR, and 13,548 net lines above the PR base. The Work cache itself costs 19 net
+lines. Three development stub dependencies and seven local stub lines were added;
+no runtime dependency changed. The real-store paired benchmark measured 32.7%
+less delivery-loop time, with 5,000 full Work decodes reduced to 1,000. Final
+frame retirement is asserted outside that timer; this is not application-wide
+throughput. Full measurement boundaries are in the design.
+
+The restart key-share continuation gap remains unresolved, and companion
+integration still requires testing against the accepted artifact before cutover.
+Neither is waived by this pass. Version selection and release are separate;
+the changelog contains draft migration notes. Later investigation tracks orjson,
+source/transient parsing cost, and a small sanitized transient cause diagnostic.

@@ -66,6 +66,14 @@ representations; update those expectations while retaining exact request, body,
 headers, timeout, bounded-read, callback-isolation, and response-release checks.
 The public `AsyncClient.send` arguments remain unchanged.
 
+Final review corrected the to-device response/callback boundary to include
+malformed decrypted events, preserving their existing delivery. A bounded generic
+supports callbacks typed for individual event filters. Mypy may infer the full
+event bound for a heterogeneous filter tuple, so a callback for such a tuple
+may need the broader `ToDeviceEvent | BadEventType` annotation. This is a known
+static inference limitation, not a runtime filtering failure. Do not add overload
+machinery in this pass solely to infer every precise tuple union.
+
 Room-name sorting iterates known members whose names fall back to user IDs;
 its optional lookup annotation does not establish an unnamed-member bug.
 `Api.public_rooms` selects only GET or POST and returns in both cases; its
@@ -86,9 +94,10 @@ not establish current PR #55 performance.
 Current PR #55 still uses one Work record per delivered batch and two journal
 transactions per record: claim and acknowledgement. Benchmark the real owned
 session with file-backed SQLite WAL/NORMAL, real prepared Work, callback delivery,
-and frame retirement. Exclude initial bootstrap, source preparation, network,
-and application admission from the timed delivery interval. Assert every event
-ID is delivered once in order and the frame retires. These measurements describe
+and frame retirement. Time the claim/delivery/settlement loop; assert final frame
+retirement afterward, outside that timer. Exclude initial bootstrap, source
+preparation, network, and application admission. Assert every event ID is
+delivered once in order and the frame retires. These measurements describe
 one serial Nio store, not a 200-stream deployment or end-to-end application speed.
 
 On CPython 3.14.7, five samples after warmup at each size gave:
@@ -140,12 +149,13 @@ median paired reduction was 32.7% (individual pairs: 30.8–33.1%). True Work
 plaintext decodes fell from 5,000 to 1,000. Both variants use the production
 decoder; the control clears its Work cache before each read. Both count decodes
 and assert unique ordered callbacks, acknowledgement deletion, and frame
-retirement. Warmup precedes measurement. This confirms a material benefit for
+retirement. The final retirement assertion is outside the timed delivery loop.
+Warmup precedes measurement. This confirms a material benefit for
 the small cache; it is not an application-wide or source-parsing speed claim.
 
-At `6aa0b79`, the repository has 45,023 physical production Python lines across
-70 files: 174 more than this follow-up's `bd320ab` baseline, 1,199 fewer than
-the original reviewed `742806f`, and 13,533 net lines above the PR base. The
+At `615ad7a`, the repository has 45,038 physical production Python lines across
+70 files: 189 more than this follow-up's `bd320ab` baseline, 1,184 fewer than
+the original reviewed `742806f`, and 13,548 net lines above the PR base. The
 typing declarations add seven development-only stub lines and three development
 stub dependencies; no runtime dependency is added. Final combined verification
 and publication are recorded in the implementation plan.
