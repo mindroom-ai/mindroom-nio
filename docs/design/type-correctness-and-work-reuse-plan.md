@@ -369,8 +369,11 @@ less delivery-loop time, with 5,000 full Work decodes reduced to 1,000. Final
 frame retirement is asserted outside that timer; this is not application-wide
 throughput. Full measurement boundaries are in the design.
 
-The restart key-share continuation gap remains unresolved, and companion
-integration still requires testing against the accepted artifact before cutover.
-Neither is waived by this pass. Version selection and release are separate;
-the changelog contains draft migration notes. Later investigation tracks orjson,
-source/transient parsing cost, and a small sanitized transient cause diagnostic.
+The restart key-share continuation gap remains unresolved. Companion PR #1878
+has been updated and is conflict-free with passing CI at `adf1ab9`; its Git source
+pins Nio `bd320ab`, so validation against the later accepted artifact remains a
+cutover step. Version selection and release are separate; the changelog contains
+draft migration notes. Source/transient parsing cost and a small sanitized
+transient cause diagnostic remain follow-ups. The orjson experiment is complete
+and adoption was explicitly rejected after its measured 9-14% delivery gain;
+retain the standard-library backend as recorded in the design.

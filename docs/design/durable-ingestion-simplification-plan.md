@@ -158,7 +158,8 @@ original diagnostics disappeared.
 All four task reviews and the whole-branch implementation review passed with no
 Critical or Important findings. Scoped documentation review is complete; its
 final wording clarification makes explicit that transient fanout uses the current
-task. Before deployment or cutover, resolve the companion MindRoom
-integration's current base conflict and run its integration suite against an
-artifact built from the accepted Nio revision; those integration steps remain
-outside this local change.
+task. The companion MindRoom integration's former base conflict is resolved;
+see its [current status](type-correctness-and-delivery-cost.md#companion-integration-status).
+Before deployment or cutover, run its integration suite against an artifact
+built from the accepted Nio revision; those integration steps remain outside
+this local change.

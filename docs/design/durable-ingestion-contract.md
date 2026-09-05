@@ -373,10 +373,11 @@ an unverified device or add callback Work publication during maintenance.
 - Full repository tests, repository pre-commit hooks, and independent review
   against this document. No live deployment or cutover is part of this change.
 
-Before deployment or cutover, resolve the companion MindRoom integration's
-current base conflict and run its integration suite against an artifact built
-from the accepted Nio revision. Those integration steps remain outside this
-local change.
+Before deployment or cutover, run the companion MindRoom integration suite
+against an artifact built from the accepted Nio revision. Its former base
+conflict is resolved; see the [current integration status](type-correctness-and-delivery-cost.md#companion-integration-status)
+for the verified companion revision and Nio pin. Artifact alignment and cutover
+validation remain outside this local change.
 
 ### Known gap before relying on restart continuation
 

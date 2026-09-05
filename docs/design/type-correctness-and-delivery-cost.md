@@ -160,21 +160,36 @@ typing declarations add seven development-only stub lines and three development
 stub dependencies; no runtime dependency is added. Final combined verification
 and publication are recorded in the implementation plan.
 
-## Later performance evaluation
+## JSON backend decision and remaining performance work
 
-The user requested an `orjson` evaluation after this pass. Reprofile after Work
-reuse to establish how much remaining delivery cost is JSON parsing or encoding.
-If material, benchmark a candidate on the same real delivery workload before
-adopting it. Verify compatibility with strict input validation, canonical stored
-bytes, authentication, and replay; compare the measured gain with the dependency
-and maintenance cost. This is a future investigation, not a dependency change
-or additional implementation task in the current pass.
+Decision, 2026-09-05: retain the standard-library JSON backend. An encoding-only
+orjson 3.12.0 experiment at `f857124`, with Work reuse enabled, measured five
+alternating pairs on real file-backed SQLite stores. For 1,000 short messages,
+median delivery fell from 891 ms to 805 ms (9.3% median paired reduction); with
+1 KiB bodies, it fell from 1,002 ms to 862 ms (13.8%). These timings exclude
+network, transient fanout, application admission, and final frame retirement.
 
-Include source capture and fresh transient fanout in that later profile. The
-current delivery benchmark excludes both. Transient fanout decodes the full
-response again; measure this cost before extending source-result interfaces to
-carry extracted transient sections or a decoded root. Keep any future reuse
-in memory and outside durable frame/Work representations.
+The measured improvement does not justify another runtime dependency and its
+compatibility/maintenance cost for this project. Adoption is deliberately
+rejected on that basis. The investigation is closed; orjson is
+not pending implementation. Do not restore it during review without materially
+different workload evidence and a new decision. Strict duplicate-key, numeric,
+canonical-byte, authentication, and replay behavior remains unchanged.
+
+Transient fanout still decodes the full response again. Measure that specific
+cost before extending source-result interfaces to carry extracted transient
+sections or a decoded root. Keep any future reuse in memory and outside durable
+frame/Work representations; it does not require a JSON backend change.
+
+## Companion integration status
+
+Checked on 2026-09-05: [MindRoom PR #1878](https://github.com/mindroom-ai/mindroom/pull/1878)
+at `adf1ab9` is open, has no merge conflict, and its CI checks passed. The former
+rebase/conflict-resolution task is complete. Its declared Nio dependency is
+`>=0.40,<0.41`, with the uv Git source pinned to `bd320ab`. This precedes the
+subsequent type and Work-reuse changes through `f857124`. Before cutover, align
+and validate against the accepted Nio revision. Do not repeat the obsolete
+conflict or old dependency-pin claims.
 
 ## Further review disposition
 

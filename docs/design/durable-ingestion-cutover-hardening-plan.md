@@ -344,10 +344,11 @@ History behavior is unchanged: explicit loss and membership-state hydration in
 Nio, later context repair in MindRoom. Actionable replay of missed requests and
 removal of the remaining gap-planning representation require a separate decision.
 Intrinsically oversized prepared output remains retained and needs intervention;
-automatic spooling or chunking was not added. The companion integration still
-needs conflict resolution and testing against the accepted Nio artifact before
-deployment. Released fork admission APIs are intentionally replaced, requiring
-coordinated consumer migration and release communication.
+automatic spooling or chunking was not added. The companion integration's former
+conflict is resolved; [current status](type-correctness-and-delivery-cost.md#companion-integration-status)
+records its tested Nio pin. Validation against the accepted Nio artifact remains
+required before deployment. Released fork admission APIs are intentionally
+replaced, requiring coordinated consumer migration and release communication.
 
 ## Final-review repair addendum
 
