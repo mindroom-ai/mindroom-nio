@@ -326,7 +326,7 @@ def _restore_rerequests(
     if not live:
         live.extend(expected)
         return
-    unique: dict[str, MegolmEvent] = {}
+    unique: dict[str | None, MegolmEvent] = {}
     for event in live:
         if type(event) is not MegolmEvent:
             raise JournalIntegrityError("key-claim rerequest state changed")
