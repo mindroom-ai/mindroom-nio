@@ -25,6 +25,7 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    TypeVar,
     cast,
 )
 from uuid import uuid5
@@ -119,6 +120,11 @@ if TYPE_CHECKING:
 from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 
 logger = logging.getLogger(__name__)
+
+_ToDeviceCallbackEventT = TypeVar(
+    "_ToDeviceCallbackEventT",
+    bound=ToDeviceEvent | BadEventType,
+)
 
 _DECRYPTED_TO_DEVICE_KINDS = {
     RoomKeyEvent: _DecryptedToDeviceKind.ROOM_KEY,
@@ -2051,7 +2057,7 @@ class Client:
         )
 
     def _handle_decrypt_to_device(
-        self, to_device_event: ToDeviceEvent
+        self, to_device_event: ToDeviceEvent | BadEventType
     ) -> ToDeviceEvent | BadEventType | None:
         if self.olm:
             return self.olm.handle_to_device_event(to_device_event)
@@ -2060,25 +2066,23 @@ class Client:
 
     def _replace_decrypted_to_device(
         self,
-        decrypted_events: list[tuple[int, ToDeviceEvent]],
+        decrypted_events: list[tuple[int, ToDeviceEvent | BadEventType]],
         response: SyncResponse,
-    ):
+    ) -> None:
         # Replace the encrypted to_device events with decrypted ones
         for decrypted_event in decrypted_events:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
     def _handle_to_device(self, response: SyncResponse):
-        decrypted_to_device = []
+        decrypted_to_device: list[tuple[int, ToDeviceEvent | BadEventType]] = []
 
         for index, to_device_event in enumerate(response.to_device_events):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                decrypted_to_device.append(
-                    (index, cast(ToDeviceEvent, decrypted_event))
-                )
-                to_device_event = cast(ToDeviceEvent, decrypted_event)
+                decrypted_to_device.append((index, decrypted_event))
+                to_device_event = decrypted_event
 
             # Do not pass room key request events to our user here. We don't
             # want to notify them about requests that get automatically handled
@@ -2273,7 +2277,7 @@ class Client:
         }
         self.olm.add_changed_users(users_for_key_query)
 
-    def _on_to_device(self, event: ToDeviceEvent):
+    def _on_to_device(self, event: ToDeviceEvent | BadEventType):
         for cb in self.to_device_callbacks:
             cb.sync_execute(event)
 
@@ -2714,7 +2718,7 @@ class Client:
         """Add a callback that will be executed on global account data events.
 
         Args:
-            callback (Callable[[AccountDataEvent], None]):
+            callback (Callable[[AccountDataEvent], Awaitable[None] | None]):
                 A function that will be
                 called if the event type in the filter argument is found in
                 the account data event list.
@@ -2740,7 +2744,7 @@ class Client:
         """Add a callback that will be executed on room account data events.
 
         Args:
-            callback (Callable[[MatrixRoom, AccountDataEvent], None]):
+            callback (Callable[[MatrixRoom, AccountDataEvent], Awaitable[None] | None]):
                 A function that will be
                 called if the event type in the filter argument is found in
                 the room account data event list.
@@ -2757,21 +2761,27 @@ class Client:
 
     def add_to_device_callback(
         self,
-        callback: Callable[[ToDeviceEvent], Awaitable[None] | None],
-        filter: type[ToDeviceEvent] | tuple[type[ToDeviceEvent], ...],
+        callback: Callable[
+            [_ToDeviceCallbackEventT],
+            Awaitable[None] | None,
+        ],
+        filter: (
+            type[_ToDeviceCallbackEventT] | tuple[type[_ToDeviceCallbackEventT], ...]
+        ),
     ) -> None:
         """Add a callback that will be executed on to-device events.
 
         Args:
-            callback (Callable[[ToDeviceEvent], None]): A function that will be
-                called if the event type in the filter argument is found in
-                the to-device part of the sync response.
+            callback (Callable[[ToDeviceEvent | BadEventType],
+            Awaitable[None] | None]): A function that will be called if the
+                event type in the filter argument is found in the to-device
+                part of the sync response.
 
             filter
-            (Union[Type[ToDeviceEvent], Tuple[Type[ToDeviceEvent], ...]]):
-                The event type or a tuple
-                containing multiple types for which the function
-                will be called.
+            (Union[Type[ToDeviceEvent | BadEventType],
+            Tuple[Type[ToDeviceEvent | BadEventType], ...]]): The event type or
+                a tuple containing multiple types for which the function will
+                be called.
 
         """
         cb = ClientCallback(callback, filter)
@@ -2785,9 +2795,9 @@ class Client:
         """Add a callback that will be executed on presence events.
 
         Args:
-            callback (Callable[[PresenceEvent], None]): A function that will be
-                called if the event type in the filter argument is found in
-                the presence part of the sync response.
+            callback (Callable[[PresenceEvent], Awaitable[None] | None]): A
+                function that will be called if the event type in the filter
+                argument is found in the presence part of the sync response.
             filter (Union[Type, Tuple[Type]]): The event type or a tuple
                 containing multiple types for which the function
                 will be called.

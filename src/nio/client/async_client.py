@@ -669,7 +669,7 @@ class AsyncClient(Client):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                to_device_event = cast(ToDeviceEvent, decrypted_event)
+                to_device_event = decrypted_event
                 response.to_device_events[index] = to_device_event
             if isinstance(
                 to_device_event, (RoomKeyRequest, RoomKeyRequestCancellation)
@@ -746,7 +746,10 @@ class AsyncClient(Client):
         for event in expired_verifications:
             await self._on_expired_verifications(event)
 
-    async def _on_to_device(self, event: ToDeviceEvent):
+    async def _on_to_device(
+        self,
+        event: ToDeviceEvent | BadEventType,
+    ) -> None:
         await self._run_event_callbacks(self.to_device_callbacks, event)
 
     async def _on_invited_rooms(self, event: Event, room: MatrixRoom):

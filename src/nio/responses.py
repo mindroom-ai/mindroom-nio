@@ -1944,7 +1944,7 @@ class SyncResponse(Response):
     rooms: Rooms = field()
     device_key_count: DeviceOneTimeKeyCount = field()
     device_list: DeviceList = field()
-    to_device_events: list[ToDeviceEvent] = field()
+    to_device_events: list[ToDeviceEvent | BadEventType] = field()
     presence_events: list[PresenceEvent] = field()
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
 
@@ -1981,7 +1981,9 @@ class SyncResponse(Response):
         return events
 
     @staticmethod
-    def _get_to_device(parsed_dict: dict[Any, Any]) -> list[ToDeviceEvent]:
+    def _get_to_device(
+        parsed_dict: dict[Any, Any],
+    ) -> list[ToDeviceEvent | BadEventType]:
         return [
             ToDeviceEvent.parse_event(event_dict)
             for event_dict in parsed_dict.get("events", [])
