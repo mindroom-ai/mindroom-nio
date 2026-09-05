@@ -322,17 +322,14 @@ speedups do not establish full application throughput improvements.
 The Classic actionable-gap exclusion below is superseded by
 [`classic-gap-recovery-and-capacity.md`](classic-gap-recovery-and-capacity.md)
 following the measured missed-request failure and the user's instruction to
-fix recovery and performance. That amendment defines bounded capture through
-the existing journal owner. Its initial-history and Sliding limits are explicit.
+fix recovery and performance. That amendment defines bounded, resumable history
+pages through the existing journal owner for eligible Classic rooms. Initial
+history remains non-actionable, and Sliding retains its existing discontinuity
+and explicit-loss semantics.
 
-The current prepared engine detects discontinuities and emits explicit loss; it
-does not fetch missed messages through a Nio `/messages` backfill loop. Companion
-MindRoom context hydration can fetch history later, but installing context is
-not equivalent to admitting those messages as actionable requests. The required
-guarantees above therefore do not promise to replay every missed request.
-Changing that behavior or deleting the remaining gap-planning representation
-requires a separate explicit decision. The capacity, ownership, and decoding
-changes do not depend on that decision.
+Companion MindRoom context hydration remains separate from actionable admission.
+The recovery amendment states the supported bounds and server-visible-history
+limit; it does not promise to replay every possible missed request.
 
 ### Protocol and crypto-queue corrections from final review
 

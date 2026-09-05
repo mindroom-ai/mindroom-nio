@@ -117,7 +117,9 @@ Files: coordinator.py, base_client.py and only directly related codec helpers/te
 
 These are measurements at completion of this simplification pass. See the
 [follow-up execution record](type-correctness-and-work-reuse-plan.md#execution-record)
-for the latest combined source totals and verification.
+for subsequent typing and delivery measurements. The later
+[capacity execution record](classic-gap-recovery-plan.md#measured-results)
+tracks resumable Classic recovery, current source totals, and real-server gates.
 
 Raw Python source totals are 46,222 lines at `742806f` and 44,788 after
 simplification. The change removes 1,434 net production lines; the earlier

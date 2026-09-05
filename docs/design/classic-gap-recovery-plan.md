@@ -5,9 +5,9 @@
 
 **Goal:** Recover skipped Classic requests and reduce measured ingestion waste.
 
-**Architecture:** Capture bounded history before the source cursor commit;
-persist the evidence in the existing Frame; prepare and deliver it through the
-existing owner and journal. Reduce oversized requests at the same cursor.
+**Architecture:** Freeze one bounded Classic sync response, checkpoint bounded
+history pages through ordinary Frames, then commit its final tail. Reuse the
+existing owner, crypto preparation, admission, and journal.
 
 **Tech stack:** Python 3.12+, asyncio, SQLite, existing Matrix HTTP transport.
 
@@ -15,126 +15,151 @@ existing owner and journal. Reduce oversized requests at the same cursor.
 
 ## Global constraints
 
-- Preserve crypto/store ownership, authenticated persisted data, ordering,
-  admission identities, and prepared-output bounds.
-- Standard-library JSON; no runtime dependencies or new recovery scheduler.
+- Preserve ownership, authenticated persisted data, event order, admission
+  identities, and prepared-output bounds.
+- Standard-library JSON; no runtime dependencies or second delivery queue.
 - Cold history stays non-actionable. New recovery scope is Classic sync.
 - Preserve the user's uncommitted companion dependency changes.
-- Use persistent evidence directories, explicit staging, and fresh commits.
+- Use persistent evidence, explicit staging, and fresh commits.
+- Validate tests against the intended behavior; remove obsolete implementation
+  assertions instead of restoring excluded guarantees.
 
-## Task 1: Retain bounded history and recover the missing interval
+## Task 1: Recover limited Classic intervals
 
 Files: `src/nio/ingest/recovery.py`, `ports.py`, `source.py`, `coordinator.py`,
-`reducer.py`, `src/nio/client/base_client.py`, and
-`src/nio/store/_sync_journal_rows.py`, `_sync_journal.py`.
-Tests: new `tests/ingest/owned_recovery_test.py`, existing source/journal suites.
+`reducer.py`, `src/nio/client/base_client.py`, and journal/schema modules.
+Tests: owned recovery, phase, journal, completion, and existing source suites.
 
-- [ ] Add an owned-session regression with a trusted baseline, a limited fresh
-  tail, and a missing middle page. Assert all requests appear in order and
-  recovered events have `RECOVERED` provenance. Observe the failure first.
-
-```python
-assert [record.event_id for record in timeline] == ["$missed", "$fresh"]
-assert timeline[0].provenance is TimelineEventProvenance.RECOVERED
-assert session._journal.load_source().cursor_json == b'{"next_batch":"s2"}'
-```
-
-- [ ] Add optional canonical recovery evidence to StagedSourceResponse and its
-  authenticated Frame envelope. Reconstruct the recovered normalized view at
-  the journal boundary; keep the original sync body and digest unchanged.
-- [ ] Fetch bounded forward pages before staging; verify token progress and
-  completion. Feed recovered events through existing preparation/settlement.
-- [ ] Cover multi-page and empty advancing pages, retained-page restart,
-  duplicates, cold history, state/membership ordering, and incomplete recovery.
-  Assert failures preserve the source cursor and no partial callbacks run.
-- [ ] Run focused source, reducer, preparation, journal, and recovery tests;
-  self-review source/consumer ownership and commit the complete change.
+- [x] Reproduce missing-middle delivery in an owned session with a trusted
+  baseline. Assert recovered then fresh order and recovered provenance.
+- [x] Add authenticated recovery evidence and preserve the original response
+  digest. Keep capture and replay in the existing owner and journal.
+- [x] Replace whole-interval capture after its real capacity failure: retain
+  the original response once, checkpoint crypto prologue, bounded pages,
+  and final tail through independently identified Frames.
+- [x] Reproduce and fix restart, encryption, cross-page state and membership,
+  local departure ordering, multi-room phases, and final completion timing.
+- [x] Reproduce and fix review findings: ordinary completion during pending
+  recovery, eligibility behind queued Frames, invite/knock callback routing.
+- [x] Pass a 19 MiB history regression with bounded queued Work, ordered
+  delivery, unique record identities, and one final completion.
+- [ ] Complete the final full-suite and real-server acceptance gates below.
 
 ## Task 2: Keep oversized responses recoverable
 
-Files: `src/nio/ingest/recovery.py`, `coordinator.py`.
-Tests: `tests/ingest/owned_recovery_test.py`, `coordinator_test.py`.
+Files: `src/nio/ingest/recovery.py`, `classic.py`, `coordinator.py`.
+Tests: owned recovery and existing Classic/coordinator suites.
 
-- [ ] Reproduce an oversized response followed by a smaller valid response.
-  Assert the second request retains `since` and other filter selections.
+- [x] Bound owned Classic windows to 500, preserving smaller user limits.
+- [x] Halve oversized successful responses at the same cursor down to one.
+  Preserve other filter selections and recover limited history after narrowing.
+- [x] Bound pages to 100 events and 2 MiB; narrow oversized pages at the same
+  position. Retain the 16 MiB combined input and 24 MiB Frame limits.
+- [x] Cover irreducible oversize, pagination progress/cycles, empty pages,
+  adjacent overlap, bounded transient retries, and the 1,000-page watchdog.
+- [x] Review canonical bounds: the strict parser rejects floats and compact
+  UTF-8 encoding cannot expand an accepted unchanged root. Retain the defensive
+  post-encoding bound; do not invent encoder behavior to test an unreachable
+  expansion. Existing oversize/cursor-preservation cases pass.
 
-```python
-assert first_query["since"] == second_query["since"] == "s1"
-assert second_filter["room"]["timeline"]["limit"] < first_filter["room"]["timeline"]["limit"]
-```
+## Task 3: Remove measured redundant validation
 
-- [ ] Bound owned Classic windows to 500; halve on oversized successes down to
-  one. Cover irreducible oversize, canonical expansion, cancellation, and
-  history recovery after narrowing. Run focused tests and commit.
+Files: source carriers, coordinator settlement, and journal settlement.
 
-## Task 3: Remove measured redundant source validation
+- [x] Benchmark before implementation with alternating real-SQLite workloads.
+- [x] Remove internal frozen-source reconstruction and its unsupported
+  mutation-escape-hatch test; retain network/disk corruption checks.
+- [x] Remove repeated settlement event canonicalization; validate caller batch
+  on acknowledged retries, retaining authenticated full equality otherwise.
+- [x] Reject cache machinery without a convincing measured benefit.
+- [x] Run focused ownership, retry, source, and settlement tests for both
+  measured variants. Keep standard-library JSON.
 
-Files: `src/nio/ingest/ports.py`, `source.py`,
-`src/nio/store/_sync_journal.py`, `tests/ingest/classic_source_test.py`.
+## Task 4: Companion and final acceptance
 
-- [x] Measure alternating real-SQLite workloads before implementation. Chosen
-  change improves the two tested shapes by 2.64% and 1.85% median.
-- [x] Delete `_revalidated_staged_source_response` and its two internal calls.
-  Keep network/disk constructors and identity checks. Remove only the test of
-  the excluded frozen-object escape hatch; retain actual corruption tests.
-- [x] Run Classic/Sliding/source-journal tests, formatting, and type checks.
-  Review the final diff and commit without adding cache machinery.
+Companion files: recovered lifecycle admission and callback typing; tests for
+admission, owned sessions, bot readiness, crypto, and desktop integration.
 
-## Task 4: Companion acceptance and real capacity verification
-
-Files: companion `src/mindroom/matrix/durable_ingestion.py` and
-`tests/test_durable_ingestion_admission.py`; this plan and the contract.
-
-- [ ] Accept recovered lifecycle provenance, replace its obsolete rejection
-  case with positive coverage, and preserve LIVE-only reply grant semantics.
-- [ ] Run focused companion admission tests against local Nio source.
+- [x] Accept recovered lifecycle provenance with positive coverage, preserving
+  LIVE-only reply grants.
+- [x] Check focused companion integration against local Nio without changing
+  the user's dependency pins.
+- [ ] Reproduce pending delivery projection at the real admission boundary;
+  preserve rollback and the outstanding batch while the pump awaits its
+  existing outbox recovery task. Test success, no busy retry, cancellation,
+  and propagation of unrelated admission errors.
 - [ ] Run uninstrumented 200-conversation Tuwunel and Synapse 5,000-window
   controls. Require exact replies, zero duplicates, drained queues, and
-  continued post-load sync. Investigate any failure at its actual boundary.
-- [ ] Run full Nio pytest, ruff, black, pre-commit, and zero-error mypy checks.
-- [ ] Self-review architecture and changed code; record actual measurements,
-  limits, and source deltas here. Commit, push authorized branches, and verify
-  remote checks. Report precisely what passed and what remains.
+  continued post-load sync, with the existing deadline unchanged.
+- [x] Run final full Nio pytest, repository hooks, and zero-error mypy.
+- [x] Recheck companion integration and zero-error typing against final source.
+- [ ] Record actual production size, tests, performance, and capacity results.
+- [ ] Review final changes, commit, push authorized branches, and verify remote
+  checks. Report remaining limits without claiming unrelated gaps are closed.
 
 ## Measured results
 
-Baseline: Nio `1021de4`, 45,038 production Python lines. Earlier capacity
-control passed 200 conversations only on Synapse's 500-event window.
+Baseline: Nio `1021de4`, 45,038 production Python lines. The earlier successful
+capacity control used Synapse's 500-event window.
 
-Performance simplification committed as `44f7b91`: 29 production lines and the
-27-line unsupported mutation test removed; 491 Classic/Sliding/source-journal
-tests passed. No cache or runtime dependency was added.
+### Performance
 
-Recovery verification before the live controls: 434 source/reducer/preparation
-tests passed; 22 owned recovery/boundary tests passed; mypy found zero issues in
-71 source files. The broader coordinator/materializer run passed 541 tests and
-found four expectations of old polling behavior. After updating those three
-filter expectations and testing terminal oversize at the minimum window, all
-29 selected recovery and affected coordinator cases passed. Real capacity
-controls and final full-suite verification are in progress.
+Commit `44f7b91` removed 29 production lines and a 27-line unsupported mutation
+test. Five paired 500-message runs with 4,800-character bodies measured median
+total-delivery improvements of 2.64% for one Frame and 1.85% for 100 smaller
+Frames. All pairs improved; 491 focused source tests passed.
 
-The second performance experiment removed repeat event canonicalization during
-callback settlement and deferred caller-batch validation to acknowledged
-retries, where retained Work is unavailable. Outstanding settlement still
-reconstructs authenticated Work and requires full batch equality. Five paired
-runs with 1,000 messages and 4,800-character bodies improved by a median 4.67%
-(all pairs 3.79–5.75%). Short-message results were noisy. The change removes
-22 production lines and adds no dependency or cache; 101 focused tests passed
-for each tested variant.
+The second patch removes 22 production lines. Five paired 1,000-message runs
+with 4,800-character bodies measured median improvement of 4.67%
+(all pairs 3.79–5.75%); control median was 1,202.8 ms and candidate median
+1,137.1 ms. Short-message gains were noisy and are not claimed.
+Each variant passed 101 focused settlement/ownership tests. No dependency
+or cache was added. These are local delivery measurements, not application
+throughput claims; percentages must not be summed.
 
+### Capacity correction and regression verification
 
-## Corrective task: drain bounded recovery chunks
+The first Tuwunel rerun completed 200 canonical replies and initial drain, then
+failed the post-load reaction/sync fence after repeated whole-capture byte-limit
+errors. This was a failed acceptance run. Incremental recovery replaces that
+policy, draining bounded Work between pages.
 
-The first Tuwunel rerun passed 200 replies and initial drain, then failed the
-post-load fence at the recovery byte bound. Follow the measured-correction
-section of the design before claiming completion.
+The new 19 MiB backlog regression passes, along with staged/settled-page restart,
+encrypted recovery, and membership transition coverage. Independent review
+reproduced three additional issues and approved their fixes after six focused
+tests plus a cancellation/reopen probe.
 
-- [ ] Retain the frozen sync response separately and checkpoint small phase
-  progress in the source cursor, using the existing owner transaction.
-- [ ] Process crypto prologue, bounded recovered pages, and final sync tail
-  through ordinary independently identified Frames.
-- [ ] Add regressions for page restart, encrypted messages, cross-page
-  membership/state changes, local departures, multi-room ordering, and final
-  completion timing. Verify their failures before implementation.
-- [ ] Repeat both real capacity controls without changing acceptance criteria.
-- [ ] Re-run full checks, review production cost, commit, and push.
+A pre-final full suite passed 2,132 tests and skipped three, with six failures
+from schema/table inventory and internal dataclass-field assertions. Those
+expectations were updated to retain meaningful schema crash checks and value
+identity checks; all 151 model/crash tests then passed. Final full-suite and
+real capacity results follow.
+
+### Final local checks and production cost
+
+The final Python 3.14.7 suite passed 2,143 tests, skipped three, and reported
+three existing fork-with-threads deprecation warnings in 210.83 seconds.
+Full mypy reported zero issues in 71 source files. All repository hooks passed,
+including explicit checks of the new, not-yet-tracked source and tests.
+
+Companion validation against this local Nio source passed all 694 selected
+admission, journal ingress, bot readiness, client, and desktop tests. Its six
+changed-file hooks passed, including full source/test typing and module-boundary
+checks. The original checkout's dependency edits were preserved.
+
+Production Python totals are 45,847 lines in 71 files: 809 net lines above
+`1021de4`, and 375 below the original simplification baseline `742806f`.
+The new continuation and journal integration account for the increase; the
+two performance simplifications remove 51 production lines. This is a real
+correctness feature with maintenance cost, justified by the reproduced lost
+requests and whole-backlog stall, not a source-size reduction.
+
+The incremental Tuwunel rerun also failed the unchanged post-load fence.
+It completed all 200 replies and initial drain, with no recovery byte error.
+Three pending-delivery-projection exceptions escaped the companion pump and
+triggered receive-loop restarts with 5-, 10-, and 20-second delays. Other
+principals settled the fence reaction; the responder had not admitted it before
+the deadline, and its final retained tail still contained that reaction.
+This identifies a real admission retry defect and does not establish that
+removing restart delay alone will satisfy capacity. Preserve the exact fence
+and deadline for the next run. Synapse remains unrun.

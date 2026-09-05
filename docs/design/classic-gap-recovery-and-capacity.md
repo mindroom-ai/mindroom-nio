@@ -14,162 +14,186 @@ repair but never became actionable requests. A Synapse experiment with a
 are failures of the complete request path, despite correct journal internals.
 
 The fix must recover a limited interval for an already joined, hydrated room,
-deliver recovered requests through the existing admission path, and preserve
-the recovered input across restart. It must retry oversized sync responses
-without advancing the cursor. Validate both reported server configurations with
-200 concurrent conversations, exact replies, no duplicates, drained queues,
-and continued post-load sync. This is not a 200-account capacity claim.
+deliver recovered requests through existing admission, and preserve captured
+input across restart. It must retry oversized sync responses without advancing
+the cursor. Validate both reported server configurations with 200 concurrent
+conversations, exact replies, no duplicates, drained queues, and continued
+post-load sync. This is not a 200-account capacity claim.
 
 ## Ownership and alternatives
 
 Nio owns the active Classic source cursor, missing-interval capture, crypto
 preparation, and durable delivery. MindRoom owns application admission and
 conversation display/context. Its existing context hydration does not trigger
-actions; adding a second application history-to-action queue would duplicate
+actions; adding another application history-to-action queue would duplicate
 ordering and deduplication responsibilities. Increasing server limits alone
 does not address response bytes or servers that clamp the requested limit.
 
-Use bounded capture before committing the source cursor. Keep the original
-canonical sync response and canonical recovery pages in the same authenticated
-Frame envelope. The existing preparation transaction then consumes one ordered
-normalized view. This avoids a second durable recovery scheduler or a second
-crypto writer. If capture is cancelled or crashes before staging, the old
-cursor remains; after staging, restart uses the retained pages without HTTP.
+The first implementation captured the whole missing interval in one bounded
+Frame. Its Tuwunel rerun delivered all 200 canonical replies and drained the
+queues, then repeatedly failed the post-load fence at the 16 MiB capture bound.
+The tested server enforces the requested forward bound; pages contained no
+duplicated lazy-member state. Retained evidence points to a genuine backlog
+of streaming edits, although exact failed page sizes were not retained.
 
-## Capture and replay
+The final design checkpoints bounded recovery pages and drains between them.
+This adds a continuation state machine because the measured workload requires
+it. It reuses ordinary Frames, preparation, Work, settlement, and retirement;
+it adds neither another crypto writer nor another application delivery queue.
+
+## Recovery eligibility and pagination
 
 For a limited Classic JOIN/LEAVE timeline with a trusted prior joined-room
 baseline, fetch `/messages` forwards from the request's `since` token to the
-new timeline's `prev_batch`. Both tokens are opaque. Keep source filters
-unchanged on sync retries. Recovery supports timeline limit and lazy-member
-settings; selectors such as `types`, `not_types`, or sender filters cannot
-prove intervening state ordering and fail explicitly before cursor commit.
-MindRoom's unfiltered timeline is supported. Initial sync and rooms without a trusted
-prior baseline do not acquire actionable cold history through this path.
+new timeline's `prev_batch`. Both tokens are opaque. Eligibility is evaluated
+after older Frames have settled, so queued departures cannot leave stale
+joined-room authority. If shutdown polling already captured a limited response,
+hold that bounded response locally while older Frames drain, retaining its
+original request identity. A crash before durable capture leaves the old cursor
+available for refetch.
+
+Keep source filters unchanged on sync retries except for the bounded timeline
+limit. Recovery supports limit and lazy-member settings; selectors such as
+`types`, `not_types`, or sender filters cannot prove intervening state ordering
+and fail explicitly before capture. MindRoom's unfiltered timeline is supported.
+Initial sync and rooms without a trusted prior baseline do not acquire
+actionable cold history.
 
 The Matrix endpoint accepts sync tokens as both bounds. Tuwunel uses exclusive
 forward bounds; its `end` usually identifies the last returned event rather
 than equalling `to`. Continue until `end` is absent or reaches the target.
-An empty chunk with a progressing `end` is not exhaustion. Recovery covers
+An empty chunk with a progressing `end` is not exhaustion. Reject stalled or
+cyclic tokens, malformed pages, and mismatched starts. Recovery covers
 server-visible events; it cannot restore history hidden by access controls.
-Reject stalled or
-cyclic tokens, malformed pages, and mismatched page starts. See the
-[Matrix pagination contract](https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv3roomsroomidmessages).
+See the [Matrix pagination contract](https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv3roomsroomidmessages).
 
-Store recovery evidence separately from the original wire response in optional
-`StagedSourceResponse.recovery_json`. It records room IDs, exact bounds, and
-canonical pages. The Frame payload authentication covers it; the existing
-source digest continues to identify the original sync response. Disk decoding
-checks the evidence and its binding to the retained request and room segment.
+## Durable phases and replay
 
-Recovered events precede the fresh timeline and receive `RECOVERED` provenance.
-Drop duplicate timeline IDs at the join boundary. State changes present in the
-recovered interval must execute in timeline order: omit their later copies
-from the sync state block rather than applying future state before old events.
-Keep existing membership transitions, authorization snapshots, departure
-fences, crypto preparation, admission identities, and callback settlement.
-MindRoom already admits recovered messages. Its lifecycle validator must also
-accept recovered provenance; recovery does not grant fresh reply permissions.
+Freeze the original bounded canonical sync response once in an authenticated
+singleton `NioIngestRecovery` row. Keep a small continuation in the existing
+Classic source cursor; its global `next_batch` remains unchanged. The continuation
+pins the response digest, eligible rooms, phase, room index, page position,
+and pagination progress. Do not put the response body inside the cursor or
+refetch a moving sync target.
+
+Drain normal, independently identified child Frames through the existing owner:
+
+1. A prologue processes retained to-device events and device-key updates once.
+2. Each page contains recovered timeline events, with no later sync state,
+   fresh tail, or fabricated room-section membership. Persist its evidence
+   and successor continuation atomically before preparation or callbacks.
+3. The final Frame applies retained state and fresh timelines after recovered
+   history, with the remaining sync sections. It commits the original
+   `next_batch` and removes the pending recovery row atomically.
+
+Each child has a distinct request and Frame identity and is independently
+replayable from its authenticated payload. Optional
+`StagedSourceResponse.recovery_json` retains the page alongside the original
+sync response in that Frame. Disk decoding checks its binding to the request
+and room segment. A staged page replays without another HTTP fetch; after a
+settled page, restart resumes from the persisted continuation.
+
+Keep one child active at a time. The singleton retains input, not another
+delivery queue. Internal children do not emit completed-sync callbacks or
+satisfy quiescence; those belong to the final Frame. Completion eligibility
+uses the completed Frame's authenticated candidate cursor, so starting another
+recovery cannot suppress a previously committed ordinary completion.
+
+## Event order and authority
+
+Recovered events receive `RECOVERED` provenance. Drop duplicate IDs within a
+page, across adjacent page overlap, and against the retained fresh tail.
+Recovered state changes execute in timeline order before retained sync state
+or fresh events. Rooms are recovered in their pinned order.
+
+Recovery eligibility stays pinned across recovered leave/invite/knock/rejoin
+events, while membership epochs, permission snapshots, callback routing, and
+departure fences follow event order. Existing invited and joined projections
+remain the owners of their respective callback routes. A trusted baseline can
+survive a complete recovered transition sequence without a future-state
+hydration request interrupting that sequence.
+
+Local membership commands wait behind older pending recovery or a locally
+captured limited response. They cannot interleave with old history and then
+have their departure authority undone by replay.
+
+MindRoom already admits recovered messages. Its lifecycle validator also
+accepts recovered provenance; recovery does not grant fresh reply permissions.
+Cold context repair remains non-actionable.
+
+An interactive source may reach admission while an attempted outgoing edit is
+still awaiting durable projection. Keep the existing atomic admission rollback
+and prompt-selection barrier. The companion pump must treat the specific
+`DeliveryProjectionPendingError` as a wait for its existing outbox recovery
+task, then retry the same unacknowledged batch. It must not restart transport,
+acknowledge early, create a second recovery queue, or repeatedly poll admission.
+Other admission errors still propagate. Cancellation stops the pump promptly
+without cancelling the independently owned outbox recovery task.
 
 ## Bounds and failure
 
 Owned Classic polling requests at most 500 timeline events, retaining any
 smaller user limit and other filter settings. If a successful response exceeds
-the wire/canonical byte bound, halve that requested limit and retry from the
-same cursor. Never truncate JSON, skip a sync token, or discard key traffic.
-At a one-event request, intrinsically oversized non-timeline data remains a
-clear source error requiring intervention.
+the wire or canonical byte bound, halve the requested limit and retry from the
+same cursor, down to one. Never truncate JSON, skip a sync token, or discard
+key traffic. Intrinsically oversized non-timeline data at the minimum window
+remains a clear source error requiring intervention.
 
-Recovery pages request at most 100 events. Bound one capture to 100 pages,
-10,000 events, and 16 MiB for the original response plus recovery evidence.
-Use bounded retries for transient page failures. An unavailable, malformed,
-stalled, or over-budget interval fails explicitly before cursor commit;
-the source can be reopened at its old cursor. This provides recoverable
-request delivery within stated bounds, not unlimited archival replay.
-Keep all existing prepared-output, Work, and crypto transaction limits.
+Recovery requests at most 100 events per page and bounds both the wire page
+body and canonical evidence to 2 MiB. Narrow an oversized page at the same position down
+to one event. The original response plus one page must fit the existing
+16 MiB staged-response bound, and the authenticated Frame must fit its existing
+24 MiB bound. Keep the existing prepared-output, Work, and crypto limits.
 
-This amendment addresses the measured Classic failure. Sliding restart overlap
-recovery and explicit loss semantics retain their existing contract; no new
-claim of complete Sliding gap replay is made.
+A 1,000-page watchdog bounds all eligible rooms in one frozen sync response.
+Retain only bounded pagination
+history and adjacent overlap IDs; total interval bytes are not accumulated
+in memory or one Frame. Allow three attempts total per page request, including
+the initial attempt, for transient failures.
+Unavailable, malformed, stalled, irreducibly oversized, or exhausted-watchdog
+recovery stops explicitly. The global source cursor remains unchanged; already
+settled pages stay settled and reopening resumes at the retained page position.
+Reopening does not reset an exhausted watchdog; that case requires intervention.
+A later failure does not roll back callbacks from earlier pages.
 
-## Performance decision
+This provides recoverable request delivery within stated limits, not unlimited
+archival replay. Sliding restart overlap recovery and explicit loss semantics
+retain their existing contract; this amendment makes no new Sliding gap claim.
 
-Measured five alternating pairs with 500 messages containing 4,800-character
-bodies. Removing internal reconstruction of already validated frozen source
-carriers reduced total delivery time by a median 2.64% for one frame and 1.85%
-for 100 frames of five messages. All pairs improved. Network constructors,
-disk constructors, payload authentication, and final identity checks remain.
-The removed checks defend object mutation through an explicitly unsupported
-Python escape hatch. Remove that obsolete test instead of preserving the
-implementation for its error-string assertion.
+## Performance decisions
 
-A Frame-cache experiment measured 0.24%/3.38% median gains across those shapes;
-duplicate stage-encoding removal measured 0.71%/0.36%. Neither warrants adding
-cache machinery. These microbenchmarks establish modest local improvements,
-not application throughput gains. Re-run the complete workload after recovery;
-record observed costs and any remaining bottleneck without attributing HTTP
-wait entirely to Nio or summing overlapping asynchronous durations.
+Five alternating pairs with 500 messages containing 4,800-character bodies
+measured removal of internal reconstruction of already validated frozen source
+carriers. Median total delivery time improved 2.64% for one Frame and 1.85%
+for 100 Frames of five messages; all pairs improved. Network/disk constructors,
+payload authentication, and final identity checks remain. The removed checks
+defend mutation through an explicitly unsupported Python escape hatch.
+
+A second experiment removed repeated event canonicalization during callback
+settlement and deferred caller-batch validation to acknowledged retries, where
+retained Work is unavailable. Outstanding settlement still reconstructs
+authenticated Work and requires full batch equality. Five paired runs with
+1,000 messages and 4,800-character bodies improved a median 4.67%
+(all pairs 3.79–5.75%). Short-message results were noisy.
+
+Together these changes remove 51 production lines, without a dependency or
+cache. Do not add the percentage gains together or claim an application
+throughput improvement. Frame caching and duplicate stage-encoding removal
+did not show enough consistent benefit to justify more machinery. Keep
+standard-library JSON; the measured codec experiment did not justify orjson.
 
 ## Verification and remaining limits
 
 Use real owned SQLite sessions with mocked HTTP only at the network boundary.
-Cover the missing middle interval, multiple/empty pages, restart after staging,
-duplicates, cold sync, membership/state ordering, unavailable history, and
-oversized retry at the unchanged cursor. Keep corruption/replay tests and the
-zero-error mypy gate. Then run the real Tuwunel and Synapse capacity harnesses
-without instrumentation, using current local Nio source and preserving the
-user's companion dependency edits.
+Cover intervals larger than one Frame, empty advancing pages, staged-page and
+settled-page restart, corruption, encrypted recovered messages, state and
+membership transitions, local departures, multiple rooms, cold sync,
+completion timing, and oversized retry at the unchanged cursor.
 
-Record actual suite counts, benchmarks, production size, integration results,
-and unresolved limits in the accompanying implementation plan. Do not call the
-cutover complete solely because internal tests pass. The separately documented
-interactive key-share restart gap remains a separate task.
-
-## Measured correction: bounded chunks instead of one whole interval
-
-The first Tuwunel 200-conversation rerun completed all 200 canonical replies
-and drained existing queues, but failed the post-load reaction/sync fence.
-Recovery repeatedly exceeded the combined 16 MiB capture bound. The tested
-server enforces the requested forward bound, and recovery pages contain no
-duplicated lazy-member state. The retained evidence points to a genuine backlog
-of streaming edits; exact failed page sizes were not retained. Raising the
-aggregate cap would preserve the same stall mechanism.
-
-This supersedes the whole-interval capture and total-byte policy above. Freeze
-the original bounded sync response once in a singleton authenticated
-`NioIngestRecovery` row. Keep a small continuation in the existing Classic
-source cursor; its global `next_batch` remains unchanged. The continuation
-pins the response digest, eligible rooms, phase, current room, page position,
-and pagination progress. Do not put the response body inside the cursor,
-refetch a moving sync target, or add another crypto writer.
-
-Drain normal, independently identified child Frames through the existing owner:
-
-1. A prologue processes retained to-device events and device-key updates once.
-2. Recovery pages contain only recovered timeline events, with no later sync
-   state, fresh tail, or fabricated room-section membership. Persist each page
-   and its successor continuation atomically before preparation or callbacks.
-3. The final Frame applies retained state and fresh timelines after recovered
-   history, along with the remaining sync sections. It commits the original
-   next_batch and removes the pending recovery row atomically.
-
-Each child remains independently replayable from its authenticated payload.
-Keep one child active at a time; the singleton is a retained input, not another
-delivery queue. Reuse ordinary Frame preparation, Work bounds, acknowledgement,
-and retirement. Internal children do not emit completed-sync callbacks or
-satisfy quiescence; those belong to the final Frame.
-
-Bound page requests and retained page bytes, narrowing an oversized page at
-the same position. Drain between pages so interval size does not become
-in-memory Work size. Keep a finite pagination watchdog and reject stalled
-tokens. Recovery eligibility stays pinned across recovered leave/rejoin
-events; membership epochs and permission snapshots still follow event order.
-Local membership operations must not interleave with an older pending
-interval in a way that restores departed authority.
-
-Tests must exercise restart around page staging, keys needed by recovered
-encrypted messages, membership/state changes across page boundaries, multiple
-rooms, final callback timing, and the original end-to-end capacity criteria.
-This change adds a real continuation state machine because the workload exposed
-a need for it; redundant internal validation and duplicate delivery mechanisms
-remain excluded.
+Run full tests, repository hooks, and zero-error mypy, then the real Tuwunel
+and Synapse capacity harnesses without instrumentation. Use current local Nio
+source and preserve the user's companion dependency edits. Record actual
+counts, production size, benchmarks, integration results, and remaining limits
+in the implementation plan. Internal tests alone do not establish cutover
+readiness. The separately documented interactive key-share restart gap remains
+a separate task.
