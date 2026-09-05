@@ -1596,13 +1596,6 @@ class Client:
             ephemeral_by_room[room_id].append(
                 (payload, value, EphemeralEvent.parse_event(deepcopy(value)))
             )
-        parsed_presence = _parse_ingestion_events(
-            frame.presence_json,
-            "presence event",
-            lambda value: _require_parsed_ingestion_event(
-                PresenceEvent.from_dict(value), PresenceEvent, "presence event"
-            ),
-        )
         parsed_global_account_data = _parse_ingestion_events(
             frame.global_account_data_json,
             "global account-data event",
@@ -2005,21 +1998,6 @@ class Client:
                 )
 
         self.encrypted_rooms.update(encrypted_room_ids)
-        for payload, raw, event in parsed_presence:
-            for room in self.rooms.values():
-                user = room.users.get(event.user_id)
-                if user is None:
-                    continue
-                user.presence = event.presence
-                user.last_active_ago = event.last_active_ago
-                user.currently_active = event.currently_active
-                user.status_msg = event.status_msg
-            append_record(
-                RecordKind.PRESENCE,
-                payload,
-                raw,
-                callback_route=_CallbackRoute.PRESENCE,
-            )
         for payload, raw, _event in parsed_global_account_data:
             append_record(
                 RecordKind.GLOBAL_ACCOUNT_DATA,

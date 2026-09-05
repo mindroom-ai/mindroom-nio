@@ -887,7 +887,7 @@ def test_one_delivery_cycle_authenticates_constant_work_with_large_ready_invento
     for index in range(1, 501):
         record = replace(
             _ready_event(index),
-            kind=RecordKind.PRESENCE,
+            kind=RecordKind.GLOBAL_ACCOUNT_DATA,
             room_id=None,
             membership_epoch=None,
             room_sequence=None,
@@ -916,7 +916,7 @@ def test_one_delivery_cycle_authenticates_constant_work_with_large_ready_invento
     assert batch.records == (
         replace(
             _ready_event(1),
-            kind=RecordKind.PRESENCE,
+            kind=RecordKind.GLOBAL_ACCOUNT_DATA,
             room_id=None,
             membership_epoch=None,
             room_sequence=None,

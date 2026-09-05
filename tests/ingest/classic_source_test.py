@@ -409,8 +409,6 @@ def test_initial_sync_normalizes_every_classic_section_in_fixed_order(
         b'{"content":{"tags":{"u.left":{}}},"type":"m.tag"}',
     )
     assert frame.ephemeral_json == (
-        b'{"event":{"content":{"user_ids":["@bob:example.org"]},'
-        b'"type":"m.typing"},"room_id":"!z-join:example.org"}',
         b'{"event":{"content":{"$z-live-2":{"m.read":'
         b'{"@me:example.org":{"ts":7}}}},"type":"m.receipt"},'
         b'"room_id":"!z-join:example.org"}',
@@ -440,14 +438,6 @@ def test_initial_sync_normalizes_every_classic_section_in_fixed_order(
         b'"type":"m.direct"}',
         b'{"content":{"@alice:example.org":["!a-join:example.org"]},'
         b'"type":"m.direct"}',
-    )
-    assert frame.presence_json == (
-        b'{"content":{"presence":"online","status_msg":"Caf\xc3\xa9"},'
-        b'"sender":"@alice:example.org","type":"m.presence"}',
-        b'{"content":{"last_active_ago":42,"presence":"unavailable"},'
-        b'"sender":"@bob:example.org","type":"m.presence"}',
-        b'{"content":{"last_active_ago":42,"presence":"unavailable"},'
-        b'"sender":"@bob:example.org","type":"m.presence"}',
     )
 
 
@@ -527,7 +517,6 @@ def test_empty_sync_is_a_durable_frame_and_preserves_fallback_capability(
     assert result.frame.to_device_json == ()
     assert result.frame.ephemeral_json == ()
     assert result.frame.global_account_data_json == ()
-    assert result.frame.presence_json == ()
     assert result.frame.device_list_delta_json == b'{"changed":[],"left":[]}'
     assert result.frame.one_time_key_counts_json == b"{}"
     assert result.frame.unused_fallback_key_types_json == expected

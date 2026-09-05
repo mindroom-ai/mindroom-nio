@@ -318,7 +318,6 @@ def _validate_prepared_metadata_semantics(
             _CallbackRoute.EPHEMERAL: {RecordKind.EPHEMERAL},
             _CallbackRoute.ROOM_ACCOUNT_DATA: {RecordKind.ROOM_ACCOUNT_DATA},
             _CallbackRoute.GLOBAL_ACCOUNT_DATA: {RecordKind.GLOBAL_ACCOUNT_DATA},
-            _CallbackRoute.PRESENCE: {RecordKind.PRESENCE},
             _CallbackRoute.TO_DEVICE: {RecordKind.TO_DEVICE},
         }
         if (

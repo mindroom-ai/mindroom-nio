@@ -63,7 +63,6 @@ def _mixed_frame() -> SyncFrame:
         (segment,),
         (b'{"event":{"type":"ephemeral"},"room_id":"!room:example.org"}',),
         (b'{"type":"global"}',),
-        (b'{"type":"presence"}',),
     )
 
 

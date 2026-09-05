@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from asyncio import sleep as _cooperative_sleep
 from hashlib import sha256
@@ -9,10 +10,11 @@ from urllib.parse import quote, urlencode
 from uuid import UUID, uuid5
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError
+from jsonschema.exceptions import ValidationError
 
 from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 from ..events.account_data import AccountDataEvent
-from ..events.ephemeral import EphemeralEvent
+from ..events.ephemeral import EphemeralEvent, TypingNoticeEvent
 from ..events.invite_events import InviteEvent
 from ..events.misc import BadEvent, UnknownBadEvent
 from ..events.presence import PresenceEvent
@@ -36,6 +38,7 @@ from ..responses import (
     RoomLeaveResponse,
     ToDeviceResponse,
 )
+from ..schemas import Schemas, validate_json
 from ..store._sync_journal_rows import (
     _decoded_bytes,
     _encoded_bytes,
@@ -936,11 +939,76 @@ class _OwnedIngestionSession:
                 quiesce_reserved=self._quiesce_source_commit_target is not None,
             )
             self._source_commit_generation += 1
+            await self._deliver_transient_observations(result.response_body)
             if (
                 self._quiesce_source_commit_target is not None
                 and self._source_commit_generation >= self._quiesce_source_commit_target
             ):
                 return
+
+    async def _deliver_transient_observations(self, response_body: bytes) -> None:
+        """Best-effort observations from fresh, committed responses only."""
+        root = load_json(response_body, "fresh source response")
+        discarded = False
+        try:
+            async with asyncio.timeout(1):
+                if type(self._source) is ClassicSource:
+                    typing = (
+                        (room_id, event)
+                        for rooms in root.get("rooms", {}).values()
+                        for room_id, room in rooms.items()
+                        for event in room.get("ephemeral", {}).get("events", [])
+                        if event.get("type") == "m.typing"
+                    )
+                    presence = root.get("presence", {})
+                else:
+                    extensions = root.get("extensions", {})
+                    typing = extensions.get("typing", {}).get("rooms", {}).items()
+                    presence = extensions.get("presence", {})
+                for room_id, raw in typing:
+                    await _cooperative_sleep(0)
+                    try:
+                        validate_json(raw, Schemas.m_typing)
+                        if raw["type"] != "m.typing":
+                            raise ValueError("invalid typing type")
+                    except (ValidationError, ValueError):
+                        discarded = True
+                        continue
+                    room = self._client.rooms.get(room_id)
+                    if room is not None:
+                        event = TypingNoticeEvent(raw["content"]["user_ids"])
+                        event.source = raw
+                        room.handle_ephemeral_event(event)
+                        await self._client._on_ephemeral(event, room)
+                for raw in presence.get("events", []):
+                    await _cooperative_sleep(0)
+                    try:
+                        validate_json(raw, Schemas.presence)
+                    except ValidationError:
+                        discarded = True
+                        continue
+                    content = raw["content"]
+                    presence_event = PresenceEvent(
+                        raw["sender"],
+                        content["presence"],
+                        content.get("last_active_ago"),
+                        content.get("currently_active"),
+                        content.get("status_msg"),
+                    )
+                    for room in self._client.rooms.values():
+                        user = room.users.get(presence_event.user_id)
+                        if user is not None:
+                            user.presence = presence_event.presence
+                            user.last_active_ago = presence_event.last_active_ago
+                            user.currently_active = presence_event.currently_active
+                            user.status_msg = presence_event.status_msg
+                    await self._client._on_presence(presence_event)
+        except Exception:
+            # Callback failures, timeout, and malformed transient sections never
+            # affect durable progress. External cancellation is a BaseException.
+            discarded = True
+        if discarded:
+            logging.getLogger(__name__).warning("Discarded transient sync observations")
 
     @staticmethod
     def _network_result(
@@ -2014,38 +2082,6 @@ class _OwnedIngestionSession:
                             event,
                             projected_room,
                         )
-                    terminal = True
-                elif (
-                    type(record) is EventRecord
-                    and record.kind is RecordKind.PRESENCE
-                    and room is None
-                    and metadata is not None
-                    and metadata.preparation_phase is _PreparationPhase.SOURCE
-                    and metadata.decryption is _DecryptionDisposition.NONE
-                    and metadata.decryption_verified is None
-                    and metadata.decrypted_to_device_kind is None
-                    and metadata.callback_route is _CallbackRoute.PRESENCE
-                ):
-                    source = _load_settlement_event(
-                        record.source_json,
-                        "presence event",
-                        "presence event source is invalid",
-                    )
-                    if source.get("type") != metadata.effective_event_type:
-                        raise JournalIntegrityError("presence event source is invalid")
-                    event = PresenceEvent.from_dict(source)
-                    if type(event) is not PresenceEvent:
-                        raise JournalIntegrityError("presence event source is invalid")
-                    for projected_room in self._client.rooms.values():
-                        user = projected_room.users.get(event.user_id)
-                        if user is None:
-                            continue
-                        user.presence = event.presence
-                        user.last_active_ago = event.last_active_ago
-                        user.currently_active = event.currently_active
-                        user.status_msg = event.status_msg
-                    if receipt_new:
-                        await self._client._on_presence(event)
                     terminal = True
                 elif (
                     type(record) is EventRecord

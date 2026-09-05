@@ -681,7 +681,10 @@ def _parity_response(
         "sender": BOB,
         "type": "m.room.message",
     }
-    typing = {"content": {"user_ids": [BOB]}, "type": "m.typing"}
+    receipt = {
+        "content": {"$parity-message": {"m.read": {BOB: {"ts": 3}}}},
+        "type": "m.receipt",
+    }
     room_account_data = {
         "content": {"tags": {"u.work": {"order": 1}}},
         "type": "m.tag",
@@ -714,7 +717,7 @@ def _parity_response(
                     "join": {
                         ROOM: {
                             "account_data": {"events": [room_account_data]},
-                            "ephemeral": {"events": [typing]},
+                            "ephemeral": {"events": [receipt]},
                             "state": {"events": [member]},
                             "timeline": {"events": [message], "limited": False},
                         }
@@ -745,7 +748,7 @@ def _parity_response(
                 "events": [to_device] if nonempty else [],
                 "next_batch": "td1",
             },
-            "typing": {"rooms": {ROOM: typing} if nonempty else {}},
+            "receipts": {"rooms": {ROOM: receipt} if nonempty else {}},
         },
         "lists": {RESERVED_ALL_ROOMS_LIST: {"count": int(nonempty)}},
         "pos": "p1",
@@ -866,7 +869,6 @@ def _sync_frame_parity(frame: SyncFrame) -> object:
         segments,
         frame.ephemeral_json,
         frame.global_account_data_json,
-        frame.presence_json,
     )
 
 
@@ -1125,7 +1127,6 @@ async def _owned_transport_parity_case(
             ) == (1, 1, 1, 0)
             assert len(normalized.ephemeral_json) == 1
             assert len(normalized.global_account_data_json) == 1
-            assert len(normalized.presence_json) == 1
             assert len(prepared.room_snapshots) == 1
             assert prepared.records
         else:
@@ -18640,12 +18641,10 @@ async def test_owned_settle_state_uses_invite_parser_or_snapshot_only(
         await restored_session.close()
 
 
-@pytest.mark.parametrize("target", ["presence", "ephemeral", "room-account-data"])
+@pytest.mark.parametrize("target", ["ephemeral", "room-account-data"])
 @pytest.mark.asyncio
 async def test_owned_settle_auxiliary_state_before_receipt_callback(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-    target: str,
+    tmp_path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
     from nio.client.base_client import _room_snapshot
 
@@ -18698,22 +18697,17 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         pending = session._journal.load_pending_hydrations(limit=2)
         assert len(pending) == 1
         hydrated = normalize_hydration_response(
-            pending[0],
-            own_user_id=ACCOUNT,
-            response_body=hydration_state(),
+            pending[0], own_user_id=ACCOUNT, response_body=hydration_state()
         )
         assert session._journal.apply_hydration_result(result=hydrated) is not None
-
         fifo = (
             RecordKind.ROOM_LIFECYCLE,
-            RecordKind.PRESENCE,
             RecordKind.STATE,
             RecordKind.STATE,
             RecordKind.EPHEMERAL,
             RecordKind.ROOM_ACCOUNT_DATA,
         )
         target_kind = {
-            "presence": RecordKind.PRESENCE,
             "ephemeral": RecordKind.EPHEMERAL,
             "room-account-data": RecordKind.ROOM_ACCOUNT_DATA,
         }[target]
@@ -18742,12 +18736,9 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         ).fetchone()[0]
     finally:
         await session.close()
-
     reopened = reopen_owned_bootstrap(tmp_path, generation)
     restored_client = owned_client(tmp_path)
-    restored_client.config = replace(
-        restored_client.config,
-    )
+    restored_client.config = replace(restored_client.config)
     restored_session = open_owned_session(restored_client, reopened, generation)
     connection = restored_session._owned_store.database.connection()
     try:
@@ -18755,17 +18746,12 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         room = restored_client.rooms[ROOM]
         assert type(room) is nio.MatrixRoom
         assert (
-            _room_snapshot(
-                room,
-                snapshot.membership_epoch,
-                snapshot.own_membership,
-            )
+            _room_snapshot(room, snapshot.membership_epoch, snapshot.own_membership)
             == snapshot
         )
         assert BOB in room.users
-        if target != "presence":
-            room.name = "corrupted auxiliary snapshot"
-            room.users[ACCOUNT].display_name = "Corrupted auxiliary Alice"
+        room.name = "corrupted auxiliary snapshot"
+        room.users[ACCOUNT].display_name = "Corrupted auxiliary Alice"
         room.fully_read_marker = "$aux-keep"
         room.tags = {"u.keep": {"order": 0.25}}
         room.typing_users = [ACCOUNT]
@@ -18777,27 +18763,11 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             room.users[ACCOUNT].status_msg,
         ) = alice_presence
         mutated_snapshot = _room_snapshot(
-            room,
-            snapshot.membership_epoch,
-            snapshot.own_membership,
+            room, snapshot.membership_epoch, snapshot.own_membership
         )
-        assert (mutated_snapshot != snapshot) is (target != "presence")
-
+        assert mutated_snapshot != snapshot
         expected_metadata = {
-            "presence": (
-                "m.presence",
-                _CallbackRoute.PRESENCE,
-                None,
-                None,
-                None,
-            ),
-            "ephemeral": (
-                "m.typing",
-                _CallbackRoute.EPHEMERAL,
-                ROOM,
-                0,
-                3,
-            ),
+            "ephemeral": ("m.receipt", _CallbackRoute.EPHEMERAL, ROOM, 0, 3),
             "room-account-data": (
                 "m.tag",
                 _CallbackRoute.ROOM_ACCOUNT_DATA,
@@ -18837,11 +18807,7 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         def assert_snapshot_overlay() -> None:
             assert restored_client.rooms[ROOM] is room
             assert (
-                _room_snapshot(
-                    room,
-                    snapshot.membership_epoch,
-                    snapshot.own_membership,
-                )
+                _room_snapshot(room, snapshot.membership_epoch, snapshot.own_membership)
                 == snapshot
             )
 
@@ -18860,22 +18826,13 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
                 room.users[ACCOUNT].currently_active,
                 room.users[ACCOUNT].status_msg,
             ) == alice_presence
-            if target != "ephemeral":
-                assert room.typing_users == [ACCOUNT]
+            assert room.typing_users == [ACCOUNT]
             if target != "room-account-data":
                 assert room.tags == {"u.keep": {"order": 0.25}}
 
         def assert_applied() -> None:
-            if target == "presence":
-                bob = room.users[BOB]
-                assert (
-                    bob.presence,
-                    bob.last_active_ago,
-                    bob.currently_active,
-                    bob.status_msg,
-                ) == ("online", 0, True, "ready")
-            elif target == "ephemeral":
-                assert room.typing_users == [BOB]
+            if target == "ephemeral":
+                assert room.read_receipts[BOB].event_id == "$parity-message"
             else:
                 assert room.tags == {"u.work": {"order": 1}}
             assert_preserved_auxiliary()
@@ -18908,13 +18865,9 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
                 None,
                 expected_metadata[1],
             )
-            assert room_value == (None if target == "presence" else aggregate)
+            assert room_value == aggregate
             assert (
-                _room_snapshot(
-                    room,
-                    snapshot.membership_epoch,
-                    snapshot.own_membership,
-                )
+                _room_snapshot(room, snapshot.membership_epoch, snapshot.own_membership)
                 == mutated_snapshot
             )
             assert_outside_owner_transaction()
@@ -18926,7 +18879,6 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         applied: list[object] = []
         real_ephemeral_parse = EphemeralEvent.parse_event
         real_account_parse = AccountDataEvent.parse_event
-        real_presence_parse = PresenceEvent.from_dict
         real_handle_ephemeral = room.handle_ephemeral_event
         real_handle_account = room.handle_account_data
 
@@ -18934,20 +18886,16 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             raise AssertionError("auxiliary settlement replayed a wrong path")
 
         def observe_parse(
-            _event_type: type[object],
-            event_source: dict[object, object],
+            _event_type: type[object], event_source: dict[object, object]
         ) -> object:
             assert len(authenticated) == 1
             assert event_source == source
             assert_snapshot_overlay()
             assert_outside_owner_transaction()
             assert_outstanding()
-            if target == "presence":
-                event = real_presence_parse(event_source)
-                assert type(event) is PresenceEvent
-            elif target == "ephemeral":
+            if target == "ephemeral":
                 event = real_ephemeral_parse(event_source)
-                assert type(event) is nio.TypingNoticeEvent
+                assert type(event) is nio.ReceiptEvent
             else:
                 event = real_account_parse(event_source)
                 assert type(event) is nio.TagEvent
@@ -18961,41 +18909,20 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             assert_outside_owner_transaction()
             assert_outstanding()
             if target == "ephemeral":
-                real_handle_ephemeral(event)  # type: ignore[arg-type]
+                real_handle_ephemeral(event)
             else:
                 assert target == "room-account-data"
-                real_handle_account(event)  # type: ignore[arg-type]
+                real_handle_account(event)
             applied.append(event)
             assert_applied()
 
         forbidden_callbacks: list[str] = []
         _install_owned_settlement_callback_tripwires(
-            restored_client,
-            forbidden_callbacks,
+            restored_client, forbidden_callbacks
         )
         routed: list[object] = []
         callbacks: list[object] = []
-        if target == "presence":
-            restored_client.presence_callbacks.clear()
-            real_route = restored_client._on_presence
-
-            async def callback(event: object) -> None:
-                assert parsed == [event]
-                assert_applied()
-                assert_outside_owner_transaction()
-                assert_outstanding()
-                callbacks.append(event)
-
-            async def observe_route(event: object) -> None:
-                assert parsed == [event]
-                assert_applied()
-                assert_outside_owner_transaction()
-                assert_outstanding()
-                routed.append(event)
-                await real_route(event)  # type: ignore[arg-type]
-
-            restored_client.add_presence_callback(callback, None)
-        elif target == "ephemeral":
+        if target == "ephemeral":
             restored_client.ephemeral_callbacks.clear()
             real_route = restored_client._on_ephemeral
 
@@ -19014,7 +18941,7 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
                 assert_outside_owner_transaction()
                 assert_outstanding()
                 routed.append(event)
-                await real_route(event, candidate_room)  # type: ignore[arg-type]
+                await real_route(event, candidate_room)
 
             restored_client.add_ephemeral_callback(callback, None)
         else:
@@ -19036,10 +18963,9 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
                 assert_outside_owner_transaction()
                 assert_outstanding()
                 routed.append(event)
-                await real_route(event, candidate_room)  # type: ignore[arg-type]
+                await real_route(event, candidate_room)
 
             restored_client.add_room_account_data_callback(callback, None)
-
         acknowledgements: list[BatchRef] = []
         real_acknowledge = restored_session._journal.acknowledge_batch
 
@@ -19047,10 +18973,7 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             assert ref == batch.ref
             assert len(authenticated) == 1
             assert routed == callbacks == parsed
-            if target == "presence":
-                assert applied == []
-            else:
-                assert applied == parsed
+            assert applied == parsed
             assert_snapshot_overlay()
             assert_applied()
             assert_outside_owner_transaction()
@@ -19062,56 +18985,32 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         connection.set_trace_callback(statements.append)
         with monkeypatch.context() as patch:
             patch.setattr(
-                restored_session._journal,
-                "_load_batch_settlement",
-                observe_settlement,
+                restored_session._journal, "_load_batch_settlement", observe_settlement
             )
             patch.setattr(
-                restored_session._journal,
-                "acknowledge_batch",
-                observe_acknowledgement,
+                restored_session._journal, "acknowledge_batch", observe_acknowledgement
             )
             patch.setattr(Event, "parse_event", classmethod(forbidden_path))
             patch.setattr(InviteEvent, "parse_event", classmethod(forbidden_path))
             patch.setattr(room, "handle_event", forbidden_path)
-            if target == "presence":
-                patch.setattr(PresenceEvent, "from_dict", classmethod(observe_parse))
-                patch.setattr(
-                    EphemeralEvent, "parse_event", classmethod(forbidden_path)
-                )
-                patch.setattr(
-                    AccountDataEvent,
-                    "parse_event",
-                    classmethod(forbidden_path),
-                )
-                patch.setattr(restored_client, "_on_presence", observe_route)
-            elif target == "ephemeral":
+            if target == "ephemeral":
                 patch.setattr(EphemeralEvent, "parse_event", classmethod(observe_parse))
                 patch.setattr(PresenceEvent, "from_dict", classmethod(forbidden_path))
                 patch.setattr(
-                    AccountDataEvent,
-                    "parse_event",
-                    classmethod(forbidden_path),
+                    AccountDataEvent, "parse_event", classmethod(forbidden_path)
                 )
                 patch.setattr(room, "handle_ephemeral_event", observe_handle)
                 patch.setattr(restored_client, "_on_ephemeral", observe_route)
             else:
                 patch.setattr(
-                    AccountDataEvent,
-                    "parse_event",
-                    classmethod(observe_parse),
+                    AccountDataEvent, "parse_event", classmethod(observe_parse)
                 )
                 patch.setattr(PresenceEvent, "from_dict", classmethod(forbidden_path))
                 patch.setattr(
                     EphemeralEvent, "parse_event", classmethod(forbidden_path)
                 )
                 patch.setattr(room, "handle_account_data", observe_handle)
-                patch.setattr(
-                    restored_client,
-                    "_on_room_account_data",
-                    observe_route,
-                )
-
+                patch.setattr(restored_client, "_on_room_account_data", observe_route)
             live_paths = (
                 "receive_response",
                 "_handle_sync",
@@ -19129,7 +19028,6 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             for name in live_paths:
                 patch.setattr(restored_client, name, forbidden_path)
             expected_route = {
-                "presence": "_on_presence",
                 "ephemeral": "_on_ephemeral",
                 "room-account-data": "_on_room_account_data",
             }[target]
@@ -19146,13 +19044,9 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
                 "_prepare_and_materialize_oldest_frame",
                 forbidden_path,
             )
-
             await restored_session._settle_batch(
-                batch,
-                receipt_new=True,
-                semantic_event_new=False,
+                batch, receipt_new=True, semantic_event_new=False
             )
-
         connection.set_trace_callback(None)
         assert len(authenticated) == 1
         assert len(parsed) == len(routed) == len(callbacks) == 1
@@ -19165,11 +19059,13 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
             == work_count - 1
         )
         journal_dml = tuple(
-            statement.lstrip().upper()
-            for statement in statements
-            if statement.lstrip()
-            .upper()
-            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+            (
+                statement.lstrip().upper()
+                for statement in statements
+                if statement.lstrip()
+                .upper()
+                .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
+            )
         )
         assert len(journal_dml) == 2
         assert journal_dml[0].startswith("DELETE FROM NIOINGESTWORK")
@@ -19178,147 +19074,6 @@ async def test_owned_settle_auxiliary_state_before_receipt_callback(
         restored_client._assert_ingestion_not_poisoned()
     finally:
         connection.set_trace_callback(None)
-        await restored_session.close()
-
-
-@pytest.mark.parametrize(
-    "malformed_source",
-    (
-        {"content": {"presence": "online"}, "type": "m.presence"},
-        {"content": {}, "sender": BOB, "type": "m.presence"},
-        {"content": {"presence": 7}, "sender": BOB, "type": "m.presence"},
-    ),
-)
-@pytest.mark.asyncio
-async def test_owned_settle_rejects_authenticated_malformed_presence_without_ack(
-    tmp_path,
-    malformed_source: dict[str, object],
-) -> None:
-    from nio.store._sync_journal_plan import _canonical_work_plaintext
-    from nio.store._sync_journal_preflight import _canonical_internal
-
-    generation = uuid4()
-    bootstrap, _account = open_owned_bootstrap(tmp_path, generation)
-    client = owned_client(tmp_path)
-    session = open_owned_session(client, bootstrap, generation)
-    connection = session._owned_store.database.connection()
-    valid_source = {
-        "content": {
-            "currently_active": True,
-            "presence": "online",
-            "status_msg": "valid before authenticated reseal",
-        },
-        "sender": BOB,
-        "type": "m.presence",
-    }
-    try:
-        assert client.olm is not None
-        olm = client.olm
-        olm.account.shared = True
-        olm.uploaded_key_count = olm.account.max_one_time_keys
-        olm.save_account()
-        stage_classic(
-            bootstrap,
-            {
-                "account_data": {"events": []},
-                "device_lists": {"changed": [], "left": []},
-                "device_one_time_keys_count": {
-                    "signed_curve25519": olm.account.max_one_time_keys
-                },
-                "device_unused_fallback_key_types": [],
-                "next_batch": "malformed-presence-token",
-                "presence": {"events": [valid_source]},
-                "rooms": {},
-                "to_device": {"events": []},
-            },
-        )
-        materialized = session._materialize_oldest_frame(limits=MaterializerLimits())
-        assert materialized.status is MaterializeStatus.MATERIALIZED
-        owner = session._journal.load_owner()
-        with session._journal._owner.read():
-            inventory = session._journal._load_task3_work_inventory(owner)
-        assert len(inventory.work) == 1
-        work = inventory.work[0]
-        assert type(work.value) is EventRecord
-        assert work.value.kind is RecordKind.PRESENCE
-        assert work.metadata is not None
-        assert work.metadata.callback_route is _CallbackRoute.PRESENCE
-        malformed = replace(
-            work.value,
-            source_json=canonical_json(malformed_source),
-        )
-        row = connection.execute(
-            "SELECT account_id, work_id, kind, status, frame_id, room_id, "
-            "membership_epoch, room_sequence, ready_revision, ready_ordinal, "
-            "created_revision, payload, payload_sha256 FROM NioIngestWork "
-            "WHERE account_id = ? AND work_id = ?",
-            (ACCOUNT, work.value.record_id),
-        ).fetchone()
-        assert row is not None
-        plaintext = _canonical_work_plaintext("event", malformed, work.metadata)
-        payload, digest = session._journal._payload(
-            owner,
-            "NioIngestWork",
-            plaintext,
-            header=_canonical_internal(row[1:11]),
-        )
-        connection.execute(
-            "UPDATE NioIngestWork SET payload = ?, payload_sha256 = ? "
-            "WHERE account_id = ? AND work_id = ?",
-            (payload, digest, ACCOUNT, work.value.record_id),
-        )
-    finally:
-        await session.close()
-
-    reopened = reopen_owned_bootstrap(tmp_path, generation)
-    restored_client = owned_client(tmp_path)
-    restored_session = open_owned_session(restored_client, reopened, generation)
-    restored_connection = restored_session._owned_store.database.connection()
-    try:
-        batch = restored_session.next_batch(max_records=1)
-        assert batch is not None
-        assert batch.records == (malformed,)
-        settlement = restored_session._journal._load_batch_settlement(batch)
-        assert settlement is not None
-        authenticated_work, aggregate = settlement
-        assert authenticated_work.value == malformed
-        assert authenticated_work.metadata == work.metadata
-        assert aggregate is None
-        frontier = _owned_delivery_frontier(restored_connection)
-        graph = tuple(restored_connection.iterdump())
-        callbacks: list[object] = []
-
-        async def callback(event: object) -> None:
-            callbacks.append(event)
-            raise AssertionError("malformed presence reached a callback")
-
-        restored_client.add_presence_callback(callback, None)
-        statements: list[str] = []
-        restored_connection.set_trace_callback(statements.append)
-        with pytest.raises(
-            JournalIntegrityError,
-            match="presence event source is invalid",
-        ):
-            await restored_session._settle_batch(
-                batch,
-                receipt_new=True,
-                semantic_event_new=False,
-            )
-
-        restored_connection.set_trace_callback(None)
-        assert callbacks == []
-        assert tuple(restored_connection.iterdump()) == graph
-        assert _owned_delivery_frontier(restored_connection) == frontier
-        assert restored_session.next_batch(max_records=1) == batch
-        assert not any(
-            statement.lstrip()
-            .upper()
-            .startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))
-            for statement in statements
-        )
-        restored_client._assert_ingestion_not_poisoned()
-    finally:
-        restored_connection.set_trace_callback(None)
         await restored_session.close()
 
 
@@ -19496,3 +19251,265 @@ async def test_owned_settle_rejects_authenticated_malformed_collected_request(
     finally:
         restored_connection.set_trace_callback(None)
         await restored_session.close()
+
+
+@pytest.mark.parametrize("transport", ["classic", "sliding"])
+@pytest.mark.parametrize(
+    "transient",
+    [
+        "valid",
+        "bad-content",
+        "bad-container",
+        "callback-error",
+        "callback-timeout",
+        "cancel",
+    ],
+)
+@pytest.mark.asyncio
+async def test_fresh_transients_are_best_effort(tmp_path, caplog, transport, transient):
+    config = classic_config() if transport == "classic" else sliding_config()
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation, source=config.source)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation, config)
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    room = nio.MatrixRoom(ROOM, ACCOUNT)
+    room.add_member(BOB, "Bob", None)
+    client.rooms[ROOM] = room
+    seen = []
+
+    async def typing_callback(candidate, event):
+        assert not session._owned_store.database.connection().in_transaction
+        assert session._journal.load_source().next_request_id == 1
+        seen.append(("typing", candidate.room_id, event.users))
+        if transient == "callback-error":
+            raise RuntimeError("payload-secret")
+        if transient == "callback-timeout":
+            await asyncio.Event().wait()
+        if transient == "cancel":
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+    async def presence_callback(event):
+        assert not session._owned_store.database.connection().in_transaction
+        seen.append(("presence", event.user_id, event.presence))
+
+    client.add_ephemeral_callback(typing_callback, nio.TypingNoticeEvent)
+    client.add_presence_callback(presence_callback, None)
+    requests = []
+
+    async def respond(request, **kwargs):
+        requests.append(request.path)
+        if request.path.endswith("/state"):
+            return session._network_result(request, 200, hydration_state())
+        if len([path for path in requests if not path.endswith("/state")]) > 1:
+            raise asyncio.CancelledError
+        body = _parity_response(
+            transport,
+            request.body,
+            nonempty=True,
+            one_time_key_count=client.olm.account.max_one_time_keys,
+        )
+        typing = {"type": "m.typing", "content": {"user_ids": [BOB]}}
+        if transport == "classic":
+            body["rooms"]["join"][ROOM]["ephemeral"]["events"].append(typing)
+        else:
+            body["extensions"]["typing"] = {"rooms": {ROOM: typing}}
+        if transient == "bad-content":
+            bad_typing = {"type": "m.typing", "content": "payload-secret"}
+            bad_presence = {"type": "m.presence", "content": "payload-secret"}
+        else:
+            bad_typing = None
+            bad_presence = None
+        if transport == "classic":
+            if transient == "bad-content":
+                body["rooms"]["join"][ROOM]["ephemeral"]["events"] = [
+                    body["rooms"]["join"][ROOM]["ephemeral"]["events"][0],
+                    *([bad_typing] * 5),
+                ]
+                body["presence"]["events"] = [bad_presence] * 5
+            elif transient == "bad-container":
+                body["presence"] = "payload-secret"
+        elif transient == "bad-content":
+            body["extensions"]["typing"]["rooms"][ROOM] = bad_typing
+            body["extensions"]["presence"]["events"] = [bad_presence] * 5
+        elif transient == "bad-container":
+            body["extensions"]["typing"] = "payload-secret"
+            body["extensions"]["presence"] = "payload-secret"
+        return session._network_result(request, 200, canonical_json(body))
+
+    session._request = respond
+    records = []
+    closed = False
+    started = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await run_with_acknowledgements(session, records)
+        if transient == "cancel":
+            assert seen == [("typing", ROOM, [BOB])]
+            assert records == []
+            assert len(session._journal.list_frames(2)) == 1
+            await session.close()
+            closed = True
+            restored_client = owned_client(tmp_path)
+            reopened = reopen_owned_bootstrap(
+                tmp_path, generation, source=config.source
+            )
+            restored = open_owned_session(restored_client, reopened, generation, config)
+            replayed = []
+            restored_client.add_ephemeral_callback(
+                lambda *args: replayed.append(args), nio.TypingNoticeEvent
+            )
+            restored_client.add_presence_callback(
+                lambda *args: replayed.append(args), None
+            )
+
+            async def restart_response(request, **kwargs):
+                if request.path.endswith("/state"):
+                    return restored._network_result(request, 200, hydration_state())
+                raise asyncio.CancelledError
+
+            restored._request = restart_response
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await run_with_acknowledgements(restored, records)
+                assert any(record.event_id == "$parity-message" for record in records)
+                assert replayed == []
+                assert restored._journal.list_frames(2) == ()
+            finally:
+                await restored.close()
+            return
+        assert any(record.event_id == "$parity-message" for record in records)
+        assert any(record.kind is RecordKind.EPHEMERAL for record in records)
+        if transient in {"callback-error", "callback-timeout"}:
+            assert seen == [("typing", ROOM, [BOB])]
+        if transient == "callback-timeout":
+            assert 0.9 <= asyncio.get_running_loop().time() - started < 5
+        assert all(
+            not isinstance(record, EventRecord)
+            or json.loads(record.source_json).get("type") != "m.typing"
+            for record in records
+        )
+        assert session._journal.load_pending_hydrations(limit=1) == ()
+        assert session._journal.list_frames(2) == ()
+        if transient == "valid":
+            assert seen == [("typing", ROOM, [BOB]), ("presence", BOB, "online")]
+            assert client.rooms[ROOM].typing_users == [BOB]
+            assert client.rooms[ROOM].users[BOB].presence == "online"
+        assert "payload-secret" not in caplog.text
+        assert len(caplog.records) == (0 if transient == "valid" else 1)
+        client._assert_ingestion_not_poisoned()
+    finally:
+        if not closed:
+            await session.close()
+
+
+@pytest.mark.parametrize("transport", ["classic", "sliding"])
+@pytest.mark.asyncio
+async def test_transient_only_response_creates_no_durable_obligations(
+    tmp_path, transport
+):
+    config = classic_config() if transport == "classic" else sliding_config()
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation, source=config.source)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation, config)
+    client.olm.account.shared = True
+    client.olm.uploaded_key_count = client.olm.account.max_one_time_keys
+    client.olm.save_account()
+    polls = 0
+
+    async def respond(request, **kwargs):
+        nonlocal polls
+        polls += 1
+        if polls > 1:
+            raise asyncio.CancelledError
+        body = _parity_response(
+            transport,
+            request.body,
+            nonempty=False,
+            one_time_key_count=client.olm.account.max_one_time_keys,
+        )
+        presence = {
+            "events": [
+                {"type": "m.presence", "sender": BOB, "content": {"presence": "online"}}
+            ]
+        }
+        if transport == "sliding":
+            body["extensions"]["presence"] = presence
+            body["extensions"]["typing"] = {
+                "rooms": {ROOM: {"type": "m.typing", "content": {"user_ids": [BOB]}}}
+            }
+        else:
+            body["presence"] = presence
+        return session._network_result(request, 200, canonical_json(body))
+
+    session._request = respond
+    records = []
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await run_with_acknowledgements(session, records)
+        assert polls == 2
+        assert records == []
+        assert client.rooms == {}
+        assert session._journal.load_source().next_request_id == 1
+        assert session._journal.load_pending_hydrations(limit=1) == ()
+        connection = session._owned_store.database.connection()
+        for table in ("NioIngestFrame", "NioIngestWork", "NioIngestRoomAggregate"):
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            )
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "ephemeral",
+    [
+        {"events": [{"content": "payload-secret"}]},
+        {"events": ["payload-secret"]},
+        "payload-secret",
+    ],
+)
+@pytest.mark.asyncio
+async def test_unidentified_classic_ephemeral_remains_strict(tmp_path, ephemeral):
+    generation = uuid4()
+    bootstrap, _ = open_owned_bootstrap(tmp_path, generation)
+    client = owned_client(tmp_path)
+    session = open_owned_session(client, bootstrap, generation)
+    before = session._journal.load_source()
+    try:
+        body = {
+            "next_batch": "s1",
+            "rooms": {
+                "join": {
+                    ROOM: {
+                        "ephemeral": ephemeral,
+                        "timeline": {"events": []},
+                    }
+                }
+            },
+        }
+        from nio.ingest.source import SourceResultKind
+
+        request = session._source.plan_request(before, before.next_request_id)
+        result = session._source.normalize(
+            request, session._network_result(request, 200, canonical_json(body))
+        )
+        if isinstance(ephemeral, dict) and isinstance(ephemeral["events"][0], dict):
+            assert result.kind is SourceResultKind.FRAME
+            stage_classic(bootstrap, body)
+            with pytest.raises(JournalIntegrityError):
+                session._materialize_oldest_frame(limits=MaterializerLimits())
+            connection = session._owned_store.database.connection()
+            assert (
+                connection.execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0]
+                == 0
+            )
+        else:
+            assert result.kind is SourceResultKind.TERMINAL_ERROR
+            assert session._journal.load_source() == before
+    finally:
+        await session.close()

@@ -145,7 +145,7 @@ def _equivalent_frames() -> tuple[SyncFrame, SyncFrame]:
         origin_server_ts=2,
         sender=BOB,
     )
-    typing = _event("m.typing", {"user_ids": [BOB]})
+    receipt = _event("m.receipt", {"$message": {"m.read": {BOB: {"ts": 3}}}})
     room_account_data = _event("m.tag", {"tags": {"u.work": {"order": 1}}})
     global_account_data = _event("org.example.theme", {"theme": "dark"})
     presence = _event(
@@ -170,7 +170,7 @@ def _equivalent_frames() -> tuple[SyncFrame, SyncFrame]:
                 "join": {
                     ROOM: {
                         "account_data": {"events": [room_account_data]},
-                        "ephemeral": {"events": [typing]},
+                        "ephemeral": {"events": [receipt]},
                         "state": {"events": [member]},
                         "timeline": {"events": [message]},
                     }
@@ -193,7 +193,7 @@ def _equivalent_frames() -> tuple[SyncFrame, SyncFrame]:
                     "events": [ordinary_to_device],
                     "next_batch": "td1",
                 },
-                "typing": {"rooms": {ROOM: typing}},
+                "receipts": {"rooms": {ROOM: receipt}},
             },
             "lists": {RESERVED_ALL_ROOMS_LIST: {"count": 2}},
             "rooms": {
@@ -573,7 +573,6 @@ def test_equivalent_frames_prepare_transport_neutral_replay_stable_output(
         ("$message", RecordKind.TIMELINE, ROOM, "event"),
         (None, RecordKind.EPHEMERAL, ROOM, "ephemeral"),
         (None, RecordKind.ROOM_ACCOUNT_DATA, ROOM, "room_account_data"),
-        (None, RecordKind.PRESENCE, None, "presence"),
         (None, RecordKind.GLOBAL_ACCOUNT_DATA, None, "global_account_data"),
     )
     invite_snapshot = next(
@@ -733,7 +732,7 @@ def test_section_membership_is_fallback_transition_evidence(
         sender=BOB,
     )
     room_account_data = _event("m.tag", {"tags": {}})
-    ephemeral = _event("m.typing", {"user_ids": [BOB]})
+    ephemeral = _event("m.receipt", {"$message": {"m.read": {BOB: {"ts": 3}}}})
     frame = _normalize_frame(
         TransportKind.CLASSIC,
         36,
@@ -1422,7 +1421,7 @@ def test_falsey_parsers_suppress_callbacks_but_keep_records_across_transports(
         },
     )
     orphan_account_data = _event("m.tag", {"tags": {}})
-    orphan_typing = _event("m.typing", {"user_ids": [BOB]})
+    orphan_receipt = _event("m.receipt", {"$message": {"m.read": {BOB: {"ts": 3}}}})
     orphan_frame = _normalize_frame(
         TransportKind.SLIDING,
         35,
@@ -1430,7 +1429,7 @@ def test_falsey_parsers_suppress_callbacks_but_keep_records_across_transports(
             "extensions": {
                 "account_data": {"rooms": {ROOM: [orphan_account_data]}},
                 "to_device": {"events": [falsey_to_device], "next_batch": "td3"},
-                "typing": {"rooms": {ROOM: orphan_typing}},
+                "receipts": {"rooms": {ROOM: orphan_receipt}},
             }
         },
     )

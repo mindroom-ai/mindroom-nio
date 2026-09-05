@@ -623,10 +623,6 @@ def _prepared_source_records(
             (RecordKind.EPHEMERAL, room_id, source_json, None) for source_json in events
         )
     records.extend(
-        (RecordKind.PRESENCE, None, source_json, None)
-        for source_json in frame.presence_json
-    )
-    records.extend(
         (RecordKind.GLOBAL_ACCOUNT_DATA, None, source_json, None)
         for source_json in frame.global_account_data_json
     )
@@ -760,7 +756,6 @@ def _validate_prepared_record(
         _CallbackRoute.EPHEMERAL: {RecordKind.EPHEMERAL},
         _CallbackRoute.ROOM_ACCOUNT_DATA: {RecordKind.ROOM_ACCOUNT_DATA},
         _CallbackRoute.GLOBAL_ACCOUNT_DATA: {RecordKind.GLOBAL_ACCOUNT_DATA},
-        _CallbackRoute.PRESENCE: {RecordKind.PRESENCE},
         _CallbackRoute.TO_DEVICE: {RecordKind.TO_DEVICE},
     }
     if (

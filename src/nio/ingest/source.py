@@ -314,7 +314,6 @@ class SyncFrame:
     room_segments: tuple[RoomSegment, ...]
     ephemeral_json: tuple[bytes, ...]
     global_account_data_json: tuple[bytes, ...]
-    presence_json: tuple[bytes, ...]
 
     def __post_init__(self) -> None:
         _require_exact(self.frame_id, UUID, "frame_id")
@@ -348,7 +347,6 @@ class SyncFrame:
             self.global_account_data_json,
             "global_account_data_json",
         )
-        _require_json_bytes_tuple(self.presence_json, "presence_json")
         if self.origin.frame_index != 0:
             raise ValueError("frame origin frame_index must be zero")
         room_ids = tuple(segment.room_id for segment in self.room_segments)
@@ -371,7 +369,8 @@ def _normalized_ephemeral_envelopes(
                 raise ValueError("ephemeral envelope contents are invalid")
             if canonical_json({"event": event, "room_id": room_id}) != payload:
                 raise ValueError("ephemeral envelope is not canonical")
-            normalized.append((room_id, canonical_json(event)))
+            if event.get("type") != "m.typing":
+                normalized.append((room_id, canonical_json(event)))
         except (TypeError, ValueError) as error:
             raise ValueError("invalid canonical ephemeral envelope") from error
     return tuple(normalized)

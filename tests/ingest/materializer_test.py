@@ -173,7 +173,6 @@ def _frame(ephemeral_json: tuple[bytes, ...] = ()) -> SyncFrame:
         segments,
         ephemeral_json,
         (),
-        (),
     )
 
 
@@ -349,7 +348,6 @@ def _prepared_frame(
     to_device: tuple[bytes, ...] = (),
     ephemeral: tuple[bytes, ...] = (),
     global_account_data: tuple[bytes, ...] = (),
-    presence: tuple[bytes, ...] = (),
 ) -> SyncFrame:
     return SyncFrame(
         _FRAME_ID,
@@ -364,7 +362,6 @@ def _prepared_frame(
         room_segments,
         ephemeral,
         global_account_data,
-        presence,
     )
 
 
@@ -654,9 +651,9 @@ def _prepared_planner_fixture(
         _prepared_event("m.room.member", event_id="$rejoin", membership="join"),
         _prepared_event("m.room.member", event_id="$ban", membership="ban"),
     )
-    ephemeral_source = _prepared_event("m.typing")
+    ephemeral_source = _prepared_event("m.receipt")
     room_account_data_source = _prepared_event("m.tag")
-    presence_source = _prepared_event("m.presence")
+    extra_global_source = _prepared_event("org.example.global")
     global_source = _prepared_event("m.push_rules")
     records = (
         _prepared_record(
@@ -709,7 +706,7 @@ def _prepared_planner_fixture(
             5,
             RecordKind.EPHEMERAL,
             ephemeral_source,
-            event_type="m.typing",
+            event_type="m.receipt",
             room=True,
             route=_CallbackRoute.EPHEMERAL,
         ),
@@ -723,10 +720,10 @@ def _prepared_planner_fixture(
         ),
         _prepared_record(
             7,
-            RecordKind.PRESENCE,
-            presence_source,
-            event_type="m.presence",
-            route=_CallbackRoute.PRESENCE,
+            RecordKind.GLOBAL_ACCOUNT_DATA,
+            extra_global_source,
+            event_type="org.example.global",
+            route=_CallbackRoute.GLOBAL_ACCOUNT_DATA,
         ),
         _prepared_record(
             8,
@@ -764,8 +761,7 @@ def _prepared_planner_fixture(
         ephemeral=(
             _ephemeral_envelope(_PREPARED_ROOM_ID, json.loads(ephemeral_source)),
         ),
-        global_account_data=(global_source,),
-        presence=(presence_source,),
+        global_account_data=(extra_global_source, global_source),
     )
     prepared = _prepared_payload(frame, records, transitions)
     return _PreparedPlannerFixture(
@@ -902,7 +898,7 @@ def test_prepared_reduction_preserves_linear_transition_order_and_epochs() -> No
 
 
 def test_prepared_reduction_preserves_ephemeral_only_room_ownership() -> None:
-    source_json = _prepared_event("m.typing")
+    source_json = _prepared_event("m.receipt")
     frame = _prepared_frame(
         ephemeral=(_ephemeral_envelope(_PREPARED_ROOM_ID, json.loads(source_json)),)
     )
@@ -910,7 +906,7 @@ def test_prepared_reduction_preserves_ephemeral_only_room_ownership() -> None:
         0,
         RecordKind.EPHEMERAL,
         source_json,
-        event_type="m.typing",
+        event_type="m.receipt",
         room=True,
         route=_CallbackRoute.EPHEMERAL,
     )
@@ -2234,7 +2230,7 @@ def test_prepared_reduction_rejects_section_without_membership_claim() -> None:
 def test_prepared_reduction_preserves_mixed_empty_segment_action_order() -> None:
     transition_room = "!transition:example.org"
     recovery_room = "!recovery:example.org"
-    presence_source = _prepared_event("m.presence")
+    extra_global_source = _prepared_event("org.example.global")
     segments = (
         _prepared_segment(
             _prepared_observation("join"),
@@ -2247,13 +2243,15 @@ def test_prepared_reduction_preserves_mixed_empty_segment_action_order() -> None
             section=RoomSection.JOIN,
         ),
     )
-    frame = _prepared_frame(room_segments=segments, presence=(presence_source,))
+    frame = _prepared_frame(
+        room_segments=segments, global_account_data=(extra_global_source,)
+    )
     record = _prepared_record(
         0,
-        RecordKind.PRESENCE,
-        presence_source,
-        event_type="m.presence",
-        route=_CallbackRoute.PRESENCE,
+        RecordKind.GLOBAL_ACCOUNT_DATA,
+        extra_global_source,
+        event_type="org.example.global",
+        route=_CallbackRoute.GLOBAL_ACCOUNT_DATA,
     )
     transition = _prepared_section_transition(
         frame,
@@ -2852,7 +2850,7 @@ def _prepared_unrelated_held(index: int) -> AuthenticatedWork:
     return _prepared_room_held(
         str(uuid5(_STREAM_ID, f"prepared-unrelated-held:{index}")),
         kind=RecordKind.EPHEMERAL,
-        source_json=_prepared_event("m.typing"),
+        source_json=_prepared_event("m.receipt"),
         origin=RecordOrigin(TransportKind.CLASSIC, 0, 0, index),
         room_id="!prepared-unrelated:example.org",
         membership_epoch=9,
@@ -2970,7 +2968,7 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
         {"content": {"padding": "z" * 4096}, "type": "m.tag"}
     )
     other_room_id = "!prepared-other:example.org"
-    other_source = _prepared_event("m.typing")
+    other_source = _prepared_event("m.receipt")
     segment = replace(
         case.frame.room_segments[0],
         room_account_data_json=(oversized_source,),
@@ -2987,7 +2985,7 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
         7,
         RecordKind.EPHEMERAL,
         other_source,
-        event_type="m.typing",
+        event_type="m.receipt",
         room=True,
         route=_CallbackRoute.EPHEMERAL,
     )._replace(room_id=other_room_id)
@@ -3054,7 +3052,8 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
         index
         for index, item in enumerate(ordered)
         if type(item.value) is EventRecord
-        and item.value.kind in (RecordKind.PRESENCE, RecordKind.GLOBAL_ACCOUNT_DATA)
+        and item.value.kind
+        in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.GLOBAL_ACCOUNT_DATA)
     ]
     assert len(lifecycle_positions) == 4
     assert (
@@ -3322,7 +3321,7 @@ def _prepared_gap_case(
     *, empty: bool
 ) -> tuple[_PreparedPlannerFixture, AuthenticatedWork]:
     room_source = _prepared_event("m.room.name")
-    presence_source = _prepared_event("m.presence") if empty else None
+    extra_global_source = _prepared_event("org.example.global") if empty else None
     global_source = _prepared_event("m.push_rules") if empty else None
     segment = _prepared_segment(
         _prepared_observation("join", unparsed=True),
@@ -3331,17 +3330,18 @@ def _prepared_gap_case(
     )
     frame = _prepared_frame(
         room_segments=(segment,),
-        global_account_data=(() if global_source is None else (global_source,)),
-        presence=(() if presence_source is None else (presence_source,)),
+        global_account_data=(
+            () if global_source is None else (extra_global_source, global_source)
+        ),
     )
     records = (
         (
             _prepared_record(
                 0,
-                RecordKind.PRESENCE,
-                presence_source,
-                event_type="m.presence",
-                route=_CallbackRoute.PRESENCE,
+                RecordKind.GLOBAL_ACCOUNT_DATA,
+                extra_global_source,
+                event_type="org.example.global",
+                route=_CallbackRoute.GLOBAL_ACCOUNT_DATA,
             ),
             _prepared_record(
                 1,
@@ -3351,7 +3351,7 @@ def _prepared_gap_case(
                 route=_CallbackRoute.GLOBAL_ACCOUNT_DATA,
             ),
         )
-        if presence_source is not None and global_source is not None
+        if extra_global_source is not None and global_source is not None
         else (
             _prepared_record(
                 0,
@@ -3575,7 +3575,7 @@ def test_prepared_empty_gap_barrier_precedes_later_accountwide_work() -> None:
     ] == [
         "baseline_lost",
         RecordKind.STATE.value,
-        RecordKind.PRESENCE.value,
+        RecordKind.GLOBAL_ACCOUNT_DATA.value,
         RecordKind.GLOBAL_ACCOUNT_DATA.value,
     ]
 
@@ -3888,7 +3888,7 @@ def test_blocked_result_invariant_has_a_neutral_message() -> None:
 def test_source_discovery_normalized_ephemeral_envelopes_are_canonical_ordered_pairs() -> (
     None
 ):
-    first_event = {"content": {"user_ids": ["@a:example.org"]}, "type": "m.typing"}
+    first_event = {"content": {"user_ids": ["@a:example.org"]}, "type": "m.receipt"}
     second_event = {
         "content": {"$event": {"m.read": "@b:example.org"}},
         "type": "m.receipt",
@@ -3910,10 +3910,10 @@ def test_source_discovery_normalized_ephemeral_envelopes_are_canonical_ordered_p
     "payload",
     [
         b'{"room_id":"!ephemeral:example.org"}',
-        b'{"event":{"type":"m.typing"},"room_id":"!ephemeral:example.org","extra":0}',
-        b'{"room_id":"!ephemeral:example.org","event":{"type":"m.typing"}}',
+        b'{"event":{"type":"m.receipt"},"room_id":"!ephemeral:example.org","extra":0}',
+        b'{"room_id":"!ephemeral:example.org","event":{"type":"m.receipt"}}',
         b'{"event":[],"room_id":"!ephemeral:example.org"}',
-        b'{"event":{"type":"m.typing"},"room_id":""}',
+        b'{"event":{"type":"m.receipt"},"room_id":""}',
         b"{",
     ],
 )
@@ -3925,7 +3925,7 @@ def test_source_discovery_normalized_ephemeral_envelopes_reject_invalid_canonica
 
 
 def test_source_discovery_frame_room_ids_keep_segment_then_ephemeral_order() -> None:
-    first_event = {"type": "m.typing"}
+    first_event = {"type": "m.receipt"}
     second_event = {"type": "m.receipt"}
     frame = _frame(
         (

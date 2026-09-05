@@ -1565,13 +1565,10 @@ def test_rooms_and_extensions_normalize_without_losing_order_or_duplicates(
         _canonical(global_data),
         _canonical(global_data),
     )
-    assert frame.presence_json == (_canonical(presence), _canonical(presence))
     assert frame.ephemeral_json == tuple(
         _canonical({"event": event, "room_id": room_id})
         for room_id, event in (
-            ("!a:example.org", typing_a),
             ("!a:example.org", receipt_a),
-            ("!z:example.org", typing_z),
             ("!z:example.org", receipt_z),
         )
     )

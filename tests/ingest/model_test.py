@@ -58,7 +58,6 @@ def test_wire_enums_have_stable_string_values() -> None:
         "EPHEMERAL": "ephemeral",
         "ROOM_ACCOUNT_DATA": "room_account_data",
         "GLOBAL_ACCOUNT_DATA": "global_account_data",
-        "PRESENCE": "presence",
         "TO_DEVICE": "to_device",
         "ROOM_LIFECYCLE": "room_lifecycle",
     }

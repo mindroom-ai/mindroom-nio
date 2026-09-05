@@ -61,7 +61,6 @@ def _shape(frame: SyncFrame) -> tuple[tuple[RecordKind, str | None, bytes], ...]
         (RecordKind.GLOBAL_ACCOUNT_DATA, None, event)
         for event in frame.global_account_data_json
     )
-    records.extend((RecordKind.PRESENCE, None, event) for event in frame.presence_json)
     return tuple(records)
 
 

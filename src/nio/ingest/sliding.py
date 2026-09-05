@@ -848,14 +848,6 @@ class SlidingSource:
             )
 
         ephemeral = self._ephemeral_events(extensions)
-        presence_extension = _object(
-            extensions.get("presence", {}),
-            "extensions.presence",
-        )
-        presence = require_json_events(
-            presence_extension.get("events", []),
-            "extensions.presence.events",
-        )
         source_json = canonical_json(root)
         source_sha256 = hashlib.sha256(source_json).digest()
         frame_id = _frame_id_for_response(request, source_sha256)
@@ -884,7 +876,6 @@ class SlidingSource:
                 global_account_data_json=tuple(
                     canonical_json(event) for event in global_account_data
                 ),
-                presence_json=tuple(canonical_json(event) for event in presence),
             ),
             source_json,
         )
@@ -935,28 +926,11 @@ class SlidingSource:
 
     @staticmethod
     def _ephemeral_events(extensions: dict[str, Any]) -> list[bytes]:
-        by_extension: dict[str, dict[str, dict[str, Any]]] = {}
-        for extension_name in ("typing", "receipts"):
-            extension = _object(
-                extensions.get(extension_name, {}),
-                f"extensions.{extension_name}",
-            )
-            rooms = _object(
-                extension.get("rooms", {}),
-                f"extensions.{extension_name}.rooms",
-            )
-            events: dict[str, dict[str, Any]] = {}
-            for room_id, event in rooms.items():
-                SlidingSource._validate_room_id(room_id)
-                events[room_id] = _object(
-                    event,
-                    f"extensions.{extension_name}.rooms.{room_id}",
-                )
-            by_extension[extension_name] = events
-        room_ids = sorted(set(by_extension["typing"]) | set(by_extension["receipts"]))
-        return [
-            canonical_json({"room_id": room_id, "event": event})
-            for room_id in room_ids
-            for extension_name in ("typing", "receipts")
-            if (event := by_extension[extension_name].get(room_id)) is not None
-        ]
+        extension = _object(extensions.get("receipts", {}), "extensions.receipts")
+        rooms = _object(extension.get("rooms", {}), "extensions.receipts.rooms")
+        events = []
+        for room_id, event in sorted(rooms.items()):
+            SlidingSource._validate_room_id(room_id)
+            event = _object(event, "extensions.receipts.rooms event")
+            events.append(canonical_json({"room_id": room_id, "event": event}))
+        return events

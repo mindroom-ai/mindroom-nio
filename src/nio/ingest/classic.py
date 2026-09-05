@@ -275,6 +275,7 @@ class ClassicSource:
                 ephemeral.extend(
                     canonical_json({"room_id": room_id, "event": event})
                     for event in ephemeral_events
+                    if event.get("type") != "m.typing"
                 )
                 own_membership = _latest_own_membership(
                     state,
@@ -401,13 +402,6 @@ class ClassicSource:
                     for event in require_json_event_container(
                         root.get("account_data", {}),
                         "account_data",
-                    )
-                ),
-                presence_json=tuple(
-                    canonical_json(event)
-                    for event in require_json_event_container(
-                        root.get("presence", {}),
-                        "presence",
                     )
                 ),
             ),

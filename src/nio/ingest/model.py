@@ -40,7 +40,6 @@ class RecordKind(StrEnum):
     EPHEMERAL = "ephemeral"
     ROOM_ACCOUNT_DATA = "room_account_data"
     GLOBAL_ACCOUNT_DATA = "global_account_data"
-    PRESENCE = "presence"
     TO_DEVICE = "to_device"
     ROOM_LIFECYCLE = "room_lifecycle"
 
@@ -73,7 +72,6 @@ class _CallbackRoute(StrEnum):
     EPHEMERAL = "ephemeral"
     ROOM_ACCOUNT_DATA = "room_account_data"
     GLOBAL_ACCOUNT_DATA = "global_account_data"
-    PRESENCE = "presence"
     TO_DEVICE = "to_device"
 
 

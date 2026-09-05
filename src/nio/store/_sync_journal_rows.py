@@ -1830,7 +1830,6 @@ class JournalRows:
                 elif value.room_id is None:
                     valid = value.kind in (
                         RecordKind.GLOBAL_ACCOUNT_DATA,
-                        RecordKind.PRESENCE,
                         *(
                             (RecordKind.TO_DEVICE,)
                             if decoded.metadata is not None
