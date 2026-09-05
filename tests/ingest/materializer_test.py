@@ -3,7 +3,6 @@
 import base64
 import hashlib
 import json
-import re
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid5
 
@@ -3069,8 +3068,7 @@ def test_prepared_capacity_loss_follows_all_room_lifecycle_fences() -> None:
         index
         for index, item in enumerate(ordered)
         if type(item.value) is EventRecord
-        and item.value.kind
-        in (RecordKind.GLOBAL_ACCOUNT_DATA, RecordKind.GLOBAL_ACCOUNT_DATA)
+        and item.value.kind is RecordKind.GLOBAL_ACCOUNT_DATA
     ]
     assert len(lifecycle_positions) == 4
     assert (
@@ -3774,129 +3772,6 @@ def test_prepared_room_capacity_uses_final_wrapped_row_and_terminal_loss(
     )
 
 
-@dataclass(frozen=True)
-class _FinalRowCapacityCase:
-    case_id: str
-    status: str
-    limit_delta: int
-    plan_is_admitted: bool
-    loss_reason: LossReason | None
-
-
-_FINAL_ROW_CAPACITY_CASES = (
-    _FinalRowCapacityCase("exact-final-ready-row", "ready", 0, True, None),
-    _FinalRowCapacityCase("one-over-final-ready-row", "ready", -1, False, None),
-    _FinalRowCapacityCase("exact-final-held-row", "held", 0, True, None),
-    _FinalRowCapacityCase(
-        "one-over-final-held-row",
-        "held",
-        -1,
-        True,
-        LossReason.EVENT_LIMIT,
-    ),
-)
-
-
-@dataclass(frozen=True)
-class _HydrationMaterializerCase:
-    case_id: str
-    scenario: str
-    pending: bool
-    expected_routes: tuple[str, ...] | None
-    expected_error: str | None
-
-
-_HYDRATION_MATERIALIZER_CASES = (
-    _HydrationMaterializerCase(
-        "hydration-empty-pending-owner", "empty-pending", True, (), None
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ephemeral-null-owner", "ephemeral-null", False, ("ready",), None
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ephemeral-overflow-pending",
-        "room-overflow",
-        True,
-        ("hold_for_hydration", "hold_for_hydration"),
-        None,
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ephemeral-overflow-null",
-        "room-overflow",
-        False,
-        ("ready", "ready"),
-        None,
-    ),
-    _HydrationMaterializerCase(
-        "hydration-global-oversize-precedence",
-        "global-overflow",
-        True,
-        ("hold_for_hydration", "ready"),
-        "planned Work record exceeds the canonical byte limit",
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ambiguous-owner-absent-aggregate",
-        "absent-aggregate",
-        True,
-        None,
-        "room descriptor has no continuity",
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ambiguous-owner-two-rooms",
-        "two-rooms",
-        False,
-        None,
-        "selected frame has inconsistent room ownership",
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ambiguous-owner-segment-and-ephemeral",
-        "segment-and-ephemeral",
-        True,
-        None,
-        "selected frame has inconsistent room ownership",
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ambiguous-owner-recovery-gap",
-        "recovery-gap",
-        False,
-        ("hold_for_gap",),
-        "invalid ephemeral-only room ownership",
-    ),
-    _HydrationMaterializerCase(
-        "hydration-ambiguous-owner-null-with-held",
-        "null-with-held",
-        False,
-        ("ready",),
-        "READY ephemeral room has orphan HELD Work",
-    ),
-)
-
-
-@dataclass(frozen=True)
-class _RetirementCase:
-    case_id: str
-    metric: str
-    successor_count: int
-    global_count: int
-    excess: int
-    outcome: str
-    room_body_length: int = 0
-    tuned_padding: int = 0
-
-
-_RETIREMENT_CAPACITY_CASES = (
-    _RetirementCase("addition-count-exact", "count", 9_997, 1, 0, "normal"),
-    _RetirementCase("addition-count-one-over", "count", 9_998, 1, 1, "replacement"),
-    _RetirementCase("replacement-count-one-over", "count", 1, 9_998, 1, "error"),
-    _RetirementCase("addition-bytes-exact", "bytes", 63, 1, 0, "normal", 257_677, 47),
-    _RetirementCase(
-        "addition-bytes-four-over", "bytes", 63, 1, 4, "replacement", 257_677, 50
-    ),
-    _RetirementCase("total-bytes-exact", "total-bytes", 1, 1, 0, "replacement"),
-    _RetirementCase("total-bytes-one-over", "total-bytes", 1, 1, 1, "capacity"),
-)
-
-
 def test_blocked_result_invariant_has_a_neutral_message() -> None:
     with pytest.raises(ValueError, match="blocked materialization has only a frame"):
         MaterializeResult(MaterializeStatus.BLOCKED, None, None)
@@ -4251,30 +4126,6 @@ def test_contract_envelope_bound_rejects_large_request_metadata_before_transacti
         journal.close()
 
 
-_DISCOVERY_ACCOUNT_ID = "@discovery:example.org"
-_DISCOVERY_DEVICE_ID = "DISCOVERY"
-_DISCOVERY_CLASSIC = ClassicSourceConfig(30_000, b"{}")
-_DISCOVERY_SLIDING = SlidingSourceConfig(
-    30_000,
-    "discovery",
-    b"{}",
-    b"{}",
-    b"{}",
-    2,
-)
-
-
-_SQL_IDENTIFIER = r'(?:[A-Z_][A-Z0-9_$]*|"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\])'
-_PROJECTION_WILDCARD = re.compile(
-    rf"(?<![A-Z0-9_$])(?:{_SQL_IDENTIFIER}\s*\.\s*)?\*(?![A-Z0-9_$])",
-    re.IGNORECASE,
-)
-_PAYLOAD_LENGTH = re.compile(
-    rf"\bLENGTH\s*\(\s*(?:{_SQL_IDENTIFIER}\s*\.\s*)?" r"PAYLOAD\s*\)",
-    re.IGNORECASE,
-)
-
-
 def test_materializer_max_retained_plaintext_backlog_size_is_arithmetic_only() -> None:
     retained_frame_count = 255
     frame_payload_bytes = 24 * 1024 * 1024
@@ -4283,113 +4134,6 @@ def test_materializer_max_retained_plaintext_backlog_size_is_arithmetic_only() -
 
     assert retained_bytes == 6_417_285_120
     assert retained_bytes / (1024**3) == 5.9765625
-
-
-_ATOMICITY_H1_CLASSIC_PLAIN = "h1-classic-plain"
-_ATOMICITY_RETIREMENT_SLIDING_CRYPTO = "retirement-sliding-crypto"
-_ATOMICITY_POST_HYDRATION_CLASSIC_READY = "post-hydration-classic-ready"
-_MATERIALIZER_CRASH_EXIT_CODE = 87
-
-_MATERIALIZER_ROLLBACK_CASES = (
-    pytest.param(
-        _ATOMICITY_H1_CLASSIC_PLAIN,
-        "aggregate_insert",
-        1,
-        id="h1-aggregate-insert",
-    ),
-    *(
-        pytest.param(
-            _ATOMICITY_H1_CLASSIC_PLAIN,
-            "work_insert",
-            occurrence,
-            id=f"h1-work-insert-{occurrence}",
-        )
-        for occurrence in range(1, 3)
-    ),
-    pytest.param(
-        _ATOMICITY_H1_CLASSIC_PLAIN,
-        "frame_delete",
-        1,
-        id="h1-frame-delete",
-    ),
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "meta_revision_epoch_cas",
-        1,
-        id="retirement-meta-cas",
-    ),
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "aggregate_update",
-        1,
-        id="retirement-aggregate-update",
-    ),
-    *(
-        pytest.param(
-            _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-            "work_insert",
-            occurrence,
-            id=f"retirement-work-insert-{occurrence}",
-        )
-        for occurrence in range(1, 5)
-    ),
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "work_release",
-        1,
-        id="retirement-work-release",
-    ),
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "frame_crypto_retain",
-        1,
-        id="retirement-frame-crypto-retain",
-    ),
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "before_commit",
-        1,
-        id="retirement-before-commit",
-    ),
-    *(
-        pytest.param(
-            _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
-            boundary,
-            1,
-            id=f"post_hydration_ready-{boundary.replace('_', '-')}",
-        )
-        for boundary in (
-            "meta_revision_epoch_cas",
-            "aggregate_update",
-            "work_insert",
-            "frame_delete",
-            "before_commit",
-        )
-    ),
-)
-_MATERIALIZER_CRASH_CASES = (
-    *_MATERIALIZER_ROLLBACK_CASES,
-    pytest.param(
-        _ATOMICITY_RETIREMENT_SLIDING_CRYPTO,
-        "commit",
-        1,
-        id="retirement-commit",
-    ),
-    pytest.param(
-        _ATOMICITY_POST_HYDRATION_CLASSIC_READY,
-        "commit",
-        1,
-        id="post_hydration_ready-commit",
-    ),
-)
-
-type _MaterializerStorageGraph = tuple[
-    OwnerView,
-    SourceState,
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-    tuple[tuple[object, ...], ...],
-]
 
 
 def _expected_plaintext_materializer_envelope(

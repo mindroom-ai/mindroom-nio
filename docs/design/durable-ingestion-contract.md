@@ -117,6 +117,38 @@ A programming error is not suppressed by a blanket exception around preparation,
 materialization, or settlement. Exceptions are caught only inside the transient
 handling boundary or an already established retry policy.
 
+## Failure costs and maintenance tradeoffs
+
+These are risk judgments, not measured incident frequencies. Each guarantee has
+its stated scope; failed hardware, inconsistent backups, and arbitrary external
+side effects require separate policies.
+
+| Guarantee or limit | Realistic trigger | Worst case without the guarantee | Maintenance decision |
+| --- | --- | --- | --- |
+| Atomic response/cursor capture | Process kill or response arriving during shutdown | Cursor skips an unretained message or to-device key; later decryption can fail permanently | Keep one fundamental transaction boundary. |
+| Atomic prepared output and crypto writes | Exception or crash during preparation | Crypto advances without deliverable output, or recovery uses inconsistent key state | Keep the transaction and poisoned-session recovery despite their complexity. |
+| Stable Work replay and consumer admission | Consumer restarts after acceptance but before acknowledgement | Work is lost or processed twice; an external action can repeat | Keep stable identities and admission; consumers still own external-effect deduplication. |
+| Membership and authorization ordering | Kick, leave, invite, join, or power-level change interleaved with messages | Consumer acts using stale membership or authorization | Keep ordered state and departure fencing because access decisions depend on them. |
+| Bounded gap repair and explicit loss | Limited timeline, reconnect, or incomplete state | Missing context is silently presented as complete history | Keep bounded recovery and honest losses; do not promise unlimited repair. |
+| Single supported store owner | Overlapping service restart or accidental second client | Competing crypto writers overwrite state or progress | Keep the lifetime lease and actual I/O fences; exclude arbitrary local writers. |
+| Deployed MatrixStore adoption | Existing deployment upgrades | Device identity, sessions, or trust facts are lost, disrupting encrypted history and verification | Keep careful adoption and boundary validation. |
+| Exact encrypted outbound retry | Server accepts a request but its response is lost | One logical send repeats or retry uses a different body after crypto state changes | Keep persisted bodies and transaction IDs with atomic response application. |
+| Durable receipts and account data | Restart while auxiliary records remain pending | Read/account settings become stale or callbacks are missed | Keep the shared durable route; callback effects are not exactly once. |
+| Transient typing/presence durability is excluded | Restart, malformed update, callback error, or slow callback | Typing/online state is missing or stale until a later update | Drop replay obligations; bound fresh callbacks and isolate failures. |
+| Recent commit survival after machine failure is excluded | Power loss or operating-system crash | Some recent commits are lost | Keep WAL NORMAL; stronger sync policy is a separate product decision. |
+| Revalidation of immutable internal values is excluded | Programmer mutates private objects contrary to their invariants | Internal behavior becomes undefined | Validate network/disk boundaries, then trust unchanged values within the operation. |
+
+Matrix allows a subsequent sync using the returned cursor to acknowledge
+previously delivered to-device messages and permits their deletion. Its
+transaction IDs also support request idempotency, motivating retained input
+before cursor progress and exact outbound retry.
+[Matrix to-device delivery](https://spec.matrix.org/latest/client-server-api/#send-to-device-messaging)
+
+SQLite distinguishes application crashes from operating-system crashes or power
+loss: WAL NORMAL preserves committed transactions across application crashes but
+can lose recent commits after machine failure.
+[SQLite synchronous modes](https://www.sqlite.org/pragma.html#pragma_synchronous)
+
 ## Review and maintenance rules
 
 Every proposed added check or persistent state must identify its trust boundary

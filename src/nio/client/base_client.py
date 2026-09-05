@@ -241,19 +241,6 @@ def _encrypted_room_ids_from_parsed_segments(
     )
 
 
-def _prepared_frame_encrypted_room_ids(
-    frame: SyncFrame,
-    live_room_ids: set[str],
-) -> tuple[str, ...]:
-    """Rebuild the frame-local encryption effect from authenticated source."""
-    return _encrypted_room_ids_from_parsed_segments(
-        tuple(
-            _parse_ingestion_room_segment(segment) for segment in frame.room_segments
-        ),
-        live_room_ids,
-    )
-
-
 def _prepared_waiting_key_request(
     event: RoomKeyRequest,
 ) -> _PreparedWaitingKeyRequest:
