@@ -195,6 +195,97 @@ tests are accepted for this change; their size does not create a test-shrink or
 historical-document deletion task. Existing supersession statements remain
 controlling.
 
+## Cutover hardening amendment
+
+Accepted direction, 2026-09-05: retain the atomic prepared engine and fix its
+observed capacity and ownership gaps. This amendment does not authorize a live
+cutover. The companion integration still needs its own verification.
+
+### One ingestion route per client
+
+An attached owned client rejects ordinary `sync`, `sync_forever`, and application
+of an ordinary `SyncResponse` before network, callback, token, or crypto effects.
+Its coordinator owns those effects. Non-sync response handling, sends, history
+reads, hydration, and cleanup remain available. Ordinary clients keep their
+existing callback behavior, including nested response callbacks.
+
+The factory requires a client that has never attempted ordinary sync. Record
+that attempt before its first await, including failed or cancelled attempts;
+callers can create a fresh client instead. This closes the race where a custom
+HTTP implementation has an outstanding sync but no visible HTTP session yet.
+Use the existing attached-store marker and one ordinary-use flag, without a
+second mode manager. A healthy owned close restores ordinary-client use; a
+poisoned client still requires reconstruction.
+
+### Atomic frame capacity
+
+A real 322,948-byte Classic response containing 2,050 timeline messages was
+accepted and then repeatedly failed preparation at the 2,048 READY-record limit,
+including after reopening. This is a supported workload and must make progress.
+The owned coordinator already drains the previous prepared frame before polling
+again. Remove the separate READY count/byte limits and their unused settings.
+Publish each prepared frame atomically within the remaining durable output
+bounds; retain the existing crypto transaction and stable Work identities.
+
+The supported durable output envelope remains 20,000 total Work records and
+64 MiB of encoded Work, with 10,000 HELD records / 32 MiB of encoded HELD Work,
+and 1 MiB per encoded Work row. Reserve the maximum header growth of HELD rows
+when admitting them so promotion to READY cannot itself exhaust the per-row or
+total byte allowance. Keep existing bounded loss handling for held-history
+capacity; do not discard deliverable messages to fit a READY threshold.
+
+The source-response byte limit is not a guarantee that its prepared output fits:
+many tiny events, decrypted content, synthetic records, and storage metadata can
+expand it. Exceeding a hard output bound is a distinct `JournalCapacityError`,
+not evidence of corrupt storage and not an ordinary retryable queue pause.
+The preparation transaction rolls back, the accepted source frame remains,
+and a client whose crypto memory changed must be reconstructed. Reopening alone
+cannot fix an intrinsically oversized frame. Such input requires operator
+intervention or a separately designed larger-input representation; automatic
+chunking, lossy skipping, or output spooling is outside this amendment. Persisted
+rows that violate the supported schema still fail integrity validation.
+
+A prepared-output spool or incremental crypto preparation would add durable
+progress, completion fencing, ordering, and crash states. Neither removes the
+need for a finite output bound. Those designs are not justified by the observed
+READY-threshold bug and must not return as review-driven requirements without a
+separate product decision.
+
+### Reuse of unchanged validated data
+
+Cache at most one decoded room Aggregate per journal instance. Every read still
+fetches the row and checks its owner, identity, types, and revision. Reuse requires
+an exact match of every stored field, including payload bytes and digest, plus
+the stream/transport identity under which it was authenticated. A revision or
+digest match alone is insufficient. A changed row takes the normal validating
+decode path; clear the cache when closing. This extends internal-value reuse
+across reads only when the complete authenticated input is unchanged. It does
+not cache room projection effects or admit competing raw writers.
+
+Compute encoded Work length from the same canonical envelope prefix used for
+persistence, without constructing and hashing the complete row just to count its
+bytes. Reuse unchanged sizes inside one planning operation where that removes
+repeat work; any changed status, revision, ordinal, identity, or plaintext needs
+its own size. Keep one final digest for the bytes actually persisted. No global
+cache, event batching framework, or new storage representation is introduced.
+
+Share small projection and crypto-control helpers between ordinary sync and
+owned preparation where they implement the same rules. Keep each route's
+orchestration, callbacks, transaction timing, and durable admission separate.
+Performance measurements must identify their workload and boundary; a faster
+codec is not an end-to-end throughput claim.
+
+### History decision boundary
+
+The current prepared engine detects discontinuities and emits explicit loss; it
+does not fetch missed messages through a Nio `/messages` backfill loop. Companion
+MindRoom context hydration can fetch history later, but installing context is
+not equivalent to admitting those messages as actionable requests. Thus the
+required gap-repair guarantee above must not be read as an existing promise to
+replay every missed request. Changing that behavior or deleting the remaining
+gap-planning representation requires a separate explicit decision. The capacity,
+ownership, and decoding changes do not depend on that decision.
+
 ## Verification
 
 - Real owned-engine Classic/Sliding processing, replay, acknowledgement, and
