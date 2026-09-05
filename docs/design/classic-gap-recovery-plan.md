@@ -13,6 +13,13 @@ existing owner, crypto preparation, admission, and journal.
 
 **Spec:** `docs/design/classic-gap-recovery-and-capacity.md`.
 
+**Current status:** The selected recovery, projection retry, and performance
+corrections are committed and published in both repositories. Full local suites,
+types, hooks, remote tests, image builds, and smoke stacks pass. Final Synapse
+capacity acceptance passes; Tuwunel passes every functional check but remains
+below the 45-second overlap requirement. Full qualification is still open.
+See the final results and separate scheduling scope at the end of this plan.
+
 ## Global constraints
 
 - Preserve ownership, authenticated persisted data, event order, admission
@@ -99,8 +106,8 @@ admission, owned sessions, bot readiness, crypto, and desktop integration.
   continued post-load sync, with the existing deadline unchanged.
 - [x] Run final full Nio pytest, repository hooks, and zero-error mypy.
 - [x] Recheck companion integration and zero-error typing against final source.
-- [ ] Record actual production size, tests, performance, and capacity results.
-- [ ] Review final changes, commit, push authorized branches, and verify remote
+- [x] Record actual production size, tests, performance, and capacity results.
+- [x] Review final changes, commit, push authorized branches, and verify remote
   checks. Report remaining limits without claiming unrelated gaps are closed.
 
 ## Task 5: Resolve remaining measured capacity limits
@@ -113,13 +120,13 @@ read, 45-second full visible overlap, exact replies, fence, or drain checks.
 - [x] Measure synchronous Nio processing against the actual large Synapse event
   shape; distinguish maximum event-loop blockage from total throughput before
   selecting a smaller source window or another performance change.
-- [ ] Reduce the fixed Classic request ceiling to 100, preserving oversize
+- [x] Reduce the fixed Classic request ceiling to 100, preserving oversize
   halving, smaller user limits, and all recovery/cursor behavior; verify tests
   and repeat live controls.
 - [x] Diagnose MindRoom's serial dispatch preparation with targeted timing.
   Preserve durable pending-turn recording and ordering. Fresh roots already
   skip thread-history reads and text debounce; do not delete imaginary work.
-- [ ] Benchmark any selected change, test its real behavioral boundaries,
+- [x] Benchmark any selected change, test its real behavioral boundaries,
   rerun unchanged live acceptance, then update the final results and publish.
 
 ## Measured results
@@ -474,3 +481,83 @@ matched. A separate warnings-enabled profile removed 120 false warnings and
 41,120 formatted diagnostic bytes. These are parser timings, not a claim of
 equivalent application improvement. Verify the companion correction against
 the final pinned dependency before publishing and repeating capacity controls.
+
+### Final published-source verification
+
+MindRoom pins Nio `09d5a25` and publishes the companion corrections in
+`b45966053`. Nio production is unchanged from `918a64a`; subsequent Nio commits
+record design and results only. Both published source trees were compared with
+the live workload sources; all production Python files matched, and the user's
+original dependency edits remained byte-for-byte unchanged.
+
+The companion parser regressions first produced six expected failures: four
+reaction/redaction classification cases and two false-warning cases. The
+correction preserves encrypted attachment replay and malformed-media rejection.
+All 597 focused cases then passed. The full companion suite passes 15,838 tests,
+skips 22, and reports 26 warnings; all repository hooks and full-project types
+pass. Remote Python tests pass 15,836 cases with 12 skips. All four full/minimal
+AMD64/ARM64 image builds and the complete smoke-stack workflow pass. Independent
+reviews approved the projection wait and parser changes.
+
+Nio's full local result remains 2,153 passed and three skipped, with zero mypy
+errors across 71 files and all hooks passing. Remote tests pass on Python 3.12,
+3.13, and 3.14, including coverage. Production remains 45,833 lines: 795 above
+the profiling baseline and 389 below the original simplification baseline.
+The companion changes add 25 net production lines, for a combined increase of
+820 versus the profiling snapshot. The latest two Nio simplifications removed
+28 lines; the companion parser correction adds one import and changes one call.
+
+The final uninstrumented controls preserve all original acceptance predicates:
+
+| Measurement | Tuwunel | Synapse, 5,000 server window |
+| --- | ---: | ---: |
+| Exact completed replies | 200 | 200 |
+| Reply median | 74.638 s | 78.715 s |
+| Reply p95 | 85.603 s | 85.750 s |
+| First input to last reply | 86.313 s | 87.802 s |
+| Initial visible reply spread | 20.465 s | 20.020 s |
+| Full visible overlap | 43.390 s | 47.580 s |
+| Fence principals settled | 3/3 | 3/3 |
+| Pending journal / outbox rows | 0 / 0 | 0 / 0 |
+| Peak process-tree RSS | 621.29 MiB | 658.78 MiB |
+
+Both controls pass continued sync and clean shutdown with zero application
+errors, stalls, degraded reads, or drain-failure markers. All false `msgtype`
+warnings are gone; other warning lines remain (408 on Tuwunel, 407 on Synapse).
+The scenario intentionally streams 4,800 characters at 80 characters per second;
+these reply times include approximately 60 seconds of synthetic generation.
+
+Synapse passes full acceptance, including 905 health checks, 200 peak active
+streams, and the unchanged 180-second shared workload deadline. Its measured
+phases total 175.946 seconds, including 82.067 seconds waiting for the fence and
+5.509 seconds for shutdown. Tuwunel's sole failure remains full overlap below
+45 seconds. Preserve that failure; do not label both controls fully passing.
+One passing Synapse run does not establish a general latency bound or isolate
+the parser correction as its cause. Local parser savings are approximately
+38 milliseconds per 1,000 events, not a 37% application speedup.
+
+### Separate scheduling scope
+
+Read-only investigation locates the approximately 20-second startup spread in
+MindRoom's shared new-root coalescing gate. Receipt-lane delivery enqueues
+without awaiting preparation, and established explicit threads already have
+independent drain tasks. New room roots share `(room, None, requester)`; that
+gate awaits each batch's context preparation, planning, durable handoff, and
+response-lock acquisition before preparing the next batch.
+
+Same-sender speech readiness, attachment/caption grouping, and follow-ups within
+one conversation need ordering. Independent closed root batches need not share
+all preparation work, but parallelizing their handoff changes cleanup, retry,
+shutdown, and durable-source ownership. It is not a lane-key or codec fix.
+Substituting a root event ID for the semantic coalescing thread is specifically
+unsafe: `turn_controller.py` uses that key to select context and reply targeting,
+and room-level media promotion depends on the absent thread ID.
+
+Keep that scheduling redesign separate from these corrections. A follow-up
+should first block preparation of root A and establish whether independent
+root B can safely prepare, preserving the existing caption, speech, target,
+failure, and shutdown behavior. Benchmark a bounded handoff only after defining
+its ownership. Do not add a second writer or delete either pending-turn write
+to force the synthetic overlap check to pass. The outstanding overlap result
+and the separately documented interactive key-share restart gap remain visible
+cutover considerations; no release, deployment, or merge is performed here.
