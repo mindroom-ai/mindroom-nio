@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking changes
+
+- Replace the fork-specific recovery/admission path with owned durable ingestion
+  for Classic and Sliding Sync. Released interfaces including
+  `AsyncClient.add_event_admission_callback` and `CallbackNotAcceptedError` are
+  removed. Consumers must migrate to the supported owned integration described
+  in `docs/design/durable-ingestion-contract.md`.
+- Integrations using earlier checkpoints of this PR must also update for removal
+  of the plain `IngestionSession`/`open_ingestion` API, `RecordKind.PRESENCE`,
+  `_CallbackRoute.PRESENCE`, `SyncFrame.presence_json`, and the two
+  `MaterializerLimits` READY-only count/byte limits. Those intermediate interfaces
+  were never released. The supported owned factory, session, completion, and
+  settlement names remain as documented in the contract.
+- Typing and presence are best-effort fresh observations and are not replayed.
+  Their cooperative one-second budget covers transient processing and callbacks;
+  callbacks may be cancelled at an await, and partial effects are not rolled back.
+- Unverified-device key-share requests now reach the existing approval callback
+  before a missing Olm session is claimed. This intentionally makes the callback
+  occur earlier for ordinary clients too; verification still controls key sharing.
+
+### Error handling and platform support
+
+- Prepared ingestion output exceeding the hard capacity bounds raises
+  `nio.ingest.errors.JournalCapacityError` and stops the owned session.
+- Import the package without `fcntl`; attempting filesystem ownership where it
+  is unavailable raises `LocalProtocolError` when the owned store is opened.
+- Permission helpers return identity-lookup errors, and v12 upgrades fail clearly
+  on an identity error or unusable power-level state before dependent writes.
+- Downloads saved to a directory require a response filename. An unnamed response
+  can still be saved to an explicit destination file.
+- Synchronous clients now await custom callback awaitables and propagate their
+  errors, preserving sequential callback completion.
+
+### Performance and development checks
+
+- Reuse one authenticated Work value when its complete stored row and owner
+  identity are unchanged, retaining per-read validation and existing transactions.
+  Five paired local delivery benchmarks measured about 33% less time for 1,000
+  messages; this does not measure whole-application throughput.
+- Require zero mypy errors across the package in CI, using development-only
+  dependency declarations and existing runtime validation.
+
+### Cutover requirements
+
+- This is a breaking change relative to 0.40.0; select the release version before
+  publishing. Companion integration and dependency pins require cutover testing.
+- The documented unverified key-request continuation gap after restart remains
+  open. A replayed approval callback may not support `continue_key_share()` until
+  that separate issue is fixed and verified through the owned engine.
+
 ## 0.40.0
 
 ### Performance

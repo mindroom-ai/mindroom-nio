@@ -45,11 +45,11 @@ The native inbound-session result is tuple[vodozemac.Session, bytes]. Existing
 AsyncDataT remains the shared accepted attachment-input type. Native/private
 methods absent from upstream stubs keep their existing signatures and effects.
 
-- [ ] Record current canonical diagnostics, then add types-jsonschema,
+- [x] Record current canonical diagnostics, then add types-jsonschema,
   types-aiofiles, and types-peewee as development dependencies. Refresh only the
   necessary lock entries and verify locked installation. Configure a portable
   local stub search path if declarations need it; retain all 70 source files.
-- [ ] Inspect actual optional/private/native API definitions before writing
+- [x] Inspect actual optional/private/native API definitions before writing
   declarations. A local optional Olm declaration covers only used Account
   pickle methods; the queue-store declaration subclasses Peewee's SqliteDatabase.
   Do not install a legacy runtime backend solely for checking.
@@ -62,13 +62,13 @@ class Account:
     def pickle(self, passphrase: str = "") -> bytes: ...
 ```
 
-- [ ] Correct LeasedSqliteDatabase constructor forwarding types and declare its
+- [x] Correct LeasedSqliteDatabase constructor forwarding types and declare its
   existing timeout/connection hook interface truthfully. Bind omitted
   peewee.sort_models through a precise verified callable declaration if needed.
   Preserve leases, connection arguments, hooks, epoch fences, and all four
   explicit runtime model bindings. Correct preflight path narrowing exposed by
   published stubs without widening supported input kinds.
-- [ ] Type jsonschema format callbacks for arbitrary JSON input. Add a focused
+- [x] Type jsonschema format callbacks for arbitrary JSON input. Add a focused
   failing case for applying the string format to a non-string JSON value, using
   the library format contract; preserve schema type rejection separately.
 
@@ -78,7 +78,7 @@ with pytest.raises(ValidationError):
     validate_json(42, {"type": "string", "format": "user_id"})
 ```
 
-- [ ] Correct attachment type aliases, inbound-session tuple return, concrete
+- [x] Correct attachment type aliases, inbound-session tuple return, concrete
   message-index cache type, and verified ECC/native declaration gaps. Preserve
   deferred first decryption, exact pickle conversions, and cryptographic bytes.
   For dynamic decrypted-event room_id assignment, express the existing dynamic
@@ -98,7 +98,7 @@ def create_inbound_session(
     )
 ```
 
-- [ ] Run focused dependency/crypto/store tests and canonical mypy; record the
+- [x] Run focused dependency/crypto/store tests and canonical mypy; record the
   remaining diagnostic inventory for later tasks. Run hooks on changed files,
   inspect runtime changes and production size, then commit with rationale.
 
@@ -111,7 +111,7 @@ Interfaces: public_rooms returns tuple[str, str, str | None], with serialized
 JSON body. Optional fields permitted by wire schemas stay optional. File-response
 factories accept their existing success bodies and error dictionaries.
 
-- [ ] Correct heterogeneous query dictionary types and nested request payload
+- [x] Correct heterogeneous query dictionary types and nested request payload
   declarations using their real JSON shapes. Fix implicit optional defaults and
   make GET/POST control flow exhaustive without adding a fallback response.
 
@@ -122,15 +122,15 @@ filter_room_types: list[str | None] | None = None
 # tuple[str, str, str | None]
 ```
 
-- [ ] Align InviteMemberEvent.prev_membership, interactive registration fields,
+- [x] Align InviteMemberEvent.prev_membership, interactive registration fields,
   hierarchy next_batch, and room-message end with schema-permitted absence.
   Fix response-factory input/return declarations around existing construction;
   do not substitute a different error class just to satisfy a narrow annotation.
-- [ ] Resolve known-member sorting's optional lookup type from its actual
+- [x] Resolve known-member sorting's optional lookup type from its actual
   invariant: the synchronous comprehension iterates self.users, and known
   MatrixUser names fall back to user IDs. Preserve name/avatar behavior; no
   new unnamed-member failure test is justified by this diagnostic.
-- [ ] Run API/response/room/event tests and canonical mypy. Verify wire payloads
+- [x] Run API/response/room/event tests and canonical mypy. Verify wire payloads
   and public return values are unchanged, run hooks, review diff, then commit.
 
 ## Task 3: Correct client and transport contracts and real error paths
@@ -145,11 +145,11 @@ callback order and re-entry. Upload input providers keep existing synchronous
 and asynchronous input support; the internal _send provider is awaited. Existing
 error-result classes remain the error channel for permission/upgrade operations.
 
-- [ ] Correct callback callable/filter declarations, explicit filtered None
+- [x] Correct callback callable/filter declarations, explicit filtered None
   return, type aliases, receipt thread-ID narrowing, response-class selection,
   and separate factory argument/body/path/JSON locals. Preserve dynamic event
   metadata using accurate fields or existing setattr behavior, not blanket Any.
-- [ ] Express awaited internal providers and aiohttp request values correctly.
+- [x] Express awaited internal providers and aiohttp request values correctly.
   Preserve configured timeout and SSL semantics, including default verification
   and explicit ssl=False. Remove obsolete suppression comments when types now
   describe the actual call.
@@ -161,7 +161,7 @@ data_provider: Callable[[int, int], Awaitable[AsyncDataT]] | None
 callback: Callable[..., Awaitable[None] | None]
 ```
 
-- [ ] Add failing whoami-error cases for has_permission, has_event_permission,
+- [x] Add failing whoami-error cases for has_permission, has_event_permission,
   and the v12 upgrade path. Use existing client/HTTP fixtures and assert the
   appropriate error result and no dependent remote writes. Handle absent v12
   power-level state clearly before accessing its users map.
@@ -172,7 +172,7 @@ assert isinstance(result, ErrorResponse)
 # HTTP fixture supplies WhoamiError; no following state-changing request occurs.
 ```
 
-- [ ] Add a real download response with no content-disposition filename and
+- [x] Add a real download response with no content-disposition filename and
   save_to pointing to a directory. Require ValueError before any file opens;
   an explicit destination file remains usable for the same unnamed response.
   Preserve existing named downloads and error-body parsing.
@@ -183,11 +183,11 @@ with pytest.raises(ValueError, match="filename"):
 assert list(directory.iterdir()) == []
 ```
 
-- [ ] Correct HTTP/2 header/event iterable types, request-header method/instance
+- [x] Correct HTTP/2 header/event iterable types, request-header method/instance
   field typing, and numeric reset codes. Fix ConnectionTerminated's loop-variable
   typo while retaining its existing logging/pass behavior. Existing transport
   tests suffice for annotation and diagnostic-only changes; add no reset policy.
-- [ ] Run new regressions plus existing client/transport/callback suites. Recheck
+- [x] Run new regressions plus existing client/transport/callback suites. Recheck
   mypy, hooks, and exact runtime/error behavior before committing.
 
 ## Task 4: Expose ingestion invariants to the checker
@@ -204,10 +204,10 @@ Interfaces: keep all record types, exact accepted values, validation failures,
 source/owner identities, batch APIs, transaction boundaries, and status enums.
 Expected runtime behavior is unchanged.
 
-- [ ] Narrow integer/tuple/object values after existing exact checks. Preserve
+- [x] Narrow integer/tuple/object values after existing exact checks. Preserve
   bool rejection and other intentional exact-type requirements. Use precise
   cast targets for previously validated SQLite fields, not a new validator layer.
-- [ ] Give distinct names to staged and prepared frames and narrow discriminated
+- [x] Give distinct names to staged and prepared frames and narrow discriminated
   results before using optional frames. Remove redundant casts and duplicate
   scoped-list declarations only where established control flow proves them.
 
@@ -217,14 +217,14 @@ assert frame is not None  # inside the existing FRAME-discriminated branch
 # Existing frame logic uses this narrowed local.
 ```
 
-- [ ] Type maintenance response-class alternatives with their common precise
+- [x] Type maintenance response-class alternatives with their common precise
   response interface and validated room-key fields with their existing type.
   Construct typed OwnerView, SourceState, and DeliveryState values from checked
   columns, preserving the authoritative decode at each boundary.
-- [ ] Run affected ingestion suites, canonical mypy, and hooks. Resolve all
+- [x] Run affected ingestion suites, canonical mypy, and hooks. Resolve all
   remaining package diagnostics attributable to Tasks 1–4 through their owning
   implementer before this task is complete; no diagnostic budget remains.
-- [ ] Confirm zero errors across all source files, then add the type-check CI
+- [x] Confirm zero errors across all source files, then add the type-check CI
   job using the existing checkout/uv setup versions and a locked environment.
   No baseline or exclusions; new errors fail CI.
 
@@ -244,7 +244,7 @@ assert frame is not None  # inside the existing FRAME-discriminated branch
         run: uv run --locked mypy -p nio --warn-redundant-casts --no-incremental
 ```
 
-- [ ] Run the exact CI command locally, inspect behavior-preserving scope and
+- [x] Run the exact CI command locally, inspect behavior-preserving scope and
   production delta, validate workflow hooks, then commit.
 
 ## Task 5: Reuse the unchanged authenticated Work value
@@ -255,13 +255,13 @@ Interfaces: existing JournalRows and AuthenticatedWork; one additional private
 cache entry, no change to next_batch, _settle_batch, acknowledgement, or schema.
 Task 4's exact column/revision typing stays intact.
 
-- [ ] Add behavioral regressions through real owned delivery: one decode per
+- [x] Add behavioral regressions through real owned delivery: one decode per
   unchanged Work over claim/settlement/ack; same callback order, batch identity,
   and frame retirement. Use decode call count only alongside those outcomes.
-- [ ] Cover payload mutation with unchanged digest/revision, a different valid
+- [x] Cover payload mutation with unchanged digest/revision, a different valid
   row, account/stream/transport identity change, lowered owner revision, HELD
   promotion, deletion/ack, and close/reopen. Keep corruption failures observable.
-- [ ] Add a single-entry cache after _validate_task3_work_row, following existing
+- [x] Add a single-entry cache after _validate_task3_work_row, following existing
   Aggregate authentication keys. Every read still fetches SQLite and validates
   clear columns before consulting the cached value.
 
@@ -276,9 +276,9 @@ self._work_cache = authentication, stored, value
 return value
 ```
 
-- [ ] Clear Work and Aggregate caches on close. Do not cache mutable projection,
+- [x] Clear Work and Aggregate caches on close. Do not cache mutable projection,
   parsed callback events, admission facts, operations, or effects.
-- [ ] Run focused delivery/corruption/crypto/recovery tests, zero-error mypy,
+- [x] Run focused delivery/corruption/crypto/recovery tests, zero-error mypy,
   hooks, and the same paired real-store benchmark. Record actual production
   delta and measured speedup; no machine-specific timing assertion in tests.
   Inspect cache bounds/invalidation and commit.
@@ -308,3 +308,27 @@ baseline and verifies the combined behavior. Files shared by tasks are edited
 sequentially; no two implementers own them concurrently. Real error paths have
 focused regressions, while annotation-only paths retain existing assertions.
 No new guarantee or delivery representation is required.
+
+## Execution record
+
+Tasks 1–5 are implemented and reviewed. The combined final gate remains
+in progress.
+
+| Task | Commits | Verification |
+| --- | --- | --- |
+| 1: dependency and crypto types | `9802ffc` | 205 passed, 3 skipped; narrow declarations reviewed |
+| 2: request and response types | `ca12e32` | 138 passed; existing behavior retained |
+| 3: client and transport contracts | `9df4016`, `fee3352` | 221 passed; callback repair covered by two real regressions and 10 callback tests |
+| 4: ingestion invariants and CI | `4563c33` | Zero mypy errors in all 70 files; 1,562 ingestion tests passed, then the two corrected transport expectations passed |
+| 5: bounded Work reuse | `6aa0b79` | 296 passed, 1 skipped; five real-store benchmark pairs showed 32.7% median delivery-time reduction for 19 net production lines |
+
+Review additionally reproduced dropped custom-awaitable work in synchronous
+callbacks. The small adapter in `fee3352` honors the existing callback contract;
+its regressions exercise completion order and propagated errors through real
+client delivery. Two ingestion test expectations changed only because aiohttp
+already normalizes the timeout and default TLS values that Nio now passes
+explicitly. The design records the evidence and costs of both decisions.
+
+A minor callback-docstring mismatch remains for final review. No blocking task
+review finding remains open. The final three-version full suite, combined
+review, final results, and push are still required.

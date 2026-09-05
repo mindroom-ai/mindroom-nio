@@ -446,7 +446,10 @@ and meaningful tests rather than blanket suppression or test accommodation.
 They also requested inspection of PR #57's performance ideas, with benchmarks on
 this PR #55 before deciding whether any optimization merits adoption. Both are
 separate follow-ups after the current repairs, verification, review, and push.
-PR #57 has not yet been evaluated as part of this hardening pass.
+That historical hardening pass did not evaluate PR #57. The subsequent
+[type and delivery-cost design](type-correctness-and-delivery-cost.md) records
+the evaluation, bounded Work reuse, and the zero-error CI requirement that
+supersedes this pass's historical mypy baseline comparison.
 
 ### Publication
 

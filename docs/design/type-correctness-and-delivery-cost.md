@@ -11,7 +11,7 @@ The canonical check is `MYPYPATH=src uv run --no-sync mypy -p nio
 --warn-redundant-casts --no-incremental`. At `bd320ab`, mypy 2.3.0 reports
 144 errors in 23 files while checking all 70 source files. Forty-five diagnostics
 are in PR-new files; 99 are in pre-existing files, some modified by the PR. This
-is provenance, not an allowed baseline. Completion requires zero diagnostics
+is provenance, not an allowed baseline. Completion requires zero errors
 under that command and an equivalent locked CI check.
 
 Add published jsonschema, aiofiles, and Peewee typing packages to development
@@ -49,6 +49,22 @@ Reproduce possible behavioral defects before changing them. In particular:
 - jsonschema format callbacks accept arbitrary JSON values at their library
   boundary. Apply string-format rules to strings and leave non-string rejection
   to schema type validation, matching jsonschema's format contract.
+- Review reproduced a synchronous callback defect: a callable returning a
+  custom awaitable is invoked, but its returned work is silently ignored.
+  Honor the existing `Awaitable[None] | None` contract with a small coroutine
+  adapter suitable for all supported Python versions. Keep synchronous waiting,
+  callback order, and exception propagation; no task queue or timeout is added.
+  This causes previously ignored custom-awaitable work to execute. Existing
+  coroutine and `None` callbacks retain their behavior.
+
+Transport test expectations follow aiohttp's effective request settings.
+Inspection of its request implementation confirms that a numeric timeout is
+converted to `ClientTimeout(total=value)` and `ssl=None` to `True`. Passing these
+typed normalized values from Nio preserves the existing timeout and default TLS
+verification. Two ingestion tests used fake HTTP sessions that compared the old
+representations; update those expectations while retaining exact request, body,
+headers, timeout, bounded-read, callback-isolation, and response-release checks.
+The public `AsyncClient.send` arguments remain unchanged.
 
 Room-name sorting iterates known members whose names fall back to user IDs;
 its optional lookup annotation does not establish an unnamed-member bug.
@@ -116,6 +132,68 @@ close, and reopen. Retain corruption detection and stable batch identities. Then
 repeat the same real delivery benchmark against the production implementation,
 report source-size cost, and retain only a measured improvement consistent with
 the small design.
+
+The production implementation in `6aa0b79` adds 19 net source lines. Five
+alternating-order pairs on fresh file-backed WAL/NORMAL stores measured a
+1,301.3 ms control median and an 878.1 ms reuse median for 1,000 messages. The
+median paired reduction was 32.7% (individual pairs: 30.8–33.1%). True Work
+plaintext decodes fell from 5,000 to 1,000. Both variants use the production
+decoder; the control clears its Work cache before each read. Both count decodes
+and assert unique ordered callbacks, acknowledgement deletion, and frame
+retirement. Warmup precedes measurement. This confirms a material benefit for
+the small cache; it is not an application-wide or source-parsing speed claim.
+
+At `6aa0b79`, the repository has 45,023 physical production Python lines across
+70 files: 174 more than this follow-up's `bd320ab` baseline, 1,199 fewer than
+the original reviewed `742806f`, and 13,533 net lines above the PR base. The
+typing declarations add seven development-only stub lines and three development
+stub dependencies; no runtime dependency is added. Final combined verification
+and publication are recorded in the implementation plan.
+
+## Later performance evaluation
+
+The user requested an `orjson` evaluation after this pass. Reprofile after Work
+reuse to establish how much remaining delivery cost is JSON parsing or encoding.
+If material, benchmark a candidate on the same real delivery workload before
+adopting it. Verify compatibility with strict input validation, canonical stored
+bytes, authentication, and replay; compare the measured gain with the dependency
+and maintenance cost. This is a future investigation, not a dependency change
+or additional implementation task in the current pass.
+
+Include source capture and fresh transient fanout in that later profile. The
+current delivery benchmark excludes both. Transient fanout decodes the full
+response again; measure this cost before extending source-result interfaces to
+carry extracted transient sections or a decoded root. Keep any future reuse
+in memory and outside durable frame/Work representations.
+
+## Further review disposition
+
+A follow-up review of `bd320ab` raised transient-path and release concerns.
+The earlier 144-error status and unevaluated PR #57 status are superseded by this
+work. The remaining conclusions are:
+
+- The fresh response already passed the same strict JSON loader before commit,
+  and its bytes remain immutable. No supported input was found that fails only
+  the repeated root decode before transient isolation. A monkeypatched loader
+  failure does not justify adding a new guarantee or regression test. Genuine
+  transient section/event and callback failures remain isolated as documented.
+- The generic transient warning lacks a useful cause. Track a small sanitized
+  cause diagnostic for later; do not build per-category discard accounting or
+  include exception messages, payloads, credentials, or keys.
+- The transient deadline covers section extraction, validation, projection,
+  and callbacks, with cooperative yields. The contract now states this scope;
+  retaining the bounded pass avoids an extra event buffer and permits dropping
+  the remainder of a large burst, consistent with best-effort semantics.
+- The shared typing filter is not redundant across both transports.
+  `SlidingSource._ephemeral_events` accepts an object from the receipts extension
+  without enforcing its event type. A misplaced `m.typing` object reaches that
+  capture output, then `_normalized_ephemeral_envelopes` discards it. A focused
+  probe confirmed one captured envelope and zero normalized envelopes. Removing
+  the shared filter alone would weaken the transient/durable separation. Any
+  later consolidation must cover both source boundaries and preserve that rule.
+- Draft release notes belong in this PR. Version selection and release remain
+  separate. The existing owned restart-continuation gap and companion integration
+  requirements remain recorded; neither is silently resolved by this follow-up.
 
 ## Scope and release boundary
 

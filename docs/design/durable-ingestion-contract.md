@@ -102,8 +102,12 @@ must still be valid bounded JSON; malformed durable sections and unidentifiable
 mixed envelopes retain their normal validation.
 
 Callback exceptions are isolated from durable progress. Within the owned
-engine's transient path, `asyncio.timeout(1)` encloses sequential callback
-awaits in the current task; it creates no separate task for the fanout. A timeout can
+engine's transient path, `asyncio.timeout(1)` provides one cooperative budget
+per fresh response for transient section extraction, event validation,
+projection updates, and sequential callback awaits in the current task. The
+already validated response body is decoded before this budget. It creates no
+separate task for the fanout. A large transient burst can exhaust the budget
+before all callbacks run; completeness remains deliberately unsupported. A timeout can
 cancel a callback at an await after its projection update or earlier callback
 side effects. Those effects are not rolled back, and the unfinished fanout is
 discarded. Callbacks must cooperate with cancellation, clean up resources, and
