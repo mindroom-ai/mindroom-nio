@@ -243,11 +243,16 @@ async def test_owned_sync_entrypoints_reject_before_effects_and_do_not_stick(
     before_token = client.next_batch
     before_source = session._journal.load_source()
     callback_events: list[str] = []
+    crypto_calls: list[SyncResponse] = []
 
     async def callback(_room: nio.MatrixRoom, event: nio.RoomMessageText) -> None:
         callback_events.append(event.event_id)
 
+    def observe_olm_events(response: SyncResponse) -> None:
+        crypto_calls.append(response)
+
     client.add_event_callback(callback, nio.RoomMessageText)
+    client._handle_olm_events = observe_olm_events  # type: ignore[method-assign]
     response = _sync_response()
 
     with pytest.raises(LocalProtocolError, match=OWNED_SYNC_ERROR):
@@ -269,6 +274,7 @@ async def test_owned_sync_entrypoints_reject_before_effects_and_do_not_stick(
     assert client.send_calls == []
     assert sync_forever_calls == []
     assert callback_events == []
+    assert crypto_calls == []
     assert client.next_batch == before_token
     assert session._journal.load_source() == before_source
 
