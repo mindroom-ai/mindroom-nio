@@ -820,6 +820,10 @@ def store_loaded(fn):
     return inner
 
 
+async def _await_callback_result(result: Awaitable[None]) -> None:
+    await result
+
+
 @dataclass
 class ClientCallback:
     """nio internal callback class."""
@@ -853,8 +857,8 @@ class ClientCallback:
     ) -> None:
         """Execute callback from synchronous context."""
         result = self._execute(event, room, *callback_args)
-        if inspect.iscoroutine(result):
-            asyncio.run(result)
+        if inspect.isawaitable(result):
+            asyncio.run(_await_callback_result(result))
 
     async def async_execute(
         self,

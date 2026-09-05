@@ -1089,6 +1089,48 @@ class TestClass:
         with pytest.raises(CallbackException):
             client.receive_response(self.sync_response)
 
+    def test_event_callback_waits_for_custom_awaitable_in_order(self, client):
+        client.receive_response(self.login_response)
+        callback_order = []
+
+        class CallbackCompletion:
+            def __await__(self):
+                callback_order.append("awaited")
+                yield from ()
+
+        def awaitable_callback(_room, _event):
+            callback_order.append("called")
+            return CallbackCompletion()
+
+        def following_callback(_room, _event):
+            callback_order.append("following")
+
+        client.add_event_callback(awaitable_callback, RoomEncryptionEvent)
+        client.add_event_callback(following_callback, RoomEncryptionEvent)
+
+        client.receive_response(self.sync_response)
+
+        assert callback_order == ["called", "awaited", "following"]
+
+    def test_event_callback_propagates_custom_awaitable_error(self, client):
+        client.receive_response(self.login_response)
+
+        class CallbackException(Exception):
+            pass
+
+        class FailingCallback:
+            def __await__(self):
+                raise CallbackException
+                yield
+
+        def callback(_room, _event):
+            return FailingCallback()
+
+        client.add_event_callback(callback, RoomEncryptionEvent)
+
+        with pytest.raises(CallbackException):
+            client.receive_response(self.sync_response)
+
     def test_to_device_cb(self, client):
         client.receive_response(self.login_response)
 
