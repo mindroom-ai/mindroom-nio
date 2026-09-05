@@ -440,10 +440,13 @@ def _prepared_crypto_delta_snapshot(
             target = (user_id, device_id)
             waiting = olm.key_requests_waiting_for_session.get(target, {})
             waiting_requests: list[_PreparedWaitingKeyRequest] = []
-            for request_id, event in waiting.items():
-                if type(request_id) is not str or type(event) is not RoomKeyRequest:
+            for request_id, request_event in waiting.items():
+                if (
+                    type(request_id) is not str
+                    or type(request_event) is not RoomKeyRequest
+                ):
                     raise TypeError("waiting room-key request is invalid")
-                prepared_request = _prepared_waiting_key_request(event)
+                prepared_request = _prepared_waiting_key_request(request_event)
                 if (request_id, user_id, device_id) != (
                     prepared_request.request_id,
                     prepared_request.sender_user_id,
@@ -821,7 +824,7 @@ def store_loaded(fn):
 class ClientCallback:
     """nio internal callback class."""
 
-    func: Callable[..., None] | Callable[..., Awaitable[None]] = field()
+    func: Callable[..., Awaitable[None] | None] = field()
     filter: tuple[type, ...] | type | None = None
 
     def _execute(
@@ -829,7 +832,7 @@ class ClientCallback:
         event,
         room: MatrixRoom | None = None,
         *callback_args,
-    ) -> Awaitable | None:
+    ) -> Awaitable[None] | None:
         """
         Checks the filter and executes the function once.
         sync_execute and async_execute will each determine
@@ -840,6 +843,7 @@ class ClientCallback:
                 return self.func(room, event, *callback_args)
             else:
                 return self.func(event, *callback_args)
+        return None
 
     def sync_execute(
         self,
@@ -2651,7 +2655,7 @@ class Client:
     def add_event_callback(
         self,
         callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
-        filter: type[Event] | tuple[type[Event], None],
+        filter: type[Event] | tuple[type[Event], ...],
     ) -> None:
         """Add a callback that will be executed on room events.
 
@@ -2675,7 +2679,10 @@ class Client:
 
     def add_ephemeral_callback(
         self,
-        callback: Callable[[MatrixRoom, EphemeralEvent], None],
+        callback: Callable[
+            [MatrixRoom, EphemeralEvent],
+            Awaitable[None] | None,
+        ],
         filter: type[EphemeralEvent] | tuple[type[EphemeralEvent], ...],
     ) -> None:
         """Add a callback that will be executed on ephemeral room events.
@@ -2697,7 +2704,7 @@ class Client:
 
     def add_global_account_data_callback(
         self,
-        callback: Callable[[AccountDataEvent], None],
+        callback: Callable[[AccountDataEvent], Awaitable[None] | None],
         filter: type[AccountDataEvent] | tuple[type[AccountDataEvent], ...],
     ) -> None:
         """Add a callback that will be executed on global account data events.
@@ -2720,7 +2727,10 @@ class Client:
 
     def add_room_account_data_callback(
         self,
-        callback: Callable[[MatrixRoom, AccountDataEvent], None],
+        callback: Callable[
+            [MatrixRoom, AccountDataEvent],
+            Awaitable[None] | None,
+        ],
         filter: type[AccountDataEvent] | tuple[type[AccountDataEvent], ...],
     ) -> None:
         """Add a callback that will be executed on room account data events.
@@ -2743,7 +2753,7 @@ class Client:
 
     def add_to_device_callback(
         self,
-        callback: Callable[[ToDeviceEvent], None],
+        callback: Callable[[ToDeviceEvent], Awaitable[None] | None],
         filter: type[ToDeviceEvent] | tuple[type[ToDeviceEvent], ...],
     ) -> None:
         """Add a callback that will be executed on to-device events.
@@ -2765,9 +2775,9 @@ class Client:
 
     def add_presence_callback(
         self,
-        callback: Callable[[PresenceEvent], None],
+        callback: Callable[[PresenceEvent], Awaitable[None] | None],
         filter: type | tuple[type],
-    ):
+    ) -> None:
         """Add a callback that will be executed on presence events.
 
         Args:

@@ -25,6 +25,7 @@ import warnings
 from asyncio import Event as AsyncioEvent
 from collections.abc import (
     AsyncIterator,
+    Awaitable,
     Callable,
     Coroutine,
     Iterable,
@@ -35,11 +36,13 @@ from dataclasses import dataclass
 from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import Any, TypeVar
+from ssl import SSLContext
+from typing import Any, Protocol, TypeVar, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
 import aiofiles
+import aiofiles.os
 from aiofiles.threadpool.binary import AsyncBufferedReader
 from aiofiles.threadpool.text import AsyncTextIOWrapper
 from aiohttp import (
@@ -258,6 +261,16 @@ _RoomMembershipResponseT = TypeVar(
 )
 
 DataProvider = Callable[[int, int], AsyncDataT]
+_SendDataProvider = Callable[[int, int], Awaitable[AsyncDataT]]
+
+
+class _ResponseFactory(Protocol):
+    @classmethod
+    def from_dict(
+        cls,
+        parsed_dict: dict[Any, Any],
+        *args: Any,
+    ) -> Response: ...
 
 
 SynchronousFile = (
@@ -480,7 +493,7 @@ class AsyncClient(Client):
         device_id: str | None = "",
         store_path: str | None = "",
         config: AsyncClientConfig | None = None,
-        ssl: bool | None = None,
+        ssl: SSLContext | bool | None = None,
         proxy: str | None = None,
     ):
         self.homeserver = homeserver
@@ -520,13 +533,13 @@ class AsyncClient(Client):
 
     def add_response_callback(
         self,
-        func: Coroutine[Any, Any, Response],
-        cb_filter: tuple[type] | type | None = None,
-    ):
-        """Add a coroutine that will be called if a response is received.
+        func: Callable[..., Awaitable[None] | None],
+        cb_filter: tuple[type, ...] | type | None = None,
+    ) -> None:
+        """Add a callback that will be called if a response is received.
 
         Args:
-            func (Coroutine): The coroutine that will be called with the
+            func (Callable): The callback that will be called with the
                 response as the argument.
             cb_filter (Type, optional): A type or a tuple of types for which
                 the callback should be called.
@@ -591,7 +604,7 @@ class AsyncClient(Client):
         Returns a subclass of `Response` depending on the type of the
         response_class argument.
         """
-        data = data or ()
+        factory_args = data or ()
 
         content_type = transport_response.content_type
         is_json = content_type == "application/json"
@@ -602,34 +615,40 @@ class AsyncClient(Client):
 
         if issubclass(response_class, FileResponse) and is_json:
             if transport_response.status in range(200, 300):
-                data = await transport_response.read()
+                file_data: bytes | os.PathLike | dict[Any, Any] = (
+                    await transport_response.read()
+                )
                 # the data was returned fine, so the raw bytes are passed to prevent parsing as an error.
             else:
-                data = await self.parse_body(transport_response)
+                file_data = await self.parse_body(transport_response)
                 # there was an error in the response, so the data must be a dictionary to parse as an error
-            resp = response_class.from_data(data, content_type, name)
+            resp = response_class.from_data(file_data, content_type, name)
 
         elif issubclass(response_class, FileResponse):
             if not save_to:
-                body = await transport_response.read()
+                file_body: bytes | os.PathLike = await transport_response.read()
             else:
-                save_to = Path(save_to)
-                if save_to.is_dir():
-                    save_to = save_to / name
+                destination = Path(save_to)
+                if await aiofiles.os.path.isdir(destination):
+                    if name is None:
+                        raise ValueError(
+                            "A response filename is required when saving to a directory"
+                        )
+                    destination /= name
 
-                async with aiofiles.open(save_to, "wb") as f:
+                async with aiofiles.open(destination, "wb") as f:
                     async for chunk in transport_response.content.iter_chunked(
                         self.config.io_chunk_size
                     ):
                         await f.write(chunk)
-                body = save_to
-            resp = response_class.from_data(body, content_type, name)
+                file_body = destination
+            resp = response_class.from_data(file_body, content_type, name)
         elif (
             issubclass(response_class, RoomGetStateEventResponse)
             and transport_response.status == 404
         ):
             parsed_dict = await self.parse_body(transport_response)
-            resp = response_class.create_error(parsed_dict, data[-1])
+            resp = response_class.create_error(parsed_dict, factory_args[-1])
 
         elif (
             transport_response.status == 401 and response_class == DeleteDevicesResponse
@@ -639,7 +658,8 @@ class AsyncClient(Client):
 
         else:
             parsed_dict = await self.parse_body(transport_response)
-            resp = response_class.from_dict(parsed_dict, *data)
+            response_factory = cast(type[_ResponseFactory], response_class)
+            resp = response_factory.from_dict(parsed_dict, *factory_args)
 
         resp.transport_response = transport_response
         return resp
@@ -649,7 +669,8 @@ class AsyncClient(Client):
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                response.to_device_events[index] = to_device_event = decrypted_event
+                to_device_event = cast(ToDeviceEvent, decrypted_event)
+                response.to_device_events[index] = to_device_event
             if isinstance(
                 to_device_event, (RoomKeyRequest, RoomKeyRequestCancellation)
             ):
@@ -846,7 +867,7 @@ class AsyncClient(Client):
         response_data: tuple[Any, ...] | None = None,
         content_type: str | None = None,
         trace_context: Any | None = None,
-        data_provider: DataProvider | None = None,
+        data_provider: _SendDataProvider | None = None,
         timeout: float | None = None,  # noqa: ASYNC109
         content_length: int | None = None,
         save_to: os.PathLike | None = None,
@@ -878,11 +899,7 @@ class AsyncClient(Client):
 
         while True:
             if data_provider:
-                # mypy expects an "Awaitable[Any]" but data_provider is a
-                # method generated during runtime that may or may not be
-                # Awaitable. The actual type is a union of the types that we
-                # can receive from reading files.
-                data = await data_provider(got_429, got_timeouts)  # type: ignore
+                data = await data_provider(got_429, got_timeouts)
 
             try:
                 transport_resp = await self.send(
@@ -968,14 +985,19 @@ class AsyncClient(Client):
         if self.config.custom_headers is not None:
             request_headers.update(self.config.custom_headers)
 
+        request_timeout = ClientTimeout(
+            total=self.config.request_timeout if timeout is None else timeout
+        )
+        request_ssl = self.ssl if self.ssl is not None else True
+
         return await self.client_session.request(
             method,
             self.homeserver + path,
             data=data,
-            ssl=self.ssl,
+            ssl=request_ssl,
             headers=request_headers,
             trace_request_ctx=trace_context,
-            timeout=self.config.request_timeout if timeout is None else timeout,
+            timeout=request_timeout,
         )
 
     async def mxc_to_http(
@@ -3188,7 +3210,7 @@ class AsyncClient(Client):
         room_id: str,
         event_id: str,
         receipt_type: ReceiptType = ReceiptType.read,
-        thread_id: str | None = "main",
+        thread_id: str = "main",
     ) -> UpdateReceiptMarkerResponse | UpdateReceiptMarkerError:
         """Update the marker of given the `receipt_type` to specified `event_id`.
 
@@ -3442,14 +3464,15 @@ class AsyncClient(Client):
 
         initial_file_pos = 0
 
-        async def provider(got_429, got_timeouts):
+        async def provider(got_429: int, got_timeouts: int) -> AsyncDataT:
             nonlocal initial_file_pos
             if monitor and (got_429 or got_timeouts):
                 # We have to restart from scratch
                 monitor.transferred = 0
 
-            if isinstance(data_provider, Callable):
-                data = data_provider(got_429, got_timeouts)
+            upload_data: AsyncDataT | SynchronousFileType | AsyncFileType
+            if callable(data_provider):
+                upload_data = data_provider(got_429, got_timeouts)
 
             elif isinstance(data_provider, SynchronousFile):
                 if got_429 or got_timeouts:
@@ -3457,7 +3480,7 @@ class AsyncClient(Client):
                 else:
                     initial_file_pos = data_provider.tell()
 
-                data = data_provider
+                upload_data = data_provider
 
             elif isinstance(data_provider, AsyncFile):
                 if got_429 or got_timeouts:
@@ -3465,7 +3488,7 @@ class AsyncClient(Client):
                 else:
                     initial_file_pos = await data_provider.tell()
 
-                data = data_provider
+                upload_data = data_provider
 
             else:
                 raise TypeError(
@@ -3476,12 +3499,12 @@ class AsyncClient(Client):
 
             if encrypt:
                 return self._encrypted_data_generator(
-                    data,
+                    upload_data,
                     decryption_dict,
                     monitor,
                 )
 
-            return self._plain_data_generator(data, monitor)
+            return self._plain_data_generator(upload_data, monitor)
 
         response = await self._send(
             UploadResponse,
@@ -3571,7 +3594,9 @@ class AsyncClient(Client):
             access_token=self.access_token,
         )
 
-        response_class = MemoryDownloadResponse
+        response_class: type[DiskDownloadResponse] | type[MemoryDownloadResponse] = (
+            MemoryDownloadResponse
+        )
         if save_to is not None:
             response_class = DiskDownloadResponse
 
@@ -3923,7 +3948,7 @@ class AsyncClient(Client):
         server: str | None = None,
         since: str | None = None,
         filter_generic_search_term: str | None = None,
-        filter_room_types: list[str | None] = None,
+        filter_room_types: list[str | None] | None = None,
         include_all_networks: bool = False,
         third_party_instance_id: str | None = None,
     ) -> PublicRoomsResponse | PublicRoomsError:
@@ -4297,9 +4322,15 @@ class AsyncClient(Client):
         }
 
         if MatrixRoom._supports_room_version_12(new_room_version):
+            if not isinstance(old_room_power_levels, dict):
+                return RoomUpgradeError("Room has no usable power-level state")
             who_am_i = await self.whoami()
-            if who_am_i.user_id in old_room_power_levels["users"]:
-                del old_room_power_levels["users"][who_am_i.user_id]
+            if isinstance(who_am_i, ErrorResponse):
+                return RoomUpgradeError("Failed to identify the current user")
+            users = old_room_power_levels.get("users", {})
+            if not isinstance(users, dict):
+                return RoomUpgradeError("Room has no usable power-level state")
+            users.pop(who_am_i.user_id, None)
         else:
             # Get last known event from the old room
             old_room_event = await self.room_messages(
@@ -4394,6 +4425,8 @@ class AsyncClient(Client):
         self, room_id: str, event_name: str, event_type: str = "event"
     ) -> bool | ErrorResponse:
         who_am_i = await self.whoami()
+        if isinstance(who_am_i, ErrorResponse):
+            return who_am_i
 
         # TODO: why does this function use whoami instead of self.user_id?
         # Does that also mean that it shouldn't use MatrixRoom.creators?
@@ -4428,6 +4461,8 @@ class AsyncClient(Client):
         self, room_id: str, permission_type: str
     ) -> bool | ErrorResponse:
         who_am_i = await self.whoami()
+        if isinstance(who_am_i, ErrorResponse):
+            return who_am_i
 
         # TODO: why does this function use whoami instead of self.user_id?
         # Does that also mean that it shouldn't use MatrixRoom.creators?

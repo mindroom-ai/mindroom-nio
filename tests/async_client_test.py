@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import math
 import re
@@ -148,7 +149,12 @@ from nio.api import (
 )
 from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
-from nio.responses import PublicRoom, PublicRoomsResponse
+from nio.responses import (
+    PublicRoom,
+    PublicRoomsResponse,
+    RoomUpgradeError,
+    WhoamiError,
+)
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -2770,6 +2776,34 @@ class TestClass:
         resp = await async_client.download(mxc=mxc)
         assert isinstance(resp, DownloadError)
 
+    async def test_download_without_filename_requires_explicit_disk_path(
+        self, async_client, aioresponse, tmp_path
+    ):
+        download_directory = tmp_path / "downloads"
+        download_directory.mkdir()
+        mxc = "mxc://example.org/ascERGshawAWawugaAcauga"
+        url = (
+            f"{BASE_MEDIA_URL}/download/example.org/ascERGshawAWawugaAcauga"
+            "?allow_remote=true"
+        )
+        aioresponse.get(
+            url,
+            status=200,
+            content_type="image/png",
+            body=self.file_response,
+            repeat=True,
+        )
+
+        with pytest.raises(ValueError, match="filename"):
+            await async_client.download(mxc=mxc, save_to=download_directory)
+        assert list(download_directory.iterdir()) == []
+
+        destination = download_directory / "downloaded-media"
+        response = await async_client.download(mxc=mxc, save_to=destination)
+        assert isinstance(response, DownloadResponse)
+        assert response.body == destination
+        assert destination.read_bytes() == self.file_response
+
     async def test_thumbnail(self, async_client, aioresponse):
         server_name = "example.org"
         media_id = "ascERGshawAWawugaAcauga"
@@ -4859,11 +4893,11 @@ class TestClass:
     async def test_async_mockable(self):
         mock = AsyncMock(spec=AsyncClient)
 
-        assert asyncio.iscoroutinefunction(
+        assert inspect.iscoroutinefunction(
             mock.room_send
         ), "logged_in method should be awaitable"
 
-        assert not asyncio.iscoroutinefunction(
+        assert not inspect.iscoroutinefunction(
             mock.restore_login
         ), "not logged_in method should not be awaitable"
 
@@ -5243,6 +5277,36 @@ class TestClass:
         response = await async_client.has_permission(TEST_ROOM_ID, "kick")
         assert response is False
 
+    async def test_has_permission_returns_whoami_error(self, async_client, aioresponse):
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401,
+            payload={"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"},
+        )
+
+        response = await async_client.has_permission(TEST_ROOM_ID, "kick")
+
+        assert isinstance(response, WhoamiError)
+        assert len(aioresponse.requests) == 1
+        assert all(method == "GET" for method, _url in aioresponse.requests)
+
+    async def test_has_event_permission_returns_whoami_error(
+        self, async_client, aioresponse
+    ):
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401,
+            payload={"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"},
+        )
+
+        response = await async_client.has_event_permission(
+            TEST_ROOM_ID, "m.room.tombstone", "state"
+        )
+
+        assert isinstance(response, WhoamiError)
+        assert len(aioresponse.requests) == 1
+        assert all(method == "GET" for method, _url in aioresponse.requests)
+
     async def test_has_permission__roomv12_creator_does(
         self, async_client, aioresponse
     ):
@@ -5437,3 +5501,97 @@ class TestClass:
 
         await async_client.room_upgrade(TEST_ROOM_ID, "12")
         assert room_create_called.is_set()
+
+    @pytest.mark.parametrize(
+        "second_whoami_fails",
+        [
+            pytest.param(True, id="whoami-error"),
+            pytest.param(False, id="missing-power-levels"),
+        ],
+    )
+    async def test_room_upgrade_to_v12_stops_before_writes_on_invalid_state(
+        self, async_client, aioresponse, second_whoami_fails
+    ):
+        room_create_event_dict = {
+            "event_id": "$create_event_id",
+            "origin_server_ts": 1,
+            "type": "m.room.create",
+            "sender": ALICE_ID,
+            "state_key": "",
+            "content": {"room_version": "11"},
+        }
+        room_create_event = RoomCreateEvent.from_dict(room_create_event_dict)
+        state = [room_create_event_dict]
+        sync_state = [room_create_event]
+        power_levels_event_content = {
+            "users": {ALICE_ID: 100},
+            "state_default": 50,
+        }
+        if second_whoami_fails:
+            power_levels_event_dict = {
+                "event_id": "$power_levels_event_id",
+                "origin_server_ts": 1,
+                "type": "m.room.power_levels",
+                "sender": ALICE_ID,
+                "state_key": "",
+                "content": power_levels_event_content,
+            }
+            state.append(power_levels_event_dict)
+            sync_state.append(PowerLevelsEvent.from_dict(power_levels_event_dict))
+
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=200,
+            payload={"device_id": ALICE_DEVICE_ID, "user_id": ALICE_ID},
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.power_levels",
+            status=200,
+            payload=power_levels_event_content,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state",
+            status=200,
+            payload=state,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401 if second_whoami_fails else 200,
+            payload=(
+                {"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"}
+                if second_whoami_fails
+                else {"device_id": ALICE_DEVICE_ID, "user_id": ALICE_ID}
+            ),
+        )
+        await async_client.receive_response(
+            SyncResponse(
+                next_batch="sync_next_batch",
+                rooms=Rooms(
+                    invite={},
+                    join={
+                        TEST_ROOM_ID: RoomInfo(
+                            timeline=Timeline(
+                                events=[], limited=False, prev_batch="room_prev_batch"
+                            ),
+                            state=sync_state,
+                            ephemeral=[],
+                            account_data=[],
+                        )
+                    },
+                    leave={},
+                ),
+                device_key_count=DeviceOneTimeKeyCount(
+                    curve25519=None, signed_curve25519=None
+                ),
+                device_list=DeviceList(changed=[], left=[]),
+                to_device_events=[],
+                presence_events=[],
+            )
+        )
+
+        response = await async_client.room_upgrade(TEST_ROOM_ID, "12")
+
+        assert isinstance(response, RoomUpgradeError)
+        assert not any(
+            method in {"POST", "PUT", "DELETE"} for method, _url in aioresponse.requests
+        )
