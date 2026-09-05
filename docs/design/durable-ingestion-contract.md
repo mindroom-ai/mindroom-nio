@@ -64,9 +64,12 @@ background worker, or general-purpose retry framework is needed.
    not classify every receipt as business-critical or promise semantics beyond
    that observed compatibility. Discarding receipts requires a separate contract
    decision; this change relaxes only typing and presence.
-5. Preserve bounded history-gap detection, repair/hydration, explicit unresolved
-   losses, and fenced Sliding cursor resets. Never pretend unknown history is
-   complete or erase retained durable Work during a connection reset.
+5. Preserve history-gap detection, membership-state hydration, explicit losses,
+   and fenced Sliding cursor resets. Nio emits loss for unresolved history;
+   MindRoom owns later conversation-context repair. Replaying missed messages as
+   actionable requests is a separate product decision, not an existing guarantee
+   of this engine. Never pretend unknown history is complete or erase retained
+   durable Work during a connection reset.
 6. Keep a single supported owner of a durable crypto store, atomic adoption of
    deployed ordinary stores, account/device binding, and safe close/revocation.
    SQLite transactions, foreign keys, row identity/digest checks, and validation
@@ -163,8 +166,9 @@ side effects require separate policies.
 | Atomic prepared output and crypto writes | Exception or crash during preparation | Crypto advances without deliverable output, or recovery uses inconsistent key state | Keep the transaction and poisoned-session recovery despite their complexity. |
 | Stable Work replay and consumer admission | Consumer restarts after acceptance but before acknowledgement | Work is lost or processed twice; an external action can repeat | Keep stable identities and admission; consumers still own external-effect deduplication. |
 | Membership and authorization ordering | Kick, leave, invite, join, or power-level change interleaved with messages | Consumer acts using stale membership or authorization | Keep ordered state and departure fencing because access decisions depend on them. |
-| Bounded gap repair and explicit loss | Limited timeline, reconnect, or incomplete state | Missing context is silently presented as complete history | Keep bounded recovery and honest losses; do not promise unlimited repair. |
-| Single supported store owner | Overlapping service restart or accidental second client | Competing crypto writers overwrite state or progress | Keep the lifetime lease and actual I/O fences; exclude arbitrary local writers. |
+| Gap detection, state hydration, and explicit loss | Limited timeline, reconnect, or incomplete state | Missing context is silently presented as complete history | Nio reports loss and hydrates state; MindRoom owns context repair. Actionable backfill requires a separate decision. |
+| Single supported store and ingestion owner | Overlapping restart, accidental second client, or ordinary sync on an attached owned client | Competing crypto writers or sync routes overwrite state or progress | Keep the lifetime lease, actual I/O fences, and narrow ordinary-sync entry guard; exclude arbitrary local writers. |
+| Atomic frames within output limits | A valid busy-room response exceeds the old READY threshold | Accepted input repeatedly fails after restart and the bot stops making progress | Remove the separate READY limits; retain explicit total/per-row bounds and precise resource errors. Intrinsically oversized output still needs intervention. |
 | Deployed MatrixStore adoption | Existing deployment upgrades | Device identity, sessions, or trust facts are lost, disrupting encrypted history and verification | Keep careful adoption and boundary validation. |
 | Exact encrypted outbound retry | Server accepts a request but its response is lost | One logical send repeats or retry uses a different body after crypto state changes | Keep persisted bodies and transaction IDs with atomic response application. |
 | Durable receipts and account data | Restart while auxiliary records remain pending | Read/account settings become stale or callbacks are missed | Keep the shared durable route; callback effects are not exactly once. |
@@ -306,11 +310,11 @@ speedups do not establish full application throughput improvements.
 The current prepared engine detects discontinuities and emits explicit loss; it
 does not fetch missed messages through a Nio `/messages` backfill loop. Companion
 MindRoom context hydration can fetch history later, but installing context is
-not equivalent to admitting those messages as actionable requests. Thus the
-required gap-repair guarantee above must not be read as an existing promise to
-replay every missed request. Changing that behavior or deleting the remaining
-gap-planning representation requires a separate explicit decision. The capacity,
-ownership, and decoding changes do not depend on that decision.
+not equivalent to admitting those messages as actionable requests. The required
+guarantees above therefore do not promise to replay every missed request.
+Changing that behavior or deleting the remaining gap-planning representation
+requires a separate explicit decision. The capacity, ownership, and decoding
+changes do not depend on that decision.
 
 ## Verification
 

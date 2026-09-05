@@ -37,7 +37,7 @@ Interfaces: existing `_ingestion_store_snapshot` marks attachment;
 `_validate_owned_client_is_pristine` checks factory eligibility. Add one sticky
 `_ordinary_sync_started` boolean and `_begin_ordinary_sync()` helper on Client.
 
-- [ ] Add failing behavioral cases for owned sync, sync_forever, and direct
+- [x] Add failing behavioral cases for owned sync, sync_forever, and direct
   SyncResponse handling before HTTP/callback/token/crypto effects. Exercise a
   custom send paused during ordinary sync while the factory tries to attach.
   Check bootstrap remains usable by a fresh client after rejection, and failed
@@ -52,7 +52,7 @@ assert client.next_batch == before_token
 assert session._journal.load_source() == before_source
 ```
 
-- [ ] Initialize the flag to False. The helper checks poison/attachment before
+- [x] Initialize the flag to False. The helper checks poison/attachment before
   setting it. Invoke it at entry to sync, sync_forever, and both implementations
   of _handle_sync, before side effects and before the first await.
 
@@ -64,10 +64,10 @@ def _begin_ordinary_sync(self) -> None:
     self._ordinary_sync_started = True
 ```
 
-- [ ] Reject the flag in the existing pristine predicate. Preserve non-sync
+- [x] Reject the flag in the existing pristine predicate. Preserve non-sync
   response handling, owned sends/history/hydration/cleanup, ordinary nested
   callbacks, healthy detach followed by ordinary sync, and poisoned rejection.
-- [ ] Capture red/green evidence, run public compatibility and focused owned
+- [x] Capture red/green evidence, run public compatibility and focused owned
   lifecycle tests, hooks, inspect diff, then commit with an explanatory body.
 
 ## Task 2: Admit whole frames within the hard output envelope
@@ -80,7 +80,7 @@ Interfaces: remove the two private max_ready_work settings from MaterializerLimi
 keep the existing materialization and consumer APIs. Add JournalCapacityError
 as a RuntimeError in ingest/errors.py, separate from JournalIntegrityError.
 
-- [ ] Port the real owned 2,050-message failure into a regression using actual
+- [x] Port the real owned 2,050-message failure into a regression using actual
   preparation and SQLite. Establish/hydrate/settle the baseline room first.
   Verify publication, restart with stable Work identity, acknowledgement, and
   eventual frame retirement. Add a frame above the former 16 MiB READY-byte
@@ -96,14 +96,14 @@ assert session._journal._execute(
 # settle the durable records, and assert no retained frame remains.
 ```
 
-- [ ] Remove READY-specific rejection and settings. Retain total, HELD, and
+- [x] Remove READY-specific rejection and settings. Retain total, HELD, and
   per-record bounds plus existing held-loss behavior. Do not replace the old
   READY ceiling with a larger READY ceiling or discard deliverable messages.
-- [ ] Reserve HELD-to-READY header growth using maximum SQLite integer revision
+- [x] Reserve HELD-to-READY header growth using maximum SQLite integer revision
   and ordinal widths when testing per-row and total admission. Preserve exact
   stored-byte validation and no count growth during promotion. Test a boundary
   where a HELD row fits but its unreserved promoted representation would not.
-- [ ] Raise JournalCapacityError for freshly planned hard resource excess,
+- [x] Raise JournalCapacityError for freshly planned hard resource excess,
   preserving the original bound-specific diagnostic and rollback. Do not wrap
   it as integrity failure. Keep corruption detection on persisted rows intact.
   Verify retained source input and poisoned-client reconstruction on rejection.
@@ -118,7 +118,7 @@ assert session._journal._execute(
 ).fetchone()[0] == before_count
 ```
 
-- [ ] Update direct planner tests to the new envelope and remove only assertions
+- [x] Update direct planner tests to the new envelope and remove only assertions
   for discarded READY settings. Run materializer, hydration, owned crash/replay
   and focused source/settlement tests, hooks, inspect diff, then commit.
 
@@ -131,7 +131,7 @@ Interfaces: journal-local single-entry cache of full stored Aggregate row,
 authentication owner identity, and immutable RoomAggregateValue. Share envelope
 prefix construction between _row persistence/authentication and size calculation.
 
-- [ ] Add a regression counting Aggregate decodes across repeated real journal
+- [x] Add a regression counting Aggregate decodes across repeated real journal
   reads/settlements, asserting reuse only for identical stored input. Corrupt
   payload while leaving digest/revision unchanged and require integrity failure.
   Verify changed valid row, other room, other owner identity, and close behavior.
@@ -144,11 +144,11 @@ assert decode_calls == 1
 # Changing payload alone must bypass reuse and fail normal authentication.
 ```
 
-- [ ] Fetch and validate row columns before consulting the single-entry cache;
+- [x] Fetch and validate row columns before consulting the single-entry cache;
   compare the complete row plus account/stream/transport authentication identity.
   Cache only successful immutable decode. Clear on close; do not cache projection
   execution, pending intents, or mutable client state.
-- [ ] Factor a small canonical-envelope-prefix helper from _row. Compute full
+- [x] Factor a small canonical-envelope-prefix helper from _row. Compute full
   encoded row length without building/hash-digesting the full payload solely for
   size. Reuse exact unchanged sizes within one plan if still needed. Test length
   equality with persisted bytes for event/loss, READY/HELD, unicode identities,
@@ -161,10 +161,10 @@ assert _stored_work_size(owner, stored) == len(
 )
 ```
 
-- [ ] Run focused codec, corruption, delivery, hydration, and replay tests; record
+- [x] Run focused codec, corruption, delivery, hydration, and replay tests; record
   call-count and representative 1,000/10,000-member decode measurements before
   and after. Record workload/limits, not machine-independent timing thresholds.
-- [ ] Run hooks, inspect production diff/size, then commit.
+- [x] Run hooks, inspect production diff/size, then commit.
 
 ## Task 4: Share ordinary and owned projection policy
 
@@ -175,12 +175,12 @@ tests/public_sync_compatibility_test.py and existing transient tests.
 Interfaces: small Client projection/control helpers consumed by ordinary handlers
 and owned preparation/delivery. Keep route-specific transaction/callback timing.
 
-- [ ] Share presence projection for known users in a Client helper used by base,
+- [x] Share presence projection for known users in a Client helper used by base,
   async, and owned transient handling. Callers keep callback and timeout policy.
-- [ ] Share OTK count and changed/left-device tracking policy between ordinary
+- [x] Share OTK count and changed/left-device tracking policy between ordinary
   _handle_olm_events and owned frame preparation; pass existing concrete values,
   not a new carrier or strategy object. Preserve encryption-disabled behavior.
-- [ ] Share the existing room-state membership invalidation/encryption logic
+- [x] Share the existing room-state membership invalidation/encryption logic
   only where its inputs/effects match; preserve invite/no-room gates and room
   summaries in their current owners. Do not merge the two orchestrators.
 
@@ -191,11 +191,11 @@ assert owned.olm.users_for_key_query == ordinary.olm.users_for_key_query
 assert set(owned.rooms[room_id].users) == set(ordinary.rooms[room_id].users)
 ```
 
-- [ ] Use existing behavior/parity tests, adding a failing parity case only where
+- [x] Use existing behavior/parity tests, adding a failing parity case only where
   a changed rule needs coverage. Run preparation, public compatibility, transient,
   and relevant crypto tests. Inspect net helper cost; omit abstractions that do
   not eliminate real duplicated policy and record that decision in results.
-- [ ] Run hooks, inspect diff, then commit.
+- [x] Run hooks, inspect diff, then commit.
 
 ## Task 5: Bind the complete runtime model list directly
 
@@ -205,11 +205,11 @@ binding tests using real ordinary and owned store fixtures.
 Interfaces: keep both decorators and every lifecycle/transaction boundary; only
 change the bind_ctx keyword arguments at their four ordinary/owned call sites.
 
-- [ ] Verify MatrixStore/DefaultStore model lists include runtime foreign-key
+- [x] Verify MatrixStore/DefaultStore model lists include runtime foreign-key
   targets; SqliteStore/SqliteMemoryStore additionally include DeviceTrustState.
   Preserve existing session, forwarding-chain, device key, sidecar/SQL trust,
   room, request, and sync-token round trips. Migration-only models stay separate.
-- [ ] Add real nested cross-store cases with distinct stored token/key values,
+- [x] Add real nested cross-store cases with distinct stored token/key values,
   plus read and atomic exception cases. Cover ordinary and owned decorator paths,
   rollback after a nested write, and complete binding restoration on every exit.
 
@@ -221,7 +221,7 @@ assert Accounts._meta.database is store_a.database
 # After the outer context exits, each model has its original database binding.
 ```
 
-- [ ] Apply the explicit binding arguments at exactly the four decorator sites.
+- [x] Apply the explicit binding arguments at exactly the four decorator sites.
   Preserve owner validation, read/write scopes, epoch fences, atomic/savepoint
   scopes, and queue database behavior. Do not alter migration/bootstrap bindings.
 
@@ -232,10 +232,10 @@ with self.database.bind_ctx(
     return fn(self, *args, **kwargs)
 ```
 
-- [ ] Record serial binding/token/account microbenchmarks with original and new
+- [x] Record serial binding/token/account microbenchmarks with original and new
   binding options on the same store/runtime. State runtime, workload, and timing
   boundary. No concurrent safety or whole-application throughput claim.
-- [ ] Run store, encryption, ownership/recovery, migration, and new binding tests,
+- [x] Run store, encryption, ownership/recovery, migration, and new binding tests,
   hooks, inspect diff, then commit with the rationale and verification.
 
 ## Task 6: Verify, document results, review, and push
@@ -243,13 +243,13 @@ with self.database.bind_ctx(
 Controller task. Files: this plan and the contract where a final design decision
 needs recording; no unreviewed production changes in this task.
 
-- [ ] Confirm all task reviews and targeted tests pass. Run the complete suite
+- [x] Confirm all task reviews and targeted tests pass. Run the complete suite
   on Python 3.12, 3.13, and 3.14; run repository pre-commit hooks and compare mypy
   diagnostics against the 8b529ed baseline (144 errors; baseline is not clean).
 - [ ] Perform an independent whole-PR review against the contract and base
   5b6de3b, with a separate focus on this hardening delta from 8b529ed. Address
   valid findings, rerun affected checks, and record remaining limitations.
-- [ ] Record source-size deltas and precise verification/performance results.
+- [x] Record source-size deltas and precise verification/performance results.
   Keep context recovery versus actionable replay explicit; any change in that
   product decision gets its own contract amendment before implementation.
 - [ ] Commit tracked results, privacy-scan outgoing content/metadata, check remote
@@ -265,3 +265,79 @@ hard output envelope. History semantics stay separate until the product decision
 is made. No schema migration or new public API is required. Task 2 may touch the
 size helper before Task 3; Task 3 preserves its promotion-reservation semantics.
 Focused tests precede commits; the complete matrix follows all production tasks.
+
+## Implementation and verification results
+
+The five production tasks are implemented and their task reviews are clean.
+Ownership uses one ordinary-sync flag plus the existing attachment marker;
+capacity removes the conflicting READY limits; unchanged Aggregates reuse one
+validated value; ordinary and owned routes share three concrete leaf policies;
+store calls bind their complete runtime model list directly. No new persistent
+representation, dependency, public configuration, or ingestion orchestrator was
+added.
+
+Production size counts tracked `src/**/*.py` physical lines, including comments
+and blanks; tests and documentation are excluded.
+
+| Revision | Production lines | Final change from revision |
+| --- | ---: | ---: |
+| PR base `5b6de3b` | 31,490 | +13,341 |
+| Original reviewed PR `742806f` | 46,222 | -1,391 |
+| Previous simplification `8b529ed` | 44,788 | +43 |
+| Completed hardening `83cff56` | 44,831 | 0 |
+
+The hardening pass adds 43 production lines overall. Shared policy alone removes
+15 lines. The remaining large code is concentrated in preparation/coordinator,
+journal validation/publication, and deployed-store adoption. Those mechanisms
+carry the retained crash, crypto, ownership, and admission guarantees; neither
+line compression nor another state machine would improve this tradeoff.
+
+`pytest --benchmark-disable` completed on Python 3.12.13, 3.13.14, and 3.14.7:
+2,028 passed and 3 skipped on each interpreter. Existing fork tests emit three
+deprecation warnings on each; Python 3.14 also reports two deprecated
+`asyncio.iscoroutinefunction` uses in tests. The full matrix began before the
+final annotation-only correction to `rooms.py`; 83 affected tests passed after
+that correction. All repository pre-commit hooks passed. The full mypy check
+still reports 144 errors in 23 files, exactly matching the normalized baseline
+with no added or removed diagnostics. This is existing debt, not a passing type
+check.
+
+### Performance boundaries
+
+Repeated real Aggregate reads used in-memory SQLite, complete row lookup, and an
+equality assertion against the expected immutable value. Seven samples per size;
+medians include one cold read and repeated identical reads. The single-entry
+cache benefits repeated reads of the same room, not alternating-room scans.
+
+| Room members | Encoded Aggregate bytes | Before | After |
+| --- | ---: | ---: | ---: |
+| 1,000 | 119,861 | 6.830 ms | 0.152 ms |
+| 10,000 | 1,199,861 | 71.233 ms | 1.497 ms |
+
+The direct-binding measurement used CPython 3.14.7, Peewee 3.19.0, and one
+`SqliteMemoryStore`. It invoked the actual decorated methods while selecting
+original recursive or new direct-list binding options on the same database.
+Seven serial batches used 2,000 binding iterations or 1,000 method calls per
+batch; setup and correctness assertions were outside the timed section. These
+measurements supersede the smaller synthetic single-binding token/account probe.
+
+| Operation | Recursive binding | Direct-list binding |
+| --- | ---: | ---: |
+| Empty binding context | 150.308 us | 12.936 us |
+| `load_sync_token()` | 494.097 us | 207.461 us |
+| `load_account()` | 307.575 us | 163.766 us |
+
+Neither measurement includes full Matrix traffic, application admission,
+callbacks, disk durability, or concurrent throughput. Reprofile the paired
+MindRoom/Nio workload before claiming application-wide savings.
+
+### Remaining cutover limits
+
+History behavior is unchanged: explicit loss and membership-state hydration in
+Nio, later context repair in MindRoom. Actionable replay of missed requests and
+removal of the remaining gap-planning representation require a separate decision.
+Intrinsically oversized prepared output remains retained and needs intervention;
+automatic spooling or chunking was not added. The companion integration still
+needs conflict resolution and testing against the accepted Nio artifact before
+deployment. Released fork admission APIs are intentionally replaced, requiring
+coordinated consumer migration and release communication.
