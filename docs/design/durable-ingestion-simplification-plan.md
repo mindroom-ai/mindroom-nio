@@ -30,7 +30,10 @@ affected ingestion tests and exports.
 - [x] Inventory callers and classify tests as shared behavior, owned behavior,
   or discarded plain-engine behavior. Capture this inventory in the work ledger.
 - [x] Preserve owned factory, batch, settlement, source scheduling, and cleanup
-  interfaces. Exercise owned materialization, including frames with crypto.
+  interfaces, including `_open_owned_ingestion`, `_OwnedIngestionSession`,
+  `_FrameCompletion`, `_MarkedStoreRequiresSqlite`, `_settle_batch`, and the
+  current `next_batch` and settlement signatures used by MindRoom. Exercise
+  owned materialization, including frames with crypto.
 - [x] Remove plan_frame_materialization, reduce_staged_frame, their exclusive
   carriers/helpers, journal's plain materialization entrypoints, and public
   open_ingestion/IngestionSession exports. Merge shared runner methods into the
@@ -78,7 +81,9 @@ database.py; codec/store-owner/crash tests.
 - [x] Remove repeated ordinary-store authentication within the same unchanged
   BEGIN IMMEDIATE snapshot. Keep sidecar race checks and post-conversion checks.
 - [x] Consolidate lifecycle state left after Task 1 and perform one lease identity
-  check at each actual SQLite execute/fetch boundary, not at each wrapper layer.
+  check per actual SQLite execute, fetch, or iteration call, including every
+  `fetchone` or `next`; remove duplicate wrapper checks without removing per-row
+  checks.
 - [x] Preserve closed/revoked/forked/cross-thread rejection and safe cleanup.
   Keep production imports usable without fcntl; unsupported durable filesystem
   ownership must fail clearly at use, without breaking ordinary client import.
@@ -96,10 +101,10 @@ Files: coordinator.py, base_client.py and only directly related codec helpers/te
   boundary. Do not turn all event handling into a generic framework.
 - [x] Run the complete suite with uv run --locked pytest --benchmark-disable.
 - [x] Run repository pre-commit hooks and applicable type checks.
-- [ ] Dispatch independent review of the full diff against the contract; fix valid
+- [x] Dispatch independent review of the full diff against the contract; fix valid
   findings and rerun affected checks. Review must distinguish excluded guarantees
   from regressions to required ones.
-- [ ] Update this tracked checklist and add measured source deltas and verification
+- [x] Update this tracked checklist and add measured source deltas and verification
   results. Commit only intended files. Report final branch/commit and any limits.
 
 ## Measured changes and verification
@@ -121,13 +126,28 @@ unsupported mutation of private crypto objects account for the reduced suite.
 Settlement reconstruction, real crypto crashes, persisted outbound decoding,
 consumer admission, and ordinary client behavior remain covered.
 
-The complete Python 3.14 suite passed 2,012 tests, with 3 skipped and 5 existing
-warnings. The focused settlement/materialization/preparation suite passed 485 tests.
-Repository pre-commit hooks passed. The configured mypy command, with `src` on
-its module path and incremental caching disabled, reports 144 errors in 23 files
-versus 150 at the original baseline and 149 before settlement simplification.
-This refactor adds no diagnostics and removes five old room-variable assignment
-errors. The branch's one added diagnostic is the existing missing jsonschema
-stubs issue at a new import site; seven original diagnostics disappeared.
+These actual measurements supersede the August fixed size budgets. Large
+behavioral tests are accepted for this change; their size creates no test-shrink
+or historical-document deletion task.
 
-Whole-branch independent review and the Python 3.12/3.13 matrix remain pending.
+The complete Python 3.12.13 and 3.13.14 suites each passed 2,012 tests, with 3
+skipped and 3 existing warnings, in 210.59 and 209.29 seconds respectively. The
+complete Python 3.14.7 suite passed 2,012 tests, with 3 skipped and 5 existing
+warnings, in 184.69 seconds. All three runs exercised the same implementation
+source immediately before this documentation-only update. The focused
+settlement/materialization/preparation suite passed 485 tests. All six repository
+pre-commit hooks passed.
+
+The configured mypy command, with `src` on its module path and incremental
+caching disabled, reports 144 errors in 23 files versus 150 at the original
+baseline and 149 before settlement simplification. Task 4 adds no diagnostics
+and removes five old room-variable assignment errors. Across the branch, one
+missing-jsonschema-stubs diagnostic was added at a new import site and seven
+original diagnostics disappeared.
+
+All four task reviews and the whole-branch implementation review passed with no
+Critical or Important findings. This documentation-only update awaits scoped
+review. Before deployment or cutover, resolve the companion MindRoom
+integration's current base conflict and run its integration suite against an
+artifact built from the accepted Nio revision; those integration steps remain
+outside this local change.
