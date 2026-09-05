@@ -2545,6 +2545,7 @@ def _validate_owned_client_is_pristine(client: AsyncClient) -> None:
         or bool(client.sharing_session)
         or client.synced.is_set()
         or client._ingestion_store_snapshot is not None
+        or client._ordinary_sync_started
         or (event_scope is not None and event_scope.active)
         or (response_scope is not None and response_scope.active)
     )

@@ -957,6 +957,7 @@ class Client:
         self.store: MatrixStore | None = None
         self._ingestion_store_snapshot: _IngestionStoreSnapshot | None = None
         self._ingestion_poisoned = False
+        self._ordinary_sync_started = False
         self.config = config or ClientConfig()
 
         self.user_id = ""
@@ -1150,6 +1151,14 @@ class Client:
             raise LocalProtocolError(
                 "owned ingestion session is poisoned; reopen with a fresh client"
             )
+
+    def _begin_ordinary_sync(self) -> None:
+        self._assert_ingestion_not_poisoned()
+        if self._ingestion_store_snapshot is not None:
+            raise LocalProtocolError(
+                "ordinary sync is unavailable during owned ingestion"
+            )
+        self._ordinary_sync_started = True
 
     def _poison_ingestion(self) -> None:
         self._ingestion_poisoned = True
@@ -2288,6 +2297,8 @@ class Client:
             cb.sync_execute(event)
 
     def _handle_sync(self, response: SyncResponse) -> None | Coroutine[Any, Any, None]:
+        self._begin_ordinary_sync()
+
         # We already received such a sync response, do nothing in that case.
         if self.next_batch == response.next_batch:
             return None

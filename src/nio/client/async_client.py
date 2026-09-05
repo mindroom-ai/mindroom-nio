@@ -794,6 +794,8 @@ class AsyncClient(Client):
                 self._response_callback_scope.reset(token)
 
     async def _handle_sync(self, response: SyncResponse) -> None:
+        self._begin_ordinary_sync()
+
         if self.next_batch == response.next_batch:
             return
 
@@ -1308,6 +1310,7 @@ class AsyncClient(Client):
         Returns either a `SyncResponse` if the request was successful or
         a `SyncError` if there was an error with the request.
         """
+        self._begin_ordinary_sync()
 
         sync_token = since or self.next_batch
         presence = set_presence or self._presence
@@ -1425,6 +1428,7 @@ class AsyncClient(Client):
             set_presence (str, optional): The presence state.
                 One of: ["online", "offline", "unavailable"]
         """
+        self._begin_ordinary_sync()
 
         first_sync = True
 
