@@ -74,6 +74,10 @@ Files: source carriers, coordinator settlement, and journal settlement.
 - [x] Reject cache machinery without a convincing measured benefit.
 - [x] Run focused ownership, retry, source, and settlement tests for both
   measured variants. Keep standard-library JSON.
+- [ ] Measure and implement one immutable decoded Frame entry, after the
+  error-free live run exposed remaining catch-up cost. Preserve full-row,
+  authentication, current-owner revision, mutable-outbound exclusion, and close
+  behavior; verify changed disk data and normal delivery before rerunning live.
 
 ## Task 4: Companion and final acceptance
 
@@ -84,7 +88,7 @@ admission, owned sessions, bot readiness, crypto, and desktop integration.
   LIVE-only reply grants.
 - [x] Check focused companion integration against local Nio without changing
   the user's dependency pins.
-- [ ] Reproduce pending delivery projection at the real admission boundary;
+- [x] Reproduce pending delivery projection at the real admission boundary;
   preserve rollback and the outstanding batch while the pump awaits its
   existing outbox worker's next progress signal. Test success, no busy retry,
   cancellation, unrelated outbox debt, and propagation of unrelated admission
@@ -118,6 +122,20 @@ Each variant passed 101 focused settlement/ownership tests. No dependency
 or cache was added. These are local delivery measurements, not application
 throughput claims; percentages must not be summed.
 
+The incremental-recovery benchmark used 1,000 recovered streaming edits and
+100 fresh events. Keeping the same event shape while increasing the retained
+sync response from 40,907 to 1,244,907 bytes raised median delivery time from
+3.380 to 5.135 seconds. This isolates repeated retained-body work; it does
+not attribute the real server's much longer delays entirely to Nio.
+
+Three paired large-response runs measured removal of duplicate staging
+payload encoding: median 2.63% improvement, all pairs 2.13–3.54%, with six
+production lines removed. A normalized Frame cache measured 4.69%, but its
+additional roughly 0.11-second saving here did not justify another cache.
+The final encoding, size bounds, authentication, and transaction rollback
+remain. Thirteen targeted atomic staging, crash, restage, and identity cases
+passed with both the probe and actual production deletion.
+
 ### Capacity correction and regression verification
 
 The first Tuwunel rerun completed 200 canonical replies and initial drain, then
@@ -136,10 +154,10 @@ expectations were updated to retain meaningful schema crash checks and value
 identity checks; all 151 model/crash tests then passed. Final full-suite and
 real capacity results follow.
 
-### Final local checks and production cost
+### Local checks and production cost
 
-The final Python 3.14.7 suite passed 2,143 tests, skipped three, and reported
-three existing fork-with-threads deprecation warnings in 210.83 seconds.
+The final Python 3.14.7 suite passed 2,147 tests, skipped three, and reported
+three existing fork-with-threads deprecation warnings in 213.06 seconds.
 Full mypy reported zero issues in 71 source files. All repository hooks passed,
 including explicit checks of the new, not-yet-tracked source and tests.
 
@@ -148,10 +166,10 @@ admission, journal ingress, bot readiness, client, and desktop tests. Its six
 changed-file hooks passed, including full source/test typing and module-boundary
 checks. The original checkout's dependency edits were preserved.
 
-Production Python totals are 45,847 lines in 71 files: 809 net lines above
-`1021de4`, and 375 below the original simplification baseline `742806f`.
+Production Python totals are 45,841 lines in 71 files: 803 net lines above
+`1021de4`, and 381 below the original simplification baseline `742806f`.
 The new continuation and journal integration account for the increase; the
-two performance simplifications remove 51 production lines. This is a real
+three performance simplifications remove 57 production lines. This is a real
 correctness feature with maintenance cost, justified by the reproduced lost
 requests and whole-backlog stall, not a source-size reduction.
 
@@ -170,3 +188,25 @@ edit was projected, but an unrelated room's failed send kept the complete
 outbox task running and the pump parked. The corrected design wakes on each
 recovery pass and rechecks the admission barrier, preserving the worker's
 existing backoff and ownership.
+
+The final companion projection-wait change passed 420 focused admission, bot,
+and projection cases, including SQLite/PostgreSQL rollback and unrelated-debt
+regressions. Four existing store-barrier cases also passed. Changed-file hooks,
+full project typing, and module-boundary checks passed. Independent review ran
+three additional probes for unrelated debt, a prior pass signal, and shutdown;
+it approved the corrected wait. The next live controls remain the acceptance
+gate.
+
+The next Tuwunel run completed all 200 replies with zero sync failures,
+projection errors, restarts, watchdog stalls, or degraded reads, but still
+failed the unchanged post-load fence. Reply latency was 74.275 seconds median,
+85.855 seconds p95, and 87.013 seconds from first input to last reply. All
+402 outbox rows were acknowledged. Catch-up settled 16,744 companion events;
+the fence had not reached any of the three syncing principals by the deadline.
+These numbers establish reply delivery, not passing capacity acceptance.
+
+Removing restart delay was therefore necessary but insufficient. Re-examining
+the recovery architecture identifies repeated frame decoding during per-event
+delivery as the next measured target. Keep every recovered revision in order;
+do not skip edits, weaken the fence, enlarge the deadline, or add a second
+admission path to make this workload pass. Synapse remains unrun.

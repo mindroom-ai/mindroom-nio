@@ -183,11 +183,38 @@ authenticated Work and requires full batch equality. Five paired runs with
 1,000 messages and 4,800-character bodies improved a median 4.67%
 (all pairs 3.79–5.75%). Short-message results were noisy.
 
-Together these changes remove 51 production lines, without a dependency or
-cache. Do not add the percentage gains together or claim an application
-throughput improvement. Frame caching and duplicate stage-encoding removal
-did not show enough consistent benefit to justify more machinery. Keep
-standard-library JSON; the measured codec experiment did not justify orjson.
+The new recovery workload also justified deleting a duplicate Frame payload
+encoding within the same staging transaction. The final write still encodes,
+authenticates, and bounds the identical payload; errors still roll back the
+whole transaction. Three paired 1,100-event recovery runs with a 1.2 MiB
+retained sync response improved a median 2.63% (all pairs 2.13–3.54%).
+This removes six production lines.
+
+The three selected changes remove 57 production lines without a new dependency
+or cache. Do not add their percentage gains together or claim an application
+throughput improvement. A journal-owned normalized Frame cache improved the
+recovery workload by 4.69%, but its additional saving did not justify another
+cache and its lifecycle obligations. Keep standard-library JSON; the measured
+codec experiment did not justify orjson.
+
+The subsequent error-free live run still missed the post-load fence. Its
+backlog makes repeated persisted Frame decoding a separate, material target:
+the local 1,100-event recovery profile decoded Frame state 2,644 times.
+Permit one decoded Frame entry per journal, following the existing Work and
+Aggregate reuse rules. Every read still fetches the actual row and validates
+its column types, identity, drain-header authentication, and revision bounds
+against the current owner. A hit requires identical complete stored fields,
+including payload bytes, digests, and revisions, plus the account, stream,
+and transport identity used to authenticate them. Changed input takes the
+full authenticated decode path; clear the entry on close.
+
+Cache only deeply immutable staged Frames or prepared Frame state with no
+outbound operations. Outbound operation contexts may contain mutable JSON,
+so prepared Frames containing those operations stay uncached. This adds no
+projection cache or new authority: callbacks, admission, claims, acknowledgements,
+SQLite transactions, and recovery ordering remain unchanged. Keep all recovered
+streaming revisions; discarding intermediate edits would change durable event
+delivery and is outside this performance correction.
 
 ## Verification and remaining limits
 
