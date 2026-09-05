@@ -2490,5 +2490,6 @@ class SqliteIngestionJournal(JournalRows):
     # fmt: on
 
     def close(self) -> None:
+        self._work_cache = None
         self._room_aggregate_cache = None
         self._owner.close()

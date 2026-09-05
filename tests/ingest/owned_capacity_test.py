@@ -7,7 +7,7 @@ from uuid import UUID
 import pytest
 from ingestion_helpers import open_test_session
 
-from nio import AsyncClient
+from nio import AsyncClient, RoomMessageText
 from nio.crypto import OlmAccount
 from nio.exceptions import LocalProtocolError
 from nio.ingest.config import ClassicSourceConfig, IngestionConfig
@@ -17,6 +17,7 @@ from nio.ingest.ports import NetworkResult, StagedSourceResponse
 from nio.ingest.source import canonical_json
 from nio.ingest.state import SourceState, StagedFrame
 from nio.store import SqliteStore
+from nio.store import _sync_journal_rows as journal_rows_module
 from nio.store._sync_journal_values import MaterializerLimits, MaterializeStatus
 from nio.store.sync_journal import _open_configured_ingestion_store
 
@@ -249,5 +250,74 @@ async def test_owned_capacity_rejection_rolls_back_and_requires_fresh_client(
         result = session._materialize_oldest_frame(limits=MaterializerLimits())
         assert result.status is MaterializeStatus.MATERIALIZED
         assert len(await _settle_frame(session, frame.frame_id)) == 3
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_delivery_reuses_work_without_changing_order_or_retirement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session = await _baseline_session(tmp_path)
+    journal = session._journal
+    observed: list[str] = []
+    session._client.add_event_callback(
+        lambda _room, event: observed.append(event.event_id),
+        RoomMessageText,
+    )
+    frame = _stage(session, _messages(3))
+    result = session._materialize_oldest_frame(limits=MaterializerLimits())
+    assert result.status is MaterializeStatus.MATERIALIZED
+
+    decoded_work_ids: list[str] = []
+    real_decode = journal_rows_module._decode_work_plaintext
+
+    def counted_decode(*args: object):
+        decoded_work_ids.append(str(args[1]))
+        return real_decode(*args)  # type: ignore[arg-type]
+
+    acknowledgements = []
+    real_acknowledge = journal.acknowledge_batch
+
+    def observe_acknowledgement(ref):
+        assert observed == [
+            f"$message{index}" for index in range(len(acknowledgements) + 1)
+        ]
+        acknowledgements.append(ref)
+        real_acknowledge(ref)
+
+    monkeypatch.setattr(journal_rows_module, "_decode_work_plaintext", counted_decode)
+    monkeypatch.setattr(journal, "acknowledge_batch", observe_acknowledgement)
+
+    try:
+        batches = []
+        while (batch := session.next_batch()) is not None:
+            replay = session.next_batch()
+            assert replay == batch
+            assert replay.ref == batch.ref
+            batches.append(batch)
+            await session._settle_batch(
+                batch,
+                receipt_new=True,
+                semantic_event_new=True,
+            )
+            assert (
+                journal._execute(
+                    "SELECT 1 FROM NioIngestWork WHERE work_id = ?",
+                    (batch.records[0].record_id,),
+                ).fetchone()
+                is None
+            )
+
+        assert observed == ["$message0", "$message1", "$message2"]
+        assert acknowledgements == [batch.ref for batch in batches]
+        assert len(batches) == 3
+        assert len({batch.ref for batch in batches}) == 3
+        assert len(decoded_work_ids) == 3
+        assert len(set(decoded_work_ids)) == 3
+        assert journal._execute("SELECT COUNT(*) FROM NioIngestWork").fetchone()[0] == 0
+        await session._advance_blocked_frame(frame.frame_id)
+        assert journal.list_frames(1) == ()
     finally:
         await session.close()

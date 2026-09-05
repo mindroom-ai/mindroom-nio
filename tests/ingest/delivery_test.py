@@ -37,6 +37,7 @@ from nio.ingest.serialization import (
     canonical_batch_payload,
 )
 from nio.store._sync_journal import SqliteIngestionJournal
+from nio.store import _sync_journal_rows as journal_rows_module
 from nio.store._sync_journal_plan import (
     AuthenticatedWork,
     _PreparedWorkMetadata,
@@ -928,6 +929,195 @@ def test_one_delivery_cycle_authenticates_constant_work_with_large_ready_invento
 
     assert 0 < authenticated_work <= 5
     bootstrap.close()
+
+
+def test_work_reuse_requires_exact_row_and_authentication_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    first_record = _ready_event(601)
+    second_record = _ready_event(602)
+    first_stored = _seed_work(
+        journal,
+        first_record,
+        ready_revision=1,
+        ready_ordinal=0,
+    )
+    _seed_work(
+        journal,
+        second_record,
+        ready_revision=1,
+        ready_ordinal=1,
+    )
+    owner = journal.load_owner()
+    real_decode = journal_rows_module._decode_work_plaintext
+    decoded_work_ids: list[str] = []
+
+    def counted_decode(*args: object):
+        decoded_work_ids.append(str(args[1]))
+        return real_decode(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(journal_rows_module, "_decode_work_plaintext", counted_decode)
+
+    with journal._owner.read():
+        first = journal._load_delivery_work(owner, first_record.record_id)
+        first_again = journal._load_delivery_work(owner, first_record.record_id)
+    assert first is not None and first_again is not None
+    assert first[1].value == first_record
+    assert first_again[1] is first[1]
+    assert decoded_work_ids == [first_record.record_id]
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestWork SET payload = ? WHERE work_id = ?",
+            (_same_length_tamper(first_stored[11]), first_record.record_id),
+        )
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_delivery_work(owner, first_record.record_id)
+    with journal._owner.journal_write():
+        journal._execute(
+            "UPDATE NioIngestWork SET payload = ? WHERE work_id = ?",
+            (first_stored[11], first_record.record_id),
+        )
+
+    with journal._owner.read():
+        restored = journal._load_delivery_work(owner, first_record.record_id)
+        second = journal._load_delivery_work(owner, second_record.record_id)
+    assert restored is not None and restored[1] is first[1]
+    assert second is not None and second[1].value == second_record
+    assert decoded_work_ids == [first_record.record_id, second_record.record_id]
+
+    with journal._owner.read():
+        other_account = journal._load_delivery_work(
+            replace(owner, account_id="@other:example.org"),
+            second_record.record_id,
+        )
+        original_account = journal._load_delivery_work(owner, second_record.record_id)
+    assert other_account is not None and other_account[1] is not second[1]
+    assert original_account is not None and original_account[1] is not other_account[1]
+    assert decoded_work_ids == [
+        first_record.record_id,
+        second_record.record_id,
+        second_record.record_id,
+        second_record.record_id,
+    ]
+
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_delivery_work(
+            replace(owner, stream_id=UUID(int=603)),
+            second_record.record_id,
+        )
+    with journal._owner.read(), pytest.raises(JournalIntegrityError):
+        journal._load_delivery_work(
+            replace(owner, transport_kind=TransportKind.SLIDING),
+            second_record.record_id,
+        )
+
+    with journal._owner.read():
+        first_after_second = journal._load_delivery_work(owner, first_record.record_id)
+        second_after_first = journal._load_delivery_work(owner, second_record.record_id)
+    assert (
+        first_after_second is not None and first_after_second[1].value == first_record
+    )
+    assert (
+        second_after_first is not None and second_after_first[1].value == second_record
+    )
+    assert decoded_work_ids[-2:] == [first_record.record_id, second_record.record_id]
+    bootstrap.close()
+
+
+def test_work_reuse_validates_revision_promotion_deletion_and_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = _open(tmp_path)
+    journal = bootstrap._journal
+    held_record = _ready_event(604)
+    held_stored = _seed_work(
+        journal,
+        held_record,
+        ready_revision=None,
+        ready_ordinal=None,
+        status="held",
+    )
+    owner = journal.load_owner()
+    real_decode = journal_rows_module._decode_work_plaintext
+    decode_calls = 0
+
+    def counted_decode(*args: object):
+        nonlocal decode_calls
+        decode_calls += 1
+        return real_decode(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(journal_rows_module, "_decode_work_plaintext", counted_decode)
+
+    with journal._owner.read():
+        held = journal._load_delivery_work(owner, held_record.record_id)
+    assert held is not None and held[1].status == "held"
+    assert decode_calls == 1
+    with (
+        journal._owner.read(),
+        pytest.raises(JournalIntegrityError, match="invalid Work row"),
+    ):
+        journal._load_delivery_work(replace(owner, revision=0), held_record.record_id)
+    assert decode_calls == 1
+
+    ready_clear = list(held_stored[1:11])
+    ready_clear[2] = "ready"
+    ready_clear[7] = owner.revision
+    ready_clear[8] = 0
+    ready_stored = _replace_work(
+        journal,
+        held_stored,
+        tuple(ready_clear),
+        held_record,
+    )
+    with journal._owner.read():
+        ready = journal._load_delivery_work(owner, held_record.record_id)
+    assert ready is not None and ready[1].status == "ready"
+    assert ready[1] is not held[1]
+    assert decode_calls == 2
+
+    with journal._owner.journal_write():
+        journal._execute(
+            "DELETE FROM NioIngestWork WHERE account_id = ? AND work_id = ?",
+            (journal.account_id, ready_stored[1]),
+        )
+    with journal._owner.read():
+        assert journal._load_delivery_work(owner, held_record.record_id) is None
+    assert decode_calls == 2
+
+    reopened_record = _ready_event(605)
+    _seed_work(
+        journal,
+        reopened_record,
+        ready_revision=owner.revision,
+        ready_ordinal=0,
+    )
+    with journal._owner.read():
+        before_close = journal._load_delivery_work(owner, reopened_record.record_id)
+    assert before_close is not None
+    assert decode_calls == 3
+    bootstrap.close()
+    assert journal._work_cache is None
+    assert journal._room_aggregate_cache is None
+
+    reopened = _open(tmp_path)
+    try:
+        reopened_owner = reopened._journal.load_owner()
+        with reopened._journal._owner.read():
+            after_reopen = reopened._journal._load_delivery_work(
+                reopened_owner,
+                reopened_record.record_id,
+            )
+        assert after_reopen is not None
+        assert after_reopen[1].value == reopened_record
+        assert after_reopen[1] is not before_close[1]
+        assert decode_calls == 4
+    finally:
+        reopened.close()
 
 
 def test_frame_work_lookup_authenticates_only_one_matching_row(

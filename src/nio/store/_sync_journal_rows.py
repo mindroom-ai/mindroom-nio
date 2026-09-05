@@ -1381,6 +1381,14 @@ class JournalRows:
     device_id: str
 
     def __init__(self) -> None:
+        self._work_cache: (
+            tuple[
+                tuple[str, UUID, TransportKind],
+                _Task3WorkRow,
+                AuthenticatedWork,
+            ]
+            | None
+        ) = None
         self._room_aggregate_cache: (
             tuple[
                 tuple[str, UUID, TransportKind],
@@ -1758,6 +1766,14 @@ class JournalRows:
         row: tuple[object, ...],
     ) -> AuthenticatedWork:
         stored = self._validate_task3_work_row(owner, row)
+        authentication = (
+            owner.account_id,
+            owner.stream_id,
+            owner.transport_kind,
+        )
+        cached = self._work_cache
+        if cached is not None and cached[:2] == (authentication, stored):
+            return cached[2]
         (
             _account_id,
             work_id,
@@ -1878,7 +1894,7 @@ class JournalRows:
             raise JournalIntegrityError("invalid Work value") from error
         if local_header_invalid:
             raise JournalIntegrityError("local READY Work header is invalid")
-        return AuthenticatedWork(
+        authenticated = AuthenticatedWork(
             value,
             status,
             len(payload),
@@ -1887,6 +1903,8 @@ class JournalRows:
             UUID(raw_frame_id),
             created_revision,
         )
+        self._work_cache = authentication, stored, authenticated
+        return authenticated
 
     def _load_delivery_work(
         self,
