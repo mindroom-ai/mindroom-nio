@@ -366,8 +366,21 @@ current base conflict and run its integration suite against an artifact built
 from the accepted Nio revision. Those integration steps remain outside this
 local change.
 
+### Known gap before relying on restart continuation
+
+Replaying a collected unverified key-request callback currently does not restore
+Olm's in-memory pending approval map. A real Olm/store reconstruction probe shows
+that verification followed by `continue_key_share` rejects the request as
+unknown; the same owned replay outcome is inferred from its unchanged callback
+path and still needs an end-to-end reproduction. Existing tests establish
+callback replay and absence of secret sharing before trust, not successful
+interactive continuation after restart. Reproduce and resolve this before
+relying on that flow at cutover; it is an implementation gap, not a newly excluded
+guarantee. Publishing the current protocol/queue repairs does not deploy them.
+
 ## References
 
+- [Matrix room encryption state](https://spec.matrix.org/latest/client-server-api/#mroomencryption)
 - [Matrix to-device delivery](https://spec.matrix.org/latest/client-server-api/#send-to-device-messaging)
 - [SQLite synchronous modes](https://www.sqlite.org/pragma.html#pragma_synchronous)
 - [`asyncio.timeout`](https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout)

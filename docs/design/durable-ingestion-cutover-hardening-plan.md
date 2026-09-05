@@ -246,7 +246,7 @@ needs recording; no unreviewed production changes in this task.
 - [x] Confirm all task reviews and targeted tests pass. Run the complete suite
   on Python 3.12, 3.13, and 3.14; run repository pre-commit hooks and compare mypy
   diagnostics against the 8b529ed baseline (144 errors; baseline is not clean).
-- [ ] Perform an independent whole-PR review against the contract and base
+- [x] Perform an independent whole-PR review against the contract and base
   5b6de3b, with a separate focus on this hardening delta from 8b529ed. Address
   valid findings, rerun affected checks, and record remaining limitations.
 - [x] Record source-size deltas and precise verification/performance results.
@@ -281,26 +281,33 @@ and blanks; tests and documentation are excluded.
 
 | Revision | Production lines | Final change from revision |
 | --- | ---: | ---: |
-| PR base `5b6de3b` | 31,490 | +13,341 |
-| Original reviewed PR `742806f` | 46,222 | -1,391 |
-| Previous simplification `8b529ed` | 44,788 | +43 |
-| Completed hardening `83cff56` | 44,831 | 0 |
+| PR base `5b6de3b` | 31,490 | +13,359 |
+| Original reviewed PR `742806f` | 46,222 | -1,373 |
+| Previous simplification `8b529ed` | 44,788 | +61 |
+| Five production tasks `83cff56` | 44,831 | +18 |
+| Final-review repairs `1ca6072` | 44,849 | 0 |
 
-The hardening pass adds 43 production lines overall. Shared policy alone removes
-15 lines. The remaining large code is concentrated in preparation/coordinator,
-journal validation/publication, and deployed-store adoption. Those mechanisms
-carry the retained crash, crypto, ownership, and admission guarantees; neither
+The hardening pass and final-review repairs add 61 production lines overall:
+43 for the five tasks and 18 for the protocol/crypto repairs. Shared policy alone
+removes 15 lines. The remaining large code is concentrated in
+preparation/coordinator, journal validation/publication, and deployed-store
+adoption. Those mechanisms carry the retained crash, crypto, ownership, and
+admission guarantees; neither
 line compression nor another state machine would improve this tradeoff.
 
 `pytest --benchmark-disable` completed on Python 3.12.13, 3.13.14, and 3.14.7:
-2,028 passed and 3 skipped on each interpreter. Existing fork tests emit three
-deprecation warnings on each; Python 3.14 also reports two deprecated
-`asyncio.iscoroutinefunction` uses in tests. The full matrix began before the
-final annotation-only correction to `rooms.py`; 83 affected tests passed after
-that correction. All repository pre-commit hooks passed. The full mypy check
-still reports 144 errors in 23 files, exactly matching the normalized baseline
-with no added or removed diagnostics. This is existing debt, not a passing type
-check.
+2,068 passed and 3 skipped on each interpreter after the behavioral repairs.
+Existing fork tests emit three deprecation warnings on each; Python 3.14 also
+reports two deprecated `asyncio.iscoroutinefunction` uses in tests. The matrix
+began before an added cancellation assertion segment and the final local type
+annotation correction; production runtime behavior was unchanged. The two
+cancellation tests and 33 crypto/restart cases passed separately afterward.
+All repository pre-commit hooks passed, including scoped checks after those last
+changes. The full mypy command (`MYPYPATH=src uv run --no-sync mypy -p nio
+--warn-redundant-casts --no-incremental`) still reports 144 errors in 23 files,
+exactly matching the normalized baseline with no added or removed diagnostics.
+This is existing debt, not a passing type check. The requested zero-error cleanup
+follows completion and push of this pass; it is not waived by baseline parity.
 
 ### Performance boundaries
 
@@ -348,24 +355,24 @@ Independent review at `a055bac` found three supported-workload blockers in the
 broader PR. The targeted hardening changes had no additional blocker. Repair
 these together before the final push; they enforce the existing contract.
 
-- [ ] R1: Accept valid noncanonical wire JSON in membership success and the two
+- [x] R1: Accept valid noncanonical wire JSON in membership success and the two
   maintenance/membership error parsers. Keep bounded strict decoding, schemas,
   response identity, and internal canonical validation. Verify real owned
   join/leave progress and retry/terminal classification with ordinary JSON.
-- [ ] R2: Accept `m.room.encryption` state during hydration; correct the encrypted
+- [x] R2: Accept `m.room.encryption` state during hydration; correct the encrypted
   envelope rejection to `m.room.encrypted`. Preserve duplicate-key, membership,
   and intent checks. Verify a real encrypted-room hydration, delivery, settlement,
   and restart, including encryption projection and crypto tracking.
-- [ ] R3: Remove executor-only singleton assumptions from queued shares, waiting
+- [x] R3: Remove executor-only singleton assumptions from queued shares, waiting
   claims, dummy rerequests, and simultaneous waiting/wedged devices. Consume only
   the matching live message, preserve other messages, allow multiple valid
   follow-ups per device, and align per-session deduplication. Keep existing
   operation storage, exact retry bytes/IDs, atomic application, and poison rules.
   Cover ordinary Olm-generated multi-message workloads and restart around sends.
-- [ ] Run focused regressions and crash/replay checks, then the full interpreter
+- [x] Run focused regressions and crash/replay checks, then the full interpreter
   matrix and hooks after the behavioral corrections. Compare normalized mypy
   diagnostics and update final production-size measurements.
-- [ ] Independently re-review the complete fix diff against R1–R3 and check it for
+- [x] Independently re-review the complete fix diff against R1–R3 and check it for
   new breakage before push. Record the verdict and remaining cutover limits.
 
 ### Related trust-order correction
@@ -380,3 +387,63 @@ that ordinary/owned callback available earlier. Add real ordinary and owned
 regressions proving no claim/share before verification, durable callback replay,
 and successful explicit continuation after verification. No new maintenance
 publication phase is needed.
+
+### Repair verification and test intent
+
+The three review findings were reproduced against the earlier implementation:
+40 regression cases failed there. The corrected focused suite passed 447 tests
+with 3 existing skips, followed by the complete interpreter matrix above. Tests
+exercise actual SQLite ownership, Olm/Megolm encryption and recipient decryption,
+callbacks, settlement, and reopening around preparation, application, and
+uncertain sends. Fault cases verify atomic rollback, post-commit publication,
+poisoned-client reconstruction, stable request bytes/IDs, and frame retirement.
+
+Existing test changes were assessed against the supported behavior. The hydration
+negative fixture now uses the encrypted envelope type; a separate positive test
+proves ordinary encryption configuration survives encrypted-room delivery and
+restart. HTTP fate tests retain their pending-state, request-identity, and
+classification assertions, and use status 400 so fallback status handling cannot
+hide ignored Matrix error codes. Cancellation still covers waiting-for-session
+requests and unverified requests. A separate test covers the original combined
+unverified/no-session input, cancellation and recollection, denied continuation
+before verification, and successful real sharing after verification. Expected
+security or recovery outcomes were not weakened to make the suite pass.
+
+The shared trust-order change intentionally surfaces an unverified own-device
+callback before a missing-session claim. Its cost is earlier ordinary callback
+timing in this narrow case. Reversing that decision would require restoring the
+old order and designing explicit callback Work publication during maintenance.
+
+### Independent review outcome
+
+The whole-PR review identified R1–R3 at `a055bac`. Scoped re-review of
+`a055bac..1ca6072` accepted all three repairs and found no new Critical/Important
+breakage. It independently checked the changed tests against protocol and
+behavior, including their retained cancellation and crypto recovery assertions.
+The broad review was risk-focused across the production architecture; this is
+not a claim that every line of the large PR was exhaustively verified.
+
+One separate existing limitation remains: a collected unverified key-request
+callback can be replayed without restoring the Olm pending approval map. A real
+store/Olm reconstruction probe confirmed that subsequent `continue_key_share`
+rejects the request as unknown; reaching the same failure from owned callback
+replay is inferred from its unchanged call chain, not a completed end-to-end
+reproduction. The new owned tests prove durable callback replay and no premature
+secret sharing; explicit successful continuation was tested on the ordinary
+path only. Do not present those results as proof of continuation after restart.
+
+This limitation is a cutover gap to reproduce and resolve separately before
+relying on interactive key sharing across restart. It does not block publishing
+the current repairs for review, and it is not waived as an excluded guarantee.
+The failure blocks key availability for that request; it does not bypass device
+trust or expose the key. Deferring it costs a failed continuation until separately
+resolved. The companion integration and this path still need cutover verification.
+
+### Follow-up work after this push
+
+The user requested elimination of all 144 mypy errors, with truthful annotations
+and meaningful tests rather than blanket suppression or test accommodation.
+They also requested inspection of PR #57's performance ideas, with benchmarks on
+this PR #55 before deciding whether any optimization merits adoption. Both are
+separate follow-ups after the current repairs, verification, review, and push.
+PR #57 has not yet been evaluated as part of this hardening pass.
