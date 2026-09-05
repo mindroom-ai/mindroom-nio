@@ -275,6 +275,24 @@ orchestration, callbacks, transaction timing, and durable admission separate.
 Performance measurements must identify their workload and boundary; a faster
 codec is not an end-to-end throughput claim.
 
+### Explicit Peewee model binding
+
+The store decorators bind their explicit `models` list with `bind_refs=False`
+and `bind_backrefs=False`. MatrixStore/DefaultStore enumerate ten runtime models;
+SqliteStore/SqliteMemoryStore add SQL device trust. Those lists include the
+foreign-key targets and lazy relationships used by their operations. Adding an
+operation or model requires keeping the appropriate list complete; no runtime
+relationship-discovery framework is needed. DefaultStore keeps its sidecar trust
+path, and historical migration-only models need not join the runtime list.
+
+Keep all four ordinary/owned decorator binding contexts and their restoration,
+ownership checks, read/write scopes, transactions, and queue-store handling.
+Leave bootstrap, migration, and subset bindings unchanged. This avoids repeating
+relationship traversal on every store call; it does not change Peewee's shared
+class metadata or promise new concurrency safety. Verify distinct database
+values, nested contexts, and exception rollback/restoration. Serial operation
+speedups do not establish full application throughput improvements.
+
 ### History decision boundary
 
 The current prepared engine detects discontinuities and emits explicit loss; it

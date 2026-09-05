@@ -197,7 +197,48 @@ assert set(owned.rooms[room_id].users) == set(ordinary.rooms[room_id].users)
   not eliminate real duplicated policy and record that decision in results.
 - [ ] Run hooks, inspect diff, then commit.
 
-## Task 5: Verify, document results, review, and push
+## Task 5: Bind the complete runtime model list directly
+
+Files: src/nio/store/database.py; tests/store_test.py and focused adjacent store
+binding tests using real ordinary and owned store fixtures.
+
+Interfaces: keep both decorators and every lifecycle/transaction boundary; only
+change the bind_ctx keyword arguments at their four ordinary/owned call sites.
+
+- [ ] Verify MatrixStore/DefaultStore model lists include runtime foreign-key
+  targets; SqliteStore/SqliteMemoryStore additionally include DeviceTrustState.
+  Preserve existing session, forwarding-chain, device key, sidecar/SQL trust,
+  room, request, and sync-token round trips. Migration-only models stay separate.
+- [ ] Add real nested cross-store cases with distinct stored token/key values,
+  plus read and atomic exception cases. Cover ordinary and owned decorator paths,
+  rollback after a nested write, and complete binding restoration on every exit.
+
+```python
+# Inside a binding context for store_a, call decorated methods on store_b.
+assert store_a.load_sync_token() == "token-a"
+assert store_b.load_sync_token() == "token-b"
+assert Accounts._meta.database is store_a.database
+# After the outer context exits, each model has its original database binding.
+```
+
+- [ ] Apply the explicit binding arguments at exactly the four decorator sites.
+  Preserve owner validation, read/write scopes, epoch fences, atomic/savepoint
+  scopes, and queue database behavior. Do not alter migration/bootstrap bindings.
+
+```python
+with self.database.bind_ctx(
+    self.models, bind_refs=False, bind_backrefs=False
+):
+    return fn(self, *args, **kwargs)
+```
+
+- [ ] Record serial binding/token/account microbenchmarks with original and new
+  binding options on the same store/runtime. State runtime, workload, and timing
+  boundary. No concurrent safety or whole-application throughput claim.
+- [ ] Run store, encryption, ownership/recovery, migration, and new binding tests,
+  hooks, inspect diff, then commit with the rationale and verification.
+
+## Task 6: Verify, document results, review, and push
 
 Controller task. Files: this plan and the contract where a final design decision
 needs recording; no unreviewed production changes in this task.
@@ -216,8 +257,9 @@ needs recording; no unreviewed production changes in this task.
 
 ## Design self-review
 
-The four production tasks map directly to the amendment: logical ownership,
-atomic capacity, exact-input reuse, and shared policy. Required crash/crypto and
+The five production tasks map directly to the amendment: logical ownership,
+atomic capacity, exact-input reuse, shared policy, and explicit model binding.
+Required crash/crypto and
 consumer boundaries remain intact. The capacity promise explicitly stops at the
 hard output envelope. History semantics stay separate until the product decision
 is made. No schema migration or new public API is required. Task 2 may touch the
