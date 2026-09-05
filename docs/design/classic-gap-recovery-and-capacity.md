@@ -231,6 +231,36 @@ a universal event-loop latency bound. Large individual events, state/global
 sections, and other application tasks remain separate limits. The local pause
 reproduction does not by itself establish the live health timeout's cause.
 
+### One authenticated value per owning operation
+
+Blocking-Frame authentication already fetches and decodes the complete stored
+row. Return that value to outbound maintenance, completion, and Work readiness
+checks instead of immediately fetching it again. Retain header authentication,
+revision checks, prepared-state classification, and the separate Work lookup.
+An owned read scope is not a SQLite snapshot; the justification is that these
+synchronous operations have no intervening await, callback, or supported writer.
+This removes eight lines; three recovery pairs measured a modest 1.55% median
+improvement, with ordinary delivery within noise.
+
+Claim and acknowledgement each authenticate delivery state once inside their
+existing `BEGIN IMMEDIATE` transaction. Keep the separate claim and
+acknowledgement commits, authenticated Work, FIFO selection, batch identity,
+byte/count limits, revision exhaustion checks, CAS, deletion, and crash hooks.
+Remove the preflight read and second snapshot comparison: the authoritative
+read now occurs after acquiring the transaction's write reservation.
+No await or application callback runs inside either transaction.
+
+Empty polls, outstanding replay, and acknowledged retries also enter that
+transaction, but perform no DML, revision change, or transition hook.
+Three paired local runs measured 4.41% faster ordinary delivery and 3.66%
+faster recovery; idle/retry overhead was approximately zero to two microseconds
+per call. This modest cost buys simpler ownership with fewer authenticated
+reads, without another cache, queue, or batching protocol.
+Do not restore an outside/inside snapshot comparison to satisfy tests that
+inject coherent private writes at transaction entry. Such injection models the
+removed implementation, not a supported concurrent writer. Actual persisted
+corruption, ownership, rollback, FIFO, and crash/replay checks remain required.
+
 ## Verification and remaining limits
 
 Use real owned SQLite sessions with mocked HTTP only at the network boundary.

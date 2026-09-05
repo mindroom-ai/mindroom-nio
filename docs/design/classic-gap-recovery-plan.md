@@ -356,3 +356,66 @@ under concurrent JSON processing; most cost moved rather than disappearing.
 Cross-loop production support would require additional future/drain changes.
 Keep the existing backend; these results do not justify that architecture change
 or establish a fix for the live dispatch ramp.
+
+### Latest unchanged capacity controls
+
+The production 100-event-ceiling Tuwunel control completed 200 exact replies,
+the fence across all three principals, subsequent sync progress, both drains,
+and clean shutdown without application errors or stalls. It settled 17,061
+companion events and acknowledged all 402 outgoing deliveries. Reply median was
+74.558 seconds, p95 84.956 seconds, and first-input-to-last-reply 86.113 seconds.
+Initial replies spread over 20.530 seconds. The sole failed predicate was full
+visible overlap: 43.960 seconds against the unchanged 45-second minimum.
+Tuwunel already capped responses at 100, so this run does not isolate an effect
+from changing the client's ceiling.
+
+The Synapse 5,000-window control with the same source completed all 200 exact
+replies, acknowledged all 402 deliveries, remained responsive to the two-second
+health read, and had no application errors or stalls. Reply median was 80.213
+seconds, p95 87.112 seconds, and last reply 89.492 seconds after first input;
+full overlap passed at 48.164 seconds. It failed the shared 180-second workload
+deadline at the general principal's fence. The deadline includes reply waiting,
+drain, fence, final audit, and shutdown; it is not 180 seconds reserved for
+the fence. The final snapshot had 23,147 settled companion events and one
+pending redaction. The other two principals had settled the fence.
+
+The missing fence was durably captured at index 98 of the general principal's
+last unprepared 100-event tail. That consumer was still settling events at the
+deadline and during quiesce; the retained tail followed its progress in order.
+There was no lost fence or exhausted recovery watchdog. This is insufficient
+catch-up throughput within the unchanged deadline, not passing acceptance.
+Exact projection-wait durations were not logged, so attribution remains bounded
+by that evidence. Peak RSS was 608.30 MiB for Tuwunel and 646.20 MiB for Synapse.
+
+### Reject the serial writer; select smaller Nio simplifications
+
+One subsequent full-application diagnostic pair confirmed rejection of the
+serial SQLite executor prototype. Both variants completed all 200 replies,
+health, fence, sync, drain, and shutdown checks, but failed overlap. Serial
+dispatch time increased from 20.198 to 25.066 seconds (24.1%); median reply time
+increased from 74.968 to 79.635 seconds (6.2%), and p95 from 85.174 to 92.396.
+Keep the existing companion writer. The original diagnostic parser rejected
+two additional setup flushes in the candidate; a separate read-only audit
+selected the exact 200 workload roots from each database and verified one
+completed flush per root. These are diagnostic results, not production
+qualification, and no acceptance predicate changed.
+
+Select two smaller Nio changes described in the architecture amendment:
+
+1. Return and reuse the blocking Frame's already authenticated decoded value.
+   Three recovery pairs improved a median 1.55%; ordinary results were noise.
+   This removes eight production lines without adding state.
+2. Read delivery state once inside each existing claim/acknowledgement
+   transaction and remove the second snapshot comparison. Three pairs improved
+   ordinary delivery by a median 4.41% and recovery by 3.66%. Idle and retry
+   operations retain their exact persisted graph and revision, with no DML or
+   transition hooks; measured added cost was approximately zero to two
+   microseconds per call. Claim and acknowledgement remain separate commits.
+
+Review and remove only tests of coherent private writer injection between the
+old read/write scopes. Preserve actual corruption, ownership, FIFO, byte/count
+limits, rollback, and crash/replay coverage. Run the full suite and hooks, then
+repeat both unchanged real capacity controls with frozen source and idle CPUs.
+Do not add local percentage gains or promise an application result from them.
+Publish the companion against the final pushed Nio revision from an isolated
+checkout, preserving the user's original dependency edits byte-for-byte.
