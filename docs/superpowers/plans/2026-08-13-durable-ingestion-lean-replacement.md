@@ -1,5 +1,9 @@
 # Durable Ingestion Lean Replacement Implementation Plan
 
+> Historical plan. The [supported guarantee contract](../../design/durable-ingestion-contract.md)
+> and [simplification plan](../../design/durable-ingestion-simplification-plan.md)
+> control subsequent work where they conflict with this document.
+
 > **For agentic workers:** Continue with `baspowers:executing-plans`, use
 > `baspowers:test-driven-development` for every behavior change, and use
 > `baspowers:verification-before-completion` before any completion claim.

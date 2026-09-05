@@ -1,5 +1,11 @@
 # Durable ingestion: lean replacement design
 
+> The [2026-09-05 supported guarantee contract](../../design/durable-ingestion-contract.md)
+> supersedes conflicting requirements below, including the plain ingestion API,
+> durable typing/presence delivery, and repeated internal validation. This document
+> retains historical implementation context; excluded guarantees must not be
+> restored as routine review fixes.
+
 **Status:** controlling design, approved 2026-08-13; non-sensitive observation
 and measured-budget amendments approved 2026-08-16 and 2026-08-20
 
