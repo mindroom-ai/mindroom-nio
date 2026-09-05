@@ -984,7 +984,9 @@ class _OwnedIngestionSession:
                     await _cooperative_sleep(0)
                     try:
                         validate_json(raw, Schemas.presence)
-                    except ValidationError:
+                        if raw["type"] != "m.presence":
+                            raise ValueError("invalid presence type")
+                    except (ValidationError, ValueError):
                         discarded = True
                         continue
                     content = raw["content"]

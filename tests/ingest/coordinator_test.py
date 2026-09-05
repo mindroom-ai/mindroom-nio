@@ -19260,6 +19260,7 @@ async def test_owned_settle_rejects_authenticated_malformed_collected_request(
         "valid",
         "bad-content",
         "bad-container",
+        "bad-presence-type",
         "callback-error",
         "callback-timeout",
         "cancel",
@@ -19277,6 +19278,7 @@ async def test_fresh_transients_are_best_effort(tmp_path, caplog, transport, tra
     client.olm.save_account()
     room = nio.MatrixRoom(ROOM, ACCOUNT)
     room.add_member(BOB, "Bob", None)
+    room.users[BOB].presence = "unavailable"
     client.rooms[ROOM] = room
     seen = []
 
@@ -19338,6 +19340,9 @@ async def test_fresh_transients_are_best_effort(tmp_path, caplog, transport, tra
         elif transient == "bad-container":
             body["extensions"]["typing"] = "payload-secret"
             body["extensions"]["presence"] = "payload-secret"
+        if transient == "bad-presence-type":
+            presence_root = body if transport == "classic" else body["extensions"]
+            presence_root["presence"]["events"][0]["type"] = "m.invalid"
         return session._network_result(request, 200, canonical_json(body))
 
     session._request = respond
@@ -19384,6 +19389,9 @@ async def test_fresh_transients_are_best_effort(tmp_path, caplog, transport, tra
         assert any(record.event_id == "$parity-message" for record in records)
         assert any(record.kind is RecordKind.EPHEMERAL for record in records)
         if transient in {"callback-error", "callback-timeout"}:
+            assert seen == [("typing", ROOM, [BOB])]
+        if transient == "bad-presence-type":
+            assert client.rooms[ROOM].users[BOB].presence == "unavailable"
             assert seen == [("typing", ROOM, [BOB])]
         if transient == "callback-timeout":
             assert 0.9 <= asyncio.get_running_loop().time() - started < 5
