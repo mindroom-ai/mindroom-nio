@@ -429,3 +429,48 @@ and all repository hooks pass. Production now totals 45,833 Python lines:
 795 above the profiling baseline and 389 below the original simplification
 baseline. The companion correction adds 24 net production lines. Real capacity
 qualification still requires the next unchanged controls.
+
+### Controls at `918a64a` and companion parser selection
+
+Both unchanged controls still failed full qualification after these smaller
+simplifications. Tuwunel completed all replies, the exact fence across three
+principals, continued sync, drain, and clean shutdown. Its only failure was
+43.257 seconds of full overlap. Reply median was 74.180 seconds, p95 85.034,
+and last reply 86.181 seconds after first input; initial replies spread over
+20.549 seconds. All 17,019 companion rows settled and all outbox debt cleared.
+These results do not demonstrate an application latency improvement.
+
+Synapse completed all 200 replies with median 81.664 seconds, p95 89.248,
+and last reply at 91.304 seconds. Full overlap passed at 48.897 seconds.
+The shared deadline expired during the observer's incremental sync while
+polling the fence. The fence had settled for two principals but remained
+in the general principal's retained 100-event tail; ten of that principal's
+journal rows were pending, with no unacknowledged outbox rows. Final acceptance
+for drain, subsequent sync, and shutdown was not reached. Both runs retained
+unchanged source and dependency files and had no application error or stall
+markers. Existing parser warnings are counted separately below.
+
+The logs exposed a small companion bug with a measurable local cost:
+`ingestion_timeline_views` tries every event through `RoomMessage` media parsing,
+then parses non-media events again through `Event.parse_event`. This creates
+false missing-`msgtype` warnings for valid reactions and redactions and ignores
+the outer event type while probing media. The latest Tuwunel run emitted 606
+annotation and 603 redaction warnings from this path; prior controls did too.
+
+Use the existing encrypted-media predicate to select specialized media parsing
+only for encrypted `m.room.message` attachments. Other sources go straight to
+the existing generic event parser. Preserve the current fallback after failed
+encrypted-media parsing, event-ID validation, provenance, and projection logic.
+This keeps event type authoritative without another cache or delivery path.
+Add a behavioral regression for reactions carrying image-shaped extension
+fields, plus valid-event diagnostics and encrypted/malformed media boundaries.
+
+Three alternating local pairs over 1,000 retained text edits measured median
+parsing time falling from 107.01 to 67.95 milliseconds (36.55%). A mixed batch
+with 80% retained edits and reactions, redactions, membership, clear images,
+and encrypted images fell from 102.89 to 65.09 milliseconds (36.81%). All
+22 ordinary, media, encrypted, and malformed fixture outcomes and parsed fields
+matched. A separate warnings-enabled profile removed 120 false warnings and
+41,120 formatted diagnostic bytes. These are parser timings, not a claim of
+equivalent application improvement. Verify the companion correction against
+the final pinned dependency before publishing and repeating capacity controls.
