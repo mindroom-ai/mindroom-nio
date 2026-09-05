@@ -367,3 +367,16 @@ these together before the final push; they enforce the existing contract.
   diagnostics and update final production-size measurements.
 - [ ] Independently re-review the complete fix diff against R1–R3 and check it for
   new breakage before push. Record the verdict and remaining cutover limits.
+
+### Related trust-order correction
+
+The real R3 tests also exposed an unverified own-device request with no Olm
+session. The current shared policy schedules a claim before checking trust;
+after the claim, it returns callback Work that maintenance cannot publish. Move
+the existing trust check in `Olm.share_with_ourselves` ahead of missing-session
+claim scheduling. Existing preparation then publishes the collected callback.
+This preserves the current Work/operation representation and deliberately makes
+that ordinary/owned callback available earlier. Add real ordinary and owned
+regressions proving no claim/share before verification, durable callback replay,
+and successful explicit continuation after verification. No new maintenance
+publication phase is needed.

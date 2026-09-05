@@ -339,6 +339,15 @@ all generated follow-ups within the existing ordered operation list, with exact
 bodies/transaction IDs and atomic crypto response application. No singleton-only
 restriction, new schema, queue manager, or retry state machine is warranted.
 
+For an own-device room-key request, the shared Olm policy checks existing device
+trust before scheduling a missing-session key claim. An unverified device is
+reported through the existing collected-request callback during preparation,
+which can already publish durable callback Work. Verification and explicit
+continuation still control sharing. This intentionally makes the callback
+available earlier for the combined unverified/no-session case in ordinary and
+owned sync, and avoids an unnecessary claim. It does not authorize sharing with
+an unverified device or add callback Work publication during maintenance.
+
 ## Verification
 
 - Real owned-engine Classic/Sliding processing, replay, acknowledgement, and
