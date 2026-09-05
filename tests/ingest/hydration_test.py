@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import nio.store._sync_journal_rows as journal_rows_module
 from nio.event_provenance import TimelineEventProvenance
 from nio.exceptions import LocalProtocolError
 from nio.ingest._json import canonical_json
@@ -353,6 +354,151 @@ def _raw_hydration_graph(journal: SqliteIngestionJournal) -> tuple[object, ...]:
         )
     finally:
         connection.close()
+
+
+def test_aggregate_decode_cache_requires_identical_authenticated_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _open_journal(tmp_path / "aggregate-cache.db")
+    closed = False
+    try:
+        _seed_pending(journal)
+        owner = journal.load_owner()
+        real_decode = journal_rows_module._room_aggregate_value_from_plaintext
+        decode_calls = 0
+
+        def counted_decode(*args: object) -> RoomAggregateValue:
+            nonlocal decode_calls
+            decode_calls += 1
+            return real_decode(*args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            journal_rows_module,
+            "_room_aggregate_value_from_plaintext",
+            counted_decode,
+        )
+
+        loaded = journal._load_room_aggregate(owner, ROOM_ID)
+        assert loaded is not None
+        assert journal._load_room_aggregate(owner, ROOM_ID) == loaded
+        assert decode_calls == 1
+
+        changed = replace(loaded[1], next_room_sequence=1)
+        changed_plaintext = _canonical_room_aggregate_plaintext(changed)
+        changed_payload, changed_digest = journal._payload(
+            owner,
+            "NioIngestRoomAggregate",
+            changed_plaintext,
+            header=_canonical_internal(
+                [ROOM_ID, changed.updated_revision, "hydration"]
+            ),
+        )
+        with journal._owner.journal_write():
+            journal._execute(
+                "UPDATE NioIngestRoomAggregate SET payload = ?, payload_sha256 = ? "
+                "WHERE account_id = ? AND room_id = ?",
+                (changed_payload, changed_digest, journal.account_id, ROOM_ID),
+            )
+        changed_loaded = journal._load_room_aggregate(owner, ROOM_ID)
+        assert changed_loaded is not None and changed_loaded[1] == changed
+        assert decode_calls == 2
+
+        with journal._owner.journal_write():
+            journal._execute(
+                "UPDATE NioIngestRoomAggregate SET payload = ? "
+                "WHERE account_id = ? AND room_id = ?",
+                (changed_payload + b" ", journal.account_id, ROOM_ID),
+            )
+        with pytest.raises(JournalIntegrityError, match="invalid room Aggregate row"):
+            journal._load_room_aggregate(owner, ROOM_ID)
+        assert decode_calls == 2
+
+        with journal._owner.journal_write():
+            journal._execute(
+                "UPDATE NioIngestRoomAggregate SET payload = ? "
+                "WHERE account_id = ? AND room_id = ?",
+                (changed_payload, journal.account_id, ROOM_ID),
+            )
+        with pytest.raises(JournalIntegrityError, match="invalid room Aggregate row"):
+            journal._load_room_aggregate(replace(owner, revision=0), ROOM_ID)
+        with pytest.raises(JournalIntegrityError, match="invalid room Aggregate row"):
+            journal._load_room_aggregate(replace(owner, stream_id=uuid4()), ROOM_ID)
+        assert (
+            journal._load_room_aggregate(
+                replace(owner, account_id="@other:example.org"), ROOM_ID
+            )
+            == changed_loaded
+        )
+        assert decode_calls == 3
+
+        other_room = "!other:example.org"
+        other = replace(
+            changed,
+            continuity=replace(changed.continuity, room_id=other_room),
+        )
+        other_payload, other_digest = journal._payload(
+            owner,
+            "NioIngestRoomAggregate",
+            _canonical_room_aggregate_plaintext(other),
+            header=_canonical_internal(
+                [other_room, other.updated_revision, "hydration"]
+            ),
+        )
+        with journal._owner.journal_write():
+            journal._execute(
+                "INSERT INTO NioIngestRoomAggregate VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    journal.account_id,
+                    other_room,
+                    other.updated_revision,
+                    "hydration",
+                    other_payload,
+                    other_digest,
+                ),
+            )
+        assert journal._load_room_aggregate(owner, other_room) is not None
+        assert journal._load_room_aggregate(owner, ROOM_ID) == changed_loaded
+        assert decode_calls == 5
+
+        journal.close()
+        closed = True
+        assert journal._room_aggregate_cache is None
+    finally:
+        if not closed:
+            journal.close()
+
+
+def test_hydration_settlement_reuses_identical_aggregate_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nio.ingest.hydration import normalize_hydration_response
+
+    journal = _open_journal(tmp_path / "aggregate-settlement-cache.db")
+    try:
+        pending = _seed_pending(journal)
+        result = normalize_hydration_response(
+            pending,
+            own_user_id=OWN_USER,
+            response_body=canonical_json([_member_event()]),
+        )
+        real_decode = journal_rows_module._room_aggregate_value_from_plaintext
+        decode_calls = 0
+
+        def counted_decode(*args: object) -> RoomAggregateValue:
+            nonlocal decode_calls
+            decode_calls += 1
+            return real_decode(*args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            journal_rows_module,
+            "_room_aggregate_value_from_plaintext",
+            counted_decode,
+        )
+
+        assert journal.apply_hydration_result(result=result) is not None
+        assert decode_calls == 1
+    finally:
+        journal.close()
 
 
 def _capacity_work_row(

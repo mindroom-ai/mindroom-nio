@@ -33,7 +33,9 @@ from ..ingest.reducer import (
 )
 from ..ingest.serialization import _loss_id, _record_to_dict
 from ..ingest.source import SyncFrame
-from ._sync_journal_format import _canonical_internal, _row
+from ._sync_journal_format import _canonical_envelope_prefix
+from ._sync_journal_format import _canonical_internal as _canonical_internal
+from ._sync_journal_format import _row as _row
 from ._sync_journal_values import (
     _HELD_PROMOTION_RESERVE_BYTES,
     MaterializerLimits,
@@ -164,14 +166,12 @@ def _stored_work_size(
     owner: tuple[str, UUID, TransportKind],
     stored: _StoredWorkRow,
 ) -> int:
-    return len(
-        _row(
-            owner,
-            "NioIngestWork",
-            stored.plaintext,
-            header=_canonical_internal(stored.clear_values),
-        )[0]
+    prefix = _canonical_envelope_prefix(
+        owner,
+        "NioIngestWork",
+        stored.clear_values,
     )
+    return len(prefix) + len(b',"value":') + len(stored.plaintext) + len(b"}")
 
 
 def _canonical_work_plaintext(

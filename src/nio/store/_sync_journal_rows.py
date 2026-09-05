@@ -1380,6 +1380,16 @@ class JournalRows:
     account_id: str
     device_id: str
 
+    def __init__(self) -> None:
+        self._room_aggregate_cache: (
+            tuple[
+                tuple[str, UUID, TransportKind],
+                tuple[object, ...],
+                RoomAggregateValue,
+            ]
+            | None
+        ) = None
+
     if TYPE_CHECKING:
 
         def _execute(
@@ -1992,6 +2002,14 @@ class JournalRows:
                 or len(digest) != 32
             ):
                 raise ValueError("Aggregate columns are invalid")
+            authentication = (
+                owner.account_id,
+                owner.stream_id,
+                owner.transport_kind,
+            )
+            cached = self._room_aggregate_cache
+            if cached is not None and cached[:2] == (authentication, stored):
+                return stored, cached[2]
             plaintext = self._payload(
                 owner,
                 "NioIngestRoomAggregate",
@@ -2015,6 +2033,7 @@ class JournalRows:
                 value.pending_hydration.origin.transport is not owner.transport_kind
             ):
                 raise ValueError("Aggregate origin transport does not match owner")
+            self._room_aggregate_cache = authentication, stored, value
             return stored, value
         except JournalIntegrityError:
             raise

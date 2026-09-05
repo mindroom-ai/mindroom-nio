@@ -29,6 +29,25 @@ _STORED_ROWS = {
 }
 
 
+def _canonical_envelope_prefix(
+    owner: tuple[str, UUID, TransportKind],
+    table: str,
+    header: bytes | tuple[object, ...],
+) -> bytes:
+    kind, *fields = _STORED_ROWS[table].split()
+    clear = [*header] if isinstance(header, tuple) else load_internal_json(header, kind)
+    return _canonical_internal(
+        {
+            "schema_version": 1,
+            "row_kind": kind,
+            "account_id": owner[0],
+            "stream_id": str(owner[1]),
+            "transport_kind": owner[2].value,
+            **dict(zip(fields, clear, strict=True)),
+        }
+    )[:-1]
+
+
 def _row(
     owner: tuple[str, UUID, TransportKind],
     table: str,
@@ -39,21 +58,10 @@ def _row(
     if digest is not None:
         envelope = load_internal_json(value, "stored payload")
         payload, value = value, _canonical_internal(dict.get(envelope, "value"))
-    kind, *fields = _STORED_ROWS[table].split()
-    clear = [*header] if isinstance(header, tuple) else load_internal_json(header, kind)
-    prefix = _canonical_internal(
-        {
-            "schema_version": 1,
-            "row_kind": kind,
-            "account_id": owner[0],
-            "stream_id": str(owner[1]),
-            "transport_kind": owner[2].value,
-            **dict(zip(fields, clear, strict=True)),
-        }
-    )
+    prefix = _canonical_envelope_prefix(owner, table, header)
     if value is None:
-        return hashlib.sha256(prefix).digest()
-    expected = prefix[:-1] + b',"value":' + value + b"}"
+        return hashlib.sha256(prefix + b"}").digest()
+    expected = prefix + b',"value":' + value + b"}"
     if digest is None:
         return expected, hashlib.sha256(expected).digest()
     if hashlib.sha256(payload).digest() != digest or payload != expected:

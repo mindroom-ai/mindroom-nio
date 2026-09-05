@@ -13,6 +13,7 @@ import nio.ingest.classic as classic_module
 import nio.ingest.ports as ports_module
 import nio.ingest.sliding as sliding_module
 import nio.store as store
+import nio.store._sync_journal_format as journal_format_module
 import nio.store._sync_journal_plan as journal_plan_module
 from nio.event_provenance import TimelineEventProvenance
 from nio.ingest import source
@@ -2860,6 +2861,89 @@ def _prepared_stored_work_size(
             header=header,
         )[0]
     )
+
+
+@pytest.mark.parametrize(
+    ("owner", "stored"),
+    (
+        (
+            ("@planner-事件:example.org", _STREAM_ID, TransportKind.CLASSIC),
+            journal_plan_module._StoredWorkRow(
+                "$event-事件",
+                "event",
+                "ready",
+                _FRAME_ID,
+                "!room-事件:example.org",
+                2**63 - 1,
+                2**63 - 1,
+                2**63 - 1,
+                2**63 - 1,
+                2**63 - 1,
+                b'{"kind":"event","value":{}}',
+            ),
+        ),
+        (
+            ("@planner-事件:example.org", _STREAM_ID, TransportKind.SLIDING),
+            journal_plan_module._StoredWorkRow(
+                "$loss-事件",
+                "loss",
+                "held",
+                _FRAME_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                2**63 - 1,
+                b'{"kind":"loss","value":{}}',
+            ),
+        ),
+    ),
+)
+def test_stored_work_size_matches_persisted_envelope(
+    owner: tuple[str, UUID, TransportKind],
+    stored: journal_plan_module._StoredWorkRow,
+) -> None:
+    payload, _ = journal_plan_module._row(
+        owner,
+        "NioIngestWork",
+        stored.plaintext,
+        header=_canonical_internal(stored.clear_values),
+    )
+
+    assert journal_plan_module._stored_work_size(owner, stored) == len(payload)
+
+
+def test_stored_work_size_does_not_hash_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = (_PLANNER_ACCOUNT_ID, _STREAM_ID, TransportKind.CLASSIC)
+    stored = journal_plan_module._StoredWorkRow(
+        "$event",
+        "event",
+        "ready",
+        _FRAME_ID,
+        "!room:example.org",
+        0,
+        0,
+        1,
+        0,
+        1,
+        b'{"kind":"event","value":{}}',
+    )
+    payload, _ = journal_plan_module._row(
+        owner,
+        "NioIngestWork",
+        stored.plaintext,
+        header=_canonical_internal(stored.clear_values),
+    )
+
+    def reject_hash(*args: object, **kwargs: object) -> None:
+        raise AssertionError("size calculation hashed stored payload")
+
+    monkeypatch.setattr(journal_format_module.hashlib, "sha256", reject_hash)
+
+    assert journal_plan_module._stored_work_size(owner, stored) == len(payload)
 
 
 def _prepared_unrelated_held(index: int) -> AuthenticatedWork:

@@ -1239,6 +1239,7 @@ def _authenticate_full_ingestion_graph(
 
     class BootstrapRows(JournalRows):
         def __init__(self) -> None:
+            super().__init__()
             self.account_id = account_id
             self.device_id = device_id
 

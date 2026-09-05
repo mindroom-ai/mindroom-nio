@@ -200,6 +200,7 @@ class SqliteIngestionJournal(JournalRows):
         stream_id: UUID,
         transition_statement_hook: Callable[[str], None] | None,
     ) -> None:
+        super().__init__()
         self.database_path = database_path
         self.account_id = account_id
         self.device_id = device_id
@@ -2482,4 +2483,5 @@ class SqliteIngestionJournal(JournalRows):
     # fmt: on
 
     def close(self) -> None:
+        self._room_aggregate_cache = None
         self._owner.close()
