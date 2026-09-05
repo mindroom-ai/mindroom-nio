@@ -28,8 +28,16 @@ compatibility promise. MindRoom accepts `EPHEMERAL` records and has no
 `RecordKind.PRESENCE` branch, so durable receipts continue through the existing
 `EPHEMERAL` route without defining new receipt semantics.
 
-The discarded plain-session API existed only in this unmerged change, so no
-released API is removed. Version and changelog publication remain release work.
+The discarded plain-session API existed only in this unmerged change; removing
+that API does not remove a released interface. The full PR also replaces older
+released fork-specific ingestion interfaces, including
+`AsyncClient.add_event_admission_callback` and `CallbackNotAcceptedError`, with
+the owned batch/admission contract. Those old fork interfaces are deliberately
+removed, not covered by the upstream-style callback compatibility promise.
+Consumers using them need the coordinated integration cutover; do not restore a
+second admission path through compatibility shims. The release must communicate
+these breaking changes. Version selection and release publication remain
+separate work.
 
 The data flow remains response/cursor commit, callback-free preparation with
 crypto writes, prepared Work publication, consumer admission, acknowledgement,
