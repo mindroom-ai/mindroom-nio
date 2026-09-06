@@ -164,5 +164,8 @@ The companion suite passed 15,850 tests with 22 skipped against the rebuilt Nio
 wheel. All 72 source, wheel and installed Python files matched before and after
 the run. The inherited `UV_NO_SYNC=true` setting kept test subprocesses from
 restoring an older dependency pin. The final committed dependency installation
-must retain these same bytes; release and live cutover validation remain tracked
-separately.
+retains these same bytes at runtime commit `398dae4`. The final integrated
+controls and their outstanding catch-up capacity limits are recorded in the
+[recovery plan](classic-gap-recovery-plan.md#completed-interactive-continuation-and-root-preparation-follow-ups).
+They do not change this interaction's tested persistence and trust guarantees.
+Release and deployment remain separate.

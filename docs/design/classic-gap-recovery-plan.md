@@ -577,3 +577,52 @@ Interactive key-share restart is handled by the separately specified
 and final integration results are recorded there and below. The outstanding
 overlap result remains a cutover consideration; no release, deployment, or merge
 is performed here.
+
+### Completed interactive continuation and root preparation follow-ups
+
+Nio runtime `398dae4` retains interactive approvals and approved handoffs across
+restart through the existing SQLite owner and outbound maintenance. Its 22 new
+owned cases exercise real crypto, receiving-device decryption, callback/ack
+failure, changed trust, missing sessions and commit crashes. The full suite
+passes 2,181 tests with three skipped; mypy reports zero errors in 72 files and
+all repository hooks pass. Remote Python 3.12/3.13/3.14 and coverage jobs pass.
+
+MindRoom runtime `55c37f9f3` bounds independent closed-root preparation at eight
+tasks per gate while retaining semantic keys and lifecycle ownership. Its local
+suite passes 15,850 tests with 22 skipped, and all hooks pass. Every installed
+Nio source file matches the tested wheel and committed pin. Remote tests pass
+(15,848 passed, 12 skipped), as do all four full/minimal AMD64/ARM64 image builds
+and the complete smoke stack.
+
+Production Python totals 46,224 Nio lines: this follow-up adds 391 net lines,
+including the 340-line key-share carrier. The total is 1,186 lines above the
+original profiling revision `1021de4` and two above the `742806f` simplification
+baseline. MindRoom's root scheduling change adds 63 net production lines.
+
+Final integrated controls retained the 200-root workload, 180-second shared
+deadline, 45-second overlap requirement and two-second health read. All three
+completed 200 exact replies with verified runtime source and no application
+errors, degraded reads or event-loop stalls. These times include approximately
+60 seconds of synthetic generation.
+
+| Control | Reply median / p95 | Full overlap | Fence principals | Application pending / outbox |
+| --- | ---: | ---: | ---: | ---: |
+| Tuwunel | 74.607 / 83.888 s | 44.250 s | 3/3 | 0 / 0 |
+| Synapse, 5,000-event cap | 80.235 / 86.141 s | 47.714 s | 2/3 | 1 / 0 |
+| Same-source Synapse repeat | 80.058 / 87.582 s | 48.262 s | 1/3 | 0 / 0 |
+
+Tuwunel passed fence, drain, continued sync and clean shutdown; its sole failure
+was overlap below 45 seconds. Both Synapse runs failed fence qualification. The
+repeat traceback locates the timeout in the shared workload deadline during
+fence observation, not the two-second health read. The responder kept advancing
+through old streaming edits across the deadline and cleanup, so there is no
+evidence of a frozen owner. The first failed Synapse run had 7.7% more observer
+journal traffic than the earlier passing control; it cannot establish a matched
+per-event processing regression.
+
+Zero application queue debt after cleanup does not certify full Nio drain: the
+repeat retained authenticated Frames and Work. Preserve both failures and the
+outstanding single-process catch-up limit. The scheduling change provides
+independent-root isolation, with no large measured reply-median gain; these
+results do not qualify the full 200-conversation capacity target. No deadline,
+durability or ownership guarantee was relaxed to improve the result.
