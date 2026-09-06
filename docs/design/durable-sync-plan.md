@@ -535,3 +535,17 @@ Before merge, either transfer existing recovery obligations safely or reject ado
 Do not describe the current cutover as safe for an undrained main recovery store.
 The local two-process evidence is retained under `capacity/compatibility-audit-main-to-durable`, with `main.json` and `adopted.json` recording the verified observations.
 No production fix had been made at the audit checkpoint; its merge-ready recommendation was superseded by this blocker until the resolution above.
+
+
+## Sliding restoration qualification
+
+The [restoration amendment](sliding-sync-restoration.md) records completed ordinary
+and durable Sliding support through the shared core. Both transports pass matched
+200-reply controls on Tuwunel and Synapse; Sliding also passes actual history-gap
+and application restart checks on both. Performance is similar in these controls,
+with no demonstrated general speed advantage. Restoration adds 1,526 net producer
+production lines, leaving the complete PR 1,381 lines smaller than main. Final
+producer checks pass 844 tests with three skipped, zero mypy errors and all hooks.
+The consumer evidence index retains failed attempts and reproduction metadata,
+including one unexplained pre-fix health timeout. The 1,000-reply target and release
+publication remain separate work.

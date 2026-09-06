@@ -1,6 +1,6 @@
 # Sliding Sync through the shared durable core
 
-Status: implementation plan accepted for execution, 2026-09-06.
+Status: implemented and locally qualified, 2026-09-06.
 This amendment supersedes the Classic-only scope in [durable-sync.md](durable-sync.md).
 It preserves that document's transaction, consumer, crypto, size and loss contracts.
 
@@ -231,3 +231,49 @@ the complete PR is +5,056/-6,437, or 1,381 fewer production lines than main.
 Final verification for this fix: 844 passed, three skipped; mypy is clean across
 60 source files and all repository hooks pass. Live qualification below must use
 a rebuilt, exactly pinned consumer wheel rather than the pre-fix package.
+
+## Live qualification result
+
+The corrected producer `f7e1dfd78812c8c58d846bc8e62df698903c18bf`, installed as
+an exactly pinned Git wheel in consumer `d820bc3a4`, passes all four matched
+200-reply controls. Runs use Python 3.13, one responder, three syncing principals,
+the existing 180-second deadline, 45-second full-overlap minimum and two-second
+health timeout. All complete exactly 200 replies, cross every fence, advance
+source progress, retain zero producer/application/outbox debt and stop cleanly.
+Source/package/helper hashes and immutable server images are recorded per run;
+controls run sequentially without competing test processes.
+
+| Server | Transport | Initial median / p95 (s) | Completion median / p95 (s) | Full overlap (s) |
+| --- | --- | --- | --- | --- |
+| Tuwunel | Classic | 5.862 / 11.928 | 69.898 / 76.008 | 50.538 |
+| Tuwunel | Sliding | 6.172 / 11.974 | 70.088 / 76.017 | 50.134 |
+| Synapse | Classic | 5.845 / 11.072 | 75.343 / 79.175 | 55.759 |
+| Synapse | Sliding | 5.556 / 10.915 | 74.808 / 78.859 | 56.155 |
+
+These single-run differences establish no clear speed advantage for Sliding.
+Retain it for subscriptions, discovery and bounded windows; Classic remains the
+default. Completion includes approximately 60 seconds of synthetic generation.
+Neither statistical equivalence nor 1,000 concurrent replies is established.
+
+Both servers also pass 20-message downtime recovery and a 20-message limited
+live window, with no loss/duplicates and ten actual history pages each. The final
+application restart profile passes on both with consumer `9883dba3a`: it replaces
+both bots, interrupts a pending fresh request, restarts the process, recovers the
+reply, keeps historical requests non-actionable, hydrates requested history and
+drains all stores before clean shutdown.
+
+Live checks identified two stale restart-harness assumptions: room/model changes
+now apply in place, and the retired Classic JSON checkpoint is no longer the
+producer's progress store. The harness now changes a construction prompt to
+request actual replacement and observes exact event projection followed by
+committed SQLite progress with no input/batch debt. It never assumes opaque
+positions change on idle responses. These harness corrections add no production
+code and do not change the capacity workload; all 130 harness tests pass.
+
+Failed attempts remain in the evidence, including the pre-fix two-second health
+timeout whose cause was not established and the sampled run that could not
+confirm clean shutdown. Passing later runs do not explain the earlier timeout.
+MindRoom's tracked `docs/dev/durable-ingestion-performance.md` and adjacent JSON
+preserve the full run mapping, actual metrics, failure explanations, source
+revisions and portable reproduction archive. No merge, release or deployment
+was performed by this qualification.
