@@ -35,7 +35,9 @@ atomically admits each batch in its existing journal before acknowledging nio.
 **Produces:** Private `_SyncItem` dataclass and
 `Client._iter_sync(response: SyncResponse, *, include_left: bool = False)`.
 Items expose `route: str | None`, `event: object | None`,
-`room: MatrixRoom | None`, and `section: str | None`.
+`room: MatrixRoom | None`, `section: str | None`, and
+`source: dict[str, Any] | None = None`. Preserve the original wire source for
+encrypted to-device and timeline observations, before calling the decrypt hook.
 Routes are `event`, `invite`, `ephemeral`, `room_account_data`,
 `global_account_data`, `presence`, `to_device`, and `expired_verification`.
 Section markers identify `invite`, `join`, or `leave`; non-callback state events

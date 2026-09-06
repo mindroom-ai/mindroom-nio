@@ -253,6 +253,14 @@ class MatrixStore:
                 "construction is unsupported"
             )
 
+        if "NioDurableMeta" in self.database.get_tables():
+            raise LocalProtocolError("this database requires a durable sync session")
+
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        """Initialize normal crypto tables on the store's bound connection."""
+
         store_version = self._get_store_version()
 
         # Update the store if it's an old version here.

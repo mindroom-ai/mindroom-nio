@@ -82,7 +82,9 @@ obeys the same rule. Never retry preparation on the mutated instance.
 ## Shared event processing
 
 `Client._iter_sync(response, *, include_left=False)` is synchronous and yields
-`_SyncItem(route, event, room, section)` at current callback points. It also
+`_SyncItem(route, event, room, section, source)` at current callback points. Its
+optional `source` retains the original wire envelope when decryption replaces
+the event. It also
 yields state and room-section observations needed by durable consumers.
 `Client` dispatches callbacks synchronously; `AsyncClient` awaits each callback
 between yields. Existing callback ordering, room object identity, response
