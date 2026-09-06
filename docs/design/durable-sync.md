@@ -338,6 +338,12 @@ operation is unobserved; no per-room echo queue or counter is introduced. If the
 server is unavailable, the next command waits for sync progress or its caller
 cancels; it must not bypass the boundary.
 
+Starting a local command drains already captured input before HTTP. A completed
+poll whose body has not yet been accepted is discarded when the command takes
+source ownership, even if cancelling that poll can no longer interrupt it. The
+cursor remains unchanged, so a later poll obtains that interval again; a response
+that predates local HTTP cannot serve as the operation's authoritative observation.
+
 Nio reconciles that outstanding operation's reported history. State before its
 echo cannot revive authorization or produce a second effective departure. The
 existing history/baseline rules keep the uncertain interval non-actionable. Once
