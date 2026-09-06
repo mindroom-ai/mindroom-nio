@@ -537,6 +537,130 @@ class Schemas:
         "required": ["events"],
     }
 
+    sliding_sync_room = {
+        "type": "object",
+        "properties": {
+            "bump_stamp": {"type": ["integer", "null"]},
+            "membership": {"type": ["string", "null"]},
+            "lists": {"type": ["array", "null"], "items": {"type": "string"}},
+            "name": {"type": ["string", "null"]},
+            "avatar": {"type": ["string", "null"]},
+            "heroes": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string"},
+                        "displayname": {"type": ["string", "null"]},
+                        "avatar_url": {"type": ["string", "null"]},
+                    },
+                    "required": ["user_id"],
+                },
+            },
+            "is_dm": {"type": ["boolean", "null"]},
+            "initial": {"type": "boolean"},
+            "expanded_timeline": {"type": "boolean"},
+            "unstable_expanded_timeline": {"type": "boolean"},
+            "required_state": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "state_key": {"type": "string"},
+                    },
+                    "required": ["type", "state_key"],
+                },
+            },
+            "timeline": {"type": "array", "items": {"type": "object"}},
+            "prev_batch": {"type": ["string", "null"]},
+            "limited": {"type": "boolean"},
+            "num_live": {"type": ["integer", "null"]},
+            "joined_count": {"type": ["integer", "null"]},
+            "invited_count": {"type": ["integer", "null"]},
+            "notification_count": {"type": ["integer", "null"]},
+            "highlight_count": {"type": ["integer", "null"]},
+            "stripped_state": {"type": "array", "items": {"type": "object"}},
+            "invite_state": {"type": "array", "items": {"type": "object"}},
+        },
+    }
+
+    sliding_sync = {
+        "type": "object",
+        "properties": {
+            "pos": {"type": "string"},
+            "lists": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"],
+                },
+            },
+            "rooms": {
+                "type": "object",
+                "additionalProperties": sliding_sync_room,
+            },
+            "extensions": {
+                "type": "object",
+                "properties": {
+                    "to_device": {
+                        "type": "object",
+                        "properties": {
+                            "events": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                            "next_batch": {"type": "string"},
+                        },
+                    },
+                    "e2ee": {
+                        "type": "object",
+                        "properties": {
+                            "device_one_time_keys_count": {
+                                "type": "object",
+                                "properties": {
+                                    "curve25519": {"type": "integer"},
+                                    "signed_curve25519": {"type": "integer"},
+                                },
+                            },
+                            "device_lists": {
+                                "type": "object",
+                                "properties": {
+                                    "changed": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "left": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "account_data": {
+                        "type": "object",
+                        "properties": {
+                            "global": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                            "rooms": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {"type": "object"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "required": ["pos"],
+    }
+
     to_device = {
         "type": "object",
         "properties": {

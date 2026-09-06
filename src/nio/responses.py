@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Generator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
@@ -136,6 +137,12 @@ __all__ = [
     "SetPushRuleActionsResponse",
     "ShareGroupSessionResponse",
     "ShareGroupSessionError",
+    "SlidingSyncError",
+    "SlidingSyncHero",
+    "SlidingSyncList",
+    "SlidingSyncResponse",
+    "SlidingSyncRoom",
+    "SlidingSyncStateStub",
     "SyncResponse",
     "SyncError",
     "Timeline",
@@ -274,6 +281,140 @@ class RoomInfo:
     def parse_account_data(event_dict):
         """Parse the account data dictionary and produce a list of events."""
         return [AccountDataEvent.parse_event(event) for event in event_dict]
+
+
+@dataclass
+class SlidingSyncList:
+    count: int = field()
+
+    @classmethod
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> SlidingSyncList:
+        return cls(parsed_dict["count"])
+
+
+@dataclass
+class SlidingSyncHero:
+    user_id: str = field()
+    displayname: str | None = None
+    avatar_url: str | None = None
+
+    @classmethod
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> SlidingSyncHero:
+        return cls(
+            parsed_dict["user_id"],
+            parsed_dict.get("displayname"),
+            parsed_dict.get("avatar_url"),
+        )
+
+
+@dataclass
+class SlidingSyncStateStub:
+    type: str = field()
+    state_key: str = field()
+
+    @classmethod
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> SlidingSyncStateStub:
+        return cls(parsed_dict["type"], parsed_dict["state_key"])
+
+
+@dataclass
+class SlidingSyncRoom:
+    bump_stamp: int | None = None
+    membership: str | None = None
+    lists: list[str] | None = None
+    name: str | None = None
+    avatar: str | None = None
+    # None when the field was absent from the response; an explicit empty
+    # list means the server cleared the heroes.
+    heroes: list[SlidingSyncHero] | None = None
+    is_dm: bool | None = None
+    initial: bool = False
+    expanded_timeline: bool = False
+    required_state: list[Event | BadEventType | SlidingSyncStateStub] = field(
+        default_factory=list
+    )
+    timeline: list[Event | BadEventType] = field(default_factory=list)
+    prev_batch: str | None = None
+    limited: bool = False
+    num_live: int | None = None
+    joined_count: int | None = None
+    invited_count: int | None = None
+    notification_count: int | None = None
+    highlight_count: int | None = None
+    stripped_state: list[InviteEvent | BadEventType] = field(default_factory=list)
+
+    @staticmethod
+    def _get_required_state(
+        parsed_dicts: list[dict[Any, Any]],
+    ) -> list[Event | BadEventType | SlidingSyncStateStub]:
+        events: list[Event | BadEventType | SlidingSyncStateStub] = []
+
+        for event_dict in parsed_dicts:
+            # MSC4186 uses StateStub responses without content to signal deleted state.
+            if "content" not in event_dict:
+                events.append(SlidingSyncStateStub.from_dict(event_dict))
+            else:
+                events.append(Event.parse_event(event_dict))
+
+        return events
+
+    @staticmethod
+    def _get_stripped_state(
+        parsed_dicts: list[dict[Any, Any]],
+    ) -> list[InviteEvent | BadEventType]:
+        events: list[InviteEvent | BadEventType] = []
+
+        for event_dict in parsed_dicts:
+            event = InviteEvent.parse_event(event_dict)
+
+            if event:
+                events.append(event)
+
+        return events
+
+    @classmethod
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> SlidingSyncRoom:
+        num_live = parsed_dict.get("num_live")
+        if num_live is not None and type(num_live) is not int:
+            raise TypeError("num_live must be an integer")
+
+        return cls(
+            bump_stamp=parsed_dict.get("bump_stamp"),
+            membership=parsed_dict.get("membership"),
+            lists=parsed_dict.get("lists"),
+            name=parsed_dict.get("name"),
+            avatar=parsed_dict.get("avatar"),
+            heroes=(
+                [SlidingSyncHero.from_dict(hero) for hero in parsed_dict["heroes"]]
+                if parsed_dict.get("heroes") is not None
+                else None
+            ),
+            is_dm=parsed_dict.get("is_dm"),
+            initial=parsed_dict.get("initial", False),
+            # Synapse serialises this flag with an unstable prefix.
+            expanded_timeline=parsed_dict.get(
+                "unstable_expanded_timeline",
+                parsed_dict.get("expanded_timeline", False),
+            ),
+            required_state=cls._get_required_state(
+                parsed_dict.get("required_state", [])
+            ),
+            timeline=SyncResponse._get_room_events(parsed_dict.get("timeline", [])),
+            prev_batch=parsed_dict.get("prev_batch"),
+            limited=parsed_dict.get("limited", False),
+            num_live=num_live,
+            joined_count=parsed_dict.get("joined_count"),
+            invited_count=parsed_dict.get("invited_count"),
+            # The current MSC4186 text drops these counts, but deployed
+            # servers still include them on every room.
+            notification_count=parsed_dict.get("notification_count"),
+            highlight_count=parsed_dict.get("highlight_count"),
+            stripped_state=cls._get_stripped_state(
+                # The MSC4186 text renamed invite_state to stripped_state;
+                # deployed servers still send invite_state.
+                parsed_dict.get("stripped_state", parsed_dict.get("invite_state", []))
+            ),
+        )
 
 
 @dataclass
@@ -2161,6 +2302,87 @@ class SyncResponse(Response):
             presence_events,
             list(SyncResponse._get_account_data(parsed_dict)),
         )
+
+
+class SlidingSyncError(SyncError):
+    pass
+
+
+@dataclass
+class SlidingSyncResponse(Response):
+    """A Simplified Sliding Sync response, containing protocol data only.
+
+    ``pos`` tracks this connection. ``to_device_next_batch`` independently
+    tracks device delivery and is sent as ``extensions.to_device.since``.
+    Room ``prev_batch`` tokens are pagination boundaries. ``extensions``
+    retains the wire dictionary even when event parsers consume their input.
+    """
+
+    pos: str = field()
+    lists: dict[str, SlidingSyncList] = field(default_factory=dict)
+    rooms: dict[str, SlidingSyncRoom] = field(default_factory=dict)
+    extensions: dict[str, Any] = field(default_factory=dict)
+    to_device_events: list[ToDeviceEvent | BadEventType] = field(default_factory=list)
+    to_device_next_batch: str | None = None
+    device_key_count: DeviceOneTimeKeyCount = field(
+        default_factory=lambda: DeviceOneTimeKeyCount(None, None)
+    )
+    device_list: DeviceList = field(default_factory=lambda: DeviceList([], []))
+    account_data_events: list[AccountDataEvent] = field(default_factory=list)
+    room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
+
+    @classmethod
+    @verify(Schemas.sliding_sync, SlidingSyncError, False)
+    def from_dict(
+        cls, parsed_dict: dict[Any, Any]
+    ) -> SlidingSyncResponse | ErrorResponse:
+        try:
+            lists = {
+                name: SlidingSyncList.from_dict(data)
+                for name, data in parsed_dict.get("lists", {}).items()
+            }
+            rooms = {
+                room_id: SlidingSyncRoom.from_dict(data)
+                for room_id, data in parsed_dict.get("rooms", {}).items()
+            }
+            extensions = parsed_dict.get("extensions", {})
+            # Event parsers can remove content or add defaults to nested dictionaries.
+            parsed_extensions = deepcopy(extensions)
+            to_device = parsed_extensions.get("to_device", {})
+            to_device_events = [
+                event
+                for data in to_device.get("events", [])
+                if (event := ToDeviceEvent.parse_event(data)) is not None
+            ]
+            e2ee = parsed_extensions.get("e2ee", {})
+            counts = e2ee.get("device_one_time_keys_count", {})
+            devices = e2ee.get("device_lists", {})
+            account_data = parsed_extensions.get("account_data", {})
+            return cls(
+                pos=parsed_dict["pos"],
+                lists=lists,
+                rooms=rooms,
+                extensions=extensions,
+                to_device_events=to_device_events,
+                to_device_next_batch=to_device.get("next_batch"),
+                device_key_count=DeviceOneTimeKeyCount(
+                    counts.get("curve25519"), counts.get("signed_curve25519")
+                ),
+                device_list=DeviceList(
+                    devices.get("changed", []), devices.get("left", [])
+                ),
+                account_data_events=RoomInfo.parse_account_data(
+                    account_data.get("global", [])
+                ),
+                room_account_data={
+                    room_id: RoomInfo.parse_account_data(events)
+                    for room_id, events in account_data.get("rooms", {}).items()
+                },
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            # Some event-specific parsers assume fields beyond the envelope schema.
+            logger.warning("Invalid sliding sync event payload: %s", type(exc).__name__)
+            return SlidingSyncError("Invalid sliding sync event payload")
 
 
 class UploadFilterError(ErrorResponse):
