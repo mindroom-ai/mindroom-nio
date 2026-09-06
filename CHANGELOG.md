@@ -2,6 +2,94 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking changes
+
+- Replace the fork-specific recovery/admission path and prototype ingestion
+  interfaces with the batch API in `nio.durable`: `open_durable_sync`,
+  `DurableSync`, `DurableSyncConfig`, `SyncBatch`, `SyncRecord`, and `RecordKind`.
+  Consume committed batches with `next_batch()` and acknowledge them with
+  `ack(batch)` after application admission. See `docs/design/durable-sync.md`.
+- Durable sync supports Classic `/sync` and simplified Sliding Sync through the
+  same batch API. The old `nio.ingest` and sync-journal interfaces are removed. Released fork interfaces
+  including `AsyncClient.add_event_admission_callback` and
+  `CallbackNotAcceptedError` are removed; ordinary upstream-style client APIs
+  retain their behavior. Prototype ingestion databases are rejected explicitly.
+- Typing, presence, and read receipts are best effort and are not replayed.
+  Fresh transient processing and callbacks share a cooperative one-second budget;
+  callbacks may be cancelled at an await, without rolling back partial effects.
+- Unverified-device key-share requests reach the existing approval callback
+  before a missing Olm session is claimed. This changes callback ordering for
+  ordinary clients too; verification still controls key sharing.
+
+### Durability and compatibility
+
+- Retire durable outbound encryption sessions when refreshed recipients change
+  or the previous recipient set is unknown; profile-only updates keep the session.
+- Request fresh Sliding state after recovery loses a joined room's authorization
+  baseline, so future live delivery resumes after the fenced interval.
+- Commit retained sync input, crypto changes, room projection, and output batches
+  on one SQLite connection. Restart replays committed batches without decrypting
+  them again. Unacknowledged batches keep stable identity and order.
+- Preserve ordinary SQLite account identity and effective file-backed device
+  trust during explicit adoption. Ordinary shared connection leases exclude
+  durable adoption; retained ordinary handles reject access after adoption.
+- Reject adoption while a released store has unaccepted timeline events, real
+  recovery gaps or unacknowledged loss. Drain or settle those obligations with
+  the prior release first; rejected stores remain usable by that release.
+- Preserve ordinary Sliding APIs and response models. Select durable Sliding with
+  `DurableSyncConfig(sliding=SlidingSyncConfig(...))`; room subscriptions can be
+  refreshed without discarding accepted input. Durable stores bind one transport.
+  Connection expiry preserves independent room and to-device checkpoints; bounded
+  recovery distinguishes downtime messages from old window history.
+- Route attached public crypto and to-device methods through retained requests.
+  Retries reuse ciphertext and transaction IDs. Interactive key-share approvals
+  survive restart; changed device keys invalidate cached outbound recipients.
+- A failed attached device-trust commit discards the client, preventing later key
+  forwarding based on a verification state that SQLite rolled back.
+- Restore member power from canonical room power metadata, preserving state
+  deletion across restart without reviving an older member-level cache.
+- Serialize local membership commands until the previous outcome is acknowledged
+  and observed by sync. Immediate local departure still fences work; delayed sync
+  may delay the next command. Committed intents survive restart without repeating
+  successful HTTP, and unaccepted polls cannot cross local command ownership.
+- Reconcile a pending local membership operation once at the complete sync
+  boundary. Intermediate ambiguous cycles remain historical; later responses
+  retain ordered transitions. A rejoin requires fresh authorization state.
+- Linked join-to-join profile changes preserve Sliding continuity and bounded
+  recovery, including multiple linked updates in one live window.
+- Local joins preserve known encryption and discard the old room's recovery
+  checkpoint together with its projection. New rooms require established state
+  before plaintext sending. Completed durable recipient lookup permits encrypted
+  sends without replacing the historical member projection.
+- Reinvitation replaces former joined members in memory and on disk; Classic
+  local-membership reconciliation preserves explicit bans.
+- Retry truncated HTTP response bodies within the existing bounded retry policy.
+- Recover limited Classic timelines through bounded, resumable history pages.
+  Unavailable history and oversized single events produce explicit loss barriers.
+  Quiescing stops new polls and drains captured work without an extra final poll.
+- Match incoming key-request cancellations by sender and requesting device as
+  well as request ID, for ordinary and durable clients.
+- Import the package without `fcntl`; filesystem ownership requires supported
+  locking and otherwise raises `LocalProtocolError` when opening a store.
+- Permission helpers return identity-lookup errors, and v12 upgrades fail clearly
+  on an identity error or unusable power-level state before dependent writes.
+- Downloads saved to a directory require a response filename. An unnamed response
+  can still be saved to an explicit destination file.
+- Synchronous clients await custom callback awaitables and propagate errors,
+  preserving sequential callback completion.
+- Require zero mypy errors across the package in CI.
+
+### Cutover requirements
+
+- This is a breaking change relative to 0.40.0; select the release version before
+  publishing. Companion integration and dependency pins require cutover testing.
+- Durable SQLite uses WAL with `synchronous=FULL`, selected after measured
+  comparison with NORMAL. Process-crash recovery is tested with killed processes;
+  power-loss durability relies on SQLite and storage honoring flushes. The
+  consumer must durably admit each batch before acknowledging it.
+
 ## 0.40.0
 
 ### Performance

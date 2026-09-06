@@ -31,7 +31,7 @@ from Crypto.Util import Counter  # nosec
 
 from .attachments import _get_decryption_info_dict
 
-AsyncDataT = (
+type AsyncDataT = (
     str
     | Path
     | bytes
@@ -41,7 +41,7 @@ AsyncDataT = (
     | AsyncBufferedReader
 )
 
-_EncryptedReturnT = AsyncGenerator[bytes | dict[str, Any], None]
+type _EncryptedReturnT = AsyncGenerator[bytes | dict[str, Any], None]
 
 
 async def async_encrypt_attachment(data: AsyncDataT) -> _EncryptedReturnT:

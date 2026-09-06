@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import logging
-import sys
 from collections import defaultdict
+from typing import cast
 
 from .events import (
     AccountDataEvent,
@@ -161,7 +161,7 @@ class MatrixRoom:
         except ValueError:
             users = [
                 u
-                for u in sorted(self.users, key=lambda u: self.user_name(u))
+                for u in sorted(self.users, key=lambda u: cast(str, self.user_name(u)))
                 if u != self.own_user_id
             ]
             empty = not users
@@ -226,7 +226,9 @@ class MatrixRoom:
                 return self.avatar_url(
                     next(
                         u
-                        for u in sorted(self.users, key=lambda u: self.user_name(u))
+                        for u in sorted(
+                            self.users, key=lambda u: cast(str, self.user_name(u))
+                        )
                         if u != self.own_user_id
                     )
                 )
@@ -369,14 +371,8 @@ class MatrixRoom:
 
         if isinstance(event, ReceiptEvent):
             for receipt in event.receipts:
-                if sys.version_info < (3, 12):
-                    try:
-                        ReceiptType(receipt.receipt_type)
-                    except (TypeError, ValueError):
-                        continue
-                else:
-                    if receipt.receipt_type not in ReceiptType:
-                        continue
+                if receipt.receipt_type not in ReceiptType:
+                    continue
                 if receipt.thread_id:
                     self.threaded_read_receipts.setdefault(receipt.user_id, {})[
                         receipt.thread_id
@@ -384,7 +380,7 @@ class MatrixRoom:
                 else:
                     self.read_receipts[receipt.user_id] = receipt
 
-    def handle_event(self, event: Event) -> None:
+    def handle_event(self, event: Event | BadEventType) -> None:
         logger.info(
             f"Room {self.room_id} handling event of type {type(event).__name__}"
         )
@@ -539,7 +535,7 @@ class MatrixInvitedRoom(MatrixRoom):
 
         return super().handle_membership(event)
 
-    def handle_event(self, event: Event) -> None:
+    def handle_event(self, event: Event | BadEventType) -> None:
         logger.info(
             f"Room {self.room_id} handling event of type {type(event).__name__}"
         )

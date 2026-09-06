@@ -19,6 +19,7 @@ import logging
 import pprint
 import time
 from collections import OrderedDict, UserDict, deque
+from collections.abc import Iterable
 from enum import Enum, unique
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,6 +31,7 @@ import h11
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "nio"
+type _Http2Header = tuple[bytes | str, bytes | str]
 
 
 @unique
@@ -119,17 +121,24 @@ class HttpRequest(TransportRequest):
 
 
 class Http2Request(TransportRequest):
-    @staticmethod
-    def _request(method, target, headers):
-        h = [(":method", method), (":path", target)]
-
-        h = h + headers
-
-        return h
+    _request: list[_Http2Header]
 
     @staticmethod
-    def _headers(host: str, data: bytes | None = None) -> list[tuple[str, str]]:
-        headers = [
+    def _build_request(
+        method: str,
+        target: str,
+        headers: Iterable[_Http2Header],
+    ) -> list[_Http2Header]:
+        request_headers: list[_Http2Header] = [
+            (":method", method),
+            (":path", target),
+        ]
+        request_headers.extend(headers)
+        return request_headers
+
+    @staticmethod
+    def _headers(host: str, data: bytes | None = None) -> list[_Http2Header]:
+        headers: list[_Http2Header] = [
             (":authority", f"{host}"),
             (":scheme", "https"),
             ("user-agent", f"{USER_AGENT}"),
@@ -155,7 +164,7 @@ class Http2Request(TransportRequest):
 
         request_data = bytes(request_data, "utf-8")
 
-        request = Http2Request._request(
+        request = Http2Request._build_request(
             method=method,
             target=target,
             headers=Http2Request._headers(host, request_data),
@@ -173,7 +182,7 @@ class Http2Request(TransportRequest):
 
     @classmethod
     def get(cls, host, target, timeout=0):
-        request = Http2Request._request(
+        request = Http2Request._build_request(
             method="GET",
             target=target,
             headers=Http2Request._headers(host),
@@ -252,15 +261,19 @@ class HttpResponse(TransportResponse):
 
 
 class Http2Response(TransportResponse):
-    def __init__(self, uuid=None, timeout=0):
+    def __init__(
+        self,
+        uuid: UUID | None = None,
+        timeout: float = 0,
+    ) -> None:
         super().__init__(uuid, timeout)
         self.was_reset = False
-        self.error_code: h2.errors.ErrorCodes | None = None
+        self.error_code: h2.errors.ErrorCodes | int | None = None
 
-    def add_response(self, headers: h2.events.ResponseReceived) -> None:
+    def add_response(self, headers: Iterable[_Http2Header]) -> None:
         for header in headers:
             name, value = header
-            logger.debug(f"Got http2 header {name}: {value}")
+            logger.debug("Got http2 header %r: %r", name, value)
 
             if name == b":status" or name == ":status":
                 self.status_code = int(value)
@@ -478,14 +491,14 @@ class Http2Connection(Connection):
         self._data_to_send = OrderedDict()
         return self._connection.data_to_send()
 
-    def _handle_response(self, event: h2.events.Event) -> None:
+    def _handle_response(self, event: h2.events.ResponseReceived) -> None:
         stream_id = event.stream_id
         headers = event.headers
 
         response = self._responses[stream_id]
         response.add_response(headers)
 
-    def _handle_data(self, event: h2.events.Event) -> None:
+    def _handle_data(self, event: h2.events.DataReceived) -> None:
         stream_id = event.stream_id
         data = event.data
 
@@ -506,7 +519,10 @@ class Http2Connection(Connection):
         response.error_code = event.error_code
         return response
 
-    def _handle_events(self, events: h2.events.Event) -> Http2Response | None:
+    def _handle_events(
+        self,
+        events: Iterable[h2.events.Event],
+    ) -> Http2Response | None:
         for event in events:
             logger.info(f"Handling Http2 event: {repr(event)}")
 
@@ -529,7 +545,7 @@ class Http2Connection(Connection):
             elif isinstance(event, h2.events.StreamReset):
                 logger.error("Http2 stream reset")
                 return self._handle_reset(event)
-            elif isinstance(events, h2.events.ConnectionTerminated):
+            elif isinstance(event, h2.events.ConnectionTerminated):
                 logger.error("Http2 connection terminated")
                 # TODO reset the client
                 pass

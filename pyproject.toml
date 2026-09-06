@@ -12,11 +12,9 @@ authors = [
 ]
 license = { file = "LICENSE.md" }
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -54,7 +52,7 @@ Source = "https://github.com/mindroom-ai/mindroom-nio"
 Documentation = "https://matrix-nio.readthedocs.io/en/latest/"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 
 fix = true
 show-fixes = true
@@ -134,6 +132,9 @@ markers = [
     "expects_anonymous_recovery_clear: exercises the UNKNOWN clear-cause backstop",
 ]
 
+[tool.mypy]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/stubs"
+
 [dependency-groups]
 dev = [
     "mindroom-nio[e2e]",
@@ -152,4 +153,7 @@ dev = [
     "pytest-asyncio>=0.26.0",
     "pytest-benchmark>=4.0.0",
     "pytest-cov>=2.12.1",
+    "types-aiofiles>=25.1.0.20260518",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-peewee>=4.4.0.20260827",
 ]

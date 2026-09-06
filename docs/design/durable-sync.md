@@ -1,0 +1,512 @@
+# Durable Classic sync
+
+Scope amendment: [Sliding Sync restoration](sliding-sync-restoration.md) restores
+both ordinary Sliding APIs and a Sliding transport through this shared durable
+core. Its transport-specific requirements supersede the Classic-only exclusions
+below; implementation and qualification are tracked in that amendment.
+
+Status: selected for implementation, 2026-09-06. This is the normative design
+for the replacement of PR #55's ingestion engine. Implementation is tracked in
+[the plan](durable-sync-plan.md); selection does not imply implementation is done.
+
+This document supersedes conflicting requirements in
+`durable-ingestion-contract.md`, including its cutover amendments and private
+MindRoom API compatibility commitment. The replacement is coordinated with the
+MindRoom consumer. Ordinary upstream-style clients retain their public behavior.
+An explicitly excluded guarantee is not a review defect. Adding one requires a
+realistic failure, user impact, implementation cost, and a test demonstrating it.
+
+## Why change the design
+
+The fork's main branch has a demonstrated crash gap. A real encrypted sync
+containing a room key and message saves `next_batch` before applying its
+to-device events. Killing the process at that boundary leaves a persisted
+encrypted timeline record, no room key, and a restart request using the new
+cursor. The healthy control decrypts the message. Recovery on main instead
+delivers an undecrypted `MegolmEvent`. Retaining timeline events alone is not
+enough to recover a sync response.
+
+The existing PR fixes this class of bug, but adds a second event processor,
+transport-neutral frames, a prepared-work validator, per-record delivery claims,
+cross-database proof carriers, extensive schema preflight, and callback
+settlement that partly duplicates application admission. At the starting head,
+new ingestion and storage files total 19,100 lines. The PR's production delta
+against main is +21,415/-6,681, or +14,734 net lines. Its 2,181 passing tests and
+three skips establish a regression baseline, not evidence that this abstraction
+is economical. The integrated 200-request runs still miss capacity targets.
+
+Three approaches were considered:
+
+1. Patch the old timeline-only recovery. Smallest initial change, but it still
+   needs a transaction joining input, crypto mutations, and accepted output.
+2. Keep simplifying the current engine. Preserves completed work, but leaves
+   two event-processing implementations and an unnecessarily general protocol.
+3. Add a small durable adapter around shared upstream sync processing. Selected:
+   durability owns persistence and replay; normal nio code owns Matrix and crypto
+   interpretation; MindRoom owns business admission and authorization.
+
+The governing rule is **persist the minimum facts needed to resume useful work,
+with one owner for each fact**. Size and performance are acceptance criteria.
+
+## Ownership and data flow
+
+The adapter requires nio's E2EE extra and an encryption-enabled SQLite client;
+it handles plaintext rooms as well as encrypted rooms. This reuses the normal
+account-bound store rather than introducing a second non-crypto storage backend.
+
+Nio owns Matrix cursors, received input, crypto state, room projection, pending
+crypto requests, and batches awaiting consumer acknowledgement. MindRoom owns
+semantic deduplication, authorization, conversation scheduling, and application
+effects. Their separate databases are appropriate; a second semantic ledger in
+nio is not.
+
+The durable adapter supports standard Classic `/sync` only. Ordinary client
+interfaces remain available. The new durable API does not support Sliding Sync,
+multiple consumers, concurrent store writers, arbitrary storage backends, or
+custom reducers. Explicit Sliding configuration is rejected by the consumer.
+Old unmerged ingestion databases are rejected clearly; their pending records or
+tokens are never silently discarded or reinterpreted. Deployed ordinary SQLite
+stores, including effective file-backed device trust, have an explicit adoption
+path that preserves account identity and trust.
+
+For each response:
+
+1. Retain its bounded raw body before making any request acknowledging its
+   `next_batch`. Until commit, the previous token remains authoritative.
+2. In a synchronous SQLite transaction, run shared nio processing and freeze
+   durable observations at their event-time yield points. Commit crypto writes,
+   room changes, output batches, pending crypto work, and preparation progress
+   together. No application callback or network await occurs in this transaction.
+3. Expose the oldest committed batch with a read. Delivery does not claim, lease,
+   hash, or rewrite the records. Acknowledgement deletes that batch transactionally.
+4. MindRoom atomically inserts a batch receipt and its admission effects, applies
+   ordered lifecycle hooks, then acknowledges nio. A crash between these steps
+   redelivers the same batch; business admission is idempotent.
+
+On any failure after in-memory crypto or room mutation but before confirmed
+commit, discard the live client/store instance. SQLite rollback does not roll
+back Python objects. Reopening restores the last committed state. Cancellation
+obeys the same rule. Never retry preparation on the mutated instance.
+Attached public device-trust changes use this same transaction/disposal boundary:
+verification held only in a rolled-back Python object must never authorize a
+later incoming key request. Ordinary clients retain their existing trust path.
+Disposal also rejects public crypto operations and new HTTP requests, including
+requests resumed after an await. It cannot retract a request already on the wire.
+
+## Shared event processing
+
+`Client._iter_sync(response, *, include_left=False)` is synchronous and yields
+`_SyncItem(route, event, room, section, source)` at current callback points. Its
+optional `source` retains the original wire envelope when decryption replaces
+the event. It also
+yields state and room-section observations needed by durable consumers.
+`Client` dispatches callbacks synchronously; `AsyncClient` awaits each callback
+between yields. Existing callback ordering, room object identity, response
+mutation, and exception propagation remain unchanged for ordinary clients.
+
+The durable collector exhausts this iterator without callbacks. It freezes each
+observation immediately, preserving event-time membership and verification.
+After commit it delivers parsed committed events without running `_handle_sync`
+or decrypting again. Leave-room processing is opt-in for the durable collector;
+ordinary upstream behavior continues to ignore `rooms.leave`.
+
+Room persistence contains compact live metadata and member deltas keyed by room
+and user. It preserves own membership, encryption, power levels, room version,
+creators and users, plus inexpensive display metadata. Avoid copying the entire
+member list on a message. Restore derived indexes using normal room methods.
+Do not claim a complete member list unless it was persisted as complete. Store
+the live projection where upstream updates merge values; the latest raw state
+event alone is not necessarily that projection.
+
+Room power metadata is the authority for restored member levels, including the
+default when an explicit user entry is absent. Member rows contain identity,
+profile and invitation data, not a second power snapshot. A deleted power-state
+tuple must remain deleted after restart; an older member row cannot restore it.
+
+Committed callback events retain their original event data and crypto evidence.
+Room callbacks after restart see the restored current room projection; exact
+historical snapshots of every room at every callback are not promised.
+
+## Batch interface
+
+`nio.durable` exposes `DurableSync`, `DurableSyncConfig`, `SyncBatch`,
+`SyncRecord`, `RecordKind`, and `open_durable_sync`. Its records use:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SyncBatch:
+    stream_id: UUID
+    sequence: int
+    records: tuple[SyncRecord, ...]
+    completes_sync: bool = False
+
+@dataclass(frozen=True, slots=True)
+class SyncRecord:
+    kind: RecordKind
+    room_id: str | None
+    source: dict[str, Any]
+    clear: dict[str, Any] | None = None
+    provenance: TimelineEventProvenance | None = None
+    membership_epoch: int | None = None
+    crypto: CryptoEvidence | None = None
+    membership: OwnMembership | None = None
+    route: str | None = None
+```
+
+`CryptoEvidence` stores `verified`, `sender_key`, and optional `session_id`.
+`OwnMembership` stores previous/current membership and epoch, and whether the
+change was local or reported. Record kinds are timeline, state, room account
+data, global account data, to-device, room lifecycle, and loss. Loss contains a
+reason and bounded recovery context; it never invents successful recovery.
+Record identity is `(stream_id, sequence, index)`. Sequence and batch boundaries
+are assigned during preparation, not at delivery. Account/device and consumer
+generation are checked at session opening. No canonical digest, generated UUID
+per record, room sequence, request identity, or transport origin crosses this
+boundary. Decode network and persisted data defensively; trust unchanged values
+inside their owning operation.
+
+Membership epochs identify a joined tenure: the first join uses epoch zero,
+departing from join increments it, and rejoining retains that incremented epoch.
+This matches the application's authorization boundary. Rejoining discards stale
+persisted members and treats its initial timeline as history.
+
+Batches have bounded count and encoded size. Split before and after own
+membership, loss, and membership events that change authorization. Preserve
+their interleaving with messages. An earlier live grant must not run after a
+later departure. `completes_sync` marks the final chunk, including an empty
+response, only after required restoration and crypto maintenance.
+
+The session offers `run()`, `next_batch()`, `ack(batch)`, `wait_for_work()`,
+`quiesce()`, `close()`, durable progress, and serialized local membership changes.
+Local changes retain an intent before HTTP, expected membership/epoch, and an
+ordered result. They must not resurrect authorization through a stale echo.
+
+`quiesce()` cancels an unaccepted long poll and stops new polls, then finishes
+already captured input while the consumer keeps draining. It does not fetch an
+extra final response. It waits for prepared batches, including completion and
+local membership outcomes, to be acknowledged before the runner returns.
+The consumer runs its completion hook before acknowledging that batch.
+One maintenance pass drains queued sends and performs at most one upload,
+query, and claim. Successful partial federation responses retain missing work
+for a later pass; completion does not claim every remote device was reachable.
+
+`dispatch(record, event=None)` invokes an observation's registered nio callback
+outside storage transactions. It restores the committed event unless the
+application supplies its authenticated extension event. The consumer decides
+whether receipt/semantic novelty warrants dispatch and acknowledges separately.
+Callback failure leaves the batch available; it does not poison committed state.
+`progress_generation` exposes the highest committed batch sequence, including
+acknowledged batches, and `cursor` exposes the last prepared Matrix position.
+
+`change_membership(operation_id, room_id, previous_membership, previous_epoch,
+current_membership)` accepts keyword arguments and returns success as a boolean.
+Only join and leave are local targets. The application reads its current journal
+position after `wait_for_membership_idle()` and supplies that expected position;
+a stale expectation cannot authorize a newer transition.
+
+## Crypto and history
+
+Use the existing SQLite connection and crypto methods. Persist private one-time
+keys with the exact pending upload before HTTP. Persist generated to-device
+ciphertext and transaction ID with the ratchet mutation. Retry identical pending
+sends. Apply responses, remove acknowledged work, and retain any generated
+follow-on work atomically. Serialize crypto maintenance response application
+with sync, so a key-query response cannot erase a newer dirty-user observation.
+
+While attached, the client's existing upload/query/claim, to-device, missing-key,
+and group-share methods use this same pending-request owner. They never bypass
+the durable crypto transaction. Group sharing still uses nio's normal recipient
+selection and encryption generator; each generated chunk is retained before its
+HTTP send. A concurrent room departure or device change may invalidate an
+outbound group session, so an earlier response cannot mark a replacement session
+shared. A process restart may create a new outbound group session; already
+retained ciphertext is retried unchanged. Public interactive approval or
+cancellation commits its decision and generated sends before returning.
+
+An attached client's `joined_members()` returns the current server response
+without replacing the historical room projection used for recovery. Outgoing
+encryption keeps only a disposable recipient list, invalidated by observed
+membership changes. It never grants incoming-event authorization. A member
+change during the lookup rejects that lookup; the application may retry.
+Completing a lookup compares the previous recipient set with the fresh set and
+invalidates the outbound Megolm session if they differ or the previous set is
+unknown. The existing crypto owner performs this before exposing the new cache.
+Order and profile changes alone do not rotate keys. A removed recipient's old
+session must not decrypt newly encrypted messages; ciphertext retained before
+the refresh keeps its original retry semantics.
+
+Persist waiting and untrusted interactive key-share requests needed by
+`continue_key_share`, including state required after restart. Test the actual
+restart and human-approval path. Committed device trust survives restart. An
+in-progress SAS exchange may require restarting verification; persisting its
+ephemeral handshake is excluded. No new cross-restart Megolm replay cache
+guarantee is introduced beyond prepared-output replay and ordinary nio behavior.
+
+The event codec reuses upstream parsers. Decrypted room events use
+`Event.parse_decrypted_event()` and restore crypto evidence. Sanitized room-key
+events require explicit reconstruction because their source omits key material.
+Do not pickle arbitrary Python classes. MindRoom authenticates replayed custom
+to-device events through its existing signed-device check, extracted into a pure
+helper. It receives the original envelope and committed clear event; replay
+must not invoke Olm decryption again.
+
+Limited timelines recover the chronological missed interval from the previous
+committed position before applying the retained live tail. Persist one bounded
+continuation and fetch one page at a time, draining its output before fetching
+more. Apply intervening membership/state in chronological order from the trusted
+old projection. Context-only older history does not rewind the live projection
+or acquire live authorization provenance. Initial history is not a live request.
+Unknown authorization state requires hydration or an explicit fenced loss.
+Malformed room state is not an ignorable message. The durable collector rejects
+parser failures in state/invitation observations, events carrying a state key,
+and the required membership/create/power/encryption types even if their state key
+is missing. The preparation transaction rolls back and disposes the client; its
+input remains retained for diagnosis. It must not advance the cursor or emit
+later live grants using stale state. This is a protocol failure, not an automatic
+repair policy. Ordinary parsing and malformed non-state messages keep their
+existing behavior.
+Token cycles, unavailable history, and oversized single events terminate as
+explicit loss rather than silently advancing a supposedly complete history.
+
+Defaults retain the established bounds: 16 MiB accepted sync body, 100 events
+and 2 MiB per recovery page, 1,000 recovery pages, and bounded cancellable retry.
+An oversized page reduces the window; one oversized event produces loss.
+
+## Deliberate limits and durability
+
+Typing, presence, and read receipts are best effort and are not replayed. Losing
+them may leave temporary UI caches stale; a later observation refreshes them.
+This explicitly relaxes the previous durable-receipt compatibility decision.
+Account data and authorization state remain durable. Callback failures do not
+roll back committed input. Auxiliary notification is at least once when retried;
+exactly-once external effects remain the application's responsibility.
+Fresh transient parsing, projection, and sequential callback awaits share a
+one-second budget per response. A callback can be cancelled at an await when
+that budget expires. Parser and callback failures are isolated and diagnostics
+identify counts and exception classes without event content.
+
+Use a lifetime exclusive filesystem lease for durable stores and ordinary-store
+coordination at opening. Do not stat the database on every SQL execution or row.
+Live file replacement, malicious database editing, custom SQLite triggers,
+arbitrary schema variants, hostile same-process callers, and recovery of
+unmerged prototype formats are unsupported. Normal schema version, identity,
+foreign-key, and decoded-data validation remain. Import without `fcntl` works;
+using ownership without supported locking fails clearly.
+
+Durable SQLite uses WAL with `synchronous=FULL`. Measured batch preparation,
+delivery and acknowledgement for 200 encrypted events took 52.9 ms with NORMAL
+and 61.5 ms with FULL; 1,000 took 270.4 ms and 280.9 ms. That small cost buys
+SQLite's commit synchronization rather than an application protocol. According
+to [SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
+WAL/FULL preserves committed transactions across power loss when the filesystem
+and storage honor synchronization. Process-kill tests verify crash atomicity;
+they do not simulate hardware failure. Application handoff requires its journal
+to synchronize admission before acknowledging nio; MindRoom already uses FULL
+for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
+consumer databases. No new writer thread, database queue, serializer dependency,
+or generic retry framework is introduced. Whole-response JSON is decoded once per
+preparation attempt; prepared batches are encoded once and read without repeated
+canonicalization. Diagnostics exclude message payloads, credentials, and keys.
+Response-validation logs contain the response class, exception class and schema
+rule, not the instance or server-provided error text. Server error details remain
+available on returned error responses for callers to handle deliberately.
+
+HTTP retries keep the same operation and body for connection failures, timeouts,
+408, 429, and server errors. Each request has at most five attempts with a
+cancellable exponential delay capped at thirty seconds; bounded server retry
+hints take precedence. Other HTTP errors return immediately.
+
+## Consumer and acceptance
+
+MindRoom adopts batch receipts in its existing application journal. Preserve its
+projection barrier and ordered pre/post admission authorization hooks. Removing
+that barrier would need a separate durable blocked-admission design. Discard this
+bot's own pending/streaming replacement events early after decryption; preserve
+placeholders, terminal edits, other users' edits, redactions, and unknown status.
+
+Acceptance requires real process-crash and encrypted restart tests, idempotent
+batch admission, membership ordering, bounded missed-history recovery, existing
+interactive key-share approval after restart, ordinary client compatibility,
+clean tests/types/hooks, and repeated 200-request integrated controls. Report
+reply latency separately from synthetic generation time, history convergence,
+event-loop delay, SQLite commits per admitted event, and production line delta.
+Use the existing writer and stdlib JSON unless measurements justify a change.
+The current engine is removed before completion; two permanent implementations
+would defeat this design. Publish no release or merge as part of implementation.
+
+### Recovery continuation and authorization baseline
+
+Recovery stores one continuation on the retained input: prologue, current room
+and forward pagination position, then tail. The decoded sync stays in memory
+between pages; restart decodes the retained body once. Each page commits its
+observations, crypto, room changes, and continuation in one synchronous
+transaction. Output acknowledgement gates the next page. Only the tail advances
+the global cursor; crypto maintenance retains the original input until completion.
+
+Both limited joined and left rooms use the old sync cursor as `from` and their
+retained `prev_batch` as the target, without sending an HTTP `to` bound. Some
+servers exclude that boundary and finish at an earlier event token, so a bounded
+request can prevent the overlap needed to prove completion. Request at most the
+existing page limit and stop interpreting the page at its first retained-tail
+event. Later events in that page remain outside this captured sync interval.
+Target equality or retained-tail overlap proves completion; an empty page alone
+does not. Advancing empty pages continue. Missing boundaries, token cycles,
+unavailable or malformed history, and bounded-control exhaustion emit a loss
+barrier and fence the affected tail. Duplicates are removed before event handling;
+the active interval's event IDs and tokens are bounded, not a semantic ledger.
+
+Room metadata records whether an authorization baseline has been established.
+Adopted cursors without projections and local joins need full state; current
+state never authorizes an earlier missed interval. Initial and fenced tails are
+history. A full-state response establishes only a future baseline. Self departure
+ends live tenure at its event, and rejoin resets the room before the shared
+iterator handles that event, clearing stale members. A section-only departure
+follows its final timeline event. OwnMembership remains metadata on its original
+state, timeline, or lifecycle observation; it does not create duplicate carriers.
+
+When a Sliding tail leaves a joined room without an authorization baseline,
+the source drops that room's checkpoint and resets its connection position in
+the tail transaction, after pagination ends. The next request obtains fresh
+initial state; ordinary deltas cannot repair the missing baseline. The reset
+decision comes from persisted room metadata, so restarting during recovery preserves it.
+Pagination candidates remain stable until the current input has drained. Fresh
+state authorizes future events only; it never reclassifies the lost interval.
+
+## Local membership has one authority
+
+A successful local join/leave immediately publishes its committed lifecycle
+outcome, preserving immediate departure fencing. Its single retained intent stays
+until that outcome is acknowledged and a subsequently committed authoritative
+sync boundary observes the operation. A later local command waits for this
+boundary, even after the previous command returned success. At most one local
+operation is unobserved; no per-room echo queue or counter is introduced. If the
+server is unavailable, the next command waits for sync progress or its caller
+cancels; it must not bypass the boundary.
+
+Starting a local command drains already captured input before HTTP. A completed
+poll whose body has not yet been accepted is discarded when the command takes
+source ownership, even if cancelling that poll can no longer interrupt it. The
+cursor remains unchanged, so a later poll obtains that interval again; a response
+that predates local HTTP cannot serve as the operation's authoritative observation.
+
+Nio reconciles that outstanding operation at the complete sync boundary, not at
+the first event whose membership string matches its target. Standard join/leave
+responses supply no membership event ID. An unseen earlier leave/rejoin can
+otherwise be mistaken for the local echo and apply the departure twice.
+See the Matrix [join](https://spec.matrix.org/v1.19/client-server-api/#post_matrixclientv3joinroomidoralias),
+[leave](https://spec.matrix.org/v1.19/client-server-api/#post_matrixclientv3roomsroomidleave)
+and [sync](https://spec.matrix.org/v1.19/client-server-api/#get_matrixclientv3sync)
+response definitions.
+
+While the operation is unobserved, the room's uncertain interval remains HISTORY
+and its individual membership events cannot change the local outcome. After
+processing the whole response, reconcile once against the authoritative final
+membership. An equal target confirms the outcome without another epoch change;
+a different final membership applies the net transition from the local outcome.
+This relies on the supported server producing a coherent response after the
+successful local HTTP operation; the runner discards pre-operation polls.
+Partial state must not establish a fresh authorization baseline for a rejoined
+room. Later responses retain normal ordered transitions.
+
+Sliding can provide the final membership in its top-level field, returned own
+member state, or stripped invitation state. Absence of all fresh evidence does
+not confirm an operation. Reconciliation into join clears the old room/member
+projection and room checkpoint and requests a fresh initial window; that window
+establishes a future authorization baseline instead of recovering from discarded
+state. Reconciliation into invite retains only the invited-room projection.
+
+Room replacement is one lifecycle operation, not an assignment of an empty
+`MatrixRoom`. The durable session preserves known encryption while clearing the
+old joined projection, persisted members, recipient cache and outbound group.
+Local join does this even if the last committed membership was already join:
+that old observation does not prove an uninterrupted tenure. It also drops the
+room's Sliding proof/token and restarts the connection before accepting another
+window. A room with no retained projection cannot recover or become ready from
+an old checkpoint. A fresh initial/full-state response establishes only a future
+baseline. A new room whose encryption state is not yet known cannot send
+plaintext while waiting for that baseline; known encrypted rooms may use fresh
+recipient lookup. Recovery keeps its current input's pagination plan stable while
+draining; any checkpoint invalidation required by a tail reset happens after
+that input's Sliding commit.
+
+An invitation replaces the joined-room cache entry and its persisted member
+snapshot with the current invited projection. Joined member writes remain
+incremental; persisting the small invitation snapshot must not retain unrelated
+members from an earlier joined tenure. Classic's `leave` section covers both
+leave and ban. Reconciliation uses the final explicit own membership in state
+and timeline when available, falling back to the section only without that
+evidence. It reads the full captured tail before duplicate filtering.
+
+Recipient lookup has a separate, existing authority: a completed durable
+recipient cache permits ordinary encryption and group sharing without pretending
+the historical room projection has a complete member list. An absent or in-flight
+cache does not. Truncated HTTP bodies use the existing bounded connection retry
+policy; cancellation, authorization failures and response-size bounds retain
+their existing behavior. These corrections add no new persisted state, queue,
+public interface or guarantee about exact membership echoes.
+
+Exact attribution of the local membership event and counting every intermediate
+cycle within that uncertain interval are not guaranteed. Current state and
+authorization after the boundary matter; replaying those historical cycles as
+effective transitions does not. Do not introduce reason markers, a per-room echo
+queue or additional state queries merely to infer that unsupported attribution.
+Keep the intent across restart between local acknowledgement and observation.
+Quiesce still does not fetch an extra final response: an acknowledged intent
+awaiting observation can remain for reopening, without blocking shutdown.
+
+MindRoom applies the producer's explicit prior/current membership and epoch once
+inside batch admission. It must not create or consume legacy departure-echo debt
+for these typed outcomes. Other callers retain their own documented behavior.
+This removes competing authority at the boundary; consumer reviewers must not
+reintroduce echo inference for already normalized producer transitions.
+
+
+## Long-term scale direction
+
+The application goal is more than 1,000 concurrent replies.
+This is a direction for future qualification, not a guarantee established by a
+1,000-event local preparation benchmark or the current 200-reply live controls.
+Burst startup, sustained streaming, history catch-up, memory and health latency
+need separate measurements on specified hardware and model timing.
+The adapter's batch bounds constrain processing units, not the number of active
+application replies; application scheduling stays with the consumer.
+
+A follow-up 200-root Tuwunel investigation found no sufficient startup improvement
+from batching consumer writer handoffs, grouping consumer commits, excluding
+already-owned pending payloads, or combining producer capture and preparation
+commits. The producer trial changed initial visibility spread from 22.539 to
+21.931 seconds in one run and still missed the unchanged overlap requirement.
+No production change is adopted from these experiments. Full-run sampling found
+Nio's synchronous commits on the main thread, but that is a blocking location,
+not proof of the exact startup critical path. The remaining limit is unresolved.
+The consumer's root-preparation scheduling document records the comparisons.
+
+Keep the existing ownership split and FULL durability while measuring that path.
+A new writer, scheduler, persistent queue, codec dependency or weaker guarantee
+requires its own evidence; the scale ambition alone does not justify one.
+
+Documentation follow-up verification: 700 tests passed with three skipped,
+mypy reported no issues in 58 source files, and all repository hooks passed.
+The consumer suite passed 15,522 tests with 22 skipped; its hooks also passed.
+Production code and tests were unchanged by that documentation follow-up.
+
+## Correlated startup profiling and consumer ownership
+
+The subsequent correlated 50/100/200-root traces locate the remaining startup serialization in the consumer's agent-wide handled-turn ledger lock.
+At baseline, that lock stayed held while unrelated admission and settlement operations occupied the shared database queue.
+Calibrated py-spy sampling also locates synchronous Nio commits, but those stalls overlap the ledger waits; summing both would overstate the critical path.
+
+MindRoom `5502b1177` reserves only conflicting source, discovery and anchor identities through commit or rollback.
+It retains the existing backend transactions, both pending-turn writes, eight preparation slots, FULL durability and every producer guarantee.
+The ledger grows by 47 net lines; shorter caller documentation makes the consumer production-file increase 28 lines.
+No Nio production code changes are needed.
+
+Alternating uninstrumented Tuwunel controls reduce initial reply spread from 21.69–21.81 seconds to 12.03–12.07 seconds.
+Both fixed runs pass every original predicate: full overlap is 49.74–49.90 seconds against the 45-second requirement, with 200 exact replies, all three fence principals and zero producer/application/outbox debt after clean shutdown.
+Completion p95 improves from about 83.3 seconds to 75.9–76.1 seconds, including approximately 60 seconds of synthetic generation.
+The same committed source passes the Synapse control with 54.219 seconds of overlap and the same correctness and drain checks.
+The previously recorded Tuwunel startup-capacity limitation is resolved for this workload, without qualifying 1,000 concurrent replies or a universal latency bound.
+
+The consumer's `docs/dev/ledger-write-ownership.md` records the architecture, twenty new SQLite/Postgres cases, calibrated traces, failed diagnostic prototypes and exact-source controls.
+Its full suite passes 15,542 tests with 22 skipped; all repository hooks pass.
+Future performance work should keep this distinction between actual conflict ownership and unrelated queue waits, and justify any new writer, codec or durability change with its own measured evidence.

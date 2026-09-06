@@ -18,15 +18,18 @@ import asyncio
 import inspect
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    TypeVar,
 )
 
 from ..crypto import ENCRYPTION_ENABLED, DeviceStore, OutgoingKeyRequest
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEvent,
@@ -34,6 +37,7 @@ from ..events import (
     EphemeralEvent,
     Event,
     MegolmEvent,
+    OlmEvent,
     PresenceEvent,
     RoomEncryptionEvent,
     RoomKeyRequest,
@@ -73,11 +77,17 @@ if ENCRYPTION_ENABLED:
     from ..store import DefaultStore, MatrixStore, SqliteMemoryStore
 if TYPE_CHECKING:
     from ..crypto import OlmDevice, Sas
+    from ..durable.client import DurableSync
 
 
 from ..event_builders import ToDeviceMessage
 
 logger = logging.getLogger(__name__)
+
+_ToDeviceCallbackEventT = TypeVar(
+    "_ToDeviceCallbackEventT",
+    bound=ToDeviceEvent | BadEventType,
+)
 
 
 def logged_in(func):
@@ -113,6 +123,7 @@ def logged_in_async(func):
 def store_loaded(fn):
     @wraps(fn)
     def inner(self, *args, **kwargs):
+        self._assert_not_disposed()
         if not self.store or not self.olm:
             raise LocalProtocolError("Matrix store and olm account is not loaded.")
         return fn(self, *args, **kwargs)
@@ -120,11 +131,15 @@ def store_loaded(fn):
     return inner
 
 
+async def _await_callback_result(result: Awaitable[None]) -> None:
+    await result
+
+
 @dataclass
 class ClientCallback:
     """nio internal callback class."""
 
-    func: Callable[..., None] | Callable[..., Awaitable[None]] = field()
+    func: Callable[..., Awaitable[None] | None] = field()
     filter: tuple[type, ...] | type | None = None
 
     def _execute(
@@ -132,7 +147,7 @@ class ClientCallback:
         event,
         room: MatrixRoom | None = None,
         *callback_args,
-    ) -> Awaitable | None:
+    ) -> Awaitable[None] | None:
         """
         Checks the filter and executes the function once.
         sync_execute and async_execute will each determine
@@ -143,6 +158,7 @@ class ClientCallback:
                 return self.func(room, event, *callback_args)
             else:
                 return self.func(event, *callback_args)
+        return None
 
     def sync_execute(
         self,
@@ -152,8 +168,8 @@ class ClientCallback:
     ) -> None:
         """Execute callback from synchronous context."""
         result = self._execute(event, room, *callback_args)
-        if inspect.iscoroutine(result):
-            asyncio.run(result)
+        if inspect.isawaitable(result):
+            asyncio.run(_await_callback_result(result))
 
     async def async_execute(
         self,
@@ -165,6 +181,30 @@ class ClientCallback:
         result = self._execute(event, room, *callback_args)
         if inspect.isawaitable(result):
             await result
+
+
+@dataclass(frozen=True)
+class _SyncItem:
+    """One sync observation, yielded before processing the next event."""
+
+    route: str | None = None
+    event: object | None = None
+    room: MatrixRoom | None = None
+    section: str | None = None
+    source: dict[str, Any] | None = None
+    provenance: TimelineEventProvenance | None = None
+
+
+_SYNC_CALLBACK_HANDLERS = {
+    "event": "_on_event",
+    "invite": "_on_invited_rooms",
+    "ephemeral": "_on_ephemeral",
+    "room_account_data": "_on_room_account_data",
+    "global_account_data": "_on_global_account_data",
+    "presence": "_on_presence",
+    "to_device": "_on_to_device",
+    "expired_verification": "_on_expired_verifications",
+}
 
 
 @dataclass(frozen=True)
@@ -258,6 +298,16 @@ class Client:
         self.store_path = store_path
         self.olm: Olm | None = None
         self.store: MatrixStore | None = None
+        self._disposed = False
+        self._durable_session: DurableSync | None = None
+        self._ordinary_sync_started = False
+        self._ordinary_device_transport: str | None = None
+        self._ordinary_sync_in_flight = False
+        self._sliding_to_device_since: str | None = None
+        self._sliding_seen_events: dict[str, dict[str, bool]] = {}
+        self._pending_sliding_room_account_data: dict[
+            str, dict[str, AccountDataEvent | BadEventType]
+        ] = {}
         self.config = config or ClientConfig()
 
         self.user_id = ""
@@ -372,6 +422,7 @@ class Client:
 
     def _assert_logged_in(self):
         """Assert that the client is logged in."""
+        self._assert_not_disposed()
         if not self.logged_in:
             raise LocalProtocolError("Not logged in.")
 
@@ -446,6 +497,52 @@ class Client:
             if self.config.store_sync_tokens:
                 self.loaded_sync_token = self.store.load_sync_token()
 
+    def _assert_not_disposed(self) -> None:
+        if self._disposed:
+            raise LocalProtocolError(
+                "durable sync session is poisoned; reopen with a fresh client"
+            )
+
+    def _begin_ordinary_sync(self) -> None:
+        self._assert_not_disposed()
+        if self._durable_session is not None:
+            raise LocalProtocolError("ordinary sync is unavailable during durable sync")
+        self._ordinary_sync_started = True
+
+    def _claim_sync_transport(self, transport: str) -> None:
+        """Keep the account's incompatible device cursor formats separate."""
+        self._begin_ordinary_sync()
+        if self._ordinary_device_transport not in (None, transport):
+            raise LocalProtocolError(
+                "Classic and Sliding device cursor transports cannot be mixed"
+            )
+        self._ordinary_device_transport = transport
+
+    def _claim_sync_poll(self) -> None:
+        self._begin_ordinary_sync()
+        if self._ordinary_sync_in_flight:
+            raise LocalProtocolError(
+                "an ordinary sync transport request is already in flight"
+            )
+        self._ordinary_sync_in_flight = True
+
+    def _sliding_request_extensions(
+        self, extensions: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        self._begin_ordinary_sync()
+        if extensions is None:
+            return None
+        result = deepcopy(extensions)
+        to_device = result.get("to_device", {})
+        if to_device.get("enabled", False):
+            self._claim_sync_transport("sliding")
+            if self._sliding_to_device_since is not None:
+                to_device["since"] = self._sliding_to_device_since
+        return result
+
+    def _dispose(self) -> None:
+        self._disposed = True
+
     def restore_login(
         self,
         user_id: str,
@@ -509,9 +606,9 @@ class Client:
         assert self.olm
         session = self.olm.outbound_group_sessions.pop(room_id, None)
 
-        # There is no need to invalidate the session if it was never
-        # shared, put it back where it was.
-        if session and not session.shared:
+        # An attached client may have already retained or sent part of this
+        # group while its final HTTP acknowledgement is still outstanding.
+        if session and not session.shared and self._durable_session is None:
             self.olm.outbound_group_sessions[room_id] = session
         elif session:
             logger.info(f"Invalidating session for {room_id}")
@@ -522,6 +619,21 @@ class Client:
         for room in self.rooms.values():
             if device.user_id in room.users:
                 self.invalidate_outbound_session(room.room_id)
+        if self._durable_session is not None:
+            self._durable_session._outbound.invalidate_users((device.user_id,))
+
+    def _change_device_trust(
+        self, device: OlmDevice, change: Callable[[OlmDevice], bool]
+    ) -> bool:
+        session = self._durable_session
+        if session is None:
+            changed = change(device)
+        else:
+            with session._outbound.transaction():
+                changed = change(device)
+        if changed:
+            self._invalidate_outbound_sessions(device)
+        return changed
 
     @store_loaded
     def verify_device(self, device: OlmDevice) -> bool:
@@ -540,12 +652,7 @@ class Client:
         verified.
         """
         assert self.olm
-
-        changed = self.olm.verify_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.verify_device)
 
     @store_loaded
     def unverify_device(self, device: OlmDevice) -> bool:
@@ -563,12 +670,7 @@ class Client:
         unverified.
         """
         assert self.olm
-
-        changed = self.olm.unverify_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unverify_device)
 
     @store_loaded
     def blacklist_device(self, device: OlmDevice) -> bool:
@@ -585,12 +687,7 @@ class Client:
         already.
         """
         assert self.olm
-
-        changed = self.olm.blacklist_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.blacklist_device)
 
     @store_loaded
     def unblacklist_device(self, device: OlmDevice) -> bool:
@@ -604,12 +701,7 @@ class Client:
         blacklist and no removal happened.
         """
         assert self.olm
-
-        changed = self.olm.unblacklist_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unblacklist_device)
 
     @store_loaded
     def ignore_device(self, device: OlmDevice) -> bool:
@@ -625,12 +717,7 @@ class Client:
         list of ignored devices.
         """
         assert self.olm
-
-        changed = self.olm.ignore_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.ignore_device)
 
     @store_loaded
     def unignore_device(self, device: OlmDevice) -> bool:
@@ -644,12 +731,7 @@ class Client:
         list and no removal happened.
         """
         assert self.olm
-
-        changed = self.olm.unignore_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unignore_device)
 
     def _handle_register(self, response: RegisterResponse | ErrorResponse) -> None:
         if isinstance(response, ErrorResponse):
@@ -686,8 +768,8 @@ class Client:
         return self.olm.decrypt_megolm_event(event)
 
     def _handle_decrypt_to_device(
-        self, to_device_event: ToDeviceEvent
-    ) -> ToDeviceEvent | None:
+        self, to_device_event: ToDeviceEvent | BadEventType
+    ) -> ToDeviceEvent | BadEventType | None:
         if self.olm:
             return self.olm.handle_to_device_event(to_device_event)
 
@@ -695,22 +777,37 @@ class Client:
 
     def _replace_decrypted_to_device(
         self,
-        decrypted_events: list[tuple[int, ToDeviceEvent]],
+        decrypted_events: list[tuple[int, ToDeviceEvent | BadEventType]],
         response: SyncResponse | SlidingSyncResponse,
-    ):
+    ) -> None:
         # Replace the encrypted to_device events with decrypted ones
         for decrypted_event in decrypted_events:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
-    def _handle_to_device(self, response: SyncResponse | SlidingSyncResponse):
-        decrypted_to_device = []
+    def _iter_to_device(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
+        return self._iter_decrypted_to_device(response, replace_immediately=False)
+
+    def _iter_decrypted_to_device(
+        self, response: SyncResponse | SlidingSyncResponse, *, replace_immediately: bool
+    ) -> Iterator[_SyncItem]:
+        decrypted_to_device: list[tuple[int, ToDeviceEvent | BadEventType]] = []
 
         for index, to_device_event in enumerate(response.to_device_events):
+            source = (
+                deepcopy(to_device_event.source)
+                if isinstance(to_device_event, OlmEvent)
+                else to_device_event.source
+            )
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                decrypted_to_device.append((index, decrypted_event))
+                if replace_immediately:
+                    response.to_device_events[index] = decrypted_event
+                else:
+                    decrypted_to_device.append((index, decrypted_event))
                 to_device_event = decrypted_event
 
             # Do not pass room key request events to our user here. We don't
@@ -721,9 +818,14 @@ class Client:
             ):
                 continue
 
-            self._on_to_device(to_device_event)
+            yield _SyncItem("to_device", to_device_event, source=source)
 
-        self._replace_decrypted_to_device(decrypted_to_device, response)
+        if not replace_immediately:
+            self._replace_decrypted_to_device(decrypted_to_device, response)
+
+    def _handle_to_device(self, response: SyncResponse):
+        for item in self._iter_to_device(response):
+            self._dispatch_sync_item(item)
 
     def _get_invited_room(self, room_id: str) -> MatrixInvitedRoom:
         if room_id not in self.invited_rooms:
@@ -732,17 +834,23 @@ class Client:
 
         return self.invited_rooms[room_id]
 
-    def _handle_invited_rooms(self, response: SyncResponse):
+    def _iter_invited_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
         for room_id, info in response.rooms.invite.items():
             room = self._get_invited_room(room_id)
+            yield _SyncItem(room=room, section="invite")
 
             for event in info.invite_state:
                 room.handle_event(event)
-                self._on_invited_rooms(event, room)
+                yield _SyncItem("invite", event, room, "invite")
 
-    def _handle_joined_state(
-        self, room_id: str, join_info: RoomInfo, encrypted_rooms: set[str]
-    ):
+    def _iter_joined_state(
+        self,
+        room_id: str,
+        join_info: RoomInfo,
+        encrypted_rooms: set[str],
+        *,
+        section: str = "join",
+    ) -> Iterator[_SyncItem]:
         if room_id in self.invited_rooms:
             del self.invited_rooms[room_id]
 
@@ -753,22 +861,43 @@ class Client:
             )
 
         room = self.rooms[room_id]
+        yield _SyncItem(room=room, section=section)
 
         for event in join_info.state:
-            if isinstance(event, RoomEncryptionEvent):
-                encrypted_rooms.add(room_id)
-
-            if isinstance(event, RoomMemberEvent):
-                if room.handle_membership(event):
-                    self._invalidate_session_for_member_event(room_id)
-            else:
-                room.handle_event(event)
+            self._handle_joined_state_event(room_id, room, event, encrypted_rooms)
+            yield _SyncItem(event=event, room=room, section=section)
 
         if join_info.summary:
             room.update_summary(join_info.summary)
 
         if join_info.unread_notifications:
             room.update_unread_notifications(join_info.unread_notifications)
+
+    def _handle_invited_rooms(self, response: SyncResponse):
+        for item in self._iter_invited_rooms(response):
+            self._dispatch_sync_item(item)
+
+    def _handle_joined_state(
+        self, room_id: str, join_info: RoomInfo, encrypted_rooms: set[str]
+    ):
+        for _item in self._iter_joined_state(room_id, join_info, encrypted_rooms):
+            pass
+
+    def _handle_joined_state_event(
+        self,
+        room_id: str,
+        room: MatrixRoom,
+        event: Event | BadEventType,
+        encrypted_rooms: set[str],
+    ) -> None:
+        if isinstance(event, RoomEncryptionEvent):
+            encrypted_rooms.add(room_id)
+
+        if isinstance(event, RoomMemberEvent):
+            if room.handle_membership(event):
+                self._invalidate_session_for_member_event(room_id)
+        else:
+            room.handle_event(event)
 
     def _handle_timeline_event(
         self,
@@ -777,16 +906,11 @@ class Client:
         room: MatrixRoom,
         encrypted_rooms: set[str],
     ) -> Event | BadEventType | None:
-        decrypted_event = None
+        decrypted_event = self._decrypt_timeline_event(event, room_id)
+        if decrypted_event:
+            event = decrypted_event
 
-        if isinstance(event, MegolmEvent) and self.olm:
-            event.room_id = room_id
-            decrypted_event = self.olm._decrypt_megolm_no_error(event)
-
-            if decrypted_event:
-                event = decrypted_event
-
-        elif isinstance(event, RoomEncryptionEvent):
+        if isinstance(event, RoomEncryptionEvent):
             encrypted_rooms.add(room_id)
 
         if isinstance(event, RoomMemberEvent):
@@ -801,37 +925,70 @@ class Client:
 
         return decrypted_event
 
-    def _handle_joined_rooms(self, response: SyncResponse):
+    def _decrypt_timeline_event(
+        self, event: Event | BadEventType, room_id: str
+    ) -> Event | BadEventType | None:
+        if isinstance(event, MegolmEvent) and self.olm:
+            event.room_id = room_id
+            return self.olm._decrypt_megolm_no_error(event)
+        return None
+
+    def _iter_room_timeline(
+        self,
+        room_id: str,
+        info: RoomInfo,
+        room: MatrixRoom,
+        encrypted_rooms: set[str],
+        section: str,
+        *,
+        apply_state: bool = True,
+        provenance: TimelineEventProvenance | None = None,
+    ) -> Iterator[_SyncItem]:
+        decrypted_events: list[tuple[int, Event | BadEventType]] = []
+
+        for index, event in enumerate(info.timeline.events):
+            if apply_state and self._durable_session is not None:
+                room = self._durable_session._timeline_room(room_id, room, event)
+            source = (
+                deepcopy(event.source)
+                if isinstance(event, MegolmEvent)
+                else event.source
+            )
+            decrypted_event = (
+                self._handle_timeline_event(event, room_id, room, encrypted_rooms)
+                if apply_state
+                else self._decrypt_timeline_event(event, room_id)
+            )
+
+            if decrypted_event:
+                event = decrypted_event
+                decrypted_events.append((index, decrypted_event))
+
+            yield _SyncItem("event", event, room, section, source, provenance)
+
+        # Replace the Megolm events with decrypted ones
+        for index, event in decrypted_events:
+            info.timeline.events[index] = event
+
+    def _iter_joined_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
         encrypted_rooms: set[str] = set()
 
         for room_id, join_info in response.rooms.join.items():
-            self._handle_joined_state(room_id, join_info, encrypted_rooms)
+            yield from self._iter_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
-            decrypted_events: list[tuple[int, Event | BadEventType]] = []
-
-            for index, event in enumerate(join_info.timeline.events):
-                decrypted_event = self._handle_timeline_event(
-                    event, room_id, room, encrypted_rooms
-                )
-
-                if decrypted_event:
-                    event = decrypted_event
-                    decrypted_events.append((index, decrypted_event))
-
-                self._on_event(event, room)
-
-            # Replace the Megolm events with decrypted ones
-            for index, event in decrypted_events:
-                join_info.timeline.events[index] = event
+            yield from self._iter_room_timeline(
+                room_id, join_info, room, encrypted_rooms, "join"
+            )
+            room = self.rooms[room_id]
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
-                self._on_ephemeral(event, room)
+                yield _SyncItem("ephemeral", event, room, "join")
 
             for event in join_info.account_data:
                 room.handle_account_data(event)
-                self._on_room_account_data(event, room)
+                yield _SyncItem("room_account_data", event, room, "join")
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -841,62 +998,107 @@ class Client:
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
 
-    def _handle_presence_events(self, response: SyncResponse):
+    def _iter_presence_events(self, response: SyncResponse) -> Iterator[_SyncItem]:
         for event in response.presence_events:
-            for room_id in self.rooms.keys():
-                if event.user_id not in self.rooms[room_id].users:
-                    continue
+            self._project_presence(event)
+            yield _SyncItem("presence", event)
 
-                self.rooms[room_id].users[event.user_id].presence = event.presence
-                self.rooms[room_id].users[
-                    event.user_id
-                ].last_active_ago = event.last_active_ago
-                self.rooms[room_id].users[
-                    event.user_id
-                ].currently_active = event.currently_active
-                self.rooms[room_id].users[event.user_id].status_msg = event.status_msg
+    def _handle_joined_rooms(self, response: SyncResponse):
+        for item in self._iter_joined_rooms(response):
+            self._dispatch_sync_item(item)
 
-            self._on_presence(event)
+    def _iter_left_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
+        encrypted_rooms: set[str] = set()
+        for room_id, info in response.rooms.leave.items():
+            for item in self._iter_joined_state(
+                room_id, info, encrypted_rooms, section="leave"
+            ):
+                if item.event is not None:
+                    yield item
+            room = self.rooms[room_id]
+            yield from self._iter_room_timeline(
+                room_id, info, room, encrypted_rooms, "leave"
+            )
+            room = self.rooms[room_id]
+            for event in info.account_data:
+                room.handle_account_data(event)
+                yield _SyncItem("room_account_data", event, room, "leave")
+            yield _SyncItem(room=room, section="leave")
+            self.rooms.pop(room_id, None)
+            self.invited_rooms.pop(room_id, None)
+        self.encrypted_rooms.update(encrypted_rooms)
+        if encrypted_rooms and self.store:
+            self.store.save_encrypted_rooms(encrypted_rooms)
 
-    def _handle_global_account_data_events(
-        self,
-        response: SyncResponse,
-    ) -> None:
+    def _handle_presence_events(self, response: SyncResponse):
+        for item in self._iter_presence_events(response):
+            self._dispatch_sync_item(item)
+
+    def _project_presence(self, event: PresenceEvent) -> None:
+        for room in self.rooms.values():
+            user = room.users.get(event.user_id)
+            if user is None:
+                continue
+
+            user.presence = event.presence
+            user.last_active_ago = event.last_active_ago
+            user.currently_active = event.currently_active
+            user.status_msg = event.status_msg
+
+    def _iter_global_account_data_events(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
         for event in response.account_data_events:
-            self._on_global_account_data(event)
+            yield _SyncItem("global_account_data", event)
+
+    def _handle_global_account_data_events(self, response: SyncResponse) -> None:
+        for item in self._iter_global_account_data_events(response):
+            self._dispatch_sync_item(item)
+
+    def _iter_expired_verifications(self) -> Iterator[_SyncItem]:
+        assert self.olm
+        for event in self.olm.clear_verifications():
+            yield _SyncItem("expired_verification", event)
 
     def _handle_expired_verifications(self):
-        expired_verifications = self.olm.clear_verifications()
-
-        for event in expired_verifications:
-            self._on_expired_verifications(event)
+        for item in self._iter_expired_verifications():
+            self._dispatch_sync_item(item)
 
     def _handle_olm_events(self, response: SyncResponse | SlidingSyncResponse) -> None:
+        self._update_olm_sync_state(
+            response.device_key_count.signed_curve25519,
+            response.device_list.changed,
+            response.device_list.left,
+        )
+
+    def _update_olm_sync_state(
+        self,
+        uploaded_key_count: int | None,
+        changed_users: list[str],
+        left_users: list[str],
+    ) -> None:
         assert self.olm
 
-        changed_users = set()
-        if response.device_key_count.signed_curve25519 is not None:
-            self.olm.uploaded_key_count = response.device_key_count.signed_curve25519
+        if uploaded_key_count is not None:
+            self.olm.uploaded_key_count = uploaded_key_count
 
-        for user in response.device_list.changed:
-            for room in self.rooms.values():
-                if not room.encrypted:
-                    continue
+        users_for_key_query = {
+            user_id
+            for user_id in (*changed_users, *left_users)
+            if any(
+                room.encrypted and user_id in room.users for room in self.rooms.values()
+            )
+            or (
+                self._durable_session is not None
+                and (
+                    user_id in self.olm.tracked_users
+                    or user_id in self.olm.device_store.users
+                )
+            )
+        }
+        self.olm.add_changed_users(users_for_key_query)
 
-                if user in room.users:
-                    changed_users.add(user)
-
-        for user in response.device_list.left:
-            for room in self.rooms.values():
-                if not room.encrypted:
-                    continue
-
-                if user in room.users:
-                    changed_users.add(user)
-
-        self.olm.add_changed_users(changed_users)
-
-    def _on_to_device(self, event: ToDeviceEvent):
+    def _on_to_device(self, event: ToDeviceEvent | BadEventType):
         for cb in self.to_device_callbacks:
             cb.sync_execute(event)
 
@@ -930,37 +1132,91 @@ class Client:
         for cb in self.to_device_callbacks:
             cb.sync_execute(event)
 
+    def _dispatch_sync_item(self, item: _SyncItem) -> Any:
+        """Dispatch at the yield so callbacks see the current room state."""
+        if item.route is None:
+            return None
+        handler = getattr(self, _SYNC_CALLBACK_HANDLERS[item.route])
+        if item.room is not None:
+            return handler(item.event, item.room)
+        return handler(item.event)
+
+    def _iter_sync(
+        self, response: SyncResponse, *, include_left: bool = False
+    ) -> Iterator[_SyncItem]:
+        """Apply sync incrementally without callbacks or cursor/fence changes.
+
+        Consume observations as they are yielded to capture event-time room
+        state. Leaving rooms are removed after their final observation.
+        """
+        yield from self._iter_to_device(response)
+        yield from self._iter_invited_rooms(response)
+        yield from self._iter_joined_rooms(response)
+        if include_left:
+            yield from self._iter_left_rooms(response)
+        yield from self._iter_presence_events(response)
+        yield from self._iter_global_account_data_events(response)
+        if self.olm:
+            yield from self._iter_expired_verifications()
+            self._handle_olm_events(response)
+            yield from self._iter_key_requests()
+
     def _handle_sync(self, response: SyncResponse) -> None | Coroutine[Any, Any, None]:
-        # We already received such a sync response, do nothing in that case.
+        self._claim_sync_transport("classic")
         if self.next_batch == response.next_batch:
             return None
-
         self.next_batch = response.next_batch
-
         if self.config.store_sync_tokens and self.store:
             self.store.save_sync_token(self.next_batch)
-
-        self._handle_to_device(response)
-
-        self._handle_invited_rooms(response)
-
-        self._handle_joined_rooms(response)
-
-        self._handle_presence_events(response)
-
-        self._handle_global_account_data_events(response)
-
-        if self.olm:
-            self._handle_expired_verifications()
-            self._handle_olm_events(response)
-            self._collect_key_requests()
-
+        for item in self._iter_sync(response):
+            self._dispatch_sync_item(item)
         return None
 
+    def _iter_ordinary_sliding_sync(
+        self, response: SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
+        from .sliding_sync import iter_sliding_sync
+
+        self._begin_ordinary_sync()
+        if response.to_device_next_batch is not None or response.to_device_events:
+            self._claim_sync_transport("sliding")
+        completed = {
+            room_id: {event_id for event_id, encrypted in seen.items() if not encrypted}
+            for room_id, seen in self._sliding_seen_events.items()
+        }
+        for item in iter_sliding_sync(self, response, suppress_ids=completed):
+            if item.route == "event" and item.room is not None:
+                event_id = getattr(item.event, "event_id", None)
+                if event_id:
+                    seen = self._sliding_seen_events.setdefault(item.room.room_id, {})
+                    encrypted = isinstance(item.event, MegolmEvent)
+                    duplicate_ciphertext = encrypted and event_id in seen
+                    seen[event_id] = encrypted
+                    while len(seen) > 4096:
+                        del seen[next(iter(seen))]
+                    if duplicate_ciphertext:
+                        continue
+                    if not encrypted:
+                        completed.setdefault(item.room.room_id, set()).add(event_id)
+            yield item
+        if response.to_device_next_batch is not None:
+            self._sliding_to_device_since = response.to_device_next_batch
+
+    def _handle_sliding_sync(
+        self, response: SlidingSyncResponse
+    ) -> None | Coroutine[Any, Any, None]:
+        for item in self._iter_ordinary_sliding_sync(response):
+            self._dispatch_sync_item(item)
+        return None
+
+    def _iter_key_requests(self) -> Iterator[_SyncItem]:
+        assert self.olm
+        for event in self.olm.collect_key_requests():
+            yield _SyncItem("to_device", event)
+
     def _collect_key_requests(self):
-        events = self.olm.collect_key_requests()
-        for event in events:
-            self._on_to_device(event)
+        for item in self._iter_key_requests():
+            self._dispatch_sync_item(item)
 
     def _decrypt_event_array(self, array: list[Event | BadEventType]):
         if not self.olm:
@@ -1043,6 +1299,8 @@ class Client:
                 for room in self.rooms.values():
                     if room.encrypted and user_id in room.users:
                         self.invalidate_outbound_session(room.room_id)
+            if self._durable_session is not None:
+                self._durable_session._outbound.invalidate_users(response.changed)
 
     def _handle_joined_members(self, response: JoinedMembersResponse):
         if response.room_id not in self.rooms:
@@ -1118,6 +1376,8 @@ class Client:
             self._handle_register(response)
         elif isinstance(response, SyncResponse):
             self._handle_sync(response)
+        elif isinstance(response, SlidingSyncResponse):
+            self._handle_sliding_sync(response)
         elif isinstance(response, RoomMessagesResponse):
             self._handle_messages_response(response)
         elif isinstance(response, RoomContextResponse):
@@ -1243,7 +1503,7 @@ class Client:
         room isn't shared yet.
 
         Raises `MembersSyncError` if the room is encrypted but the room members
-        aren't fully loaded due to member lazy loading.
+        aren't fully loaded and no durable recipient lookup has completed.
 
         Returns a tuple containing the new message type and the new encrypted
         content.
@@ -1258,7 +1518,12 @@ class Client:
         if not room.encrypted:
             raise LocalProtocolError(f"Room {room_id} is not encrypted")
 
-        if not room.members_synced:
+        # A durable lookup provides current recipients without replacing the
+        # room projection retained at the sync cursor.
+        if not room.members_synced and (
+            self._durable_session is None
+            or self._durable_session._outbound.member_cache.get(room_id) is None
+        ):
             raise MembersSyncError(
                 "The room is encrypted and the members " "aren't fully synced."
             )
@@ -1280,7 +1545,7 @@ class Client:
     def add_event_callback(
         self,
         callback: Callable[[MatrixRoom, Event], Awaitable[None] | None],
-        filter: type[Event] | tuple[type[Event], None],
+        filter: type[Event] | tuple[type[Event], ...],
     ) -> None:
         """Add a callback that will be executed on room events.
 
@@ -1304,7 +1569,10 @@ class Client:
 
     def add_ephemeral_callback(
         self,
-        callback: Callable[[MatrixRoom, EphemeralEvent], None],
+        callback: Callable[
+            [MatrixRoom, EphemeralEvent],
+            Awaitable[None] | None,
+        ],
         filter: type[EphemeralEvent] | tuple[type[EphemeralEvent], ...],
     ) -> None:
         """Add a callback that will be executed on ephemeral room events.
@@ -1326,13 +1594,13 @@ class Client:
 
     def add_global_account_data_callback(
         self,
-        callback: Callable[[AccountDataEvent], None],
+        callback: Callable[[AccountDataEvent], Awaitable[None] | None],
         filter: type[AccountDataEvent] | tuple[type[AccountDataEvent], ...],
     ) -> None:
         """Add a callback that will be executed on global account data events.
 
         Args:
-            callback (Callable[[AccountDataEvent], None]):
+            callback (Callable[[AccountDataEvent], Awaitable[None] | None]):
                 A function that will be
                 called if the event type in the filter argument is found in
                 the account data event list.
@@ -1349,13 +1617,16 @@ class Client:
 
     def add_room_account_data_callback(
         self,
-        callback: Callable[[MatrixRoom, AccountDataEvent], None],
+        callback: Callable[
+            [MatrixRoom, AccountDataEvent],
+            Awaitable[None] | None,
+        ],
         filter: type[AccountDataEvent] | tuple[type[AccountDataEvent], ...],
     ) -> None:
         """Add a callback that will be executed on room account data events.
 
         Args:
-            callback (Callable[[MatrixRoom, AccountDataEvent], None]):
+            callback (Callable[[MatrixRoom, AccountDataEvent], Awaitable[None] | None]):
                 A function that will be
                 called if the event type in the filter argument is found in
                 the room account data event list.
@@ -1372,21 +1643,27 @@ class Client:
 
     def add_to_device_callback(
         self,
-        callback: Callable[[ToDeviceEvent], None],
-        filter: type[ToDeviceEvent] | tuple[type[ToDeviceEvent], ...],
+        callback: Callable[
+            [_ToDeviceCallbackEventT],
+            Awaitable[None] | None,
+        ],
+        filter: (
+            type[_ToDeviceCallbackEventT] | tuple[type[_ToDeviceCallbackEventT], ...]
+        ),
     ) -> None:
         """Add a callback that will be executed on to-device events.
 
         Args:
-            callback (Callable[[ToDeviceEvent], None]): A function that will be
-                called if the event type in the filter argument is found in
-                the to-device part of the sync response.
+            callback (Callable[[ToDeviceEvent | BadEventType],
+            Awaitable[None] | None]): A function that will be called if the
+                event type in the filter argument is found in the to-device
+                part of the sync response.
 
             filter
-            (Union[Type[ToDeviceEvent], Tuple[Type[ToDeviceEvent], ...]]):
-                The event type or a tuple
-                containing multiple types for which the function
-                will be called.
+            (Union[Type[ToDeviceEvent | BadEventType],
+            Tuple[Type[ToDeviceEvent | BadEventType], ...]]): The event type or
+                a tuple containing multiple types for which the function will
+                be called.
 
         """
         cb = ClientCallback(callback, filter)
@@ -1394,15 +1671,15 @@ class Client:
 
     def add_presence_callback(
         self,
-        callback: Callable[[PresenceEvent], None],
+        callback: Callable[[PresenceEvent], Awaitable[None] | None],
         filter: type | tuple[type],
-    ):
+    ) -> None:
         """Add a callback that will be executed on presence events.
 
         Args:
-            callback (Callable[[PresenceEvent], None]): A function that will be
-                called if the event type in the filter argument is found in
-                the presence part of the sync response.
+            callback (Callable[[PresenceEvent], Awaitable[None] | None]): A
+                function that will be called if the event type in the filter
+                argument is found in the presence part of the sync response.
             filter (Union[Type, Tuple[Type]]): The event type or a tuple
                 containing multiple types for which the function
                 will be called.
@@ -1549,6 +1826,8 @@ class Client:
 
         """
         assert self.olm
+        if self._durable_session is not None:
+            return self._durable_session._outbound.change_key_share(event)
         return self.olm.continue_key_share(event)
 
     @store_loaded
@@ -1569,4 +1848,6 @@ class Client:
 
         """
         assert self.olm
+        if self._durable_session is not None:
+            return self._durable_session._outbound.change_key_share(event, cancel=True)
         return self.olm.cancel_key_share(event)
