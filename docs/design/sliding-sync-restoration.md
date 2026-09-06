@@ -106,8 +106,9 @@ Retain the bounded window's observed identities separately from identities whose
 interpretation completed. The first overlap with the previously observed window
 separates older context from the recoverable suffix: unseen entries before it are
 history and must not rewind state or trigger new requests. Successfully applied
-overlap still skips duplicate interpretation. A backward expansion retains the
-prior pagination token and excludes the older prefix from future overlap anchors.
+overlap still skips duplicate interpretation. After successful recovery, a backward
+expansion retains the prior pagination token and excludes the older prefix from
+future overlap anchors. Missing boundaries or recovery loss invalidate that floor.
 Otherwise a later window or forward page could move the recovery floor backwards.
 
 Undecryptable actionable ciphertext also anchors the context boundary, while
@@ -219,3 +220,14 @@ establish deployed-server readiness or a performance gain.
 Final producer unit verification at this checkpoint: 838 passed, three skipped;
 mypy reports no issues in 60 source files. The complete consumer suite also
 passed against the editable producer; locked-wheel qualification follows pinning.
+
+The live expanded-window fix adds 58 net production lines across the shared
+interpreter, Sliding checkpoint and existing recovery call site. Its 27 focused
+tests include regression cases for old membership context, actionable late-key
+promotion, historical ciphertext, forward pagination after reopening, and missing
+boundaries/page loss. Review caught and reproduced the latter boundary cases
+before the fix was committed. Restoration now adds 1,526 net production lines;
+the complete PR is +5,056/-6,437, or 1,381 fewer production lines than main.
+Final verification for this fix: 844 passed, three skipped; mypy is clean across
+60 source files and all repository hooks pass. Live qualification below must use
+a rebuilt, exactly pinned consumer wheel rather than the pre-fix package.

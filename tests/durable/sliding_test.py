@@ -121,6 +121,59 @@ async def test_transport_switch_rejects_instead_of_reinterpreting_cursor(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_expanded_window_keeps_older_membership_context_historical(tmp_path):
+    """A wider subscription must not replay an old invite over a joined baseline."""
+
+    async def sync(request):
+        raise AssertionError("captured input must drain without polling")
+
+    async def history(request):
+        assert request.query["from"] == "w2"
+        assert request.query["to"] == "w1"
+        return web.json_response({"start": "w2", "chunk": []})
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        first = json.loads(window("$old", prev_batch="w2"))
+        first["rooms"][ROOM]["timeline"].insert(0, member("$join", "join"))
+        await session._accept_response(json.dumps(first).encode())
+        await settle(session)
+        wider = json.loads(window("$warm", pos="p2", prev_batch="w1"))
+        wider["rooms"][ROOM].pop("num_live")
+        wider["rooms"][ROOM]["limited"] = False
+        wider["rooms"][ROOM]["timeline"] = [
+            message("$ancient"),
+            member("$invite", "invite"),
+            member("$join", "join"),
+            message("$old"),
+            message("$warm"),
+        ]
+        session._capture_response(json.dumps(wider).encode())
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            await runner
+            timeline = {
+                record.source["event_id"]: record
+                for record in records
+                if record.kind is RecordKind.TIMELINE
+            }
+            assert timeline["$warm"].provenance is TimelineEventProvenance.RECOVERED
+            assert timeline["$warm"].membership_epoch == 0
+            assert timeline["$ancient"].provenance is TimelineEventProvenance.HISTORY
+            assert timeline["$invite"].membership is None
+            assert session._metadata[ROOM]["membership"] == "join"
+            assert not any(record.kind is RecordKind.LOSS for record in records)
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_restart_recovers_downtime_without_reapplying_previous_window(tmp_path):
     calls = []
 

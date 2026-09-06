@@ -30,6 +30,25 @@ def live_event_count(room: SlidingSyncRoom) -> int:
     return 0 if room.initial or room.expanded_timeline else len(room.timeline)
 
 
+def timeline_provenance(
+    room: SlidingSyncRoom,
+    index: int,
+    *,
+    history: bool = False,
+    recovered: bool = False,
+    history_prefix: int = 0,
+) -> TimelineEventProvenance:
+    if history or index < history_prefix:
+        return TimelineEventProvenance.HISTORY
+    if index >= len(room.timeline) - live_event_count(room):
+        return TimelineEventProvenance.LIVE
+    return (
+        TimelineEventProvenance.RECOVERED
+        if recovered
+        else TimelineEventProvenance.HISTORY
+    )
+
+
 def _reset_snapshot(client: Client, room: MatrixRoom) -> None:
     fresh = MatrixRoom(room.room_id, room.own_user_id, room.encrypted)
     for name in (
@@ -154,6 +173,7 @@ def iter_sliding_sync(
     recovered_rooms: Collection[str] = (),
     history_rooms: Collection[str] = (),
     suppress_ids: Mapping[str, Collection[str]] | None = None,
+    history_prefixes: Mapping[str, int] | None = None,
 ) -> Iterator[_SyncItem]:
     """Apply protocol state incrementally, preserving event-time authorization.
 
@@ -192,10 +212,15 @@ def iter_sliding_sync(
         live_start = len(info.timeline) - live_event_count(info)
         recovered = room_id in recovered_rooms
         history = room_id in history_rooms
+        history_prefix = (history_prefixes or {}).get(room_id, 0)
         timeline_state = (
             []
             if history
-            else info.timeline if recovered else info.timeline[live_start:]
+            else (
+                info.timeline[history_prefix:]
+                if recovered
+                else info.timeline[max(live_start, history_prefix) :]
+            )
         )
         state_first = not known or (
             info.initial
@@ -217,18 +242,12 @@ def iter_sliding_sync(
                 room_id, ()
             ):
                 continue
-            provenance = (
-                TimelineEventProvenance.HISTORY
-                if history
-                else (
-                    TimelineEventProvenance.LIVE
-                    if index >= live_start
-                    else (
-                        TimelineEventProvenance.RECOVERED
-                        if recovered
-                        else TimelineEventProvenance.HISTORY
-                    )
-                )
+            provenance = timeline_provenance(
+                info,
+                index,
+                history=history,
+                recovered=recovered,
+                history_prefix=history_prefix,
             )
             timeline = Timeline([event], info.limited, info.prev_batch)
             yield from client._iter_room_timeline(

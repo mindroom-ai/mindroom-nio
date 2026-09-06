@@ -278,6 +278,7 @@ class Recovery:
                 include_left=True,
                 recovered_rooms=state["recovered_rooms"],
                 history_rooms=state["history_rooms"],
+                history_prefixes=state["sliding_history_prefixes"],
                 suppress_ids={
                     room_id: set(ids) for room_id, ids in state["applied_ids"].items()
                 },
@@ -306,7 +307,7 @@ class Recovery:
         for room_id in processor.rooms:
             if session._metadata[room_id].get("membership") in ("leave", "ban"):
                 session.client.rooms.pop(room_id, None)
-        session._sliding.commit(response)
+        session._sliding.commit(response, state)
         session._crypto.capture()
         session._store.set_cursor(response.pos)
         session._store.save_continuation({"phase": "prepared"})

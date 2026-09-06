@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..api import Api
+from ..client.sliding_sync import timeline_provenance
+from ..event_provenance import TimelineEventProvenance
 from ..events import AccountDataEvent, MegolmEvent, RoomMemberEvent
 from ..exceptions import LocalProtocolError
 from ..responses import SlidingSyncResponse, SlidingSyncRoom, SlidingSyncStateStub
@@ -158,10 +160,20 @@ class SlidingSource:
         state["recovered_rooms"] = []
         state["history_rooms"] = []
         state["unknown_rooms"] = []
+        state["sliding_history_prefixes"] = {}
         for room_id, room in response.rooms.items():
             held = self.baselines.get(room_id, {})
             _, continues = self.membership(room_id, room)
             state["applied_ids"][room_id] = held.get("event_ids", [])
+            observed = set(held.get("window_ids", []))
+            state["sliding_history_prefixes"][room_id] = next(
+                (
+                    index
+                    for index, event in enumerate(room.timeline)
+                    if event.source.get("event_id") in observed
+                ),
+                0,
+            )
             if room.initial or room.limited:
                 if continues and held.get("token") and room.prev_batch:
                     state["sliding_starts"][room_id] = held["token"]
@@ -173,7 +185,7 @@ class SlidingSource:
             elif not self.session._metadata.get(room_id, {}).get("baseline"):
                 state["history_rooms"].append(room_id)
 
-    def commit(self, response: SlidingSyncResponse) -> None:
+    def commit(self, response: SlidingSyncResponse, state: dict[str, Any]) -> None:
         database = self.session._store.database
         pending = self.session.client._pending_sliding_room_account_data
         encoded_pending = {
@@ -201,18 +213,44 @@ class SlidingSource:
             proof, _ = self.membership(room_id, room)
             prior = self.baselines.get(room_id, {})
             if proof is not None:
+                prefix = state["sliding_history_prefixes"][room_id]
                 token = room.prev_batch
-                if not (room.initial or room.limited):
+                if (
+                    prefix
+                    and room_id in state["recovered_rooms"]
+                    and room_id not in state["history_rooms"]
+                ):
+                    token = prior["token"]
+                elif not (room.initial or room.limited):
                     token = token or prior.get("token")
-                # A later key may make a repeated encrypted window actionable.
+                # Only actionable ciphertext awaits promotion; history stays observed.
                 ids = [
                     event.source.get("event_id")
-                    for event in room.timeline
+                    for index, event in enumerate(room.timeline)
                     if not isinstance(event, MegolmEvent)
+                    or timeline_provenance(
+                        room,
+                        index,
+                        history=room_id in state["history_rooms"],
+                        recovered=room_id in state["recovered_rooms"],
+                        history_prefix=prefix,
+                    )
+                    is TimelineEventProvenance.HISTORY
+                ]
+                window_ids = [
+                    event.source.get("event_id") for event in room.timeline[prefix:]
                 ]
                 if token == prior.get("token"):
                     ids = list(dict.fromkeys([*prior.get("event_ids", []), *ids]))
-                value = {"token": token, "membership": proof, "event_ids": ids}
+                    window_ids = list(
+                        dict.fromkeys([*prior.get("window_ids", []), *window_ids])
+                    )
+                value = {
+                    "token": token,
+                    "membership": proof,
+                    "event_ids": ids,
+                    "window_ids": window_ids,
+                }
                 if len(encode_json(value).encode()) > 2 * 1024 * 1024:
                     raise LocalProtocolError(
                         "Sliding room checkpoint exceeds its bound"

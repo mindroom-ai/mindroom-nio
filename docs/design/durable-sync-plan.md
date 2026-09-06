@@ -1,5 +1,10 @@
 # Durable Classic Sync Implementation Plan
 
+Current scope includes the completed Classic simplification and the subsequent
+[Sliding restoration amendment](sliding-sync-restoration.md). Historical
+Classic-only constraints and the compatibility audit below describe earlier
+checkpoints; the amendment records their resolution and current qualification.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use baspowers:subagent-driven-development or baspowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Replace the large ingestion engine with shared upstream processing and
@@ -509,9 +514,16 @@ The consumer's performance evidence index, tracked measurement JSON and ledger o
 The existing 200-reply qualification stands; 1,000 replies remain unqualified.
 
 
-## Compatibility audit: unresolved main-store adoption blocker
+## Compatibility audit: main-store adoption blocker (resolved)
 
-The final PR removes the fork's Sliding Sync implementation entirely, including `sliding_sync()`, `sliding_sync_forever()`, response types and persisted window-token APIs.
+Resolved by `98e0f78`: adoption rejects outstanding released recovery gaps,
+unaccepted timeline records and unacknowledged loss markers before mutating the
+store. Focused tests pass 33 cases; the previous release independently reopened
+all ten rejected fixtures with keys, trust, token and obligations intact. Clean
+stores remain adoptable. Sliding APIs and durable recovery are restored by the
+linked amendment. The findings below remain as historical evidence of the defect.
+
+At this audit checkpoint the PR removed the fork's Sliding Sync implementation entirely, including `sliding_sync()`, `sliding_sync_forever()`, response types and persisted window-token APIs.
 It also replaces the released backfill configuration, admission callbacks and recovery/checkpoint APIs with `nio.durable`; the source reduction includes deliberate feature removal, not only implementation simplification.
 Ordinary upstream-style APIs do not imply compatibility with all APIs on this fork's main branch.
 
@@ -522,4 +534,4 @@ This is a released main-store migration issue, distinct from deliberately reject
 Before merge, either transfer existing recovery obligations safely or reject adoption while outstanding obligations remain, with regression coverage against a database created by main.
 Do not describe the current cutover as safe for an undrained main recovery store.
 The local two-process evidence is retained under `capacity/compatibility-audit-main-to-durable`, with `main.json` and `adopted.json` recording the verified observations.
-No production fix has been made in this audit; the prior merge-ready recommendation is superseded by this blocker.
+No production fix had been made at the audit checkpoint; its merge-ready recommendation was superseded by this blocker until the resolution above.

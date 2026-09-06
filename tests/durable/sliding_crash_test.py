@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from nio import AsyncClient, RoomKeyEvent
+from nio import AsyncClient, RoomKeyEvent, TimelineEventProvenance
 from nio.durable import DurableSyncConfig, SlidingSyncConfig, open_durable_sync
 from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind
@@ -143,9 +143,16 @@ async def test_late_room_key_can_promote_a_previously_undecryptable_window(tmp_p
     raw["extensions"]["to_device"]["events"] = []
     client, session = opened(tmp_path)
     try:
+        timeline = raw["rooms"][ROOM]["timeline"]
+        raw["rooms"][ROOM]["timeline"] = []
+        await session._accept_response(json.dumps(raw).encode())
+        await settle(session)
+        raw["pos"] = "live"
+        raw["rooms"][ROOM].update(initial=False, num_live=1, timeline=timeline)
         await session._accept_response(json.dumps(raw).encode())
         first = [r for r in await settle(session) if r.kind is RecordKind.TIMELINE]
         assert len(first) == 1 and first[0].clear is None
+        assert first[0].provenance is TimelineEventProvenance.LIVE
         raw["pos"] = "p2"
         raw["rooms"][ROOM]["initial"] = False
         raw["rooms"][ROOM]["num_live"] = 1
@@ -154,6 +161,58 @@ async def test_late_room_key_can_promote_a_previously_undecryptable_window(tmp_p
         promoted = [r for r in await settle(session) if r.kind is RecordKind.TIMELINE]
         assert len(promoted) == 1
         assert restore_event(promoted[0]).body == BODY
+    finally:
+        await session.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_expanded_window_promotes_ciphertext_before_processed_overlap(tmp_path):
+    from .recovery_test import message
+    from .sliding_test import settle
+
+    await seeded(tmp_path)
+    raw = json.loads((tmp_path / "sliding.json").read_text())
+    keys = raw["extensions"]["to_device"]["events"]
+    raw["extensions"]["to_device"]["events"] = []
+    ciphertext_id = raw["rooms"][ROOM]["timeline"][0]["event_id"]
+    raw["rooms"][ROOM]["timeline"].append(message("$processed"))
+    client, session = opened(tmp_path)
+    timeline = raw["rooms"][ROOM]["timeline"]
+    raw["rooms"][ROOM]["timeline"] = []
+    await session._accept_response(json.dumps(raw).encode())
+    await settle(session)
+    raw["pos"] = "live"
+    raw["rooms"][ROOM].update(initial=False, num_live=2, timeline=timeline)
+    await session._accept_response(json.dumps(raw).encode())
+    first = await settle(session)
+    assert (
+        next(r for r in first if r.source.get("event_id") == ciphertext_id).clear
+        is None
+    )
+    await session.close()
+    await client.close()
+
+    client, session = opened(tmp_path)
+    try:
+        raw["pos"] = "p2"
+        raw["rooms"][ROOM].update(initial=True, num_live=0)
+        raw["rooms"][ROOM]["timeline"].insert(0, message("$ancient"))
+        raw["extensions"]["to_device"]["events"] = keys
+        session._capture_response(json.dumps(raw).encode())
+        session._prepare_pending()
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        # Equal window boundaries need no network page; finish the shared walker.
+        await session._recovery.advance()
+        session._prepare_pending()
+        records = await settle(session)
+        promoted = next(r for r in records if r.source.get("event_id") == ciphertext_id)
+        ancient = next(r for r in records if r.source.get("event_id") == "$ancient")
+        assert restore_event(promoted).body == BODY
+        assert promoted.provenance is TimelineEventProvenance.RECOVERED
+        assert ancient.provenance is TimelineEventProvenance.HISTORY
+        assert not any(r.source.get("event_id") == "$processed" for r in records)
     finally:
         await session.close()
         await client.close()
