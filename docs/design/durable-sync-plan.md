@@ -436,3 +436,18 @@ new findings. This completes the replacement and coordinated verification;
 release publication and the separately measured Tuwunel startup-capacity limit
 remain outside the completed implementation. Subsequent plan-only commits do
 not change the pinned runtime source.
+
+## Startup profiling follow-up
+
+Correlated traces and alternating actual-source controls identify and resolve the consumer ledger's unnecessary serialization without changing Nio production code.
+MindRoom `5502b1177` keeps conflicting identity mutations ordered while allowing unrelated writes to await persistence concurrently.
+The ledger adds 47 net lines, with a total consumer production-file increase of 28 lines after shortening caller documentation.
+Its full suite passes 15,542 tests with 22 skipped, including twenty new SQLite/Postgres cases; all repository hooks pass.
+
+Two uninstrumented Tuwunel runs pass every original 200-root predicate, reducing initial reply spread from 21.69–21.81 seconds to 12.03–12.07 seconds and increasing full overlap from 39.71–40.34 seconds to 49.74–49.90 seconds.
+Synapse also passes with 54.219 seconds of full overlap.
+All fixed runs complete exactly 200 replies, settle three fence principals, retain zero producer/application/outbox debt and shut down cleanly with verified source hashes.
+The producer design and the consumer's ledger ownership document retain the detailed evidence, unchanged guarantees and 1,000-reply qualification limit.
+Release publication remains separate work; the previously unresolved local Tuwunel startup target is now met.
+Final producer verification passes 700 tests with three skipped in 58.81 seconds, reports zero mypy errors across 58 source files, and passes every repository hook.
+Producer source and tests remain unchanged; the final consumer documentation hooks also pass without changing the tested runtime source.

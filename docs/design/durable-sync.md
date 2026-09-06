@@ -391,4 +391,25 @@ requires its own evidence; the scale ambition alone does not justify one.
 Documentation follow-up verification: 700 tests passed with three skipped,
 mypy reported no issues in 58 source files, and all repository hooks passed.
 The consumer suite passed 15,522 tests with 22 skipped; its hooks also passed.
-Production code and tests are unchanged in both repositories.
+Production code and tests were unchanged by that documentation follow-up.
+
+## Correlated startup profiling and consumer ownership
+
+The subsequent correlated 50/100/200-root traces locate the remaining startup serialization in the consumer's agent-wide handled-turn ledger lock.
+At baseline, that lock stayed held while unrelated admission and settlement operations occupied the shared database queue.
+Calibrated py-spy sampling also locates synchronous Nio commits, but those stalls overlap the ledger waits; summing both would overstate the critical path.
+
+MindRoom `5502b1177` reserves only conflicting source, discovery and anchor identities through commit or rollback.
+It retains the existing backend transactions, both pending-turn writes, eight preparation slots, FULL durability and every producer guarantee.
+The ledger grows by 47 net lines; shorter caller documentation makes the consumer production-file increase 28 lines.
+No Nio production code changes are needed.
+
+Alternating uninstrumented Tuwunel controls reduce initial reply spread from 21.69–21.81 seconds to 12.03–12.07 seconds.
+Both fixed runs pass every original predicate: full overlap is 49.74–49.90 seconds against the 45-second requirement, with 200 exact replies, all three fence principals and zero producer/application/outbox debt after clean shutdown.
+Completion p95 improves from about 83.3 seconds to 75.9–76.1 seconds, including approximately 60 seconds of synthetic generation.
+The same committed source passes the Synapse control with 54.219 seconds of overlap and the same correctness and drain checks.
+The previously recorded Tuwunel startup-capacity limitation is resolved for this workload, without qualifying 1,000 concurrent replies or a universal latency bound.
+
+The consumer's `docs/dev/ledger-write-ownership.md` records the architecture, twenty new SQLite/Postgres cases, calibrated traces, failed diagnostic prototypes and exact-source controls.
+Its full suite passes 15,542 tests with 22 skipped; all repository hooks pass.
+Future performance work should keep this distinction between actual conflict ownership and unrelated queue waits, and justify any new writer, codec or durability change with its own measured evidence.
