@@ -15,7 +15,7 @@ from .client_test import ROOM, USER, client, open_session, response
 
 
 @asynccontextmanager
-async def homeserver(sync):
+async def homeserver(sync, *, query=None):
     requests = []
 
     async def handle(request):
@@ -27,6 +27,8 @@ async def homeserver(sync):
         if request.path.endswith("/keys/upload"):
             return web.json_response({"one_time_key_counts": {"signed_curve25519": 50}})
         if request.path.endswith("/keys/query"):
+            if query is not None:
+                return await query(request)
             return web.json_response({"device_keys": {USER: {}}})
         raise AssertionError(request.path)
 
@@ -53,6 +55,48 @@ async def drain_sync(session):
             await session.ack(batch)
             if batch.completes_sync:
                 return records
+
+
+@pytest.mark.asyncio
+async def test_partial_key_query_defers_missing_users_without_blocking_completion(
+    tmp_path,
+):
+    queries = 0
+    stop = asyncio.Event()
+
+    async def query(request):
+        nonlocal queries
+        queries += 1
+        if queries > 2:
+            return web.Response(status=400)
+        return web.json_response({"device_keys": {}, "failures": {"example.org": {}}})
+
+    async def sync(request):
+        if request.query.get("since"):
+            await stop.wait()
+        return web.Response(body=response())
+
+    async with homeserver(sync, query=query) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        nio_client.olm.users_for_key_query.add(USER)
+        task = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            await session.quiesce()
+            await task
+            assert queries == 1
+            assert nio_client.olm.users_for_key_query == {USER}
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+    reopened = open_session(tmp_path)
+    try:
+        assert reopened.client.olm.users_for_key_query == {USER}
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

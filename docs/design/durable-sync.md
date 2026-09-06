@@ -170,6 +170,9 @@ ordered result. They must not resurrect authorization through a stale echo.
 already captured input while the consumer keeps draining. It does not fetch an
 extra final response. A completion batch remains replayable until acknowledged.
 The consumer runs its completion hook before acknowledging that batch.
+One maintenance pass drains queued sends and performs at most one upload,
+query, and claim. Successful partial federation responses retain missing work
+for a later pass; completion does not claim every remote device was reachable.
 
 `dispatch(record, event=None)` invokes an observation's registered nio callback
 outside storage transactions. It restores the committed event unless the
@@ -231,6 +234,10 @@ This explicitly relaxes the previous durable-receipt compatibility decision.
 Account data and authorization state remain durable. Callback failures do not
 roll back committed input. Auxiliary notification is at least once when retried;
 exactly-once external effects remain the application's responsibility.
+Fresh transient parsing, projection, and sequential callback awaits share a
+one-second budget per response. A callback can be cancelled at an await when
+that budget expires. Parser and callback failures are isolated and diagnostics
+identify counts and exception classes without event content.
 
 Use a lifetime exclusive filesystem lease for durable stores and ordinary-store
 coordination at opening. Do not stat the database on every SQL execution or row.

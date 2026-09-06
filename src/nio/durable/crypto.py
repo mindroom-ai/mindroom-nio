@@ -263,7 +263,9 @@ class CryptoMaintenance:
         self.capture()
         return request
 
-    def next_request(self) -> CryptoRequest | None:
+    def next_request(
+        self, *, completed: set[str] | frozenset[str] = frozenset()
+    ) -> CryptoRequest | None:
         self.store._require_transaction()
         if pending := self._pending():
             return pending[0]
@@ -271,16 +273,18 @@ class CryptoMaintenance:
         self._retain_messages()
         if self._messages:
             return self.enqueue_message(self._messages[0][1])
-        if olm.should_upload_keys:
+        if "upload" not in completed and olm.should_upload_keys:
             return self._retain_request("upload", Api.keys_upload("", olm.share_keys()))
-        if olm.users_for_key_query:
+        if "query" not in completed and olm.users_for_key_query:
             users = sorted(olm.users_for_key_query)
             # New sync invalidations are now distinguishable from this query.
             olm.users_for_key_query.clear()
             return self._retain_request(
                 "query", Api.keys_query("", users, self.store.cursor)
             )
-        if olm.wedged_devices or olm.key_request_devices_no_session:
+        if "claim" not in completed and (
+            olm.wedged_devices or olm.key_request_devices_no_session
+        ):
             return self._retain_request(
                 "claim",
                 Api.keys_claim(

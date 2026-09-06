@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, replace
+from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -18,7 +19,7 @@ from ..exceptions import LocalProtocolError
 from ..responses import ErrorResponse, SyncResponse
 from ..rooms import MatrixInvitedRoom
 from ..store import MatrixStore, SqliteStore
-from .codec import freeze_event
+from .codec import freeze_event, restore_event
 from .crypto import CryptoMaintenance
 from .model import (
     OwnMembership,
@@ -28,6 +29,7 @@ from .model import (
     encode_json,
     encode_records,
 )
+from .observations import TransientSections, deliver_transients
 from .projection import encode_member, encode_room, restore_room
 from .store import DurableStore
 from .transport import Transport
@@ -44,6 +46,7 @@ class DurableSyncConfig:
     max_batch_bytes: int = 2 * 1024 * 1024
     max_pending_bytes: int = 64 * 1024 * 1024
     sync_timeout_ms: int = 30_000
+    sync_filter: dict[str, Any] | str | None = None
     recovery_page_size: int = 100
     max_recovery_pages: int = 1_000
 
@@ -111,7 +114,7 @@ class DurableSync:
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
 
-    def _decode_response(self, body: bytes) -> SyncResponse:
+    def _decode_response(self, body: bytes) -> tuple[SyncResponse, TransientSections]:
         if len(body) > self.config.max_response_bytes:
             raise LocalProtocolError("sync response exceeds the durable input bound")
         try:
@@ -119,23 +122,23 @@ class DurableSync:
             if not isinstance(root, dict):
                 raise ValueError("response is not an object")
             # Transient observations never decide whether durable data is accepted.
-            root.pop("presence", None)
+            transients: TransientSections = [(None, root.pop("presence", {}))]
             rooms = root.get("rooms", {})
             if isinstance(rooms, dict):
                 for section in ("join", "leave"):
                     infos = rooms.get(section, {})
                     if isinstance(infos, dict):
-                        for info in infos.values():
+                        for room_id, info in infos.items():
                             if isinstance(info, dict):
-                                info.pop("ephemeral", None)
+                                transients.append((room_id, info.pop("ephemeral", {})))
             response = SyncResponse.from_dict(root)
             if not isinstance(response, SyncResponse) or not response.next_batch:
                 raise ValueError("invalid sync response")
-            return response
+            return response, transients
         except (ValueError, TypeError, KeyError) as error:
             raise LocalProtocolError("malformed durable sync response") from error
 
-    def _capture_response(self, body: bytes) -> SyncResponse:
+    def _capture_response(self, body: bytes) -> tuple[SyncResponse, TransientSections]:
         self._assert_active()
         response = self._decode_response(body)
         with self._store.transaction():
@@ -143,8 +146,9 @@ class DurableSync:
         return response
 
     async def _accept_response(self, body: bytes) -> None:
-        response = self._capture_response(body)
+        response, transients = self._capture_response(body)
         self._prepare_pending(response)
+        await deliver_transients(self.client, transients)
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
         metadata = self._metadata.setdefault(room_id, {})
@@ -162,7 +166,7 @@ class DurableSync:
         pending = self._store.input
         if pending is None or pending[1].get("phase") == "prepared":
             return
-        response = response or self._decode_response(pending[0])
+        response = response or self._decode_response(pending[0])[0]
         known_rooms = {
             room_id
             for room_id, metadata in self._metadata.items()
@@ -332,12 +336,54 @@ class DurableSync:
         self._assert_active()
         return self._store.cursor
 
+    @property
+    def progress_generation(self) -> int:
+        self._assert_active()
+        return self._store.database.execute_sql(
+            "SELECT MAX(acked_sequence, COALESCE((SELECT MAX(sequence) FROM NioDurableBatch),0)) "
+            "FROM NioDurableMeta WHERE id=1"
+        ).fetchone()[0]
+
+    async def dispatch(
+        self, record: SyncRecord, *, event: object | None = None
+    ) -> None:
+        """Invoke one committed observation's callback without acknowledging it."""
+        self._assert_active()
+        if record.route is None:
+            return
+        room = None
+        if record.room_id is not None:
+            room = self.client.rooms.get(
+                record.room_id
+            ) or self.client.invited_rooms.get(record.room_id)
+            if room is None:
+                members = {
+                    user_id: json.loads(member)
+                    for user_id, member in self._store.database.execute_sql(
+                        "SELECT user_id,member FROM NioDurableMember WHERE room_id=?",
+                        (record.room_id,),
+                    )
+                }
+                room = restore_room(
+                    record.room_id, self._metadata[record.room_id], members
+                )
+        value = self.client._dispatch_sync_item(
+            _SyncItem(
+                record.route,
+                event if event is not None else restore_event(record),
+                room,
+            )
+        )
+        if isawaitable(value):
+            await value
+
     async def _maintain_crypto(self) -> None:
         async with self._crypto_lock:
+            completed: set[str] = set()
             while True:
                 try:
                     with self._store.transaction():
-                        request = self._crypto.next_request()
+                        request = self._crypto.next_request(completed=completed)
                 except BaseException:
                     self.client._poison_ingestion()
                     self._store.close()
@@ -365,6 +411,7 @@ class DurableSync:
                     self._store.close()
                     raise
                 self._changed.set()
+                completed.add(request.kind)
 
     async def run(self) -> None:
         """Run one Classic source, draining committed batches between responses."""
@@ -393,7 +440,12 @@ class DurableSync:
                         self._store.publish((), completes_sync=True)
                     self._changed.set()
                     continue
-                method, path = Api.sync("", self.cursor, self.config.sync_timeout_ms)
+                method, path = Api.sync(
+                    "",
+                    self.cursor,
+                    self.config.sync_timeout_ms,
+                    self.config.sync_filter,
+                )
                 self._poll = asyncio.create_task(
                     self._transport.request(
                         method,
