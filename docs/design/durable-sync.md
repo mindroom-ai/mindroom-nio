@@ -388,6 +388,36 @@ projection and room checkpoint and requests a fresh initial window; that window
 establishes a future authorization baseline instead of recovering from discarded
 state. Reconciliation into invite retains only the invited-room projection.
 
+Room replacement is one lifecycle operation, not an assignment of an empty
+`MatrixRoom`. The durable session preserves known encryption while clearing the
+old joined projection, persisted members, recipient cache and outbound group.
+Local join does this even if the last committed membership was already join:
+that old observation does not prove an uninterrupted tenure. It also drops the
+room's Sliding proof/token and restarts the connection before accepting another
+window. A room with no retained projection cannot recover or become ready from
+an old checkpoint. A fresh initial/full-state response establishes only a future
+baseline. A new room whose encryption state is not yet known cannot send
+plaintext while waiting for that baseline; known encrypted rooms may use fresh
+recipient lookup. Recovery keeps its current input's pagination plan stable while
+draining; any checkpoint invalidation required by a tail reset happens after
+that input's Sliding commit.
+
+An invitation replaces the joined-room cache entry and its persisted member
+snapshot with the current invited projection. Joined member writes remain
+incremental; persisting the small invitation snapshot must not retain unrelated
+members from an earlier joined tenure. Classic's `leave` section covers both
+leave and ban. Reconciliation uses the final explicit own membership in state
+and timeline when available, falling back to the section only without that
+evidence. It reads the full captured tail before duplicate filtering.
+
+Recipient lookup has a separate, existing authority: a completed durable
+recipient cache permits ordinary encryption and group sharing without pretending
+the historical room projection has a complete member list. An absent or in-flight
+cache does not. Truncated HTTP bodies use the existing bounded connection retry
+policy; cancellation, authorization failures and response-size bounds retain
+their existing behavior. These corrections add no new persisted state, queue,
+public interface or guarantee about exact membership echoes.
+
 Exact attribution of the local membership event and counting every intermediate
 cycle within that uncertain interval are not guaranteed. Current state and
 authorization after the boundary matter; replaying those historical cycles as

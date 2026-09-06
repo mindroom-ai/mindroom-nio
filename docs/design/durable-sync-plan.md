@@ -654,3 +654,43 @@ All 25 manifested files verify, and standalone reanalysis reproduces the four
 cohorts and ABBA comparison exactly. The archive README and the consumer's
 `docs/dev/durable-ingestion-performance.md` describe fresh reproduction and the
 frozen companion harness dependency; raw logs, keys and databases are excluded.
+
+## Room lifecycle review corrections at `6143e8a`
+
+All six new reports reproduce. Ten real-boundary room lifecycle cases fail for
+plaintext sending after local join (including restart), stale Sliding proof,
+reinvitation before/after restart and explicit Classic bans. Independent HTTP
+tests reproduce the recipient-cache encryption rejection and truncated-body
+retry omission. Correct the existing owners described in the contract; preserve
+the shared interpreter, single transaction owner and deliberate membership limits.
+
+- [ ] In `durable/client.py` and `durable/recovery.py`, consolidate joined-room
+  reset, retaining encryption and invalidating old members/recipients/group state.
+  In `durable/sliding.py`, own checkpoint invalidation and reuse it for local HTTP
+  outcomes and end-of-input reconciliation. Regression: local join followed by
+  a limited or ordinary delta cannot recover/authorize from the removed snapshot.
+  At `client/async_client.py`'s send boundary, reject plaintext before a new
+  room's state is established; test that HTTP sees no message until fresh state.
+- [ ] In `durable/processor.py` and the existing room persistence boundary, make
+  an invited projection replace its joined cache and member rows. Test both
+  transports with and without a preceding local leave, then reopen the store.
+- [ ] In `durable/recovery.py`, preserve final explicit own membership before
+  filtering captured timeline duplicates. Test bans in state and timeline after
+  local join; persisted and emitted membership must both remain ban after restart.
+- [ ] In `client/base_client.py`, allow `encrypt()` to use a completed durable
+  recipient cache. Test actual lookup/query/claim/share/send and peer decryption;
+  preserve rejection for missing/in-flight cache and ordinary incomplete rooms.
+- [ ] In `durable/transport.py`, include `ClientPayloadError` in the existing
+  retry tuple. Test a truncated real HTTP response followed by success; retain
+  bounded exhaustion and cancellation behavior.
+- [ ] Run focused regressions, full producer suite, typing and hooks; review
+  the combined lifecycle change and report actual production deltas. Rebuild
+  and exactly pin the consumer wheel, run affected consumer checks, then commit
+  and push. Existing capacity measurements retain their original source IDs;
+  repeat live qualification only for a concrete new performance concern.
+
+Verification commands: `uv run --locked pytest --benchmark-disable`,
+`MYPYPATH=src uv run --no-sync mypy -p nio --warn-redundant-casts --no-incremental`,
+and `uv run --no-sync pre-commit run --all-files`. Keep focused red/green logs in
+the persistent `capacity/durable-sync-kernel/review-room-lifecycle-20260906`
+evidence directory. No new benchmark campaign, serializer or database redesign.
