@@ -291,3 +291,80 @@ async def test_local_leave_waits_through_old_joined_state_and_accepts_standalone
         finally:
             await session.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay_http", [False, True])
+async def test_local_command_discards_completed_poll_before_acceptance(
+    tmp_path, delay_http
+):
+    import json
+
+    from .recovery_test import baseline, member
+
+    session = open_session(tmp_path)
+    await baseline(session)
+    poll_finished = asyncio.Event()
+    http_started = asyncio.Event()
+    release_http = asyncio.Event()
+    stop_poll = asyncio.Event()
+    polls = 0
+
+    async def request(_method, path, *_args, **_kwargs):
+        nonlocal polls
+        if "/sync" in path:
+            polls += 1
+            if polls > 1:
+                await stop_poll.wait()
+            body = json.loads(response(token="before-local-http", messages=0))
+            body["rooms"]["join"][ROOM]["timeline"]["events"] = [
+                member("$pre-command-leave", "leave")
+            ]
+            poll_finished.set()
+            return json.dumps(body).encode()
+        http_started.set()
+        if delay_http:
+            await release_http.wait()
+        return b"{}"
+
+    session._transport.request = request
+    session._maintain_crypto = lambda: asyncio.sleep(0)
+
+    async def local():
+        # Woken by the poll task before its awaiting runner gets CPU again.
+        await poll_finished.wait()
+        return await session.change_membership(
+            operation_id=OPERATION,
+            room_id=ROOM,
+            previous_membership="join",
+            previous_epoch=0,
+            current_membership="leave",
+        )
+
+    command = asyncio.create_task(local())
+    runner = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(http_started.wait(), 5)
+        await asyncio.sleep(0)
+        assert session.cursor == "s1"
+        assert session._store.input is None
+        assert session._metadata[ROOM]["membership"] == (
+            "join" if delay_http else "leave"
+        )
+        release_http.set()
+        assert await asyncio.wait_for(command, 5)
+        batch = await session.next_batch()
+        assert [
+            (r.membership.source, r.membership.current_epoch) for r in batch.records
+        ] == [("local", 1)]
+        await session.ack(batch)
+        assert not session._read_local_intent().get("observed")
+        await session.quiesce()
+        await runner
+    finally:
+        release_http.set()
+        stop_poll.set()
+        command.cancel()
+        await asyncio.gather(command, return_exceptions=True)
+        await session.close()
+        await asyncio.gather(runner, return_exceptions=True)

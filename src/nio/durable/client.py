@@ -397,6 +397,10 @@ class DurableSync:
                 )
                 try:
                     body = await self._poll
+                    if self._poll is None:
+                        # Local work took ownership after this poll completed.
+                        # Keep the cursor so its unaccepted interval is replayed.
+                        continue
                 except asyncio.CancelledError:
                     # An owned poll can be interrupted for local work. External
                     # cancellation of the runner still propagates normally.
@@ -480,6 +484,7 @@ class DurableSync:
             self._source_ready.clear()
             if self._poll is not None:
                 self._poll.cancel()
+                self._poll = None
             try:
                 while self._store.input is not None:
                     self._changed.clear()
