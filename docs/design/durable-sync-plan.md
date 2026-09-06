@@ -235,3 +235,46 @@ capacity workspace and update both existing PR descriptions with relative paths.
   Against main `5b6de3bc`, it is +3,856/-6,809 (net -2,953). Task 6 alone removes
   20,613 net production lines from `91a513c`. These are source counts, not
   throughput measurements; integrated workload acceptance remains Task 7.
+
+## Initial replacement measurements
+
+At Nio `34699bf` and MindRoom `72732c22b`, full suites passed: 689 passed/3
+skipped and 15,514 passed/22 skipped respectively. Nio mypy and MindRoom ty were
+clean, as were repository hooks. Installed wheel files matched committed source.
+Independent review found local-membership echo ownership defects in both layers;
+fixes and final integrated qualification remain required.
+
+Three sequential process runs per case compared capture, preparation, batch read
+and acknowledgement against the published Nio implementation at `9df7aa9`.
+Room setup, input generation, crypto maintenance and HTTP were outside timing.
+Fixtures used 200 events/50 members and 1,000 events/500 members; encrypted cases
+used real Megolm decryption. Counts were collected separately from timing.
+
+| Events | Payload | Old NORMAL median | New NORMAL median | New FULL median |
+| --- | --- | ---: | ---: | ---: |
+| 200 | Plain | 196.7 ms | 17.1 ms | 25.1 ms |
+| 200 | Encrypted | 262.7 ms | 52.9 ms | 61.5 ms |
+| 1,000 | Plain | 1,736.7 ms | 76.7 ms | 87.8 ms |
+| 1,000 | Encrypted | 2,107.8 ms | 270.4 ms | 280.9 ms |
+
+For 200 plain events, SQL commits fell from 404 to 3, selects from 3,235 to 11,
+and JSON decodes from 1,854 to 3. Encrypted decodes fell from 2,854 to 203. The new
+adapter made no member-row writes for unchanged membership. These are
+engine measurements, not end-to-end reply times. Select FULL for the durable
+adapter; retain stdlib JSON and no new writer. PR57's broad idea of fewer commits
+is already achieved by the batch boundary; its retired-engine patch is not used.
+
+First uninstrumented 200-root controls used the candidate wheel and the unchanged
+180-second reply deadline, 45-second overlap minimum, two-second health timeout,
+all-principal reaction fence and drain checks. Tuwunel completed 200 replies with
+median/p95 71.754/81.323 seconds, but failed overlap at 41.207 seconds. Synapse
+completed 200 with 75.954/81.870 seconds and passed all criteria (50.008-second
+overlap). Both had no loop-stall diagnostics and zero Nio input/batches or journal/
+delivery backlog after shutdown. The synthetic stream itself lasts about 60
+seconds. These initial NORMAL controls are not final acceptance evidence.
+
+Final work: reconcile local echoes in the single producer intent, remove typed
+consumer echo debt, use FULL, and investigate the bounded startup preparation
+limit against the remaining Tuwunel overlap failure. Keep acceptance thresholds
+unchanged. Rerun real local/restart/crypto regressions and integrated controls on
+the final installed wheel before updating pins and pushing.

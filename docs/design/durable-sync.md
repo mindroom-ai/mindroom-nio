@@ -264,11 +264,18 @@ unmerged prototype formats are unsupported. Normal schema version, identity,
 foreign-key, and decoded-data validation remain. Import without `fcntl` works;
 using ownership without supported locking fails clearly.
 
-SQLite WAL with `synchronous=NORMAL` initially retains the established process
-crash contract. Compare FULL under the batched workload before the final setting
-is selected; document the measured tradeoff. Until then do not claim power-loss
-durability. No new writer thread, database queue, serializer dependency, or
-generic retry framework is introduced. Whole-response JSON is decoded once per
+Durable SQLite uses WAL with `synchronous=FULL`. Measured batch preparation,
+delivery and acknowledgement for 200 encrypted events took 52.9 ms with NORMAL
+and 61.5 ms with FULL; 1,000 took 270.4 ms and 280.9 ms. That small cost buys
+SQLite's commit synchronization rather than an application protocol. According
+to [SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
+WAL/FULL preserves committed transactions across power loss when the filesystem
+and storage honor synchronization. Process-kill tests verify crash atomicity;
+they do not simulate hardware failure. Application handoff requires its journal
+to synchronize admission before acknowledging nio; MindRoom already uses FULL
+for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
+consumer databases. No new writer thread, database queue, serializer dependency,
+or generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 
@@ -319,3 +326,28 @@ ends live tenure at its event, and rejoin resets the room before the shared
 iterator handles that event, clearing stale members. A section-only departure
 follows its final timeline event. OwnMembership remains metadata on its original
 state, timeline, or lifecycle observation; it does not create duplicate carriers.
+
+## Local membership has one authority
+
+A successful local join/leave immediately publishes its committed lifecycle
+outcome, preserving immediate departure fencing. Its single retained intent stays
+until that outcome is acknowledged and a subsequently committed authoritative
+sync boundary observes the operation. A later local command waits for this
+boundary, even after the previous command returned success. At most one local
+operation is unobserved; no per-room echo queue or counter is introduced. If the
+server is unavailable, the next command waits for sync progress or its caller
+cancels; it must not bypass the boundary.
+
+Nio reconciles that outstanding operation's reported history. State before its
+echo cannot revive authorization or produce a second effective departure. The
+existing history/baseline rules keep the uncertain interval non-actionable. Once
+the operation is observed, later genuine transitions retain their normal ordered
+epoch changes. Keep the intent across restart between local acknowledgement and
+observation. Quiesce still does not fetch an extra final response: an acknowledged
+intent awaiting observation can remain for reopening, without blocking shutdown.
+
+MindRoom applies the producer's explicit prior/current membership and epoch once
+inside batch admission. It must not create or consume legacy departure-echo debt
+for these typed outcomes. Other callers retain their own documented behavior.
+This removes competing authority at the boundary; consumer reviewers must not
+reintroduce echo inference for already normalized producer transitions.
