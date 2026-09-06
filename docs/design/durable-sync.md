@@ -362,3 +362,33 @@ inside batch admission. It must not create or consume legacy departure-echo debt
 for these typed outcomes. Other callers retain their own documented behavior.
 This removes competing authority at the boundary; consumer reviewers must not
 reintroduce echo inference for already normalized producer transitions.
+
+
+## Long-term scale direction
+
+The application goal is more than 1,000 concurrent replies.
+This is a direction for future qualification, not a guarantee established by a
+1,000-event local preparation benchmark or the current 200-reply live controls.
+Burst startup, sustained streaming, history catch-up, memory and health latency
+need separate measurements on specified hardware and model timing.
+The adapter's batch bounds constrain processing units, not the number of active
+application replies; application scheduling stays with the consumer.
+
+A follow-up 200-root Tuwunel investigation found no sufficient startup improvement
+from batching consumer writer handoffs, grouping consumer commits, excluding
+already-owned pending payloads, or combining producer capture and preparation
+commits. The producer trial changed initial visibility spread from 22.539 to
+21.931 seconds in one run and still missed the unchanged overlap requirement.
+No production change is adopted from these experiments. Full-run sampling found
+Nio's synchronous commits on the main thread, but that is a blocking location,
+not proof of the exact startup critical path. The remaining limit is unresolved.
+The consumer's root-preparation scheduling document records the comparisons.
+
+Keep the existing ownership split and FULL durability while measuring that path.
+A new writer, scheduler, persistent queue, codec dependency or weaker guarantee
+requires its own evidence; the scale ambition alone does not justify one.
+
+Documentation follow-up verification: 700 tests passed with three skipped,
+mypy reported no issues in 58 source files, and all repository hooks passed.
+The consumer suite passed 15,522 tests with 22 skipped; its hooks also passed.
+Production code and tests are unchanged in both repositories.
