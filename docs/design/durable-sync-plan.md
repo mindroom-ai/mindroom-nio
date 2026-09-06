@@ -477,3 +477,20 @@ The consumer's `docs/dev/ledger-write-ownership.md` records the controls, reject
 The largest combined category is delivery/outbox work (4.407 seconds of the 13.357-second traced startup); admission, ledger writes, hydration and settlement account for the rest.
 This identifies which operations occupy the writer, while the exact low-level synchronization owners remain partly unresolved.
 No Nio production change or weaker durability guarantee follows from this trial.
+
+## Consumer SQL replay and GIL attribution
+
+The next investigation uses MindRoom `e276982fdbd3f58b8d471376c417767654819da4` and Nio `ce18a1fed0a592b93b789de4480ac3e61e8c3145` with unchanged production source.
+Two verified 200-root traces compare the same startup SQL operations live and in isolated FULL-durability replay: 11.439/11.130 seconds in the live worker versus 1.409/1.340 seconds for direct SQL replay.
+Replay verifies fetched results and final logical database contents; it omits application computation and concurrent readers, so this ratio is not an achievable application speedup.
+Native counters in the second trace record 98,212 GIL-acquisition condition waits totaling 7.693 seconds and 1,379 fsync calls totaling 2.298 seconds; result propagation through the event loop adds about three seconds.
+Native timings include scheduling/CPU and slightly wider bookkeeping; they overlap thread CPU and must not be added as an exact partition.
+
+A fresh normal control passes every original predicate with 11.983 seconds of initial reply spread, 49.873 seconds of full overlap and 75.561-second completion p95.
+A diagnostic event-loop writer gives 11.768 seconds of initial spread but a worse 76.847-second completion p95; it also blocks a scheduled callback for 2.212 seconds under real external SQLite contention.
+That policy is rejected; keep the existing consumer writer, FULL durability and eight preparations.
+No producer/consumer production code or dependency changes in this investigation, and 1,000 concurrent replies remain unqualified.
+
+MindRoom's `docs/dev/durable-ingestion-performance.md` is the evidence entry point, with a tracked JSON measurement summary, a transaction-boundary map in `docs/dev/ledger-write-ownership.md`, and a persistent checksummed reproduction package.
+The package retains historical probe variants, helper scripts, native symbols and metadata for portable re-analysis; fresh SQL replay requires regenerating the synthetic workload because SQL parameters/results were intentionally not retained.
+It also indexes the rejected query, pool-size, thread-switch and inline-writer experiments so they are not repeated without new evidence.
