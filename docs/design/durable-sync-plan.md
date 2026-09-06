@@ -683,7 +683,7 @@ the shared interpreter, single transaction owner and deliberate membership limit
 - [x] In `durable/transport.py`, include `ClientPayloadError` in the existing
   retry tuple. Test a truncated real HTTP response followed by success; retain
   bounded exhaustion and cancellation behavior.
-- [ ] Run focused regressions, full producer suite, typing and hooks; review
+- [x] Run focused regressions, full producer suite, typing and hooks; review
   the combined lifecycle change and report actual production deltas. Rebuild
   and exactly pin the consumer wheel, run affected consumer checks, then commit
   and push. Existing capacity measurements retain their original source IDs;
@@ -708,4 +708,10 @@ No persisted schema, public API, queue or new guarantee was added.
 Producer verification after the final cleanup: 879 passed, three skipped in
 71.72 seconds; zero mypy errors across 60 source files; all repository hooks
 pass. Scoped re-review confirmed the cleanup preserves boundary ordering.
-Consumer pinning and integration verification follow this producer commit.
+Consumer `pyproject.toml` and lock exactly pin producer
+`cb7c55da1ffca2f1cdf0733968b208ffe082b397`. The rebuilt wheel matches all 60
+producer Python files; 287 affected consumer tests pass in 35.45 seconds and
+all consumer hooks pass. Consumer production source remains unchanged. Later
+documentation commits do not require another wheel pin. Both repositories retain
+the qualification record; no additional performance claim follows from these
+correctness changes.
