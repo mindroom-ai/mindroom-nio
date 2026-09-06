@@ -15,7 +15,7 @@ from .client_test import ROOM, USER, client, open_session, response
 
 
 @asynccontextmanager
-async def homeserver(sync, *, query=None):
+async def homeserver(sync, *, query=None, membership=None):
     requests = []
 
     async def handle(request):
@@ -30,6 +30,8 @@ async def homeserver(sync, *, query=None):
             if query is not None:
                 return await query(request)
             return web.json_response({"device_keys": {USER: {}}})
+        if membership is not None:
+            return await membership(request)
         raise AssertionError(request.path)
 
     application = web.Application()
@@ -216,3 +218,32 @@ async def test_rejoin_discards_old_members_and_does_not_mark_initial_tail_live(
         assert set(reopened.client.rooms[ROOM].users) == {USER}
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_waits_for_completion_acknowledgement(tmp_path):
+    async def sync(request):
+        raise AssertionError("quiesce must not start another source request")
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await session._accept_response(response())
+        runner = asyncio.create_task(session.run())
+        stopping = asyncio.create_task(session.quiesce())
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    await session.wait_for_work()
+                    batch = await session.next_batch()
+                    if batch.completes_sync:
+                        break
+                    await session.ack(batch)
+            assert not runner.done()
+            await session.ack(batch)
+            await stopping
+            await runner
+        finally:
+            await session.close()
+            await nio_client.close()

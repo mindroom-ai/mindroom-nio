@@ -168,7 +168,8 @@ ordered result. They must not resurrect authorization through a stale echo.
 
 `quiesce()` cancels an unaccepted long poll and stops new polls, then finishes
 already captured input while the consumer keeps draining. It does not fetch an
-extra final response. A completion batch remains replayable until acknowledged.
+extra final response. It waits for prepared batches, including completion and
+local membership outcomes, to be acknowledged before the runner returns.
 The consumer runs its completion hook before acknowledging that batch.
 One maintenance pass drains queued sends and performs at most one upload,
 query, and claim. Successful partial federation responses retain missing work

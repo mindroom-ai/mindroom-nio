@@ -17,7 +17,7 @@ from ..event_provenance import TimelineEventProvenance
 from ..events import InviteMemberEvent, RoomMemberEvent
 from ..exceptions import LocalProtocolError
 from ..responses import ErrorResponse, SyncResponse
-from ..rooms import MatrixInvitedRoom
+from ..rooms import MatrixInvitedRoom, MatrixRoom
 from ..store import MatrixStore, SqliteStore
 from .codec import freeze_event, restore_event
 from .crypto import CryptoMaintenance
@@ -32,11 +32,10 @@ from .model import (
 from .observations import TransientSections, deliver_transients
 from .projection import encode_member, encode_room, restore_room
 from .store import DurableStore
-from .transport import Transport
+from .transport import HttpError, Transport
 
 if TYPE_CHECKING:
     from ..client.async_client import AsyncClient
-    from ..rooms import MatrixRoom
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +81,9 @@ class DurableSync:
         self._poll: asyncio.Task[bytes] | None = None
         self._quiescing = False
         self._crypto_lock = asyncio.Lock()
+        self._local_lock = asyncio.Lock()
+        self._source_ready = asyncio.Event()
+        self._source_ready.set()
         self._transport = Transport(client, config.max_response_bytes)
         self._crypto = CryptoMaintenance(client, store)
         self._crypto.restore()
@@ -424,8 +426,6 @@ class DurableSync:
         try:
             while not self._closed:
                 self._assert_active()
-                if self._quiescing and self._store.input is None:
-                    return
                 if self._store.has_batches():
                     self._changed.clear()
                     await self._changed.wait()
@@ -440,6 +440,20 @@ class DurableSync:
                         self._store.publish((), completes_sync=True)
                     self._changed.set()
                     continue
+                local = self._read_local_intent()
+                if (
+                    local is not None
+                    and "sequence" not in local
+                    and not self._local_lock.locked()
+                ):
+                    async with self._local_lock:
+                        await self._apply_local_intent(local)
+                    continue
+                await self._source_ready.wait()
+                if self._store.has_batches():
+                    continue
+                if self._quiescing or self._closed:
+                    return
                 method, path = Api.sync(
                     "",
                     self.cursor,
@@ -457,7 +471,9 @@ class DurableSync:
                     body = await self._poll
                 except asyncio.CancelledError:
                     if self._quiescing and not running.cancelling():
-                        return
+                        continue
+                    if self._local_lock.locked() and not running.cancelling():
+                        continue
                     raise
                 finally:
                     self._poll = None
@@ -465,6 +481,164 @@ class DurableSync:
         finally:
             self._running = None
             self._changed.set()
+
+    def _read_local_intent(self) -> dict[str, Any] | None:
+        row = self._store.database.execute_sql(
+            "SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'"
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _local_position_matches(self, intent: dict[str, Any]) -> bool:
+        metadata = self._metadata.get(intent["room_id"], {})
+        return (
+            "join" if metadata.get("membership") == "join" else "leave",
+            metadata.get("membership_epoch", 0),
+        ) == (intent["previous_membership"], intent["previous_epoch"])
+
+    async def wait_for_membership_idle(self) -> None:
+        """Wait for the preceding local outcome to reach application acknowledgement."""
+        self._assert_active()
+        while intent := self._read_local_intent():
+            if "sequence" in intent:
+                acked = self._store.database.execute_sql(
+                    "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
+                ).fetchone()[0]
+                if intent["sequence"] <= acked:
+                    with self._store.transaction():
+                        self._store.database.execute_sql(
+                            "DELETE FROM NioDurableCrypto WHERE kind='membership'"
+                        )
+                    return
+            self._changed.clear()
+            await self._changed.wait()
+            self._assert_active()
+
+    async def change_membership(
+        self,
+        *,
+        operation_id: UUID,
+        room_id: str,
+        previous_membership: str | None,
+        previous_epoch: int,
+        current_membership: str,
+    ) -> bool:
+        """Retain a local join/leave before HTTP; consumer draining must continue."""
+        self._assert_active()
+        if (
+            not room_id
+            or current_membership not in ("join", "leave")
+            or previous_membership not in ("join", "leave", None)
+            or previous_epoch < 0
+        ):
+            raise ValueError("invalid local membership transition")
+        intent = {
+            "operation_id": str(operation_id),
+            "room_id": room_id,
+            "previous_membership": previous_membership or "leave",
+            "previous_epoch": previous_epoch,
+            "current_membership": current_membership,
+        }
+        await self.wait_for_membership_idle()
+        async with self._local_lock:
+            if not self._local_position_matches(intent):
+                return False
+            if self._read_local_intent() is not None:
+                raise LocalProtocolError("another local membership command is pending")
+            with self._store.transaction():
+                self._store.database.execute_sql(
+                    "INSERT INTO NioDurableCrypto(kind,key,body) VALUES('membership','current',?)",
+                    (encode_json(intent),),
+                )
+            self._source_ready.clear()
+            if self._poll is not None:
+                self._poll.cancel()
+            try:
+                while self._store.input is not None:
+                    self._changed.clear()
+                    await self._changed.wait()
+                    self._assert_active()
+                return await self._apply_local_intent(intent)
+            finally:
+                self._source_ready.set()
+                self._changed.set()
+
+    async def _apply_local_intent(self, intent: dict[str, Any]) -> bool:
+        if not self._local_position_matches(intent):
+            with self._store.transaction():
+                self._store.database.execute_sql(
+                    "DELETE FROM NioDurableCrypto WHERE kind='membership'"
+                )
+            self._changed.set()
+            return False
+        room_id = intent["room_id"]
+        target = intent["current_membership"]
+        method, path = (
+            Api.join("", room_id) if target == "join" else Api.room_leave("", room_id)
+        )
+        try:
+            await self._transport.request(method, path, "{}")
+        except HttpError:
+            with self._store.transaction():
+                self._store.database.execute_sql(
+                    "DELETE FROM NioDurableCrypto WHERE kind='membership'"
+                )
+            self._changed.set()
+            return False
+        self._assert_active()
+        try:
+            with self._store.transaction():
+                previous, epoch = (
+                    intent["previous_membership"],
+                    intent["previous_epoch"],
+                )
+                change = OwnMembership(
+                    previous,
+                    target,
+                    epoch,
+                    epoch + (previous == "join" and target == "leave"),
+                    "local",
+                )
+                room = self.client.rooms.get(room_id) or MatrixRoom(
+                    room_id, self.client.user_id
+                )
+                self._metadata.setdefault(room_id, {}).update(
+                    membership=target, membership_epoch=change.current_epoch
+                )
+                if target == "join":
+                    room = MatrixRoom(room_id, self.client.user_id)
+                    self.client.rooms[room_id] = room
+                    self._store.database.execute_sql(
+                        "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+                    )
+                else:
+                    self.client.rooms.pop(room_id, None)
+                    if self.client.olm:
+                        self.client.olm.outbound_group_sessions.pop(room_id, None)
+                self.client.invited_rooms.pop(room_id, None)
+                self._save_rooms({room_id: room}, set())
+                batch = self._store.publish(
+                    (
+                        SyncRecord(
+                            RecordKind.ROOM_LIFECYCLE,
+                            room_id,
+                            {"membership": target},
+                            membership=change,
+                            membership_epoch=change.current_epoch,
+                        ),
+                    )
+                )
+                intent["sequence"] = batch.sequence
+                self._store.database.execute_sql(
+                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
+                    (encode_json(intent),),
+                )
+            self._changed.set()
+            return True
+        except BaseException:
+            self.client._poison_ingestion()
+            self._store.close()
+            self._changed.set()
+            raise
 
     async def quiesce(self) -> None:
         """Stop polling; finish captured input while the consumer keeps draining."""
