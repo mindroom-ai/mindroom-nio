@@ -4,7 +4,9 @@
 > [Durable Classic sync](durable-sync.md), including its explicit API and scope
 > changes. Requirements below apply only where the replacement retains them.
 
-Status: accepted for implementation, 2026-09-05.
+Status: historical, superseded by [Durable Classic sync](durable-sync.md),
+2026-09-06. The prototype engine and its interfaces have been removed;
+conflicting guarantees below do not apply to the replacement.
 
 This document controls the simplification of PR #55. It supersedes conflicting
 requirements in the August durable-ingestion design and plan, especially the

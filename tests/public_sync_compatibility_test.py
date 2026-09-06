@@ -5,8 +5,6 @@ import importlib.util
 import json
 import re
 import sqlite3
-import subprocess
-import sys
 
 import nio
 import pytest
@@ -159,7 +157,7 @@ def test_retained_public_sync_method_signatures_match_upstream_boundary() -> Non
 
 
 def test_fork_only_public_sync_surface_is_absent() -> None:
-    """Durable Sliding stays private under nio.ingest, not on desktop AsyncClient."""
+    """Sliding Sync is unsupported by the Classic durable adapter."""
     assert (
         tuple(
             name
@@ -558,37 +556,12 @@ def test_existing_desktop_store_retains_inert_recovery_tables(tmp_path) -> None:
     assert after_rows == before_rows
 
 
-def test_ingestion_preflight_imports_without_retired_recovery_models() -> None:
-    """Historical topology authentication does not depend on retired ORM types."""
-    program = r"""
-import importlib
-import sys
-
-import nio.store.models as models
-
-for name in (
-    "PendingTimelineEvents",
-    "SlidingWindowTokens",
-    "SyncRecoveryAbandonedRooms",
-    "SyncRecoveryGaps",
-):
-    if hasattr(models, name):
-        delattr(models, name)
-sys.modules.pop("nio.store._sync_journal_preflight", None)
-importlib.import_module("nio.store._sync_journal_preflight")
-"""
-
-    subprocess.run(
-        [sys.executable, "-c", program],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
 def test_retired_recovery_modules_and_owners_are_absent() -> None:
     """The superseded recovery engine has no importable or executable owner."""
     modules = (
+        "nio.ingest",
+        "nio.store.sync_journal",
+        "nio.store._ingestion_store_owner",
         "nio.client.sliding_membership",
         "nio.client.sync_recovery",
         "nio.client.sync_reset_fence",

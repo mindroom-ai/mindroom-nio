@@ -57,7 +57,7 @@ class Recovery:
         ]
 
     def _poison(self) -> None:
-        self.session.client._poison_ingestion()
+        self.session.client._dispose()
         self.session._store.close()
         self.session._changed.set()
 

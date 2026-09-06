@@ -2,12 +2,15 @@
 
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 import vodozemac
 from aiohttp import web
 from unpaddedbase64 import decode_base64
 
+from nio.crypto import Olm, TrustState
+from nio.store import SqliteMemoryStore
 from nio.durable.codec import restore_event
 from nio.events import RoomKeyRequest
 from nio.event_builders import ToDeviceMessage
@@ -446,7 +449,7 @@ async def test_approval_wakes_idle_long_poll_to_send_key(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revoke", ["blacklist", "membership"])
+@pytest.mark.parametrize("revoke", ["blacklist", "membership", "rotation"])
 async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revoke):
     recipient = "@peer:example.org"
 
@@ -457,9 +460,18 @@ async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revo
             )
         return web.json_response({})
 
-    async with homeserver(None, membership=http) as (url, _):
+    rotated = Olm(recipient, "OTHER", SqliteMemoryStore(recipient, "OTHER"))
+    rotated_keys = rotated.share_keys()["device_keys"]
+
+    async def query(_request):
+        return web.json_response(
+            {"device_keys": {recipient: {"OTHER": rotated_keys}}, "failures": {}}
+        )
+
+    async with homeserver(None, membership=http, query=query) as (url, _):
         nio_client = client()
         nio_client.homeserver = url
+        nio_client.config = replace(nio_client.config, replace_rotated_device_keys=True)
         session = open_session(tmp_path, nio_client)
         with session._store.transaction():
             publish_account(nio_client.olm)
@@ -476,6 +488,13 @@ async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revo
             assert recipient not in room.users
             if revoke == "blacklist":
                 assert nio_client.blacklist_device(device)
+            elif revoke == "rotation":
+                nio_client.olm.users_for_key_query.add(recipient)
+                response = await nio_client.keys_query()
+                assert "OTHER" in response.changed[recipient]
+                current = nio_client.device_store[recipient]["OTHER"]
+                assert current.ed25519 == rotated_keys["keys"]["ed25519:OTHER"]
+                assert current.trust_state is TrustState.unset
             else:
                 # Cached current recipient is absent from the historical projection.
                 # Ordinary remove_member therefore reports no local change.

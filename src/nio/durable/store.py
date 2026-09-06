@@ -22,35 +22,8 @@ from ..store import (
     MatrixStore,
     SqliteStore,
 )
+from ..store._sqlite_lease import FileLease
 from .model import SyncBatch, SyncRecord, decode_records, encode_json, encode_records
-
-
-class _Lease:
-    """Opening-time coordination; live filesystem replacement is unsupported."""
-
-    def __init__(self, database_path: Path) -> None:
-        try:
-            import fcntl
-        except ImportError as error:
-            raise LocalProtocolError(
-                "store filesystem ownership requires fcntl support"
-            ) from error
-        path = Path(f"{database_path.resolve()}.ingest.lock")
-        self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException as error:
-            self.close()
-            if isinstance(error, BlockingIOError):
-                raise LocalProtocolError(
-                    "store lifetime lease is already held"
-                ) from error
-            raise
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
 
 
 class _Database(SqliteDatabase):
@@ -109,7 +82,7 @@ class DurableStore:
         self.path = store_path / (database_name or f"{user_id}_{device_id}.db")
         self._closed = False
         self._pid = os.getpid()
-        self._lease = _Lease(self.path)
+        self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
             pragmas={"foreign_keys": 1, "secure_delete": "fast"},
@@ -118,7 +91,7 @@ class DurableStore:
         try:
             self.database.connect()
             tables = set(self.database.get_tables())
-            if "NioIngestMeta" in tables:
+            if "nioingestmeta" in {table.lower() for table in tables}:
                 raise LocalProtocolError(
                     "unmerged ingestion format cannot open as durable sync"
                 )

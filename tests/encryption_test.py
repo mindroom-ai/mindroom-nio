@@ -40,7 +40,7 @@ from nio.events import (
     UnknownToDeviceEvent,
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
-from nio.ingest.config import ClassicSourceConfig
+from nio.durable.store import DurableStore
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
 from nio.store import (
     DefaultStore,
@@ -50,7 +50,6 @@ from nio.store import (
     SqliteMemoryStore,
     SqliteStore,
 )
-import nio.store.sync_journal as bootstrap_api
 
 AliceId = "@alice:example.org"
 Alice_device = "ALDEVICE"
@@ -617,29 +616,26 @@ class TestClass:
         sidecars_before = tuple(
             path.read_bytes() if path.exists() else None for path in sidecar_paths
         )
-        bootstrap = bootstrap_api._open_configured_ingestion_store(
+        owner = DurableStore(
             Path(self.store_path),
             source_store_class=DefaultStore,
-            owned_store_class=SqliteStore,
-            source=ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}"),
-            account_id=AliceId,
+            user_id=AliceId,
             device_id=Alice_device,
-            consumer_generation=UUID("22222222-2222-4222-8222-222222222222"),
+            consumer_id=UUID("22222222-2222-4222-8222-222222222222"),
             pickle_key=PICKLE_KEY,
             database_name=database_name,
         )
         try:
-            store = bootstrap._open_owned_store_candidate()._store_for_attachment()
+            store = owner.matrix
             alice = Olm(
                 AliceId,
                 Alice_device,
                 store,
                 replace_rotated_device_keys=True,
             )
-            owner = bootstrap._journal._owner
 
             def snapshot():
-                with owner.read():
+                with owner.transaction():
                     return tuple(
                         tuple(row)
                         for row in store.database.execute_sql(
@@ -677,11 +673,11 @@ class TestClass:
 
             if outcome == "rollback":
                 with pytest.raises(InjectedFailure):
-                    with owner.e2ee_write():
+                    with owner.transaction():
                         alice.handle_response(rotated)
                 assert snapshot() == before
             else:
-                with owner.e2ee_write():
+                with owner.transaction():
                     alice.handle_response(rotated)
                 after = snapshot()
                 assert after != before
@@ -699,7 +695,7 @@ class TestClass:
                 == sidecars_before
             )
         finally:
-            bootstrap.close()
+            owner.close()
 
     def test_olm_inbound_session(self, monkeypatch):
         def mocksave(self):

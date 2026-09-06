@@ -59,7 +59,7 @@ class OutboundCrypto:
             with self.store.transaction():
                 yield
         except BaseException:
-            self.client._poison_ingestion()
+            self.client._dispose()
             self.store.close()
             self.session._changed.set()
             raise

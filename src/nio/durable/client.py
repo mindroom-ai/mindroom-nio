@@ -115,7 +115,7 @@ class DurableSync:
                 self.client.rooms[room_id] = room
 
     def _assert_active(self) -> None:
-        self.client._assert_ingestion_not_poisoned()
+        self.client._assert_not_disposed()
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
 
@@ -542,7 +542,7 @@ class DurableSync:
             self._changed.set()
             return True
         except BaseException:
-            self.client._poison_ingestion()
+            self.client._dispose()
             self._store.close()
             self._changed.set()
             raise
@@ -582,7 +582,7 @@ class DurableSync:
                     pass
         finally:
             self._store.close()
-            self.client._poison_ingestion()
+            self.client._dispose()
             self._changed.set()
 
 
@@ -610,7 +610,7 @@ def open_durable_sync(
         raise LocalProtocolError(
             "durable sync requires a fresh client without a loaded store"
         )
-    client._assert_ingestion_not_poisoned()
+    client._assert_not_disposed()
     store = DurableStore(
         store_path,
         user_id=client.user_id,
@@ -639,5 +639,5 @@ def open_durable_sync(
         return session
     except BaseException:
         store.close()
-        client._poison_ingestion()
+        client._dispose()
         raise

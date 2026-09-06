@@ -158,6 +158,13 @@ async def receive(mode, path):
     await session._accept_response(body)
     if mode == "after_prepare":
         kill_self()
+    if mode == "after_receive":
+        batch = await session.next_batch()
+        assert batch is not None
+        (path / "received.json").write_text(
+            json.dumps({"stream_id": str(batch.stream_id), "sequence": batch.sequence})
+        )
+        kill_self()
     await session.close()
     await client.close()
 
@@ -180,6 +187,15 @@ async def restart(path):
     else:
         session._prepare_pending()
     received = []
+    first_batch = await session.next_batch()
+    receipt_path = path / "received.json"
+    if receipt_path.exists():
+        receipt = json.loads(receipt_path.read_text())
+        assert first_batch is not None
+        assert (str(first_batch.stream_id), first_batch.sequence) == (
+            receipt["stream_id"],
+            receipt["sequence"],
+        )
     while batch := await session.next_batch():
         for record in batch.records:
             if record.kind is RecordKind.TIMELINE:
@@ -234,6 +250,7 @@ def run_worker(mode, path):
         "after_capture",
         "during_prepare",
         "after_prepare",
+        "after_receive",
     ],
 )
 def test_encrypted_sync_survives_process_interruption(tmp_path, boundary):
@@ -253,7 +270,9 @@ def test_encrypted_sync_survives_process_interruption(tmp_path, boundary):
     assert proof["received"] == [{"type": "RoomMessageText", "body": BODY}]
     assert proof["key_present"] is True
     assert proof["cursor_after"] == "s1"
-    assert proof["had_committed_output"] is (boundary in ("healthy", "after_prepare"))
+    assert proof["had_committed_output"] is (
+        boundary in ("healthy", "after_prepare", "after_receive")
+    )
 
 
 if __name__ == "__main__":

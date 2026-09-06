@@ -2,17 +2,14 @@ from uuid import uuid4
 
 import pytest
 
-from ingestion_helpers import open_ingestion_store
 from nio.crypto import OlmAccount
-from nio.ingest.config import ClassicSourceConfig
+from nio.durable.store import DurableStore
 from nio.store import (
     Accounts,
     SqliteMemoryStore,
     use_database,
     use_database_atomic,
 )
-
-SOURCE = ClassicSourceConfig(timeout_ms=30_000, filter_json=b"{}")
 
 
 class ExpectedStoreFailure(RuntimeError):
@@ -63,29 +60,29 @@ def ordinary_binding_stores():
 
 
 @pytest.fixture
-def owned_binding_stores(tmp_path):
-    bootstraps = []
+def durable_binding_stores(tmp_path):
+    owners = []
     stores = []
     try:
         for label in ("a", "b"):
             store_path = tmp_path / label
             store_path.mkdir()
-            bootstrap = open_ingestion_store(
+            owner = DurableStore(
                 store_path,
-                account_id=f"@binding-{label}:example.org",
+                user_id=f"@binding-{label}:example.org",
                 device_id=f"DEVICE-{label.upper()}",
-                consumer_generation=uuid4(),
-                source=SOURCE,
+                consumer_id=uuid4(),
                 database_name="journal.db",
                 pickle_key=f"pickle-{label}",
             )
-            bootstraps.append(bootstrap)
-            store = bootstrap._open_owned_store_candidate()._store_for_attachment()
-            stores.append((store, None, _seed_store(store, None)))
+            owners.append(owner)
+            store = owner.matrix
+            with owner.transaction():
+                stores.append((store, None, _seed_store(store, None)))
         yield tuple(stores)
     finally:
-        for bootstrap in reversed(bootstraps):
-            bootstrap.close()
+        for owner in reversed(owners):
+            owner.close()
 
 
 def _assert_bindings(models, database):
@@ -132,5 +129,7 @@ def test_nested_ordinary_store_bindings_restore_and_roll_back(
     _exercise_nested_store_bindings(ordinary_binding_stores)
 
 
-def test_nested_owned_store_bindings_restore_and_roll_back(owned_binding_stores):
-    _exercise_nested_store_bindings(owned_binding_stores)
+def test_nested_durable_store_bindings_restore_and_roll_back(durable_binding_stores):
+    with durable_binding_stores[0][0].database.atomic():
+        with durable_binding_stores[1][0].database.atomic():
+            _exercise_nested_store_bindings(durable_binding_stores)

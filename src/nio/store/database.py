@@ -16,13 +16,12 @@ import os
 import sqlite3
 import threading
 import weakref
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
 
-from peewee import DoesNotExist, Model, SqliteDatabase
+from peewee import DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -53,34 +52,7 @@ from . import (
     StoreVersion,
     SyncTokens,
 )
-from ._ingestion_store_owner import (
-    LeasedSqliteDatabase,
-    StableFileLock,
-    _LifetimeLeasedConnection,
-)
-
-if TYPE_CHECKING:
-
-    from ._ingestion_store_owner import IngestionStoreOwner
-    from .sync_journal import _OwnedStoreCandidate
-
-
-def _open_matrix_store_from_owned_candidate(
-    candidate: _OwnedStoreCandidate,
-    store_class: type[MatrixStore],
-    pickle_key: str,
-) -> MatrixStore:
-    if store_class is not SqliteStore:
-        raise LocalProtocolError("ingestion v1 requires exact SqliteStore")
-    journal = candidate._journal
-    return store_class(
-        journal.account_id,
-        journal.device_id,
-        str(candidate.database_path.parent),
-        pickle_key=pickle_key,
-        database_name=candidate.database_path.name,
-        _ingestion_bootstrap=candidate,
-    )
+from ._sqlite_lease import FileLease, LeasedSqliteDatabase, check_ordinary_database
 
 
 def use_database(fn):
@@ -88,19 +60,8 @@ def use_database(fn):
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        owner = self._ingestion_owner
-        if owner is not None:
-            self._assert_ingestion_view()
-            with owner.read():
-                with self.database.bind_ctx(
-                    self.models, bind_refs=False, bind_backrefs=False
-                ):
-                    return fn(self, *args, **kwargs)
-        with nullcontext():
-            with self.database.bind_ctx(
-                self.models, bind_refs=False, bind_backrefs=False
-            ):
-                return fn(self, *args, **kwargs)
+        with self.database.bind_ctx(self.models, bind_refs=False, bind_backrefs=False):
+            return fn(self, *args, **kwargs)
 
     return inner
 
@@ -110,45 +71,21 @@ def use_database_atomic(fn):
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        owner = self._ingestion_owner
-        if owner is not None:
-            self._assert_ingestion_view()
-            with owner.e2ee_write():
-                with self.database.bind_ctx(
-                    self.models, bind_refs=False, bind_backrefs=False
-                ):
-                    with self.database.atomic():
-                        return fn(self, *args, **kwargs)
-        with nullcontext():
-            with self.database.bind_ctx(
-                self.models, bind_refs=False, bind_backrefs=False
-            ):
-                if isinstance(self.database, SqliteQueueDatabase):
-                    return fn(self, *args, **kwargs)
-                else:
-                    with self.database.atomic():
-                        return fn(self, *args, **kwargs)
+        with self.database.bind_ctx(self.models, bind_refs=False, bind_backrefs=False):
+            if isinstance(self.database, SqliteQueueDatabase):
+                return fn(self, *args, **kwargs)
+            with self.database.atomic():
+                return fn(self, *args, **kwargs)
 
     return inner
 
 
 def use_default_trust_sidecars(fn):
-    """Hold one shared store lease across a mutating sidecar operation."""
+    """Hold one shared store lease across a sidecar operation."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self._trust_sidecar_guard(mutating=True):
-            return fn(self, *args, **kwargs)
-
-    return inner
-
-
-def use_default_trust_sidecar_reads(fn):
-    """Guard a read-only sidecar lookup without acquiring a transient lease."""
-
-    @wraps(fn)
-    def inner(self, *args, **kwargs):
-        with self._trust_sidecar_guard(mutating=False):
+        with self._trust_sidecar_guard():
             return fn(self, *args, **kwargs)
 
     return inner
@@ -158,7 +95,6 @@ def use_default_trust_sidecar_reads(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
-    requires_filesystem_coordination: ClassVar[bool] = True
     models = [
         Accounts,
         OlmSessions,
@@ -179,12 +115,6 @@ class MatrixStore:
     database_name: str = ""
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
-    _ingestion_bootstrap: _OwnedStoreCandidate | None = field(default=None, repr=False)
-    _ingestion_owner: IngestionStoreOwner | None = field(
-        default=None, init=False, repr=False
-    )
-    _ingestion_revoked: bool = field(default=False, init=False, repr=False)
-    _ingestion_initialized: bool = field(default=False, init=False, repr=False)
 
     def _create_database(self):
         return LeasedSqliteDatabase(
@@ -194,15 +124,6 @@ class MatrixStore:
                 "secure_delete": "fast",
             },
         )
-
-    def _assert_ingestion_view(self) -> None:
-        if self._ingestion_revoked:
-            raise LocalProtocolError("borrowed ingestion store is revoked")
-
-    def _revoke_ingestion_lease(self) -> None:
-        if self._ingestion_owner is None:
-            raise LocalProtocolError("store is not borrowed from ingestion")
-        self._ingestion_revoked = True
 
     @use_database_atomic
     def upgrade_to_v2(self):
@@ -222,28 +143,15 @@ class MatrixStore:
     def __post_init__(self) -> None:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
-        bootstrap = self._ingestion_bootstrap
-        if not self.requires_filesystem_coordination:
-            if bootstrap is not None:
-                raise LocalProtocolError("memory store cannot use StoreBootstrap")
-            self._post_init_legacy_store()
-            return
-        if bootstrap is not None:
-            self._ingestion_bootstrap = None
-            with bootstrap._claim_store(self):
-                self._ingestion_owner = bootstrap._journal._owner
-                self._post_init_ingestion_store(bootstrap)
-            return
-
         try:
-            self._post_init_legacy_store()
+            self._post_init_ordinary_store()
         except BaseException:
             database = getattr(self, "database", None)
             if database is not None and not database.is_closed():
                 database.close()
             raise
 
-    def _post_init_legacy_store(self) -> None:
+    def _post_init_ordinary_store(self) -> None:
         self.database = self._create_database()
         self.database.connect()
 
@@ -272,75 +180,6 @@ class MatrixStore:
 
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
-
-    def _post_init_ingestion_store(self, bootstrap: _OwnedStoreCandidate) -> None:
-        if self._ingestion_initialized:
-            raise LocalProtocolError("borrowed ingestion store is already initialized")
-        owner = self._ingestion_owner
-        if owner is None:
-            raise LocalProtocolError("borrowed ingestion store has no owner")
-        if os.path.realpath(self.database_path) != os.path.realpath(
-            bootstrap.database_path
-        ):
-            raise LocalProtocolError("StoreBootstrap database path does not match")
-        if self.user_id != bootstrap._journal.account_id:
-            raise LocalProtocolError("StoreBootstrap account_id does not match")
-        if self.device_id != bootstrap._journal.device_id:
-            raise LocalProtocolError("StoreBootstrap device_id does not match")
-
-        self.database = owner.database
-        with owner.read():
-            row = self.database.execute_sql(
-                "SELECT account_id, device_id, schema_version, writer_epoch "
-                "FROM NioIngestMeta"
-            ).fetchone()
-            if row is None or tuple(row) != (
-                self.user_id,
-                self.device_id,
-                1,
-                str(bootstrap._journal.writer_epoch),
-            ):
-                raise LocalProtocolError(
-                    "StoreBootstrap no longer matches the ingestion-v1 marker"
-                )
-
-            e2ee_models: list[type[Model]] = [
-                Accounts,
-                OlmSessions,
-                MegolmInboundSessions,
-                ForwardedChains,
-                DeviceKeys,
-                EncryptedRooms,
-                OutgoingKeyRequests,
-                Keys,
-            ]
-            if DeviceTrustState in self.models:
-                e2ee_models.append(DeviceTrustState)
-            existing_tables = set(self.database.get_tables())
-            expected_tables = {model._meta.table_name for model in e2ee_models}
-            expected_tables.add(StoreVersion._meta.table_name)
-            present_e2ee = expected_tables & existing_tables
-
-            if present_e2ee and present_e2ee != expected_tables:
-                raise LocalProtocolError(
-                    "ingestion-v1 store has an incomplete E2EE schema"
-                )
-
-        with self.database.bind_ctx([StoreVersion, *e2ee_models]):
-            if not present_e2ee:
-                with owner.e2ee_write():
-                    with self.database.atomic():
-                        self.database.create_tables([StoreVersion, *e2ee_models])
-                        StoreVersion.create(version=self.store_version)
-            else:
-                with owner.read():
-                    versions = tuple(StoreVersion.select())
-                    if len(versions) != 1 or versions[0].version != self.store_version:
-                        raise LocalProtocolError(
-                            "ingestion-v1 store requires the supported E2EE schema"
-                        )
-        self._ingestion_v1_store = True
-        self._ingestion_initialized = True
 
     def _get_store_version(self):
         with self.database.bind_ctx([StoreVersion]):
@@ -844,9 +683,7 @@ class DefaultStore(MatrixStore):
     blacklist_db: KeyStore = field(init=False)
     ignore_db: KeyStore = field(init=False)
     _trust_guard_depth: int = field(default=0, init=False, repr=False)
-    _trust_guard_lease: StableFileLock | None = field(
-        default=None, init=False, repr=False
-    )
+    _trust_guard_lease: FileLease | None = field(default=None, init=False, repr=False)
     _trust_guard_lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False
     )
@@ -855,7 +692,7 @@ class DefaultStore(MatrixStore):
     _trust_sidecar_coordinated: bool = field(default=False, init=False, repr=False)
 
     @contextmanager
-    def _trust_sidecar_guard(self, *, mutating: bool = True):
+    def _trust_sidecar_guard(self):
         if not self._trust_sidecar_coordinated:
             yield
             return
@@ -877,49 +714,23 @@ class DefaultStore(MatrixStore):
                 raise LocalProtocolError(
                     "ordinary trust database has no built-in lease"
                 )
-            # While the ordinary connection is open it already holds the shared
-            # lifetime lease, and its connect-time marker probe proved the
-            # database is not ingestion-owned. An exclusive adopter cannot
-            # acquire the lease (and so cannot add the marker) until that
-            # connection closes, so the per-call read-only SQLite probe is only
-            # needed when the connection is closed. Read-only lookups borrow
-            # the connection lease outright; mutations still take their own
-            # transient shared lease so a reentrant database close inside the
-            # operation cannot hand exclusion to another owner mid-write.
-            owned_lease: StableFileLock | None = None
-            connection_open = not self.database.is_closed()
-            if connection_open:
-                connection = self.database.connection()
-                if not isinstance(connection, _LifetimeLeasedConnection):
-                    raise LocalProtocolError(
-                        "ordinary trust database connection has no lifetime lease"
-                    )
-                connection._assert_lifetime_lease()
-            if connection_open and not mutating:
-                connection_lease = connection._lifetime_lease
-                assert connection_lease is not None
-                lease = connection_lease
-            else:
-                owned_lease = StableFileLock(Path(self.database_path), exclusive=False)
-                lease = owned_lease
-                try:
-                    self.database._remember_lifetime_identity(lease.database_identity)
-                    lease.assert_identity()
-                    if not connection_open:
-                        uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
-                        with closing(sqlite3.connect(uri, uri=True)) as probe:
-                            marked = probe.execute(
-                                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                                "AND name COLLATE NOCASE IN "
-                                "('NioIngestMeta', 'NioDurableMeta')"
-                            ).fetchone()
-                        if marked:
+            # A separate shared lease protects sidecars even if the SQLite
+            # connection closes during this operation. Closed handles probe
+            # the marker before reading or writing their cached trust state.
+            lease = FileLease(Path(self.database_path), exclusive=False)
+            try:
+                if self.database.is_closed():
+                    uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
+                    with closing(sqlite3.connect(uri, uri=True)) as probe:
+                        try:
+                            check_ordinary_database(probe)
+                        except LocalProtocolError as error:
                             raise LocalProtocolError(
                                 "legacy trust sidecars are unavailable after adoption"
-                            )
-                except BaseException:
-                    lease.close()
-                    raise
+                            ) from error
+            except BaseException:
+                lease.close()
+                raise
             self._trust_guard_lease = lease
             self._trust_guard_depth = 1
             self._trust_guard_thread = threading.get_ident()
@@ -930,8 +741,7 @@ class DefaultStore(MatrixStore):
                 self._trust_guard_depth = 0
                 self._trust_guard_thread = None
                 self._trust_guard_lease = None
-                if owned_lease is not None:
-                    owned_lease.close()
+                lease.close()
 
     def _assert_trust_sidecar_owner(self) -> None:
         if not self._trust_sidecar_coordinated:
@@ -943,7 +753,7 @@ class DefaultStore(MatrixStore):
             raise LocalProtocolError(
                 "trust sidecar ownership belongs to another thread"
             )
-        lease.assert_identity()
+        lease.assert_open()
 
     def __post_init__(self):
         self._trust_guard_pid = os.getpid()
@@ -1012,12 +822,12 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.verified
         return self.trust_db.add(key)
 
-    @use_default_trust_sidecar_reads
+    @use_default_trust_sidecars
     def is_device_verified(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.trust_db
 
-    @use_default_trust_sidecar_reads
+    @use_default_trust_sidecars
     def is_device_blacklisted(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.blacklist_db
@@ -1063,7 +873,7 @@ class DefaultStore(MatrixStore):
 
         return
 
-    @use_default_trust_sidecar_reads
+    @use_default_trust_sidecars
     def is_device_ignored(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.ignore_db
@@ -1369,8 +1179,6 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
-
-    requires_filesystem_coordination: ClassVar[bool] = False
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

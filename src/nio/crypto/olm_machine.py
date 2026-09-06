@@ -99,7 +99,6 @@ class KeyShareError(Exception):
 
 
 class Olm:
-    _require_persisted_account = False
     _olm_algorithm = "m.olm.v1.curve25519-aes-sha2"
     _megolm_algorithm = "m.megolm.v1.aes-sha2"
     _algorithms = [_olm_algorithm, _megolm_algorithm]
@@ -123,29 +122,6 @@ class Olm:
     # This totals in 146 bytes per message. The cache has a limit of 100000
     # which results in around 14 MiB of memory in total.
     _message_index_store_size = 100000
-
-    @classmethod
-    def _from_persisted_account(
-        cls,
-        user_id: str,
-        device_id: str,
-        store: MatrixStore,
-        replace_rotated_device_keys: bool = False,
-    ) -> Olm:
-        """Construct Olm while requiring one account already in ``store``."""
-        instance = cls.__new__(cls)
-        instance._require_persisted_account = True
-        try:
-            Olm.__init__(
-                instance,
-                user_id,
-                device_id,
-                store,
-                replace_rotated_device_keys=replace_rotated_device_keys,
-            )
-        finally:
-            del instance._require_persisted_account
-        return instance
 
     def __init__(
         self,
@@ -264,20 +240,12 @@ class Olm:
 
         # Try to load an account for this user_id/device id tuple from the
         # store.
-        account = (
-            self.store._load_persisted_account()
-            if getattr(self, "_require_persisted_account", False)
-            else self.store.load_account()
-        )
+        account = self.store.load_account()
 
         # If no account was found for this user/device create a new one.
         # Otherwise load all the Olm/Megolm sessions and other relevant account
         # data from the store as well.
         if not account:
-            if getattr(self, "_require_persisted_account", False):
-                raise LocalProtocolError(
-                    "owned ingestion requires a committed Olm account"
-                )
             logger.info(
                 f"Creating new Olm account for {self.user_id} on device {self.device_id}"
             )
@@ -1903,17 +1871,8 @@ class Olm:
         return sharing_with, to_device_dict
 
     def load(self) -> None:
-        require_persisted = getattr(self, "_require_persisted_account", False)
-        self.session_store = (
-            self.store._load_persisted_sessions()
-            if require_persisted
-            else self.store.load_sessions()
-        )
-        self.inbound_group_store = (
-            self.store._load_persisted_inbound_group_sessions()
-            if require_persisted
-            else self.store.load_inbound_group_sessions()
-        )
+        self.session_store = self.store.load_sessions()
+        self.inbound_group_store = self.store.load_inbound_group_sessions()
         self.device_store = self.store.load_device_keys()
         self.outgoing_key_requests = self.store.load_outgoing_key_requests()
 

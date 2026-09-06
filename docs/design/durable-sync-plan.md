@@ -187,16 +187,18 @@ Classic-only consumer, preserving business authorization and projection barriers
 under `src/nio/store`, and obsolete production preparation/settlement hooks.
 Update exports, tests, release notes and historical document status.
 
-- [ ] Identify required behavioral tests among old ingestion tests and retain
+- [x] Identify required behavioral tests among old ingestion tests and retain
   them against the new API. Delete tests tied only to intentionally removed
   machinery. Do not preserve production shims to make those tests pass.
-- [ ] Delete old source and imports once the replacement and consumer work.
+- [x] Delete old source and imports once the replacement and consumer work.
   Keep upstream-compatible behavior and unrelated fork fixes.
-- [ ] Run `uv run --locked pytest --benchmark-disable`, `uv run ruff check src
+- [x] Run `uv run --locked pytest --benchmark-disable`, `uv run ruff check src
   tests`, `uv run black --check src tests`, `uv run pre-commit run --all-files`,
   and `MYPYPATH=src uv run --no-sync mypy -p nio --warn-redundant-casts
-  --no-incremental`. Types must remain zero errors. Run companion full checks.
-- [ ] Draft breaking-change release notes for the new API, removed old fork
+  --no-incremental`. Types must remain zero errors. Nio: 689 passed, 3 skipped;
+  zero mypy errors and clean hooks.
+- [ ] Run companion full checks (coordinated consumer work).
+- [x] Draft breaking-change release notes for the new API, removed old fork
   interfaces, Classic-only durable transport and transient receipts. Publication
   and version selection remain release work. Review and commit.
 
@@ -226,3 +228,10 @@ capacity workspace and update both existing PR descriptions with relative paths.
 - Main crash reproduction: healthy real-crypto control passes; crash regression
   fails with missing room key and `MegolmEvent` instead of `RoomMessageText`.
 - Replacement implementation and performance results are not yet available.
+
+- Task 6 removal source measurement (2026-09-06): `src/nio` contains 28,537
+  Python lines, including 2,785 in `nio.durable` and 122 in its shared SQLite
+  lease module. Against `52c6c06`, production diff is +278/-20,813 (net -20,535).
+  Against main `5b6de3bc`, it is +3,856/-6,809 (net -2,953). Task 6 alone removes
+  20,613 net production lines from `91a513c`. These are source counts, not
+  throughput measurements; integrated workload acceptance remains Task 7.

@@ -1,5 +1,6 @@
 """The durable adapter owns transactions, not application callbacks."""
 
+import asyncio
 import json
 from uuid import UUID
 
@@ -292,3 +293,33 @@ async def test_invited_room_member_projection_survives_restart(tmp_path):
         )
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_started_ordinary_sync_rejects_durable_attachment(
+    tmp_path, monkeypatch, failed
+):
+    nio_client = client()
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def send(*args, **kwargs):
+        started.set()
+        await finish.wait()
+        raise RuntimeError("ordinary request failed")
+
+    monkeypatch.setattr(nio_client, "_send", send)
+    pending = asyncio.create_task(nio_client.sync())
+    await started.wait()
+    try:
+        if failed:
+            finish.set()
+            with pytest.raises(RuntimeError, match="ordinary request failed"):
+                await pending
+        with pytest.raises(LocalProtocolError, match="fresh"):
+            open_session(tmp_path, nio_client)
+        assert not tuple(tmp_path.glob("*.db"))
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await nio_client.close()

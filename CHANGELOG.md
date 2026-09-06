@@ -6,83 +6,56 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking changes
 
-- Replace the fork-specific recovery/admission path with owned durable ingestion
-  for Classic and Sliding Sync. Released interfaces including
-  `AsyncClient.add_event_admission_callback` and `CallbackNotAcceptedError` are
-  removed. Consumers must migrate to the supported owned integration described
-  in `docs/design/durable-ingestion-contract.md`.
-- Integrations using earlier checkpoints of this PR must also update for removal
-  of the plain `IngestionSession`/`open_ingestion` API, `RecordKind.PRESENCE`,
-  `_CallbackRoute.PRESENCE`, `SyncFrame.presence_json`, and the two
-  `MaterializerLimits` READY-only count/byte limits. Those intermediate interfaces
-  were never released. The supported owned factory, session, completion, and
-  settlement names remain as documented in the contract.
-- Typing and presence are best-effort fresh observations and are not replayed.
-  Their cooperative one-second budget covers transient processing and callbacks;
-  callbacks may be cancelled at an await, and partial effects are not rolled back.
-- Unverified-device key-share requests now reach the existing approval callback
-  before a missing Olm session is claimed. This intentionally makes the callback
-  occur earlier for ordinary clients too; verification still controls key sharing.
+- Replace the fork-specific recovery/admission path and prototype ingestion
+  interfaces with the batch API in `nio.durable`: `open_durable_sync`,
+  `DurableSync`, `DurableSyncConfig`, `SyncBatch`, `SyncRecord`, and `RecordKind`.
+  Consume committed batches with `next_batch()` and acknowledge them with
+  `ack(batch)` after application admission. See `docs/design/durable-sync.md`.
+- Durable sync supports Classic `/sync` only. Sliding Sync and the old
+  `nio.ingest` and sync-journal interfaces are removed. Released fork interfaces
+  including `AsyncClient.add_event_admission_callback` and
+  `CallbackNotAcceptedError` are removed; ordinary upstream-style client APIs
+  retain their behavior. Prototype ingestion databases are rejected explicitly.
+- Typing, presence, and read receipts are best effort and are not replayed.
+  Fresh transient processing and callbacks share a cooperative one-second budget;
+  callbacks may be cancelled at an await, without rolling back partial effects.
+- Unverified-device key-share requests reach the existing approval callback
+  before a missing Olm session is claimed. This changes callback ordering for
+  ordinary clients too; verification still controls key sharing.
 
-### Error handling and platform support
+### Durability and compatibility
 
-- Retain owned interactive key-share approvals across restart, including after
-  callback acknowledgment and Frame retirement. Explicit continuation commits
-  its claim context or exact encrypted message atomically with crypto writes;
-  callback retries and lost send responses reuse the retained handoff. Changed
-  trust during a claim restores a pending approval without sending or issuing a
-  second callback.
-- Reject the legacy `send_to_device_messages()` queue-drain helper while owned
-  ingestion is attached, before HTTP or queue mutation. Specific application and
-  verification to-device APIs remain unchanged.
+- Commit retained sync input, crypto changes, room projection, and output batches
+  on one SQLite connection. Restart replays committed batches without decrypting
+  them again. Unacknowledged batches keep stable identity and order.
+- Preserve ordinary SQLite account identity and effective file-backed device
+  trust during explicit adoption. Ordinary shared connection leases exclude
+  durable adoption; retained ordinary handles reject access after adoption.
+- Route attached public crypto and to-device methods through retained requests.
+  Retries reuse ciphertext and transaction IDs. Interactive key-share approvals
+  survive restart; changed device keys invalidate cached outbound recipients.
+- Recover limited Classic timelines through bounded, resumable history pages.
+  Unavailable history and oversized single events produce explicit loss barriers.
+  Quiescing stops new polls and drains captured work without an extra final poll.
 - Match incoming key-request cancellations by sender and requesting device as
-  well as request ID, for ordinary and owned clients.
-- Owned Classic ingestion drains server-visible gaps through bounded, durable
-  pages before advancing its sync cursor. Recovered events use normal admission;
-  restart replays a staged page or resumes after the last settled page. Cold
-  history remains non-actionable. Unsupported filters, unavailable history, and
-  per-page or pagination bounds fail with progress retained.
-- Owned Classic polling requests at most 100 timeline events and retries
-  oversized responses with a smaller window at the same cursor. Intrinsically
-  oversized data at the minimum window still requires intervention.
-- Prepared ingestion output exceeding the hard capacity bounds raises
-  `nio.ingest.errors.JournalCapacityError` and stops the owned session.
-- Import the package without `fcntl`; attempting filesystem ownership where it
-  is unavailable raises `LocalProtocolError` when the owned store is opened.
+  well as request ID, for ordinary and durable clients.
+- Import the package without `fcntl`; filesystem ownership requires supported
+  locking and otherwise raises `LocalProtocolError` when opening a store.
 - Permission helpers return identity-lookup errors, and v12 upgrades fail clearly
   on an identity error or unusable power-level state before dependent writes.
 - Downloads saved to a directory require a response filename. An unnamed response
   can still be saved to an explicit destination file.
-- Synchronous clients now await custom callback awaitables and propagate their
-  errors, preserving sequential callback completion.
-
-### Performance and development checks
-
-- Remove redundant internal reconstruction of already validated source
-  responses. Five paired SQLite benchmarks measured 1.85–2.64% lower total
-  delivery time across two frame shapes, with 29 fewer production lines.
-- Remove repeated settlement event encoding and redundant validation before
-  authenticated batch comparison. Five paired long-message SQLite benchmarks
-  measured 4.67% median lower delivery time, with 22 fewer production lines.
-  This does not establish a whole-application throughput gain.
-- Encode staged Frame payloads once in their transaction. Three paired
-  large-response recovery benchmarks measured a 2.63% median improvement,
-  with six fewer production lines and unchanged authentication/size bounds.
-- Reuse one immutable decoded Frame when its complete stored row and owner
-  identity are unchanged. Retain actual-row validation and exclude mutable
-  outbound contexts. Three paired local recovery benchmarks measured 18.51%
-  median lower delivery time; ordinary delivery showed no measured speedup.
-- Reuse one authenticated Work value when its complete stored row and owner
-  identity are unchanged, retaining per-read validation and existing transactions.
-  Five paired local delivery benchmarks measured about 33% less time for 1,000
-  messages; this does not measure whole-application throughput.
-- Require zero mypy errors across the package in CI, using development-only
-  dependency declarations and existing runtime validation.
+- Synchronous clients await custom callback awaitables and propagate errors,
+  preserving sequential callback completion.
+- Require zero mypy errors across the package in CI.
 
 ### Cutover requirements
 
 - This is a breaking change relative to 0.40.0; select the release version before
   publishing. Companion integration and dependency pins require cutover testing.
+- SQLite WAL with `synchronous=NORMAL` provides the tested process-crash contract;
+  power-loss durability is not claimed. Workload comparison with FULL remains
+  part of release acceptance.
 
 ## 0.40.0
 
