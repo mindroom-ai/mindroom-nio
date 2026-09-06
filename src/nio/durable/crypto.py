@@ -95,8 +95,11 @@ class CryptoMaintenance:
                 setattr(olm, name, requests)
             olm.key_requests_waiting_for_session.clear()
             for target, requests in facts["waiting"]:
-                device = self._device(target)
                 decoded = self._decode_requests(requests)
+                if not decoded:
+                    self._device_key(target)
+                    continue
+                device = self._device(target)
                 if any(
                     not isinstance(event, RoomKeyRequest)
                     or (event.sender, event.requesting_device_id)
@@ -153,14 +156,19 @@ class CryptoMaintenance:
         except (KeyError, TypeError, ValueError, AttributeError) as error:
             raise LocalProtocolError("invalid stored durable crypto facts") from error
 
-    def _device(self, target):
+    @staticmethod
+    def _device_key(target):
         if (
             not isinstance(target, list)
             or len(target) != 2
             or not all(isinstance(value, str) for value in target)
         ):
             raise ValueError("invalid device reference")
-        return self.olm.device_store[target[0]][target[1]]
+        return target[0], target[1]
+
+    def _device(self, target):
+        user_id, device_id = self._device_key(target)
+        return self.olm.device_store[user_id][device_id]
 
     @staticmethod
     def _decode_requests(sources):
@@ -204,6 +212,7 @@ class CryptoMaintenance:
                 "waiting": [
                     [list(target), [x.source for x in requests.values()]]
                     for target, requests in olm.key_requests_waiting_for_session.items()
+                    if requests
                 ],
                 "wedged": [[x.user_id, x.device_id] for x in olm.wedged_devices],
                 "claim_targets": [

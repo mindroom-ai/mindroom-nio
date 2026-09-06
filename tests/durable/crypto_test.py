@@ -10,7 +10,7 @@ from unpaddedbase64 import decode_base64
 from nio import AsyncClient
 from nio.crypto import Olm, OlmAccount, OlmDevice
 from nio.event_builders import RoomKeyRequestMessage
-from nio.events import MegolmEvent, RoomKeyRequest
+from nio.events import MegolmEvent, RoomKeyRequest, RoomKeyRequestCancellation
 from nio.durable.crypto import CryptoMaintenance
 from nio.durable.store import DurableStore
 from nio.exceptions import LocalProtocolError
@@ -394,6 +394,7 @@ def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
         ("uploaded_key_count", True),
         ("wedged", [[USER, "missing"]]),
         ("key_request_from_untrusted", [{}]),
+        ("waiting", [[[USER], []]]),
     ],
 )
 def test_malformed_stored_authorization_facts_fail_on_restore(tmp_path, field, value):
@@ -465,5 +466,49 @@ def test_pending_request_with_missing_message_fails_during_restore(tmp_path):
             )
         with pytest.raises(LocalProtocolError, match="crypto"):
             maintenance.restore()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("previous_empty_queue", [False, True])
+def test_unknown_device_cancellation_does_not_block_restart(
+    tmp_path, previous_empty_queue
+):
+    store, olm, maintenance = open_crypto(tmp_path)
+    cancellation = RoomKeyRequestCancellation.from_dict(
+        {
+            "type": "m.room_key_request",
+            "sender": USER,
+            "content": {
+                "action": "request_cancellation",
+                "request_id": "missed-request",
+                "requesting_device_id": "UNKNOWN",
+            },
+        }
+    )
+    with store.transaction():
+        publish_account(olm)
+        olm.handle_to_device_event(cancellation)
+        assert olm.collect_key_requests() == []
+        assert olm.key_requests_waiting_for_session[(USER, "UNKNOWN")] == {}
+        maintenance.capture()
+        if previous_empty_queue:
+            # The previous writer retained this normal empty defaultdict entry.
+            encoded = store.database.execute_sql(
+                "SELECT body FROM NioDurableCrypto WHERE kind='facts'"
+            ).fetchone()[0]
+            facts = json.loads(encoded)
+            facts["waiting"] = [[[USER, "UNKNOWN"], []]]
+            store.database.execute_sql(
+                "UPDATE NioDurableCrypto SET body=? WHERE kind='facts'",
+                (json.dumps(facts),),
+            )
+    store.close()
+    store, olm, maintenance = open_crypto(tmp_path)
+    try:
+        assert not olm.key_requests_waiting_for_session
+        assert not olm.key_request_devices_no_session
+        with store.transaction():
+            assert maintenance.next_request() is None
     finally:
         store.close()
