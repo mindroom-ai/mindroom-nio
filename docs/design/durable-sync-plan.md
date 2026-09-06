@@ -733,13 +733,13 @@ queue, public API or per-event validation layer.
   still lacks its baseline. Verify the next HTTP request asks for fresh initial
   state and later events become LIVE. Cover restart during retained recovery
   without changing pagination candidates before the tail.
-- [ ] Run focused regressions, full suite, mypy and repository hooks; review the
+- [x] Run focused regressions, full suite, mypy and repository hooks; review the
   combined diff. Record source size, commands and results. Rebuild and pin the
   consumer wheel, run affected checks, then commit and push both repositories.
 
 Focused evidence lives in the persistent capacity workspace under
 `durable-sync-kernel/review-invalidation-20260906`. Commands and final results
-will be recorded there and in this section. Existing live performance results
+are recorded there and in this section. Existing live performance results
 keep their original source revisions; these fixes make no new speed claim.
 
 Producer verification: 885 passed, three skipped in 71.88 seconds; zero mypy
@@ -754,3 +754,14 @@ refresh, +2 Sliding recovery). The full PR against main `5b6de3bc` is
 lines and exclude tests, documentation and scripts. No schema, queue, public API
 or performance-policy change was added. Set comparison runs only at completed
 recipient lookup; Sliding resets occur only when a joined baseline is missing.
+
+MindRoom pins the rebuilt producer wheel at
+`76e4fa4bf441430227205671bb48448477d2a38c`; all 60 installed Python files match
+that revision. Its broader integration check passes 337 tests with one skipped
+in 7.78 seconds, and all consumer hooks pass. The initial parallel run exposed
+a 20 ms watchdog fixture race unrelated to the Nio paths. Controlled poll ticks
+and a module-local clock now test real watchdog progress handling deterministically;
+disabling generation observation in a subprocess makes the test fail. Consumer
+production code is unchanged. The original failure, isolated control, mutation
+probe and final qualification logs are retained with the evidence. Subsequent
+producer documentation commits do not require another dependency pin.

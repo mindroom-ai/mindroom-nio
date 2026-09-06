@@ -352,10 +352,10 @@ follows its final timeline event. OwnMembership remains metadata on its original
 state, timeline, or lifecycle observation; it does not create duplicate carriers.
 
 When a Sliding tail leaves a joined room without an authorization baseline,
-the source drops that room's checkpoint and resets its connection position after
-committing the current input. The next request obtains fresh initial state;
-ordinary deltas cannot repair the missing baseline. The reset decision comes
-from persisted room metadata, so restarting during recovery preserves it.
+the source drops that room's checkpoint and resets its connection position in
+the tail transaction, after pagination ends. The next request obtains fresh
+initial state; ordinary deltas cannot repair the missing baseline. The reset
+decision comes from persisted room metadata, so restarting during recovery preserves it.
 Pagination candidates remain stable until the current input has drained. Fresh
 state authorizes future events only; it never reclassifies the lost interval.
 
