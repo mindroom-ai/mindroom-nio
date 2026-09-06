@@ -11,7 +11,7 @@ from unpaddedbase64 import decode_base64
 from nio.durable.codec import restore_event
 from nio.events import RoomKeyRequest
 from nio.event_builders import ToDeviceMessage
-from nio.exceptions import OlmUnverifiedDeviceError
+from nio.exceptions import LocalProtocolError, OlmUnverifiedDeviceError
 from nio.rooms import MatrixRoom
 
 from .client_test import ROOM, USER, client, open_session
@@ -266,15 +266,14 @@ async def test_group_ciphertext_survives_cancel_and_restart(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_late_group_response_cannot_mark_replacement_shared(tmp_path):
+async def test_invalidation_during_group_http_prevents_completion(tmp_path):
     nio_client = client()
     replacement = None
 
     async def send(_):
         nonlocal replacement
         nio_client.invalidate_outbound_session(ROOM)
-        nio_client.olm.create_outbound_group_session(ROOM)
-        replacement = nio_client.olm.outbound_group_sessions[ROOM]
+        replacement = nio_client.olm.outbound_group_sessions.get(ROOM)
         return web.json_response({})
 
     async with homeserver(None, membership=send) as (url, _):
@@ -291,12 +290,9 @@ async def test_late_group_response_cannot_mark_replacement_shared(tmp_path):
         room.members_synced = True
         nio_client.rooms[ROOM] = room
         try:
-            from nio.exceptions import LocalProtocolError
-
             with pytest.raises(LocalProtocolError, match="changed while sharing"):
                 await nio_client.share_group_session(ROOM)
-            assert replacement is not None
-            assert not replacement.shared
+            assert replacement is None
             assert session._crypto._pending() is None
         finally:
             await session.close()
@@ -364,17 +360,43 @@ async def test_public_key_calls_retain_requests_before_http(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_approval_wakes_idle_long_poll_to_send_key(tmp_path):
+@pytest.mark.parametrize(
+    "existing_session,claim_available", [(False, True), (False, False), (True, True)]
+)
+async def test_approval_wakes_idle_long_poll_to_send_key(
+    tmp_path, existing_session, claim_available
+):
+    from nio.api import Api
+    from nio.crypto import OlmAccount, OlmDevice
+
     polling = asyncio.Event()
     release = asyncio.Event()
     sent = asyncio.Event()
+    claims = 0
 
     async def sync(_):
         polling.set()
         await release.wait()
         return web.json_response({"next_batch": "s2"})
 
-    async def send(_):
+    async def send(request):
+        nonlocal claims
+        if request.path.endswith("/keys/claim"):
+            claims += 1
+            if not claim_available:
+                return web.json_response({"one_time_keys": {}})
+            key_id, key = next(iter(peer.one_time_keys["curve25519"].items()))
+            signed = {"key": key}
+            signed["signatures"] = {
+                USER: {"ed25519:OTHER": peer.sign(Api.to_canonical_json(signed))}
+            }
+            return web.json_response(
+                {
+                    "one_time_keys": {
+                        USER: {"OTHER": {f"signed_curve25519:{key_id}": signed}}
+                    }
+                }
+            )
         sent.set()
         return web.json_response({})
 
@@ -384,7 +406,14 @@ async def test_approval_wakes_idle_long_poll_to_send_key(tmp_path):
         session = open_session(tmp_path, nio_client)
         with session._store.transaction():
             publish_account(nio_client.olm)
-            _, device = queue_dummy(nio_client.olm)
+            if existing_session:
+                peer, device = queue_dummy(nio_client.olm)
+            else:
+                peer = OlmAccount()
+                peer.generate_one_time_keys(1)
+                device = OlmDevice(USER, "OTHER", peer.identity_keys)
+                nio_client.olm.device_store.add(device)
+                nio_client.store.save_device_keys({USER: {"OTHER": device}})
             nio_client.olm.outgoing_to_device_messages.clear()
             request, _ = room_key_request(nio_client.olm)
             session._crypto.capture()
@@ -398,13 +427,84 @@ async def test_approval_wakes_idle_long_poll_to_send_key(tmp_path):
             await drain_sync(session)
             async with asyncio.timeout(2):
                 await polling.wait()
+            polling.clear()
             nio_client.verify_device(device)
             assert nio_client.continue_key_share(request)
             async with asyncio.timeout(1):
-                await sent.wait()
+                if claim_available:
+                    await sent.wait()
+                else:
+                    await polling.wait()
+                    assert not sent.is_set()
+                    assert claims == 1
             await session.quiesce()
             await task
         finally:
             release.set()
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoke", ["blacklist", "membership"])
+async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revoke):
+    recipient = "@peer:example.org"
+
+    async def http(request):
+        if request.path.endswith("/joined_members"):
+            return web.json_response(
+                {"joined": {recipient: {"display_name": "Alice", "avatar_url": None}}}
+            )
+        return web.json_response({})
+
+    async with homeserver(None, membership=http) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        with session._store.transaction():
+            publish_account(nio_client.olm)
+            _, device = queue_dummy(nio_client.olm, user_id=recipient)
+            nio_client.olm.outgoing_to_device_messages.clear()
+            nio_client.verify_device(device)
+            session._crypto.capture()
+        room = MatrixRoom(ROOM, USER, encrypted=True)
+        room.add_member("@old:example.org", "Old", None)
+        nio_client.rooms[ROOM] = room
+        try:
+            await nio_client.share_group_session(ROOM)
+            assert nio_client.olm.outbound_group_sessions[ROOM].shared
+            assert recipient not in room.users
+            if revoke == "blacklist":
+                assert nio_client.blacklist_device(device)
+            else:
+                # Cached current recipient is absent from the historical projection.
+                # Ordinary remove_member therefore reports no local change.
+                await session._accept_response(
+                    json.dumps(
+                        {
+                            "next_batch": "s1",
+                            "rooms": {
+                                "join": {
+                                    ROOM: {
+                                        "timeline": {
+                                            "events": [
+                                                {
+                                                    "type": "m.room.member",
+                                                    "state_key": recipient,
+                                                    "sender": recipient,
+                                                    "event_id": "$departure",
+                                                    "origin_server_ts": 1,
+                                                    "content": {"membership": "leave"},
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    ).encode()
+                )
+            assert ROOM not in nio_client.olm.outbound_group_sessions
+        finally:
             await session.close()
             await nio_client.close()

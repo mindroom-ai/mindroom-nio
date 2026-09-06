@@ -1371,9 +1371,9 @@ class Client:
         assert self.olm
         session = self.olm.outbound_group_sessions.pop(room_id, None)
 
-        # There is no need to invalidate the session if it was never
-        # shared, put it back where it was.
-        if session and not session.shared:
+        # An attached client may have already retained or sent part of this
+        # group while its final HTTP acknowledgement is still outstanding.
+        if session and not session.shared and self._durable_session is None:
             self.olm.outbound_group_sessions[room_id] = session
         elif session:
             logger.info(f"Invalidating session for {room_id}")
@@ -1384,6 +1384,8 @@ class Client:
         for room in self.rooms.values():
             if device.user_id in room.users:
                 self.invalidate_outbound_session(room.room_id)
+        if self._durable_session is not None:
+            self._durable_session._outbound.invalidate_users((device.user_id,))
 
     @store_loaded
     def verify_device(self, device: OlmDevice) -> bool:
@@ -2571,6 +2573,8 @@ class Client:
                 for room in self.rooms.values():
                     if room.encrypted and user_id in room.users:
                         self.invalidate_outbound_session(room.room_id)
+            if self._durable_session is not None:
+                self._durable_session._outbound.invalidate_users(response.changed)
 
     def _handle_joined_members(self, response: JoinedMembersResponse):
         if response.room_id not in self.rooms:

@@ -36,12 +36,12 @@ def publish_account(olm):
     olm.save_account()
 
 
-def queue_dummy(olm):
+def queue_dummy(olm, *, user_id=USER):
     peer = OlmAccount()
     peer.generate_one_time_keys(1)
-    device = OlmDevice(USER, "OTHER", peer.identity_keys)
+    device = OlmDevice(user_id, "OTHER", peer.identity_keys)
     olm.device_store.add(device)
-    olm.store.save_device_keys({USER: {device.id: device}})
+    olm.store.save_device_keys({user_id: {device.id: device}})
     session = olm.create_session(
         next(iter(peer.one_time_keys["curve25519"].values())), device.curve25519
     )

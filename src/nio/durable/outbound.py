@@ -38,6 +38,19 @@ class OutboundCrypto:
         self.store = session._store
         self.crypto = session._crypto
         self.member_cache: dict[str, list[str] | None] = {}
+        self.maintenance_due = bool(
+            self.crypto.olm.wedged_devices
+            or self.crypto.olm.key_request_devices_no_session
+        )
+
+    def invalidate_users(self, users: Iterable[str]) -> None:
+        changed = set(users)
+        for room_id, group in list(self.crypto.olm.outbound_group_sessions.items()):
+            recipients = self.member_cache.get(room_id) or ()
+            if changed.intersection(recipients) or any(
+                user_id in changed for user_id, _ in group.users_shared_with
+            ):
+                self.client.invalidate_outbound_session(room_id)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -54,6 +67,8 @@ class OutboundCrypto:
     def change_key_share(self, event: RoomKeyRequest, cancel: bool = False) -> bool:
         with self.transaction():
             changed = self.crypto.change_key_share(event, cancel=cancel)
+        if changed:
+            self.maintenance_due = True
         self.session._changed.set()
         if changed and self.session._poll is not None:
             self.session._poll.cancel()
@@ -85,6 +100,7 @@ class OutboundCrypto:
 
     async def maintain(self) -> None:
         async with self.session._crypto_lock:
+            self.maintenance_due = False
             completed: set[str] = set()
             while True:
                 with self.transaction():
@@ -221,9 +237,13 @@ class OutboundCrypto:
                 await self.keys_claim(missing)
             async with self.session._crypto_lock:
                 await self._finish_pending()
-                if self.client.rooms.get(room_id) is not room or (
-                    not room.members_synced
-                    and self.member_cache.get(room_id) is not users
+                if (
+                    self.client.rooms.get(room_id) is not room
+                    or (
+                        not room.members_synced
+                        and self.member_cache.get(room_id) is not users
+                    )
+                    or (room.members_synced and users != list(room.users))
                 ):
                     raise LocalProtocolError("room membership changed before sharing")
                 olm = self.crypto.olm

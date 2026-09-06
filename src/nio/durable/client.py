@@ -335,7 +335,11 @@ class DurableSync:
                         self._store.publish((), completes_sync=True)
                     self._changed.set()
                     continue
-                if self._crypto._pending() or self.client.outgoing_to_device_messages:
+                if (
+                    self._outbound.maintenance_due
+                    or self._crypto._pending()
+                    or self.client.outgoing_to_device_messages
+                ):
                     await self._maintain_crypto()
                     continue
                 local = self._read_local_intent()
