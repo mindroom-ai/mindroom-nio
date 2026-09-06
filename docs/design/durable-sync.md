@@ -198,6 +198,16 @@ sends. Apply responses, remove acknowledged work, and retain any generated
 follow-on work atomically. Serialize crypto maintenance response application
 with sync, so a key-query response cannot erase a newer dirty-user observation.
 
+While attached, the client's existing upload/query/claim, to-device, missing-key,
+and group-share methods use this same pending-request owner. They never bypass
+the durable crypto transaction. Group sharing still uses nio's normal recipient
+selection and encryption generator; each generated chunk is retained before its
+HTTP send. A concurrent room departure or device change may invalidate an
+outbound group session, so an earlier response cannot mark a replacement session
+shared. A process restart may create a new outbound group session; already
+retained ciphertext is retried unchanged. Public interactive approval or
+cancellation commits its decision and generated sends before returning.
+
 Persist waiting and untrusted interactive key-share requests needed by
 `continue_key_share`, including state required after restart. Test the actual
 restart and human-approval path. Committed device trust survives restart. An
