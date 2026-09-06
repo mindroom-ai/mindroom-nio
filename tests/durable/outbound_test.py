@@ -185,6 +185,98 @@ async def test_unverified_group_share_leaves_session_usable(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_verification_commit_prevents_later_key_forward(
+    tmp_path, monkeypatch
+):
+    sent = []
+
+    async def send(request):
+        sent.append(await request.json())
+        return web.json_response({})
+
+    async with homeserver(None, membership=send) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        with session._store.transaction():
+            publish_account(nio_client.olm)
+            _, device = queue_dummy(nio_client.olm)
+            nio_client.olm.outgoing_to_device_messages.clear()
+            request, group = room_key_request(nio_client.olm)
+            group.shared = True
+            session._crypto.capture()
+
+        def fail_commit():
+            raise RuntimeError("injected commit failure")
+
+        try:
+            with monkeypatch.context() as commit_failure:
+                commit_failure.setattr(session._store.database, "commit", fail_commit)
+                with pytest.raises(RuntimeError, match="injected commit failure"):
+                    nio_client.verify_device(device)
+            error = None
+            try:
+                await session._accept_response(
+                    json.dumps(
+                        {
+                            "next_batch": "s1",
+                            "to_device": {"events": [request.source]},
+                        }
+                    ).encode()
+                )
+                await session._maintain_crypto()
+            except LocalProtocolError as caught:
+                error = caught
+            assert sent == []
+            assert error is not None and "poisoned" in str(error)
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_change", "failed_change", "persisted_state"),
+    [
+        (None, "verify_device", TrustState.unset),
+        ("verify_device", "unverify_device", TrustState.verified),
+        (None, "blacklist_device", TrustState.unset),
+        ("blacklist_device", "unblacklist_device", TrustState.blacklisted),
+        (None, "ignore_device", TrustState.unset),
+        ("ignore_device", "unignore_device", TrustState.ignored),
+    ],
+)
+async def test_failed_public_trust_commit_discards_client_and_restores_from_sqlite(
+    tmp_path, monkeypatch, initial_change, failed_change, persisted_state
+):
+    nio_client = client()
+    session = open_session(tmp_path, nio_client)
+    with session._store.transaction():
+        publish_account(nio_client.olm)
+        _, device = queue_dummy(nio_client.olm)
+    if initial_change is not None:
+        assert getattr(nio_client, initial_change)(device)
+
+    def fail_commit():
+        raise RuntimeError("injected commit failure")
+
+    with monkeypatch.context() as commit_failure:
+        commit_failure.setattr(session._store.database, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="injected commit failure"):
+            getattr(nio_client, failed_change)(device)
+    assert nio_client._disposed
+    await session.close()
+    await nio_client.close()
+
+    reopened = open_session(tmp_path)
+    try:
+        restored = reopened.client.olm.device_store[USER]["OTHER"]
+        assert restored.trust_state is persisted_state
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_outgoing_member_query_cannot_rewrite_recovery_projection(tmp_path):
     async def members(_):
         return web.json_response(

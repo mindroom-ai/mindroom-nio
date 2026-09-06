@@ -87,6 +87,9 @@ On any failure after in-memory crypto or room mutation but before confirmed
 commit, discard the live client/store instance. SQLite rollback does not roll
 back Python objects. Reopening restores the last committed state. Cancellation
 obeys the same rule. Never retry preparation on the mutated instance.
+Attached public device-trust changes use this same transaction/disposal boundary:
+verification held only in a rolled-back Python object must never authorize a
+later incoming key request. Ordinary clients retain their existing trust path.
 
 ## Shared event processing
 
@@ -363,6 +366,10 @@ Nio reconciles that outstanding operation at the complete sync boundary, not at
 the first event whose membership string matches its target. Standard join/leave
 responses supply no membership event ID. An unseen earlier leave/rejoin can
 otherwise be mistaken for the local echo and apply the departure twice.
+See the Matrix [join](https://spec.matrix.org/v1.19/client-server-api/#post_matrixclientv3joinroomidoralias),
+[leave](https://spec.matrix.org/v1.19/client-server-api/#post_matrixclientv3roomsroomidleave)
+and [sync](https://spec.matrix.org/v1.19/client-server-api/#get_matrixclientv3sync)
+response definitions.
 
 While the operation is unobserved, the room's uncertain interval remains HISTORY
 and its individual membership events cannot change the local outcome. After

@@ -620,6 +620,19 @@ class Client:
         if self._durable_session is not None:
             self._durable_session._outbound.invalidate_users((device.user_id,))
 
+    def _change_device_trust(
+        self, device: OlmDevice, change: Callable[[OlmDevice], bool]
+    ) -> bool:
+        session = self._durable_session
+        if session is None:
+            changed = change(device)
+        else:
+            with session._outbound.transaction():
+                changed = change(device)
+        if changed:
+            self._invalidate_outbound_sessions(device)
+        return changed
+
     @store_loaded
     def verify_device(self, device: OlmDevice) -> bool:
         """Mark a device as verified.
@@ -637,12 +650,7 @@ class Client:
         verified.
         """
         assert self.olm
-
-        changed = self.olm.verify_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.verify_device)
 
     @store_loaded
     def unverify_device(self, device: OlmDevice) -> bool:
@@ -660,12 +668,7 @@ class Client:
         unverified.
         """
         assert self.olm
-
-        changed = self.olm.unverify_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unverify_device)
 
     @store_loaded
     def blacklist_device(self, device: OlmDevice) -> bool:
@@ -682,12 +685,7 @@ class Client:
         already.
         """
         assert self.olm
-
-        changed = self.olm.blacklist_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.blacklist_device)
 
     @store_loaded
     def unblacklist_device(self, device: OlmDevice) -> bool:
@@ -701,12 +699,7 @@ class Client:
         blacklist and no removal happened.
         """
         assert self.olm
-
-        changed = self.olm.unblacklist_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unblacklist_device)
 
     @store_loaded
     def ignore_device(self, device: OlmDevice) -> bool:
@@ -722,12 +715,7 @@ class Client:
         list of ignored devices.
         """
         assert self.olm
-
-        changed = self.olm.ignore_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.ignore_device)
 
     @store_loaded
     def unignore_device(self, device: OlmDevice) -> bool:
@@ -741,12 +729,7 @@ class Client:
         list and no removal happened.
         """
         assert self.olm
-
-        changed = self.olm.unignore_device(device)
-        if changed:
-            self._invalidate_outbound_sessions(device)
-
-        return changed
+        return self._change_device_trust(device, self.olm.unignore_device)
 
     def _handle_register(self, response: RegisterResponse | ErrorResponse) -> None:
         if isinstance(response, ErrorResponse):

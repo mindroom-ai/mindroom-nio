@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from nio.durable.projection import encode_member, encode_room, restore_room
 from nio.events import Event, InviteEvent
 from nio.rooms import MatrixInvitedRoom, MatrixRoom
@@ -135,6 +137,17 @@ def test_power_metadata_updates_existing_member_rows_without_rewriting_them():
     restored = restore_room(room.room_id, encode_room(room), members)
     assert restored.users["@alice:x"].power_level == 75
     assert restored.power_levels.can_user_ban("@alice:x")
+
+
+@pytest.mark.parametrize("default", [0, 10])
+def test_canonical_default_overrides_cached_member_power(default):
+    room = MatrixRoom("!r:x", "@me:x")
+    room.add_member("@alice:x", "Alice", None)
+    room.handle_event(state("m.room.power_levels", {"users_default": default}))
+    member = {**encode_member(room, "@alice:x"), "power_level": 75}
+    restored = restore_room(room.room_id, encode_room(room), {"@alice:x": member})
+    assert restored.users["@alice:x"].power_level == default
+    assert restored.power_levels.get_user_level("@alice:x") == default
 
 
 def test_display_summary_account_metadata_and_space_relations_survive_restart():

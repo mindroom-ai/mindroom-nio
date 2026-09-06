@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 - Route attached public crypto and to-device methods through retained requests.
   Retries reuse ciphertext and transaction IDs. Interactive key-share approvals
   survive restart; changed device keys invalidate cached outbound recipients.
+- A failed attached device-trust commit discards the client, preventing later key
+  forwarding based on a verification state that SQLite rolled back.
+- Restore member power from canonical room power metadata, preserving state
+  deletion across restart without reviving an older member-level cache.
 - Serialize local membership commands until the previous outcome is acknowledged
   and observed by sync. Immediate local departure still fences work; delayed sync
   may delay the next command. Committed intents survive restart without repeating

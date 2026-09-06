@@ -71,7 +71,6 @@ def encode_member(room: MatrixRoom, user_id: str) -> dict[str, Any] | None:
         "display_name": user.display_name,
         "avatar_url": user.avatar_url,
         "invited": user.invited,
-        "power_level": user.power_level,
     }
 
 
@@ -105,11 +104,6 @@ def restore_room(
             member.get("display_name"),
             member.get("avatar_url"),
             member.get("invited", False),
-        )
-        # Power changes update metadata without rewriting every member row.
-        # Preserve the observed per-user default when no explicit level exists.
-        room.users[user_id].power_level = room.power_levels.users.get(
-            user_id, member.get("power_level", room.power_levels.defaults.users_default)
         )
     room.members_synced = metadata.get("members_complete") is True and metadata.get(
         "member_count"
