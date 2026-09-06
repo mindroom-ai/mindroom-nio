@@ -2269,6 +2269,8 @@ class Client:
         decrypted_events: list[tuple[int, Event | BadEventType]] = []
 
         for index, event in enumerate(info.timeline.events):
+            if self._durable_session is not None:
+                room = self._durable_session._timeline_room(room_id, room, event)
             source = (
                 deepcopy(event.source)
                 if isinstance(event, MegolmEvent)
@@ -2298,6 +2300,7 @@ class Client:
             yield from self._iter_room_timeline(
                 room_id, join_info, room, encrypted_rooms, "join"
             )
+            room = self.rooms[room_id]
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
@@ -2327,13 +2330,16 @@ class Client:
     def _iter_left_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
         encrypted_rooms: set[str] = set()
         for room_id, info in response.rooms.leave.items():
-            yield from self._iter_joined_state(
+            for item in self._iter_joined_state(
                 room_id, info, encrypted_rooms, section="leave"
-            )
+            ):
+                if item.event is not None:
+                    yield item
             room = self.rooms[room_id]
             yield from self._iter_room_timeline(
                 room_id, info, room, encrypted_rooms, "leave"
             )
+            yield _SyncItem(room=self.rooms[room_id], section="leave")
             self.rooms.pop(room_id, None)
             self.invited_rooms.pop(room_id, None)
         self.encrypted_rooms.update(encrypted_rooms)
@@ -3083,6 +3089,8 @@ class Client:
 
         """
         assert self.olm
+        if self._durable_session is not None:
+            return self._durable_session._outbound.change_key_share(event)
         if self._ingestion_key_share_handler is not None:
             return self._ingestion_key_share_handler(event, False)
         return self.olm.continue_key_share(event)
@@ -3105,6 +3113,8 @@ class Client:
 
         """
         assert self.olm
+        if self._durable_session is not None:
+            return self._durable_session._outbound.change_key_share(event, cancel=True)
         if self._ingestion_key_share_handler is not None:
             return self._ingestion_key_share_handler(event, True)
         return self.olm.cancel_key_share(event)

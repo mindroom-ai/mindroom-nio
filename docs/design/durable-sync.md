@@ -208,6 +208,12 @@ shared. A process restart may create a new outbound group session; already
 retained ciphertext is retried unchanged. Public interactive approval or
 cancellation commits its decision and generated sends before returning.
 
+An attached client's `joined_members()` returns the current server response
+without replacing the historical room projection used for recovery. Outgoing
+encryption keeps only a disposable recipient list, invalidated by observed
+membership changes. It never grants incoming-event authorization. A member
+change during the lookup rejects that lookup; the application may retry.
+
 Persist waiting and untrusted interactive key-share requests needed by
 `continue_key_share`, including state required after restart. Test the actual
 restart and human-approval path. Committed device trust survives restart. An
@@ -288,3 +294,28 @@ event-loop delay, SQLite commits per admitted event, and production line delta.
 Use the existing writer and stdlib JSON unless measurements justify a change.
 The current engine is removed before completion; two permanent implementations
 would defeat this design. Publish no release or merge as part of implementation.
+
+### Recovery continuation and authorization baseline
+
+Recovery stores one continuation on the retained input: prologue, current room
+and forward pagination position, then tail. The decoded sync stays in memory
+between pages; restart decodes the retained body once. Each page commits its
+observations, crypto, room changes, and continuation in one synchronous
+transaction. Output acknowledgement gates the next page. Only the tail advances
+the global cursor; crypto maintenance retains the original input until completion.
+
+Both limited joined and left rooms use the old sync cursor as `from` and their
+retained `prev_batch` as `to`. Target equality or retained-tail overlap proves
+completion. Advancing empty pages continue. Missing boundaries, token cycles,
+unavailable or malformed history, and bounded-control exhaustion emit a loss
+barrier and fence the affected tail. Duplicates are removed before event handling;
+the active interval's event IDs and tokens are bounded, not a semantic ledger.
+
+Room metadata records whether an authorization baseline has been established.
+Adopted cursors without projections and local joins need full state; current
+state never authorizes an earlier missed interval. Initial and fenced tails are
+history. A full-state response establishes only a future baseline. Self departure
+ends live tenure at its event, and rejoin resets the room before the shared
+iterator handles that event, clearing stale members. A section-only departure
+follows its final timeline event. OwnMembership remains metadata on its original
+state, timeline, or lifecycle observation; it does not create duplicate carriers.

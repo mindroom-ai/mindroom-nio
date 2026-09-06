@@ -1592,6 +1592,8 @@ class AsyncClient(Client):
             tx_id (str, optional): The transaction ID for this message. Should
                 be unique.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.to_device(message, tx_id)
         uuid = tx_id or uuid4()
 
         method, path, data = Api.to_device(
@@ -1784,6 +1786,8 @@ class AsyncClient(Client):
         Raises LocalProtocolError if the client isn't logged in, if the session
         store isn't loaded or if no encryption keys need to be uploaded.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.keys_upload()
         if not self.should_upload_keys:
             raise LocalProtocolError("No key upload needed.")
 
@@ -1809,6 +1813,8 @@ class AsyncClient(Client):
         Raises LocalProtocolError if the client isn't logged in, if the session
         store isn't loaded or if no key query needs to be performed.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.keys_query()
         user_list = self.users_for_key_query
 
         if not user_list:
@@ -1947,6 +1953,8 @@ class AsyncClient(Client):
             room_id(str): The room id of the room for which we wan't to request
                 the joined member list.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.joined_members(room_id)
         method, path = Api.joined_members(self.access_token, room_id)
 
         return await self._send(
@@ -2034,7 +2042,10 @@ class AsyncClient(Client):
 
             if room.encrypted:
                 if not room.members_synced:
-                    await self.joined_members(room_id)
+                    if self._durable_session is not None:
+                        await self._durable_session._outbound.ensure_members(room_id)
+                    else:
+                        await self.joined_members(room_id)
                     if self.should_query_keys:
                         await self.keys_query()
 
@@ -2485,6 +2496,8 @@ class AsyncClient(Client):
         store isn't loaded, no room with the given room id exists or the room
         isn't an encrypted room.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.keys_claim(user_set)
         method, path, data = Api.keys_claim(self.access_token, user_set)
 
         return await self._send(KeysClaimResponse, method, path, data)
@@ -2518,6 +2531,10 @@ class AsyncClient(Client):
         for this room.
         """
         assert self.olm
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.share_group_session(
+                room_id, ignore_unverified_devices
+            )
 
         try:
             room = self.rooms[room_id]
@@ -2601,6 +2618,8 @@ class AsyncClient(Client):
             event (MegolmEvent): An undecrypted MegolmEvent for which we would
                 like to request the decryption key.
         """
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.request_room_key(event, tx_id)
         uuid = tx_id or uuid4()
 
         if event.session_id in self.outgoing_key_requests:

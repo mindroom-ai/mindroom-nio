@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,13 +13,12 @@ from uuid import UUID
 from ..api import Api
 from ..client.base_client import _SyncItem
 from ..crypto import Olm
-from ..event_provenance import TimelineEventProvenance
-from ..events import InviteMemberEvent, RoomMemberEvent
+from ..events import RoomMemberEvent
 from ..exceptions import LocalProtocolError
-from ..responses import ErrorResponse, SyncResponse
+from ..responses import SyncResponse
 from ..rooms import MatrixInvitedRoom, MatrixRoom
 from ..store import MatrixStore, SqliteStore
-from .codec import freeze_event, restore_event
+from .codec import restore_event
 from .crypto import CryptoMaintenance
 from .model import (
     OwnMembership,
@@ -30,7 +29,9 @@ from .model import (
     encode_records,
 )
 from .observations import TransientSections, deliver_transients
+from .outbound import OutboundCrypto
 from .projection import encode_member, encode_room, restore_room
+from .recovery import Recovery
 from .store import DurableStore
 from .transport import HttpError, Transport
 
@@ -87,8 +88,10 @@ class DurableSync:
         self._transport = Transport(client, config.max_response_bytes)
         self._crypto = CryptoMaintenance(client, store)
         self._crypto.restore()
+        self._outbound = OutboundCrypto(self)
         self._metadata: dict[str, dict[str, Any]] = {}
         self._restore_rooms()
+        self._recovery = Recovery(self)
 
     def _restore_rooms(self) -> None:
         for room_id, encoded in self._store.database.execute_sql(
@@ -140,15 +143,19 @@ class DurableSync:
         except (ValueError, TypeError, KeyError) as error:
             raise LocalProtocolError("malformed durable sync response") from error
 
-    def _capture_response(self, body: bytes) -> tuple[SyncResponse, TransientSections]:
+    def _capture_response(
+        self, body: bytes, *, full_state: bool = False
+    ) -> tuple[SyncResponse, TransientSections]:
         self._assert_active()
         response = self._decode_response(body)
         with self._store.transaction():
             self._store.capture(body)
+            self._store.save_continuation({"full_state": full_state})
+        self._recovery.response = response[0]
         return response
 
-    async def _accept_response(self, body: bytes) -> None:
-        response, transients = self._capture_response(body)
+    async def _accept_response(self, body: bytes, *, full_state: bool = False) -> None:
+        response, transients = self._capture_response(body, full_state=full_state)
         self._prepare_pending(response)
         await deliver_transients(self.client, transients)
 
@@ -163,138 +170,54 @@ class DurableSync:
         metadata.update(membership=membership, membership_epoch=next_epoch)
         return change
 
-    def _prepare_pending(self, response: SyncResponse | None = None) -> None:
-        self._assert_active()
-        pending = self._store.input
-        if pending is None or pending[1].get("phase") == "prepared":
+    def _publish_records(self, records: tuple[SyncRecord, ...]) -> None:
+        """Publish bounded observations within the caller's transaction."""
+        if len(records) > self.config.max_batch_records:
+            limit = self.config.max_batch_records
+            for index in range(0, len(records), limit):
+                self._publish_records(records[index : index + limit])
             return
-        response = response or self._decode_response(pending[0])[0]
-        known_rooms = {
-            room_id
-            for room_id, metadata in self._metadata.items()
-            if metadata.get("membership") == "join"
-        }
-        fresh_rooms = set(response.rooms.join) - set(self.client.rooms)
-        changed_rooms: dict[str, MatrixRoom] = {}
-        changed_members: set[tuple[str, str]] = set()
-        explicit_memberships = {
-            room_id
-            for section in (response.rooms.join, response.rooms.leave)
-            for room_id, info in section.items()
-            if any(
-                isinstance(event, RoomMemberEvent)
-                and event.state_key == self.client.user_id
-                for event in (*info.state, *info.timeline.events)
-            )
-        }
-        records: list[SyncRecord] = []
+        encoded = encode_records(records)
+        size = len(encoded.encode())
+        if size > self.config.max_batch_bytes:
+            if len(records) <= 1:
+                raise LocalProtocolError(
+                    "prepared event exceeds the durable batch bound"
+                )
+            middle = len(records) // 2
+            self._publish_records(records[:middle])
+            self._publish_records(records[middle:])
+            return
         pending_bytes = self._store.database.execute_sql(
             "SELECT COALESCE(SUM(length(CAST(records AS BLOB))),0) FROM NioDurableBatch"
         ).fetchone()[0]
+        if pending_bytes + size > self.config.max_pending_bytes:
+            raise LocalProtocolError(
+                "prepared output exceeds the durable pending bound"
+            )
+        self._store.publish(records, encoded_records=encoded)
 
-        def publish(chunk: tuple[SyncRecord, ...]) -> None:
-            nonlocal pending_bytes
-            encoded = encode_records(chunk)
-            size = len(encoded.encode())
-            if size > self.config.max_batch_bytes:
-                if len(chunk) == 1:
-                    raise LocalProtocolError(
-                        "prepared event exceeds the durable batch bound"
-                    )
-                middle = len(chunk) // 2
-                publish(chunk[:middle])
-                publish(chunk[middle:])
-                return
-            pending_bytes += size
-            if pending_bytes > self.config.max_pending_bytes:
-                raise LocalProtocolError(
-                    "prepared output exceeds the durable pending bound"
-                )
-            self._store.publish(chunk, encoded_records=encoded)
+    def _timeline_room(
+        self, room_id: str, room: MatrixRoom, event: object
+    ) -> MatrixRoom:
+        if (
+            isinstance(event, RoomMemberEvent)
+            and event.state_key == self.client.user_id
+            and event.membership == "join"
+            and self._metadata.get(room_id, {}).get("membership") not in (None, "join")
+        ):
+            room = MatrixRoom(room_id, self.client.user_id, room.encrypted)
+            self.client.rooms[room_id] = room
+            self._metadata.setdefault(room_id, {})["baseline"] = False
+            self._recovery.resets.add(room_id)
+            self._store.database.execute_sql(
+                "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+            )
+        return room
 
-        def flush() -> None:
-            if records:
-                publish(tuple(records))
-                records.clear()
-
-        try:
-            with self._store.transaction():
-                for fresh_room_id in fresh_rooms:
-                    self._store.database.execute_sql(
-                        "DELETE FROM NioDurableMember WHERE room_id=?", (fresh_room_id,)
-                    )
-                for item in self.client._iter_sync(response, include_left=True):
-                    if item.route in ("presence", "ephemeral"):
-                        continue
-                    room = item.room
-                    room_id = room.room_id if room else None
-                    change = None
-                    if room is not None and room_id is not None:
-                        if room_id not in known_rooms or item.route in (
-                            None,
-                            "invite",
-                            "room_account_data",
-                        ):
-                            changed_rooms[room_id] = room
-                        if item.event is None:
-                            if room_id in explicit_memberships:
-                                continue
-                            assert item.section is not None
-                            change = self._change_membership(room_id, item.section)
-                            if change is None:
-                                continue
-                        if isinstance(item.event, (RoomMemberEvent, InviteMemberEvent)):
-                            changed_members.add((room_id, item.event.state_key))
-                            changed_rooms[room_id] = room
-                            if item.event.state_key == self.client.user_id:
-                                change = self._change_membership(
-                                    room_id, item.event.membership
-                                )
-                        elif item.event is not None and "state_key" in getattr(
-                            item.event, "source", {}
-                        ):
-                            changed_rooms[room_id] = room
-                    record = freeze_event(item)
-                    if room_id is not None:
-                        record = replace(
-                            record,
-                            membership=change,
-                            membership_epoch=self._metadata.get(room_id, {}).get(
-                                "membership_epoch", 0
-                            ),
-                            provenance=(
-                                (
-                                    TimelineEventProvenance.LIVE
-                                    if room_id in known_rooms
-                                    else TimelineEventProvenance.HISTORY
-                                )
-                                if record.kind is RecordKind.TIMELINE
-                                else record.provenance
-                            ),
-                        )
-                    barrier = change is not None or isinstance(
-                        item.event, (RoomMemberEvent, InviteMemberEvent)
-                    )
-                    if barrier:
-                        flush()
-                    records.append(record)
-                    if barrier or len(records) >= self.config.max_batch_records:
-                        flush()
-                flush()
-                for room_id, info in response.rooms.join.items():
-                    if info.summary or info.unread_notifications:
-                        changed_rooms[room_id] = self.client.rooms[room_id]
-                self._save_rooms(changed_rooms, changed_members)
-                self._crypto.capture()
-                self._store.set_cursor(response.next_batch)
-                self._store.save_continuation({"phase": "prepared"})
-            self.client.next_batch = response.next_batch
-            self._changed.set()
-        except BaseException:
-            self.client._poison_ingestion()
-            self._store.close()
-            self._changed.set()
-            raise
+    def _prepare_pending(self, response: SyncResponse | None = None) -> None:
+        self._assert_active()
+        self._recovery.prepare(response)
 
     def _save_rooms(
         self, rooms: dict[str, MatrixRoom], members: set[tuple[str, str]]
@@ -308,6 +231,7 @@ class DurableSync:
                 membership_epoch=prior.get("membership_epoch", 0),
                 members_complete=room.members_synced,
             )
+            metadata["baseline"] = prior.get("baseline", False)
             self._metadata[room_id] = metadata
             database.execute_sql(
                 "INSERT INTO NioDurableRoom(room_id,metadata) VALUES(?,?) "
@@ -380,40 +304,7 @@ class DurableSync:
             await value
 
     async def _maintain_crypto(self) -> None:
-        async with self._crypto_lock:
-            completed: set[str] = set()
-            while True:
-                try:
-                    with self._store.transaction():
-                        request = self._crypto.next_request(completed=completed)
-                except BaseException:
-                    self.client._poison_ingestion()
-                    self._store.close()
-                    raise
-                if request is None:
-                    return
-                body = await self._transport.request(
-                    request.method, request.path, request.body
-                )
-                decoded = json.loads(body)
-                try:
-                    with self._store.transaction():
-                        response, observations = self._crypto.apply(request, decoded)
-                        if isinstance(response, ErrorResponse):
-                            raise LocalProtocolError("invalid durable crypto response")
-                        if observations:
-                            self._store.publish(
-                                tuple(
-                                    freeze_event(_SyncItem("to_device", event))
-                                    for event in observations
-                                )
-                            )
-                except BaseException:
-                    self.client._poison_ingestion()
-                    self._store.close()
-                    raise
-                self._changed.set()
-                completed.add(request.kind)
+        await self._outbound.maintain()
 
     async def run(self) -> None:
         """Run one Classic source, draining committed batches between responses."""
@@ -431,14 +322,21 @@ class DurableSync:
                     await self._changed.wait()
                     continue
                 if self._store.input is not None:
-                    self._prepare_pending()
-                    if self._store.has_batches():
+                    await self._recovery.advance()
+                    if (
+                        self._store.has_batches()
+                        or self._store.input[1].get("phase") != "prepared"
+                    ):
                         continue
                     await self._maintain_crypto()
                     with self._store.transaction():
                         self._store.finish_input()
+                        self._recovery.response = None
                         self._store.publish((), completes_sync=True)
                     self._changed.set()
+                    continue
+                if self._crypto._pending() or self.client.outgoing_to_device_messages:
+                    await self._maintain_crypto()
                     continue
                 local = self._read_local_intent()
                 if (
@@ -454,11 +352,13 @@ class DurableSync:
                     continue
                 if self._quiescing or self._closed:
                     return
+                full_state = self._recovery.needs_full_state()
                 method, path = Api.sync(
                     "",
                     self.cursor,
                     self.config.sync_timeout_ms,
-                    self.config.sync_filter,
+                    None if full_state else self.config.sync_filter,
+                    full_state=full_state or None,
                 )
                 self._poll = asyncio.create_task(
                     self._transport.request(
@@ -470,14 +370,14 @@ class DurableSync:
                 try:
                     body = await self._poll
                 except asyncio.CancelledError:
-                    if self._quiescing and not running.cancelling():
-                        continue
-                    if self._local_lock.locked() and not running.cancelling():
+                    # An owned poll can be interrupted for local work. External
+                    # cancellation of the runner still propagates normally.
+                    if not running.cancelling():
                         continue
                     raise
                 finally:
                     self._poll = None
-                await self._accept_response(body)
+                await self._accept_response(body, full_state=full_state)
         finally:
             self._running = None
             self._changed.set()
@@ -602,8 +502,11 @@ class DurableSync:
                     room_id, self.client.user_id
                 )
                 self._metadata.setdefault(room_id, {}).update(
-                    membership=target, membership_epoch=change.current_epoch
+                    membership=target,
+                    membership_epoch=change.current_epoch,
+                    baseline=False,
                 )
+                self._outbound.member_cache.pop(room_id, None)
                 if target == "join":
                     room = MatrixRoom(room_id, self.client.user_id)
                     self.client.rooms[room_id] = room

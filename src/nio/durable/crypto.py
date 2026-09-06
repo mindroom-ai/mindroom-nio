@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -274,25 +275,33 @@ class CryptoMaintenance:
         if self._messages:
             return self.enqueue_message(self._messages[0][1])
         if "upload" not in completed and olm.should_upload_keys:
-            return self._retain_request("upload", Api.keys_upload("", olm.share_keys()))
+            return self.enqueue_upload()
         if "query" not in completed and olm.users_for_key_query:
-            users = sorted(olm.users_for_key_query)
-            # New sync invalidations are now distinguishable from this query.
-            olm.users_for_key_query.clear()
-            return self._retain_request(
-                "query", Api.keys_query("", users, self.store.cursor)
-            )
+            return self.enqueue_query()
         if "claim" not in completed and (
             olm.wedged_devices or olm.key_request_devices_no_session
         ):
-            return self._retain_request(
-                "claim",
-                Api.keys_claim(
-                    "",
-                    dict(olm.get_users_for_key_claiming()),
-                ),
-            )
+            return self.enqueue_claim(dict(olm.get_users_for_key_claiming()))
         return None
+
+    def enqueue_upload(self) -> CryptoRequest:
+        self.store._require_transaction()
+        return self._retain_request(
+            "upload", Api.keys_upload("", self.olm.share_keys())
+        )
+
+    def enqueue_query(self) -> CryptoRequest:
+        self.store._require_transaction()
+        users = sorted(self.olm.users_for_key_query)
+        # New sync invalidations are distinguishable from this query.
+        self.olm.users_for_key_query.clear()
+        return self._retain_request(
+            "query", Api.keys_query("", users, self.store.cursor)
+        )
+
+    def enqueue_claim(self, users: dict[str, Iterable[str]]) -> CryptoRequest:
+        self.store._require_transaction()
+        return self._retain_request("claim", Api.keys_claim("", users))
 
     def enqueue_message(
         self, message: ToDeviceMessage, *, request_id: str | None = None

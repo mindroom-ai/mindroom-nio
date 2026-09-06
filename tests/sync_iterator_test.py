@@ -174,15 +174,17 @@ def test_left_room_is_opt_in_and_removed_after_observations(client):
     assert list(client._iter_sync(response)) == []
     assert ROOM_ID in client.rooms
     iterator = client._iter_sync(response, include_left=True)
-    marker = next(iterator)
-    assert marker.section == "leave"
-    assert marker.room is client.rooms[ROOM_ID]
     state = next(iterator)
     assert state.event.event_id == "$state"
     assert state.room.name == "Leaving"
     event = next(iterator)
     assert event.route == "event"
     assert event.event.event_id == "$last"
+    # The fallback departure must not fence earlier timeline observations.
+    marker = next(iterator)
+    assert marker.section == "leave"
+    assert marker.event is None
+    assert marker.room is client.rooms[ROOM_ID]
     assert ROOM_ID in client.rooms
     assert list(iterator) == []
     assert ROOM_ID not in client.rooms
