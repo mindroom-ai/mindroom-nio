@@ -44,10 +44,10 @@ Section markers identify `invite`, `join`, or `leave`; non-callback state events
 have `route=None`. Section markers precede room state. The iterator never changes
 the cursor or invokes user callbacks. Ordinary wrappers retain their cursor logic.
 
-- [ ] Add a callback-order characterization test using two room state changes
+- [x] Add a callback-order characterization test using two room state changes
   and messages; callbacks must observe their original event-time room state.
   Add a callback exception test proving later events remain unprocessed.
-- [ ] Run the focused tests before changing production code. Add a new iterator
+- [x] Run the focused tests before changing production code. Add a new iterator
   test that initially fails because `_iter_sync` does not exist:
 
   ```python
@@ -58,15 +58,15 @@ the cursor or invokes user callbacks. Ordinary wrappers retain their cursor logi
   assert callback_events == []
   ```
 
-- [ ] Extract shared synchronous section iterators. Dispatch ordinary callbacks
+- [x] Extract shared synchronous section iterators. Dispatch ordinary callbacks
   at yields with synchronous/async wrappers; preserve subclass decryption hooks.
   Keep standalone section methods working. For joined state, emit observations
   immediately after each applied event. Include room identity in section markers.
-- [ ] Add opt-in left-room processing; emit state/timeline observations before
+- [x] Add opt-in left-room processing; emit state/timeline observations before
   removing the room. Default ordinary behavior ignores left rooms.
-- [ ] Preserve async versus sync response mutation timing where currently
+- [x] Preserve async versus sync response mutation timing where currently
   observable. Cover to-device decryption and collected/expired key callbacks.
-- [ ] Run `uv run --locked pytest --benchmark-disable tests/client_test.py
+- [x] Run `uv run --locked pytest --benchmark-disable tests/client_test.py
   tests/async_client_test.py tests/sync_iterator_test.py`, plus relevant crypto
   tests and type checks. Self-review and commit the shared processing seam.
 
@@ -82,16 +82,16 @@ the cursor or invokes user callbacks. Ordinary wrappers retain their cursor logi
 functions. Room metadata and member rows are separate. Record decoding occurs at
 the disk boundary, not at every same-process call.
 
-- [ ] Add failing encrypted-media, sanitized room-key, dummy, invitation, and
+- [x] Add failing encrypted-media, sanitized room-key, dummy, invitation, and
   verification-cancel round trips. Assert exact event class and literal crypto
   evidence after restoring; no second decrypt call may occur.
-- [ ] Implement explicit small codec tags only where normal parsers cannot
+- [x] Implement explicit small codec tags only where normal parsers cannot
   reconstruct sanitized events. Freeze envelope and clear payload before mutation
   can erase the envelope. Preserve provenance and event-time membership.
-- [ ] Add room restart tests with changed power levels, membership departure,
+- [x] Add room restart tests with changed power levels, membership departure,
   encrypted flag, and two same-name members. Check real room behavior after
   restore, including incomplete members; do not assert serialized implementation.
-- [ ] Implement compact metadata plus member deltas. A message without state
+- [x] Implement compact metadata plus member deltas. A message without state
   changes must not rewrite all member rows. Run focused tests, review and commit.
 
 ## Task 3: Implement the SQLite input and batch boundary
@@ -110,23 +110,23 @@ The factory owns attaching the store and restoring crypto/rooms under its lease.
 `ack(batch: SyncBatch)`, `wait_for_work()`, `quiesce()`, and `close()`.
 It exposes its `stream_id: UUID` and committed progress for the consumer.
 
-- [ ] Add fresh/reopen/wrong-consumer/concurrent-owner tests with real SQLite.
+- [x] Add fresh/reopen/wrong-consumer/concurrent-owner tests with real SQLite.
   Opening a durable database through an ordinary store must fail safely.
-- [ ] Implement one exclusive lifetime lease and a small versioned schema for
+- [x] Implement one exclusive lifetime lease and a small versioned schema for
   retained input, metadata, batches, room metadata/members, and pending crypto.
   Use the same connection as `SqliteStore`. Preserve default-store effective trust
   on explicit adoption. Remove per-row path checking from this path.
-- [ ] Add tests showing `next_batch` is read-only and repeated reads/reopens yield
+- [x] Add tests showing `next_batch` is read-only and repeated reads/reopens yield
   identical `(stream_id, sequence, index)` identities. Wrong/out-of-order ack
   must not delete another batch. Empty sync completion remains observable.
-- [ ] Implement bounded capture, synchronous transactional preparation, and
+- [x] Implement bounded capture, synchronous transactional preparation, and
   batched publication. Split authorization barriers per spec. Dispose the client
   after rollback; test this with a genuine transaction failure after mutation.
-- [ ] Port the demonstrated main encrypted cursor crash into a passing adapter
+- [x] Port the demonstrated main encrypted cursor crash into a passing adapter
   test. Kill subprocesses before input commit, after capture, after preparation,
   and after consumer receipt but before ack. Use real crypto and literal plaintext
   expectations. Healthy control must also pass.
-- [ ] Run focused store/client/crypto tests, review and commit.
+- [x] Run focused store/client/crypto tests, review and commit.
 
 ## Task 4: Persist crypto maintenance and chronological recovery
 
@@ -137,19 +137,19 @@ It exposes its `stream_id: UUID` and committed progress for the consumer.
 **Produces:** Exact pending crypto request persistence, response settlement,
 bounded Classic recovery continuation, and serialized local membership intent.
 
-- [ ] Test generated one-time keys surviving restart before upload response;
+- [x] Test generated one-time keys surviving restart before upload response;
   identical encrypted retry body/transaction ID; dummy acknowledgement producing
   a retained follow-on; key query interleaved with newer sync invalidation.
-- [ ] Reuse ordinary crypto methods inside the existing transaction. Persist
+- [x] Reuse ordinary crypto methods inside the existing transaction. Persist
   waiting/untrusted interactive requests and test real `continue_key_share`
   after restart. Retain committed trust; document restarted active SAS exchange.
-- [ ] Test a limited timeline with recovered membership, messages, and a retained
+- [x] Test a limited timeline with recovered membership, messages, and a retained
   tail, including a restart between pages. Assert chronological admission and
   that recovered membership never becomes a live grant.
-- [ ] Retain one bounded raw response and continuation, fetching one page at a
+- [x] Retain one bounded raw response and continuation, fetching one page at a
   time. Keep crypto prologue and pending output ahead of further requests. Test
   oversize reduction, token cycles, unavailable history, and explicit fenced loss.
-- [ ] Add and implement local membership intent/restart/stale-echo tests using
+- [x] Add and implement local membership intent/restart/stale-echo tests using
   expected membership and epoch. Run focused tests, review and commit.
 
 ## Task 5: Move MindRoom to batch admission
@@ -163,19 +163,19 @@ doctor/configuration documentation and tests.
 **Produces:** One existing-journal transaction per admitted batch and coordinated
 Classic-only consumer, preserving business authorization and projection barriers.
 
-- [ ] Create a candidate worktree from the published PR head, preserving other
+- [x] Create a candidate worktree from the published PR head, preserving other
   user worktrees. Add failing batch rollback and redelivery tests before replacing
   the adapter. Record a batch receipt and admissions in one transaction.
-- [ ] Replace per-record canonical proof validation with trusted batch conversion.
+- [x] Replace per-record canonical proof validation with trusted batch conversion.
   Keep ordered lifecycle hooks, receipt replay semantics and existing projection
   wait. Test grant/message/departure ordering and no recovered grant.
-- [ ] Extract the existing signed-device post-decrypt authentication into a pure
+- [x] Extract the existing signed-device post-decrypt authentication into a pure
   helper and use it for fresh and restored to-device events. Test removed or
   changed devices failing closed; never deserialize app subtypes inside nio.
-- [ ] Move safe self-authored pending/streaming edit filtering before expensive
+- [x] Move safe self-authored pending/streaming edit filtering before expensive
   classification. Test original placeholders, terminal edits, foreign edits,
   redactions, encrypted content, and unknown statuses.
-- [ ] Update session opening, lifecycle, completion, local membership and config;
+- [x] Update session opening, lifecycle, completion, local membership and config;
   reject explicit Sliding configuration. Test quiesce and cleanup ordering.
 - [ ] Point the candidate at the local built nio wheel for verification; final
   committed dependency uses the tested pushed commit. Run relevant tests, review
@@ -197,7 +197,7 @@ Update exports, tests, release notes and historical document status.
   and `MYPYPATH=src uv run --no-sync mypy -p nio --warn-redundant-casts
   --no-incremental`. Types must remain zero errors. Nio: 689 passed, 3 skipped;
   zero mypy errors and clean hooks.
-- [ ] Run companion full checks (coordinated consumer work).
+- [x] Run companion full checks: 15,522 passed, 22 skipped; ty and hooks clean.
 - [x] Draft breaking-change release notes for the new API, removed old fork
   interfaces, Classic-only durable transport and transient receipts. Publication
   and version selection remain release work. Review and commit.
@@ -207,13 +207,13 @@ Update exports, tests, release notes and historical document status.
 **Files:** Update measured results here; retain detailed evidence in the persistent
 capacity workspace and update both existing PR descriptions with relative paths.
 
-- [ ] Run batched encrypted/plaintext workloads against the starting branch and
+- [x] Run batched encrypted/plaintext workloads against the starting branch and
   replacement. Record CPU, JSON decode counts, commit counts, loop delay and
   member-row writes. Compare SQLite NORMAL and FULL before deciding durability.
 - [ ] Repeat the existing integrated 200-request Synapse and Tuwunel controls.
   Report all accepted/replied counts, latency distributions, synthetic generation
   time, convergence fences and drain. Investigate regressions with actual profiles.
-- [ ] Measure production additions/deletions against main and the starting head.
+- [x] Measure production additions/deletions against main and the starting head.
   Review whole-branch correctness, ownership, removed duplication and performance.
   Address demonstrated findings; excluded guarantees require a design amendment.
 - [ ] Run final necessary checks, stage only intended files, inspect staged diff,
@@ -227,7 +227,6 @@ capacity workspace and update both existing PR descriptions with relative paths.
 - Fresh baseline: 2,181 passed, 3 skipped in 211.40 seconds.
 - Main crash reproduction: healthy real-crypto control passes; crash regression
   fails with missing room key and `MegolmEvent` instead of `RoomMessageText`.
-- Replacement implementation and performance results are not yet available.
 
 - Task 6 removal source measurement (2026-09-06): `src/nio` contains 28,537
   Python lines, including 2,785 in `nio.durable` and 122 in its shared SQLite
@@ -238,11 +237,12 @@ capacity workspace and update both existing PR descriptions with relative paths.
 
 ## Initial replacement measurements
 
-At Nio `34699bf` and MindRoom `72732c22b`, full suites passed: 689 passed/3
-skipped and 15,514 passed/22 skipped respectively. Nio mypy and MindRoom ty were
-clean, as were repository hooks. Installed wheel files matched committed source.
-Independent review found local-membership echo ownership defects in both layers;
-fixes and final integrated qualification remain required.
+At Nio `34699bf`, 689 tests passed with 3 skipped. The preliminary MindRoom
+run at `72732c22b` passed 15,514 with 22 skipped, but automatic dependency sync
+was not disabled for all subprocesses; it does not certify the combined artifact.
+Final checks below supersede that limitation. Installed wheel files matched the
+committed source for the initial performance controls. Independent review found
+local-membership echo ownership defects in both layers, subsequently fixed.
 
 Three sequential process runs per case compared capture, preparation, batch read
 and acknowledgement against the published Nio implementation at `9df7aa9`.
@@ -273,8 +273,87 @@ overlap). Both had no loop-stall diagnostics and zero Nio input/batches or journ
 delivery backlog after shutdown. The synthetic stream itself lasts about 60
 seconds. These initial NORMAL controls are not final acceptance evidence.
 
-Final work: reconcile local echoes in the single producer intent, remove typed
-consumer echo debt, use FULL, and investigate the bounded startup preparation
-limit against the remaining Tuwunel overlap failure. Keep acceptance thresholds
-unchanged. Rerun real local/restart/crypto regressions and integrated controls on
-the final installed wheel before updating pins and pushing.
+The final fix reconciles local echoes in the single producer intent, removes
+typed consumer echo debt, refreshes known outbound recipients on device changes,
+and discards unaccepted polls when local membership takes ownership. FULL is the
+default. A diagnostic increase from eight to sixteen root preparations did not
+materially improve reply latency or meet the Tuwunel overlap target; retain eight.
+No writer, serializer, concurrency setting, or acceptance threshold was changed.
+
+
+## Final implementation and engine measurements
+
+Nio runtime `ed316ed` and MindRoom runtime `ed4a209d6` pass 698/3 and
+15,522/22 tests respectively (passed/skipped). Nio mypy reports zero errors in
+58 source files; MindRoom ty and affected repository hooks pass. The consumer
+suite and its subprocesses use the candidate with automatic dependency sync
+disabled, with modified producer file hashes checked before and after. Final
+integrated controls use a built wheel whose complete Python source matches Git.
+
+Production Python in `src/nio` totals 28,582 lines, including 2,823 in the durable
+adapter and 122 in its shared lease. Against starting head `9df7aa9`, production
+diff is +3,266/-20,908 (net -17,642); against main `5b6de3bc`, +3,901/-6,809
+(net -2,908). The companion production diff against `79ae63c4b` is +441/-1,004
+(net -563). Test deletion reflects removal of the superseded engine; retained
+behavioral tests cover actual crash, replay, ownership and authorization seams.
+
+The final engine repeat uses the same fixtures and three isolated runs per case.
+Old results below are the already measured matched baseline, not a new run.
+
+| Events | Payload | Old NORMAL median | Final NORMAL median | Final FULL median | Final FULL CPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 200 | Plain | 196.7 ms | 17.0 ms | 23.2 ms | 17.3 ms |
+| 200 | Encrypted | 262.7 ms | 53.2 ms | 61.8 ms | 53.4 ms |
+| 1,000 | Plain | 1,736.7 ms | 76.9 ms | 90.5 ms | 77.3 ms |
+| 1,000 | Encrypted | 2,107.8 ms | 272.4 ms | 283.8 ms | 260.0 ms |
+
+For 200 events, commits remain 404 versus 3; final selects are 12 instead of
+3,235. JSON decodes remain 1,854 versus 3 for plain input, 2,854 versus 203 for
+encrypted input. Unchanged members produce no member-row writes. This removes
+repeated engine work without a new JSON dependency or background database owner.
+The tight microbenchmark's median maximum loop gap is 23.2/61.9 milliseconds for
+200 plain/encrypted events, and 90.6/283.9 milliseconds for 1,000; it runs the
+capture/prepare/read/ack sequence without real network or consumer scheduling.
+These figures measure that probe, not live health latency or a hard latency bound.
+
+Detailed local evidence is retained under `capacity/durable-sync-kernel/`: initial
+`micro-20260906T084930Z`, final `micro-final-20260906T091913Z`, and the explicitly
+diagnostic `startup-cap16-20260906T090108Z`. These evidence directories are not
+part of the library package or repository contract.
+
+
+## Qualification correction: forward recovery completion
+
+The first final FULL controls at Nio `ed316ed`/MindRoom `ed4a209d6` exposed a
+server-dependent recovery defect. Tuwunel completed only 73 of 200 replies before
+the shared deadline, despite empty queues and no application errors. Synapse
+passed all criteria: 200 replies, median/p95 77.816/83.654 seconds, 48.356-second
+overlap, all three fence principals settled, and zero pending input, batches,
+journal work or outbox deliveries after shutdown. The failed Tuwunel result is
+not a throughput measurement or a passing drain certificate for all requests.
+
+A diagnostic trace reproduced the cause: a forward page requested from token
+841 with `to=913` returned 14 events and `end=908`; the next page returned no
+events and no end token. Tuwunel excludes the requested `to` event. Recovery
+therefore could not see the retained-tail overlap and emitted false loss, making
+later requests historical context. The full workload's clear provenance trace
+confirmed recovered and live roots being followed by incorrectly historical
+roots. Empty application queues do not prove that all requested work was handled.
+
+Use the existing retained-tail overlap check without an HTTP `to` bound. Page,
+byte, continuation and retry limits stay unchanged. Do not interpret events at or
+after the first overlap during gap recovery; the captured tail owns those events.
+Missing history without a proven boundary still emits loss. This removes one
+request constraint and requires no new persisted mechanism or weaker durability.
+
+- [ ] Reproduce the bounded-end behavior with real HTTP/SQLite and restart; assert
+  chronological recovered messages, one live tail, no false loss, and no early
+  application of events beyond the retained tail.
+- [ ] Apply the omitted-`to` request change, preserve genuine loss cases, run
+  focused/full checks, self-review and scoped review.
+- [ ] Rebuild the wheel and repeat unchanged live controls; record results here
+  before pins, commits and publication are considered complete.
+
+The trace is diagnostic evidence, not an uninstrumented latency result:
+`recovery-trace-20260906T092704Z` in the retained capacity workspace. Its wrappers
+record pagination metadata and classification, not event content or credentials.

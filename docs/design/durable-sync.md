@@ -312,8 +312,13 @@ transaction. Output acknowledgement gates the next page. Only the tail advances
 the global cursor; crypto maintenance retains the original input until completion.
 
 Both limited joined and left rooms use the old sync cursor as `from` and their
-retained `prev_batch` as `to`. Target equality or retained-tail overlap proves
-completion. Advancing empty pages continue. Missing boundaries, token cycles,
+retained `prev_batch` as the target, without sending an HTTP `to` bound. Some
+servers exclude that boundary and finish at an earlier event token, so a bounded
+request can prevent the overlap needed to prove completion. Request at most the
+existing page limit and stop interpreting the page at its first retained-tail
+event. Later events in that page remain outside this captured sync interval.
+Target equality or retained-tail overlap proves completion; an empty page alone
+does not. Advancing empty pages continue. Missing boundaries, token cycles,
 unavailable or malformed history, and bounded-control exhaustion emit a loss
 barrier and fence the affected tail. Duplicates are removed before event handling;
 the active interval's event IDs and tokens are bounded, not a semantic ledger.

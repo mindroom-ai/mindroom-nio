@@ -34,6 +34,10 @@ All notable changes to this project will be documented in this file.
 - Route attached public crypto and to-device methods through retained requests.
   Retries reuse ciphertext and transaction IDs. Interactive key-share approvals
   survive restart; changed device keys invalidate cached outbound recipients.
+- Serialize local membership commands until the previous outcome is acknowledged
+  and observed by sync. Immediate local departure still fences work; delayed sync
+  may delay the next command. Committed intents survive restart without repeating
+  successful HTTP, and unaccepted polls cannot cross local command ownership.
 - Recover limited Classic timelines through bounded, resumable history pages.
   Unavailable history and oversized single events produce explicit loss barriers.
   Quiescing stops new polls and drains captured work without an extra final poll.
@@ -53,9 +57,10 @@ All notable changes to this project will be documented in this file.
 
 - This is a breaking change relative to 0.40.0; select the release version before
   publishing. Companion integration and dependency pins require cutover testing.
-- SQLite WAL with `synchronous=NORMAL` provides the tested process-crash contract;
-  power-loss durability is not claimed. Workload comparison with FULL remains
-  part of release acceptance.
+- Durable SQLite uses WAL with `synchronous=FULL`, selected after measured
+  comparison with NORMAL. Process-crash recovery is tested with killed processes;
+  power-loss durability relies on SQLite and storage honoring flushes. The
+  consumer must durably admit each batch before acknowledging it.
 
 ## 0.40.0
 
