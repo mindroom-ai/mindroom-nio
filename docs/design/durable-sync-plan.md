@@ -451,3 +451,18 @@ The producer design and the consumer's ledger ownership document retain the deta
 Release publication remains separate work; the previously unresolved local Tuwunel startup target is now met.
 Final producer verification passes 700 tests with three skipped in 58.81 seconds, reports zero mypy errors across 58 source files, and passes every repository hook.
 Producer source and tests remain unchanged; the final consumer documentation hooks also pass without changing the tested runtime source.
+
+## Dependency tracing after the ledger fix
+
+A follow-up on MindRoom `72a5f5d4f` and Nio `adddd44` correlates all 200 preparation tasks, their actual await chains, capacity releases and consumer writer operations.
+Preparation tasks spend 97.9% of their aggregate occupied time awaiting pending-turn persistence.
+Resuming the capacity waiter after a slot releases takes 0.022 ms median; the existing consumer database writer is occupied for 99.9% of the traced startup window, with only 0.971 seconds of worker CPU.
+The next measured limit is consumer database service time, not another demonstrated preparation-scheduler defect.
+
+Separate diagnostic changes to the Python thread switch interval and ordinary SQLite worker count do not improve initial reply spread.
+Neither setting is adopted.
+A final normal control passes every unchanged 200-root predicate with 12.083 seconds of initial reply spread, 49.817 seconds of full overlap, all three fence principals, zero retained producer/application/outbox work and clean shutdown.
+A native-sampling run is retained only as diagnostic evidence: profiler overhead increases latency and its parent exits with a child-reaping error after application shutdown.
+
+The consumer's `docs/dev/ledger-write-ownership.md` records timing denominators, native-symbol limitations, negative experiments and the next bounded SQL-level investigation.
+No producer or consumer production code, dependency, durability policy or concurrency setting changes in this follow-up; 1,000 concurrent replies remain unqualified.
