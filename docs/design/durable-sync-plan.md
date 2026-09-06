@@ -715,3 +715,29 @@ all consumer hooks pass. Consumer production source remains unchanged. Later
 documentation commits do not require another wheel pin. Both repositories retain
 the qualification record; no additional performance claim follows from these
 correctness changes.
+
+## Recipient and recovery invalidation review at `785c835`
+
+Two reports concern existing invalidation owners. Recipient refresh must retire
+keys shared with an earlier recipient set. A Sliding recovery loss must request
+the fresh state needed to resume future authorization. Keep the existing crypto
+lock, synchronous transaction, room metadata and source reset; no new schema,
+queue, public API or per-event validation layer.
+
+- [ ] Reproduce recipient removal/addition through real HTTP and encryption.
+  Compare completed recipient sets in `durable/outbound.py`, rotating for a
+  changed or unknown set. Preserve the group for reordering/profile changes.
+  Verify a removed recipient's old key cannot decrypt the next ciphertext.
+- [ ] Reproduce handled Sliding history failure followed by ordinary deltas.
+  In `durable/recovery.py`, reuse the post-tail source reset when a joined room
+  still lacks its baseline. Verify the next HTTP request asks for fresh initial
+  state and later events become LIVE. Cover restart during retained recovery
+  without changing pagination candidates before the tail.
+- [ ] Run focused regressions, full suite, mypy and repository hooks; review the
+  combined diff. Record source size, commands and results. Rebuild and pin the
+  consumer wheel, run affected checks, then commit and push both repositories.
+
+Focused evidence lives in the persistent capacity workspace under
+`durable-sync-kernel/review-invalidation-20260906`. Commands and final results
+will be recorded there and in this section. Existing live performance results
+keep their original source revisions; these fixes make no new speed claim.

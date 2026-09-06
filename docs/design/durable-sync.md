@@ -226,6 +226,12 @@ without replacing the historical room projection used for recovery. Outgoing
 encryption keeps only a disposable recipient list, invalidated by observed
 membership changes. It never grants incoming-event authorization. A member
 change during the lookup rejects that lookup; the application may retry.
+Completing a lookup compares the previous recipient set with the fresh set and
+invalidates the outbound Megolm session if they differ or the previous set is
+unknown. The existing crypto owner performs this before exposing the new cache.
+Order and profile changes alone do not rotate keys. A removed recipient's old
+session must not decrypt newly encrypted messages; ciphertext retained before
+the refresh keeps its original retry semantics.
 
 Persist waiting and untrusted interactive key-share requests needed by
 `continue_key_share`, including state required after restart. Test the actual
@@ -344,6 +350,14 @@ ends live tenure at its event, and rejoin resets the room before the shared
 iterator handles that event, clearing stale members. A section-only departure
 follows its final timeline event. OwnMembership remains metadata on its original
 state, timeline, or lifecycle observation; it does not create duplicate carriers.
+
+When a Sliding tail leaves a joined room without an authorization baseline,
+the source drops that room's checkpoint and resets its connection position after
+committing the current input. The next request obtains fresh initial state;
+ordinary deltas cannot repair the missing baseline. The reset decision comes
+from persisted room metadata, so restarting during recovery preserves it.
+Pagination candidates remain stable until the current input has drained. Fresh
+state authorizes future events only; it never reclassifies the lost interval.
 
 ## Local membership has one authority
 
