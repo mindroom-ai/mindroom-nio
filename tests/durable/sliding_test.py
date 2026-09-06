@@ -174,6 +174,179 @@ async def test_expanded_window_keeps_older_membership_context_historical(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_linked_live_profile_updates_preserve_limited_window_recovery(tmp_path):
+    calls = []
+
+    async def sync(request):
+        raise AssertionError("unexpected sync")
+
+    async def history(request):
+        calls.append(dict(request.query))
+        return web.json_response({"start": "w1", "end": "w2", "chunk": []})
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        await session._accept_response(window("$old", prev_batch="w1"))
+        await settle(session)
+        profile = member("$profile", "join")
+        profile["content"]["displayname"] = "Updated"
+        profile["unsigned"] = {
+            "prev_content": {"membership": "join"},
+            "replaces_state": "$join",
+        }
+        avatar = member("$avatar", "join")
+        avatar["content"]["avatar_url"] = "mxc://example.org/updated"
+        avatar["unsigned"] = {
+            "prev_content": {"membership": "join"},
+            "replaces_state": "$profile",
+        }
+        raw = json.loads(window(pos="p2", initial=False, prev_batch="w2", state=[]))
+        raw["rooms"][ROOM].update(
+            limited=True,
+            num_live=3,
+            timeline=[profile, avatar, message("$fresh")],
+        )
+        session._capture_response(json.dumps(raw).encode())
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            await runner
+            fresh = next(
+                record
+                for record in records
+                if record.source.get("event_id") == "$fresh"
+            )
+            assert calls == [{"dir": "f", "from": "w1", "limit": "100", "to": "w2"}]
+            assert fresh.provenance is TimelineEventProvenance.LIVE
+            assert not any(record.kind is RecordKind.LOSS for record in records)
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evidence", "observed", "current"),
+    [
+        ("top-invite", True, "invite"),
+        ("own-join", True, "join"),
+        ("stripped-invite", True, "invite"),
+        ("none", False, "leave"),
+    ],
+)
+async def test_sliding_membership_boundary_reconciles_only_explicit_membership(
+    tmp_path, evidence, observed, current
+):
+    from .membership_test import OPERATION
+
+    async def membership_request(request):
+        return web.json_response({})
+
+    async with homeserver(None, membership=membership_request) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        try:
+            await session._accept_response(window("$old"))
+            await settle(session)
+            assert await session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership="join",
+                previous_epoch=0,
+                current_membership="leave",
+            )
+            await session.ack(await session.next_batch())
+            raw = json.loads(window(pos="p2", initial=False, state=[]))
+            room = raw["rooms"][ROOM]
+            room.pop("membership")
+            if evidence == "top-invite":
+                room["membership"] = "invite"
+            elif evidence == "own-join":
+                room["required_state"] = [member("$current-join", "join")]
+            elif evidence == "stripped-invite":
+                room["stripped_state"] = [member("$current-invite", "invite")]
+            raw["rooms"][ROOM]["timeline"] = []
+            await session._accept_response(json.dumps(raw).encode())
+            await settle(session)
+            assert bool(session._read_local_intent().get("observed")) is observed
+            assert session._metadata[ROOM]["membership"] == current
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_sliding_rejoin_boundary_requires_new_initial_authorization_state(
+    tmp_path,
+):
+    from .membership_test import OPERATION
+
+    async def membership_request(request):
+        return web.json_response({})
+
+    async with homeserver(None, membership=membership_request) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        try:
+            await session._accept_response(window("$old"))
+            await settle(session)
+            assert await session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership="join",
+                previous_epoch=0,
+                current_membership="leave",
+            )
+            await session.ack(await session.next_batch())
+            rejoined = json.loads(
+                window("$uncertain", pos="p2", initial=False, state=[])
+            )
+            rejoined["rooms"][ROOM]["required_state"] = [member("$rejoin", "join")]
+            await session._accept_response(json.dumps(rejoined).encode())
+            await settle(session)
+            assert session._sliding.pos is None
+            assert ROOM not in session._sliding.baselines
+            assert not session._metadata[ROOM]["baseline"]
+
+            partial = json.loads(window("$partial", pos="p3", initial=False, state=[]))
+            partial["rooms"][ROOM]["limited"] = True
+            await session._accept_response(json.dumps(partial).encode())
+            records = await settle(session)
+            record = next(
+                record
+                for record in records
+                if record.source.get("event_id") == "$partial"
+            )
+            assert record.provenance is TimelineEventProvenance.HISTORY
+            assert not session._metadata[ROOM]["baseline"]
+
+            fresh = window(
+                "$initial-history",
+                pos="p4",
+                initial=True,
+                state=[member("$fresh-join", "join")],
+            )
+            await session._accept_response(fresh)
+            records = await settle(session)
+            initial = next(
+                record
+                for record in records
+                if record.source.get("event_id") == "$initial-history"
+            )
+            assert initial.provenance is TimelineEventProvenance.HISTORY
+            assert session._metadata[ROOM]["baseline"]
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_recovers_downtime_without_reapplying_previous_window(tmp_path):
     calls = []
 

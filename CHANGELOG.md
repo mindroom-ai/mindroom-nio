@@ -50,6 +50,11 @@ All notable changes to this project will be documented in this file.
   and observed by sync. Immediate local departure still fences work; delayed sync
   may delay the next command. Committed intents survive restart without repeating
   successful HTTP, and unaccepted polls cannot cross local command ownership.
+- Reconcile a pending local membership operation once at the complete sync
+  boundary. Intermediate ambiguous cycles remain historical; later responses
+  retain ordered transitions. A rejoin requires fresh authorization state.
+- Linked join-to-join profile changes preserve Sliding continuity and bounded
+  recovery, including multiple linked updates in one live window.
 - Recover limited Classic timelines through bounded, resumable history pages.
   Unavailable history and oversized single events produce explicit loss barriers.
   Quiescing stops new polls and drains captured work without an extra final poll.

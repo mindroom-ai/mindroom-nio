@@ -209,7 +209,7 @@ class DurableSync:
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
         # The single successful local operation already owns its tenure change.
-        # Until its target appears in ordered sync, earlier state is history.
+        # Until an authoritative response boundary, reported state is history.
         intent = self._read_local_intent()
         if (
             intent is not None
@@ -217,12 +217,6 @@ class DurableSync:
             and intent["room_id"] == room_id
             and not intent.get("observed")
         ):
-            if membership == intent["current_membership"]:
-                intent["observed"] = True
-                self._store.database.execute_sql(
-                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
-                    (encode_json(intent),),
-                )
             return None
         metadata = self._metadata.setdefault(room_id, {})
         previous = metadata.get("membership")

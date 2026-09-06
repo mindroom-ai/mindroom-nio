@@ -556,12 +556,12 @@ This follow-up starts at `292ab7d`. Four reported failures are hypotheses until
 reproduced with focused tests. Preserve the shared interpreter, SQLite owner,
 bounded recovery and acknowledged batch interface; do not add another journal.
 
-- [ ] Inject a trust-write commit failure, then attempt subsequent key handling.
+- [x] Inject a trust-write commit failure, then attempt subsequent key handling.
   Fix the existing mutation boundary so rolled-back trust cannot authorize work.
-- [ ] Reproduce an unseen leave/rejoin before a successful local leave's echo.
+- [x] Reproduce an unseen leave/rejoin before a successful local leave's echo.
   Identify the actual authoritative observation instead of matching only a
   membership string; keep one retained local operation and existing epoch rules.
-- [ ] Reproduce a linked join-to-join profile update in a limited/reset Sliding
+- [x] Reproduce a linked join-to-join profile update in a limited/reset Sliding
   timeline. Preserve proven continuity and recover intervening messages.
 - [x] Reproduce power-state deletion followed by restart. Restore member levels
   from canonical room power, including its default, without rewriting all member
@@ -582,3 +582,35 @@ bounded recovery and acknowledged batch interface; do not add another journal.
 - [ ] Save portable evidence and tracked conclusions, self-review, commit and
   push the completed work. No serializer, database or scheduling rewrite is
   implied by this experiment.
+
+### Review correction results
+
+All four reports at `292ab7d` reproduced independently. A failed verification
+commit allowed an incoming key request to forward a key; the attached public
+trust mutations now use the existing transaction/disposal boundary. Deleted room
+power returned from a stale member snapshot after restart; member levels now
+derive from canonical room power. Both changes together remove 23 production
+lines, and their combined focused verification passes 62 tests.
+
+The local-membership report exposed an unsupported exact-echo assumption: standard
+join/leave responses do not identify a membership event. The normative contract
+now describes one complete post-operation boundary, historical treatment of the
+uncertain interval, and a single provable net transition. Tests injecting stale
+pre-operation bodies directly after HTTP were replaced; actual runner tests
+continue to verify rejection of completed pre-operation polls. Endpoint rejoin
+clears room/member and Sliding checkpoint state before requesting a fresh
+authorization baseline. Fresh own state and invitations settle pending commands;
+absent evidence does not. Invited rooms cannot persist through the joined cache.
+
+Linked Sliding profile updates now preserve continuity through an ordered chain
+anchored in the previous proof. Genuine departures and unproven joins still
+prevent recovery from claiming continuity. Scoped review reproduced and resolved
+the related rejoin-baseline, optional-field and invitation-cache cases before
+qualification. No new queue, journal, store or serializer was introduced.
+
+Verification: 863 passed, three skipped in 75.38 seconds; mypy reports zero errors
+across 60 source files; all repository hooks pass. The fixes change five
+production files by +160/-59, or 101 net lines. Against main `5b6de3bc`, the full
+PR changes production by +5,193/-6,473, or 1,280 fewer lines. Counts include
+comments and blank lines and exclude tests, scripts and documentation.
+Performance qualification follows with an exactly rebuilt consumer wheel.

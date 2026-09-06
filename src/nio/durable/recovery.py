@@ -17,6 +17,7 @@ from ..responses import (
     SyncResponse,
     Timeline,
 )
+from ..rooms import MatrixRoom
 from .model import OwnMembership, RecordKind, SyncRecord, encode_json
 from .processor import Processor
 from .projection import restore_room
@@ -118,6 +119,69 @@ class Recovery:
                 ),
             )
         )
+
+    def _reconcile_membership_boundary(self, room_id: str, membership: str) -> bool:
+        session = self.session
+        intent = session._read_local_intent()
+        if (
+            intent is None
+            or "sequence" not in intent
+            or intent["room_id"] != room_id
+            or intent.get("observed")
+        ):
+            return False
+        intent["observed"] = True
+        session._store.database.execute_sql(
+            "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
+            (encode_json(intent),),
+        )
+        change = (
+            None
+            if membership == intent["current_membership"]
+            else session._change_membership(room_id, membership)
+        )
+        session._outbound.member_cache.pop(room_id, None)
+        if (
+            change is not None
+            and change.previous == "join"
+            and membership != "join"
+            and session.client.olm
+        ):
+            session.client.invalidate_outbound_session(room_id)
+        if membership in ("leave", "ban", "invite"):
+            session.client.rooms.pop(room_id, None)
+            if membership != "invite":
+                session.client.invited_rooms.pop(room_id, None)
+        reset = membership == "join" and intent["current_membership"] != "join"
+        if change is not None:
+            session._metadata[room_id]["baseline"] = False
+        if reset:
+            room = session.client.rooms.get(room_id)
+            encrypted = (
+                room.encrypted
+                if room is not None
+                else room_id in session.client.encrypted_rooms
+            )
+            session.client.rooms[room_id] = MatrixRoom(
+                room_id, session.client.user_id, encrypted
+            )
+            session.client.invited_rooms.pop(room_id, None)
+            session._store.database.execute_sql(
+                "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+            )
+        if change is not None:
+            session._publish_records(
+                (
+                    SyncRecord(
+                        RecordKind.ROOM_LIFECYCLE,
+                        room_id,
+                        {"membership": membership},
+                        membership=change,
+                        membership_epoch=change.current_epoch,
+                    ),
+                )
+            )
+        return reset
 
     def prepare(
         self, response: SyncResponse | SlidingSyncResponse | None = None
@@ -243,8 +307,18 @@ class Recovery:
                 metadata["baseline"] = metadata.get("membership") == "join"
             if room_id in session.client.rooms:
                 processor.rooms[room_id] = session.client.rooms[room_id]
+            if (
+                self._reconcile_membership_boundary(room_id, section)
+                and section == "join"
+            ):
+                processor.rooms[room_id] = session.client.rooms[room_id]
+                processor.members = {
+                    member for member in processor.members if member[0] != room_id
+                }
+        for room_id in response.rooms.invite:
+            self._reconcile_membership_boundary(room_id, "invite")
         processor.save()
-        # Pre-echo joined history must not restore a locally revoked room.
+        # Pre-boundary joined history must not restore a locally revoked room.
         for room_id in processor.rooms:
             if session._metadata[room_id].get("membership") in ("leave", "ban"):
                 session.client.rooms.pop(room_id, None)
@@ -259,6 +333,7 @@ class Recovery:
     ) -> None:
         session = self.session
         assert session._sliding is not None
+        reset_rooms: set[str] = set()
         for room_id, sliding_room in response.rooms.items():
             if sliding_room.initial:
                 session._store.database.execute_sql(
@@ -303,11 +378,30 @@ class Recovery:
                         for hero in sliding_room.heroes
                         if hero.user_id in room.users
                     )
+            boundary = session._sliding.boundary_membership(sliding_room)
+            if boundary in ("join", "leave", "invite", "ban") and (
+                self._reconcile_membership_boundary(room_id, boundary)
+            ):
+                if boundary == "join":
+                    reset_rooms.add(room_id)
+                    processor.rooms[room_id] = session.client.rooms[room_id]
+                    processor.members = {
+                        member for member in processor.members if member[0] != room_id
+                    }
         processor.save()
         for room_id in processor.rooms:
             if session._metadata[room_id].get("membership") in ("leave", "ban"):
                 session.client.rooms.pop(room_id, None)
         session._sliding.commit(response, state)
+        if reset_rooms:
+            session._sliding.pos = None
+            session._sliding.generation += 1
+            for room_id in reset_rooms:
+                session._sliding.baselines.pop(room_id, None)
+                session._store.database.execute_sql(
+                    "DELETE FROM NioDurableCrypto WHERE kind='sliding_room' AND key=?",
+                    (room_id,),
+                )
         session._crypto.capture()
         session._store.set_cursor(response.pos)
         session._store.save_continuation({"phase": "prepared"})

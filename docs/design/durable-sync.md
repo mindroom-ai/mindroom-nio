@@ -381,6 +381,13 @@ successful local HTTP operation; the runner discards pre-operation polls.
 Partial state must not establish a fresh authorization baseline for a rejoined
 room. Later responses retain normal ordered transitions.
 
+Sliding can provide the final membership in its top-level field, returned own
+member state, or stripped invitation state. Absence of all fresh evidence does
+not confirm an operation. Reconciliation into join clears the old room/member
+projection and room checkpoint and requests a fresh initial window; that window
+establishes a future authorization baseline instead of recovering from discarded
+state. Reconciliation into invite retains only the invited-room projection.
+
 Exact attribution of the local membership event and counting every intermediate
 cycle within that uncertain interval are not guaranteed. Current state and
 authorization after the boundary matter; replaying those historical cycles as

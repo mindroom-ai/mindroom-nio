@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from ..api import Api
 from ..client.sliding_sync import timeline_provenance
 from ..event_provenance import TimelineEventProvenance
-from ..events import AccountDataEvent, MegolmEvent, RoomMemberEvent
+from ..events import AccountDataEvent, InviteMemberEvent, MegolmEvent, RoomMemberEvent
 from ..exceptions import LocalProtocolError
 from ..responses import SlidingSyncResponse, SlidingSyncRoom, SlidingSyncStateStub
 from .model import encode_json
@@ -130,13 +130,28 @@ class SlidingSource:
                 or event.type == "m.room.member"
             )
         ]
-        new_join = any(
-            isinstance(event, RoomMemberEvent)
-            and event.state_key == self.session.client.user_id
-            and event.membership == "join"
-            and event.event_id not in known
-            for event in live
-        )
+        continuous_proof = held.get("membership")
+        new_join = False
+        for candidate in live:
+            if not isinstance(candidate, RoomMemberEvent) or (
+                candidate.state_key != self.session.client.user_id
+            ):
+                continue
+            unsigned = candidate.source.get("unsigned", {})
+            if candidate.event_id == continuous_proof:
+                continue
+            if candidate.event_id in known:
+                continue
+            if (
+                candidate.membership != "join"
+                or candidate.prev_membership != "join"
+                or not isinstance(unsigned, dict)
+                or unsigned.get("replaces_state") != continuous_proof
+            ):
+                new_join = True
+                continuous_proof = None
+            elif not new_join:
+                continuous_proof = candidate.event_id
         event = own[-1] if own else None
         if room.membership in ("leave", "ban", "invite") or room.stripped_state:
             return None, False
@@ -152,8 +167,29 @@ class SlidingSource:
             and isinstance(unsigned, dict)
             and unsigned.get("replaces_state") == held.get("membership")
         )
-        continues = not new_join and (proof == held.get("membership") or linked)
+        continues = not new_join and (
+            proof in (held.get("membership"), continuous_proof) or linked
+        )
         return proof, continues
+
+    def boundary_membership(self, room: SlidingSyncRoom) -> str | None:
+        """Return explicit current own membership from a room response."""
+        if room.membership in ("join", "leave", "invite", "ban"):
+            return room.membership
+        for event in reversed((*room.required_state, *room.stripped_state)):
+            if (
+                isinstance(event, (RoomMemberEvent, InviteMemberEvent))
+                and event.state_key == self.session.client.user_id
+                and event.membership in ("join", "leave", "invite", "ban")
+            ):
+                return event.membership
+            if (
+                isinstance(event, SlidingSyncStateStub)
+                and event.type == "m.room.member"
+                and event.state_key == self.session.client.user_id
+            ):
+                return "leave"
+        return None
 
     def plan(self, response: SlidingSyncResponse, state: dict[str, Any]) -> None:
         state["sliding_starts"] = {}
