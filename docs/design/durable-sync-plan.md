@@ -494,3 +494,16 @@ No producer/consumer production code or dependency changes in this investigation
 MindRoom's `docs/dev/durable-ingestion-performance.md` is the evidence entry point, with a tracked JSON measurement summary, a transaction-boundary map in `docs/dev/ledger-write-ownership.md`, and a persistent checksummed reproduction package.
 The package retains historical probe variants, helper scripts, native symbols and metadata for portable re-analysis; fresh SQL replay requires regenerating the synthetic workload because SQL parameters/results were intentionally not retained.
 It also indexes the rejected query, pool-size, thread-switch and inline-writer experiments so they are not repeated without new evidence.
+
+
+## Bounded consumer delivery-transaction trial
+
+Two consumer candidates tested the next proposed local-write reductions: skip duplicate device binding for a proven fresh claim, then combine live delivery enqueue/claim.
+They added two and 84 cumulative net production lines, passed 231/244 focused tests respectively, and each passed every unchanged 200-root Tuwunel acceptance predicate.
+Initial reply spreads were 12.726 and 12.516 seconds, compared with earlier/fresh normal controls of 11.983 and 13.493 seconds.
+The combined candidate's median initial latency improved in one run, but neither candidate beat the earlier control's p95; these exploratory results do not establish a repeatable startup-tail gain or statistical equivalence.
+Both candidates are withdrawn rather than retaining extra code without a demonstrated benefit.
+Consumer production source, tests and whitelist return to the pre-trial tree; the earlier ledger-concurrency improvement remains intact.
+No Nio production change, dependency change or weaker guarantee follows from this trial.
+The consumer's performance evidence index, tracked measurement JSON and ledger ownership document preserve the exact runs, candidate commits, decisions and reproduction addendum.
+The existing 200-reply qualification stands; 1,000 replies remain unqualified.
