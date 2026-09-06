@@ -220,6 +220,8 @@ from ..responses import (
     SetPushRuleResponse,
     ShareGroupSessionError,
     ShareGroupSessionResponse,
+    SlidingSyncError,
+    SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -664,7 +666,9 @@ class AsyncClient(Client):
         resp.transport_response = transport_response
         return resp
 
-    def _iter_to_device(self, response: SyncResponse) -> Iterator[_SyncItem]:
+    def _iter_to_device(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
         # Async callbacks historically see decrypted response entries immediately.
         return self._iter_decrypted_to_device(response, replace_immediately=True)
 
@@ -756,7 +760,7 @@ class AsyncClient(Client):
                 self._response_callback_scope.reset(token)
 
     async def _handle_sync(self, response: SyncResponse) -> None:
-        self._begin_ordinary_sync()
+        self._claim_sync_transport("classic")
 
         if self.next_batch == response.next_batch:
             return
@@ -766,6 +770,11 @@ class AsyncClient(Client):
             self.store.save_sync_token(response.next_batch)
 
         for item in self._iter_sync(response):
+            if item.route is not None:
+                await self._dispatch_sync_item(item)
+
+    async def _handle_sliding_sync(self, response: SlidingSyncResponse) -> None:
+        for item in self._iter_ordinary_sliding_sync(response):
             if item.route is not None:
                 await self._dispatch_sync_item(item)
 
@@ -791,6 +800,8 @@ class AsyncClient(Client):
 
         if isinstance(response, SyncResponse):
             await self._handle_sync(response)
+        elif isinstance(response, SlidingSyncResponse):
+            await self._handle_sliding_sync(response)
         else:
             super().receive_response(response)
 
@@ -1265,7 +1276,7 @@ class AsyncClient(Client):
         Returns either a `SyncResponse` if the request was successful or
         a `SyncError` if there was an error with the request.
         """
-        self._begin_ordinary_sync()
+        self._claim_sync_transport("classic")
 
         sync_token = since or self.next_batch
         presence = set_presence or self._presence
@@ -1282,12 +1293,126 @@ class AsyncClient(Client):
             set_presence=presence,
         )
 
-        return await self._send(
-            SyncResponse,
-            method,
-            path,
-            timeout=0 if full_state else timeout / 1000 + 15 if timeout else timeout,
+        self._claim_sync_poll()
+        try:
+            return await self._send(
+                SyncResponse,
+                method,
+                path,
+                timeout=(
+                    0 if full_state else timeout / 1000 + 15 if timeout else timeout
+                ),
+            )
+        finally:
+            self._ordinary_sync_in_flight = False
+
+    @logged_in_async
+    async def sliding_sync(
+        self,
+        conn_id: str | None = None,
+        pos: str | None = None,
+        timeout: int | None = 0,  # noqa: ASYNC109
+        set_presence: str | None = None,
+        lists: dict[str, Any] | None = None,
+        room_subscriptions: dict[str, Any] | None = None,
+        extensions: dict[str, Any] | None = None,
+        unstable: bool = True,
+    ) -> SlidingSyncResponse | SlidingSyncError:
+        """Fetch a Sliding window and run the normal event callbacks.
+
+        The caller threads connection-scoped ``pos`` values. The client owns
+        the separate to-device cursor. Only one ordinary poll can be active;
+        a client using Sliding to-device data cannot also consume Classic sync.
+        """
+        request_extensions = self._sliding_request_extensions(extensions)
+        method, path, data = Api.sliding_sync(
+            self.access_token,
+            conn_id=conn_id,
+            pos=pos,
+            timeout=(
+                int(self.config.request_timeout * 1000) if timeout is None else timeout
+            ),
+            set_presence=set_presence or self._presence,
+            lists=lists,
+            room_subscriptions=room_subscriptions,
+            extensions=request_extensions,
+            unstable=unstable,
         )
+        self._claim_sync_poll()
+        try:
+            return await self._send(
+                SlidingSyncResponse,
+                method,
+                path,
+                data,
+                timeout=timeout / 1000 + 15 if timeout else timeout,
+            )
+        finally:
+            self._ordinary_sync_in_flight = False
+
+    @logged_in_async
+    async def sliding_sync_forever(
+        self,
+        timeout: int = 30_000,  # noqa: ASYNC109
+        conn_id: str = "nio",
+        lists: dict[str, Any] | None = None,
+        room_subscriptions: dict[str, Any] | None = None,
+        extensions: dict[str, Any] | None = None,
+        set_presence: str | None = None,
+        unstable: bool = True,
+        loop_sleep_time: int | None = None,
+    ) -> None:
+        """Poll Sliding sync, restart expired positions, and maintain crypto.
+
+        Connection positions start fresh on each loop invocation. Room state,
+        observed windows and the device cursor survive a connection reset.
+        Error retries wait between requests with a bounded delay.
+        """
+        self._begin_ordinary_sync()
+        pos = None
+        failures = 0
+        try:
+            while not self._stop_sync_forever:
+                result = await self.sliding_sync(
+                    conn_id=conn_id,
+                    pos=pos,
+                    timeout=0 if pos is None else timeout,
+                    set_presence=set_presence,
+                    lists=lists,
+                    room_subscriptions=room_subscriptions,
+                    extensions=extensions,
+                    unstable=unstable,
+                )
+                await self.run_response_callbacks([result])
+                if isinstance(result, SlidingSyncError):
+                    if result.status_code == "M_UNKNOWN_POS":
+                        pos = None
+                    failures += 1
+                    if not self._stop_sync_forever:
+                        delay = max(
+                            1.0, await self.get_timeout_retry_wait_time(failures)
+                        )
+                        if result.retry_after_ms is not None:
+                            delay = max(delay, result.retry_after_ms / 1000)
+                        await asyncio.sleep(min(delay, 60))
+                    continue
+                failures = 0
+                pos = result.pos
+                await self.run_response_callbacks(await self.send_to_device_messages())
+                if self.should_upload_keys:
+                    await self.run_response_callbacks([await self.keys_upload()])
+                if self.should_query_keys:
+                    await self.run_response_callbacks([await self.keys_query()])
+                if self.should_claim_keys:
+                    await self.run_response_callbacks(
+                        [await self.keys_claim(self.get_users_for_key_claiming())]
+                    )
+                self.synced.set()
+                self.synced.clear()
+                if loop_sleep_time and not self._stop_sync_forever:
+                    await asyncio.sleep(loop_sleep_time / 1000)
+        finally:
+            self._stop_sync_forever = False
 
     @logged_in_async
     async def send_to_device_messages(

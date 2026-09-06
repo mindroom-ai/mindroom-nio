@@ -77,6 +77,7 @@ from ..responses import (
     RoomSendResponse,
     RoomTypingResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     ThumbnailResponse,
     ToDeviceResponse,
@@ -211,6 +212,7 @@ class HttpClient(Client):
     def _clear_queues(self):
         self.requests_made.clear()
         self.parse_queue.clear()
+        self._ordinary_sync_in_flight = False
 
     @connected
     def disconnect(self) -> bytes:
@@ -1080,6 +1082,11 @@ class HttpClient(Client):
         filter: dict[Any, Any] | None = None,
         full_state: bool = False,
     ) -> tuple[UUID, bytes]:
+        self._claim_sync_transport("classic")
+        if self._ordinary_sync_in_flight:
+            raise LocalProtocolError(
+                "an ordinary sync transport request is already in flight"
+            )
         request = self._build_request(
             Api.sync(
                 self.access_token,
@@ -1091,7 +1098,46 @@ class HttpClient(Client):
             timeout,
         )
 
-        return self._send(request, RequestInfo(SyncResponse))
+        result = self._send(request, RequestInfo(SyncResponse))
+        self._ordinary_sync_in_flight = True
+        return result
+
+    @connected
+    @logged_in
+    def sliding_sync(
+        self,
+        conn_id: str | None = None,
+        pos: str | None = None,
+        timeout: int | None = None,
+        set_presence: str | None = None,
+        lists: dict[str, Any] | None = None,
+        room_subscriptions: dict[str, Any] | None = None,
+        extensions: dict[str, Any] | None = None,
+        unstable: bool = True,
+    ) -> tuple[UUID, bytes]:
+        """Build a Sliding request; pass its response through normal callbacks."""
+        request_extensions = self._sliding_request_extensions(extensions)
+        if self._ordinary_sync_in_flight:
+            raise LocalProtocolError(
+                "an ordinary sync transport request is already in flight"
+            )
+        request = self._build_request(
+            Api.sliding_sync(
+                self.access_token,
+                conn_id=conn_id,
+                pos=pos,
+                timeout=timeout,
+                set_presence=set_presence,
+                lists=lists,
+                room_subscriptions=room_subscriptions,
+                extensions=request_extensions,
+                unstable=unstable,
+            ),
+            timeout,
+        )
+        result = self._send(request, RequestInfo(SlidingSyncResponse))
+        self._ordinary_sync_in_flight = True
+        return result
 
     def parse_body(self, transport_response: TransportResponse) -> dict[Any, Any]:
         """Parse the body of the response.
@@ -1208,6 +1254,10 @@ class HttpClient(Client):
         if isinstance(response, KeysUploadError):
             self.handle_key_upload_error(response)
 
-        self.receive_response(response)
+        try:
+            self.receive_response(response)
+        finally:
+            if request_info.request_class in (SyncResponse, SlidingSyncResponse):
+                self._ordinary_sync_in_flight = False
 
         return response

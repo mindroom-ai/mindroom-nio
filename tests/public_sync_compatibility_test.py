@@ -48,8 +48,6 @@ _RETAINED_METHOD_PARAMETERS = {
 }
 
 _FORK_ONLY_ASYNC_CLIENT_MEMBERS = (
-    "sliding_sync",
-    "sliding_sync_forever",
     "add_event_admission_callback",
     "acknowledge_classic_sync",
     "reset_classic_sync_state",
@@ -157,7 +155,7 @@ def test_retained_public_sync_method_signatures_match_upstream_boundary() -> Non
 
 
 def test_fork_only_public_sync_surface_is_absent() -> None:
-    """Sliding Sync is unsupported by the Classic durable adapter."""
+    """Legacy recovery controls remain absent from ordinary sync clients."""
     assert (
         tuple(
             name
@@ -166,8 +164,6 @@ def test_fork_only_public_sync_surface_is_absent() -> None:
         )
         == ()
     )
-    assert not hasattr(nio, "SlidingSyncResponse")
-    assert not hasattr(nio, "SlidingSyncError")
     assert not hasattr(nio, "RecoveryAbandonment")
     assert not hasattr(nio, "SlidingWindowToken")
 

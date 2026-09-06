@@ -29,6 +29,7 @@ from typing import (
 )
 
 from ..crypto import ENCRYPTION_ENABLED, DeviceStore, OutgoingKeyRequest
+from ..event_provenance import TimelineEventProvenance
 from ..events import (
     AccountDataEvent,
     BadEvent,
@@ -64,6 +65,7 @@ from ..responses import (
     RoomKeyRequestResponse,
     RoomMessagesResponse,
     ShareGroupSessionResponse,
+    SlidingSyncResponse,
     SyncResponse,
     ToDeviceResponse,
     WhoamiResponse,
@@ -189,6 +191,7 @@ class _SyncItem:
     room: MatrixRoom | None = None
     section: str | None = None
     source: dict[str, Any] | None = None
+    provenance: TimelineEventProvenance | None = None
 
 
 _SYNC_CALLBACK_HANDLERS = {
@@ -297,6 +300,13 @@ class Client:
         self._disposed = False
         self._durable_session: DurableSync | None = None
         self._ordinary_sync_started = False
+        self._ordinary_device_transport: str | None = None
+        self._ordinary_sync_in_flight = False
+        self._sliding_to_device_since: str | None = None
+        self._sliding_seen_events: dict[str, dict[str, bool]] = {}
+        self._pending_sliding_room_account_data: dict[
+            str, dict[str, AccountDataEvent | BadEventType]
+        ] = {}
         self.config = config or ClientConfig()
 
         self.user_id = ""
@@ -496,6 +506,37 @@ class Client:
         if self._durable_session is not None:
             raise LocalProtocolError("ordinary sync is unavailable during durable sync")
         self._ordinary_sync_started = True
+
+    def _claim_sync_transport(self, transport: str) -> None:
+        """Keep the account's incompatible device cursor formats separate."""
+        self._begin_ordinary_sync()
+        if self._ordinary_device_transport not in (None, transport):
+            raise LocalProtocolError(
+                "Classic and Sliding device cursor transports cannot be mixed"
+            )
+        self._ordinary_device_transport = transport
+
+    def _claim_sync_poll(self) -> None:
+        self._begin_ordinary_sync()
+        if self._ordinary_sync_in_flight:
+            raise LocalProtocolError(
+                "an ordinary sync transport request is already in flight"
+            )
+        self._ordinary_sync_in_flight = True
+
+    def _sliding_request_extensions(
+        self, extensions: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        self._begin_ordinary_sync()
+        if extensions is None:
+            return None
+        result = deepcopy(extensions)
+        to_device = result.get("to_device", {})
+        if to_device.get("enabled", False):
+            self._claim_sync_transport("sliding")
+            if self._sliding_to_device_since is not None:
+                to_device["since"] = self._sliding_to_device_since
+        return result
 
     def _dispose(self) -> None:
         self._disposed = True
@@ -752,18 +793,20 @@ class Client:
     def _replace_decrypted_to_device(
         self,
         decrypted_events: list[tuple[int, ToDeviceEvent | BadEventType]],
-        response: SyncResponse,
+        response: SyncResponse | SlidingSyncResponse,
     ) -> None:
         # Replace the encrypted to_device events with decrypted ones
         for decrypted_event in decrypted_events:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
-    def _iter_to_device(self, response: SyncResponse) -> Iterator[_SyncItem]:
+    def _iter_to_device(
+        self, response: SyncResponse | SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
         return self._iter_decrypted_to_device(response, replace_immediately=False)
 
     def _iter_decrypted_to_device(
-        self, response: SyncResponse, *, replace_immediately: bool
+        self, response: SyncResponse | SlidingSyncResponse, *, replace_immediately: bool
     ) -> Iterator[_SyncItem]:
         decrypted_to_device: list[tuple[int, ToDeviceEvent | BadEventType]] = []
 
@@ -878,16 +921,11 @@ class Client:
         room: MatrixRoom,
         encrypted_rooms: set[str],
     ) -> Event | BadEventType | None:
-        decrypted_event = None
+        decrypted_event = self._decrypt_timeline_event(event, room_id)
+        if decrypted_event:
+            event = decrypted_event
 
-        if isinstance(event, MegolmEvent) and self.olm:
-            event.room_id = room_id
-            decrypted_event = self.olm._decrypt_megolm_no_error(event)
-
-            if decrypted_event:
-                event = decrypted_event
-
-        elif isinstance(event, RoomEncryptionEvent):
+        if isinstance(event, RoomEncryptionEvent):
             encrypted_rooms.add(room_id)
 
         if isinstance(event, RoomMemberEvent):
@@ -902,6 +940,14 @@ class Client:
 
         return decrypted_event
 
+    def _decrypt_timeline_event(
+        self, event: Event | BadEventType, room_id: str
+    ) -> Event | BadEventType | None:
+        if isinstance(event, MegolmEvent) and self.olm:
+            event.room_id = room_id
+            return self.olm._decrypt_megolm_no_error(event)
+        return None
+
     def _iter_room_timeline(
         self,
         room_id: str,
@@ -909,26 +955,31 @@ class Client:
         room: MatrixRoom,
         encrypted_rooms: set[str],
         section: str,
+        *,
+        apply_state: bool = True,
+        provenance: TimelineEventProvenance | None = None,
     ) -> Iterator[_SyncItem]:
         decrypted_events: list[tuple[int, Event | BadEventType]] = []
 
         for index, event in enumerate(info.timeline.events):
-            if self._durable_session is not None:
+            if apply_state and self._durable_session is not None:
                 room = self._durable_session._timeline_room(room_id, room, event)
             source = (
                 deepcopy(event.source)
                 if isinstance(event, MegolmEvent)
                 else event.source
             )
-            decrypted_event = self._handle_timeline_event(
-                event, room_id, room, encrypted_rooms
+            decrypted_event = (
+                self._handle_timeline_event(event, room_id, room, encrypted_rooms)
+                if apply_state
+                else self._decrypt_timeline_event(event, room_id)
             )
 
             if decrypted_event:
                 event = decrypted_event
                 decrypted_events.append((index, decrypted_event))
 
-            yield _SyncItem("event", event, room, section, source)
+            yield _SyncItem("event", event, room, section, source, provenance)
 
         # Replace the Megolm events with decrypted ones
         for index, event in decrypted_events:
@@ -1006,7 +1057,7 @@ class Client:
             user.status_msg = event.status_msg
 
     def _iter_global_account_data_events(
-        self, response: SyncResponse
+        self, response: SyncResponse | SlidingSyncResponse
     ) -> Iterator[_SyncItem]:
         for event in response.account_data_events:
             yield _SyncItem("global_account_data", event)
@@ -1024,7 +1075,7 @@ class Client:
         for item in self._iter_expired_verifications():
             self._dispatch_sync_item(item)
 
-    def _handle_olm_events(self, response: SyncResponse) -> None:
+    def _handle_olm_events(self, response: SyncResponse | SlidingSyncResponse) -> None:
         self._update_olm_sync_state(
             response.device_key_count.signed_curve25519,
             response.device_list.changed,
@@ -1122,13 +1173,50 @@ class Client:
             yield from self._iter_key_requests()
 
     def _handle_sync(self, response: SyncResponse) -> None | Coroutine[Any, Any, None]:
-        self._begin_ordinary_sync()
+        self._claim_sync_transport("classic")
         if self.next_batch == response.next_batch:
             return None
         self.next_batch = response.next_batch
         if self.config.store_sync_tokens and self.store:
             self.store.save_sync_token(self.next_batch)
         for item in self._iter_sync(response):
+            self._dispatch_sync_item(item)
+        return None
+
+    def _iter_ordinary_sliding_sync(
+        self, response: SlidingSyncResponse
+    ) -> Iterator[_SyncItem]:
+        from .sliding_sync import iter_sliding_sync
+
+        self._begin_ordinary_sync()
+        if response.to_device_next_batch is not None or response.to_device_events:
+            self._claim_sync_transport("sliding")
+        completed = {
+            room_id: {event_id for event_id, encrypted in seen.items() if not encrypted}
+            for room_id, seen in self._sliding_seen_events.items()
+        }
+        for item in iter_sliding_sync(self, response, suppress_ids=completed):
+            if item.route == "event" and item.room is not None:
+                event_id = getattr(item.event, "event_id", None)
+                if event_id:
+                    seen = self._sliding_seen_events.setdefault(item.room.room_id, {})
+                    encrypted = isinstance(item.event, MegolmEvent)
+                    duplicate_ciphertext = encrypted and event_id in seen
+                    seen[event_id] = encrypted
+                    while len(seen) > 4096:
+                        del seen[next(iter(seen))]
+                    if duplicate_ciphertext:
+                        continue
+                    if not encrypted:
+                        completed.setdefault(item.room.room_id, set()).add(event_id)
+            yield item
+        if response.to_device_next_batch is not None:
+            self._sliding_to_device_since = response.to_device_next_batch
+
+    def _handle_sliding_sync(
+        self, response: SlidingSyncResponse
+    ) -> None | Coroutine[Any, Any, None]:
+        for item in self._iter_ordinary_sliding_sync(response):
             self._dispatch_sync_item(item)
         return None
 
@@ -1299,6 +1387,8 @@ class Client:
             self._handle_register(response)
         elif isinstance(response, SyncResponse):
             self._handle_sync(response)
+        elif isinstance(response, SlidingSyncResponse):
+            self._handle_sliding_sync(response)
         elif isinstance(response, RoomMessagesResponse):
             self._handle_messages_response(response)
         elif isinstance(response, RoomContextResponse):
