@@ -364,14 +364,16 @@ class Recovery:
                     if processor.oversized:
                         loss = "oversized recovered event"
                         done = True
-                        unpublished = {
+                        # LOSS represents the already-applied oversized event;
+                        # retain its identity and exclude only untouched suffix.
+                        untouched = {
                             event.source["event_id"]
-                            for event in events[processor.processed_records :]
+                            for event in events[processor.processed_records + 1 :]
                         }
                         state["applied_ids"][room_id] = [
                             event_id
                             for event_id in state["applied_ids"][room_id]
-                            if event_id not in unpublished
+                            if event_id not in untouched
                         ]
                     room = session.client.rooms[room_id]
                     if room.encrypted and session.client.olm:

@@ -835,3 +835,69 @@ async def test_frozen_recovered_record_overflow_commits_loss_and_resumes_tail(
         finally:
             await reopened.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_oversized_state_covered_by_loss_is_not_published_again_at_tail(
+    tmp_path, restart
+):
+    oversized = member("$too-large", "join", "@oversized:example.org")
+    oversized["content"]["displayname"] = "x" * 900
+    suffix = member("$untouched", "join", "@later:example.org")
+
+    async def sync(request):
+        raise AssertionError("unexpected sync")
+
+    async def history(request):
+        return web.json_response(
+            {
+                "start": "s1",
+                "end": "tail",
+                "chunk": [message("$prefix"), oversized, suffix],
+            }
+        )
+
+    async with homeserver(sync, membership=history) as (url, requests):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(
+            tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
+        )
+        await baseline(session)
+        session._capture_response(limited(state=[oversized, suffix]))
+        records = []
+        try:
+            await session._recovery.advance()
+            while batch := await session.next_batch():
+                records.extend(batch.records)
+                await session.ack(batch)
+            assert [r.kind for r in records] == [RecordKind.TIMELINE, RecordKind.LOSS]
+            assert session.cursor == "s1"
+            assert "@later:example.org" not in nio_client.rooms[ROOM].users
+            if restart:
+                await session.close()
+                await nio_client.close()
+                nio_client = client()
+                nio_client.homeserver = url
+                session = open_session(
+                    tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
+                )
+            # A state event already represented by LOSS must not overflow again.
+            await session._recovery.advance()
+            assert session.cursor == "s2"
+            session._quiescing = True
+            runner = asyncio.create_task(session.run())
+            records.extend(await drain_sync(session))
+            await runner
+            assert session._store.input is None
+            assert "@oversized:example.org" in nio_client.rooms[ROOM].users
+            assert "@later:example.org" in nio_client.rooms[ROOM].users
+            assert len([r for r in records if r.kind is RecordKind.LOSS]) == 1
+            assert not any(r.source.get("event_id") == "$too-large" for r in records)
+            assert sum(r.source.get("event_id") == "$untouched" for r in records) == 1
+            assert sum(r.source.get("event_id") == "$prefix" for r in records) == 1
+            assert len([p for p, _ in requests if p.endswith("/messages")]) == 1
+        finally:
+            await session.close()
+            await nio_client.close()
