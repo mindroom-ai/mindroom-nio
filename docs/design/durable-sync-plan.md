@@ -466,3 +466,14 @@ A native-sampling run is retained only as diagnostic evidence: profiler overhead
 
 The consumer's `docs/dev/ledger-write-ownership.md` records timing denominators, native-symbol limitations, negative experiments and the next bounded SQL-level investigation.
 No producer or consumer production code, dependency, durability policy or concurrency setting changes in this follow-up; 1,000 concurrent replies remain unqualified.
+
+## Membership-query trial
+
+A nine-line consumer candidate removed one duplicate membership-version SELECT per admitted event while preserving the existing transactions and locks.
+Two alternating actual-source comparisons show no worthwhile startup improvement: baseline initial reply spreads are 12.090/12.153 seconds, versus 12.229/12.436 seconds for the candidate.
+All four runs pass every unchanged 200-root acceptance predicate, including three-principal fences, zero retained debt, source verification and clean shutdown.
+The production candidate is withdrawn; useful membership-transition coverage and a projection-progress test timing correction remain.
+The consumer's `docs/dev/ledger-write-ownership.md` records the controls, rejected query optimization and remaining writer-time breakdown.
+The largest combined category is delivery/outbox work (4.407 seconds of the 13.357-second traced startup); admission, ledger writes, hydration and settlement account for the rest.
+This identifies which operations occupy the writer, while the exact low-level synchronization owners remain partly unresolved.
+No Nio production change or weaker durability guarantee follows from this trial.
