@@ -117,6 +117,7 @@ if ENCRYPTION_ENABLED:
     from ..store import DefaultStore, MatrixStore, SqliteMemoryStore, SqliteStore
 if TYPE_CHECKING:
     from ..crypto import OlmDevice, Sas
+    from ..durable.client import DurableSync
 
 
 from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
@@ -996,6 +997,7 @@ class Client:
         self.store: MatrixStore | None = None
         self._ingestion_store_snapshot: _IngestionStoreSnapshot | None = None
         self._ingestion_poisoned = False
+        self._durable_session: DurableSync | None = None
         self._ingestion_key_share_handler: (
             Callable[[RoomKeyRequest, bool], bool] | None
         ) = None
@@ -1196,6 +1198,8 @@ class Client:
 
     def _begin_ordinary_sync(self) -> None:
         self._assert_ingestion_not_poisoned()
+        if self._durable_session is not None:
+            raise LocalProtocolError("ordinary sync is unavailable during durable sync")
         if self._ingestion_store_snapshot is not None:
             raise LocalProtocolError(
                 "ordinary sync is unavailable during owned ingestion"

@@ -278,14 +278,34 @@ class DurableStore:
         self.database.execute_sql("DELETE FROM NioDurableInput WHERE id=1")
 
     def publish(
-        self, records: tuple[SyncRecord, ...], *, completes_sync: bool = False
+        self,
+        records: tuple[SyncRecord, ...],
+        *,
+        completes_sync: bool = False,
+        encoded_records: str | None = None,
     ) -> SyncBatch:
         self._require_transaction()
         cursor = self.database.execute_sql(
             "INSERT INTO NioDurableBatch(records,completes_sync) VALUES(?,?)",
-            (encode_records(records), completes_sync),
+            (
+                (
+                    encoded_records
+                    if encoded_records is not None
+                    else encode_records(records)
+                ),
+                completes_sync,
+            ),
         )
         return SyncBatch(self.stream_id, cursor.lastrowid, records, completes_sync)
+
+    def has_batches(self) -> bool:
+        self._assert_open()
+        return (
+            self.database.execute_sql(
+                "SELECT 1 FROM NioDurableBatch LIMIT 1"
+            ).fetchone()
+            is not None
+        )
 
     def next_batch(self) -> SyncBatch | None:
         self._assert_open()

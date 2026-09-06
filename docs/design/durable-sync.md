@@ -45,6 +45,10 @@ with one owner for each fact**. Size and performance are acceptance criteria.
 
 ## Ownership and data flow
 
+The adapter requires nio's E2EE extra and an encryption-enabled SQLite client;
+it handles plaintext rooms as well as encrypted rooms. This reuses the normal
+account-bound store rather than introducing a second non-crypto storage backend.
+
 Nio owns Matrix cursors, received input, crypto state, room projection, pending
 crypto requests, and batches awaiting consumer acknowledgement. MindRoom owns
 semantic deduplication, authorization, conversation scheduling, and application
@@ -146,6 +150,11 @@ per record, room sequence, request identity, or transport origin crosses this
 boundary. Decode network and persisted data defensively; trust unchanged values
 inside their owning operation.
 
+Membership epochs identify a joined tenure: the first join uses epoch zero,
+departing from join increments it, and rejoining retains that incremented epoch.
+This matches the application's authorization boundary. Rejoining discards stale
+persisted members and treats its initial timeline as history.
+
 Batches have bounded count and encoded size. Split before and after own
 membership, loss, and membership events that change authorization. Preserve
 their interleaving with messages. An earlier live grant must not run after a
@@ -156,6 +165,25 @@ The session offers `run()`, `next_batch()`, `ack(batch)`, `wait_for_work()`,
 `quiesce()`, `close()`, durable progress, and serialized local membership changes.
 Local changes retain an intent before HTTP, expected membership/epoch, and an
 ordered result. They must not resurrect authorization through a stale echo.
+
+`quiesce()` cancels an unaccepted long poll and stops new polls, then finishes
+already captured input while the consumer keeps draining. It does not fetch an
+extra final response. A completion batch remains replayable until acknowledged.
+The consumer runs its completion hook before acknowledging that batch.
+
+`dispatch(record, event=None)` invokes an observation's registered nio callback
+outside storage transactions. It restores the committed event unless the
+application supplies its authenticated extension event. The consumer decides
+whether receipt/semantic novelty warrants dispatch and acknowledges separately.
+Callback failure leaves the batch available; it does not poison committed state.
+`progress_generation` exposes the highest committed batch sequence, including
+acknowledged batches, and `cursor` exposes the last prepared Matrix position.
+
+`change_membership(operation_id, room_id, previous_membership, previous_epoch,
+current_membership)` accepts keyword arguments and returns success as a boolean.
+Only join and leave are local targets. The application reads its current journal
+position after `wait_for_membership_idle()` and supplies that expected position;
+a stale expectation cannot authorize a newer transition.
 
 ## Crypto and history
 
@@ -219,6 +247,11 @@ durability. No new writer thread, database queue, serializer dependency, or
 generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
+
+HTTP retries keep the same operation and body for connection failures, timeouts,
+408, 429, and server errors. Each request has at most five attempts with a
+cancellable exponential delay capped at thirty seconds; bounded server retry
+hints take precedence. Other HTTP errors return immediately.
 
 ## Consumer and acceptance
 
