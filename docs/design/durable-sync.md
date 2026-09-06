@@ -90,6 +90,8 @@ obeys the same rule. Never retry preparation on the mutated instance.
 Attached public device-trust changes use this same transaction/disposal boundary:
 verification held only in a rolled-back Python object must never authorize a
 later incoming key request. Ordinary clients retain their existing trust path.
+Disposal also rejects public crypto operations and new HTTP requests, including
+requests resumed after an await. It cannot retract a request already on the wire.
 
 ## Shared event processing
 
@@ -255,6 +257,14 @@ more. Apply intervening membership/state in chronological order from the trusted
 old projection. Context-only older history does not rewind the live projection
 or acquire live authorization provenance. Initial history is not a live request.
 Unknown authorization state requires hydration or an explicit fenced loss.
+Malformed room state is not an ignorable message. The durable collector rejects
+parser failures in state/invitation observations, events carrying a state key,
+and the required membership/create/power/encryption types even if their state key
+is missing. The preparation transaction rolls back and disposes the client; its
+input remains retained for diagnosis. It must not advance the cursor or emit
+later live grants using stale state. This is a protocol failure, not an automatic
+repair policy. Ordinary parsing and malformed non-state messages keep their
+existing behavior.
 Token cycles, unavailable history, and oversized single events terminate as
 explicit loss rather than silently advancing a supposedly complete history.
 
@@ -297,6 +307,9 @@ consumer databases. No new writer thread, database queue, serializer dependency,
 or generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
+Response-validation logs contain the response class, exception class and schema
+rule, not the instance or server-provided error text. Server error details remain
+available on returned error responses for callers to handle deliberately.
 
 HTTP retries keep the same operation and body for connection failures, timeouts,
 408, 429, and server errors. Each request has at most five attempts with a

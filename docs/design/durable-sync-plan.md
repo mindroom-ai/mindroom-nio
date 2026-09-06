@@ -765,3 +765,35 @@ disabling generation observation in a subprocess makes the test fail. Consumer
 production code is unchanged. The original failure, isolated control, mutation
 probe and final qualification logs are retained with the evidence. Subsequent
 producer documentation commits do not require another dependency pin.
+
+## Native whole-PR review loop at `10ef9aa`
+
+Apply MindRoom's native review loop: the main thread owns all edits, validation,
+commits and pushes; two fresh read-only reviewers inspect the entire PR after
+each pushed correction. Findings are untrusted until reproduced. Stop only when
+both approve the same pushed head. Reconsider the design after every third round
+that still finds substantial issues or a new major bug class.
+
+Round one reports four existing-boundary defects. Main-thread regressions
+reproduce disposal bypass at public encryption/HTTP, malformed state preserving
+live authority, completed-but-unaccepted polls escaping quiescence, and response
+validation leaking payloads at WARNING and DEBUG. The initial focused run has
+21 failures and three passing controls. An independent Python 3.12 full run
+hangs at the truncated-response test's server cleanup: the successful connection
+is never closed. Its request and retry assertions already succeeded.
+
+- [ ] Check disposal at shared login, store and HTTP boundaries; cover close,
+  rollback and a send suspended before its network request.
+- [ ] Reject malformed state in the single durable collector, using existing
+  transaction rollback/disposal. Preserve ordinary parsing and malformed messages.
+- [ ] Revoke poll ownership before cancelling during quiescence, using the same
+  completed-poll rule as local membership operations.
+- [ ] Remove response bodies and validation exception messages from diagnostics.
+  Keep response/error class and schema rule; callers still receive error details.
+- [ ] Close both test-server responses, then verify Python 3.12 and the normal
+  environment, typing and repository hooks. This needs no production retry change.
+- [ ] Commit/push, repeat fresh whole-PR reviews and qualify the consumer pin.
+
+Persistent commands, logs and review dispositions live under the already indexed
+capacity evidence directory `durable-sync-kernel/review-invalidation-20260906/native-loop`.
+No new queue, schema, interpreter or performance guarantee is planned.
