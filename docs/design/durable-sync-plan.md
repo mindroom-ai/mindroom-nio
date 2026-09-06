@@ -210,7 +210,7 @@ capacity workspace and update both existing PR descriptions with relative paths.
 - [x] Run batched encrypted/plaintext workloads against the starting branch and
   replacement. Record CPU, JSON decode counts, commit counts, loop delay and
   member-row writes. Compare SQLite NORMAL and FULL before deciding durability.
-- [ ] Repeat the existing integrated 200-request Synapse and Tuwunel controls.
+- [x] Repeat the existing integrated 200-request Synapse and Tuwunel controls.
   Report all accepted/replied counts, latency distributions, synthetic generation
   time, convergence fences and drain. Investigate regressions with actual profiles.
 - [x] Measure production additions/deletions against main and the starting head.
@@ -346,14 +346,66 @@ after the first overlap during gap recovery; the captured tail owns those events
 Missing history without a proven boundary still emits loss. This removes one
 request constraint and requires no new persisted mechanism or weaker durability.
 
-- [ ] Reproduce the bounded-end behavior with real HTTP/SQLite and restart; assert
+- [x] Reproduce the bounded-end behavior with real HTTP/SQLite and restart; assert
   chronological recovered messages, one live tail, no false loss, and no early
   application of events beyond the retained tail.
-- [ ] Apply the omitted-`to` request change, preserve genuine loss cases, run
+- [x] Apply the omitted-`to` request change, preserve genuine loss cases, run
   focused/full checks, self-review and scoped review.
-- [ ] Rebuild the wheel and repeat unchanged live controls; record results here
+- [x] Rebuild the wheel and repeat unchanged live controls; record results here
   before pins, commits and publication are considered complete.
 
 The trace is diagnostic evidence, not an uninstrumented latency result:
 `recovery-trace-20260906T092704Z` in the retained capacity workspace. Its wrappers
 record pagination metadata and classification, not event content or credentials.
+
+
+The correction is committed at `aac2e32`: one removed HTTP argument and a short
+comment, adding one net production line. The real HTTP/SQLite regression passes
+both live and restart variants; all 29 recovery tests pass, including genuine
+loss controls. Full nio checks pass 700 tests with 3 skipped, zero mypy errors
+across 58 source files, and every repository hook. Final production totals are
+28,583 Python lines, including 2,824 in the adapter; net reductions are 17,641
+against the starting PR and 2,907 against main. The non-limited engine benchmark
+above is unaffected by this history-request-only change; the final integrated results below qualify the rebuilt artifact within the
+stated limitations.
+
+
+## Final integrated results
+
+The final runtime is Nio `aac2e32` with MindRoom `ed4a209d6`. All installed
+Python files and loaded module paths match those commits before and after each
+control. No production behavior, deadline, health timeout, overlap threshold,
+workload, or shutdown check was patched. Each run uses FULL durability, 200 roots,
+a 180-second shared reply deadline, a 45-second minimum full visible overlap,
+and a two-second health timeout. Reply times include about 60 seconds of
+synthetic generation; they are not LLM latency predictions.
+
+| Control | Reply median | Reply p95 | Full overlap | Acceptance |
+| --- | ---: | ---: | ---: | --- |
+| Tuwunel | 73.927 s | 86.501 s | 37.567 s | Overlap below 45 s |
+| Tuwunel repeat | 74.830 s | 86.533 s | 37.470 s | Overlap below 45 s |
+| Synapse 5,000-event cap | 76.987 s | 82.719 s | 47.352 s | PASS |
+
+Every run completed exactly 200 replies and all three post-terminal fence
+principals, with zero input/batch rows, journal work or delivery-outbox debt after
+clean shutdown. No event-loop stalls, degraded reads, or incomplete-drain
+warnings were recorded. Synapse passes every predicate. Both Tuwunel runs fail
+only the original overlap requirement; do not describe them as full capacity
+passes. Their recovered-request failure is corrected, and the failed pre-fix
+73/200 run remains recorded above.
+
+Compared with the earlier published controls, Tuwunel's median is roughly
+unchanged and p95 is about 2.6 seconds slower (86.5 versus 83.9). Synapse's median
+and p95 improve from roughly 80.1/87.6 to 77.0/82.7 seconds, and its previous fence
+and retained-input failures are absent. These few runs are workload evidence,
+not a statistical guarantee of general speedup. The much lower engine cost does
+not remove the application's shared startup persistence cost. In the final
+Tuwunel runs, preparation starts span 23.5-23.9 seconds; the sixteen-slot trial
+already failed to improve this class of delay materially. A separate application
+persistence optimization needs its own profile and design. No writer redesign,
+serializer dependency, durability reduction, or relaxed threshold is justified
+as part of this adapter replacement.
+
+Detailed final controls: `controls-20260906T093405Z` and
+`controls-20260906T094006Z` in the retained capacity workspace. The full measured
+source delta, test counts, required guarantees, and deliberate limits are above.
