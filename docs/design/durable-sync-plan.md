@@ -782,18 +782,26 @@ validation leaking payloads at WARNING and DEBUG. The initial focused run has
 hangs at the truncated-response test's server cleanup: the successful connection
 is never closed. Its request and retry assertions already succeeded.
 
-- [ ] Check disposal at shared login, store and HTTP boundaries; cover close,
+- [x] Check disposal at shared login, store and HTTP boundaries; cover close,
   rollback and a send suspended before its network request.
-- [ ] Reject malformed state in the single durable collector, using existing
+- [x] Reject malformed state in the single durable collector, using existing
   transaction rollback/disposal. Preserve ordinary parsing and malformed messages.
-- [ ] Revoke poll ownership before cancelling during quiescence, using the same
+- [x] Revoke poll ownership before cancelling during quiescence, using the same
   completed-poll rule as local membership operations.
-- [ ] Remove response bodies and validation exception messages from diagnostics.
+- [x] Remove response bodies and validation exception messages from diagnostics.
   Keep response/error class and schema rule; callers still receive error details.
-- [ ] Close both test-server responses, then verify Python 3.12 and the normal
+- [x] Close both test-server responses, then verify Python 3.12 and the normal
   environment, typing and repository hooks. This needs no production retry change.
-- [ ] Commit/push, repeat fresh whole-PR reviews and qualify the consumer pin.
+- After each correction, commit/push and repeat fresh whole-PR reviews. Record
+  final verdicts and companion-pin qualification with the retained loop evidence.
 
 Persistent commands, logs and review dispositions live under the already indexed
 capacity evidence directory `durable-sync-kernel/review-invalidation-20260906/native-loop`.
 No new queue, schema, interpreter or performance guarantee is planned.
+
+Round-one qualification: 910 passed and three skipped in Python 3.14.7 (85.66s)
+and Python 3.12.13 (84.57s); zero mypy errors across 60 files; all repository
+hooks pass. The corrections add 13 net production lines across five files
+(+25/-12). The complete PR against `5b6de3bc` is +5,249/-6,481 across 42 production
+files, or 1,232 fewer lines. These are correctness changes; existing live
+performance measurements retain their original revision IDs.

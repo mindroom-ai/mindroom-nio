@@ -307,11 +307,7 @@ class TestClass:
 
 
 class TestSchemaValidationWarning:
-    """Response bodies are checked against the success schema before anything looks at
-    whether the body is actually an error. A server error body therefore fails success
-    validation, and the warning that gets logged describes the missing success field
-    rather than the error the server reported. These tests pin the warning to the real
-    errcode so a failed request is diagnosable from logs alone."""
+    """Validation diagnostics identify the failure without disclosing server data."""
 
     def _warnings(self, caplog):
         return [
@@ -320,7 +316,7 @@ class TestSchemaValidationWarning:
             if record.name == "nio.responses" and record.levelno == logging.WARNING
         ]
 
-    def test_warning_reports_errcode_from_error_body(self, caplog):
+    def test_error_details_remain_on_response_without_entering_logs(self, caplog):
         parsed_dict = {
             "errcode": "M_FORBIDDEN",
             "error": "You don't have permission to view this room.",
@@ -330,21 +326,23 @@ class TestSchemaValidationWarning:
 
         assert isinstance(response, RoomMessagesError)
         assert response.status_code == "M_FORBIDDEN"
+        assert response.message == parsed_dict["error"]
         warnings = self._warnings(caplog)
         assert len(warnings) == 1
-        assert "M_FORBIDDEN" in warnings[0]
-        assert "You don't have permission to view this room." in warnings[0]
+        assert parsed_dict["error"] not in warnings[0]
 
-    def test_warning_still_names_the_failed_schema_field(self, caplog):
+    def test_warning_names_the_response_exception_and_schema_rule(self, caplog):
         parsed_dict = {"errcode": "M_FORBIDDEN", "error": "denied"}
         with caplog.at_level(logging.WARNING, logger="nio.responses"):
             RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
 
-        assert "chunk" in self._warnings(caplog)[0]
+        warning = self._warnings(caplog)[0]
+        assert "RoomMessagesResponse" in warning
+        assert "ValidationError" in warning
+        assert "required" in warning
 
     def test_warning_omits_unrelated_body_fields(self, caplog):
-        # An error body is not guaranteed to be free of user content, so only the two
-        # documented error fields may be logged.
+        # Even error bodies can carry user content.
         parsed_dict = {
             "errcode": "M_FORBIDDEN",
             "error": "denied",
@@ -355,7 +353,7 @@ class TestSchemaValidationWarning:
 
         assert "must-not-be-logged" not in self._warnings(caplog)[0]
 
-    def test_warning_escapes_server_control_characters(self, caplog):
+    def test_warning_omits_server_control_characters(self, caplog):
         parsed_dict = {
             "errcode": "M_FORBIDDEN\nFORGED",
             "error": "denied\rFORGED",
@@ -366,8 +364,7 @@ class TestSchemaValidationWarning:
         warning = self._warnings(caplog)[0]
         assert "\n" not in warning
         assert "\r" not in warning
-        assert r"\n" in warning
-        assert r"\r" in warning
+        assert "FORGED" not in warning
 
     def test_warning_bounds_server_error_fields(self, caplog):
         parsed_dict = {
@@ -378,6 +375,14 @@ class TestSchemaValidationWarning:
             RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
 
         assert len(self._warnings(caplog)[0]) < 1_000
+
+    def test_debug_does_not_dump_valid_response_body(self, caplog):
+        parsed_dict = {"chunk": [], "start": "payload-secret"}
+        with caplog.at_level(logging.DEBUG, logger="nio.responses"):
+            response = RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+        assert isinstance(response, RoomMessagesResponse)
+        assert response.start == "payload-secret"
+        assert "payload-secret" not in caplog.text
 
     @pytest.mark.parametrize(
         "parsed_dict",

@@ -358,6 +358,7 @@ def client_session(func):
 
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
+        self._assert_not_disposed()
         if not self.client_session:
             trace = TraceConfig()
             trace.on_request_chunk_sent.append(on_request_chunk_sent)

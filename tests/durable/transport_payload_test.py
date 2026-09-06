@@ -35,9 +35,8 @@ async def truncated_then_complete_server():
                 + body
             )
         await writer.drain()
-        if attempts == 1:
-            writer.close()
-            await writer.wait_closed()
+        writer.close()
+        await writer.wait_closed()
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     try:

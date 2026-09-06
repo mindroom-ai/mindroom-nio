@@ -123,6 +123,7 @@ def logged_in_async(func):
 def store_loaded(fn):
     @wraps(fn)
     def inner(self, *args, **kwargs):
+        self._assert_not_disposed()
         if not self.store or not self.olm:
             raise LocalProtocolError("Matrix store and olm account is not loaded.")
         return fn(self, *args, **kwargs)
@@ -421,6 +422,7 @@ class Client:
 
     def _assert_logged_in(self):
         """Assert that the client is logged in."""
+        self._assert_not_disposed()
         if not self.logged_in:
             raise LocalProtocolError("Not logged in.")
 

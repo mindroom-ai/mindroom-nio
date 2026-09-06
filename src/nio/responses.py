@@ -194,19 +194,15 @@ def verify(schema, error_class, pass_arguments=True):
         @wraps(f)
         def wrapper(cls, parsed_dict, *args, **kwargs):
             try:
-                logger.debug("Validating response schema %r: %s", schema, parsed_dict)
+                logger.debug("Validating %s", cls.__name__)
                 validate_json(parsed_dict, schema)
             except (SchemaError, ValidationError) as e:
-                # An error body fails the success schema, so report the errcode the
-                # server sent alongside the missing success field. Only these two
-                # fields are logged; the rest of the body may hold user content.
-                body = parsed_dict if isinstance(parsed_dict, dict) else {}
-                # repr escapes controls; precision bounds untrusted server output.
+                # Exception messages and server error fields can contain payloads.
                 logger.warning(
-                    "Error validating response: %s (errcode=%.128r, error=%.512r)",
-                    e.message,
-                    body.get("errcode"),
-                    body.get("error"),
+                    "Error validating %s: %s (rule=%s)",
+                    cls.__name__,
+                    type(e).__name__,
+                    e.validator,
                 )
 
                 if pass_arguments:

@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 
 from ..client.base_client import _SyncItem
 from ..event_provenance import TimelineEventProvenance
-from ..events import InviteMemberEvent, RoomMemberEvent
+from ..events import BadEvent, InviteMemberEvent, RoomMemberEvent, UnknownBadEvent
+from ..exceptions import LocalProtocolError
 from ..responses import SlidingSyncStateStub
 from ..rooms import MatrixRoom
 from .codec import freeze_event
@@ -57,6 +58,18 @@ class Processor:
             change = None
             historical = item.provenance is TimelineEventProvenance.HISTORY
             if room is not None and room_id is not None:
+                if isinstance(item.event, (BadEvent, UnknownBadEvent)) and (
+                    item.route in (None, "invite")
+                    or "state_key" in item.event.source
+                    or item.event.source.get("type")
+                    in (
+                        "m.room.member",
+                        "m.room.create",
+                        "m.room.power_levels",
+                        "m.room.encryption",
+                    )
+                ):
+                    raise LocalProtocolError("malformed durable room state")
                 if item.section == "invite":
                     session.client.rooms.pop(room_id, None)
                 self.rooms[room_id] = room

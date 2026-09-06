@@ -679,7 +679,8 @@ class DurableSync:
         self._quiescing = True
         self._changed.set()
         if self._poll is not None:
-            self._poll.cancel()
+            poll, self._poll = self._poll, None
+            poll.cancel()
         if self._running is not None and self._running is not asyncio.current_task():
             await asyncio.shield(self._running)
 
