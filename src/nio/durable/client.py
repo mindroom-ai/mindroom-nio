@@ -160,6 +160,22 @@ class DurableSync:
         await deliver_transients(self.client, transients)
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
+        # The single successful local operation already owns its tenure change.
+        # Until its target appears in ordered sync, earlier state is history.
+        intent = self._read_local_intent()
+        if (
+            intent is not None
+            and "sequence" in intent
+            and intent["room_id"] == room_id
+            and not intent.get("observed")
+        ):
+            if membership == intent["current_membership"]:
+                intent["observed"] = True
+                self._store.database.execute_sql(
+                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
+                    (encode_json(intent),),
+                )
+            return None
         metadata = self._metadata.setdefault(room_id, {})
         previous = metadata.get("membership")
         epoch = metadata.get("membership_epoch", 0)
@@ -206,6 +222,14 @@ class DurableSync:
             and event.membership == "join"
             and self._metadata.get(room_id, {}).get("membership") not in (None, "join")
         ):
+            intent = self._read_local_intent()
+            if (
+                intent is not None
+                and "sequence" in intent
+                and intent["room_id"] == room_id
+                and not intent.get("observed")
+            ):
+                return room
             room = MatrixRoom(room_id, self.client.user_id, room.encrypted)
             self.client.rooms[room_id] = room
             self._metadata.setdefault(room_id, {})["baseline"] = False
@@ -400,14 +424,14 @@ class DurableSync:
         ) == (intent["previous_membership"], intent["previous_epoch"])
 
     async def wait_for_membership_idle(self) -> None:
-        """Wait for the preceding local outcome to reach application acknowledgement."""
+        """Wait for local acknowledgement and committed authoritative observation."""
         self._assert_active()
         while intent := self._read_local_intent():
             if "sequence" in intent:
                 acked = self._store.database.execute_sql(
                     "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
                 ).fetchone()[0]
-                if intent["sequence"] <= acked:
+                if intent["sequence"] <= acked and intent.get("observed"):
                     with self._store.transaction():
                         self._store.database.execute_sql(
                             "DELETE FROM NioDurableCrypto WHERE kind='membership'"

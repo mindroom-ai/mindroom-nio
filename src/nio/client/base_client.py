@@ -1048,6 +1048,13 @@ class Client:
             if any(
                 room.encrypted and user_id in room.users for room in self.rooms.values()
             )
+            or (
+                self._durable_session is not None
+                and (
+                    user_id in self.olm.tracked_users
+                    or user_id in self.olm.device_store.users
+                )
+            )
         }
         self.olm.add_changed_users(users_for_key_query)
 

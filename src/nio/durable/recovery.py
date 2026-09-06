@@ -199,6 +199,11 @@ class Recovery:
             if room_id in session.client.rooms:
                 processor.rooms[room_id] = session.client.rooms[room_id]
         processor.save()
+        # Pre-echo joined history must not restore a locally revoked room.
+        for room_id in processor.rooms:
+            if session._metadata[room_id].get("membership") in ("leave", "ban"):
+                session.client.rooms.pop(room_id, None)
+                session.client.invited_rooms.pop(room_id, None)
         session._crypto.capture()
         session._store.set_cursor(response.next_batch)
         session._store.save_continuation({"phase": "prepared"})

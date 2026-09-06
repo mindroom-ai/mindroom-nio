@@ -620,7 +620,6 @@ async def test_local_join_empty_projection_never_authorizes_initial_tail(tmp_pat
             )
             batch = await session.next_batch()
             await session.ack(batch)
-            await session.wait_for_membership_idle()
             assert session._recovery.needs_full_state()
             await session._accept_response(response(), full_state=True)
             records = []
@@ -631,6 +630,7 @@ async def test_local_join_empty_projection_never_authorizes_initial_tail(tmp_pat
                 TimelineEventProvenance.HISTORY
             }
             assert session._metadata[ROOM]["baseline"]
+            await session.wait_for_membership_idle()
         finally:
             await session.close()
             await nio_client.close()
@@ -665,6 +665,7 @@ async def test_tail_state_rejoin_resets_projection_before_full_state(tmp_path):
             ]
             assert set(nio_client.rooms[ROOM].users) == {USER}
             assert session._metadata[ROOM]["baseline"]
+            await session.wait_for_membership_idle()
         finally:
             await session.close()
             await nio_client.close()

@@ -62,6 +62,10 @@ class Processor:
                             "leave",
                             "ban",
                         ):
+                            # An empty leave section also confirms local leave.
+                            session._change_membership(
+                                room_id, session._metadata[room_id]["membership"]
+                            )
                             continue
                     elif room_id in self.explicit_memberships:
                         continue

@@ -527,3 +527,119 @@ async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revo
         finally:
             await session.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_sync_device_change_queries_cached_recipient_after_successful_query(
+    tmp_path, restart
+):
+    recipient = "@peer:example.org"
+    unrelated = "@untracked:example.org"
+    source = asyncio.Queue()
+    queried = []
+    rotated = Olm(recipient, "OTHER", SqliteMemoryStore(recipient, "OTHER"))
+    rotated_keys = rotated.share_keys()["device_keys"]
+    current_keys = None
+
+    async def sync(request):
+        return web.Response(body=await source.get())
+
+    async def query(request):
+        users = (await request.json())["device_keys"]
+        queried.append(set(users))
+        return web.json_response(
+            {
+                "device_keys": {
+                    user: {"OTHER": current_keys} if user == recipient else {}
+                    for user in users
+                },
+                "failures": {},
+            }
+        )
+
+    async def http(request):
+        if request.path.endswith("/joined_members"):
+            return web.json_response(
+                {"joined": {recipient: {"display_name": "Peer", "avatar_url": None}}}
+            )
+        if request.path.endswith("/keys/claim"):
+            keys = rotated.share_keys()["one_time_keys"]
+            key_id = next(iter(keys))
+            return web.json_response(
+                {
+                    "one_time_keys": {recipient: {"OTHER": {key_id: keys[key_id]}}},
+                    "failures": {},
+                }
+            )
+        return web.json_response({})
+
+    async with homeserver(sync, query=query, membership=http) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        nio_client.config = replace(nio_client.config, replace_rotated_device_keys=True)
+        session = open_session(tmp_path, nio_client)
+        with session._store.transaction():
+            publish_account(nio_client.olm)
+            peer, device = queue_dummy(nio_client.olm, user_id=recipient)
+            nio_client.olm.outgoing_to_device_messages.clear()
+            old = Olm(recipient, "OTHER", SqliteMemoryStore(recipient, "OTHER"))
+            old.account = peer
+            current_keys = old.share_keys()["device_keys"]
+            room = MatrixRoom(ROOM, USER, encrypted=True)
+            room.add_member("@old:example.org", "Old", None)
+            nio_client.rooms[ROOM] = room
+            session._metadata[ROOM] = {
+                "membership": "join",
+                "membership_epoch": 0,
+                "baseline": True,
+            }
+            session._save_rooms({ROOM: room}, {(ROOM, "@old:example.org")})
+            session._crypto.capture()
+        await nio_client.joined_members(ROOM)
+        await nio_client.keys_query()
+        assert queried == [{recipient}]
+        assert not nio_client.olm.users_for_key_query
+        assert recipient in nio_client.olm.tracked_users
+        nio_client.verify_device(device)
+        await nio_client.share_group_session(ROOM)
+        assert nio_client.olm.outbound_group_sessions[ROOM].shared
+        assert recipient not in room.users
+        if restart:
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            nio_client.config = replace(
+                nio_client.config, replace_rotated_device_keys=True
+            )
+            session = open_session(tmp_path, nio_client)
+            assert not session._outbound.member_cache
+            assert not nio_client.olm.outbound_group_sessions
+            assert recipient not in nio_client.rooms[ROOM].users
+        current_keys = rotated_keys
+        runner = asyncio.create_task(session.run())
+        try:
+            await source.put(
+                json.dumps(
+                    {
+                        "next_batch": "changed",
+                        "device_lists": {"changed": [recipient, unrelated], "left": []},
+                    }
+                ).encode()
+            )
+            await drain_sync(session)
+            assert queried == [{recipient}, {recipient}]
+            current = nio_client.device_store[recipient]["OTHER"]
+            assert current.ed25519 == rotated_keys["keys"]["ed25519:OTHER"]
+            assert current.trust_state is TrustState.unset
+            assert ROOM not in nio_client.olm.outbound_group_sessions
+            with pytest.raises(OlmUnverifiedDeviceError):
+                await nio_client.share_group_session(ROOM)
+            await session.quiesce()
+            await runner
+        finally:
+            source.put_nowait(b'{"next_batch":"shutdown"}')
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)

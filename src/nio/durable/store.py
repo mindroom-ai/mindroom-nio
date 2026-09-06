@@ -131,7 +131,7 @@ class DurableStore:
                     if source_store_class is DefaultStore:
                         self._adopt_trust(user_id, device_id)
             self.database.execute_sql("PRAGMA journal_mode=WAL")
-            self.database.execute_sql("PRAGMA synchronous=NORMAL")
+            self.database.execute_sql("PRAGMA synchronous=FULL")
         except BaseException:
             self.close()
             raise

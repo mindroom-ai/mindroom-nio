@@ -77,8 +77,8 @@ async def test_local_leave_retries_after_restart_and_emits_ordered_tenure_change
                 calls == [("POST", f"/_matrix/client/v3/rooms/{ROOM}/leave", "{}")] * 2
             )
             await reopened.ack(batch)
-            await reopened.wait_for_membership_idle()
             await reopened.quiesce()
+            assert reopened._read_local_intent()["sequence"] == batch.sequence
             await runner
             assert ROOM not in nio_client.rooms
         finally:
@@ -104,3 +104,190 @@ async def test_stale_local_expectation_cannot_send_or_advance_membership(tmp_pat
         assert session.client.rooms[ROOM].users
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_acknowledged_local_intent_gates_next_command_until_echo(
+    tmp_path, restart
+):
+    import json
+
+    from nio import TimelineEventProvenance
+
+    from .recovery_test import baseline, member, message
+
+    queue = asyncio.Queue()
+    calls = []
+
+    async def sync(request):
+        return web.Response(body=await queue.get())
+
+    async def membership(request):
+        calls.append(request.path)
+        return web.json_response({})
+
+    def echo(token, section, events):
+        return json.dumps(
+            {
+                "next_batch": token,
+                "rooms": {
+                    section: {
+                        ROOM: {"state": {"events": []}, "timeline": {"events": events}}
+                    }
+                },
+            }
+        ).encode()
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        assert await session.change_membership(
+            operation_id=OPERATION,
+            room_id=ROOM,
+            previous_membership="join",
+            previous_epoch=0,
+            current_membership="leave",
+        )
+        await session.ack(await session.next_batch())
+        if restart:
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        operation = asyncio.create_task(
+            session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=1,
+                current_membership="join",
+            )
+        )
+        try:
+            # The second command must wait even though its predecessor was ACKed.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(operation), 0.05)
+            assert len(calls) == 1
+            await queue.put(
+                echo(
+                    "s2",
+                    "leave",
+                    [
+                        member("$old-join", "join"),
+                        message("$uncertain"),
+                        member("$leave-echo", "leave"),
+                    ],
+                )
+            )
+            records = await drain_sync(session)
+            assert not [r for r in records if r.membership]
+            assert (
+                next(
+                    r for r in records if r.source.get("event_id") == "$uncertain"
+                ).provenance
+                is TimelineEventProvenance.HISTORY
+            )
+            assert await asyncio.wait_for(operation, 5)
+            batch = await session.next_batch()
+            assert batch.records[0].membership.current_epoch == 1
+            await session.ack(batch)
+            await queue.put(
+                echo(
+                    "s3",
+                    "join",
+                    [
+                        member("$old-leave", "leave"),
+                        message("$before-join"),
+                        member("$join-echo", "join"),
+                        member("$real-leave", "leave"),
+                        member("$real-rejoin", "join"),
+                    ],
+                )
+            )
+            records = await drain_sync(session)
+            assert [
+                (r.source.get("event_id"), r.membership.current_epoch)
+                for r in records
+                if r.membership
+            ] == [("$real-leave", 2), ("$real-rejoin", 2)]
+            await session.wait_for_membership_idle()
+            assert len(calls) == 2
+            assert session._metadata[ROOM]["membership_epoch"] == 2
+            await session.quiesce()
+            await runner
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_echo", [False, True])
+async def test_local_leave_waits_through_old_joined_state_and_accepts_standalone_echo(
+    tmp_path, explicit_echo
+):
+    import json
+
+    from .recovery_test import baseline, member
+
+    async def membership(request):
+        return web.json_response({})
+
+    async with homeserver(None, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        try:
+            assert await session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership="join",
+                previous_epoch=0,
+                current_membership="leave",
+            )
+            await session.ack(await session.next_batch())
+            await session._accept_response(
+                response(token="old", messages=0), full_state=True
+            )
+            while batch := await session.next_batch():
+                assert not [r for r in batch.records if r.membership]
+                await session.ack(batch)
+            assert ROOM not in nio_client.rooms
+            assert not session._metadata[ROOM]["baseline"]
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(session.wait_for_membership_idle(), 0.05)
+            assert not session._read_local_intent().get("observed")
+            with session._store.transaction():
+                session._store.finish_input()
+            body = {
+                "next_batch": "echo",
+                "rooms": {
+                    "leave": {
+                        ROOM: {
+                            "state": {"events": []},
+                            "timeline": {
+                                "events": (
+                                    [member("$echo", "leave")] if explicit_echo else []
+                                )
+                            },
+                        }
+                    }
+                },
+            }
+            await session._accept_response(json.dumps(body).encode())
+            while batch := await session.next_batch():
+                assert not [r for r in batch.records if r.membership]
+                await session.ack(batch)
+            await asyncio.wait_for(session.wait_for_membership_idle(), 5)
+            assert session._metadata[ROOM]["membership_epoch"] == 1
+        finally:
+            await session.close()
+            await nio_client.close()

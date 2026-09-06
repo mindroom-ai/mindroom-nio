@@ -223,3 +223,15 @@ def test_preexisting_default_handle_cannot_change_trust_after_adoption(tmp_path)
     store.close()
     with pytest.raises(LocalProtocolError, match="adoption"):
         ordinary.verify_device(device)
+
+
+def test_durable_writer_uses_full_synchronous_on_open_and_reopen(tmp_path):
+    for _ in range(2):
+        store = open_store(tmp_path)
+        try:
+            assert store.database.execute_sql("PRAGMA synchronous").fetchone()[0] == 2
+            assert (
+                store.database.execute_sql("PRAGMA journal_mode").fetchone()[0] == "wal"
+            )
+        finally:
+            store.close()
