@@ -94,6 +94,24 @@ account data for a room outside the current window, coalesced by wire event type
 until that room appears. Transient extensions retain the existing best-effort
 budget and never become replay obligations.
 
+### Expanded-window context boundary
+
+Live qualification reproduced a subscription reset where Tuwunel expanded a
+known room's window backwards beyond its previously observed window. Treating
+every unseen event in that snapshot as recovered replayed an older invitation,
+revoked the current joined tenure, and classified a newly sent request as history.
+The regression reproduces that failure without a live server.
+
+Retain the bounded window's observed identities separately from identities whose
+interpretation succeeded. The first overlap with the previously observed window
+separates older context from the recoverable suffix: unseen entries before it are
+history and must not rewind state or trigger new requests. Successfully applied
+overlap still skips duplicate interpretation. Undecryptable observed ciphertext
+also anchors the context boundary, while remaining eligible for later promotion
+when a repeated window arrives with its key. Both identity sets belong to the
+same existing room checkpoint and share its byte bound. No new queue, walker,
+database table or transaction owner is introduced.
+
 ## Main-store adoption
 
 Reject adoption of a released store with outstanding recovery gaps, unaccepted
