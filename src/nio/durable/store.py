@@ -106,6 +106,8 @@ class DurableStore:
                         "durable store account/device identity mismatch"
                     )
             with self.database.atomic("IMMEDIATE"):
+                if "NioDurableMeta" not in tables:
+                    self._check_legacy_recovery(tables)
                 self.matrix = _MatrixStore(
                     self.database, user_id, device_id, self.path, pickle_key
                 )
@@ -135,6 +137,29 @@ class DurableStore:
         except BaseException:
             self.close()
             raise
+
+    def _check_legacy_recovery(self, tables: set[str]) -> None:
+        """Refuse outstanding released-store work before any adoption writes."""
+        tables = {table.lower() for table in tables}
+        for table, predicate in (
+            (
+                "pendingtimelineevents",
+                "generation > 0 AND admission_accepted = 0",
+            ),
+            ("syncrecoverygaps", "target_token != ''"),
+            ("syncrecoveryabandonedrooms", "1"),
+        ):
+            if (
+                table in tables
+                and self.database.execute_sql(
+                    f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1"
+                ).fetchone()
+            ):
+                raise LocalProtocolError(
+                    "durable adoption requires recovery to be drained or explicitly "
+                    "settled using the prior release; outstanding legacy recovery "
+                    "work or unacknowledged loss remains"
+                )
 
     def _create_schema(self, consumer_id: UUID, user_id: str, device_id: str) -> None:
         statements = (
