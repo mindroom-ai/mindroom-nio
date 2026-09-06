@@ -1,5 +1,9 @@
 # Durable ingestion: supported guarantees and deliberate limits
 
+> Historical contract for the previous engine. The replacement is governed by
+> [Durable Classic sync](durable-sync.md), including its explicit API and scope
+> changes. Requirements below apply only where the replacement retains them.
+
 Status: accepted for implementation, 2026-09-05.
 
 This document controls the simplification of PR #55. It supersedes conflicting
