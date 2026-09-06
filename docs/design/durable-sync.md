@@ -1,5 +1,10 @@
 # Durable Classic sync
 
+Scope amendment: [Sliding Sync restoration](sliding-sync-restoration.md) restores
+both ordinary Sliding APIs and a Sliding transport through this shared durable
+core. Its transport-specific requirements supersede the Classic-only exclusions
+below; implementation and qualification are tracked in that amendment.
+
 Status: selected for implementation, 2026-09-06. This is the normative design
 for the replacement of PR #55's ingestion engine. Implementation is tracked in
 [the plan](durable-sync-plan.md); selection does not imply implementation is done.
