@@ -48,6 +48,7 @@ class SyncRecord:
     crypto: CryptoEvidence | None = None
     membership: OwnMembership | None = None
     route: str | None = None
+    codec: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +77,7 @@ def encode_records(records: tuple[SyncRecord, ...]) -> str:
                 "crypto": asdict(record.crypto) if record.crypto else None,
                 "membership": asdict(record.membership) if record.membership else None,
                 "route": record.route,
+                "codec": record.codec,
             }
             for record in records
         ]
@@ -93,15 +95,54 @@ def decode_records(encoded: str) -> tuple[SyncRecord, ...]:
             raise ValueError("stored record requires an event object")
         if value.get("clear") is not None and not isinstance(value["clear"], dict):
             raise ValueError("stored clear event must be an object")
-        for field in ("room_id", "route"):
+        for field in ("room_id", "route", "codec"):
             if value.get(field) is not None and not isinstance(value[field], str):
                 raise ValueError(f"stored {field} must be a string")
         value["kind"] = RecordKind(value["kind"])
         if value.get("provenance") is not None:
             value["provenance"] = TimelineEventProvenance(value["provenance"])
         if value.get("crypto") is not None:
-            value["crypto"] = CryptoEvidence(**value["crypto"])
+            crypto = value["crypto"]
+            if not isinstance(crypto, dict):
+                raise ValueError("stored crypto evidence must be an object")
+            if (
+                crypto.get("verified") is not None
+                and type(crypto["verified"]) is not bool
+            ):
+                raise ValueError("stored verification must be boolean or null")
+            if not isinstance(crypto.get("sender_key"), str):
+                raise ValueError("stored sender key must be a string")
+            if crypto.get("session_id") is not None and not isinstance(
+                crypto["session_id"], str
+            ):
+                raise ValueError("stored session ID must be a string or null")
+            try:
+                value["crypto"] = CryptoEvidence(**crypto)
+            except TypeError as error:
+                raise ValueError("invalid stored crypto evidence") from error
+        if value.get("membership_epoch") is not None:
+            _validate_epoch(value["membership_epoch"])
         if value.get("membership") is not None:
-            value["membership"] = OwnMembership(**value["membership"])
+            membership = value["membership"]
+            if not isinstance(membership, dict):
+                raise ValueError("stored membership must be an object")
+            allowed = ("join", "invite", "leave", "ban", "knock")
+            if membership.get("current") not in allowed or membership.get(
+                "previous"
+            ) not in (*allowed, None):
+                raise ValueError("invalid stored membership state")
+            if membership.get("source", "reported") not in ("local", "reported"):
+                raise ValueError("invalid stored membership source")
+            _validate_epoch(membership.get("previous_epoch"))
+            _validate_epoch(membership.get("current_epoch"))
+            try:
+                value["membership"] = OwnMembership(**membership)
+            except TypeError as error:
+                raise ValueError("invalid stored membership") from error
         records.append(SyncRecord(**value))
     return tuple(records)
+
+
+def _validate_epoch(value: object) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError("stored membership epoch must be a nonnegative integer")
