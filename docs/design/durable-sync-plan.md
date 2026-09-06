@@ -177,7 +177,7 @@ Classic-only consumer, preserving business authorization and projection barriers
   redactions, encrypted content, and unknown statuses.
 - [x] Update session opening, lifecycle, completion, local membership and config;
   reject explicit Sliding configuration. Test quiesce and cleanup ordering.
-- [ ] Point the candidate at the local built nio wheel for verification; final
+- [x] Point the candidate at the local built nio wheel for verification; final
   committed dependency uses the tested pushed commit. Run relevant tests, review
   and commit coordinated changes without touching the user's dirty checkout.
 
@@ -216,7 +216,7 @@ capacity workspace and update both existing PR descriptions with relative paths.
 - [x] Measure production additions/deletions against main and the starting head.
   Review whole-branch correctness, ownership, removed duplication and performance.
   Address demonstrated findings; excluded guarantees require a design amendment.
-- [ ] Run final necessary checks, stage only intended files, inspect staged diff,
+- [x] Run final necessary checks, stage only intended files, inspect staged diff,
   commit, and push fast-forward to the existing PR branches. Update descriptions
   with verified results and wait for relevant CI/reviews; resolve valid findings.
 
@@ -409,3 +409,30 @@ as part of this adapter replacement.
 Detailed final controls: `controls-20260906T093405Z` and
 `controls-20260906T094006Z` in the retained capacity workspace. The full measured
 source delta, test counts, required guarantees, and deliberate limits are above.
+
+
+## Publication and artifact verification
+
+The coordinated producer is pushed at `a686d43119a8c14b48d46a57858f70ee1579de55`;
+its Python source is identical to the tested `aac2e32` wheel. MindRoom is pushed
+at `556cacacb8822aae7b20bedfedadc60438a5871b`, with that immutable producer pin in
+both its project configuration and lock file. The pinned-artifact consumer suite
+passes 15,522 tests with 22 skipped and 16 warnings in 119.58 seconds. All Python
+source hashes match before and after the suite, including subprocesses with
+automatic dependency resync disabled. Complete consumer hooks, types and frontend
+checks pass. The user's separate checkout is preserved.
+
+Nio remote CI passes Python 3.12/3.13/3.14 tests, mypy, hooks and coverage. Both
+existing PR descriptions contain the final API, ownership, source-size and
+performance results, including the Tuwunel capacity limitation. The final source
+and qualification fixes have independent scoped reviews with no open findings.
+
+
+The companion remote suite passes 15,520 tests with 12 skipped. All four full/
+minimal AMD64/ARM64 image builds, static/plugin checks, runtime image probes,
+Kubernetes platform/instance smoke checks, and the Compose stack smoke pass on
+`556cacacb`. Both PRs are mergeable. Automated review checks completed without
+new findings. This completes the replacement and coordinated verification;
+release publication and the separately measured Tuwunel startup-capacity limit
+remain outside the completed implementation. Subsequent plan-only commits do
+not change the pinned runtime source.
