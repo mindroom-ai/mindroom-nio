@@ -972,6 +972,9 @@ class Client:
         self.store: MatrixStore | None = None
         self._ingestion_store_snapshot: _IngestionStoreSnapshot | None = None
         self._ingestion_poisoned = False
+        self._ingestion_key_share_handler: (
+            Callable[[RoomKeyRequest, bool], bool] | None
+        ) = None
         self._ordinary_sync_started = False
         self.config = config or ClientConfig()
 
@@ -1275,6 +1278,7 @@ class Client:
         self.next_batch = snapshot.next_batch
         self.loaded_sync_token = cast(Any, snapshot.loaded_sync_token)
         self._ingestion_store_snapshot = None
+        self._ingestion_key_share_handler = None
 
     def restore_login(
         self,
@@ -2953,6 +2957,8 @@ class Client:
 
         """
         assert self.olm
+        if self._ingestion_key_share_handler is not None:
+            return self._ingestion_key_share_handler(event, False)
         return self.olm.continue_key_share(event)
 
     @store_loaded
@@ -2973,4 +2979,6 @@ class Client:
 
         """
         assert self.olm
+        if self._ingestion_key_share_handler is not None:
+            return self._ingestion_key_share_handler(event, True)
         return self.olm.cancel_key_share(event)

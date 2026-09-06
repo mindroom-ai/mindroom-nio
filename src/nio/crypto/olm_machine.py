@@ -473,7 +473,12 @@ class Olm:
         elif isinstance(event, RoomKeyRequestCancellation):
             # Let us first remove key requests that just arrived. Those don't
             # need anything special.
-            self.received_key_requests.pop(event.request_id, None)
+            queued = self.received_key_requests.get(event.request_id)
+            if queued is not None and (queued.sender, queued.requesting_device_id) == (
+                event.sender,
+                event.requesting_device_id,
+            ):
+                self.received_key_requests.pop(event.request_id)
 
             # Now come the key requests that are waiting for an Olm session.
             user_key = (event.sender, event.requesting_device_id)
@@ -490,7 +495,11 @@ class Olm:
 
             # Finally key requests that are waiting for device
             # verification.
-            if event.request_id in self.key_request_from_untrusted:
+            pending = self.key_request_from_untrusted.get(event.request_id)
+            if pending is not None and (
+                pending.sender,
+                pending.requesting_device_id,
+            ) == (event.sender, event.requesting_device_id):
                 # First remove the event from our untrusted queue.
                 self.key_request_from_untrusted.pop(event.request_id)
                 # Since events in the untrusted queue were forwarded to users

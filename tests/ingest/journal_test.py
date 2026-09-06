@@ -33,6 +33,7 @@ from nio.store._sync_journal_preflight import _row
 from nio.store._sync_journal_values import MaterializerLimits
 import nio.store.sync_journal as bootstrap_api
 import nio.ingest.errors as ingest_errors
+from nio.store.sync_journal_schema import SCHEMA_SQL
 from ingestion_helpers import open_ingestion_store
 
 ACCOUNT_ID = "@alice:example.org"
@@ -59,7 +60,7 @@ FRESH_BOUNDARIES = (
     "insert_account",
     "create_meta",
     "insert_meta",
-    *(f"schema_{index}" for index in range(10)),
+    *(f"schema_{index}" for index in range(len(SCHEMA_SQL))),
     "insert_source",
     "foreign_key_check",
     "before_commit",
@@ -238,6 +239,7 @@ def test_fresh_owned_store_bootstrap_is_one_atomic_full_graph(
         "NioIngestRoomAggregate",
         "NioIngestWork",
         "NioIngestRecovery",
+        "NioIngestKeyShare",
     }
     assert len(pickle_calls) == 1
     identity_keys, shared, used_key, pickled = pickle_calls[0]
@@ -306,7 +308,7 @@ def test_fresh_owned_store_retries_empty_database_residue(
             assert connection.execute("SELECT * FROM sqlite_master").fetchall() == []
 
     bootstrap = _fresh_open(tmp_path)
-    assert len(_table_names(database_path)) == 17
+    assert len(_table_names(database_path)) == 18
     bootstrap.close()
 
 
@@ -393,11 +395,11 @@ def test_fresh_owned_store_hook_failure_is_all_absent_or_complete(
     if boundary != "commit":
         assert master == ()
         retried = _fresh_open(tmp_path)
-        assert len(_table_names(database_path)) == 17
+        assert len(_table_names(database_path)) == 18
         retried.close()
         return
 
-    assert len(_table_names(database_path)) == 17
+    assert len(_table_names(database_path)) == 18
     with sqlite3.connect(database_path) as connection:
         account_before = connection.execute(
             "SELECT account, shared FROM accounts"

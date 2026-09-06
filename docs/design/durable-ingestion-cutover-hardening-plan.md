@@ -440,6 +440,12 @@ The failure blocks key availability for that request; it does not bypass device
 trust or expose the key. Deferring it costs a failed continuation until separately
 resolved. The companion integration and this path still need cutover verification.
 
+This is the historical finding from that review. The separately authorized
+[interactive continuation change](key-share-restart-continuation.md) reproduces
+the owned callback and retired-Frame failures directly and records the current
+implementation and verification. Use that document and the controlling contract
+for the current status; the earlier callback-only tests were not sufficient.
+
 ### Follow-up work after this push
 
 The user requested elimination of all 144 mypy errors, with truthful annotations

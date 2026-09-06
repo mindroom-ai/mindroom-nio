@@ -274,5 +274,6 @@ and Synapse capacity harnesses without instrumentation. Use current local Nio
 source and preserve the user's companion dependency edits. Record actual
 counts, production size, benchmarks, integration results, and remaining limits
 in the implementation plan. Internal tests alone do not establish cutover
-readiness. The separately documented interactive key-share restart gap remains
-a separate task.
+readiness. Interactive key-share restart is a separately authorized change
+specified in [owned continuation](key-share-restart-continuation.md), with its
+own persistence lifetime and verification results.

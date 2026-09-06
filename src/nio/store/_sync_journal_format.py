@@ -21,6 +21,7 @@ def _canonical_internal(value: object) -> bytes:
 
 
 _STORED_ROWS = {
+    "NioIngestKeyShare": "key_share request_id updated_revision",
     "NioIngestRecovery": "recovery source_epoch request_id",
     "NioIngestSourceState": "source source_epoch next_request_id active",
     "NioIngestFrame": "frame frame_id source_epoch request_id staged_revision",

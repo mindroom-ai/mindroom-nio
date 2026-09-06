@@ -62,6 +62,7 @@ from .classic import ClassicSource
 from .config import IngestionConfig, source_transport
 from .errors import JournalConflictError, JournalIntegrityError
 from .hydration import normalize_hydration_response
+from .key_shares import _KeyShare, _OwnedKeyShares
 from .model import (
     BatchRef,
     EventRecord,
@@ -781,6 +782,18 @@ class _OwnedIngestionSession:
         self._detached = False
         self._revoked = False
         self._closed = False
+        self._key_shares = _OwnedKeyShares(client, journal)
+        self._key_shares.restore()
+        client._ingestion_key_share_handler = self._change_key_share
+
+    def _change_key_share(self, event: RoomKeyRequest, cancel: bool) -> bool:
+        self._client._assert_ingestion_not_poisoned()
+        if self._close_task is not None or self._closed:
+            raise LocalProtocolError("ingestion session is closed")
+        result = self._key_shares.change(event, cancel)
+        if result:
+            self._signal_durable_progress()
+        return result
 
     def next_batch(
         self,
@@ -1268,14 +1281,16 @@ class _OwnedIngestionSession:
         self._client._assert_ingestion_not_poisoned()
         store = self._owned_store
         preparation_started = False
+        key_shares_before: dict[str, _KeyShare] = {}
 
         def prepare(
             frame: SyncFrame,
             staged_revision: int,
             prior_continuities: tuple[RoomContinuity, ...],
         ) -> _PreparedIngestionFrame:
-            nonlocal preparation_started
+            nonlocal preparation_started, key_shares_before
             preparation_started = True
+            key_shares_before = self._key_shares.prepare()
             prepared = self._client._prepare_ingestion_frame(
                 frame,
                 staged_revision,
@@ -1301,11 +1316,13 @@ class _OwnedIngestionSession:
             if olm.should_upload_keys:
                 upload_body = canonical_json(olm.share_keys())
                 olm.save_account()
-            return _initial_outbound_maintenance(
+            outbound = _initial_outbound_maintenance(
                 frame_id=prepared.frame_id,
                 delta=delta,
                 upload_body=upload_body,
             )
+            self._key_shares.capture(key_shares_before)
+            return outbound
 
         try:
             result = self._journal._prepare_and_materialize_oldest_frame(
@@ -1490,6 +1507,7 @@ class _OwnedIngestionSession:
             nonlocal apply_started
             apply_started = True
             claim_targets: list[tuple[str, str]] = []
+            interactive_candidates: list[RoomKeyRequest] = []
             claim_waiting_counts: dict[tuple[str, str], int] = {}
             claim_was_wedged: set[tuple[str, str]] = set()
             claim_rerequest_contexts: dict[tuple[str, str], list[dict[str, object]]] = (
@@ -1552,6 +1570,7 @@ class _OwnedIngestionSession:
                         )
                         for value in claim["waiting_key_requests"]
                     )
+                    interactive_candidates.extend(reconstructed_waiting)
                     reconstructed_rerequests = tuple(
                         _key_claim_rerequest_event(
                             value,
@@ -1665,10 +1684,12 @@ class _OwnedIngestionSession:
                 return tuple(dummy_follow_ups)
             if operation.kind != "key_claim":
                 return ()
-            if claim_waiting_counts and olm.collect_key_requests() != []:
-                raise JournalIntegrityError(
-                    "waiting key claim generated unsupported callback Work"
-                )
+            if claim_waiting_counts:
+                untrusted = olm.collect_key_requests()
+                self._key_shares.finish_claim(interactive_candidates, untrusted)
+                for request_event in untrusted:
+                    target = (request_event.sender, request_event.requesting_device_id)
+                    claim_waiting_counts[target] -= 1
             generated = _new_to_device_messages(
                 olm.outgoing_to_device_messages, queued_before
             )

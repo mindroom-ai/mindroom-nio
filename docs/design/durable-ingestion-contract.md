@@ -41,9 +41,11 @@ separate work.
 
 The data flow remains response/cursor commit, callback-free preparation with
 crypto writes, prepared Work publication, consumer admission, acknowledgement,
-outbound crypto maintenance, then frame retirement. Durable state stays in
-the existing five ingestion tables; no new table, dependency, public option,
-background worker, or general-purpose retry framework is needed.
+outbound crypto maintenance, then frame retirement. The original five ingestion
+tables are joined by the bounded Classic recovery carrier and the interactive
+key-share carrier described in their design amendments. Both use the same SQLite
+owner; no new dependency, public option, background worker, or general-purpose
+retry framework is needed.
 
 ## Required guarantees
 
@@ -382,17 +384,29 @@ conflict is resolved; see the [current integration status](type-correctness-and-
 for the verified companion revision and Nio pin. Artifact alignment and cutover
 validation remain outside this local change.
 
-### Known gap before relying on restart continuation
+### Interactive key-share continuation across restart
 
-Replaying a collected unverified key-request callback currently does not restore
-Olm's in-memory pending approval map. A real Olm/store reconstruction probe shows
-that verification followed by `continue_key_share` rejects the request as
-unknown; the same owned replay outcome is inferred from its unchanged callback
-path and still needs an end-to-end reproduction. Existing tests establish
-callback replay and absence of secret sharing before trust, not successful
-interactive continuation after restart. Reproduce and resolve this before
-relying on that flow at cutover; it is an implementation gap, not a newly excluded
-guarantee. Publishing the current protocol/queue repairs does not deploy them.
+Owned ingestion retains unverified own-device approvals independently of callback
+acknowledgment and Frame retirement. Reconstructed clients expose the pending
+requests through the existing query and approval methods. Verification alone
+does not continue a request: explicit continuation rechecks current trust, then
+atomically retains its claim context or exact encrypted message with any crypto
+writes. Ordinary preparation transfers that handoff into its existing outbound
+plan. Callback or acknowledgment retry cannot discard or encrypt it twice.
+
+If trust changes while an interactive claim is in flight, claim-response
+application restores a durable, queryable approval without sending or publishing
+a second callback. Local cancellation removes an awaiting approval; ordered
+incoming cancellation must match sender, requesting device and request ID. The
+sender/device check also applies to ordinary clients. Cancellation does not
+recall an already continued encrypted share.
+
+The legacy `send_to_device_messages()` queue-drain helper refuses while owned
+ingestion is attached, before HTTP or queue mutation. The coordinator owns these
+retained sends; specific application and verification to-device APIs remain
+unchanged. See the [key-share design and verification](key-share-restart-continuation.md)
+for the carrier's bounds, crash boundaries, ownership and trust rules. Companion
+artifact alignment and cutover testing remain required before deployment.
 
 ## References
 

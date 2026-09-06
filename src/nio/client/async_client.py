@@ -1355,6 +1355,11 @@ class AsyncClient(Client):
 
         Automatically called by sync_forever().
         """
+        self._assert_ingestion_not_poisoned()
+        if self._ingestion_store_snapshot is not None:
+            raise LocalProtocolError(
+                "outgoing queue delivery belongs to owned ingestion"
+            )
         if not self.outgoing_to_device_messages:
             return []
 

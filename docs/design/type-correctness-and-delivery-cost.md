@@ -229,6 +229,11 @@ interactive key-share continuation gap after restart remains a cutover issue;
 this type/performance work does not claim to resolve it. Companion integration,
 release communication, and live deployment remain separate.
 
+That scope statement describes this earlier type/performance task. The later
+authorized [interactive continuation change](key-share-restart-continuation.md)
+addresses restart continuation separately and records its own verification;
+consult it and the controlling contract for the current behavior.
+
 The work uses the existing isolated branch. Record decisions before implementation,
 review each task, run focused tests and final Python 3.12/3.13/3.14 suites, require
 zero mypy errors and passing repository hooks, then push the existing PR branch

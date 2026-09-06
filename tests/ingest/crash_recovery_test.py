@@ -91,16 +91,7 @@ FRESH_STORE_BOUNDARIES = (
     "insert_account",
     "create_meta",
     "insert_meta",
-    "schema_0",
-    "schema_1",
-    "schema_2",
-    "schema_3",
-    "schema_4",
-    "schema_5",
-    "schema_6",
-    "schema_7",
-    "schema_8",
-    "schema_9",
+    *(f"schema_{index}" for index in range(len(SCHEMA_SQL))),
     "insert_source",
     "foreign_key_check",
     "before_commit",
@@ -632,7 +623,7 @@ def test_fresh_owned_store_process_death_is_empty_or_complete_and_reopenable(
 
     master, rows = graph
     table_names = {name for kind, name, _table, _sql in master if kind == "table"}
-    assert len(table_names) == 17
+    assert len(table_names) == 18
     assert {
         "NioIngestMeta",
         "NioIngestSourceState",
@@ -640,6 +631,7 @@ def test_fresh_owned_store_process_death_is_empty_or_complete_and_reopenable(
         "NioIngestRoomAggregate",
         "NioIngestWork",
         "NioIngestRecovery",
+        "NioIngestKeyShare",
     } <= table_names
     assert {table: len(table_rows) for table, table_rows in rows if table_rows} == {
         "accounts": 1,
@@ -720,6 +712,7 @@ def test_configured_adoption_process_death_is_exact_old_or_complete_new_graph(
             if kind == "table" and name.startswith("NioIngest")
         }
         assert names == {
+            "NioIngestKeyShare",
             "NioIngestMeta",
             "NioIngestSourceState",
             "NioIngestFrame",
@@ -813,6 +806,7 @@ def test_configured_sqlite_adoption_crash_preserves_exact_populated_graph(
             for kind, name, _table, _sql in graph_after[0]
             if kind == "table" and name.startswith("NioIngest")
         } == {
+            "NioIngestKeyShare",
             "NioIngestMeta",
             "NioIngestSourceState",
             "NioIngestFrame",

@@ -66,6 +66,13 @@ META_TABLE_SQL = """CREATE TABLE NioIngestMeta (
     ))"""
 
 SCHEMA_SQL = (
+    """CREATE TABLE NioIngestKeyShare (
+    account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
+    request_id TEXT NOT NULL CHECK (typeof(request_id) = 'text' AND length(request_id) > 0),
+    updated_revision INTEGER NOT NULL CHECK (typeof(updated_revision) = 'integer' AND updated_revision >= 1),
+    payload BLOB NOT NULL CHECK (typeof(payload) = 'blob' AND length(payload) BETWEEN 1 AND 1048576),
+    payload_sha256 BLOB NOT NULL CHECK (typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32),
+    PRIMARY KEY (account_id, request_id))""",
     """CREATE TABLE NioIngestSourceState (
     account_id TEXT PRIMARY KEY REFERENCES NioIngestMeta(account_id) CHECK (
         typeof(account_id) = 'text' AND length(account_id) > 0

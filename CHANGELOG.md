@@ -26,6 +26,17 @@ All notable changes to this project will be documented in this file.
 
 ### Error handling and platform support
 
+- Retain owned interactive key-share approvals across restart, including after
+  callback acknowledgment and Frame retirement. Explicit continuation commits
+  its claim context or exact encrypted message atomically with crypto writes;
+  callback retries and lost send responses reuse the retained handoff. Changed
+  trust during a claim restores a pending approval without sending or issuing a
+  second callback.
+- Reject the legacy `send_to_device_messages()` queue-drain helper while owned
+  ingestion is attached, before HTTP or queue mutation. Specific application and
+  verification to-device APIs remain unchanged.
+- Match incoming key-request cancellations by sender and requesting device as
+  well as request ID, for ordinary and owned clients.
 - Owned Classic ingestion drains server-visible gaps through bounded, durable
   pages before advancing its sync cursor. Recovered events use normal admission;
   restart replays a staged page or resumes after the last settled page. Cold
@@ -72,9 +83,6 @@ All notable changes to this project will be documented in this file.
 
 - This is a breaking change relative to 0.40.0; select the release version before
   publishing. Companion integration and dependency pins require cutover testing.
-- The documented unverified key-request continuation gap after restart remains
-  open. A replayed approval callback may not support `continue_key_share()` until
-  that separate issue is fixed and verified through the owned engine.
 
 ## 0.40.0
 

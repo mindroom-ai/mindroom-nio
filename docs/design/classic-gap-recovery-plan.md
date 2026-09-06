@@ -553,11 +553,27 @@ Substituting a root event ID for the semantic coalescing thread is specifically
 unsafe: `turn_controller.py` uses that key to select context and reply targeting,
 and room-level media promotion depends on the absent thread ID.
 
-Keep that scheduling redesign separate from these corrections. A follow-up
-should first block preparation of root A and establish whether independent
-root B can safely prepare, preserving the existing caption, speech, target,
-failure, and shutdown behavior. Benchmark a bounded handoff only after defining
-its ownership. Do not add a second writer or delete either pending-turn write
-to force the synthetic overlap check to pass. The outstanding overlap result
-and the separately documented interactive key-share restart gap remain visible
-cutover considerations; no release, deployment, or merge is performed here.
+The subsequent authorized scheduling change is specified in MindRoom's
+`docs/dev/root-preparation-scheduling.md`. Closed independent roots retain their
+semantic key and may prepare concurrently, with eight tasks per gate owner;
+explicit threads and single-conversation rooms remain serial. Tests block root
+A while root B prepares and cover grouping, source ownership, failure and drain.
+This remains separate from Nio's persistence and recovery implementation.
+
+A frozen-source Tuwunel comparison found only a modest application benefit:
+preparation start spread changed from 21.076 to 19.845 seconds, while median
+reply time stayed approximately 74.6 seconds. Both runs completed 200 exact
+replies, settled all three fence principals and drained, but failed the unchanged
+45-second full-overlap requirement (42.491 and 43.247 seconds). The change fixes
+independent-root blocking; it does not establish a general startup-throughput
+improvement. The earlier serial dispatch diagnostic attributed 20.337 of 21.314
+seconds to pending-turn persistence, including the shared ledger lock and writer
+queue. This is prior diagnostic attribution, not a measured breakdown of the
+concurrent candidate. Do not add a second writer or delete either pending-turn
+write to force the synthetic overlap check to pass.
+
+Interactive key-share restart is handled by the separately specified
+[owned continuation change](key-share-restart-continuation.md). Its verification
+and final integration results are recorded there and below. The outstanding
+overlap result remains a cutover consideration; no release, deployment, or merge
+is performed here.

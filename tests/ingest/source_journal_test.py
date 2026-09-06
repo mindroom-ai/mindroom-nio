@@ -90,6 +90,7 @@ LIST_FRAMES_SQL = (
 )
 
 EXPECTED_INGESTION_OBJECTS = {
+    ("table", "NioIngestKeyShare"),
     ("table", "NioIngestRecovery"),
     ("table", "NioIngestMeta"),
     ("table", "NioIngestSourceState"),
@@ -543,6 +544,13 @@ def _normalized_sql(sql: str) -> str:
 
 
 EXPECTED_DDL = {
+    ("table", "NioIngestKeyShare"): _normalized_sql("""CREATE TABLE NioIngestKeyShare (
+        account_id TEXT NOT NULL REFERENCES NioIngestMeta(account_id),
+        request_id TEXT NOT NULL CHECK (typeof(request_id) = 'text' AND length(request_id) > 0),
+        updated_revision INTEGER NOT NULL CHECK (typeof(updated_revision) = 'integer' AND updated_revision >= 1),
+        payload BLOB NOT NULL CHECK (typeof(payload) = 'blob' AND length(payload) BETWEEN 1 AND 1048576),
+        payload_sha256 BLOB NOT NULL CHECK (typeof(payload_sha256) = 'blob' AND length(payload_sha256) = 32),
+        PRIMARY KEY (account_id, request_id))"""),
     ("table", "NioIngestRecovery"): _normalized_sql("""CREATE TABLE NioIngestRecovery (
         account_id TEXT PRIMARY KEY REFERENCES NioIngestMeta(account_id) CHECK (
             typeof(account_id) = 'text' AND length(account_id) > 0
@@ -1022,13 +1030,14 @@ def _assert_exact_ingestion_topology(database_path: Path) -> None:
     assert {(kind, name) for kind, name, _sql in topology} == (
         EXPECTED_INGESTION_OBJECTS
     )
-    assert len(topology) == 11
+    assert len(topology) == 12
 
     assert {(kind, name): sql for kind, name, sql in topology} == EXPECTED_DDL
     with sqlite3.connect(database_path) as actual, sqlite3.connect(":memory:") as exact:
         for ddl in EXPECTED_DDL.values():
             exact.execute(ddl)
         for table in (
+            "NioIngestKeyShare",
             "NioIngestMeta",
             "NioIngestSourceState",
             "NioIngestRecovery",
