@@ -174,6 +174,7 @@ class OutboundCrypto:
     async def _joined_members(self, room_id: str) -> JoinedMembersResponse:
         self.session._assert_active()
         method, path = Api.joined_members("", room_id)
+        previous = self.member_cache.get(room_id)
         self.member_cache[room_id] = None
         try:
             body = await self.session._transport.request(method, path)
@@ -184,6 +185,8 @@ class OutboundCrypto:
                 raise LocalProtocolError("room membership changed during lookup")
             users = [member.user_id for member in response.members]
             with self.transaction():
+                if previous is None or set(previous) != set(users):
+                    self.client.invalidate_outbound_session(room_id)
                 if room_id in self.client.encrypted_rooms or (
                     (room := self.client.rooms.get(room_id)) is not None
                     and room.encrypted

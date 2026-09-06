@@ -25,6 +25,10 @@ All notable changes to this project will be documented in this file.
 
 ### Durability and compatibility
 
+- Retire durable outbound encryption sessions when refreshed recipients change
+  or the previous recipient set is unknown; profile-only updates keep the session.
+- Request fresh Sliding state after recovery loses a joined room's authorization
+  baseline, so future live delivery resumes after the fenced interval.
 - Commit retained sync input, crypto changes, room projection, and output batches
   on one SQLite connection. Restart replays committed batches without decrypting
   them again. Unacknowledged batches keep stable identity and order.

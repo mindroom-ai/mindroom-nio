@@ -695,6 +695,128 @@ async def test_gap_restart_replays_committed_batch_then_resumes_next_page(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_history_loss_requests_fresh_initial_before_resuming_live(
+    tmp_path, restart
+):
+    other_room = "!other:example.org"
+    initial = json.loads(window("$old"))
+    initial["rooms"][other_room] = json.loads(
+        window("$other-old", prev_batch="other-w1")
+    )["rooms"][ROOM]
+    gap = json.loads(
+        window("$gap", pos="p2", initial=False, prev_batch="w2", num_live=1)
+    )
+    gap["rooms"][other_room] = json.loads(
+        window("$other-gap", initial=False, prev_batch="other-w2", num_live=1)
+    )["rooms"][ROOM]
+    for room in gap["rooms"].values():
+        room["limited"] = True
+    requests = []
+    history_starts = []
+    fresh_requested = asyncio.Event()
+    allow_fresh = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def sync(request):
+        requests.append((dict(request.query), await request.json()))
+        if len(requests) == 1:
+            return web.json_response(initial)
+        if len(requests) == 2:
+            return web.json_response(gap)
+        if len(requests) == 3:
+            fresh_requested.set()
+            await allow_fresh.wait()
+            return web.Response(body=window("$fresh", pos="p3", prev_batch="w3"))
+        if len(requests) == 4:
+            return web.Response(
+                body=window("$live", pos="p4", initial=False, state=[], num_live=1)
+            )
+        await stop.wait()
+        return web.Response(body=b"{}")
+
+    async def history(request):
+        start = request.query["from"]
+        history_starts.append(start)
+        if start == "w1":
+            return web.json_response(
+                {"errcode": "M_FORBIDDEN", "error": "history unavailable"}, status=403
+            )
+        assert start == "other-w1"
+        assert request.query["to"] == "other-w2"
+        return web.json_response(
+            {
+                "start": start,
+                "end": "other-w2",
+                "chunk": [message("$other-missed")],
+            }
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            assert session._metadata[ROOM]["baseline"]
+            async with asyncio.timeout(5):
+                await session.wait_for_work()
+            loss = await session.next_batch()
+            assert [(record.kind, record.room_id) for record in loss.records] == [
+                (RecordKind.LOSS, ROOM)
+            ]
+            assert requests[1][0]["pos"] == "p1"
+            assert not session._metadata[ROOM]["baseline"]
+            if restart:
+                await session.close()
+                await nio_client.close()
+                await asyncio.gather(runner, return_exceptions=True)
+                nio_client = client()
+                nio_client.homeserver = url
+                session = open_session(tmp_path, nio_client, settings())
+                assert await session.next_batch() == loss
+                runner = asyncio.create_task(session.run())
+            records = await drain_sync(session)
+            assert history_starts == ["w1", "other-w1"]
+            assert [
+                (record.source["event_id"], record.provenance)
+                for record in records
+                if record.kind is RecordKind.TIMELINE
+            ] == [
+                ("$other-missed", TimelineEventProvenance.RECOVERED),
+                ("$gap", TimelineEventProvenance.HISTORY),
+                ("$other-gap", TimelineEventProvenance.LIVE),
+            ]
+            async with asyncio.timeout(5):
+                await fresh_requested.wait()
+            assert "pos" not in requests[2][0]
+            assert requests[2][1]["extensions"]["to_device"]["since"] == "td1"
+            assert not session._metadata[ROOM]["baseline"]
+            allow_fresh.set()
+            records = await drain_sync(session)
+            assert [
+                record.provenance
+                for record in records
+                if record.kind is RecordKind.TIMELINE
+            ] == [TimelineEventProvenance.HISTORY]
+            assert session._metadata[ROOM]["baseline"]
+            records = await drain_sync(session)
+            assert requests[3][0]["pos"] == "p3"
+            assert [
+                (record.source["event_id"], record.provenance)
+                for record in records
+                if record.kind is RecordKind.TIMELINE
+            ] == [("$live", TimelineEventProvenance.LIVE)]
+        finally:
+            allow_fresh.set()
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_lost_window_boundary_cannot_reuse_a_pre_snapshot_recovery_token(
     tmp_path,
 ):

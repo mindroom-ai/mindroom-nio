@@ -14,6 +14,7 @@ from nio.rooms import MatrixRoom
 from nio.store import SqliteMemoryStore
 
 from .client_test import ROOM, USER, client, open_session
+from .crypto_test import publish_account, queue_dummy
 from .runner_test import homeserver
 
 
@@ -101,6 +102,106 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(tm
                 "type": "m.room.message",
                 "content": {"msgtype": "m.text", "body": "fresh recipient secret"},
             }
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh", ["remove", "add", "profile", "uncached-remove"])
+async def test_recipient_refresh_rotates_only_for_changed_or_unknown_members(
+    tmp_path, refresh
+):
+    first, second = "@first:example.org", "@second:example.org"
+    members = [first] if refresh == "add" else [first, second]
+    sent = []
+    shares = []
+
+    async def http(request):
+        if request.path.endswith("/joined_members"):
+            return web.json_response(
+                {
+                    "joined": {
+                        user: {"display_name": f"Name {len(sent)}", "avatar_url": None}
+                        for user in members
+                    }
+                }
+            )
+        if "/sendToDevice/m.room.encrypted/" in request.path:
+            shares.append((await request.json())["messages"])
+            return web.json_response({})
+        if "/send/m.room.encrypted/" in request.path:
+            sent.append(await request.json())
+            return web.json_response({"event_id": f"$sent-{len(sent)}"})
+        raise AssertionError(request.path)
+
+    async with homeserver(None, membership=http) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        with session._outbound.transaction():
+            publish_account(nio_client.olm)
+            peers = {}
+            for user in (first, second):
+                peers[user], device = queue_dummy(nio_client.olm, user_id=user)
+                nio_client.verify_device(device)
+            nio_client.olm.outgoing_to_device_messages.clear()
+            session._crypto.capture()
+        room = MatrixRoom(ROOM, USER, encrypted=True)
+        room.add_member("@historical:example.org", "Historical", None)
+        nio_client.rooms[ROOM] = room
+        try:
+            await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "before"}
+            )
+            content = shares[0][first]["OTHER"]
+            ciphertext = content["ciphertext"][peers[first].identity_keys["curve25519"]]
+            _, clear = peers[first].create_inbound_session(
+                content["sender_key"],
+                vodozemac.AnyOlmMessage.from_parts(
+                    ciphertext["type"], decode_base64(ciphertext["body"])
+                ),
+            )
+            inbound = vodozemac.InboundGroupSession(
+                vodozemac.SessionKey(json.loads(clear)["content"]["session_key"])
+            )
+            assert (
+                json.loads(
+                    inbound.decrypt(
+                        vodozemac.MegolmMessage.from_base64(sent[0]["ciphertext"])
+                    ).plaintext
+                )["content"]["body"]
+                == "before"
+            )
+
+            if refresh == "uncached-remove":
+                session._outbound.member_cache.pop(ROOM)
+                members = []
+            elif refresh == "remove":
+                members = [second]
+            else:
+                # Same members, reversed and renamed, must keep their session.
+                members = [second, first]
+            await nio_client.joined_members(ROOM)
+            await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "after"}
+            )
+            assert set(room.users) == {"@historical:example.org"}
+            assert not room.members_synced
+            if refresh == "profile":
+                assert sent[1]["session_id"] == sent[0]["session_id"]
+                assert len(shares) == 1
+            else:
+                assert sent[1]["session_id"] != sent[0]["session_id"]
+                if members:
+                    assert len(shares) == 2
+                    assert set(shares[1]) == set(members)
+                else:
+                    assert len(shares) == 1
+                with pytest.raises(vodozemac.MegolmDecryptionException):
+                    inbound.decrypt(
+                        vodozemac.MegolmMessage.from_base64(sent[1]["ciphertext"])
+                    )
         finally:
             await session.close()
             await nio_client.close()

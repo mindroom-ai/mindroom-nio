@@ -724,11 +724,11 @@ the fresh state needed to resume future authorization. Keep the existing crypto
 lock, synchronous transaction, room metadata and source reset; no new schema,
 queue, public API or per-event validation layer.
 
-- [ ] Reproduce recipient removal/addition through real HTTP and encryption.
+- [x] Reproduce recipient removal/addition through real HTTP and encryption.
   Compare completed recipient sets in `durable/outbound.py`, rotating for a
   changed or unknown set. Preserve the group for reordering/profile changes.
   Verify a removed recipient's old key cannot decrypt the next ciphertext.
-- [ ] Reproduce handled Sliding history failure followed by ordinary deltas.
+- [x] Reproduce handled Sliding history failure followed by ordinary deltas.
   In `durable/recovery.py`, reuse the post-tail source reset when a joined room
   still lacks its baseline. Verify the next HTTP request asks for fresh initial
   state and later events become LIVE. Cover restart during retained recovery
@@ -741,3 +741,16 @@ Focused evidence lives in the persistent capacity workspace under
 `durable-sync-kernel/review-invalidation-20260906`. Commands and final results
 will be recorded there and in this section. Existing live performance results
 keep their original source revisions; these fixes make no new speed claim.
+
+Producer verification: 885 passed, three skipped in 71.88 seconds; zero mypy
+errors across 60 source files; all repository hooks pass. Six added regression
+cases exercise HTTP and cryptography rather than only inspecting invalidation
+calls. The recipient/outbound suites pass 31 tests, and Sliding/recovery suites
+pass 55. Scoped review found no additional blocker in these corrections.
+
+The fixes add five production lines across two existing files (+3 recipient
+refresh, +2 Sliding recovery). The full PR against main `5b6de3bc` is
++5,226/-6,471, or 1,245 fewer production lines. Counts include comments and blank
+lines and exclude tests, documentation and scripts. No schema, queue, public API
+or performance-policy change was added. Set comparison runs only at completed
+recipient lookup; Sliding resets occur only when a joined baseline is missing.

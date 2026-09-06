@@ -361,6 +361,8 @@ class Recovery:
                 and metadata.get("membership") == "join"
                 and (sliding_room.initial or metadata.get("baseline", False))
             )
+            if metadata.get("membership") == "join" and not metadata["baseline"]:
+                reset_rooms.add(room_id)
             room = session.client.rooms.get(room_id)
             if room is not None:
                 processor.rooms[room_id] = room
