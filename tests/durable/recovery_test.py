@@ -274,7 +274,9 @@ async def test_recovery_boundaries_and_loss_fence(tmp_path, mode):
 
 
 @pytest.mark.asyncio
-async def test_recovered_state_overlap_does_not_undo_later_member_change(tmp_path):
+async def test_authoritative_tail_state_overlap_does_not_duplicate_member_observation(
+    tmp_path,
+):
     async def sync(request):
         raise AssertionError("unexpected sync")
 
@@ -296,7 +298,7 @@ async def test_recovered_state_overlap_does_not_undo_later_member_change(tmp_pat
         session = open_session(tmp_path, nio_client)
         await baseline(session)
         session._capture_response(
-            limited(state=[member("$overlap", "leave", "@old:example.org")])
+            limited(state=[member("$newer", "join", "@old:example.org")])
         )
         session._quiescing = True
         runner = asyncio.create_task(session.run())
@@ -304,7 +306,7 @@ async def test_recovered_state_overlap_does_not_undo_later_member_change(tmp_pat
             records = await drain_sync(session)
             await runner
             assert "@old:example.org" in nio_client.rooms[ROOM].users
-            assert sum(r.source.get("event_id") == "$overlap" for r in records) == 1
+            assert sum(r.source.get("event_id") == "$newer" for r in records) == 1
         finally:
             await session.close()
             await nio_client.close()
@@ -665,4 +667,171 @@ async def test_tail_state_rejoin_resets_projection_before_full_state(tmp_path):
             assert session._metadata[ROOM]["baseline"]
         finally:
             await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_rejoin_restores_full_state_overlap_without_duplicate_observations(
+    tmp_path, restart
+):
+    bob = "@bob:example.org"
+    bob_join = member("$bob-join", "join", bob)
+    power = {
+        "type": "m.room.power_levels",
+        "state_key": "",
+        "sender": USER,
+        "event_id": "$power",
+        "origin_server_ts": 1,
+        "content": {"users": {USER: 100, bob: 75}},
+    }
+
+    async def sync(request):
+        raise AssertionError("unexpected sync")
+
+    async def history(request):
+        return web.json_response(
+            {
+                "start": "s1",
+                "end": "tail",
+                "chunk": [
+                    bob_join,
+                    power,
+                    member("$departure", "leave"),
+                    member("$rejoin", "join"),
+                ],
+            }
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        session._capture_response(
+            limited(state=[bob_join, power, member("$rejoin", "join")]), full_state=True
+        )
+        await session._recovery.advance()
+        records = []
+        while batch := await session.next_batch():
+            records.extend(batch.records)
+            await session.ack(batch)
+        assert session.cursor == "s1"
+        if restart:
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client)
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records.extend(await drain_sync(session))
+            await runner
+            assert bob in nio_client.rooms[ROOM].users
+            assert nio_client.rooms[ROOM].power_levels.users[bob] == 75
+            assert session._metadata[ROOM]["baseline"]
+            assert not session._recovery.needs_full_state()
+            assert sum(r.source.get("event_id") == "$bob-join" for r in records) == 1
+            assert sum(r.source.get("event_id") == "$power" for r in records) == 1
+        finally:
+            await session.close()
+            await nio_client.close()
+        reopened = open_session(tmp_path)
+        try:
+            assert bob in reopened.client.rooms[ROOM].users
+            assert reopened.client.rooms[ROOM].power_levels.users[bob] == 75
+        finally:
+            await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["message", "member", "own_leave"])
+async def test_frozen_recovered_record_overflow_commits_loss_and_resumes_tail(
+    tmp_path, event_type
+):
+    oversized = (
+        message("$too-large")
+        if event_type == "message"
+        else (
+            member("$too-large", "leave", USER)
+            if event_type == "own_leave"
+            else member("$too-large", "join", "@oversized:example.org")
+        )
+    )
+    oversized["content"]["body" if event_type == "message" else "displayname"] = (
+        "x" * 900
+    )
+    page = json.dumps(
+        {
+            "start": "s1",
+            "end": "tail",
+            "chunk": [
+                oversized,
+                member(
+                    "$unprocessed", "join" if event_type == "own_leave" else "leave"
+                ),
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert len(page) < 2 * 1024 * 1024
+
+    async def sync(request):
+        raise AssertionError("unexpected sync")
+
+    async def history(request):
+        return web.Response(body=page, content_type="application/json")
+
+    async with homeserver(sync, membership=history) as (url, requests):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(
+            tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
+        )
+        await baseline(session)
+        session._capture_response(limited())
+        try:
+            await session._recovery.advance()
+            batch = await session.next_batch()
+            assert [r.kind for r in batch.records] == [RecordKind.LOSS]
+            assert session.cursor == "s1"
+            assert not session._metadata[ROOM]["baseline"]
+            assert session._metadata[ROOM]["membership"] == (
+                "leave" if event_type == "own_leave" else "join"
+            )
+            if event_type == "own_leave":
+                change = batch.records[0].membership
+                assert (
+                    change.previous,
+                    change.current,
+                    change.previous_epoch,
+                    change.current_epoch,
+                ) == ("join", "leave", 0, 1)
+                assert batch.records[0].membership_epoch == 1
+            if event_type == "member":
+                assert "@oversized:example.org" in session.client.rooms[ROOM].users
+        finally:
+            await session.close()
+            await nio_client.close()
+        nio_client = client()
+        nio_client.homeserver = url
+        reopened = open_session(
+            tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
+        )
+        reopened._quiescing = True
+        runner = asyncio.create_task(reopened.run())
+        try:
+            assert await reopened.next_batch() == batch
+            if event_type == "member":
+                assert "@oversized:example.org" in reopened.client.rooms[ROOM].users
+            records = await drain_sync(reopened)
+            await runner
+            assert len([r for r in records if r.kind is RecordKind.LOSS]) == 1
+            tail = next(r for r in records if r.source.get("event_id") == "$tail")
+            assert tail.provenance is TimelineEventProvenance.HISTORY
+            assert reopened.cursor == "s2"
+            assert len([p for p, _ in requests if p.endswith("/messages")]) == 1
+        finally:
+            await reopened.close()
             await nio_client.close()

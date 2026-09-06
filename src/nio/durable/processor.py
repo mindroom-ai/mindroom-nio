@@ -11,7 +11,7 @@ from ..event_provenance import TimelineEventProvenance
 from ..events import InviteMemberEvent, RoomMemberEvent
 from ..rooms import MatrixRoom
 from .codec import freeze_event
-from .model import RecordKind, SyncRecord
+from .model import OwnMembership, RecordKind, SyncRecord, encode_records
 
 if TYPE_CHECKING:
     from .client import DurableSync
@@ -24,6 +24,9 @@ class Processor:
         history_rooms: list[str],
         explicit_memberships: set[str],
         provenance: TimelineEventProvenance = TimelineEventProvenance.LIVE,
+        *,
+        suppress_ids: dict[str, set[str]] | None = None,
+        stop_on_oversized: bool = False,
     ):
         self.session = session
         self.history_rooms = history_rooms
@@ -32,6 +35,11 @@ class Processor:
         self.rooms: dict[str, MatrixRoom] = {}
         self.members: set[tuple[str, str]] = set()
         self.records: list[SyncRecord] = []
+        self.suppress_ids = suppress_ids or {}
+        self.stop_on_oversized = stop_on_oversized
+        self.oversized = False
+        self.oversized_membership: OwnMembership | None = None
+        self.processed_records = 0
 
     def flush(self) -> None:
         if self.records:
@@ -75,7 +83,12 @@ class Processor:
                 if change is not None or isinstance(
                     item.event, (RoomMemberEvent, InviteMemberEvent)
                 ):
+                    session.client.invalidate_outbound_session(room_id)
                     session._outbound.member_cache.pop(room_id, None)
+                if item.event is not None and getattr(item.event, "source", {}).get(
+                    "event_id"
+                ) in self.suppress_ids.get(room_id, set()):
+                    continue
             record = freeze_event(item)
             if room_id is not None:
                 record = replace(
@@ -97,9 +110,20 @@ class Processor:
             barrier = change is not None or isinstance(
                 item.event, (RoomMemberEvent, InviteMemberEvent)
             )
+            if (
+                self.stop_on_oversized
+                and len(encode_records((record,)).encode())
+                > session.config.max_batch_bytes
+            ):
+                # The iterator already mutated nio. Commit that prefix and a
+                # fenced loss together instead of rolling back and reusing it.
+                self.oversized = True
+                self.oversized_membership = record.membership
+                break
             if barrier:
                 self.flush()
             self.records.append(record)
+            self.processed_records += 1
             if barrier or len(self.records) >= session.config.max_batch_records:
                 self.flush()
         self.flush()

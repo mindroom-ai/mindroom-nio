@@ -10,7 +10,7 @@ from ..event_provenance import TimelineEventProvenance
 from ..events import BadEvent, RoomMemberEvent, UnknownBadEvent
 from ..exceptions import LocalProtocolError
 from ..responses import RoomInfo, RoomMessagesResponse, SyncResponse, Timeline
-from .model import RecordKind, SyncRecord, encode_json
+from .model import OwnMembership, RecordKind, SyncRecord, encode_json
 from .processor import Processor
 from .projection import restore_room
 from .transport import ResponseTooLarge
@@ -61,7 +61,13 @@ class Recovery:
         self.session._store.close()
         self.session._changed.set()
 
-    def _loss(self, room_id: str, state: dict[str, Any], reason: str) -> None:
+    def _loss(
+        self,
+        room_id: str,
+        state: dict[str, Any],
+        reason: str,
+        membership: OwnMembership | None = None,
+    ) -> None:
         session = self.session
         session._metadata.setdefault(room_id, {})["baseline"] = False
         if room_id not in state["history_rooms"]:
@@ -72,6 +78,7 @@ class Recovery:
                     RecordKind.LOSS,
                     room_id,
                     {"reason": reason, "pages": state.get("pages", 0)},
+                    membership=membership,
                     membership_epoch=session._metadata[room_id].get(
                         "membership_epoch", 0
                     ),
@@ -151,11 +158,8 @@ class Recovery:
         explicit = set(state["explicit_rooms"])
         for room_id, info, _ in self._rooms():
             applied = set(state["applied_ids"].get(room_id, []))
-            info.state = [
-                event
-                for event in info.state
-                if event.source.get("event_id") not in applied
-            ]
+            # State is authoritative at the tail boundary, even when a room
+            # reset discarded an earlier application of the same event.
             info.timeline.events = [
                 event
                 for event in info.timeline.events
@@ -176,7 +180,14 @@ class Recovery:
                     "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
                 )
         self.resets.clear()
-        processor = Processor(session, state["history_rooms"], explicit)
+        processor = Processor(
+            session,
+            state["history_rooms"],
+            explicit,
+            suppress_ids={
+                room_id: set(ids) for room_id, ids in state["applied_ids"].items()
+            },
+        )
         processor.consume(session.client._iter_sync(response, include_left=True))
         complete_state = state.get("full_state") or (
             state["old_cursor"] is None and session.config.sync_filter is None
@@ -328,6 +339,7 @@ class Recovery:
                     state["history_rooms"],
                     set(state["explicit_rooms"]),
                     TimelineEventProvenance.RECOVERED,
+                    stop_on_oversized=True,
                 )
                 if events:
                     if room_id not in session.client.rooms:
@@ -349,13 +361,25 @@ class Recovery:
                             room_id, info, room, encrypted, section
                         )
                     )
+                    if processor.oversized:
+                        loss = "oversized recovered event"
+                        done = True
+                        unpublished = {
+                            event.source["event_id"]
+                            for event in events[processor.processed_records :]
+                        }
+                        state["applied_ids"][room_id] = [
+                            event_id
+                            for event_id in state["applied_ids"][room_id]
+                            if event_id not in unpublished
+                        ]
                     room = session.client.rooms[room_id]
                     if room.encrypted and session.client.olm:
                         session.client.olm.update_tracked_users(room)
                     session.client.encrypted_rooms.update(encrypted)
                     session._store.matrix.save_encrypted_rooms(encrypted)
                 if loss:
-                    self._loss(room_id, state, loss)
+                    self._loss(room_id, state, loss, processor.oversized_membership)
                     if room_id in session.client.rooms:
                         processor.rooms[room_id] = session.client.rooms[room_id]
                 state["explicit_rooms"] = list(processor.explicit_memberships)
