@@ -233,11 +233,12 @@ class Recovery:
         elif state["pages"] >= min(session.config.max_recovery_pages, 1000):
             error = "history page limit exhausted"
         else:
+            # An exclusive `to` can stop before the retained tail. Page forward
+            # until its event IDs overlap, keeping the same page/control bounds.
             method, path = Api.room_messages(
                 "",
                 room_id,
                 start=state["from"],
-                end=target,
                 direction=MessageDirection.front,
                 limit=state["limit"],
             )

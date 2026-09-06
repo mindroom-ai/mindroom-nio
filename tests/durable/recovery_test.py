@@ -67,7 +67,7 @@ async def test_recovery_orders_tenures_and_resets_rejoin_projection(tmp_path):
 
     async def history(request):
         assert request.query["from"] == "s1"
-        assert request.query["to"] == "tail"
+        assert "to" not in request.query
         assert request.query["dir"] == "f"
         return web.json_response(
             {
@@ -178,6 +178,112 @@ async def test_recovery_drains_page_before_fetch_and_restarts_at_committed_token
         finally:
             await reopened.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_recovery_reaches_exclusive_boundary_by_tail_overlap(tmp_path, restart):
+    calls = []
+    later_member = member("$later-join", "join", "@later:example.org")
+    later_message = message("$later-message")
+
+    async def sync(request):
+        raise AssertionError("retained input must finish without polling")
+
+    async def history(request):
+        calls.append(dict(request.query))
+        start = request.query["from"]
+        if start == "s1":
+            end = "before-tail"
+            events = [
+                member("$old-leave", "leave", "@old:example.org"),
+                message("$one"),
+            ]
+        elif "to" in request.query:
+            # An exclusive upper bound never returns its boundary event/token.
+            end, events = None, []
+        else:
+            end = "after-tail"
+            events = [message("$tail"), later_member, later_message]
+        page = {"start": start, "chunk": events}
+        if end is not None:
+            page["end"] = end
+        return web.json_response(page)
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = None
+        try:
+            await baseline(session)
+            session._capture_response(
+                limited(state=[member("$old-return", "join", "@old:example.org")])
+            )
+            await session._recovery.advance()
+            assert session.cursor == "s1"
+            assert set(nio_client.rooms[ROOM].users) == {USER}
+            # The committed page must drain before any further HTTP request.
+            await session._recovery.advance()
+            assert len(calls) == 1
+            records = []
+            while batch := await session.next_batch():
+                records.extend(batch.records)
+                await session.ack(batch)
+            if restart:
+                await session.close()
+                await nio_client.close()
+                nio_client = client()
+                nio_client.homeserver = url
+                session = open_session(tmp_path, nio_client)
+                assert session.cursor == "s1"
+                assert set(nio_client.rooms[ROOM].users) == {USER}
+            session._quiescing = True
+            runner = asyncio.create_task(session.run())
+            records.extend(await drain_sync(session))
+            await runner
+            assert not any(record.kind is RecordKind.LOSS for record in records)
+            timeline = [
+                record for record in records if record.kind is RecordKind.TIMELINE
+            ]
+            assert [
+                (record.source["event_id"], record.provenance) for record in timeline
+            ] == [
+                ("$old-leave", TimelineEventProvenance.RECOVERED),
+                ("$one", TimelineEventProvenance.RECOVERED),
+                ("$tail", TimelineEventProvenance.LIVE),
+            ]
+            assert set(nio_client.rooms[ROOM].users) == {USER, "@old:example.org"}
+            assert session.cursor == "s2"
+            assert calls == [
+                {"from": "s1", "dir": "f", "limit": "100"},
+                {"from": "before-tail", "dir": "f", "limit": "100"},
+            ]
+            future = json.loads(response(token="s3", messages=0))
+            future["rooms"]["join"][ROOM]["timeline"]["events"] = [
+                later_member,
+                later_message,
+            ]
+            await session._accept_response(json.dumps(future).encode())
+            future_records = []
+            while batch := await session.next_batch():
+                future_records.extend(batch.records)
+                await session.ack(batch)
+            assert [
+                (record.source["event_id"], record.provenance)
+                for record in future_records
+                if record.kind is RecordKind.TIMELINE
+            ] == [
+                ("$later-join", TimelineEventProvenance.LIVE),
+                ("$later-message", TimelineEventProvenance.LIVE),
+            ]
+            assert "@later:example.org" in nio_client.rooms[ROOM].users
+            assert session.cursor == "s3"
+        finally:
+            await session.close()
+            await nio_client.close()
+            if runner is not None:
+                await asyncio.gather(runner, return_exceptions=True)
 
 
 @pytest.mark.asyncio
