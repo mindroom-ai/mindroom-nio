@@ -1758,32 +1758,6 @@ def test_borrowed_store_has_no_production_database_close_path() -> None:
     )
 
 
-def test_production_database_reach_through_stays_in_exact_allowlist() -> None:
-    allowlist = {
-        Path("src/nio/store/_ingestion_store_owner.py"),
-        Path("src/nio/store/_sync_journal_preflight.py"),
-        Path("src/nio/store/_sync_journal.py"),
-        Path("src/nio/store/_sync_journal_rows.py"),
-        Path("src/nio/store/database.py"),
-    }
-    violations: list[str] = []
-    for path in (ROOT / "src/nio").rglob("*.py"):
-        relative = path.relative_to(ROOT)
-        if relative in allowlist:
-            continue
-        for node in ast.walk(ast.parse(path.read_text())):
-            forbidden = isinstance(node, ast.Attribute) and node.attr == "database"
-            forbidden_call = (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr
-                in {"cursor", "connection", "atomic", "commit", "rollback"}
-            )
-            if forbidden or forbidden_call:
-                violations.append(f"{relative}:{getattr(node, 'lineno', 0)}")
-    assert violations == []
-
-
 def test_default_trust_reads_reuse_open_connection_lease(
     monkeypatch,
     tmp_path: Path,

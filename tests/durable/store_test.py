@@ -192,3 +192,34 @@ def test_closed_matrix_store_cannot_reopen_without_ownership(tmp_path):
     store.close()
     with pytest.raises(LocalProtocolError, match="closed"):
         store.matrix.save_account(OlmAccount())
+
+
+@pytest.mark.parametrize("store_class", [SqliteStore, DefaultStore])
+def test_preexisting_ordinary_handle_cannot_write_after_adoption(tmp_path, store_class):
+    ordinary = store_class(USER, DEVICE, str(tmp_path))
+    account = OlmAccount()
+    ordinary.save_account(account)
+    ordinary.database.close()
+    store = open_store(tmp_path, source_store_class=store_class)
+    store.close()
+    with pytest.raises(LocalProtocolError, match="durable"):
+        ordinary.save_account(OlmAccount())
+    reopened = open_store(tmp_path)
+    try:
+        assert reopened.matrix.load_account().identity_keys == account.identity_keys
+    finally:
+        reopened.close()
+
+
+def test_preexisting_default_handle_cannot_change_trust_after_adoption(tmp_path):
+    ordinary = DefaultStore(USER, DEVICE, str(tmp_path))
+    ordinary.save_account(OlmAccount())
+    device = OlmDevice("@bob:example.org", "BOB", OlmAccount().identity_keys)
+    devices = DeviceStore()
+    devices.add(device)
+    ordinary.save_device_keys(devices)
+    ordinary.database.close()
+    store = open_store(tmp_path, source_store_class=DefaultStore)
+    store.close()
+    with pytest.raises(LocalProtocolError, match="adoption"):
+        ordinary.verify_device(device)

@@ -481,10 +481,14 @@ class LeasedSqliteDatabase(SqliteDatabase):
             try:
                 self._add_conn_hooks(connection)
                 marker = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                    "AND name = 'NioIngestMeta' COLLATE NOCASE"
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name COLLATE NOCASE IN ('NioIngestMeta', 'NioDurableMeta')"
                 ).fetchone()
                 if marker is not None:
+                    if marker[0].lower() == "niodurablemeta":
+                        raise LocalProtocolError(
+                            "this database requires a durable sync session"
+                        )
                     raise LocalProtocolError(
                         "this database is owned by ingestion v1; direct legacy "
                         "store access is unsupported"

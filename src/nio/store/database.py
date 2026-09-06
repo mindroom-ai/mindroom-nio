@@ -910,7 +910,8 @@ class DefaultStore(MatrixStore):
                         with closing(sqlite3.connect(uri, uri=True)) as probe:
                             marked = probe.execute(
                                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                                "AND name = 'NioIngestMeta' COLLATE NOCASE"
+                                "AND name COLLATE NOCASE IN "
+                                "('NioIngestMeta', 'NioDurableMeta')"
                             ).fetchone()
                         if marked:
                             raise LocalProtocolError(
