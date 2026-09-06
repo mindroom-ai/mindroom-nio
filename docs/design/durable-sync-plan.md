@@ -549,3 +549,35 @@ producer checks pass 844 tests with three skipped, zero mypy errors and all hook
 The consumer evidence index retains failed attempts and reproduction metadata,
 including one unexplained pre-fix health timeout. The 1,000-reply target and release
 publication remain separate work.
+# Review corrections and streaming-frequency experiment
+
+This follow-up starts at `292ab7d`. Four reported failures are hypotheses until
+reproduced with focused tests. Preserve the shared interpreter, SQLite owner,
+bounded recovery and acknowledged batch interface; do not add another journal.
+
+- [ ] Inject a trust-write commit failure, then attempt subsequent key handling.
+  Fix the existing mutation boundary so rolled-back trust cannot authorize work.
+- [ ] Reproduce an unseen leave/rejoin before a successful local leave's echo.
+  Identify the actual authoritative observation instead of matching only a
+  membership string; keep one retained local operation and existing epoch rules.
+- [ ] Reproduce a linked join-to-join profile update in a limited/reset Sliding
+  timeline. Preserve proven continuity and recover intervening messages.
+- [ ] Reproduce power-state deletion followed by restart. Restore member levels
+  from canonical room power, including its default, without rewriting all member
+  rows or retaining a second authorization authority.
+- [ ] Run focused regressions, the full producer suite, clean typing and hooks;
+  review the fixes, commit, rebuild and exactly pin the consumer wheel.
+- [ ] Run a bounded streaming-frequency experiment in the existing consumer
+  harness. Keep 200 roots, 4,800 characters, 80 characters/second, the first
+  40-character chunk, tool behavior, FULL durability and acceptance predicates.
+  Compare subsequent 40-character chunks with 400-character chunks in ABBA order
+  on Tuwunel Sliding. The diagnostic affects model chunk delivery only, and is
+  not a proposed production change. Preserve source/helper hashes, all failures,
+  per-reply timings and actual update counts. No concurrent test processes.
+- [ ] Record whether reducing chunk work improves startup latency consistently
+  across both pairs. Confirm on Synapse only if the result warrants it. Retain
+  the original capacity controls separately; do not claim a new production
+  speedup, statistical equivalence or 1,000-reply qualification from this trial.
+- [ ] Save portable evidence and tracked conclusions, self-review, commit and
+  push the completed work. No serializer, database or scheduling rewrite is
+  implied by this experiment.
