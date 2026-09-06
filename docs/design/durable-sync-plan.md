@@ -566,20 +566,20 @@ bounded recovery and acknowledged batch interface; do not add another journal.
 - [x] Reproduce power-state deletion followed by restart. Restore member levels
   from canonical room power, including its default, without rewriting all member
   rows or retaining a second authorization authority.
-- [ ] Run focused regressions, the full producer suite, clean typing and hooks;
+- [x] Run focused regressions, the full producer suite, clean typing and hooks;
   review the fixes, commit, rebuild and exactly pin the consumer wheel.
-- [ ] Run a bounded streaming-frequency experiment in the existing consumer
+- [x] Run a bounded streaming-frequency experiment in the existing consumer
   harness. Keep 200 roots, 4,800 characters, 80 characters/second, the first
   40-character chunk, tool behavior, FULL durability and acceptance predicates.
   Compare subsequent 40-character chunks with 400-character chunks in ABBA order
   on Tuwunel Sliding. The diagnostic affects model chunk delivery only, and is
   not a proposed production change. Preserve source/helper hashes, all failures,
   per-reply timings and actual update counts. No concurrent test processes.
-- [ ] Record whether reducing chunk work improves startup latency consistently
+- [x] Record whether reducing chunk work improves startup latency consistently
   across both pairs. Confirm on Synapse only if the result warrants it. Retain
   the original capacity controls separately; do not claim a new production
   speedup, statistical equivalence or 1,000-reply qualification from this trial.
-- [ ] Save portable evidence and tracked conclusions, self-review, commit and
+- [x] Save portable evidence and tracked conclusions, self-review, commit and
   push the completed work. No serializer, database or scheduling rewrite is
   implied by this experiment.
 
@@ -613,4 +613,44 @@ across 60 source files; all repository hooks pass. The fixes change five
 production files by +160/-59, or 101 net lines. Against main `5b6de3bc`, the full
 PR changes production by +5,193/-6,473, or 1,280 fewer lines. Counts include
 comments and blank lines and exclude tests, scripts and documentation.
-Performance qualification follows with an exactly rebuilt consumer wheel.
+Consumer `2fb726841` pins and installs the rebuilt producer wheel at `ba75e3a`.
+All 200 affected consumer tests and repository hooks pass. Later documentation
+commits do not change either qualified production tree or require another pin.
+
+### Streaming-frequency results
+
+All four sequential Tuwunel Sliding runs pass the unchanged 200-root acceptance
+predicates, recovery/restart gap probe, clean shutdown and zero retained debt.
+The runtime source, wheel, helpers and image identities match across the ABBA
+series. The consumer's tracked performance document and measurement JSON retain
+the complete run identifiers, timestamps, update counts and reproduction archive.
+
+| Arm | Subsequent chunk characters | Initial reply p95 (s) | Completed reply p95 (s) | Matrix updates |
+| --- | ---: | ---: | ---: | ---: |
+| A1 | 40 | 12.257 | 78.657 | 5,084 |
+| B1 | 400 | 11.674 | 74.538 | 3,032 |
+| B2 | 400 | 11.353 | 74.021 | 3,031 |
+| A2 | 40 | 12.231 | 76.001 | 5,027 |
+
+The larger chunks reduce Matrix updates by about 40%, but initial-reply p95 only
+improves 0.58 and 0.88 seconds in the two pairs; median startup is mixed. Completed
+reply p95 improves 4.12 and 1.98 seconds. This changes provider wakeups, downstream
+chunk work and Matrix edits together. Nominal generation time remains 60 seconds,
+but coarser synthetic sleeps also change accumulated scheduling delay. The same
+seed/tool policy produces different continuation counts from different assembled
+histories. Four runs therefore do not isolate one bottleneck or prove a production
+speedup. They show a modest tradeoff for less frequent streaming updates.
+
+Decision: retain existing production streaming behavior. The small startup result
+does not warrant Synapse confirmation or more implementation in this task. There
+is no new performance code, database, serializer or weakened durability policy.
+The retained correctness fixes add 101 net producer lines; the complete PR remains
+1,280 production lines smaller than main. The 1,000-reply goal remains unqualified.
+
+Portable evidence is retained in the capacity workspace as
+`reproducibility/20260906-review-streaming.tar.gz`, SHA-256
+`535f54ef93f610b865b5a31eeacf4c46d2b7c5d18399961fc1f3c8ad0f79a92b`.
+All 25 manifested files verify, and standalone reanalysis reproduces the four
+cohorts and ABBA comparison exactly. The archive README and the consumer's
+`docs/dev/durable-ingestion-performance.md` describe fresh reproduction and the
+frozen companion harness dependency; raw logs, keys and databases are excluded.
