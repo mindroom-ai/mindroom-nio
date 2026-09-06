@@ -113,6 +113,11 @@ Do not claim a complete member list unless it was persisted as complete. Store
 the live projection where upstream updates merge values; the latest raw state
 event alone is not necessarily that projection.
 
+Room power metadata is the authority for restored member levels, including the
+default when an explicit user entry is absent. Member rows contain identity,
+profile and invitation data, not a second power snapshot. A deleted power-state
+tuple must remain deleted after restart; an older member row cannot restore it.
+
 Committed callback events retain their original event data and crypto evidence.
 Room callbacks after restart see the restored current room projection; exact
 historical snapshots of every room at every callback are not promised.
@@ -354,13 +359,29 @@ source ownership, even if cancelling that poll can no longer interrupt it. The
 cursor remains unchanged, so a later poll obtains that interval again; a response
 that predates local HTTP cannot serve as the operation's authoritative observation.
 
-Nio reconciles that outstanding operation's reported history. State before its
-echo cannot revive authorization or produce a second effective departure. The
-existing history/baseline rules keep the uncertain interval non-actionable. Once
-the operation is observed, later genuine transitions retain their normal ordered
-epoch changes. Keep the intent across restart between local acknowledgement and
-observation. Quiesce still does not fetch an extra final response: an acknowledged
-intent awaiting observation can remain for reopening, without blocking shutdown.
+Nio reconciles that outstanding operation at the complete sync boundary, not at
+the first event whose membership string matches its target. Standard join/leave
+responses supply no membership event ID. An unseen earlier leave/rejoin can
+otherwise be mistaken for the local echo and apply the departure twice.
+
+While the operation is unobserved, the room's uncertain interval remains HISTORY
+and its individual membership events cannot change the local outcome. After
+processing the whole response, reconcile once against the authoritative final
+membership. An equal target confirms the outcome without another epoch change;
+a different final membership applies the net transition from the local outcome.
+This relies on the supported server producing a coherent response after the
+successful local HTTP operation; the runner discards pre-operation polls.
+Partial state must not establish a fresh authorization baseline for a rejoined
+room. Later responses retain normal ordered transitions.
+
+Exact attribution of the local membership event and counting every intermediate
+cycle within that uncertain interval are not guaranteed. Current state and
+authorization after the boundary matter; replaying those historical cycles as
+effective transitions does not. Do not introduce reason markers, a per-room echo
+queue or additional state queries merely to infer that unsupported attribution.
+Keep the intent across restart between local acknowledgement and observation.
+Quiesce still does not fetch an extra final response: an acknowledged intent
+awaiting observation can remain for reopening, without blocking shutdown.
 
 MindRoom applies the producer's explicit prior/current membership and epoch once
 inside batch admission. It must not create or consume legacy departure-echo debt

@@ -549,7 +549,8 @@ producer checks pass 844 tests with three skipped, zero mypy errors and all hook
 The consumer evidence index retains failed attempts and reproduction metadata,
 including one unexplained pre-fix health timeout. The 1,000-reply target and release
 publication remain separate work.
-# Review corrections and streaming-frequency experiment
+
+## Review corrections and streaming-frequency experiment
 
 This follow-up starts at `292ab7d`. Four reported failures are hypotheses until
 reproduced with focused tests. Preserve the shared interpreter, SQLite owner,
@@ -562,7 +563,7 @@ bounded recovery and acknowledged batch interface; do not add another journal.
   membership string; keep one retained local operation and existing epoch rules.
 - [ ] Reproduce a linked join-to-join profile update in a limited/reset Sliding
   timeline. Preserve proven continuity and recover intervening messages.
-- [ ] Reproduce power-state deletion followed by restart. Restore member levels
+- [x] Reproduce power-state deletion followed by restart. Restore member levels
   from canonical room power, including its default, without rewriting all member
   rows or retaining a second authorization authority.
 - [ ] Run focused regressions, the full producer suite, clean typing and hooks;
