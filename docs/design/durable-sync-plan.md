@@ -773,6 +773,10 @@ commits and pushes; two fresh read-only reviewers inspect the entire PR after
 each pushed correction. Findings are untrusted until reproduced. Stop only when
 both approve the same pushed head. Reconsider the design after every third round
 that still finds substantial issues or a new major bug class.
+The review gate is a reproduced, realistic failure within the agreed contract.
+Reject speculative safeguards, style-only changes and broader refactors without
+demonstrated immediate value. Prefer correcting existing owners; report each
+correction's production delta. Review must not expand the deliberate guarantees.
 
 Round one reports four existing-boundary defects. Main-thread regressions
 reproduce disposal bypass at public encryption/HTTP, malformed state preserving
