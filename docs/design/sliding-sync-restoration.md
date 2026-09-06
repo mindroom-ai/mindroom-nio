@@ -103,14 +103,21 @@ revoked the current joined tenure, and classified a newly sent request as histor
 The regression reproduces that failure without a live server.
 
 Retain the bounded window's observed identities separately from identities whose
-interpretation succeeded. The first overlap with the previously observed window
+interpretation completed. The first overlap with the previously observed window
 separates older context from the recoverable suffix: unseen entries before it are
 history and must not rewind state or trigger new requests. Successfully applied
-overlap still skips duplicate interpretation. Undecryptable observed ciphertext
-also anchors the context boundary, while remaining eligible for later promotion
-when a repeated window arrives with its key. Both identity sets belong to the
-same existing room checkpoint and share its byte bound. No new queue, walker,
-database table or transaction owner is introduced.
+overlap still skips duplicate interpretation. A backward expansion retains the
+prior pagination token and excludes the older prefix from future overlap anchors.
+Otherwise a later window or forward page could move the recovery floor backwards.
+
+Undecryptable actionable ciphertext also anchors the context boundary, while
+remaining eligible for later promotion when a repeated window arrives with its
+key. Historical ciphertext counts as observed history even without a key: automatic
+repetition must not turn it into a new request. Applications can explicitly fetch
+that history again after obtaining keys; durable sync does not promise automatic
+historical re-decryption. This avoids a separate pending-history ledger. Both
+identity sets belong to the same existing room checkpoint and share its byte
+bound. No new queue, walker, database table or transaction owner is introduced.
 
 ## Main-store adoption
 
@@ -190,7 +197,7 @@ late-key promotion, snapshot rotation and cancellation.
 Durable tests cover process kills during capture and crypto processing, replay
 after commit, bounded gap continuation across reopening, independent device
 progress, expiry, missing membership/boundaries, subscription refresh, transient
-isolation and persisted unknown-room account data. A failed ciphertext remains
+isolation and persisted unknown-room account data. Failed actionable ciphertext remains
 eligible for promotion if the server sends it again after keys arrive; there is
 no new automatic replay queue for ciphertext the server never resends.
 Independent review reproduced a stale recovery token after a missing-boundary
