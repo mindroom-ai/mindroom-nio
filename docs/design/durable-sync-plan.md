@@ -664,23 +664,23 @@ tests reproduce the recipient-cache encryption rejection and truncated-body
 retry omission. Correct the existing owners described in the contract; preserve
 the shared interpreter, single transaction owner and deliberate membership limits.
 
-- [ ] In `durable/client.py` and `durable/recovery.py`, consolidate joined-room
+- [x] In `durable/client.py` and `durable/recovery.py`, consolidate joined-room
   reset, retaining encryption and invalidating old members/recipients/group state.
   In `durable/sliding.py`, own checkpoint invalidation and reuse it for local HTTP
   outcomes and end-of-input reconciliation. Regression: local join followed by
   a limited or ordinary delta cannot recover/authorize from the removed snapshot.
   At `client/async_client.py`'s send boundary, reject plaintext before a new
   room's state is established; test that HTTP sees no message until fresh state.
-- [ ] In `durable/processor.py` and the existing room persistence boundary, make
+- [x] In `durable/processor.py` and the existing room persistence boundary, make
   an invited projection replace its joined cache and member rows. Test both
   transports with and without a preceding local leave, then reopen the store.
-- [ ] In `durable/recovery.py`, preserve final explicit own membership before
+- [x] In `durable/recovery.py`, preserve final explicit own membership before
   filtering captured timeline duplicates. Test bans in state and timeline after
   local join; persisted and emitted membership must both remain ban after restart.
-- [ ] In `client/base_client.py`, allow `encrypt()` to use a completed durable
+- [x] In `client/base_client.py`, allow `encrypt()` to use a completed durable
   recipient cache. Test actual lookup/query/claim/share/send and peer decryption;
   preserve rejection for missing/in-flight cache and ordinary incomplete rooms.
-- [ ] In `durable/transport.py`, include `ClientPayloadError` in the existing
+- [x] In `durable/transport.py`, include `ClientPayloadError` in the existing
   retry tuple. Test a truncated real HTTP response followed by success; retain
   bounded exhaustion and cancellation behavior.
 - [ ] Run focused regressions, full producer suite, typing and hooks; review
@@ -694,3 +694,18 @@ Verification commands: `uv run --locked pytest --benchmark-disable`,
 and `uv run --no-sync pre-commit run --all-files`. Keep focused red/green logs in
 the persistent `capacity/durable-sync-kernel/review-room-lifecycle-20260906`
 evidence directory. No new benchmark campaign, serializer or database redesign.
+
+The fixes share the existing lifecycle and projection owners. Seven production
+files change by +79/-49, or 30 net lines; the full PR is now +5,221/-6,471 against
+main `5b6de3bc`, or 1,250 fewer production lines. Sixteen added regression cases
+exercise actual HTTP/crypto, restart, sparse Sliding state and both invitation
+paths. The public encrypted-send test decrypts the delivered ciphertext at the
+peer. The extra unknown-encryption case proves that a new local join cannot send
+plaintext before receiving room state. Review found no further blocker in this
+correction wave; its proposed cleanup removed a duplicate Classic member scan.
+No persisted schema, public API, queue or new guarantee was added.
+
+Producer verification after the final cleanup: 879 passed, three skipped in
+71.72 seconds; zero mypy errors across 60 source files; all repository hooks
+pass. Scoped re-review confirmed the cleanup preserves boundary ordering.
+Consumer pinning and integration verification follow this producer commit.

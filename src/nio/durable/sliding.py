@@ -104,6 +104,16 @@ class SlidingSource:
             extensions=extensions,
         )
 
+    def forget_room(self, room_id: str) -> None:
+        """Invalidate a replaced projection before requesting its fresh state."""
+        self.baselines.pop(room_id, None)
+        self.session._store.database.execute_sql(
+            "DELETE FROM NioDurableCrypto WHERE kind='sliding_room' AND key=?",
+            (room_id,),
+        )
+        self.pos = None
+        self.generation += 1
+
     def membership(
         self, room_id: str, room: SlidingSyncRoom
     ) -> tuple[str | None, bool]:
@@ -248,7 +258,7 @@ class SlidingSource:
         for room_id, room in response.rooms.items():
             proof, _ = self.membership(room_id, room)
             prior = self.baselines.get(room_id, {})
-            if proof is not None:
+            if proof is not None and self.session._metadata[room_id].get("baseline"):
                 prefix = state["sliding_history_prefixes"][room_id]
                 token = room.prev_batch
                 if (

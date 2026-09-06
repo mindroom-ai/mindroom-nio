@@ -272,13 +272,24 @@ class DurableSync:
                 and not intent.get("observed")
             ):
                 return room
-            room = MatrixRoom(room_id, self.client.user_id, room.encrypted)
-            self.client.rooms[room_id] = room
-            self._metadata.setdefault(room_id, {})["baseline"] = False
+            room = self._reset_joined_room(room_id)
             self._recovery.resets.add(room_id)
-            self._store.database.execute_sql(
-                "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
-            )
+        return room
+
+    def _reset_joined_room(self, room_id: str) -> MatrixRoom:
+        previous = self.client.rooms.get(room_id)
+        encrypted = room_id in self.client.encrypted_rooms or (
+            previous is not None and previous.encrypted
+        )
+        room = MatrixRoom(room_id, self.client.user_id, encrypted)
+        self.client.rooms[room_id] = room
+        self.client.invited_rooms.pop(room_id, None)
+        self._metadata.setdefault(room_id, {})["baseline"] = False
+        self._outbound.member_cache.pop(room_id, None)
+        self.client.invalidate_outbound_session(room_id)
+        self._store.database.execute_sql(
+            "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+        )
         return room
 
     def _prepare_pending(
@@ -292,6 +303,11 @@ class DurableSync:
     ) -> None:
         database = self._store.database
         for room_id, room in rooms.items():
+            if isinstance(room, MatrixInvitedRoom):
+                database.execute_sql(
+                    "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+                )
+                members.update((room_id, user_id) for user_id in room.users)
             prior = self._metadata.get(room_id, {})
             metadata = encode_room(
                 room,
@@ -625,11 +641,9 @@ class DurableSync:
                 )
                 self._outbound.member_cache.pop(room_id, None)
                 if target == "join":
-                    room = MatrixRoom(room_id, self.client.user_id)
-                    self.client.rooms[room_id] = room
-                    self._store.database.execute_sql(
-                        "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
-                    )
+                    room = self._reset_joined_room(room_id)
+                    if self._sliding is not None:
+                        self._sliding.forget_room(room_id)
                 else:
                     self.client.rooms.pop(room_id, None)
                     if self.client.olm:

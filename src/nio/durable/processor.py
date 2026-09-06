@@ -57,6 +57,8 @@ class Processor:
             change = None
             historical = item.provenance is TimelineEventProvenance.HISTORY
             if room is not None and room_id is not None:
+                if item.section == "invite":
+                    session.client.rooms.pop(room_id, None)
                 self.rooms[room_id] = room
                 if item.event is None:
                     if item.section == "leave":

@@ -2161,6 +2161,15 @@ class AsyncClient(Client):
             except KeyError:
                 raise LocalProtocolError(f"No such room with id {room_id} found.")
 
+            if (
+                self._durable_session is not None
+                and not room.encrypted
+                and not self._durable_session._metadata[room_id].get("baseline")
+            ):
+                raise LocalProtocolError(
+                    "room state must be established before plaintext sending"
+                )
+
             if room.encrypted:
                 if not room.members_synced:
                     if self._durable_session is not None:

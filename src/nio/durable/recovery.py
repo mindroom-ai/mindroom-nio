@@ -17,7 +17,6 @@ from ..responses import (
     SyncResponse,
     Timeline,
 )
-from ..rooms import MatrixRoom
 from .model import OwnMembership, RecordKind, SyncRecord, encode_json
 from .processor import Processor
 from .projection import restore_room
@@ -156,19 +155,7 @@ class Recovery:
         if change is not None:
             session._metadata[room_id]["baseline"] = False
         if reset:
-            room = session.client.rooms.get(room_id)
-            encrypted = (
-                room.encrypted
-                if room is not None
-                else room_id in session.client.encrypted_rooms
-            )
-            session.client.rooms[room_id] = MatrixRoom(
-                room_id, session.client.user_id, encrypted
-            )
-            session.client.invited_rooms.pop(room_id, None)
-            session._store.database.execute_sql(
-                "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
-            )
+            session._reset_joined_room(room_id)
         if change is not None:
             session._publish_records(
                 (
@@ -265,7 +252,20 @@ class Recovery:
             self._sliding_tail(response, state)
             return
         explicit = set(state["explicit_rooms"])
-        for room_id, info, _ in self._rooms():
+        memberships = {}
+        for room_id, info, section in self._rooms():
+            own_membership = next(
+                (
+                    event.membership
+                    for event in reversed((*info.state, *info.timeline.events))
+                    if isinstance(event, RoomMemberEvent)
+                    and event.state_key == session.client.user_id
+                ),
+                None,
+            )
+            memberships[room_id] = own_membership or section
+            if own_membership is not None:
+                explicit.add(room_id)
             applied = set(state["applied_ids"].get(room_id, []))
             # State is authoritative at the tail boundary, even when a room
             # reset discarded an earlier application of the same event.
@@ -278,12 +278,6 @@ class Recovery:
                 room = session.client.rooms.get(room_id)
                 if room is not None:
                     session._timeline_room(room_id, room, event)
-            if any(
-                isinstance(event, RoomMemberEvent)
-                and event.state_key == session.client.user_id
-                for event in (*info.state, *info.timeline.events)
-            ):
-                explicit.add(room_id)
             if room_id not in session.client.rooms:
                 session._store.database.execute_sql(
                     "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
@@ -308,8 +302,8 @@ class Recovery:
             if room_id in session.client.rooms:
                 processor.rooms[room_id] = session.client.rooms[room_id]
             if (
-                self._reconcile_membership_boundary(room_id, section)
-                and section == "join"
+                self._reconcile_membership_boundary(room_id, memberships[room_id])
+                and memberships[room_id] == "join"
             ):
                 processor.rooms[room_id] = session.client.rooms[room_id]
                 processor.members = {
@@ -363,7 +357,9 @@ class Recovery:
             metadata = session._metadata.setdefault(room_id, {})
             proof, _ = session._sliding.membership(room_id, sliding_room)
             metadata["baseline"] = (
-                proof is not None and metadata.get("membership") == "join"
+                proof is not None
+                and metadata.get("membership") == "join"
+                and (sliding_room.initial or metadata.get("baseline", False))
             )
             room = session.client.rooms.get(room_id)
             if room is not None:
@@ -393,15 +389,9 @@ class Recovery:
             if session._metadata[room_id].get("membership") in ("leave", "ban"):
                 session.client.rooms.pop(room_id, None)
         session._sliding.commit(response, state)
-        if reset_rooms:
-            session._sliding.pos = None
-            session._sliding.generation += 1
-            for room_id in reset_rooms:
-                session._sliding.baselines.pop(room_id, None)
-                session._store.database.execute_sql(
-                    "DELETE FROM NioDurableCrypto WHERE kind='sliding_room' AND key=?",
-                    (room_id,),
-                )
+        for room_id in reset_rooms | self.resets:
+            session._sliding.forget_room(room_id)
+        self.resets.clear()
         session._crypto.capture()
         session._store.set_cursor(response.pos)
         session._store.save_continuation({"phase": "prepared"})

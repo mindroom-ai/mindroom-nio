@@ -1497,7 +1497,7 @@ class Client:
         room isn't shared yet.
 
         Raises `MembersSyncError` if the room is encrypted but the room members
-        aren't fully loaded due to member lazy loading.
+        aren't fully loaded and no durable recipient lookup has completed.
 
         Returns a tuple containing the new message type and the new encrypted
         content.
@@ -1512,7 +1512,12 @@ class Client:
         if not room.encrypted:
             raise LocalProtocolError(f"Room {room_id} is not encrypted")
 
-        if not room.members_synced:
+        # A durable lookup provides current recipients without replacing the
+        # room projection retained at the sync cursor.
+        if not room.members_synced and (
+            self._durable_session is None
+            or self._durable_session._outbound.member_cache.get(room_id) is None
+        ):
             raise MembersSyncError(
                 "The room is encrypted and the members " "aren't fully synced."
             )

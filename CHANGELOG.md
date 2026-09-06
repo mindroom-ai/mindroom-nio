@@ -55,6 +55,13 @@ All notable changes to this project will be documented in this file.
   retain ordered transitions. A rejoin requires fresh authorization state.
 - Linked join-to-join profile changes preserve Sliding continuity and bounded
   recovery, including multiple linked updates in one live window.
+- Local joins preserve known encryption and discard the old room's recovery
+  checkpoint together with its projection. New rooms require established state
+  before plaintext sending. Completed durable recipient lookup permits encrypted
+  sends without replacing the historical member projection.
+- Reinvitation replaces former joined members in memory and on disk; Classic
+  local-membership reconciliation preserves explicit bans.
+- Retry truncated HTTP response bodies within the existing bounded retry policy.
 - Recover limited Classic timelines through bounded, resumable history pages.
   Unavailable history and oversized single events produce explicit loss barriers.
   Quiescing stops new polls and drains captured work without an extra final poll.

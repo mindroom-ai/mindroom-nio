@@ -7,7 +7,7 @@ import json
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from aiohttp import ClientConnectionError
+from aiohttp import ClientConnectionError, ClientPayloadError
 
 from ..exceptions import LocalProtocolError
 
@@ -94,7 +94,7 @@ class Transport:
                         pass
                 finally:
                     response.release()
-            except (ClientConnectionError, TimeoutError):
+            except (ClientConnectionError, ClientPayloadError, TimeoutError):
                 if attempt == 4:
                     raise LocalProtocolError(
                         "durable HTTP connection retries exhausted"
