@@ -26,6 +26,9 @@ tokens and the to-device extension cursor are distinct facts. A connection
 starts without a position after reopening. `M_UNKNOWN_POS` resets only that
 connection position, preserving accepted input, room baselines and crypto state.
 Never pass a Sliding connection position to `/messages`.
+The [MSC4186 proposal](https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/4186-simplified-sliding-sync.md)
+describes the protocol; deployed-server qualification is still required for
+pagination and endpoint behavior.
 
 ## Shared code and ownership
 
@@ -154,3 +157,40 @@ reason to omit a required behavior. Report actual production changes separately
 from tests. No serializer, database writer, generic retry framework or old
 recovery engine is added. Performance claims require measurements; restoring
 Sliding does not by itself solve application SQLite contention.
+
+## Implementation record
+
+The design was committed before implementation as `21f58a7`.
+The released-store adoption guard is `98e0f78`: 25 added production lines, 33
+focused tests passed, and the prior release independently reopened all ten
+rejected fixtures with their keys, token, trust and readable obligations intact.
+Wire restoration is `9a64f98`; the shared interpreter and ordinary clients are
+`0cfaad3`. Wire tests cover omitted fields, deletion stubs, both expanded-window
+spellings and malformed extensions. Ordinary tests include real encrypted
+late-key promotion, snapshot rotation and cancellation.
+
+Durable tests cover process kills during capture and crypto processing, replay
+after commit, bounded gap continuation across reopening, independent device
+progress, expiry, missing membership/boundaries, subscription refresh, transient
+isolation and persisted unknown-room account data. A failed ciphertext remains
+eligible for promotion if the server sends it again after keys arrive; there is
+no new automatic replay queue for ciphertext the server never resends.
+Independent review reproduced a stale recovery token after a missing-boundary
+loss and an omitted persisted hero profile. Both received failing regressions
+and focused fixes. A proposed subscription race was disproved by the existing
+unaccepted-poll guard, so no additional concurrency mechanism was added.
+
+MindRoom restoration is `7b05d07c4`; it refreshes subscriptions in the existing
+`ensure_rooms` path after joins/leaves, including runtime room edits. Focused
+consumer tests passed 352 cases with five skips. The tracked live harness now
+accepts `--sync-mode sliding` (`0c59a7107`) for capacity and restart profiles.
+
+Before live qualification, restoration adds 1,468 net Python production lines,
+including the adoption guard. Against main `5b6de3bc`, the complete producer PR
+is +4,998/-6,437, or 1,439 fewer production lines. These counts include comments
+and blank lines and exclude tests, scripts and documentation. Qualification and
+final consumer pinning remain pending; these implementation checks alone do not
+establish deployed-server readiness or a performance gain.
+Final producer unit verification at this checkpoint: 838 passed, three skipped;
+mypy reports no issues in 60 source files. The complete consumer suite also
+passed against the editable producer; locked-wheel qualification follows pinning.

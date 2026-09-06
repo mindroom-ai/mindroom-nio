@@ -16,8 +16,9 @@ if TYPE_CHECKING:
 
 
 class HttpError(LocalProtocolError):
-    def __init__(self, status: int):
+    def __init__(self, status: int, errcode: str | None = None):
         self.status = status
+        self.errcode = errcode
         super().__init__(f"durable HTTP request failed: status={status}")
 
 
@@ -70,7 +71,13 @@ class Transport:
                     if response.status == 200:
                         return bytes(content)
                     if response.status not in (408, 429) and response.status < 500:
-                        raise HttpError(response.status)
+                        try:
+                            code = json.loads(content).get("errcode")
+                        except (ValueError, AttributeError):
+                            code = None
+                        raise HttpError(
+                            response.status, code if isinstance(code, str) else None
+                        )
                     if attempt == 4:
                         raise HttpError(response.status)
                     try:

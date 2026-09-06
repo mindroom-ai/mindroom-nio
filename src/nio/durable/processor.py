@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from ..client.base_client import _SyncItem
 from ..event_provenance import TimelineEventProvenance
 from ..events import InviteMemberEvent, RoomMemberEvent
+from ..responses import SlidingSyncStateStub
 from ..rooms import MatrixRoom
 from .codec import freeze_event
 from .model import OwnMembership, RecordKind, SyncRecord, encode_records
@@ -54,6 +55,7 @@ class Processor:
             room = item.room
             room_id = room.room_id if room else None
             change = None
+            historical = item.provenance is TimelineEventProvenance.HISTORY
             if room is not None and room_id is not None:
                 self.rooms[room_id] = room
                 if item.event is None:
@@ -73,19 +75,34 @@ class Processor:
                     change = session._change_membership(room_id, item.section)
                     if change is None:
                         continue
-                if isinstance(item.event, (RoomMemberEvent, InviteMemberEvent)):
+                if (
+                    isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
+                    and not historical
+                ):
                     self.members.add((room_id, item.event.state_key))
                     if item.event.state_key == session.client.user_id:
                         self.explicit_memberships.add(room_id)
                         change = session._change_membership(
                             room_id, item.event.membership
                         )
+                member_deleted = (
+                    isinstance(item.event, SlidingSyncStateStub)
+                    and item.event.type == "m.room.member"
+                )
+                if member_deleted:
+                    assert isinstance(item.event, SlidingSyncStateStub)
+                    self.members.add((room_id, item.event.state_key))
+                    if item.event.state_key == session.client.user_id:
+                        self.explicit_memberships.add(room_id)
+                        change = session._change_membership(room_id, "leave")
                 if change is not None and change.previous == "join":
                     session._metadata[room_id]["baseline"] = False
                     if room_id not in self.history_rooms:
                         self.history_rooms.append(room_id)
-                if change is not None or isinstance(
-                    item.event, (RoomMemberEvent, InviteMemberEvent)
+                if not historical and (
+                    member_deleted
+                    or change is not None
+                    or isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
                 ):
                     session.client.invalidate_outbound_session(room_id)
                     session._outbound.member_cache.pop(room_id, None)
@@ -105,7 +122,7 @@ class Processor:
                         (
                             TimelineEventProvenance.HISTORY
                             if room_id in self.history_rooms
-                            else self.provenance
+                            else item.provenance or self.provenance
                         )
                         if record.kind is RecordKind.TIMELINE
                         else record.provenance

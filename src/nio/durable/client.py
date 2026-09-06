@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,7 +16,7 @@ from ..client.base_client import _SyncItem
 from ..crypto import Olm
 from ..events import RoomMemberEvent
 from ..exceptions import LocalProtocolError
-from ..responses import SyncResponse
+from ..responses import SlidingSyncResponse, SyncResponse
 from ..rooms import MatrixInvitedRoom, MatrixRoom
 from ..store import MatrixStore, SqliteStore
 from .codec import restore_event
@@ -32,6 +33,7 @@ from .observations import TransientSections, deliver_transients
 from .outbound import OutboundCrypto
 from .projection import encode_member, encode_room, restore_room
 from .recovery import Recovery
+from .sliding import SlidingSource, SlidingSyncConfig
 from .store import DurableStore
 from .transport import HttpError, Transport
 
@@ -49,6 +51,7 @@ class DurableSyncConfig:
     sync_filter: dict[str, Any] | str | None = None
     recovery_page_size: int = 100
     max_recovery_pages: int = 1_000
+    sliding: SlidingSyncConfig | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -91,6 +94,20 @@ class DurableSync:
         self._outbound = OutboundCrypto(self)
         self._metadata: dict[str, dict[str, Any]] = {}
         self._restore_rooms()
+        mode = "sliding" if config.sliding is not None else "classic"
+        source = store.database.execute_sql(
+            "SELECT body FROM NioDurableCrypto WHERE kind='sync_source' AND key='current'"
+        ).fetchone()
+        previous = (
+            json.loads(source[0]) if source else ("classic" if store.cursor else mode)
+        )
+        if previous != mode:
+            raise LocalProtocolError("durable store transport cannot be changed")
+        store.database.execute_sql(
+            "INSERT OR REPLACE INTO NioDurableCrypto(kind,key,body) VALUES('sync_source','current',?)",
+            (encode_json(mode),),
+        )
+        self._sliding = SlidingSource(self, config.sliding) if config.sliding else None
         self._recovery = Recovery(self)
 
     def _restore_rooms(self) -> None:
@@ -119,15 +136,39 @@ class DurableSync:
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
 
-    def _decode_response(self, body: bytes) -> tuple[SyncResponse, TransientSections]:
+    def _decode_response(
+        self, body: bytes
+    ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
         if len(body) > self.config.max_response_bytes:
             raise LocalProtocolError("sync response exceeds the durable input bound")
         try:
             root = json.loads(body)
             if not isinstance(root, dict):
                 raise ValueError("response is not an object")
+            if self._sliding is not None:
+                transients: TransientSections = []
+                extensions = root.get("extensions", {})
+                if isinstance(extensions, dict):
+                    for kind in ("typing", "receipts"):
+                        section = extensions.pop(kind, {})
+                        rooms = (
+                            section.get("rooms", {})
+                            if isinstance(section, dict)
+                            else None
+                        )
+                        if isinstance(rooms, dict):
+                            transients.extend(
+                                (room_id, {"events": [raw]})
+                                for room_id, raw in rooms.items()
+                            )
+                        else:
+                            transients.append((None, []))
+                response = SlidingSyncResponse.from_dict(root)
+                if not isinstance(response, SlidingSyncResponse) or not response.pos:
+                    raise ValueError("invalid Sliding response")
+                return response, transients
             # Transient observations never decide whether durable data is accepted.
-            transients: TransientSections = [(None, root.pop("presence", {}))]
+            transients = [(None, root.pop("presence", {}))]
             rooms = root.get("rooms", {})
             if isinstance(rooms, dict):
                 for section in ("join", "leave"):
@@ -145,13 +186,20 @@ class DurableSync:
 
     def _capture_response(
         self, body: bytes, *, full_state: bool = False
-    ) -> tuple[SyncResponse, TransientSections]:
+    ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
         self._assert_active()
         response = self._decode_response(body)
         with self._store.transaction():
             self._store.capture(body)
-            self._store.save_continuation({"full_state": full_state})
+            self._store.save_continuation(
+                {
+                    "full_state": full_state,
+                    "transport": "sliding" if self._sliding else "classic",
+                }
+            )
         self._recovery.response = response[0]
+        if self._sliding is not None:
+            self._sliding.accepted_generation = self._sliding.generation
         return response
 
     async def _accept_response(self, body: bytes, *, full_state: bool = False) -> None:
@@ -239,7 +287,9 @@ class DurableSync:
             )
         return room
 
-    def _prepare_pending(self, response: SyncResponse | None = None) -> None:
+    def _prepare_pending(
+        self, response: SyncResponse | SlidingSyncResponse | None = None
+    ) -> None:
         self._assert_active()
         self._recovery.prepare(response)
 
@@ -380,18 +430,23 @@ class DurableSync:
                     continue
                 if self._quiescing or self._closed:
                     return
-                full_state = self._recovery.needs_full_state()
-                method, path = Api.sync(
-                    "",
-                    self.cursor,
-                    self.config.sync_timeout_ms,
-                    None if full_state else self.config.sync_filter,
-                    full_state=full_state or None,
-                )
+                full_state = self._sliding is None and self._recovery.needs_full_state()
+                request_body = None
+                if self._sliding is not None:
+                    method, path, request_body = self._sliding.request()
+                else:
+                    method, path = Api.sync(
+                        "",
+                        self.cursor,
+                        self.config.sync_timeout_ms,
+                        None if full_state else self.config.sync_filter,
+                        full_state=full_state or None,
+                    )
                 self._poll = asyncio.create_task(
                     self._transport.request(
                         method,
                         path,
+                        request_body,
                         request_timeout=self.config.sync_timeout_ms / 1000 + 30,
                     )
                 )
@@ -407,12 +462,47 @@ class DurableSync:
                     if not running.cancelling():
                         continue
                     raise
+                except HttpError as error:
+                    if (
+                        self._sliding is not None
+                        and error.status == 400
+                        and error.errcode == "M_UNKNOWN_POS"
+                        and self._sliding.unknown_positions < 4
+                    ):
+                        self._sliding.pos = None
+                        self._sliding.unknown_positions += 1
+                        await asyncio.sleep(
+                            min(0.5 * 2 ** (self._sliding.unknown_positions - 1), 30)
+                        )
+                        continue
+                    raise
                 finally:
                     self._poll = None
                 await self._accept_response(body, full_state=full_state)
         finally:
             self._running = None
             self._changed.set()
+
+    async def update_sliding_subscriptions(
+        self, room_subscriptions: dict[str, Any]
+    ) -> None:
+        """Replace future subscriptions without discarding committed work."""
+        self._assert_active()
+        if self._sliding is None:
+            raise LocalProtocolError("subscription updates require Sliding transport")
+        if self._sliding.config.room_subscriptions == room_subscriptions:
+            return
+        self._sliding.config = replace(
+            self._sliding.config, room_subscriptions=deepcopy(room_subscriptions)
+        )
+        # A fresh connection also removes sticky subscriptions absent from the new set.
+        self._sliding.pos = None
+        self._sliding.generation += 1
+        if self._poll is not None:
+            poll, self._poll = self._poll, None
+            poll.cancel()
+            await asyncio.gather(poll, return_exceptions=True)
+        self._changed.set()
 
     def _read_local_intent(self) -> dict[str, Any] | None:
         row = self._store.database.execute_sql(

@@ -6,10 +6,17 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from ..api import Api, MessageDirection
+from ..client.sliding_sync import iter_sliding_sync
 from ..event_provenance import TimelineEventProvenance
 from ..events import BadEvent, RoomMemberEvent, UnknownBadEvent
 from ..exceptions import LocalProtocolError
-from ..responses import RoomInfo, RoomMessagesResponse, SyncResponse, Timeline
+from ..responses import (
+    RoomInfo,
+    RoomMessagesResponse,
+    SlidingSyncResponse,
+    SyncResponse,
+    Timeline,
+)
 from .model import OwnMembership, RecordKind, SyncRecord, encode_json
 from .processor import Processor
 from .projection import restore_room
@@ -25,7 +32,7 @@ CONTROL_BYTES = 2 * 1024 * 1024
 class Recovery:
     def __init__(self, session: DurableSync):
         self.session = session
-        self.response: SyncResponse | None = None
+        self.response: SyncResponse | SlidingSyncResponse | None = None
         self.resets: set[str] = set()
 
     def needs_full_state(self) -> bool:
@@ -40,6 +47,21 @@ class Recovery:
 
     def _rooms(self) -> list[tuple[str, RoomInfo, str]]:
         assert self.response is not None
+        if isinstance(self.response, SlidingSyncResponse):
+            return [
+                (
+                    room_id,
+                    RoomInfo(
+                        Timeline(room.timeline, room.limited, room.prev_batch),
+                        [],
+                        [],
+                        [],
+                    ),
+                    "leave" if room.membership in ("leave", "ban") else "join",
+                )
+                for room_id, room in self.response.rooms.items()
+                if room.membership != "invite" and not room.stripped_state
+            ]
         return [
             (room_id, info, section)
             for section, rooms in (
@@ -50,6 +72,17 @@ class Recovery:
         ]
 
     def _candidates(self) -> list[tuple[str, RoomInfo, str]]:
+        if isinstance(self.response, SlidingSyncResponse):
+            source = self.session._sliding
+            assert source is not None
+            return [
+                (room_id, info, section)
+                for room_id, info, section in self._rooms()
+                if (room := self.response.rooms[room_id]).initial or room.limited
+                if source.membership(room_id, room)[1]
+                and source.baselines.get(room_id, {}).get("token")
+                and room.prev_batch
+            ]
         return [
             (room_id, info, section)
             for room_id, info, section in self._rooms()
@@ -86,7 +119,9 @@ class Recovery:
             )
         )
 
-    def prepare(self, response: SyncResponse | None = None) -> None:
+    def prepare(
+        self, response: SyncResponse | SlidingSyncResponse | None = None
+    ) -> None:
         session = self.session
         pending = session._store.input
         if pending is None or pending[1].get("phase") == "prepared":
@@ -114,7 +149,10 @@ class Recovery:
                         applied_ids={},
                     )
                     state["unknown_rooms"] = list(state["history_rooms"])
-                    if session.cursor and self._candidates():
+                    if isinstance(self.response, SlidingSyncResponse):
+                        assert session._sliding is not None
+                        session._sliding.plan(self.response, state)
+                    if (session.cursor or session._sliding) and self._candidates():
                         state["phase"] = "recover"
                         self._next_room(state, 0)
                         processor = Processor(session, state["history_rooms"], set())
@@ -126,7 +164,7 @@ class Recovery:
                         session._store.save_continuation(state)
                         session._changed.set()
                         return
-                    if session.cursor:
+                    if session.cursor or session._sliding:
                         for room_id in state["unknown_rooms"]:
                             self._loss(room_id, state, "unknown authorization baseline")
                 self._tail(state)
@@ -136,16 +174,20 @@ class Recovery:
         session._changed.set()
 
     def _next_room(self, state: dict[str, Any], index: int) -> None:
+        candidates = self._candidates()
+        start = state["old_cursor"]
+        if self.session._sliding is not None and index < len(candidates):
+            start = state["sliding_starts"][candidates[index][0]]
         state.update(
             room_index=index,
             **{
-                "from": state["old_cursor"],
+                "from": start,
                 "pages": 0,
-                "seen_tokens": [state["old_cursor"]],
+                "seen_tokens": [start],
                 "limit": min(self.session.config.recovery_page_size, 100),
             },
         )
-        if index >= len(self._candidates()):
+        if index >= len(candidates):
             state["phase"] = "tail"
 
     def _tail(self, state: dict[str, Any]) -> None:
@@ -155,6 +197,9 @@ class Recovery:
         # A committed recovery prologue must never decrypt its Olm input twice.
         if "from" in state:
             response.to_device_events.clear()
+        if isinstance(response, SlidingSyncResponse):
+            self._sliding_tail(response, state)
+            return
         explicit = set(state["explicit_rooms"])
         for room_id, info, _ in self._rooms():
             applied = set(state["applied_ids"].get(room_id, []))
@@ -209,6 +254,63 @@ class Recovery:
         session._store.save_continuation({"phase": "prepared"})
         session.client.next_batch = response.next_batch
 
+    def _sliding_tail(
+        self, response: SlidingSyncResponse, state: dict[str, Any]
+    ) -> None:
+        session = self.session
+        assert session._sliding is not None
+        for room_id, sliding_room in response.rooms.items():
+            if sliding_room.initial:
+                session._store.database.execute_sql(
+                    "DELETE FROM NioDurableMember WHERE room_id=?", (room_id,)
+                )
+                session._outbound.member_cache.pop(room_id, None)
+        explicit = set(state["explicit_rooms"]) | {
+            room_id
+            for room_id, room in response.rooms.items()
+            if room.membership != "invite" and not room.stripped_state
+        }
+        processor = Processor(session, state["history_rooms"], explicit)
+        processor.consume(
+            iter_sliding_sync(
+                session.client,
+                response,
+                include_left=True,
+                recovered_rooms=state["recovered_rooms"],
+                history_rooms=state["history_rooms"],
+                suppress_ids={
+                    room_id: set(ids) for room_id, ids in state["applied_ids"].items()
+                },
+            )
+        )
+        for room_id, sliding_room in response.rooms.items():
+            metadata = session._metadata.setdefault(room_id, {})
+            proof, _ = session._sliding.membership(room_id, sliding_room)
+            metadata["baseline"] = (
+                proof is not None and metadata.get("membership") == "join"
+            )
+            room = session.client.rooms.get(room_id)
+            if room is not None:
+                processor.rooms[room_id] = room
+                if sliding_room.initial:
+                    processor.members.update(
+                        (room_id, user_id) for user_id in room.users
+                    )
+                elif sliding_room.heroes:
+                    processor.members.update(
+                        (room_id, hero.user_id)
+                        for hero in sliding_room.heroes
+                        if hero.user_id in room.users
+                    )
+        processor.save()
+        for room_id in processor.rooms:
+            if session._metadata[room_id].get("membership") in ("leave", "ban"):
+                session.client.rooms.pop(room_id, None)
+        session._sliding.commit(response)
+        session._crypto.capture()
+        session._store.set_cursor(response.pos)
+        session._store.save_continuation({"phase": "prepared"})
+
     async def advance(self) -> None:
         self.prepare()
         session = self.session
@@ -241,6 +343,7 @@ class Recovery:
                 start=state["from"],
                 direction=MessageDirection.front,
                 limit=state["limit"],
+                end=target if session._sliding is not None else None,
             )
             try:
                 body = await session._transport.request(
@@ -295,11 +398,17 @@ class Recovery:
             event_id = event.source["event_id"]
             if event_id in tail_ids:
                 overlap = True
-                break
+                if session._sliding is None:
+                    break
+                continue
             if event_id not in seen:
                 events.append(event)
                 seen.add(event_id)
-        done = overlap or page.end == target
+        done = page.end == target or (
+            (not page.chunk and page.end is None)
+            if session._sliding is not None
+            else overlap
+        )
         if not done and (
             not isinstance(page.end, str)
             or not page.end

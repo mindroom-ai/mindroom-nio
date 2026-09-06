@@ -11,8 +11,8 @@ All notable changes to this project will be documented in this file.
   `DurableSync`, `DurableSyncConfig`, `SyncBatch`, `SyncRecord`, and `RecordKind`.
   Consume committed batches with `next_batch()` and acknowledge them with
   `ack(batch)` after application admission. See `docs/design/durable-sync.md`.
-- Durable sync supports Classic `/sync` only. Sliding Sync and the old
-  `nio.ingest` and sync-journal interfaces are removed. Released fork interfaces
+- Durable sync supports Classic `/sync` and simplified Sliding Sync through the
+  same batch API. The old `nio.ingest` and sync-journal interfaces are removed. Released fork interfaces
   including `AsyncClient.add_event_admission_callback` and
   `CallbackNotAcceptedError` are removed; ordinary upstream-style client APIs
   retain their behavior. Prototype ingestion databases are rejected explicitly.
@@ -31,6 +31,14 @@ All notable changes to this project will be documented in this file.
 - Preserve ordinary SQLite account identity and effective file-backed device
   trust during explicit adoption. Ordinary shared connection leases exclude
   durable adoption; retained ordinary handles reject access after adoption.
+- Reject adoption while a released store has unaccepted timeline events, real
+  recovery gaps or unacknowledged loss. Drain or settle those obligations with
+  the prior release first; rejected stores remain usable by that release.
+- Preserve ordinary Sliding APIs and response models. Select durable Sliding with
+  `DurableSyncConfig(sliding=SlidingSyncConfig(...))`; room subscriptions can be
+  refreshed without discarding accepted input. Durable stores bind one transport.
+  Connection expiry preserves independent room and to-device checkpoints; bounded
+  recovery distinguishes downtime messages from old window history.
 - Route attached public crypto and to-device methods through retained requests.
   Retries reuse ciphertext and transaction IDs. Interactive key-share approvals
   survive restart; changed device keys invalidate cached outbound recipients.

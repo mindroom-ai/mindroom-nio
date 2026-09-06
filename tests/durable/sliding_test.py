@@ -1,0 +1,515 @@
+"""Sliding windows share durable transactions and chronological recovery."""
+
+import asyncio
+import json
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+from aiohttp import web
+
+from nio import TimelineEventProvenance
+from nio.durable import DurableSyncConfig, SlidingSyncConfig
+from nio.durable.model import RecordKind
+from nio.exceptions import LocalProtocolError
+
+from .client_test import ROOM, USER, client, open_session
+from .recovery_test import member, message
+from .runner_test import drain_sync, homeserver
+
+
+def settings(**kwargs):
+    return DurableSyncConfig(sliding=SlidingSyncConfig(**kwargs))
+
+
+def window(*ids, pos="p1", initial=True, prev_batch="w1", num_live=0, state=None):
+    return json.dumps(
+        {
+            "pos": pos,
+            "rooms": {
+                ROOM: {
+                    "initial": initial,
+                    "membership": "join",
+                    "required_state": (
+                        [member("$join", "join")] if state is None else state
+                    ),
+                    "timeline": [message(event_id) for event_id in ids],
+                    "prev_batch": prev_batch,
+                    "num_live": num_live,
+                    "limited": initial,
+                }
+            },
+            "extensions": {"to_device": {"next_batch": "td1", "events": []}},
+        }
+    ).encode()
+
+
+async def settle(session):
+    records = []
+    while batch := await session.next_batch():
+        records.extend(batch.records)
+        await session.ack(batch)
+    with session._store.transaction():
+        session._store.finish_input()
+    session._recovery.response = None
+    return records
+
+
+@pytest.mark.asyncio
+async def test_sliding_request_owns_device_cursor_and_preserves_caller_settings(
+    tmp_path,
+):
+    lists = {
+        "small": {"ranges": [[0, 9]], "required_state": [["m.room.member", "$LAZY"]]}
+    }
+    extensions = {"account_data": {"enabled": True}}
+    config = settings(lists=lists, extensions=extensions)
+    session = open_session(tmp_path, config=config)
+    try:
+        method, path, body = session._sliding.request()
+        request = json.loads(body)
+        assert method == "POST"
+        assert "pos" not in parse_qs(urlsplit(path).query)
+        assert parse_qs(urlsplit(path).query)["timeout"] == ["0"]
+        assert ["m.room.member", "$ME"] in request["lists"]["small"]["required_state"]
+        assert request["extensions"]["to_device"] == {"enabled": True}
+        assert request["extensions"]["e2ee"] == {"enabled": True}
+        assert lists == {
+            "small": {
+                "ranges": [[0, 9]],
+                "required_state": [["m.room.member", "$LAZY"]],
+            }
+        }
+        assert extensions == {"account_data": {"enabled": True}}
+        await session._accept_response(window("$old"))
+        await settle(session)
+        request = json.loads(session._sliding.request()[2])
+        assert request["extensions"]["to_device"]["since"] == "td1"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_reopen_drops_only_connection_position_and_replays_committed_output(
+    tmp_path,
+):
+    session = open_session(tmp_path, config=settings())
+    await session._accept_response(window("$old"))
+    batch = await session.next_batch()
+    await session.close()
+    reopened = open_session(tmp_path, config=settings())
+    try:
+        assert await reopened.next_batch() == batch
+        assert "pos" not in parse_qs(urlsplit(reopened._sliding.request()[1]).query)
+        assert (
+            json.loads(reopened._sliding.request()[2])["extensions"]["to_device"][
+                "since"
+            ]
+            == "td1"
+        )
+        assert reopened._sliding.baselines[ROOM]["token"] == "w1"
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_switch_rejects_instead_of_reinterpreting_cursor(tmp_path):
+    session = open_session(tmp_path, config=settings())
+    await session._accept_response(window("$old"))
+    await session.close()
+    with pytest.raises(LocalProtocolError, match="transport"):
+        open_session(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_downtime_without_reapplying_previous_window(tmp_path):
+    calls = []
+
+    async def sync(request):
+        raise AssertionError("captured input must drain without polling")
+
+    async def history(request):
+        calls.append(dict(request.query))
+        assert request.query["from"] == "w1"
+        assert request.query["to"] == "w2"
+        return web.json_response(
+            {"start": "w1", "end": "w2", "chunk": [message("$old"), message("$missed")]}
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        first = open_session(tmp_path, config=settings())
+        await first._accept_response(window("$old"))
+        assert [
+            r.provenance for r in await settle(first) if r.kind is RecordKind.TIMELINE
+        ] == [TimelineEventProvenance.HISTORY]
+        await first.close()
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            await runner
+            timeline = [r for r in records if r.kind is RecordKind.TIMELINE]
+            assert [(r.source["event_id"], r.provenance) for r in timeline] == [
+                ("$missed", TimelineEventProvenance.RECOVERED),
+                ("$tail", TimelineEventProvenance.RECOVERED),
+            ]
+            assert not any(r.kind is RecordKind.LOSS for r in records)
+            assert len(calls) == 1
+            assert session.cursor == "p2"
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unknown_room_account_data_survives_restart_by_wire_type(tmp_path):
+    session = open_session(tmp_path, config=settings())
+    await session._accept_response(
+        json.dumps(
+            {
+                "pos": "p1",
+                "extensions": {
+                    "account_data": {
+                        "rooms": {
+                            ROOM: [
+                                {
+                                    "type": "m.tag",
+                                    "content": {
+                                        "tags": {"m.favourite": {"order": 0.2}}
+                                    },
+                                },
+                                {"type": "custom.one", "content": {"value": 1}},
+                                {"type": "custom.two", "content": {"value": 2}},
+                            ]
+                        }
+                    }
+                },
+            }
+        ).encode()
+    )
+    await settle(session)
+    await session.close()
+    reopened = open_session(tmp_path, config=settings())
+    try:
+        await reopened._accept_response(window())
+        records = await settle(reopened)
+        assert reopened.client.rooms[ROOM].tags == {"m.favourite": {"order": 0.2}}
+        account_data = [r for r in records if r.kind is RecordKind.ROOM_ACCOUNT_DATA]
+        assert len(account_data) == 3
+        assert {r.source.get("type") for r in account_data} == {
+            "m.tag",
+            "custom.one",
+            "custom.two",
+        }
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_deletion_revokes_authorization_and_persists_member_removal(
+    tmp_path,
+):
+    session = open_session(tmp_path, config=settings())
+    await session._accept_response(window())
+    await settle(session)
+    deletion = {"type": "m.room.member", "state_key": USER}
+    await session._accept_response(window(pos="p2", initial=False, state=[deletion]))
+    records = await settle(session)
+    assert any(r.membership and r.membership.current != "join" for r in records)
+    await session.close()
+    reopened = open_session(tmp_path, config=settings())
+    try:
+        assert reopened._metadata[ROOM]["membership"] != "join"
+        assert (
+            ROOM not in reopened.client.rooms
+            or USER not in reopened.client.rooms[ROOM].users
+        )
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_member_deletion_persists_exact_stub(tmp_path):
+    from nio.durable.codec import restore_event
+
+    session = open_session(tmp_path, config=settings())
+    try:
+        await session._accept_response(
+            window(
+                state=[
+                    member("$join", "join"),
+                    {"type": "m.room.name", "state_key": ""},
+                ]
+            )
+        )
+        records = await settle(session)
+        stub = next(r for r in records if r.source.get("type") == "m.room.name")
+        assert stub.source == {"type": "m.room.name", "state_key": ""}
+        assert restore_event(stub).type == "m.room.name"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_position_preserves_device_delivery_cursor(tmp_path):
+    requests = []
+    hold = asyncio.Event()
+
+    async def sync(request):
+        requests.append((dict(request.query), await request.json()))
+        if len(requests) == 1:
+            return web.Response(body=window("$old"))
+        if len(requests) == 2:
+            return web.json_response(
+                {"errcode": "M_UNKNOWN_POS", "error": "payload-secret"}, status=400
+            )
+        if len(requests) == 3:
+            return web.Response(body=window("$old", "$new", pos="p2"))
+        await hold.wait()
+        return web.Response(body=b"{}")
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            records = await drain_sync(session)
+            assert requests[1][0]["pos"] == "p1"
+            assert "pos" not in requests[2][0]
+            assert requests[2][1]["extensions"]["to_device"]["since"] == "td1"
+            assert [
+                (r.source["event_id"], r.provenance)
+                for r in records
+                if r.kind is RecordKind.TIMELINE
+            ] == [("$new", TimelineEventProvenance.RECOVERED)]
+        finally:
+            hold.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        [],
+        [{"type": "m.room.member", "state_key": USER}],
+        [member("$other-tenure", "join")],
+    ],
+)
+async def test_unproven_initial_snapshot_emits_loss_and_keeps_timeline_history(
+    tmp_path, state
+):
+    session = open_session(tmp_path, config=settings())
+    try:
+        await session._accept_response(window("$old"))
+        await settle(session)
+        await session._accept_response(
+            window("$new", pos="p2", prev_batch="w2", state=state)
+        )
+        records = await settle(session)
+        assert any(r.kind is RecordKind.LOSS for r in records)
+        assert [r.provenance for r in records if r.kind is RecordKind.TIMELINE] == [
+            TimelineEventProvenance.HISTORY
+        ]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_replacement_retains_accepted_input_and_removes_sticky_rooms(
+    tmp_path,
+):
+    session = open_session(
+        tmp_path,
+        config=settings(
+            room_subscriptions={"!old:example.org": {"timeline_limit": 10}}
+        ),
+    )
+    try:
+        session._capture_response(window("$accepted"))
+        body = session._store.input[0]
+        subscriptions = {ROOM: {"timeline_limit": 20}}
+        await session.update_sliding_subscriptions(subscriptions)
+        subscriptions[ROOM]["timeline_limit"] = 99
+        assert session._store.input[0] == body
+        session._prepare_pending()
+        records = await settle(session)
+        assert any(r.source.get("event_id") == "$accepted" for r in records)
+        request = json.loads(session._sliding.request()[2])
+        assert set(request["room_subscriptions"]) == {ROOM}
+        assert request["room_subscriptions"][ROOM]["timeline_limit"] == 20
+        assert "pos" not in parse_qs(urlsplit(session._sliding.request()[1]).query)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_transient_extension_does_not_poison_durable_messages(
+    tmp_path, caplog
+):
+    session = open_session(tmp_path, config=settings())
+    try:
+        raw = json.loads(window("$durable"))
+        raw["extensions"]["typing"] = {"rooms": "payload-secret"}
+        await session._accept_response(json.dumps(raw).encode())
+        records = await settle(session)
+        assert any(r.source.get("event_id") == "$durable" for r in records)
+        assert "malformed=1" in caplog.text
+        assert "payload-secret" not in caplog.text
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_sliding_overlap_does_not_bypass_the_bounded_history_walk(tmp_path):
+    calls = []
+
+    async def sync(request):
+        raise AssertionError("unexpected poll")
+
+    async def history(request):
+        start = request.query["from"]
+        calls.append(start)
+        page = {"start": start, "chunk": [message("$tail")] if start == "w1" else []}
+        if start == "w1":
+            page["end"] = "more"
+        return web.json_response(page)
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        await session._accept_response(window("$old"))
+        await settle(session)
+        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            await runner
+            assert calls == ["w1", "more"]
+            assert [
+                (r.source["event_id"], r.provenance)
+                for r in records
+                if r.kind is RecordKind.TIMELINE
+            ] == [("$tail", TimelineEventProvenance.RECOVERED)]
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_gap_restart_replays_committed_batch_then_resumes_next_page(tmp_path):
+    calls = []
+
+    async def sync(request):
+        raise AssertionError("unexpected poll")
+
+    async def history(request):
+        start = request.query["from"]
+        calls.append(start)
+        return web.json_response(
+            {
+                "start": start,
+                "end": "more" if start == "w1" else "w2",
+                "chunk": [message("$one" if start == "w1" else "$two")],
+            }
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        await session._accept_response(window("$old"))
+        await settle(session)
+        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        async with asyncio.timeout(5):
+            await session.wait_for_work()
+        batch = await session.next_batch()
+        assert batch.records[0].source["event_id"] == "$one"
+        assert calls == ["w1"]
+        await session.close()
+        await nio_client.close()
+        await asyncio.gather(runner, return_exceptions=True)
+        nio_client = client()
+        nio_client.homeserver = url
+        reopened = open_session(tmp_path, nio_client, settings())
+        assert await reopened.next_batch() == batch
+        reopened._quiescing = True
+        runner = asyncio.create_task(reopened.run())
+        try:
+            records = await drain_sync(reopened)
+            await runner
+            assert calls == ["w1", "more"]
+            assert [
+                (r.source["event_id"], r.provenance)
+                for r in records
+                if r.kind is RecordKind.TIMELINE
+            ] == [
+                ("$one", TimelineEventProvenance.RECOVERED),
+                ("$two", TimelineEventProvenance.RECOVERED),
+                ("$tail", TimelineEventProvenance.RECOVERED),
+            ]
+            assert reopened._sliding.pos is None
+        finally:
+            await reopened.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_lost_window_boundary_cannot_reuse_a_pre_snapshot_recovery_token(
+    tmp_path,
+):
+    session = open_session(tmp_path, config=settings())
+    try:
+        await session._accept_response(window("$old"))
+        await settle(session)
+        missing = json.loads(window("$unknown", pos="p2"))
+        missing["rooms"][ROOM].pop("prev_batch")
+        await session._accept_response(json.dumps(missing).encode())
+        assert any(r.kind is RecordKind.LOSS for r in await settle(session))
+        await session._accept_response(window("$next", pos="p3", prev_batch="w3"))
+        assert session._store.input[1]["phase"] == "prepared"
+        records = await settle(session)
+        assert any(r.kind is RecordKind.LOSS for r in records)
+        assert [r.provenance for r in records if r.kind is RecordKind.TIMELINE] == [
+            TimelineEventProvenance.HISTORY
+        ]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_incremental_hero_profile_survives_restart(tmp_path):
+    session = open_session(tmp_path, config=settings())
+    await session._accept_response(window())
+    await settle(session)
+    raw = json.loads(window(pos="p2", initial=False, state=[]))
+    raw["rooms"][ROOM].update(
+        heroes=[{"user_id": "@bob:example.org", "displayname": "Bob"}],
+        joined_count=2,
+        invited_count=0,
+    )
+    await session._accept_response(json.dumps(raw).encode())
+    await settle(session)
+    assert session.client.rooms[ROOM].users["@bob:example.org"].display_name == "Bob"
+    await session.close()
+    reopened = open_session(tmp_path, config=settings())
+    try:
+        assert (
+            reopened.client.rooms[ROOM].users["@bob:example.org"].display_name == "Bob"
+        )
+    finally:
+        await reopened.close()

@@ -16,6 +16,7 @@ from ..events import (
     RoomKeyEvent,
     ToDeviceEvent,
 )
+from ..responses import SlidingSyncStateStub
 from .model import CryptoEvidence, RecordKind, SyncRecord
 
 if TYPE_CHECKING:
@@ -36,7 +37,10 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     event_source = getattr(event, "source", {})
     payload = deepcopy(event_source)
     codec = None
-    if isinstance(event, InviteEvent):
+    if isinstance(event, SlidingSyncStateStub):
+        codec = "state_stub"
+        payload = {"type": event.type, "state_key": event.state_key}
+    elif isinstance(event, InviteEvent):
         codec = "invite"
         if isinstance(event, InviteMemberEvent):
             payload["content"] = deepcopy(event.content)
@@ -140,6 +144,8 @@ def restore_event(record: SyncRecord) -> object:
         )
     if record.codec == "invite":
         return InviteEvent.parse_event(payload)
+    if record.codec == "state_stub":
+        return SlidingSyncStateStub(payload["type"], payload["state_key"])
     if record.codec is not None:
         raise ValueError(f"unsupported stored event codec: {record.codec}")
     if record.kind == RecordKind.TO_DEVICE:
