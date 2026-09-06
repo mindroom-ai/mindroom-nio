@@ -18,7 +18,7 @@ import asyncio
 import inspect
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import wraps
@@ -44,6 +44,7 @@ from ..events import (
     InviteEvent,
     KeyVerificationCancel,
     MegolmEvent,
+    OlmEvent,
     PowerLevels,
     PresenceEvent,
     RoomEncryptionEvent,
@@ -877,6 +878,29 @@ class ClientCallback:
         result = self._execute(event, room, *callback_args)
         if inspect.isawaitable(result):
             await result
+
+
+@dataclass(frozen=True)
+class _SyncItem:
+    """One sync observation, yielded before processing the next event."""
+
+    route: str | None = None
+    event: object | None = None
+    room: MatrixRoom | None = None
+    section: str | None = None
+    source: dict[str, Any] | None = None
+
+
+_SYNC_CALLBACK_HANDLERS = {
+    "event": "_on_event",
+    "invite": "_on_invited_rooms",
+    "ephemeral": "_on_ephemeral",
+    "room_account_data": "_on_room_account_data",
+    "global_account_data": "_on_global_account_data",
+    "presence": "_on_presence",
+    "to_device": "_on_to_device",
+    "expired_verification": "_on_expired_verifications",
+}
 
 
 @dataclass(frozen=True)
@@ -2087,14 +2111,27 @@ class Client:
             index, event = decrypted_event
             response.to_device_events[index] = event
 
-    def _handle_to_device(self, response: SyncResponse):
+    def _iter_to_device(self, response: SyncResponse) -> Iterator[_SyncItem]:
+        return self._iter_decrypted_to_device(response, replace_immediately=False)
+
+    def _iter_decrypted_to_device(
+        self, response: SyncResponse, *, replace_immediately: bool
+    ) -> Iterator[_SyncItem]:
         decrypted_to_device: list[tuple[int, ToDeviceEvent | BadEventType]] = []
 
         for index, to_device_event in enumerate(response.to_device_events):
+            source = (
+                deepcopy(to_device_event.source)
+                if isinstance(to_device_event, OlmEvent)
+                else to_device_event.source
+            )
             decrypted_event = self._handle_decrypt_to_device(to_device_event)
 
             if decrypted_event:
-                decrypted_to_device.append((index, decrypted_event))
+                if replace_immediately:
+                    response.to_device_events[index] = decrypted_event
+                else:
+                    decrypted_to_device.append((index, decrypted_event))
                 to_device_event = decrypted_event
 
             # Do not pass room key request events to our user here. We don't
@@ -2105,9 +2142,14 @@ class Client:
             ):
                 continue
 
-            self._on_to_device(to_device_event)
+            yield _SyncItem("to_device", to_device_event, source=source)
 
-        self._replace_decrypted_to_device(decrypted_to_device, response)
+        if not replace_immediately:
+            self._replace_decrypted_to_device(decrypted_to_device, response)
+
+    def _handle_to_device(self, response: SyncResponse):
+        for item in self._iter_to_device(response):
+            self._dispatch_sync_item(item)
 
     def _get_invited_room(self, room_id: str) -> MatrixInvitedRoom:
         if room_id not in self.invited_rooms:
@@ -2116,17 +2158,23 @@ class Client:
 
         return self.invited_rooms[room_id]
 
-    def _handle_invited_rooms(self, response: SyncResponse):
+    def _iter_invited_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
         for room_id, info in response.rooms.invite.items():
             room = self._get_invited_room(room_id)
+            yield _SyncItem(room=room, section="invite")
 
             for event in info.invite_state:
                 room.handle_event(event)
-                self._on_invited_rooms(event, room)
+                yield _SyncItem("invite", event, room, "invite")
 
-    def _handle_joined_state(
-        self, room_id: str, join_info: RoomInfo, encrypted_rooms: set[str]
-    ):
+    def _iter_joined_state(
+        self,
+        room_id: str,
+        join_info: RoomInfo,
+        encrypted_rooms: set[str],
+        *,
+        section: str = "join",
+    ) -> Iterator[_SyncItem]:
         if room_id in self.invited_rooms:
             del self.invited_rooms[room_id]
 
@@ -2137,15 +2185,27 @@ class Client:
             )
 
         room = self.rooms[room_id]
+        yield _SyncItem(room=room, section=section)
 
         for event in join_info.state:
             self._handle_joined_state_event(room_id, room, event, encrypted_rooms)
+            yield _SyncItem(event=event, room=room, section=section)
 
         if join_info.summary:
             room.update_summary(join_info.summary)
 
         if join_info.unread_notifications:
             room.update_unread_notifications(join_info.unread_notifications)
+
+    def _handle_invited_rooms(self, response: SyncResponse):
+        for item in self._iter_invited_rooms(response):
+            self._dispatch_sync_item(item)
+
+    def _handle_joined_state(
+        self, room_id: str, join_info: RoomInfo, encrypted_rooms: set[str]
+    ):
+        for _item in self._iter_joined_state(room_id, join_info, encrypted_rooms):
+            pass
 
     def _handle_joined_state_event(
         self,
@@ -2194,37 +2254,54 @@ class Client:
 
         return decrypted_event
 
-    def _handle_joined_rooms(self, response: SyncResponse):
+    def _iter_room_timeline(
+        self,
+        room_id: str,
+        info: RoomInfo,
+        room: MatrixRoom,
+        encrypted_rooms: set[str],
+        section: str,
+    ) -> Iterator[_SyncItem]:
+        decrypted_events: list[tuple[int, Event | BadEventType]] = []
+
+        for index, event in enumerate(info.timeline.events):
+            source = (
+                deepcopy(event.source)
+                if isinstance(event, MegolmEvent)
+                else event.source
+            )
+            decrypted_event = self._handle_timeline_event(
+                event, room_id, room, encrypted_rooms
+            )
+
+            if decrypted_event:
+                event = decrypted_event
+                decrypted_events.append((index, decrypted_event))
+
+            yield _SyncItem("event", event, room, section, source)
+
+        # Replace the Megolm events with decrypted ones
+        for index, event in decrypted_events:
+            info.timeline.events[index] = event
+
+    def _iter_joined_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
         encrypted_rooms: set[str] = set()
 
         for room_id, join_info in response.rooms.join.items():
-            self._handle_joined_state(room_id, join_info, encrypted_rooms)
+            yield from self._iter_joined_state(room_id, join_info, encrypted_rooms)
 
             room = self.rooms[room_id]
-            decrypted_events: list[tuple[int, Event | BadEventType]] = []
-
-            for index, event in enumerate(join_info.timeline.events):
-                decrypted_event = self._handle_timeline_event(
-                    event, room_id, room, encrypted_rooms
-                )
-
-                if decrypted_event:
-                    event = decrypted_event
-                    decrypted_events.append((index, decrypted_event))
-
-                self._on_event(event, room)
-
-            # Replace the Megolm events with decrypted ones
-            for index, event in decrypted_events:
-                join_info.timeline.events[index] = event
+            yield from self._iter_room_timeline(
+                room_id, join_info, room, encrypted_rooms, "join"
+            )
 
             for event in join_info.ephemeral:
                 room.handle_ephemeral_event(event)
-                self._on_ephemeral(event, room)
+                yield _SyncItem("ephemeral", event, room, "join")
 
             for event in join_info.account_data:
                 room.handle_account_data(event)
-                self._on_room_account_data(event, room)
+                yield _SyncItem("room_account_data", event, room, "join")
 
             if room.encrypted and self.olm is not None:
                 self.olm.update_tracked_users(room)
@@ -2234,10 +2311,34 @@ class Client:
         if self.store:
             self.store.save_encrypted_rooms(encrypted_rooms)
 
-    def _handle_presence_events(self, response: SyncResponse):
+    def _iter_presence_events(self, response: SyncResponse) -> Iterator[_SyncItem]:
         for event in response.presence_events:
             self._project_presence(event)
-            self._on_presence(event)
+            yield _SyncItem("presence", event)
+
+    def _handle_joined_rooms(self, response: SyncResponse):
+        for item in self._iter_joined_rooms(response):
+            self._dispatch_sync_item(item)
+
+    def _iter_left_rooms(self, response: SyncResponse) -> Iterator[_SyncItem]:
+        encrypted_rooms: set[str] = set()
+        for room_id, info in response.rooms.leave.items():
+            yield from self._iter_joined_state(
+                room_id, info, encrypted_rooms, section="leave"
+            )
+            room = self.rooms[room_id]
+            yield from self._iter_room_timeline(
+                room_id, info, room, encrypted_rooms, "leave"
+            )
+            self.rooms.pop(room_id, None)
+            self.invited_rooms.pop(room_id, None)
+        self.encrypted_rooms.update(encrypted_rooms)
+        if encrypted_rooms and self.store:
+            self.store.save_encrypted_rooms(encrypted_rooms)
+
+    def _handle_presence_events(self, response: SyncResponse):
+        for item in self._iter_presence_events(response):
+            self._dispatch_sync_item(item)
 
     def _project_presence(self, event: PresenceEvent) -> None:
         for room in self.rooms.values():
@@ -2250,18 +2351,24 @@ class Client:
             user.currently_active = event.currently_active
             user.status_msg = event.status_msg
 
-    def _handle_global_account_data_events(
-        self,
-        response: SyncResponse,
-    ) -> None:
+    def _iter_global_account_data_events(
+        self, response: SyncResponse
+    ) -> Iterator[_SyncItem]:
         for event in response.account_data_events:
-            self._on_global_account_data(event)
+            yield _SyncItem("global_account_data", event)
+
+    def _handle_global_account_data_events(self, response: SyncResponse) -> None:
+        for item in self._iter_global_account_data_events(response):
+            self._dispatch_sync_item(item)
+
+    def _iter_expired_verifications(self) -> Iterator[_SyncItem]:
+        assert self.olm
+        for event in self.olm.clear_verifications():
+            yield _SyncItem("expired_verification", event)
 
     def _handle_expired_verifications(self):
-        expired_verifications = self.olm.clear_verifications()
-
-        for event in expired_verifications:
-            self._on_expired_verifications(event)
+        for item in self._iter_expired_verifications():
+            self._dispatch_sync_item(item)
 
     def _handle_olm_events(self, response: SyncResponse) -> None:
         self._update_olm_sync_state(
@@ -2324,39 +2431,54 @@ class Client:
         for cb in self.to_device_callbacks:
             cb.sync_execute(event)
 
+    def _dispatch_sync_item(self, item: _SyncItem) -> Any:
+        """Dispatch at the yield so callbacks see the current room state."""
+        if item.route is None:
+            return None
+        handler = getattr(self, _SYNC_CALLBACK_HANDLERS[item.route])
+        if item.room is not None:
+            return handler(item.event, item.room)
+        return handler(item.event)
+
+    def _iter_sync(
+        self, response: SyncResponse, *, include_left: bool = False
+    ) -> Iterator[_SyncItem]:
+        """Apply sync incrementally without callbacks or cursor/fence changes.
+
+        Consume observations as they are yielded to capture event-time room
+        state. Leaving rooms are removed after their final observation.
+        """
+        yield from self._iter_to_device(response)
+        yield from self._iter_invited_rooms(response)
+        yield from self._iter_joined_rooms(response)
+        if include_left:
+            yield from self._iter_left_rooms(response)
+        yield from self._iter_presence_events(response)
+        yield from self._iter_global_account_data_events(response)
+        if self.olm:
+            yield from self._iter_expired_verifications()
+            self._handle_olm_events(response)
+            yield from self._iter_key_requests()
+
     def _handle_sync(self, response: SyncResponse) -> None | Coroutine[Any, Any, None]:
         self._begin_ordinary_sync()
-
-        # We already received such a sync response, do nothing in that case.
         if self.next_batch == response.next_batch:
             return None
-
         self.next_batch = response.next_batch
-
         if self.config.store_sync_tokens and self.store:
             self.store.save_sync_token(self.next_batch)
-
-        self._handle_to_device(response)
-
-        self._handle_invited_rooms(response)
-
-        self._handle_joined_rooms(response)
-
-        self._handle_presence_events(response)
-
-        self._handle_global_account_data_events(response)
-
-        if self.olm:
-            self._handle_expired_verifications()
-            self._handle_olm_events(response)
-            self._collect_key_requests()
-
+        for item in self._iter_sync(response):
+            self._dispatch_sync_item(item)
         return None
 
+    def _iter_key_requests(self) -> Iterator[_SyncItem]:
+        assert self.olm
+        for event in self.olm.collect_key_requests():
+            yield _SyncItem("to_device", event)
+
     def _collect_key_requests(self):
-        events = self.olm.collect_key_requests()
-        for event in events:
-            self._on_to_device(event)
+        for item in self._iter_key_requests():
+            self._dispatch_sync_item(item)
 
     def _decrypt_event_array(self, array: list[Event | BadEventType]):
         if not self.olm:

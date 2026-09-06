@@ -29,6 +29,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Iterator,
     Sequence,
 )
 from contextvars import ContextVar
@@ -89,8 +90,6 @@ from ..events import (
     PresenceEvent,
     PushAction,
     PushCondition,
-    RoomKeyRequest,
-    RoomKeyRequestCancellation,
     ToDeviceEvent,
 )
 from ..exceptions import (
@@ -245,6 +244,7 @@ from .base_client import (
     Client,
     ClientCallback,
     ClientConfig,
+    _SyncItem,
     logged_in_async,
     store_loaded,
 )
@@ -664,87 +664,37 @@ class AsyncClient(Client):
         resp.transport_response = transport_response
         return resp
 
-    async def _handle_to_device(self, response: SyncResponse) -> None:
-        for index, to_device_event in enumerate(response.to_device_events):
-            decrypted_event = self._handle_decrypt_to_device(to_device_event)
+    def _iter_to_device(self, response: SyncResponse) -> Iterator[_SyncItem]:
+        # Async callbacks historically see decrypted response entries immediately.
+        return self._iter_decrypted_to_device(response, replace_immediately=True)
 
-            if decrypted_event:
-                to_device_event = decrypted_event
-                response.to_device_events[index] = to_device_event
-            if isinstance(
-                to_device_event, (RoomKeyRequest, RoomKeyRequestCancellation)
-            ):
-                continue
-            await self._on_to_device(to_device_event)
+    async def _handle_to_device(self, response: SyncResponse) -> None:
+        for item in self._iter_to_device(response):
+            await self._dispatch_sync_item(item)
 
     async def _handle_invited_rooms(self, response: SyncResponse) -> None:
-        for room_id, info in response.rooms.invite.items():
-            room = self._get_invited_room(room_id)
-
-            for event in info.invite_state:
-                room.handle_event(event)
-
-                await self._on_invited_rooms(event, room)
+        for item in self._iter_invited_rooms(response):
+            if item.route is not None:
+                await self._dispatch_sync_item(item)
 
     async def _handle_joined_rooms(self, response: SyncResponse) -> None:
-        encrypted_rooms: set[str] = set()
+        for item in self._iter_joined_rooms(response):
+            if item.route is not None:
+                await self._dispatch_sync_item(item)
 
-        for room_id, join_info in response.rooms.join.items():
-            self._handle_joined_state(room_id, join_info, encrypted_rooms)
-
-            room = self.rooms[room_id]
-            decrypted_events: list[tuple[int, Event | BadEventType]] = []
-
-            for index, event in enumerate(join_info.timeline.events):
-                decrypted_event = self._handle_timeline_event(
-                    event, room_id, room, encrypted_rooms
-                )
-
-                if decrypted_event:
-                    event = decrypted_event
-                    decrypted_events.append((index, decrypted_event))
-
-                await self._on_event(event, room)
-
-            for index, event in decrypted_events:
-                join_info.timeline.events[index] = event
-
-            for event in join_info.ephemeral:
-                room.handle_ephemeral_event(event)
-                await self._on_ephemeral(event, room)
-
-            for event in join_info.account_data:
-                room.handle_account_data(event)
-                await self._on_room_account_data(event, room)
-
-            if room.encrypted and self.olm is not None:
-                self.olm.update_tracked_users(room)
-
-        self.encrypted_rooms.update(encrypted_rooms)
-
-        if self.store:
-            self.store.save_encrypted_rooms(encrypted_rooms)
-
-    async def _handle_presence_events(
-        self,
-        response: SyncResponse,
-    ) -> None:
-        for event in response.presence_events:
-            self._project_presence(event)
-            await self._on_presence(event)
+    async def _handle_presence_events(self, response: SyncResponse) -> None:
+        for item in self._iter_presence_events(response):
+            await self._dispatch_sync_item(item)
 
     async def _handle_global_account_data_events(  # type: ignore
-        self,
-        response: SyncResponse,
+        self, response: SyncResponse
     ) -> None:
-        for event in response.account_data_events:
-            await self._on_global_account_data(event)
+        for item in self._iter_global_account_data_events(response):
+            await self._dispatch_sync_item(item)
 
     async def _handle_expired_verifications(self):
-        expired_verifications = self.olm.clear_verifications()
-
-        for event in expired_verifications:
-            await self._on_expired_verifications(event)
+        for item in self._iter_expired_verifications():
+            await self._dispatch_sync_item(item)
 
     async def _on_to_device(
         self,
@@ -815,21 +765,13 @@ class AsyncClient(Client):
         if self.config.store_sync_tokens and self.store:
             self.store.save_sync_token(response.next_batch)
 
-        await self._handle_to_device(response)
-        await self._handle_invited_rooms(response)
-        await self._handle_joined_rooms(response)
-        await self._handle_presence_events(response)
-        await self._handle_global_account_data_events(response)
-
-        if self.olm:
-            await self._handle_expired_verifications()
-            self._handle_olm_events(response)
-            await self._collect_key_requests()
+        for item in self._iter_sync(response):
+            if item.route is not None:
+                await self._dispatch_sync_item(item)
 
     async def _collect_key_requests(self):
-        events = self.olm.collect_key_requests()
-        for event in events:
-            await self._on_to_device(event)
+        for item in self._iter_key_requests():
+            await self._dispatch_sync_item(item)
 
     async def receive_response(self, response: Response) -> None:
         """Receive a Matrix Response and change the client state accordingly.
