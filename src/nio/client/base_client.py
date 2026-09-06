@@ -1019,7 +1019,11 @@ class Client:
             yield from self._iter_room_timeline(
                 room_id, info, room, encrypted_rooms, "leave"
             )
-            yield _SyncItem(room=self.rooms[room_id], section="leave")
+            room = self.rooms[room_id]
+            for event in info.account_data:
+                room.handle_account_data(event)
+                yield _SyncItem("room_account_data", event, room, "leave")
+            yield _SyncItem(room=room, section="leave")
             self.rooms.pop(room_id, None)
             self.invited_rooms.pop(room_id, None)
         self.encrypted_rooms.update(encrypted_rooms)

@@ -809,3 +809,19 @@ hooks pass. The corrections add 13 net production lines across five files
 (+25/-12). The complete PR against `5b6de3bc` is +5,249/-6,481 across 42 production
 files, or 1,232 fewer lines. These are correctness changes; existing live
 performance measurements retain their original revision IDs.
+
+Round two at `f492c1f` returned one approval and one reproduced omission:
+Classic leave-room account data was discarded by the shared parser and never
+yielded by the opt-in left-room interpreter. This is supported by the
+[Matrix sync schema](https://spec.matrix.org/latest/client-server-api/#get_matrixclientv3sync)
+and covered by the existing durable account-data contract. Parse it with the
+existing helper and apply/yield it before removing the room. Ordinary callback
+clients continue to ignore left-room processing. A failing tag-update regression
+now proves committed output and persisted room tags survive restart. The fix adds
+seven net production lines across two existing files; loop corrections total
+20 net production lines. No new mechanism or guarantee is needed.
+Qualification: 911 passed, three skipped in 72.93s; the 104 focused parser/sync
+checks also pass on Python 3.12; zero mypy errors across 60 source files; all
+repository hooks pass. The complete PR is +5,257/-6,482 production lines against
+`5b6de3bc`, or 1,225 fewer lines across 42 files. Fresh whole-PR verdicts for the
+pushed correction are retained with the loop evidence.

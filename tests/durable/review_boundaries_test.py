@@ -254,3 +254,47 @@ async def test_malformed_response_diagnostics_do_not_log_payloads(
         assert "ValidationError" in caplog.text
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_leave_account_data_is_committed_and_replayed_after_restart(tmp_path):
+    session = open_session(tmp_path)
+    await baseline(session)
+    tags = {"u.archived": {"order": 0.5}}
+    account_data = {"type": "m.tag", "content": {"tags": tags}}
+    body = {
+        "next_batch": "s2",
+        "rooms": {
+            "leave": {
+                ROOM: {
+                    "state": {"events": []},
+                    "timeline": {"events": [member("$left", "leave")]},
+                    "account_data": {"events": [account_data]},
+                }
+            }
+        },
+    }
+    try:
+        await session._accept_response(json.dumps(body).encode())
+        while batch := await session.next_batch():
+            if any(r.kind is RecordKind.ROOM_ACCOUNT_DATA for r in batch.records):
+                break
+            await session.ack(batch)
+        assert batch is not None, "left-room account data was discarded"
+        assert session.cursor == "s2"
+        assert ROOM not in session.client.rooms
+        assert session._metadata[ROOM]["tags"] == tags
+    finally:
+        await session.close()
+    reopened = open_session(tmp_path)
+    try:
+        assert await reopened.next_batch() == batch
+        record = next(
+            r for r in batch.records if r.kind is RecordKind.ROOM_ACCOUNT_DATA
+        )
+        assert record.source == account_data
+        assert reopened._metadata[ROOM]["tags"] == tags
+        await reopened.ack(batch)
+        assert await reopened.next_batch() is None
+    finally:
+        await reopened.close()
