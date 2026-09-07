@@ -76,7 +76,8 @@ def use_database_atomic(fn):
         with self.database.bind_ctx(self.models, bind_refs=False, bind_backrefs=False):
             if isinstance(self.database, SqliteQueueDatabase):
                 return fn(self, *args, **kwargs)
-            with self.database.atomic():
+            # Reserve the writer before reads can conflict with the sync worker.
+            with self.database.atomic("IMMEDIATE"):
                 return fn(self, *args, **kwargs)
 
     return inner
@@ -534,7 +535,7 @@ class MatrixStore:
         if isinstance(self.database, SqliteQueueDatabase):
             save()
         else:
-            with self.database.atomic():
+            with self.database.atomic("IMMEDIATE"):
                 save()
 
     @use_database_atomic

@@ -48,6 +48,7 @@ from nio import (
     JoinedRoomsResponse,
     JoinResponse,
     KeysClaimResponse,
+    KeysQueryResponse,
     KeysUploadResponse,
     LocalProtocolError,
     LoginError,
@@ -158,7 +159,7 @@ from nio.responses import (
     WhoamiError,
 )
 
-from nio.store import SqliteMemoryStore, SqliteStore
+from nio.store import EncryptedRooms, SqliteMemoryStore, SqliteStore
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -1230,6 +1231,72 @@ class TestClass:
             release_write.set()
         await receive_task
         assert TEST_ROOM_ID in async_client.store.load_encrypted_rooms()
+
+    @pytest.mark.parametrize("key_response", ["upload", "query"])
+    async def test_encrypted_room_save_can_overlap_key_response(
+        self, async_client, monkeypatch, key_response
+    ):
+        """Sync and key maintenance must both persist against the same database."""
+        store = async_client.store
+        owner = get_ident()
+        worker_read = ThreadingEvent()
+        main_started = ThreadingEvent()
+        main_wrote = ThreadingEvent()
+        worker_done = ThreadingEvent()
+        original_insert = EncryptedRooms.insert_many
+        original_save = store.save_encrypted_rooms
+        original_execute = store.database.execute_sql
+
+        def pause_after_worker_read(cls, *args, **kwargs):
+            if get_ident() != owner:
+                worker_read.set()
+                assert main_started.wait(5)
+                # Allow the other transaction to start. If SQLite excludes it
+                # before its first write, release this transaction to finish.
+                main_wrote.wait(0.1)
+            return original_insert(*args, **kwargs)
+
+        def finish_worker(rooms):
+            try:
+                return original_save(rooms)
+            finally:
+                worker_done.set()
+
+        def write_from_main(sql, *args, **kwargs):
+            if get_ident() == owner:
+                main_started.set()
+            result = original_execute(sql, *args, **kwargs)
+            if get_ident() == owner and sql.startswith("INSERT"):
+                main_wrote.set()
+                assert worker_done.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            EncryptedRooms, "insert_many", classmethod(pause_after_worker_read)
+        )
+        monkeypatch.setattr(store, "save_encrypted_rooms", finish_worker)
+        monkeypatch.setattr(store.database, "execute_sql", write_from_main)
+        receive_task = asyncio.create_task(
+            async_client.receive_response(self.encryption_sync_response)
+        )
+        try:
+            assert await asyncio.to_thread(worker_read.wait, 5)
+            response = (
+                KeysUploadResponse(0, 50)
+                if key_response == "upload"
+                else KeysQueryResponse.from_dict(self.keys_query_response)
+            )
+            await async_client.receive_response(response)
+        finally:
+            main_started.set()
+            main_wrote.set()
+            await receive_task
+
+        assert TEST_ROOM_ID in store.load_encrypted_rooms()
+        if key_response == "upload":
+            assert store.load_account().shared
+        else:
+            assert list(store.load_device_keys().active_user_devices(ALICE_ID))
 
     async def test_empty_encrypted_room_save_skips_thread_dispatch(
         self, async_client, monkeypatch
