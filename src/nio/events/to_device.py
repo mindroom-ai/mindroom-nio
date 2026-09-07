@@ -77,6 +77,8 @@ class ToDeviceEvent:
 
         if event_dict["type"] == "m.room.encrypted":
             return ToDeviceEvent.parse_encrypted_event(event_dict)
+        elif event_dict["type"] == "m.key.verification.request":
+            return KeyVerificationRequest.from_dict(event_dict)
         elif event_dict["type"] == "m.key.verification.start":
             return KeyVerificationStart.from_dict(event_dict)
         elif event_dict["type"] == "m.key.verification.accept":
@@ -535,4 +537,32 @@ class UnknownToDeviceEvent(ToDeviceEvent):
             event_dict,
             event_dict["sender"],
             event_dict["type"],
+        )
+
+
+@dataclass
+class KeyVerificationRequest(UnknownToDeviceEvent):
+    """Event requesting a key verification.
+
+    This remains an ``UnknownToDeviceEvent`` subtype so existing callbacks
+    handling verification requests through that catch-all keep working.
+    """
+
+    transaction_id: str = field()
+    from_device: str = field()
+    methods: list[str] = field()
+    timestamp: int = field()
+
+    @classmethod
+    @verify(Schemas.key_verification_request)
+    def from_dict(cls, event_dict):
+        content = event_dict["content"]
+        return cls(
+            event_dict,
+            event_dict["sender"],
+            event_dict["type"],
+            content["transaction_id"],
+            content["from_device"],
+            content["methods"],
+            content["timestamp"],
         )
