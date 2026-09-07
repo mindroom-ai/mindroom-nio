@@ -1,0 +1,596 @@
+# Durable Ingestion Lean Replacement Implementation Plan
+
+> Historical plan. The [supported guarantee contract](../../design/durable-ingestion-contract.md)
+> and [simplification plan](../../design/durable-ingestion-simplification-plan.md)
+> control subsequent work where they conflict with this document.
+
+> **For agentic workers:** Continue with `baspowers:executing-plans`, use
+> `baspowers:test-driven-development` for every behavior change, and use
+> `baspowers:verification-before-completion` before any completion claim.
+
+**Status:** Tasks 1–9 are complete and independently accepted. Task 10 product
+implementation, full suites/static verification, and post-deletion smoke are
+complete. On 2026-08-20 the user approved the final evidence-based numeric
+budget ceilings below; every behavior, crash, topology, compatibility,
+evidence, and security-exclusion gate remains unchanged. All amended budget
+gates pass. The exact-head rebind, one final 60-second smoke, and linked normal
+PR handoff remain. The accepted Task 10 smoke is root `20260820T093448Z`, with operator and sibling
+PASS verdicts, one exact Classic and Sliding effect, one authenticated Desktop
+callback, clean restarts, nine spaced zero Frame/Work samples, and absent
+process/Compose resources. The exact Task 9 deletion gate is the accepted d33/35b preflight at
+`runs/preflight-20260820T025529Z` plus the accepted 30-minute full run at
+`runs/full-20260820T030949Z`. The full operator and sibling verdicts are
+`SATURATION_PASS` and `INDEPENDENT_SATURATION_PASS`, with 5,409/5,409 exact
+responses, three loaded restarts, zero failure counters, final Work zero, and
+complete durable/process/coverage evidence. The ordinary linked deletion
+commits are matrix-nio `8287013985118bc96279ff30dbe965e48d9ddb00` and
+MindRoom `ebad3cce0cf14a36fea88a5f2d63124b954f576e`. Security-sensitive work
+remains notes-only. The detailed chronology below is retained as provenance;
+where it describes Task 9 as pending or deletion as locked, this current status
+supersedes it.
+The restored Desktop gate passed separately. The user replaced the obsolete
+long-duration/tiny-message MindRoom observation with one hard 30-minute
+saturation gate. The first reviewed 16-lane attempt failed closed at its
+second loaded restart with 29 response owners still live. A diagnostic-only
+candidate then passed preflight, but its full attempt failed closed at the
+first restart after entering deferred response-owner cleanup; its aggregate
+snapshot was placed after that blocked await. Commit `18dfbdb` moves only the
+fixed-label integer snapshot before that await. Its fresh preflight produced an
+accepted 80/80 operator/sibling pair; the restart snapshot reported five
+`recovery_proof` plus six `response_execution` owners and cleanup completed.
+Its authorized full attempt then failed closed at restart 0. Bounded quiesce,
+sync cancellation, and bot stop completed, after which 32 owners remained: 15
+`recovery_proof`, 13 `response_execution`, and 4 `streaming_response`.
+Deferred cleanup did not return before the 60-second clean-stop bound. Commit
+`2bdfbfb` adds periodic count snapshots and fixed resource-release phase
+markers without changing cancellation, proof, release, or timeout behavior.
+Its strict binding RED, product suites, complete 293-test load suite, frozen
+70-test reuse suite, static checks, exact wheel/venv identity, and independent
+product review pass. Independent bundle review authorized one preflight, but it
+failed before stack creation when a transient later reuse of an archived
+Desktop PID triggered the replay tool's raw `/proc`-existence guard. The
+diagnostic product candidate did not run. A strict harness-only correction now
+compares boot-relative process start time with the sealed generation stop time,
+still failing closed for the original lifetime, invalid clock data, or any
+unreadable live/global state; only disappearance during the per-PID stat read
+proves absence. Both operator and sibling bind the corrected replay source.
+The focused PID/replay tests, complete 293-test load suite, frozen 70-test reuse
+suite, Ruff, compileall, and exact installed-candidate verifier pass after the
+final rebind. That failed launch is consumed and produced no verdict;
+independent review then authorized one replacement preflight. The replacement
+at `runs/preflight-20260819T031210Z` produced an accepted 96/96
+operator/sibling pair with one loaded restart, final Work zero, COMPLETE
+four-phase durable evidence, and absent recorded processes/Compose scope. No
+additional preflight is authorized. Independent review found no findings and
+authorized exactly one fresh 16-lane/30-minute full run. That authorization
+was consumed by `runs/full-20260819T033127Z`, which failed closed at its first
+loaded restart. Quiesce, sync cancellation, and bounded bot stop completed;
+periodic fixed-count diagnostics then showed 14 bots leave recovery proof while
+two remained in journal-dispatcher release until the external 60-second stop
+deadline. The exact trace localized both to cancellation while awaiting queued
+pre-model agent construction on the shared default executor. MindRoom commit
+`258216c` moves that construction to a lazy bounded four-worker executor and
+retains the raw concurrent future: queued work cancels atomically, while
+already-running work keeps the prior cancellation-resistant join and cleanup.
+Focused product suites, the 202-test journal selection, 121-test shutdown
+selection, complete 293-test load suite, frozen 70-test reuse suite, static
+checks, exact wheel/venv verifier, and independent product review pass. The
+load operator and sibling are rebound. Independent static review authorized
+one short preflight; `runs/preflight-20260819T041151Z` produced an accepted
+85/85 operator/sibling pair, crossed its loaded restart in 12.55 seconds,
+completed exact drain with final Work zero, and left all recorded processes
+absent. Independent accepted-pair review authorized exactly one full run. That
+authorization was consumed by `runs/full-20260819T042710Z`, which failed closed
+at its first loaded restart. Fifteen `bot_stop` phases started, fourteen
+completed, and all sixteen bots emitted the expected typed bounded-response
+timeout; no pre-deferred/deferred owner snapshot, stopped-bot event, or
+queued-build cancellation appeared before the external stop deadline. The
+isolated project and recorded processes are absent, and no full verdict exists.
+Commit `9c9739b` adds only fixed resource-release phases for every ordinary and
+deferred stop plus periodic count-only observation around the unchanged initial
+bot-stop gather. It preserves first/second cancellation behavior and changes no
+timeout, cleanup, proof, ownership, or journal predicate. Strict TDD, the full
+affected shutdown modules, explicit typing/static checks, the 293-test load
+suite, 70-test frozen suite, exact wheel/venv verifier, and independent product
+review pass. The harness is rebound, and independent review of the stable
+seven-file diagnostic bundle found no finding and authorized exactly one fresh
+non-authoritative 90-second preflight. That authorization was consumed by
+`runs/preflight-20260819T050105Z`, which produced an accepted 96/96
+operator/sibling pair, crossed one loaded restart, reached final Work and
+outstanding zero with COMPLETE four-phase durable evidence, and left all
+recorded processes/Compose scope absent. Independent accepted-pair review found
+no finding and authorized exactly one fresh 16-lane/30-minute full run. That
+authorization was consumed by `runs/full-20260819T051741Z`. The run sustained
+the 1,800-second load window and completed all three loaded restarts. Exact
+response drain reached zero after 935 samples, but the controller then waited
+for every source to poll again before draining the remaining 19 Frames/2,559
+Work. All 17 active source counters remained unchanged for five minutes and the
+run failed closed with `FAILED/observation/TimeoutError`; no full verdict exists
+and the isolated project/processes are absent. Harness TDD now preserves the
+final all-source proof after three spaced zero-backlog samples instead of before
+the backlog drain. The complete load suite passes 294 and frozen reuse passes
+70. Independent launch-readiness review authorized one refreshed preflight;
+`runs/preflight-20260819T062719Z` produced an accepted 96/96 operator/sibling
+pair with zero final outstanding/Work/failures, three spaced zero-backlog
+samples before final authenticated progress, COMPLETE four-phase durable
+evidence with three stable/usable snapshots, and absent processes/Compose
+scope. Independent accepted-pair review found no finding and authorizes exactly
+one fresh 16-lane/30-minute full run. That authorization was consumed by
+`runs/full-20260819T064702Z`, which failed closed at its first loaded restart.
+Source quiescence, sync cancellation, and bounded bot stop returned, but 35
+response owners remained through deferred cleanup: 15 `recovery_proof`, 7
+`response_execution`, and 13 `streaming_response`. The external 60-second
+clean-stop guard killed only the isolated process group; the isolated Compose
+scope and all recorded processes are absent. Archived count-only logs contain
+no sync-recovery delivery-retry marker. They do show repeated synchronous
+traceback rendering from process-cancelled response/stream diagnostics, typing
+retries on the already fenced transport, and exact shutdown-time coalescing
+admission refusal through the deadline. MindRoom commit `35b58dcb` removes
+traceback rendering only on those exact process-shutdown paths while preserving
+warnings, retries, durable failure handoff, ownership, and every deadline.
+Product TDD, complete affected suites, hooks, and independent product review
+pass. Candidate-binding TDD failed 9 selected cases against the prior identity
+and then passed all 80; the complete load suite passes 294, frozen reuse passes
+70, Ruff and compileall pass, and the exact active venv authenticates 802/79
+payloads with Coverage 7.15.2/CTracer. No live verdict exists for this
+candidate. No preflight, full run, deletion, or security action is authorized;
+deletion remains locked.
+Task 10A is the
+documentation consolidation captured by this file; the remaining Task 10 gates
+depend on Task 9.
+
+**Goal:** Replace fork-specific sync recovery with one crash-safe,
+transport-neutral durable ingestion path while preserving the pre-fork public
+matrix-nio behavior used by Desktop.
+
+**Semantic authority:**
+`docs/superpowers/specs/2026-08-13-durable-ingestion-lean-replacement-design.md`.
+This file is the execution/status authority and restart handoff. Git history is
+the provenance for removed implementation diary entries.
+
+**Scope:** one indivisible accept/reject decision represented by one linked PR
+in matrix-nio and one in MindRoom.
+
+## Immutable architecture and compatibility boundary
+
+- The public compatibility boundary is matrix-nio commit
+  `69aa99c51f354980bf5306a85b4c7b7d71ff3217`.
+- Preserve the later upstream `origin/main` behavior
+  `secure_delete = "fast"` and its regression
+  `tests/store_test.py::test_disk_store_uses_fast_secure_delete`; restoring the
+  pre-fork public surface does not authorize reverting that behavior.
+- Preserve `AsyncClient.sync()`, `sync_forever()`, `stop_sync_forever()`,
+  `receive_response()`, `run_response_callbacks()`, response callback
+  registration, all six event callback families, callback order/re-entry,
+  `AsyncClient.rooms`, ordinary sends, response shapes, sync-token persistence,
+  E2EE state, and Desktop/pairing behavior at that boundary.
+- Fork-added public Sliding and recovery APIs are not compatibility promises.
+  Durable Sliding is a private ingestion transport adapter, not an AsyncClient
+  public API.
+- Ingestion remains schema version 1 with exactly five tables:
+  `NioIngestMeta`, `NioIngestSourceState`, `NioIngestFrame`,
+  `NioIngestRoomAggregate`, and `NioIngestWork`. The authenticated nullable
+  Frame completion-claim column does not change that topology.
+- Classic and Sliding normalize into the same authenticated Frame,
+  callback-free preparation, pure reducer, materializer, Work FIFO, batch,
+  settlement, acknowledgement, and Frame-completion state machine.
+- Response and cursor commit together. The retained Frame owns replay and
+  outbound maintenance until all Work, maintenance, completion claim, and
+  retirement finish.
+- The same exclusive SQLite owner holds ordinary MatrixStore/E2EE state and the
+  five ingestion tables. DefaultStore adoption converts trust state to the
+  SqliteStore topology in one transaction while preserving legacy sidecars as
+  rollback artifacts. A marked reopen authenticates the complete graph before
+  rotating writer/source ownership.
+- MindRoom owns application/event-journal identity, record receipt, semantic
+  dispatch, projection, and frontier in one admission transaction. It passes
+  separate `receipt_new` and `semantic_event_new` facts to nio settlement.
+- Callbacks, parsing, compatibility projection, and application dispatch never
+  run inside either database transaction. Callback failure leaves Work
+  replayable; nio acknowledges only after admission and eligible callback
+  fanout.
+- Every `RecordKind` and `LossRecord` has one explicit fate. Known valid input
+  cannot become an unacknowledgeable FIFO head; malformed or conflicting input
+  fails closed and stays visible.
+- Sliding reopen and exact positioned `M_UNKNOWN_POS` rotate connection/source
+  state atomically while preserving durable Frames, Work, frontiers, and the
+  non-connection-scoped cursor/configuration.
+- MindRoom uses the durable runner as its sole candidate sync engine;
+  `matrix_sync.mode` selects only Classic or Sliding transport. Desktop does
+  not use the durable batch engine. It stays on the upstream-style public sync
+  profile with token persistence, E2EE, callbacks, headers, and fork-only
+  limited-timeline recovery disabled.
+- No canary-specific production table, scope, control room, `probe`, occurrence
+  ledger, rotation ledger, latch, environment switch, YAML field, or evidence
+  hook may be introduced. External evidence may observe only ordinary product
+  state and process behavior.
+- Existing databases are never destructively downgraded and historical
+  recovery tables are not dropped in place; restored ordinary store code
+  ignores inert historical tables.
+
+The shared lifecycle remains:
+
+```text
+HTTP -> Frame/cursor commit -> prepare/materialize -> Work FIFO
+     -> MindRoom admission/receipt/frontier -> compatibility settlement -> ack
+     -> outbound maintenance -> claim completion -> retire -> next HTTP
+```
+
+## Fixed baselines and evidence-based budgets
+
+The baselines never move. The matrix-nio runtime and test ceilings were first
+revised on 2026-08-16 after the exact Task 9 deletion map and Task 10
+feasibility inventory proved that the original ceilings could be reached only
+by removing required behavior or hiding crash semantics in an opaque
+persistence rewrite. After complete implementation, deletion, full
+verification, and independent safe-seam inventories, the user approved the
+final numeric ceilings on 2026-08-20. Every non-budget gate is unchanged:
+
+| Repository | Baseline | Runtime | Tests | Docs/scripts | Additional gate |
+| --- | --- | ---: | ---: | ---: | --- |
+| matrix-nio | `6ed2b9817d2bc9de30dc72942f9cb867d829283b` | `src <= +15,000` | `tests <= +40,000` | `docs scripts <= +1,000` | preserve upstream compatibility |
+| MindRoom | `0acaea2baf05a4c41cce7497cfcdf4880afc6d04` | `src <= +2,000` | `tests <= +1,200` | — | `src tests <= +250` versus `925df7f3cbcc39d4904140efd9d16b93c77238ea` |
+
+Fresh Task 10A entry measurements on 2026-08-16 were:
+
+- matrix-nio entry: runtime `+19,930`, tests `+56,870`, docs/scripts `+5,260`;
+  the 354-line Task 10A consolidation reduced docs/scripts to `+647`, and the
+  current plan/spec/operational amendment leaves the tracked delta at `+699`;
+- MindRoom: runtime `+201`, tests `+2,551`, and `src tests = -95`
+  versus canary commit `925df7f3cbcc39d4904140efd9d16b93c77238ea`;
+- the six whole legacy matrix-nio modules listed in Task 9 contain 2,433
+  physical lines, so their deletion alone cannot satisfy the runtime gate.
+
+The corrected consolidation estimate is binding planning evidence: safely
+consolidating the 6,043-line journal plan/rows/values/preflight cluster can save
+about 1,000–1,750 lines (about 2,300 only at an aggressive bound), not 5,000.
+The exact Task 9 map removes 5,898 runtime and 19,400 test lines before safe
+journal/coordinator/reducer/base-client and owning-matrix consolidation. Do not
+weaken a behavior, crash oracle, or persisted-format assertion to meet a size
+gate; the exact revised commands must pass.
+
+## Completed implementation and review boundary
+
+| Task | State | Authoritative final boundary |
+| --- | --- | --- |
+| 1 — freeze authority/prune canary architecture | Complete | matrix-nio `0b07c510`; reviewed history carried through `febbe9a5` |
+| 2 — prune redundant docs/benchmarks/tests | Complete | matrix-nio `fe8a868`, `bdd5d7c`, `5709f34`; reviewed history through `febbe9a5` |
+| 3 — minimal Sliding reset | Complete | matrix-nio `febbe9a5e850f7dc97e732819c0ac688c16ccce8` |
+| Desktop no-recovery/query-only precursor | Complete | MindRoom `1fd376583`, `a5d3edc33` |
+| 4 — shared preparation/reducer/materializer/settlement/completion | Complete | matrix-nio through `ec9fe0da38378e7a7d5d100737787fb7584d8662` |
+| 5 — MindRoom receipt, pump, owned session, activation | Complete | matrix-nio `1ea9e4aae108c0f1fd2d1bec1ba81f188af408c4`; MindRoom `47180cc07e7d0177ff4981bd7ccf1f1ec65eb047` |
+| 6 — restore public sync compatibility | Complete | matrix-nio `70d21bcb6b08a9528104d16a9c6c4537b4bf1a8a`; MindRoom `253c76245174f106162368993bf1393d452c6698` |
+| 7 — cross-database crash/parity matrix | Complete | matrix-nio `6e4f14aa2b438ba431d8f7c7ab2ff176f4e11a94`; MindRoom `2cbeecb6f8e68f380a7fabb3cbe28cd88f3e1a2f` |
+| 8 — external Classic/Sliding/crash evidence | Complete | product candidate matrix-nio `af8eab819a501518c860e6dbb8581d411eec15d9`; MindRoom `934bebfbbe1a4b174aef2c075d00e971a29697f6`; evidence commits `3b0b4d6`, `94502ea`, `10dd9f6`, `20a980d`; acceptance `e1a2408` |
+| 9 — saturation observation and legacy deletion | Complete | accepted d33/35b preflight/full evidence; matrix-nio `8287013985118bc96279ff30dbe965e48d9ddb00`; MindRoom `ebad3cce0cf14a36fea88a5f2d63124b954f576e` |
+| 10 — consolidation, final verification, smoke, linked handoff | Finalization in progress | Amended budgets pass: Nio `src +14,680`, `tests +39,248`; MindRoom `src +1,924`, `tests +1,153`, canary total `+230`; exact-head rebind, final 60-second smoke, and linked normal PR handoff remain |
+
+Tasks 1–7 passed their scoped suites, static gates, and independent reviews.
+Task 7 uses real nio and MindRoom components to cover:
+
+```text
+HTTP response -> Frame -> materializer -> Work -> batch
+-> MindRoom event/projection/receipt/frontier -> nio ack
+```
+
+It proves response/cursor atomicity, deterministic replay, one application
+dispatch, conflicting-identity rollback, no Work/Frame loss, frontier ownership,
+callbacks outside transactions, Sliding reopen, and positioned
+`M_UNKNOWN_POS` after admission-before-ack.
+
+## Task 8 accepted evidence
+
+Persistent bundle:
+`~/.codex/worktrees/mindroom-task8-evidence/2026-08-15/`.
+
+Exact candidate and infrastructure:
+
+- matrix-nio commit `af8eab819a501518c860e6dbb8581d411eec15d9`;
+- matrix-nio wheel SHA-256
+  `cd11da3e96313bcd4e228c76799bf6fc7ebe5489276610ca47ac37bc0a8c1a0e`;
+- MindRoom commit `934bebfbbe1a4b174aef2c075d00e971a29697f6`;
+- MindRoom wheel SHA-256
+  `a0028fc69809c774cf572c6428883b881204838486de11d0b685d5b47eee0eac`;
+- Synapse `1.158.0`, image digest
+  `sha256:39f47bcea65c544ef3a6d58848ee98e2ea98387e9991df30474d25b54477a0af`.
+
+Accepted result hashes:
+
+| Result | SHA-256 |
+| --- | --- |
+| `classic.json` | `b81418a02a9c66c109700c9f74b4e5c594f6a24f0eab54a63d6d6c6f43288489` |
+| `sliding-restart.json` | `afba053c053e0bc93ab57d6490a3a6951987737d2abfcb9bd97dfbfd57c3a243` |
+| `sliding-unknown-pos.json` | `8bce17e59626a603bee77422e794e44229ef58d9149fad8bf19af347654741e0` |
+| `outstanding-batch.json` | `7d5db3432e6395edc150fb27e9b065236b117bef23dffb700f06fcc5aa7eb233` |
+
+`ACCEPTED_SHA256SUMS` is the sole accepted-dependency manifest: 13 entries,
+SHA-256
+`a8881b46ed2169eb537288ee6dfeaf7cf7cecab3062335249cdcd1a40829a9f2`.
+The broader provenance-only `SHA256SUMS` is not an acceptance allowlist.
+
+The accepted outstanding-batch run causally binds the exact measured Matrix
+event to its authenticated READY Work payload and durable MindRoom receipt.
+It proves:
+
+- the Work EventRecord ID and canonical source event ID both equal the measured
+  Matrix event;
+- Work and receipt record identity are equal;
+- the same authenticated descriptor, receipt, event binding, database inode,
+  and stopped disposable process group exist before stop, after confirmed
+  `SIGSTOP`, immediately before `SIGKILL`, and after kill where applicable;
+- the target application journal moves `pending -> settled` while measured
+  responses move `0 -> 1` after ordinary restart;
+- source epoch and connection identity rotate;
+- the post-recovery outstanding descriptor is explicitly null;
+- both owned databases remain at `NioIngestFrame=0` and `NioIngestWork=0`
+  across the stable drain samples;
+- the two independently accepted Sliding idle windows remain bound;
+- the focused seven-test operator suite covers the exact measured EventRecord
+  binding and a genuine canonical LossRecord authentication/skip path.
+
+Independent re-review reproduced the focused tests/manifests and reported no
+Critical, Important, or Minor finding. Task 8 PASS authorizes only the later
+activation-observation decision; it is not release, deletion, or cutover.
+
+## Current authorization boundary
+
+No new security-sensitive work is authorized in this continuation. External
+deployment, real credentials, production process control, and production-cohort
+observation are notes-only. Task 9 therefore uses a disposable loopback stack
+running ordinary product paths and synthetic local identities. Do not change
+authentication, E2EE, secret handling, or deployment security to make a gate
+easier.
+
+The current `run-20260816T184150Z` interval remains supplementary because its
+historical source tuples, semantic callback order, and fail-closed database
+samples were not all preserved. Only after `desktop_gate_failures` is empty and
+Desktop stops cleanly—thereby proving its exact duration, response, restart,
+authenticated-callback, duplicate/loss/backlog, and callback/order/
+authentication/response-failure requirements—intentionally stop the disposable
+operator/MindRoom process tree and close the run as
+`SUPPLEMENTARY_ABORTED_AFTER_SHAKEOUT_WITH_LIMITATIONS`. Waiting another 22
+hours would not advance any authoritative gate. Only a fresh run using the
+independently reviewed hardened operator can satisfy the deletion gate. Task 9,
+legacy deletion, final budgets, PR handoff, merge, release, and cutover are not
+complete.
+
+## Task 9: Activate, observe, then delete legacy recovery
+
+Observation must precede deletion. The authoritative cohort is a fresh,
+disposable, local ordinary-product stack using the reviewed candidate, exact
+wheels, synthetic local identities, and an external fail-closed operator. This
+is Task 9 deletion-gate evidence only; it provides no production, release,
+cutover, or security assurance. There is no product opt-in, fallback switch,
+canary-agent variable, new YAML setting, or production evidence hook.
+
+### MindRoom observation gate
+
+Run one uninterrupted 30-minute saturation interval that includes:
+
+- sustained 16-lane load with the reviewed bounded outstanding window;
+- every scheduled loaded process restart;
+- exact-response drain followed by three spaced zero-Frame/Work samples, then
+  one final authenticated progress proof from every source;
+- zero duplicate visible effects;
+- zero unexplained event loss;
+- no permanently growing Frame/Work backlog;
+- external coverage showing zero execution of fork-recovery code.
+
+### Loaded-restart shutdown discriminator
+
+Before another live attempt, add fixed-label response-owner phase diagnostics.
+This is generic operational logging, not a canary product hook, and must not
+change cancellation, proof, cleanup, or timeout semantics.
+
+**Files:**
+
+- MindRoom create: `src/mindroom/response_shutdown_diagnostics.py`
+- MindRoom modify: `src/mindroom/response_runner.py`
+- MindRoom modify: `src/mindroom/delivery_gateway.py`
+- MindRoom modify: `src/mindroom/pre_model_preparation.py`
+- MindRoom modify: `src/mindroom/orchestrator.py`
+- MindRoom test: `tests/test_response_runner_focused.py`
+- MindRoom test: `tests/test_response_runner_team_streaming.py`
+- MindRoom test: `tests/test_pre_model_preparation.py`
+- MindRoom test: `tests/test_sync_task_cancellation.py`
+
+1. Write a failing real-response test that tracks a response blocked in
+   `prepare_prompt_branches()` and expects the runner's pending-owner aggregate
+   to report exactly `{"agent_preparation": 1}`. The mutation it catches is
+   losing the child-task phase while the outer runner retains ownership.
+2. Run that test and require failure because the phase surface does not exist.
+3. Add an event-loop-local phase trace inherited by child tasks. It stores only
+   fixed labels, uses nested tokens so the deepest active boundary wins, and is
+   retained with process-shutdown ownership until recovery is consumed.
+4. Mark real pre-model preparation with `agent_preparation`, streaming model
+   generation with `streaming_response`, and terminal publication with
+   `final_delivery`; retain a generic `response_execution` fallback for all
+   other live response work and `recovery_proof` for a terminal response's
+   live proof.
+5. Add failing orchestrator and real-bot tests that block deferred cleanup,
+   expect periodic fixed-label owner counts, and expose the exact current
+   release phase: recovery proof, router overdue tasks, journal dispatcher,
+   ingestion session, journal store, or Matrix client. The mutation they catch
+   is a deferred phase that retains ownership without identifying its current
+   awaited resource boundary.
+6. Emit the initial aggregate mapping synchronously after bounded bot stop and
+   periodic mappings while the single owned deferred gather remains pending.
+   Mark each real resource-release await with one fixed label, then clear the
+   marker after successful release. Retain the existing shared-journal warning
+   as a later check. Do not add identifiers, exception strings, stack frames,
+   prompt/model content, or a new evidence file.
+7. Run the focused response/pre-model/orchestrator tests, complete affected
+   shutdown suites, Ruff, compileall, `git diff --check`, and repository
+   pre-commit hooks. Independently review the fixed-label/privacy boundary
+   before rebuilding a candidate.
+8. Rebind the external Task 9 operator and sibling to the reviewed wheel, run
+   exactly one fresh preflight, and allow a new 30-minute attempt only after an
+   independently accepted pair. If the full gate fails again, the periodic
+   owner and resource-release phase snapshots are the sole authority for
+   selecting the next behavioral fix; do not weaken the 5-second preparation,
+   15-second finalization, durable proof, or resource-ownership gates.
+
+Result: the fixed-label snapshots localized one full-run failure to two
+`journal_dispatcher` releases waiting on queued pre-model agent construction.
+The reviewed `258216c` fix gives that construction a dedicated bounded executor
+and raw-future queued-cancellation boundary without changing any timeout or
+running-work ownership. Its exact operator/sibling rebind passed one reviewed
+85/85 preflight and the loaded restart. The separately reviewed full run then
+failed earlier, inside the initial `bot_stop` gather: that phase was the sole
+started-not-completed phase, but ordinary release subphases were not yet
+observable. The reviewed `9c9739b` diagnostic therefore applies the same fixed
+resource phases to every ordinary/deferred release and wraps the unchanged
+initial gather with periodic integer counts. The independently reviewed
+90-second preflight produced an accepted 96/96 pair. Separate accepted-pair
+review authorized one 16-lane/30-minute run. That run sustained the complete
+load/restart window and exact-response drain, then failed closed because the
+controller required final all-source progress before draining remaining
+durable Work. A strict harness RED reproduced the circular ordering. GREEN
+moves only that proof after three spaced zero-backlog samples; no threshold,
+timeout, product, or deletion predicate changed. The independently reviewed
+refreshed preflight then produced an accepted 96/96 operator/sibling pair and
+proved final source progress only after zero backlog. Separate accepted-pair
+review authorized exactly one fresh 16-lane/30-minute full run. The resulting
+`runs/full-20260819T064702Z` attempt failed closed at its first loaded restart
+with 35 retained response/proof owners and no full verdict. The fixed phase
+logs rule out the sync-recovery retry ladder and directly show synchronous
+process-shutdown traceback storms until the external stop deadline. The
+reviewed `35b58dcb` correction changes only traceback rendering/classification
+for those exact process-shutdown paths; all waits, retries, ownership, and
+deadlines remain unchanged. Its static harness rebind passes 80 selected and
+294 complete load tests plus 70 frozen reuse tests. No live run is authorized
+for the new candidate and deletion remains locked.
+
+### Desktop observation gate
+
+Run the restored upstream-style `sync_forever()` profile for at least two
+hours and 100 successful responses, including:
+
+- one process restart;
+- one real to-device callback;
+- zero duplicate visible effects;
+- zero unexplained event loss;
+- no permanently growing backlog;
+- zero callback/order/authentication failure;
+- external coverage showing zero execution of fork-recovery code.
+
+### Required observation record
+
+For both consumers preserve exact UTC start/end times, candidate repository
+commits, exact wheel hashes, configuration identity, cohort identity, successful
+poll/response totals, restart timestamps/counts, callback/result counts,
+duplicate/loss totals, Frame/Work backlog samples, coverage file/module totals,
+diagnostic/failure totals, and operator/version identity. Keep evidence outside
+temporary directories and include its manifest hash in the final report.
+
+If either observation fails, delete nothing. Fix the durable path or restore
+Task 6's old-engine imports/calls within the linked branches, rerun every
+affected verification gate, and repeat the complete observation interval.
+There is no hidden runtime fallback.
+
+### Observation-gated deletion
+
+Only after both observations pass, remove:
+
+- `src/nio/client/sync_recovery.py`;
+- `src/nio/client/sync_reset_fence.py`;
+- `src/nio/client/sync_response_ordering.py`;
+- `src/nio/client/sliding_membership.py`;
+- `src/nio/recovery_abandonment.py`;
+- `src/nio/sliding_sync_tokens.py` where no longer required;
+- recovery/checkpoint regions in `async_client.py`, `database.py`,
+  `responses.py`, `base_client.py`, and `store/models.py`;
+- implementation-detail tests coupled only to those internals.
+
+Retain the upstream public sync/callback implementation. Before deleting any
+test, map it to deleted internals or port its still-relevant parity assertion to
+the retained public/durable matrices. Re-run both bot and Desktop verification
+after deletion. Use one ordinary commit:
+`refactor: remove superseded sync recovery machinery`.
+
+## Task 10: Consolidate, verify, and prepare linked handoff
+
+After Task 9's observation-gated deletion:
+
+1. Consolidate runtime and tests without weakening the exhaustive behavior and
+   crash oracle. Prefer safe journal/coordinator/reducer/base-client
+   simplification and parameterized behavior matrices over an opaque generic
+   persistence rewrite.
+2. Run the complete matrix-nio suite and complete affected MindRoom suite.
+3. Run Classic and Sliding compatibility matrices, the cross-database crash
+   matrix, the exact upstream `secure_delete = "fast"` regression, and
+   post-deletion bot and Desktop smoke/soak checks.
+4. Run Ruff, type checking, repository formatters, bytecode compilation,
+   `git diff --check`, configured pre-commit hooks, and a suppression scan.
+5. Run an independent code/evidence review and resolve every valid blocking
+   finding.
+6. Run the exact fixed-baseline budget gates below from clean tracked
+   worktrees. If any command fails, simplify/delete or report the blocker;
+   never move a baseline or limit without a recorded user-approved design
+   amendment.
+
+Matrix-nio gate, run from the matrix-nio root:
+
+```bash
+set -euo pipefail
+test "$(git rev-parse 6ed2b9817d2bc9de30dc72942f9cb867d829283b^{commit})" = \
+  6ed2b9817d2bc9de30dc72942f9cb867d829283b
+test -z "$(git status --porcelain --untracked-files=no)"
+net_lines() {
+  git diff --numstat 6ed2b9817d2bc9de30dc72942f9cb867d829283b -- "$@" |
+    awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }'
+}
+test "$(net_lines src)" -le 15000
+test "$(net_lines tests)" -le 40000
+test "$(net_lines docs scripts)" -le 1000
+```
+
+MindRoom gate, run from the MindRoom root:
+
+```bash
+set -euo pipefail
+test "$(git rev-parse 0acaea2baf05a4c41cce7497cfcdf4880afc6d04^{commit})" = \
+  0acaea2baf05a4c41cce7497cfcdf4880afc6d04
+test -z "$(git status --porcelain --untracked-files=no)"
+mr_net() {
+  git diff --numstat 0acaea2baf05a4c41cce7497cfcdf4880afc6d04 -- "$1" |
+    awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }'
+}
+test "$(mr_net src)" -le 2000
+test "$(mr_net tests)" -le 1200
+test "$(git diff --numstat 925df7f3cbcc39d4904140efd9d16b93c77238ea -- src tests |
+  awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n += $1 - $2 } END { print n + 0 }')" -le 250
+```
+
+The final report must distinguish public compatibility retained, fork recovery
+deleted, schema-v1/five-table topology, Classic/Sliding parity, crash evidence,
+both observation windows, exact commits/wheels/evidence hashes, test/static
+results, budgets, limitations, and rollback.
+
+## Linked PR handoff
+
+- matrix-nio already has draft PR #55 on
+  `docs/durable-ingestion-rewrite-plan`. Do not create a duplicate. Only after
+  every gate passes, update it and convert it to a normal non-draft PR.
+- MindRoom's earlier PR #1800 is merged and its remote branch is gone. After all
+  gates pass, push the ordinary history on
+  `wip/matrix-journal-ingress-cutover` and open one new normal non-draft linked
+  PR.
+- Present the two PRs as one accept/reject decision. Do not split either into
+  phase PRs.
+- Use ordinary commits only. Do not amend, rebase, force-push, merge, release,
+  or claim cutover as part of finishing this plan.
+- Preserve unrelated untracked `src/mindroom_nio.egg-info/`; never stage it.
+
+## Rollback and restart rule
+
+- Before observation completion, legacy source remains the rollback material;
+  the candidate has no runtime fallback toggle.
+- If observation fails, restore Task 6's old-engine connections or fix the
+  durable path in the linked branches and repeat the entire relevant interval.
+- If deletion or consolidation regresses behavior, revert that ordinary change
+  or restore only the mapped compatibility code/tests, then rerun all affected
+  suites and observations required by the changed candidate.
+- Never infer completion from prose. Confirm Git ancestry, clean tracked state,
+  exact hashes, suite results, observation evidence, fixed budgets, and review
+  before advancing a gate.

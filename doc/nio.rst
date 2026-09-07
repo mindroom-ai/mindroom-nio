@@ -64,9 +64,6 @@ AsyncClient
 .. autoclass:: nio.TimelineEventProvenance
     :members:
 
-.. autoclass:: nio.RecoveryAbandonment
-    :members:
-
 .. autoclass:: nio.TransferMonitor
     :members:
     :undoc-members:
@@ -199,10 +196,6 @@ Storage
 
 .. autoclass:: nio.store.SqliteMemoryStore
     :show-inheritance:
-
-.. automodule:: nio.sliding_sync_tokens
-    :members:
-    :undoc-members:
 
 Encryption
 ----------

@@ -12,16 +12,16 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import sqlite3
-from dataclasses import asdict, dataclass, field
+import threading
+import weakref
+from contextlib import closing, contextmanager
+from dataclasses import dataclass, field
 from functools import wraps
-from typing import TYPE_CHECKING, ClassVar
+from pathlib import Path
 
-from Crypto.Cipher import AES
-from peewee import EXCLUDED, Case, DoesNotExist, SqliteDatabase
+from peewee import DoesNotExist, SqliteDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from ..crypto import (
@@ -35,13 +35,7 @@ from ..crypto import (
     SessionStore,
     TrustState,
 )
-from ..event_provenance import TimelineEventProvenance
 from ..exceptions import LocalProtocolError
-from ..recovery_abandonment import (
-    RecoveryAbandonment,
-    normalize_abandonment_reasons,
-)
-from ..sliding_sync_tokens import SlidingWindowToken
 from . import (
     Accounts,
     DeviceKeys,
@@ -55,73 +49,44 @@ from . import (
     MegolmInboundSessions,
     OlmSessions,
     OutgoingKeyRequests,
-    PendingTimelineEvents,
-    SlidingWindowTokens,
     StoreVersion,
-    SyncRecoveryAbandonedRooms,
-    SyncRecoveryGaps,
     SyncTokens,
 )
-from .log import logger
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
-
-    from ..client.sync_recovery import (
-        PendingEventKind,
-        PendingTimelineEvent,
-        RecoveryGap,
-    )
-
-
-_RECOVERY_PAYLOAD_VERSION = 1
-_RECOVERY_NONCE_SIZE = 12
-_RECOVERY_TAG_SIZE = 16
-# Widest recovery write binds 12 values per row; 80 * 12 stays below
-# SQLite's legacy 999-variable statement limit.
-_RECOVERY_WRITE_CHUNK_SIZE = 80
-_RECOVERY_KEY_DOMAIN = b"mindroom-nio:sync-recovery:v3\0"
-
-
-def _recovery_payload_aad(
-    account_id: int,
-    room_id: str,
-    generation: int,
-    event_id: str,
-) -> bytes:
-    values = (str(account_id), room_id, str(generation), event_id)
-    encoded = (value.encode() for value in values)
-    return b"".join(len(value).to_bytes(4, "big") + value for value in encoded)
+from ._sqlite_lease import FileLease, LeasedSqliteDatabase, check_ordinary_database
 
 
 def use_database(fn):
-    """
-    Ensure that the correct database context is used for the wrapped function.
-    """
+    """Ensure that the correct database context is used."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self.database.bind_ctx(self.models):
+        with self.database.bind_ctx(self.models, bind_refs=False, bind_backrefs=False):
             return fn(self, *args, **kwargs)
 
     return inner
 
 
 def use_database_atomic(fn):
-    """
-    Ensure that the correct database context is used for the wrapped function.
-
-    This also ensures that the database transaction will be atomic.
-    """
+    """Bind the correct database and make non-queue writes atomic."""
 
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        with self.database.bind_ctx(self.models):
+        with self.database.bind_ctx(self.models, bind_refs=False, bind_backrefs=False):
             if isinstance(self.database, SqliteQueueDatabase):
                 return fn(self, *args, **kwargs)
-            else:
-                with self.database.atomic():
-                    return fn(self, *args, **kwargs)
+            with self.database.atomic():
+                return fn(self, *args, **kwargs)
+
+    return inner
+
+
+def use_default_trust_sidecars(fn):
+    """Hold one shared store lease across a sidecar operation."""
+
+    @wraps(fn)
+    def inner(self, *args, **kwargs):
+        with self._trust_sidecar_guard():
+            return fn(self, *args, **kwargs)
 
     return inner
 
@@ -130,8 +95,6 @@ def use_database_atomic(fn):
 class MatrixStore:
     """Storage class for matrix state."""
 
-    supports_atomic_recovery: ClassVar[bool] = False
-    supports_recovery_abandonment_reasons: ClassVar[bool] = False
     models = [
         Accounts,
         OlmSessions,
@@ -143,10 +106,6 @@ class MatrixStore:
         StoreVersion,
         Keys,
         SyncTokens,
-        SyncRecoveryGaps,
-        SyncRecoveryAbandonedRooms,
-        PendingTimelineEvents,
-        SlidingWindowTokens,
     ]
     store_version = 10
     user_id: str = field()
@@ -157,15 +116,8 @@ class MatrixStore:
     database_path: str = field(init=False)
     database: SqliteDatabase = field(init=False)
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if "supports_atomic_recovery" not in cls.__dict__:
-            cls.supports_atomic_recovery = False
-        if "supports_recovery_abandonment_reasons" not in cls.__dict__:
-            cls.supports_recovery_abandonment_reasons = False
-
     def _create_database(self):
-        return SqliteDatabase(
+        return LeasedSqliteDatabase(
             self.database_path,
             pragmas={
                 "foreign_keys": 1,
@@ -173,6 +125,7 @@ class MatrixStore:
             },
         )
 
+    @use_database_atomic
     def upgrade_to_v2(self):
         with self.database.bind_ctx([DeviceKeys_v1]):
             self.database.drop_tables(
@@ -187,207 +140,34 @@ class MatrixStore:
             self.database.create_tables([DeviceKeys, DeviceTrustState])
         self._update_version(2)
 
-    def upgrade_to_v3(self):
-        with self.database.bind_ctx(self.models):
-            self.database.create_tables([SyncRecoveryGaps, PendingTimelineEvents])
-        self._update_version(3)
-
-    def upgrade_to_v5(self):
-        with self.database.bind_ctx(self.models):
-            self.database.drop_tables([SlidingWindowTokens], safe=True)
-            self.database.create_tables([SlidingWindowTokens])
-        self._update_version(5)
-
-    def upgrade_to_v6(self):
-        with self.database.bind_ctx(self.models):
-            table = PendingTimelineEvents._meta.table_name
-            columns = {
-                row[1]
-                for row in self.database.execute_sql(
-                    f'PRAGMA table_info("{table}")'
-                ).fetchall()
-            }
-            if "admission_accepted" not in columns:
-                self.database.execute_sql(
-                    f'ALTER TABLE "{table}" '
-                    "ADD COLUMN admission_accepted INTEGER NOT NULL DEFAULT 0"
-                )
-        self._update_version(6)
-
-    @use_database_atomic
-    def upgrade_to_v7(self):
-        table = PendingTimelineEvents._meta.table_name
-        columns = {
-            row[1]
-            for row in self.database.execute_sql(
-                f'PRAGMA table_info("{table}")'
-            ).fetchall()
-        }
-        if "provenance" not in columns:
-            self.database.execute_sql(
-                f'ALTER TABLE "{table}" '
-                "ADD COLUMN provenance TEXT NOT NULL DEFAULT 'live'"
-            )
-        if "apply_room_state" not in columns:
-            self.database.execute_sql(
-                f'ALTER TABLE "{table}" '
-                "ADD COLUMN apply_room_state INTEGER NOT NULL DEFAULT 1"
-            )
-
-        # Legacy rows predate public provenance, so classify them conservatively
-        # as history while preserving their exact callback obligations.
-        PendingTimelineEvents.update(
-            provenance=TimelineEventProvenance.HISTORY.value,
-            apply_room_state=PendingTimelineEvents.is_live,
-        ).execute()
-        self._update_version(7)
-
-    @use_database_atomic
-    def upgrade_to_v8(self):
-        table = SyncRecoveryGaps._meta.table_name
-        columns = {
-            row[1]
-            for row in self.database.execute_sql(
-                f'PRAGMA table_info("{table}")'
-            ).fetchall()
-        }
-        if "membership_bound" not in columns:
-            self.database.execute_sql(
-                f'ALTER TABLE "{table}" '
-                "ADD COLUMN membership_bound INTEGER NOT NULL DEFAULT 0"
-            )
-        self._update_version(8)
-
-    @use_database_atomic
-    def upgrade_to_v9(self):
-        with self.database.bind_ctx(self.models):
-            self.database.create_tables([SyncRecoveryAbandonedRooms])
-        self._update_version(9)
-
-    def _refuse_queued_recovery_schema_rebuild(self) -> None:
-        if not self.database.is_stopped():
-            self.database.stop()
-        if not self.database.is_closed():
-            self.database.close()
-        raise LocalProtocolError(
-            "Queued SQLite store cannot safely rebuild the recovery "
-            "abandonment schema; reopen it once with SqliteStore to "
-            "complete the migration."
-        )
-
-    def _preflight_queued_recovery_schema_rebuild(self) -> None:
-        if not isinstance(self.database, SqliteQueueDatabase):
-            return
-        table = SyncRecoveryAbandonedRooms._meta.table_name
-        if self.database.table_exists(f"{table}_legacy_v10"):
-            self._refuse_queued_recovery_schema_rebuild()
-
-    def _copy_recovery_abandonment_rows(self, source_table: str) -> None:
-        table = SyncRecoveryAbandonedRooms._meta.table_name
-        columns = {
-            row[1]
-            for row in self.database.execute_sql(
-                f'PRAGMA table_info("{source_table}")'
-            ).fetchall()
-        }
-        reason = 'COALESCE("reason", ?)' if "reason" in columns else "?"
-        self.database.execute_sql(
-            f'INSERT OR IGNORE INTO "{table}" '
-            '("room_id", "reason", "account_id") '
-            f'SELECT "room_id", {reason}, "account_id" FROM "{source_table}"',
-            (RecoveryAbandonment.UNKNOWN.value,),
-        )
-
-    def _repair_recovery_abandonment_schema(self) -> bool:
-        """Replace pre-release v10 shapes with the multi-cause table."""
-        table = SyncRecoveryAbandonedRooms._meta.table_name
-        legacy_table = f"{table}_legacy_v10"
-        legacy_exists = self.database.table_exists(legacy_table)
-        if legacy_exists and isinstance(self.database, SqliteQueueDatabase):
-            self._refuse_queued_recovery_schema_rebuild()
-        if not self.database.table_exists(table):
-            self.database.create_tables([SyncRecoveryAbandonedRooms])
-            if legacy_exists:
-                self._copy_recovery_abandonment_rows(legacy_table)
-                self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
-            return True
-
-        columns = {
-            row[1]
-            for row in self.database.execute_sql(
-                f'PRAGMA table_info("{table}")'
-            ).fetchall()
-        }
-        unique_indexes = [
-            row
-            for row in self.database.execute_sql(
-                f'PRAGMA index_list("{table}")'
-            ).fetchall()
-            if row[2]
-        ]
-        unique_columns = [
-            tuple(
-                column[2]
-                for column in self.database.execute_sql(
-                    f'PRAGMA index_info("{index[1]}")'
-                ).fetchall()
-            )
-            for index in unique_indexes
-        ]
-        expected = frozenset({"account_id", "room_id", "reason"})
-        if (
-            "reason" in columns
-            and len(unique_indexes) == 1
-            and not unique_indexes[0][4]
-            and frozenset(unique_columns[0]) == expected
-        ):
-            if legacy_exists:
-                self._copy_recovery_abandonment_rows(legacy_table)
-                self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
-                return True
-            return False
-        if isinstance(self.database, SqliteQueueDatabase):
-            self._refuse_queued_recovery_schema_rebuild()
-
-        self.database.execute_sql(f'DROP TABLE IF EXISTS "{legacy_table}"')
-        self.database.execute_sql(f'ALTER TABLE "{table}" RENAME TO "{legacy_table}"')
-        self.database.create_tables([SyncRecoveryAbandonedRooms])
-        self._copy_recovery_abandonment_rows(legacy_table)
-        self.database.execute_sql(f'DROP TABLE "{legacy_table}"')
-        return True
-
-    def _seed_terminal_recovery_abandonments(self) -> None:
-        table = SyncRecoveryAbandonedRooms._meta.table_name
-        gaps_table = SyncRecoveryGaps._meta.table_name
-        self.database.execute_sql(
-            f'INSERT OR IGNORE INTO "{table}" '
-            '("room_id", "reason", "account_id") '
-            f'SELECT DISTINCT gaps."room_id", ?, gaps."account_id" '
-            f'FROM "{gaps_table}" AS gaps '
-            'WHERE gaps."target_token" != ? '
-            'AND gaps."cursor_token" IS NULL '
-            f'AND NOT EXISTS (SELECT 1 FROM "{table}" AS abandoned '
-            'WHERE abandoned."account_id" = gaps."account_id" '
-            'AND abandoned."room_id" = gaps."room_id")',
-            (RecoveryAbandonment.UNKNOWN.value, ""),
-        )
-
-    @use_database_atomic
-    def upgrade_to_v10(self):
-        self._repair_recovery_abandonment_schema()
-        self._seed_terminal_recovery_abandonments()
-        self._update_version(10)
-
-    @use_database_atomic
-    def _repair_v10_recovery_abandonments(self) -> None:
-        if self._repair_recovery_abandonment_schema():
-            self._seed_terminal_recovery_abandonments()
-
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.database_name = self.database_name or f"{self.user_id}_{self.device_id}.db"
         self.database_path = os.path.join(self.store_path, self.database_name)
+        try:
+            self._post_init_ordinary_store()
+        except BaseException:
+            database = getattr(self, "database", None)
+            if database is not None and not database.is_closed():
+                database.close()
+            raise
+
+    def _post_init_ordinary_store(self) -> None:
         self.database = self._create_database()
         self.database.connect()
+
+        if "NioIngestMeta" in self.database.get_tables():
+            raise LocalProtocolError(
+                "this database is owned by ingestion v1; direct legacy store "
+                "construction is unsupported"
+            )
+
+        if "NioDurableMeta" in self.database.get_tables():
+            raise LocalProtocolError("this database requires a durable sync session")
+
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        """Initialize normal crypto tables on the store's bound connection."""
 
         store_version = self._get_store_version()
 
@@ -395,31 +175,11 @@ class MatrixStore:
         if store_version == 1:
             self.upgrade_to_v2()
             store_version = 2
-        if store_version == 2:
-            self.upgrade_to_v3()
-            store_version = 3
-        if store_version in (3, 4):
-            self.upgrade_to_v5()
-            store_version = 5
-        if store_version == 5:
-            self.upgrade_to_v6()
-            store_version = 6
-        if store_version == 6:
-            self.upgrade_to_v7()
-            store_version = 7
-        if store_version == 7:
-            self.upgrade_to_v8()
-            store_version = 8
-        if store_version == 8:
-            self.upgrade_to_v9()
-            store_version = 9
-        if store_version == 9:
-            self.upgrade_to_v10()
+        if store_version < self.store_version:
+            self._update_version(self.store_version)
 
-        self._preflight_queued_recovery_schema_rebuild()
         with self.database.bind_ctx(self.models):
             self.database.create_tables(self.models)
-        self._repair_v10_recovery_abandonments()
 
     def _get_store_version(self):
         with self.database.bind_ctx([StoreVersion]):
@@ -442,6 +202,17 @@ class MatrixStore:
         except DoesNotExist:
             return None
 
+    def _load_persisted_account(self) -> OlmAccount | None:
+        """Load an existing account without upgrading or writing its pickle."""
+        account = self._get_account()
+        if not account:
+            return None
+        return OlmAccount.from_pickle(
+            account.account,
+            self.pickle_key,
+            account.shared,
+        )
+
     def load_account(self) -> OlmAccount | None:
         """Load the Olm account from the database.
 
@@ -450,14 +221,9 @@ class MatrixStore:
                 current device_id.
 
         """
-        account = self._get_account()
-
-        if not account:
+        olm_account = self._load_persisted_account()
+        if olm_account is None:
             return None
-
-        olm_account = OlmAccount.from_pickle(
-            account.account, self.pickle_key, account.shared
-        )
 
         # upgrade account pickle in database to vodozemac format
         if olm_account.upgrade_pickle:
@@ -466,7 +232,7 @@ class MatrixStore:
 
         return olm_account
 
-    @use_database
+    @use_database_atomic
     def save_account(self, account):
         """Save the provided Olm account to the database.
 
@@ -491,6 +257,18 @@ class MatrixStore:
         ).execute()
 
     @use_database
+    def _load_persisted_sessions(self) -> SessionStore:
+        """Decode persisted Olm sessions without upgrading their pickles."""
+        session_store = SessionStore()
+        account = self._get_account()
+        if not account:
+            return session_store
+        for s in account.olm_sessions:
+            session = Session.from_pickle(s.session, s.creation_time, self.pickle_key)
+            session_store.add(s.sender_key, session)
+        return session_store
+
+    @use_database_atomic
     def load_sessions(self) -> SessionStore:
         """Load all Olm sessions from the database.
 
@@ -498,25 +276,18 @@ class MatrixStore:
             ``SessionStore`` object, containing all the loaded sessions.
 
         """
-        session_store = SessionStore()
+        session_store = self._load_persisted_sessions()
 
-        account = self._get_account()
-
-        if not account:
-            return session_store
-
-        for s in account.olm_sessions:
-            session = Session.from_pickle(s.session, s.creation_time, self.pickle_key)
-            session_store.add(s.sender_key, session)
-
-            # upgrade session pickles in database to vodozemac format
-            if session.upgrade_pickle:
-                session.upgrade_pickle = False
-                self.save_session(s.sender_key, session)
+        for sender_key, sessions in session_store.items():
+            for session in sessions:
+                # upgrade session pickles in database to vodozemac format
+                if session.upgrade_pickle:
+                    session.upgrade_pickle = False
+                    self.save_session(sender_key, session)
 
         return session_store
 
-    @use_database
+    @use_database_atomic
     def save_session(self, curve_key, session):
         """Save the provided Olm session to the database.
 
@@ -538,20 +309,12 @@ class MatrixStore:
         ).execute()
 
     @use_database
-    def load_inbound_group_sessions(self) -> GroupSessionStore:
-        """Load all Olm sessions from the database.
-
-        Returns:
-            ``GroupSessionStore`` object, containing all the loaded sessions.
-
-        """
+    def _load_persisted_inbound_group_sessions(self) -> GroupSessionStore:
+        """Decode persisted inbound sessions without upgrading their pickles."""
         store = GroupSessionStore()
-
         account = self._get_account()
-
         if not account:
             return store
-
         for s in account.inbound_group_sessions:
             session = InboundGroupSession.from_pickle(
                 s.session,
@@ -562,7 +325,19 @@ class MatrixStore:
                 [chain.sender_key for chain in s.forwarded_chains],
             )
             store.add(session)
+        return store
 
+    @use_database_atomic
+    def load_inbound_group_sessions(self) -> GroupSessionStore:
+        """Load all Olm sessions from the database.
+
+        Returns:
+            ``GroupSessionStore`` object, containing all the loaded sessions.
+
+        """
+        store = self._load_persisted_inbound_group_sessions()
+
+        for session in store:
             # upgrade session pickles in database to vodozemac format
             if session.upgrade_pickle:
                 session.upgrade_pickle = False
@@ -570,7 +345,7 @@ class MatrixStore:
 
         return store
 
-    @use_database
+    @use_database_atomic
     def save_inbound_group_session(self, session):
         """Save the provided Megolm inbound group session to the database.
 
@@ -701,7 +476,7 @@ class MatrixStore:
             for request in account.out_key_requests
         }
 
-    @use_database
+    @use_database_atomic
     def add_outgoing_key_request(self, key_request: OutgoingKeyRequest) -> None:
         """Add an outgoing key request to the store."""
         account = self._get_account()
@@ -715,7 +490,7 @@ class MatrixStore:
             account=account,
         ).on_conflict_ignore().execute()
 
-    @use_database
+    @use_database_atomic
     def remove_outgoing_key_request(self, key_request: OutgoingKeyRequest) -> None:
         """Remove an active outgoing key request from the store."""
         account = self._get_account()
@@ -744,7 +519,7 @@ class MatrixStore:
                 rows, fields=[EncryptedRooms.room_id, EncryptedRooms.account]
             ).on_conflict_ignore().execute()
 
-    @use_database
+    @use_database_atomic
     def save_sync_token(self, token: str) -> None:
         """Save the current Matrix transport token."""
         account = self._get_account()
@@ -768,616 +543,6 @@ class MatrixStore:
         return None
 
     @use_database_atomic
-    def _clear_sync_recovery(self) -> None:
-        """Clear the persisted sync cursor and recovery lane atomically."""
-        account = self._get_account()
-        assert account
-
-        SyncTokens.delete().where(SyncTokens.account == account).execute()
-        PendingTimelineEvents.delete().where(
-            PendingTimelineEvents.account == account
-        ).execute()
-        SyncRecoveryGaps.delete().where(SyncRecoveryGaps.account == account).execute()
-        SyncRecoveryAbandonedRooms.delete().where(
-            SyncRecoveryAbandonedRooms.account == account,
-        ).execute()
-        SlidingWindowTokens.delete().where(
-            SlidingWindowTokens.account == account,
-        ).execute()
-
-    @staticmethod
-    def _restore_completed_markers(account, *conditions) -> None:
-        PendingTimelineEvents.update(
-            generation=0,
-            sequence=0,
-            event_payload=b"",
-            is_live=False,
-            was_encrypted=True,
-            was_completed=False,
-            admission_accepted=False,
-            apply_room_state=False,
-        ).where(
-            PendingTimelineEvents.account == account,
-            PendingTimelineEvents.generation > 0,
-            PendingTimelineEvents.was_completed == True,  # noqa: E712
-            *conditions,
-        ).execute()
-
-    @staticmethod
-    def _write_recovery_abandonments(
-        account,
-        abandoned_rooms: Mapping[str, object],
-    ) -> None:
-        """Append every normalized cause without erasing standing causes."""
-        rows = [
-            {"account": account, "room_id": room_id, "reason": reason.value}
-            for room_id, value in abandoned_rooms.items()
-            for reason in normalize_abandonment_reasons(value)
-        ]
-        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
-            SyncRecoveryAbandonedRooms.insert_many(
-                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).on_conflict_ignore().execute()
-
-    @use_database_atomic
-    def save_recovery(
-        self,
-        token: str | None,
-        clear_rooms: set[str],
-        gaps: list[RecoveryGap] | tuple[RecoveryGap, ...],
-        events: list[PendingTimelineEvent] | tuple[PendingTimelineEvent, ...],
-        clear_recovered: RecoveryGap | None,
-        window_tokens: Mapping[str, SlidingWindowToken] | None = None,
-        forgotten_rooms: Iterable[str] = (),
-        abandoned_rooms: Iterable[str] = (),
-        *,
-        abandoned_room_reasons: Mapping[str, object] | None = None,
-        clear_room_reasons: Mapping[str, object] | None = None,
-    ) -> None:
-        account = self._get_account()
-        assert account
-
-        # Window tokens ride the same transaction as the plan they belong
-        # to: a baseline stored without its plan, or the other way round,
-        # would send a restarted walk from the wrong position.
-        self._write_sliding_window_tokens(account, window_tokens, forgotten_rooms)
-
-        if token:
-            SyncTokens.replace(account=account, token=token).execute()
-        clear_rooms = list(clear_rooms)
-        clear_room_reasons = {
-            room_id: normalize_abandonment_reasons(reasons)
-            for room_id, reasons in (clear_room_reasons or {}).items()
-        }
-        detailed_abandonments = {
-            room_id: normalize_abandonment_reasons(reasons)
-            for room_id, reasons in (abandoned_room_reasons or {}).items()
-        }
-        for room_id in abandoned_rooms:
-            if room_id in clear_room_reasons:
-                continue
-            detailed_abandonments.setdefault(
-                room_id,
-                frozenset({RecoveryAbandonment.UNKNOWN}),
-            )
-        for index in range(0, len(clear_rooms), _RECOVERY_WRITE_CHUNK_SIZE):
-            room_batch = clear_rooms[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            persisted_real_gap_rooms = {
-                row.room_id
-                for row in SyncRecoveryGaps.select(SyncRecoveryGaps.room_id).where(
-                    SyncRecoveryGaps.account == account,
-                    SyncRecoveryGaps.room_id.in_(room_batch),
-                    SyncRecoveryGaps.target_token != "",
-                )
-            }
-            for room_id in persisted_real_gap_rooms:
-                reasons = clear_room_reasons.get(room_id)
-                if reasons is None:
-                    if room_id in detailed_abandonments:
-                        continue
-                    logger.error(
-                        "Clearing a real gap in %s without naming a cause", room_id
-                    )
-                    reasons = frozenset({RecoveryAbandonment.UNKNOWN})
-                detailed_abandonments[room_id] = (
-                    detailed_abandonments.get(room_id, frozenset()) | reasons
-                )
-            self._restore_completed_markers(
-                account,
-                PendingTimelineEvents.room_id.in_(room_batch),
-            )
-            PendingTimelineEvents.delete().where(
-                PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id.in_(room_batch),
-                PendingTimelineEvents.generation > 0,
-            ).execute()
-            SyncRecoveryGaps.delete().where(
-                SyncRecoveryGaps.account == account,
-                SyncRecoveryGaps.room_id.in_(room_batch),
-            ).execute()
-        if clear_recovered:
-            self._restore_completed_markers(
-                account,
-                PendingTimelineEvents.room_id == clear_recovered.room_id,
-                PendingTimelineEvents.generation == clear_recovered.generation,
-                PendingTimelineEvents.is_live == False,  # noqa: E712
-            )
-            PendingTimelineEvents.delete().where(
-                PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id == clear_recovered.room_id,
-                PendingTimelineEvents.generation == clear_recovered.generation,
-                PendingTimelineEvents.is_live == False,  # noqa: E712
-            ).execute()
-        rows = [{"account": account, **asdict(gap)} for gap in gaps]
-        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
-            SyncRecoveryGaps.replace_many(
-                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).execute()
-        self._write_recovery_abandonments(account, detailed_abandonments)
-        self._upsert_pending_events(account, events)
-
-    @use_database_atomic
-    def clear_recovery_abandonment(self, room_ids: Iterable[str]) -> None:
-        """Forget that these rooms lost history, once the application says so."""
-        account = self._get_account()
-        assert account
-
-        room_ids = list(room_ids)
-        for index in range(0, len(room_ids), _RECOVERY_WRITE_CHUNK_SIZE):
-            SyncRecoveryAbandonedRooms.delete().where(
-                SyncRecoveryAbandonedRooms.account == account,
-                SyncRecoveryAbandonedRooms.room_id.in_(
-                    room_ids[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-                ),
-            ).execute()
-
-    def _recovery_payload_key(self) -> bytes:
-        return hashlib.sha256(_RECOVERY_KEY_DOMAIN + self.pickle_key.encode()).digest()
-
-    @staticmethod
-    def _encrypt_recovery_payload(
-        key: bytes,
-        account_id: int,
-        event: PendingTimelineEvent,
-    ) -> bytes:
-        nonce = os.urandom(_RECOVERY_NONCE_SIZE)
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=_RECOVERY_TAG_SIZE)
-        header = bytes((_RECOVERY_PAYLOAD_VERSION,))
-        cipher.update(
-            header
-            + _recovery_payload_aad(
-                account_id,
-                event.room_id,
-                event.generation,
-                event.event_id,
-            )
-        )
-        payload = json.dumps(
-            {"kind": event.kind, "source": event.source_json},
-            separators=(",", ":"),
-        ).encode()
-        encrypted, tag = cipher.encrypt_and_digest(payload)
-        return header + nonce + tag + encrypted
-
-    @staticmethod
-    def _decrypt_recovery_payload(
-        key: bytes,
-        account_id: int,
-        row: PendingTimelineEvents,
-    ) -> tuple[str, PendingEventKind]:
-        payload = bytes(row.event_payload)
-        minimum_size = 1 + _RECOVERY_NONCE_SIZE + _RECOVERY_TAG_SIZE
-        if len(payload) < minimum_size or payload[0] != _RECOVERY_PAYLOAD_VERSION:
-            raise ValueError("Invalid encrypted recovery payload")
-        header = payload[:1]
-        nonce_end = 1 + _RECOVERY_NONCE_SIZE
-        tag_end = nonce_end + _RECOVERY_TAG_SIZE
-        cipher = AES.new(
-            key,
-            AES.MODE_GCM,
-            nonce=payload[1:nonce_end],
-            mac_len=_RECOVERY_TAG_SIZE,
-        )
-        cipher.update(
-            header
-            + _recovery_payload_aad(
-                account_id,
-                row.room_id,
-                row.generation,
-                row.event_id,
-            )
-        )
-        try:
-            decrypted = cipher.decrypt_and_verify(
-                payload[tag_end:],
-                payload[nonce_end:tag_end],
-            )
-            decoded = json.loads(decrypted)
-            kind = decoded["kind"]
-            source = decoded["source"]
-            if kind not in {
-                "timeline",
-                "ephemeral",
-                "account_data",
-            } or not isinstance(source, str):
-                raise ValueError
-            return source, kind
-        except (KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
-            raise ValueError("Invalid encrypted recovery payload") from error
-
-    def _upsert_pending_events(self, account, events) -> None:
-        key = self._recovery_payload_key()
-        rows = [
-            {
-                "account": account,
-                "room_id": event.room_id,
-                "generation": event.generation,
-                "sequence": event.sequence,
-                "event_id": event.event_id,
-                "event_payload": (
-                    b""
-                    if event.generation == 0
-                    else self._encrypt_recovery_payload(key, account.id, event)
-                ),
-                "is_live": event.is_live,
-                "was_encrypted": event.was_encrypted,
-                "was_completed": event.was_completed,
-                "admission_accepted": event.admission_accepted,
-                "provenance": event.provenance.value,
-                "apply_room_state": event.apply_room_state,
-            }
-            for event in events
-        ]
-        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
-            promote_completed_placeholder = (
-                (PendingTimelineEvents.generation == 0)
-                & PendingTimelineEvents.was_encrypted
-                & (~EXCLUDED.was_encrypted | EXCLUDED.was_completed)
-            )
-            resequence_same_generation = (PendingTimelineEvents.generation > 0) & (
-                PendingTimelineEvents.generation == EXCLUDED.generation
-            )
-            promote_recovered_continuity = (
-                resequence_same_generation
-                & ~PendingTimelineEvents.was_completed
-                & (
-                    PendingTimelineEvents.provenance
-                    == TimelineEventProvenance.HISTORY.value
-                )
-                & (EXCLUDED.provenance == TimelineEventProvenance.RECOVERED.value)
-            )
-            PendingTimelineEvents.insert_many(
-                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).on_conflict(
-                conflict_target=[
-                    PendingTimelineEvents.account,
-                    PendingTimelineEvents.room_id,
-                    PendingTimelineEvents.event_id,
-                ],
-                update={
-                    PendingTimelineEvents.generation: EXCLUDED.generation,
-                    PendingTimelineEvents.sequence: EXCLUDED.sequence,
-                    PendingTimelineEvents.event_payload: Case(
-                        None,
-                        ((promote_completed_placeholder, EXCLUDED.event_payload),),
-                        PendingTimelineEvents.event_payload,
-                    ),
-                    PendingTimelineEvents.is_live: Case(
-                        None,
-                        ((promote_completed_placeholder, EXCLUDED.is_live),),
-                        PendingTimelineEvents.is_live,
-                    ),
-                    PendingTimelineEvents.was_encrypted: Case(
-                        None,
-                        ((promote_completed_placeholder, EXCLUDED.was_encrypted),),
-                        PendingTimelineEvents.was_encrypted,
-                    ),
-                    PendingTimelineEvents.was_completed: Case(
-                        None,
-                        ((promote_completed_placeholder, EXCLUDED.was_completed),),
-                        PendingTimelineEvents.was_completed,
-                    ),
-                    PendingTimelineEvents.admission_accepted: Case(
-                        None,
-                        (
-                            (
-                                promote_completed_placeholder,
-                                EXCLUDED.admission_accepted,
-                            ),
-                        ),
-                        PendingTimelineEvents.admission_accepted,
-                    ),
-                    PendingTimelineEvents.provenance: Case(
-                        None,
-                        (
-                            (promote_completed_placeholder, EXCLUDED.provenance),
-                            (promote_recovered_continuity, EXCLUDED.provenance),
-                        ),
-                        PendingTimelineEvents.provenance,
-                    ),
-                    PendingTimelineEvents.apply_room_state: Case(
-                        None,
-                        ((promote_completed_placeholder, EXCLUDED.apply_room_state),),
-                        PendingTimelineEvents.apply_room_state,
-                    ),
-                },
-                where=promote_completed_placeholder | resequence_same_generation,
-            ).execute()
-
-    @use_database
-    def load_sync_recovery(
-        self,
-    ) -> tuple[
-        list[SyncRecoveryGaps],
-        list[PendingTimelineEvent],
-        dict[str, frozenset[RecoveryAbandonment]],
-    ]:
-        """Load room obligations, their ordered pending callbacks, and lost rooms."""
-        from ..client.sync_recovery import PendingTimelineEvent  # noqa: PLC0415
-
-        account = self._get_account()
-        if not account:
-            return [], [], {}
-
-        abandoned_sets: dict[str, set[RecoveryAbandonment]] = {}
-        for row in (
-            SyncRecoveryAbandonedRooms.select()
-            .where(SyncRecoveryAbandonedRooms.account == account)
-            .order_by(
-                SyncRecoveryAbandonedRooms.room_id,
-                SyncRecoveryAbandonedRooms.reason,
-            )
-        ):
-            abandoned_sets.setdefault(row.room_id, set()).update(
-                normalize_abandonment_reasons(row.reason)
-            )
-        abandoned = {
-            room_id: frozenset(reasons) for room_id, reasons in abandoned_sets.items()
-        }
-        gaps = list(
-            SyncRecoveryGaps.select()
-            .where(SyncRecoveryGaps.account == account)
-            .order_by(SyncRecoveryGaps.room_id, SyncRecoveryGaps.generation)
-        )
-        rows = list(
-            PendingTimelineEvents.select()
-            .where(PendingTimelineEvents.account == account)
-            .order_by(
-                PendingTimelineEvents.room_id,
-                PendingTimelineEvents.generation,
-                Case(
-                    PendingTimelineEvents.generation,
-                    ((0, PendingTimelineEvents.id),),
-                    PendingTimelineEvents.sequence,
-                ),
-                PendingTimelineEvents.id,
-            )
-        )
-        key = self._recovery_payload_key()
-        events = []
-        for row in rows:
-            source_json, kind = (
-                ("", "timeline")
-                if row.generation == 0
-                else self._decrypt_recovery_payload(key, account.id, row)
-            )
-            events.append(
-                PendingTimelineEvent(
-                    row.room_id,
-                    row.generation,
-                    row.sequence,
-                    row.event_id,
-                    source_json,
-                    row.is_live,
-                    row.was_encrypted,
-                    row.was_completed,
-                    kind,
-                    row.admission_accepted,
-                    TimelineEventProvenance(row.provenance),
-                    row.apply_room_state,
-                )
-            )
-        return gaps, events, abandoned
-
-    @use_database
-    def has_real_recovery_gap(self, room_id: str) -> bool:
-        """Return whether this room has persisted, non-synthetic recovery work."""
-        account = self._get_account()
-        if not account:
-            return False
-        return (
-            SyncRecoveryGaps.select()
-            .where(
-                SyncRecoveryGaps.account == account,
-                SyncRecoveryGaps.room_id == room_id,
-                SyncRecoveryGaps.target_token != "",
-            )
-            .exists()
-        )
-
-    @use_database_atomic
-    def accept_recovery_event(
-        self,
-        room_id: str,
-        generation: int,
-        event_id: str,
-    ) -> None:
-        """Durably record admission before ordinary callback fanout.
-
-        The row is matched without its generation: after a crashed sync
-        iteration the store can hold the event under a different generation
-        than the running loop believes, and the event has at most one row
-        either way. A missing row is tolerated for the same reason — raising
-        here poisons every following sync iteration with the same error,
-        while the worst case of continuing is one duplicate callback
-        dispatch, which admission dedup already absorbs.
-        """
-        account = self._get_account()
-        assert account
-        updated = (
-            PendingTimelineEvents.update(admission_accepted=True)
-            .where(
-                PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id == room_id,
-                PendingTimelineEvents.generation > 0,
-                PendingTimelineEvents.event_id == event_id,
-            )
-            .execute()
-        )
-        if updated != 1:
-            logger.warning(
-                "Pending recovery event already cleared at admission: %s "
-                "(generation %d in %s)",
-                event_id,
-                generation,
-                room_id,
-            )
-
-    @use_database
-    def load_sliding_window_tokens(self) -> dict[str, SlidingWindowToken]:
-        """Load each room's last sliding window token."""
-        account = self._get_account()
-        if not account:
-            return {}
-        return {
-            row.room_id: SlidingWindowToken(row.token, row.membership_event_id)
-            for row in SlidingWindowTokens.select().where(
-                SlidingWindowTokens.account == account
-            )
-        }
-
-    @use_database_atomic
-    def save_sliding_window_tokens(
-        self,
-        tokens: Mapping[str, SlidingWindowToken],
-        forgotten: Iterable[str] = (),
-    ) -> None:
-        """Persist window tokens, dropping the rooms that no longer have one."""
-        account = self._get_account()
-        assert account
-        self._write_sliding_window_tokens(account, tokens, forgotten)
-
-    def _write_sliding_window_tokens(
-        self,
-        account,
-        tokens: Mapping[str, SlidingWindowToken] | None,
-        forgotten: Iterable[str],
-    ) -> None:
-        """Write window tokens in chunks SQLite can bind in one statement."""
-        forgotten = list(forgotten)
-        for index in range(0, len(forgotten), _RECOVERY_WRITE_CHUNK_SIZE):
-            SlidingWindowTokens.delete().where(
-                SlidingWindowTokens.account == account,
-                SlidingWindowTokens.room_id.in_(
-                    forgotten[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-                ),
-            ).execute()
-
-        rows = [
-            {
-                "account": account,
-                "room_id": room_id,
-                "token": token.token,
-                "membership_event_id": token.membership_event_id,
-            }
-            for room_id, token in (tokens or {}).items()
-        ]
-        for index in range(0, len(rows), _RECOVERY_WRITE_CHUNK_SIZE):
-            SlidingWindowTokens.replace_many(
-                rows[index : index + _RECOVERY_WRITE_CHUNK_SIZE]
-            ).execute()
-
-    @use_database_atomic
-    def forget_sliding_window_token(self, room_id: str) -> None:
-        """Drop one room's window token, e.g. after leaving or forgetting it."""
-        account = self._get_account()
-        if not account:
-            return
-        SlidingWindowTokens.delete().where(
-            SlidingWindowTokens.account == account,
-            SlidingWindowTokens.room_id == room_id,
-        ).execute()
-
-    @use_database_atomic
-    def finish_recovery(
-        self,
-        room_id: str,
-        generation: int,
-        event_id: str | None,
-        was_encrypted: bool,
-    ) -> None:
-        account = self._get_account()
-        assert account
-        event_filter = (
-            PendingTimelineEvents.account == account,
-            PendingTimelineEvents.room_id == room_id,
-            PendingTimelineEvents.generation == generation,
-        )
-        if event_id:
-            # Completion must tolerate a crashed iteration's leftovers: the
-            # row may already be gone, sit under another generation, or
-            # already be a generation-0 marker. INSERT OR REPLACE collapses
-            # every such state into the single marker row, where the old
-            # fetch/delete/insert sequence raised DoesNotExist or violated
-            # the UNIQUE(account_id, room_id, event_id) constraint.
-            pending = PendingTimelineEvents.get_or_none(
-                PendingTimelineEvents.account == account,
-                PendingTimelineEvents.room_id == room_id,
-                PendingTimelineEvents.event_id == event_id,
-            )
-            if event_id.startswith("~"):
-                if pending:
-                    pending.delete_instance()
-                return
-            # The marker mirrors record_completed_timeline_event: the first
-            # completion's provenance sticks, and encryption state combines
-            # with AND so an event once delivered decrypted is never
-            # re-dispatched as pending decryption.
-            already_completed = pending is not None and pending.generation == 0
-            PendingTimelineEvents.replace(
-                account=account,
-                room_id=room_id,
-                generation=0,
-                sequence=0,
-                event_id=event_id,
-                event_payload=b"",
-                is_live=False,
-                was_encrypted=(
-                    bool(pending.was_encrypted) and was_encrypted
-                    if already_completed
-                    else was_encrypted
-                ),
-                was_completed=False,
-                admission_accepted=False,
-                provenance=(
-                    pending.provenance
-                    if pending
-                    else TimelineEventProvenance.HISTORY.value
-                ),
-                apply_room_state=False,
-            ).execute()
-            stale = (
-                PendingTimelineEvents.select(PendingTimelineEvents.id)
-                .where(
-                    PendingTimelineEvents.account == account,
-                    PendingTimelineEvents.room_id == room_id,
-                    PendingTimelineEvents.generation == 0,
-                )
-                .order_by(PendingTimelineEvents.id.desc())
-                .offset(512)
-            )
-            PendingTimelineEvents.delete().where(
-                PendingTimelineEvents.id.in_(stale)
-            ).execute()
-            return
-        PendingTimelineEvents.delete().where(*event_filter).execute()
-        SyncRecoveryGaps.delete().where(
-            SyncRecoveryGaps.account == account,
-            SyncRecoveryGaps.room_id == room_id,
-            SyncRecoveryGaps.generation == generation,
-        ).execute()
-
-    @use_database
     def delete_encrypted_room(self, room: str) -> None:
         """Delete an encrypted room from the store."""
         db_room = EncryptedRooms.get_or_none(EncryptedRooms.room_id == room)
@@ -1514,23 +679,124 @@ class DefaultStore(MatrixStore):
             should be used.
     """
 
-    supports_atomic_recovery: ClassVar[bool] = True
-    supports_recovery_abandonment_reasons: ClassVar[bool] = True
     trust_db: KeyStore = field(init=False)
     blacklist_db: KeyStore = field(init=False)
+    ignore_db: KeyStore = field(init=False)
+    _trust_guard_depth: int = field(default=0, init=False, repr=False)
+    _trust_guard_lease: FileLease | None = field(default=None, init=False, repr=False)
+    _trust_guard_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    _trust_guard_thread: int | None = field(default=None, init=False, repr=False)
+    _trust_guard_pid: int = field(default=0, init=False, repr=False)
+    _trust_sidecar_coordinated: bool = field(default=False, init=False, repr=False)
+
+    @contextmanager
+    def _trust_sidecar_guard(self):
+        if not self._trust_sidecar_coordinated:
+            yield
+            return
+        if os.getpid() != self._trust_guard_pid:
+            raise LocalProtocolError(
+                "ordinary trust store belongs to the constructing process"
+            )
+        with self._trust_guard_lock:
+            if self._trust_guard_depth:
+                self._assert_trust_sidecar_owner()
+                self._trust_guard_depth += 1
+                try:
+                    yield
+                finally:
+                    self._trust_guard_depth -= 1
+                return
+
+            if not isinstance(self.database, LeasedSqliteDatabase):
+                raise LocalProtocolError(
+                    "ordinary trust database has no built-in lease"
+                )
+            # A separate shared lease protects sidecars even if the SQLite
+            # connection closes during this operation. Closed handles probe
+            # the marker before reading or writing their cached trust state.
+            lease = FileLease(Path(self.database_path), exclusive=False)
+            try:
+                if self.database.is_closed():
+                    uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
+                    with closing(sqlite3.connect(uri, uri=True)) as probe:
+                        try:
+                            check_ordinary_database(probe)
+                        except LocalProtocolError as error:
+                            raise LocalProtocolError(
+                                "legacy trust sidecars are unavailable after adoption"
+                            ) from error
+            except BaseException:
+                lease.close()
+                raise
+            self._trust_guard_lease = lease
+            self._trust_guard_depth = 1
+            self._trust_guard_thread = threading.get_ident()
+            try:
+                yield
+                self._assert_trust_sidecar_owner()
+            finally:
+                self._trust_guard_depth = 0
+                self._trust_guard_thread = None
+                self._trust_guard_lease = None
+                lease.close()
+
+    def _assert_trust_sidecar_owner(self) -> None:
+        if not self._trust_sidecar_coordinated:
+            return
+        lease = self._trust_guard_lease
+        if not self._trust_guard_depth or lease is None:
+            raise LocalProtocolError("trust sidecar I/O requires shared ownership")
+        if threading.get_ident() != self._trust_guard_thread:
+            raise LocalProtocolError(
+                "trust sidecar ownership belongs to another thread"
+            )
+        lease.assert_open()
 
     def __post_init__(self):
+        self._trust_guard_pid = os.getpid()
+        self._trust_sidecar_coordinated = (
+            type(self)._create_database is MatrixStore._create_database
+        )
         super().__post_init__()
+        try:
+            with self._trust_sidecar_guard():
+                store_ref = weakref.ref(self)
 
-        trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
-        self.trust_db = KeyStore(os.path.join(self.store_path, trust_file_path))
+                def assert_owner() -> None:
+                    store = store_ref()
+                    if store is None:
+                        raise LocalProtocolError("trust sidecar owner was finalized")
+                    store._assert_trust_sidecar_owner()
 
-        blacklist_file_path = f"{self.user_id}_{self.device_id}.blacklisted_devices"
-        self.blacklist_db = KeyStore(os.path.join(self.store_path, blacklist_file_path))
+                ownership_assertion = (
+                    assert_owner if self._trust_sidecar_coordinated else None
+                )
+                trust_file_path = f"{self.user_id}_{self.device_id}.trusted_devices"
+                self.trust_db = KeyStore(
+                    os.path.join(self.store_path, trust_file_path),
+                    ownership_assertion,
+                )
+                blacklist_file_path = (
+                    f"{self.user_id}_{self.device_id}.blacklisted_devices"
+                )
+                self.blacklist_db = KeyStore(
+                    os.path.join(self.store_path, blacklist_file_path),
+                    ownership_assertion,
+                )
+                ignore_file_path = f"{self.user_id}_{self.device_id}.ignored_devices"
+                self.ignore_db = KeyStore(
+                    os.path.join(self.store_path, ignore_file_path),
+                    ownership_assertion,
+                )
+        except BaseException:
+            if not self.database.is_closed():
+                self.database.close()
+            raise
 
-        ignore_file_path = f"{self.user_id}_{self.device_id}.ignored_devices"
-        self.ignore_db = KeyStore(os.path.join(self.store_path, ignore_file_path))
-
+    @use_default_trust_sidecars
     def blacklist_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.trust_db.remove(key)
@@ -1538,6 +804,7 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.blacklisted
         return self.blacklist_db.add(key)
 
+    @use_default_trust_sidecars
     def unblacklist_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1547,6 +814,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def verify_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.blacklist_db.remove(key)
@@ -1554,14 +822,17 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.verified
         return self.trust_db.add(key)
 
+    @use_default_trust_sidecars
     def is_device_verified(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.trust_db
 
+    @use_default_trust_sidecars
     def is_device_blacklisted(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.blacklist_db
 
+    @use_default_trust_sidecars
     def unverify_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1571,6 +842,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def ignore_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         self.blacklist_db.remove(key)
@@ -1578,6 +850,7 @@ class DefaultStore(MatrixStore):
         device.trust_state = TrustState.ignored
         return self.ignore_db.add(key)
 
+    @use_default_trust_sidecars
     def unignore_device(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
 
@@ -1587,6 +860,7 @@ class DefaultStore(MatrixStore):
 
         return False
 
+    @use_default_trust_sidecars
     def ignore_devices(self, devices: list[OlmDevice]) -> None:
         keys = [Key.from_olmdevice(device) for device in devices]
 
@@ -1599,10 +873,12 @@ class DefaultStore(MatrixStore):
 
         return
 
+    @use_default_trust_sidecars
     def is_device_ignored(self, device: OlmDevice) -> bool:
         key = Key.from_olmdevice(device)
         return key in self.ignore_db
 
+    @use_default_trust_sidecars
     @use_database
     def load_device_keys(self) -> DeviceStore:
         store = DeviceStore()
@@ -1654,8 +930,6 @@ class SqliteStore(MatrixStore):
             should be used.
     """
 
-    supports_atomic_recovery: ClassVar[bool] = True
-    supports_recovery_abandonment_reasons: ClassVar[bool] = True
     models = MatrixStore.models + [DeviceTrustState]
 
     def _get_device(self, device):
@@ -1673,7 +947,7 @@ class SqliteStore(MatrixStore):
         except DoesNotExist:
             return None
 
-    @use_database
+    @use_database_atomic
     def verify_device(self, device: OlmDevice) -> bool:
         if self.is_device_verified(device):
             return False
@@ -1687,7 +961,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unverify_device(self, device: OlmDevice) -> bool:
         if not self.is_device_verified(device):
             return False
@@ -1715,7 +989,7 @@ class SqliteStore(MatrixStore):
 
         return trust_state == TrustState.verified
 
-    @use_database
+    @use_database_atomic
     def blacklist_device(self, device: OlmDevice) -> bool:
         if self.is_device_blacklisted(device):
             return False
@@ -1729,7 +1003,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unblacklist_device(self, device: OlmDevice) -> bool:
         if not self.is_device_blacklisted(device):
             return False
@@ -1757,7 +1031,7 @@ class SqliteStore(MatrixStore):
 
         return trust_state == TrustState.blacklisted
 
-    @use_database
+    @use_database_atomic
     def ignore_device(self, device: OlmDevice) -> bool:
         if self.is_device_ignored(device):
             return False
@@ -1771,7 +1045,7 @@ class SqliteStore(MatrixStore):
 
         return True
 
-    @use_database
+    @use_database_atomic
     def unignore_device(self, device: OlmDevice) -> bool:
         if not self.is_device_ignored(device):
             return False
@@ -1905,9 +1179,6 @@ class SqliteMemoryStore(SqliteStore):
         pickle_key (str, optional): A passphrase that will be used to encrypt
             encryption keys while they are in storage.
     """
-
-    supports_atomic_recovery: ClassVar[bool] = True
-    supports_recovery_abandonment_reasons: ClassVar[bool] = True
 
     def __init__(self, user_id, device_id, pickle_key=""):
         super().__init__(user_id, device_id, "", pickle_key=pickle_key)

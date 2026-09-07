@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import math
 import re
@@ -117,7 +118,6 @@ from nio import (
     SetPushRuleActionsResponse,
     SetPushRuleResponse,
     ShareGroupSessionResponse,
-    SlidingSyncResponse,
     SpaceGetHierarchyError,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -135,12 +135,9 @@ from nio import (
     UploadFilterResponse,
     UploadResponse,
 )
-from nio.client.sync_reset_fence import finish_sync_request, issue_sync_request
 from nio.api import (
-    MATRIX_API_PATH_UNSTABLE,
     MATRIX_API_PATH_V1,
     MATRIX_API_PATH_V3,
-    MATRIX_API_PATH_V4,
     MATRIX_LEGACY_MEDIA_API_PATH,
     MATRIX_MEDIA_API_PATH,
     EventFormat,
@@ -152,12 +149,15 @@ from nio.api import (
 )
 from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
-from nio.responses import PublicRoom, PublicRoomsResponse
+from nio.responses import (
+    PublicRoom,
+    PublicRoomsResponse,
+    RoomUpgradeError,
+    WhoamiError,
+)
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
-BASE_URL_V4 = f"https://example.org{MATRIX_API_PATH_V4}"
-BASE_URL_UNSTABLE = f"https://example.org{MATRIX_API_PATH_UNSTABLE}"
 BASE_MEDIA_URL = f"https://example.org{MATRIX_MEDIA_API_PATH}"
 BASE_LEGACY_MEDIA_URL = f"https://example.org{MATRIX_LEGACY_MEDIA_API_PATH}"
 TEST_ROOM_ID = "!testroom:example.org"
@@ -901,1391 +901,11 @@ class TestClass:
         assert user.presence == "online"
         assert user.status_msg == "I am here."
 
-    async def test_sliding_sync(self, async_client, aioresponse):
-        lists = {
-            "main": {
-                "timeline_limit": 1,
-                "required_state": [["m.room.create", ""]],
-                "ranges": [[0, 19]],
-            }
-        }
-
-        def sliding_sync_cb(url, data, headers, **kwargs):
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-
-            assert headers["Authorization"] == f"Bearer {async_client.access_token}"
-            # pos/timeout travel as query parameters, not body fields.
-            assert url.query["timeout"] == "0"
-            assert url.query["pos"] == "s123"
-            assert json.loads(data) == {
-                "conn_id": "main",
-                "lists": lists,
-            }
-            return CallbackResult(
-                status=200,
-                payload={
-                    "pos": "s1",
-                    "lists": {"main": {"count": 1}},
-                    "rooms": {},
-                },
-            )
-
-        aioresponse.post(
-            f"{BASE_URL_UNSTABLE}/org.matrix.simplified_msc3575/sync"
-            "?pos=s123&timeout=0",
-            callback=sliding_sync_cb,
-        )
-
-        resp = await async_client.sliding_sync(
-            conn_id="main",
-            pos="s123",
-            timeout=0,
-            lists=lists,
-        )
-
-        assert isinstance(resp, SlidingSyncResponse)
-        assert resp.pos == "s1"
-        assert resp.lists["main"].count == 1
-
-    sliding_sync_url = re.compile(
-        rf"^https://example\.org{MATRIX_API_PATH_UNSTABLE}"
-        r"/org\.matrix\.simplified_msc3575/sync.*$"
-    )
-
-    @staticmethod
-    def sliding_sync_request_recorder(script):
-        """Return an aioresponses callback that records requests.
-
-        ``script`` maps the 1-based request number to the CallbackResult to
-        return; unlisted requests get an empty response with a fresh pos.
-        The returned ``requests`` list collects ``(query, body)`` pairs.
-        """
-        requests = []
-
-        def callback(url, data, **kwargs):
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-            requests.append((dict(url.query), json.loads(data)))
-
-            result = script.get(len(requests))
-            if result is not None:
-                return result
-
-            return CallbackResult(
-                status=200, payload={"pos": f"p{len(requests)}", "rooms": {}}
-            )
-
-        return requests, callback
-
-    async def test_sliding_sync_forever(self, async_client, aioresponse):
-        lists = {
-            "main": {
-                "ranges": [[0, 19]],
-                "timeline_limit": 10,
-                "required_state": [
-                    ["m.room.create", ""],
-                    ["m.room.name", ""],
-                    ["m.room.member", "$LAZY"],
-                ],
-            }
-        }
-        extensions = {
-            "to_device": {"enabled": True},
-            "e2ee": {"enabled": True},
-            "account_data": {"enabled": True},
-        }
-
-        first_payload = {
-            "pos": "p1",
-            "lists": {"main": {"count": 1}},
-            "rooms": {
-                TEST_ROOM_ID: {
-                    "name": "Sliding Room",
-                    "initial": True,
-                    "joined_count": 2,
-                    "invited_count": 0,
-                    "notification_count": 2,
-                    "highlight_count": 1,
-                    "required_state": [
-                        {
-                            "event_id": "$create:example.org",
-                            "sender": ALICE_ID,
-                            "type": "m.room.create",
-                            "state_key": "",
-                            "origin_server_ts": 1,
-                            "content": {"creator": ALICE_ID},
-                        },
-                        {
-                            "event_id": "$name:example.org",
-                            "sender": ALICE_ID,
-                            "type": "m.room.name",
-                            "state_key": "",
-                            "origin_server_ts": 2,
-                            "content": {"name": "Sliding Room"},
-                        },
-                        {
-                            "event_id": "$alice:example.org",
-                            "sender": ALICE_ID,
-                            "type": "m.room.member",
-                            "state_key": ALICE_ID,
-                            "origin_server_ts": 3,
-                            "content": {"membership": "join", "displayname": "Alice"},
-                        },
-                    ],
-                    "timeline": [
-                        {
-                            "event_id": "$hello:example.org",
-                            "sender": ALICE_ID,
-                            "type": "m.room.message",
-                            "origin_server_ts": 4,
-                            "content": {"msgtype": "m.text", "body": "hello sliding"},
-                        }
-                    ],
-                    "prev_batch": "t1",
-                    "limited": False,
-                }
-            },
-            "extensions": {
-                "to_device": {
-                    "next_batch": "td1",
-                    "events": [
-                        {
-                            "sender": ALICE_ID,
-                            "type": "org.example.ping",
-                            "content": {"body": "ping"},
-                        }
-                    ],
-                },
-                "e2ee": {"device_one_time_keys_count": {"signed_curve25519": 50}},
-            },
-        }
-
-        requests, callback = self.sliding_sync_request_recorder(
-            {1: CallbackResult(status=200, payload=first_payload)}
-        )
-        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/query",
-            status=200,
-            payload=self.keys_query_response,
-            repeat=True,
-        )
-
-        messages = []
-        to_device = []
-
-        async def message_cb(room, event):
-            messages.append((room.room_id, event))
-
-        async def to_device_cb(event):
-            to_device.append(event)
-
-        async_client.add_event_callback(message_cb, RoomMessageText)
-        async_client.add_to_device_callback(to_device_cb, UnknownToDeviceEvent)
-
-        sliding_responses = []
-
-        async def response_cb(response):
-            sliding_responses.append(response)
-            if len(sliding_responses) >= 3:
-                async_client.stop_sync_forever()
-
-        async_client.add_response_callback(response_cb, SlidingSyncResponse)
-
-        assert async_client.should_upload_keys
-
-        await asyncio.wait_for(
-            async_client.sliding_sync_forever(
-                timeout=30_000,
-                conn_id="test-conn",
-                lists=lists,
-                extensions=extensions,
-            ),
-            60,
-        )
-
-        # The first request is an initial sync: no pos, no server long-poll.
-        first_query, first_body = requests[0]
-        assert "pos" not in first_query
-        assert first_query["timeout"] == "0"
-        assert first_body["conn_id"] == "test-conn"
-        assert first_body["lists"] == lists
-        assert first_body["extensions"] == extensions
-
-        # Later requests thread pos and the to-device delivery token.
-        second_query, second_body = requests[1]
-        assert second_query["pos"] == "p1"
-        assert second_query["timeout"] == "30000"
-        assert second_body["extensions"]["to_device"] == {
-            "enabled": True,
-            "since": "td1",
-        }
-        # The caller's extensions dict is never mutated.
-        assert extensions["to_device"] == {"enabled": True}
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.name == "Sliding Room"
-        assert ALICE_ID in room.users
-        assert room.summary.joined_member_count == 2
-        assert room.unread_notifications == 2
-        assert room.unread_highlights == 1
-
-        assert [event.body for _, event in messages] == ["hello sliding"]
-        assert [event.source["type"] for event in to_device] == ["org.example.ping"]
-
-        assert not async_client.should_upload_keys
-
-    async def test_sliding_sync_forever_seeds_room_tokens(
-        self, async_client, aioresponse
-    ):
-        """The first request widens its ranges, the rest do not.
-
-        A room outside the list window never hands the client a token, so
-        a limited window it later arrives with cannot be recovered. The
-        connection's first request covers every room to collect those
-        tokens; the configured window applies from then on.
-        """
-        async_client.config = AsyncClientConfig(
-            backfill_limited_timelines=True,
-            backfill_sliding_seed_rooms=500,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-            repeat=True,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/query",
-            status=200,
-            payload=self.keys_query_response,
-            repeat=True,
-        )
-        requests = []
-
-        def callback(url, data, **kwargs):
-            requests.append(json.loads(data))
-            if len(requests) >= 2:
-                async_client.stop_sync_forever()
-            return CallbackResult(
-                status=200, payload={"pos": f"p{len(requests)}", "rooms": {}}
-            )
-
-        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
-
-        lists = {
-            "main": {"ranges": [[0, 9]], "timeline_limit": 5},
-            "archive": {"ranges": [[1000, 1010]], "timeline_limit": 1},
-        }
-        await asyncio.wait_for(
-            async_client.sliding_sync_forever(
-                timeout=30_000, conn_id="seed", lists=lists
-            ),
-            60,
-        )
-
-        assert requests[0]["lists"]["main"]["ranges"] == [[0, 499]]
-        assert requests[0]["lists"]["archive"]["ranges"] == [
-            [0, 499],
-            [1000, 1010],
-        ]
-        assert requests[1]["lists"]["main"]["ranges"] == [[0, 9]]
-        assert requests[1]["lists"]["archive"]["ranges"] == [[1000, 1010]]
-        # Widening is a copy; the caller's lists are untouched.
-        assert lists["main"]["ranges"] == [[0, 9]]
-        assert lists["archive"]["ranges"] == [[1000, 1010]]
-        assert requests[0]["lists"]["main"]["timeline_limit"] == 5
-
-    async def test_sliding_sync_forever_without_backfill_keeps_ranges(
-        self, async_client, aioresponse
-    ):
-        """Widening is a backfill concern; plain loops are unchanged."""
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-            repeat=True,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/query",
-            status=200,
-            payload=self.keys_query_response,
-            repeat=True,
-        )
-        requests = []
-
-        def callback(url, data, **kwargs):
-            requests.append(json.loads(data))
-            if len(requests) >= 2:
-                async_client.stop_sync_forever()
-            return CallbackResult(
-                status=200, payload={"pos": f"p{len(requests)}", "rooms": {}}
-            )
-
-        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
-
-        await asyncio.wait_for(
-            async_client.sliding_sync_forever(
-                timeout=30_000,
-                conn_id="plain",
-                lists={"main": {"ranges": [[0, 9]], "timeline_limit": 5}},
-            ),
-            60,
-        )
-
-        assert requests[0]["lists"]["main"]["ranges"] == [[0, 9]]
-
-    async def test_sliding_sync_forever_unknown_pos(self, async_client, aioresponse):
-        def message(event_id, body):
-            return {
-                "event_id": event_id,
-                "sender": ALICE_ID,
-                "type": "m.room.message",
-                "origin_server_ts": 1,
-                "content": {"msgtype": "m.text", "body": body},
-            }
-
-        room = {
-            "name": "Replay Room",
-            "joined_count": 1,
-            "invited_count": 0,
-            "required_state": [],
-            "timeline": [message("$m1:example.org", "first")],
-        }
-        # After a pos reset the server re-renders the window: the same
-        # timeline events come again, plus whatever is new.
-        replayed_room = {
-            **room,
-            "initial": True,
-            "timeline": [
-                message("$m1:example.org", "first"),
-                message("$m2:example.org", "second"),
-            ],
-        }
-
-        requests, callback = self.sliding_sync_request_recorder(
-            {
-                1: CallbackResult(
-                    status=200,
-                    payload={
-                        "pos": "p1",
-                        "rooms": {TEST_ROOM_ID: room},
-                        "extensions": {"to_device": {"next_batch": "td1"}},
-                    },
-                ),
-                2: CallbackResult(
-                    status=400,
-                    payload={
-                        "errcode": "M_UNKNOWN_POS",
-                        "error": "Connection expired",
-                    },
-                ),
-                3: CallbackResult(
-                    status=200,
-                    payload={"pos": "p3", "rooms": {TEST_ROOM_ID: replayed_room}},
-                ),
-            }
-        )
-        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-        )
-
-        messages = []
-
-        async def message_cb(room, event):
-            messages.append(event)
-
-        async_client.add_event_callback(message_cb, RoomMessageText)
-
-        sliding_responses = []
-
-        async def response_cb(response):
-            sliding_responses.append(response)
-            if len(sliding_responses) >= 2:
-                async_client.stop_sync_forever()
-
-        async_client.add_response_callback(response_cb, SlidingSyncResponse)
-
-        await asyncio.wait_for(
-            async_client.sliding_sync_forever(
-                timeout=30_000,
-                conn_id="test-conn",
-                extensions={"to_device": {"enabled": True}},
-            ),
-            60,
-        )
-
-        assert len(requests) == 3
-
-        # The second request carried the now-expired pos.
-        assert requests[1][0]["pos"] == "p1"
-
-        # After M_UNKNOWN_POS the connection restarts without a pos, but the
-        # to-device delivery token is kept: it is independent of pos.
-        reset_query, reset_body = requests[2]
-        assert "pos" not in reset_query
-        assert reset_body["extensions"]["to_device"]["since"] == "td1"
-
-        # The replayed timeline event is not dispatched a second time.
-        assert [event.body for event in messages] == ["first", "second"]
-
-    async def test_receive_sliding_sync_response(self, async_client):
-        own_id = async_client.user_id
-        invited_room_id = "!invited:example.org"
-        left_room_id = "!left:example.org"
-
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "rooms": {
-                    invited_room_id: {
-                        "membership": "invite",
-                        "invite_state": [
-                            {
-                                "sender": ALICE_ID,
-                                "state_key": "",
-                                "type": "m.room.name",
-                                "content": {"name": "Invited Room"},
-                            },
-                            {
-                                "sender": ALICE_ID,
-                                "state_key": own_id,
-                                "type": "m.room.member",
-                                "content": {"membership": "invite"},
-                            },
-                        ],
-                    },
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "joined_count": 2,
-                        "invited_count": 1,
-                        "notification_count": 11,
-                        "highlight_count": 1,
-                        "heroes": [
-                            {"user_id": ALICE_ID, "displayname": "Alice"},
-                            {
-                                "user_id": CAROL_ID,
-                                "displayname": "Carol",
-                                "avatar_url": "mxc://example.org/carol",
-                            },
-                        ],
-                        "required_state": [
-                            {
-                                "event_id": "$enc:example.org",
-                                "sender": ALICE_ID,
-                                "type": "m.room.encryption",
-                                "state_key": "",
-                                "origin_server_ts": 1,
-                                "content": {
-                                    "algorithm": "m.megolm.v1.aes-sha2",
-                                },
-                            },
-                            {
-                                "event_id": "$alice:example.org",
-                                "sender": ALICE_ID,
-                                "type": "m.room.member",
-                                "state_key": ALICE_ID,
-                                "origin_server_ts": 2,
-                                "content": {"membership": "join"},
-                            },
-                        ],
-                        "timeline": [
-                            {
-                                "event_id": "$megolm:example.org",
-                                "sender": ALICE_ID,
-                                "type": "m.room.encrypted",
-                                "origin_server_ts": 3,
-                                "content": {
-                                    "algorithm": "m.megolm.v1.aes-sha2",
-                                    "ciphertext": "AwgAEnACgAkLmt6q",
-                                    "device_id": "JLAFKJWSCS",
-                                    "sender_key": "IlRMeOPX2e0MurIyfWEucYBRVOEEUMrOHqn/8mLqMjA",
-                                    "session_id": "X3lUlvLELLYxeTx4yOVu6UDpasGEVO0J",
-                                },
-                            },
-                        ],
-                    },
-                    left_room_id: {
-                        "membership": "leave",
-                        "required_state": [],
-                        "timeline": [
-                            {
-                                "event_id": "$bye:example.org",
-                                "sender": ALICE_ID,
-                                "type": "m.room.message",
-                                "origin_server_ts": 4,
-                                "content": {"msgtype": "m.text", "body": "bye"},
-                            },
-                        ],
-                    },
-                },
-                "extensions": {
-                    "to_device": {"next_batch": "td9", "events": []},
-                    "e2ee": {
-                        # An explicit zero must reach the olm machine so a
-                        # drained key pool is replenished.
-                        "device_one_time_keys_count": {"signed_curve25519": 0},
-                        "device_lists": {"changed": [ALICE_ID], "left": []},
-                    },
-                    "account_data": {
-                        "global": [
-                            {
-                                "type": "org.example.settings",
-                                "content": {"setting": True},
-                            },
-                        ],
-                        "rooms": {
-                            TEST_ROOM_ID: [
-                                {
-                                    "type": "m.fully_read",
-                                    "content": {"event_id": "$megolm:example.org"},
-                                },
-                            ],
-                        },
-                    },
-                },
-            }
-        )
-        assert isinstance(response, SlidingSyncResponse)
-
-        events = []
-        invite_events = []
-        global_account_data = []
-        room_account_data = []
-
-        async def event_cb(room, event):
-            events.append((room.room_id, event))
-
-        async def invite_cb(room, event):
-            invite_events.append((room.room_id, event))
-
-        async def global_account_data_cb(event):
-            global_account_data.append(event)
-
-        async def room_account_data_cb(room, event):
-            room_account_data.append((room.room_id, event))
-
-        async_client.add_event_callback(event_cb, MegolmEvent)
-        async_client.add_event_callback(invite_cb, InviteNameEvent)
-        async_client.add_global_account_data_callback(
-            global_account_data_cb, UnknownAccountDataEvent
-        )
-        async_client.add_room_account_data_callback(
-            room_account_data_cb, FullyReadEvent
-        )
-
-        await async_client.receive_response(response)
-
-        # The invite got its own room with the stripped state applied.
-        invited_room = async_client.invited_rooms[invited_room_id]
-        assert invited_room.name == "Invited Room"
-        assert invited_room.inviter == ALICE_ID
-        assert [room_id for room_id, _ in invite_events] == [invited_room_id]
-
-        # The joined room was built from required_state and the server
-        # computed fields.
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.encrypted
-        assert TEST_ROOM_ID in async_client.encrypted_rooms
-        assert ALICE_ID in room.users
-        assert room.summary.joined_member_count == 2
-        assert room.summary.invited_member_count == 1
-        assert room.summary.heroes == [ALICE_ID, CAROL_ID]
-        assert room.unread_notifications == 11
-        assert room.unread_highlights == 1
-
-        # Heroes that lazy member loading never delivered are seeded as
-        # members so display names and avatars resolve.
-        assert room.users[CAROL_ID].display_name == "Carol"
-        assert room.users[CAROL_ID].avatar_url == "mxc://example.org/carol"
-
-        # The undecryptable timeline event was dispatched as a MegolmEvent
-        # with its room id attached.
-        assert len(events) == 1
-        assert events[0][0] == TEST_ROOM_ID
-        assert events[0][1].room_id == TEST_ROOM_ID
-
-        # Left rooms are parsed but never applied, matching /v3/sync.
-        assert left_room_id not in async_client.rooms
-
-        # Extensions reached the olm machine and the account data callbacks.
-        assert async_client.olm.uploaded_key_count == 0
-        assert ALICE_ID in async_client.users_for_key_query
-        assert async_client._sliding_sync_to_device_since == "td9"
-        assert [event.type for event in global_account_data] == ["org.example.settings"]
-        assert [(room_id, event.event_id) for room_id, event in room_account_data] == [
-            (TEST_ROOM_ID, "$megolm:example.org")
-        ]
-        assert room.fully_read_marker == "$megolm:example.org"
-
-        # Accepting the invite moves the room from invited to joined.
-        join_response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p2",
-                "rooms": {
-                    invited_room_id: {
-                        "membership": "join",
-                        "joined_count": 2,
-                        "invited_count": 0,
-                        "required_state": [
-                            {
-                                "event_id": "$join:example.org",
-                                "sender": own_id,
-                                "type": "m.room.member",
-                                "state_key": own_id,
-                                "origin_server_ts": 5,
-                                "content": {"membership": "join"},
-                            },
-                        ],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(join_response)
-
-        assert invited_room_id not in async_client.invited_rooms
-        assert own_id in async_client.rooms[invited_room_id].users
-
-    async def test_sliding_sync_encrypted_round_trip(
-        self, async_client_pair, aioresponse
-    ):
-        alice, bob = async_client_pair
-
-        seed = {
-            "pos": "s1",
-            "rooms": {
-                TEST_ROOM_ID: {
-                    "membership": "join",
-                    "joined_count": 2,
-                    "invited_count": 0,
-                    "required_state": [
-                        {
-                            "event_id": "$enc:example.org",
-                            "sender": alice.user_id,
-                            "type": "m.room.encryption",
-                            "state_key": "",
-                            "origin_server_ts": 1,
-                            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
-                        },
-                        *(
-                            {
-                                "event_id": f"$member{i}:example.org",
-                                "sender": user_id,
-                                "type": "m.room.member",
-                                "state_key": user_id,
-                                "origin_server_ts": 2,
-                                "content": {"membership": "join"},
-                            }
-                            for i, user_id in enumerate((alice.user_id, bob.user_id))
-                        ),
-                    ],
-                    "timeline": [],
-                },
-            },
-        }
-        await alice.receive_response(SlidingSyncResponse.from_dict(seed))
-        await bob.receive_response(SlidingSyncResponse.from_dict(seed))
-
-        assert alice.rooms[TEST_ROOM_ID].encrypted
-        assert bob.rooms[TEST_ROOM_ID].encrypted
-
-        alice_device = OlmDevice(
-            alice.user_id, alice.device_id, alice.olm.account.identity_keys
-        )
-        bob_device = OlmDevice(
-            bob.user_id, bob.device_id, bob.olm.account.identity_keys
-        )
-        alice.olm.device_store.add(bob_device)
-        bob.olm.device_store.add(alice_device)
-
-        alice_to_share = alice.olm.share_keys()
-        alice_one_time = list(alice_to_share["one_time_keys"].items())[0]
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/claim",
-            status=200,
-            payload={
-                "one_time_keys": {
-                    alice.user_id: {
-                        alice.device_id: {alice_one_time[0]: alice_one_time[1]},
-                    },
-                },
-                "failures": {},
-            },
-        )
-
-        to_device_for_alice = None
-
-        def to_device_cb(url, data, **kwargs):
-            nonlocal to_device_for_alice
-            to_device_for_alice = json.loads(data)
-            return CallbackResult(status=200, payload={})
-
-        to_device_url = re.compile(
-            rf"https://example\.org{MATRIX_API_PATH_V3}"
-            r"/sendToDevice/m\.room.encrypted/[0-9a-fA-f-]*",
-        )
-        aioresponse.put(to_device_url, callback=to_device_cb, repeat=True)
-
-        share_response = await bob.share_group_session(
-            TEST_ROOM_ID, ignore_unverified_devices=True
-        )
-        assert isinstance(share_response, ShareGroupSessionResponse)
-        assert to_device_for_alice
-
-        encrypted_content = bob.olm.group_encrypt(
-            TEST_ROOM_ID,
-            {
-                "type": "m.room.message",
-                "content": {"msgtype": "m.text", "body": "sliding secret"},
-            },
-        )
-        megolm_timeline_event = {
-            "event_id": "$secret:example.org",
-            "sender": bob.user_id,
-            "type": "m.room.encrypted",
-            "origin_server_ts": 3,
-            "content": encrypted_content,
-        }
-
-        messages = []
-        undecryptable = []
-
-        async def message_cb(room, event):
-            messages.append((room.room_id, event))
-
-        async def megolm_cb(room, event):
-            undecryptable.append(event)
-
-        alice.add_event_callback(message_cb, RoomMessageText)
-        alice.add_event_callback(megolm_cb, MegolmEvent)
-
-        # The event arrives before its room key and is dispatched in its
-        # encrypted form.
-        early = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s2",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [],
-                        "timeline": [megolm_timeline_event],
-                    },
-                },
-            }
-        )
-        await alice.receive_response(early)
-
-        assert len(undecryptable) == 1
-        assert not messages
-
-        # A replay while the key is still missing is suppressed: the
-        # encrypted form was already dispatched once.
-        early_replay = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s2b",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [],
-                        "timeline": [megolm_timeline_event],
-                    },
-                },
-            }
-        )
-        await alice.receive_response(early_replay)
-
-        assert len(undecryptable) == 1
-        assert not messages
-
-        # The room key arrives in the to_device extension of a later
-        # response that replays the same timeline event: to-device events
-        # are processed before room timelines, and the now-decryptable
-        # event must reach the callbacks despite its earlier encrypted
-        # dispatch.
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s3",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [],
-                        "timeline": [megolm_timeline_event],
-                    },
-                },
-                "extensions": {
-                    "to_device": {
-                        "next_batch": "td1",
-                        "events": [
-                            self.olm_message_to_event(to_device_for_alice, alice, bob)
-                        ],
-                    },
-                },
-            }
-        )
-        assert isinstance(response, SlidingSyncResponse)
-
-        await alice.receive_response(response)
-
-        assert [(room_id, event.body) for room_id, event in messages] == [
-            (TEST_ROOM_ID, "sliding secret")
-        ]
-        decrypted = messages[0][1]
-        assert decrypted.sender == bob.user_id
-        assert decrypted.decrypted
-
-        # Both the to-device event and the timeline event were replaced by
-        # their decrypted counterparts on the response object.
-        assert isinstance(response.to_device_events[0], RoomKeyEvent)
-        assert isinstance(response.rooms[TEST_ROOM_ID].timeline[0], RoomMessageText)
-
-        # Once dispatched decrypted, further replays are de-duplicated.
-        replay = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s4",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [],
-                        "timeline": [megolm_timeline_event],
-                    },
-                },
-            }
-        )
-        await alice.receive_response(replay)
-
-        assert len(messages) == 1
-        assert len(undecryptable) == 1
-
-    async def test_receive_sliding_sync_state_stub(self, async_client):
-        def state(type_, content):
-            return {
-                "event_id": f"${type_}:example.org",
-                "sender": ALICE_ID,
-                "type": type_,
-                "state_key": "",
-                "origin_server_ts": 1,
-                "content": content,
-            }
-
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [
-                            state("m.room.name", {"name": "Named"}),
-                            state("m.room.topic", {"topic": "Topical"}),
-                            state("m.room.avatar", {"url": "mxc://example.org/a"}),
-                            state("m.room.join_rules", {"join_rule": "knock"}),
-                            state("m.room.guest_access", {"guest_access": "can_join"}),
-                            state(
-                                "m.room.history_visibility",
-                                {"history_visibility": "world_readable"},
-                            ),
-                            state(
-                                "m.room.tombstone",
-                                {
-                                    "body": "upgraded",
-                                    "replacement_room": "!new:example.org",
-                                },
-                            ),
-                            state("m.room.power_levels", {"users": {ALICE_ID: 100}}),
-                            {
-                                "event_id": "$alice:example.org",
-                                "sender": ALICE_ID,
-                                "type": "m.room.member",
-                                "state_key": ALICE_ID,
-                                "origin_server_ts": 2,
-                                "content": {"membership": "join"},
-                            },
-                        ],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(response)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.name == "Named"
-        assert room.topic == "Topical"
-        assert room.room_avatar_url == "mxc://example.org/a"
-        assert room.join_rule == "knock"
-        assert room.guest_access == "can_join"
-        assert room.history_visibility == "world_readable"
-        assert room.replacement_room == "!new:example.org"
-        assert room.power_levels.users[ALICE_ID] == 100
-        assert ALICE_ID in room.users
-
-        # MSC4186 signals deleted state entries with content-less stubs.
-        stub_response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p2",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [
-                            {"type": "m.room.name", "state_key": ""},
-                            {"type": "m.room.topic", "state_key": ""},
-                            {"type": "m.room.avatar", "state_key": ""},
-                            {"type": "m.room.join_rules", "state_key": ""},
-                            {"type": "m.room.guest_access", "state_key": ""},
-                            {"type": "m.room.history_visibility", "state_key": ""},
-                            {"type": "m.room.tombstone", "state_key": ""},
-                            {"type": "m.room.power_levels", "state_key": ""},
-                            {"type": "m.room.member", "state_key": ALICE_ID},
-                        ],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(stub_response)
-
-        assert room.name is None
-        assert room.topic is None
-        assert room.room_avatar_url is None
-        assert room.join_rule == "invite"
-        assert room.guest_access == "forbidden"
-        assert room.history_visibility == "shared"
-        assert room.replacement_room is None
-        assert ALICE_ID not in room.power_levels.users
-        assert ALICE_ID not in room.users
-
-    async def test_receive_sliding_sync_initial_rebuild(self, async_client):
-        def member(user_id):
-            return {
-                "event_id": f"$member-{user_id}:example.org",
-                "sender": user_id,
-                "type": "m.room.member",
-                "state_key": user_id,
-                "origin_server_ts": 1,
-                "content": {"membership": "join"},
-            }
-
-        encryption = {
-            "event_id": "$enc:example.org",
-            "sender": ALICE_ID,
-            "type": "m.room.encryption",
-            "state_key": "",
-            "origin_server_ts": 1,
-            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
-        }
-        name = {
-            "event_id": "$name:example.org",
-            "sender": ALICE_ID,
-            "type": "m.room.name",
-            "state_key": "",
-            "origin_server_ts": 1,
-            "content": {"name": "Before"},
-        }
-
-        first = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "initial": True,
-                        "required_state": [
-                            encryption,
-                            name,
-                            member(ALICE_ID),
-                            member(CAROL_ID),
-                        ],
-                        "timeline": [],
-                    },
-                },
-                "extensions": {
-                    "account_data": {
-                        "rooms": {
-                            TEST_ROOM_ID: [
-                                {"type": "m.tag", "content": {"tags": {"u.keep": {}}}},
-                                {
-                                    "type": "m.fully_read",
-                                    "content": {"event_id": "$read:example.org"},
-                                },
-                            ],
-                        },
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(first)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.encrypted
-        assert room.name == "Before"
-        assert CAROL_ID in room.users
-        assert room.tags == {"u.keep": {}}
-        room.typing_users = [ALICE_ID]
-
-        async_client.olm.create_outbound_group_session(TEST_ROOM_ID)
-        async_client.olm.outbound_group_sessions[TEST_ROOM_ID].shared = True
-
-        # The connection expired while carol left and the name was removed:
-        # the fresh connection's initial snapshot simply no longer contains
-        # them. The room must be rebuilt, not patched, and the outbound
-        # session rotated so carol stops receiving new room keys.
-        snapshot = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p2",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "initial": True,
-                        "required_state": [encryption, member(ALICE_ID)],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(snapshot)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert ALICE_ID in room.users
-        assert CAROL_ID not in room.users
-        assert room.name is None
-        assert room.encrypted
-        assert not room.members_synced
-        assert TEST_ROOM_ID not in async_client.olm.outbound_group_sessions
-
-        # Data owned by other channels — account data, receipts, typing —
-        # is not part of the room render and survives the rebuild.
-        assert room.tags == {"u.keep": {}}
-        assert room.fully_read_marker == "$read:example.org"
-        assert room.typing_users == [ALICE_ID]
-
-    async def test_receive_sliding_sync_invited_heroes(self, async_client):
-        # Only we have joined, so the hero can only be an invited member.
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "joined_count": 1,
-                        "invited_count": 1,
-                        "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
-                        "required_state": [],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(response)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.users[ALICE_ID].invited
-        assert ALICE_ID in room.invited_users
-
-    async def test_receive_sliding_sync_pending_room_account_data(self, async_client):
-        def account_data_response(pos, events):
-            return SlidingSyncResponse.from_dict(
-                {
-                    "pos": pos,
-                    "extensions": {"account_data": {"rooms": {TEST_ROOM_ID: events}}},
-                }
-            )
-
-        received = []
-
-        async def account_data_cb(room, event):
-            received.append((room.room_id, event))
-
-        async_client.add_room_account_data_callback(
-            account_data_cb, (FullyReadEvent, TagEvent)
-        )
-
-        # Account data for a room outside the sliding window is buffered.
-        await async_client.receive_response(
-            account_data_response(
-                "p1", [{"type": "m.tag", "content": {"tags": {"u.work": {}}}}]
-            )
-        )
-        # A later delta carrying a different type must not clobber it:
-        # account data is type-keyed state.
-        await async_client.receive_response(
-            account_data_response(
-                "p2",
-                [
-                    {
-                        "type": "m.fully_read",
-                        "content": {"event_id": "$mark:example.org"},
-                    }
-                ],
-            )
-        )
-
-        assert received == []
-        assert TEST_ROOM_ID not in async_client.rooms
-
-        # Once the room enters the window, all buffered account data is
-        # applied and dispatched.
-        third = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p3",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "required_state": [],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(third)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert {type(event) for _, event in received} == {FullyReadEvent, TagEvent}
-        assert room.fully_read_marker == "$mark:example.org"
-        assert room.tags == {"u.work": {}}
-
-    async def test_pending_unknown_account_data_keeps_each_wire_type(
-        self, async_client
-    ):
-        received = []
-
-        async def account_data_cb(room, event):
-            received.append((room.room_id, event.type))
-
-        async_client.add_room_account_data_callback(
-            account_data_cb, UnknownAccountDataEvent
-        )
-
-        for pos, event_type in (
-            ("p1", "org.example.first"),
-            ("p2", "org.example.second"),
-        ):
-            event = UnknownAccountDataEvent.from_dict(
-                {"type": event_type, "content": {}}
-            )
-            await async_client.receive_response(
-                SlidingSyncResponse(
-                    pos,
-                    room_account_data={TEST_ROOM_ID: [event]},
-                )
-            )
-
-        assert received == []
-
-        await async_client.receive_response(
-            SlidingSyncResponse.from_dict(
-                {
-                    "pos": "p3",
-                    "rooms": {
-                        TEST_ROOM_ID: {
-                            "membership": "join",
-                            "required_state": [],
-                            "timeline": [],
-                        },
-                    },
-                }
-            )
-        )
-
-        assert received == [
-            (TEST_ROOM_ID, "org.example.first"),
-            (TEST_ROOM_ID, "org.example.second"),
-        ]
-
-    async def test_sliding_sync_forever_error_backoff(self, async_client, aioresponse):
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/query",
-            status=200,
-            payload=self.keys_query_response,
-            repeat=True,
-        )
-
-        request_times = []
-
-        def callback(url, data, **kwargs):
-            request_times.append((time.monotonic(), dict(url.query)))
-
-            if len(request_times) in (2, 3, 4):
-                return CallbackResult(
-                    status=500,
-                    payload={"errcode": "M_UNKNOWN", "error": "boom"},
-                )
-
-            return CallbackResult(
-                status=200, payload={"pos": f"p{len(request_times)}", "rooms": {}}
-            )
-
-        aioresponse.post(self.sliding_sync_url, callback=callback, repeat=True)
-
-        successes = []
-
-        async def response_cb(response):
-            successes.append(response)
-            if len(successes) >= 2:
-                async_client.stop_sync_forever()
-
-        async_client.add_response_callback(response_cb, SlidingSyncResponse)
-
-        await asyncio.wait_for(
-            async_client.sliding_sync_forever(timeout=30_000, conn_id="backoff"),
-            60,
-        )
-
-        assert len(request_times) == 5
-
-        # Errors other than M_UNKNOWN_POS retry with the same position...
-        assert [query.get("pos") for _, query in request_times] == [
-            None,
-            "p1",
-            "p1",
-            "p1",
-            "p1",
-        ]
-
-        # ...but consecutive errors back off exponentially instead of
-        # hot-looping (0s, then 0.2s, 0.4s with the default backoff factor;
-        # the first error retries immediately).
-        gaps = [
-            request_times[i + 1][0] - request_times[i][0]
-            for i in range(len(request_times) - 1)
-        ]
-        assert gaps[2] >= 0.15
-        assert gaps[3] >= 0.3
-
-    async def test_receive_sliding_sync_left_heroes_not_seeded(self, async_client):
-        # In an otherwise-empty room the server's heroes list falls back to
-        # members who left; they must not be resurrected as joined members.
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "p1",
-                "rooms": {
-                    TEST_ROOM_ID: {
-                        "membership": "join",
-                        "joined_count": 1,
-                        "invited_count": 0,
-                        "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
-                        "required_state": [],
-                        "timeline": [],
-                    },
-                },
-            }
-        )
-        await async_client.receive_response(response)
-
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert ALICE_ID not in room.users
-        # The summary still records them, so "Empty Room (had Alice)" style
-        # display names keep working.
-        assert room.summary.heroes == [ALICE_ID]
-
-    async def test_receive_sliding_sync_heroes_cleared(self, async_client):
-        def response(pos, room):
-            return SlidingSyncResponse.from_dict(
-                {"pos": pos, "rooms": {TEST_ROOM_ID: {"membership": "join", **room}}}
-            )
-
-        await async_client.receive_response(
-            response(
-                "p1",
-                {
-                    "joined_count": 2,
-                    "invited_count": 0,
-                    "heroes": [{"user_id": ALICE_ID, "displayname": "Alice"}],
-                    "required_state": [],
-                    "timeline": [],
-                },
-            )
-        )
-        room = async_client.rooms[TEST_ROOM_ID]
-        assert room.summary.heroes == [ALICE_ID]
-
-        # An explicit empty list clears stale heroes...
-        await async_client.receive_response(
-            response(
-                "p2",
-                {
-                    "joined_count": 1,
-                    "invited_count": 0,
-                    "heroes": [],
-                    "required_state": [],
-                    "timeline": [],
-                },
-            )
-        )
-        assert room.summary.heroes == []
-
-        # ...while an omitted field leaves them untouched.
-        await async_client.receive_response(
-            response("p3", {"required_state": [], "timeline": []})
-        )
-        assert room.summary.heroes == []
-
-    async def test_sliding_sync_forever_cancels_siblings_on_error(
-        self, async_client, aioresponse
-    ):
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/upload",
-            status=200,
-            payload=self.final_keys_upload_response,
-        )
-        aioresponse.post(
-            f"{BASE_URL_V3}/keys/query",
-            status=200,
-            payload=self.keys_query_response,
-            repeat=True,
-        )
-
-        calls = 0
-        long_poll_started = asyncio.Event()
-        long_poll_cancelled = asyncio.Event()
-
-        async def fake_sliding_sync(**kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                return SlidingSyncResponse.from_dict({"pos": "p1"})
-
-            long_poll_started.set()
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                long_poll_cancelled.set()
-                raise
-
-        async def failing_send_to_device_messages():
-            await long_poll_started.wait()
-            raise RuntimeError("to-device send blew up")
-
-        async_client.sliding_sync = fake_sliding_sync
-        async_client.send_to_device_messages = failing_send_to_device_messages
-
-        # A failing sibling request must not leave the long-poll running:
-        # its response would be applied to client state after the loop died.
-        with pytest.raises(RuntimeError, match="to-device send blew up"):
-            await asyncio.wait_for(async_client.sliding_sync_forever(), 30)
-
-        await asyncio.wait_for(long_poll_cancelled.wait(), 30)
-
-    @pytest.mark.parametrize("transport", ["classic", "sliding"])
     async def test_sync_forever_waits_for_cancelled_child_teardown(
         self,
         tempdir,
-        transport,
     ):
-        """Loop completion means every owned sync request is quiescent."""
+        """Classic loop completion means every owned request is quiescent."""
         client = AsyncClient(
             "https://example.org",
             "ephemeral",
@@ -2293,8 +913,6 @@ class TestClass:
             tempdir,
             config=AsyncClientConfig(
                 encryption_enabled=False,
-                backfill_limited_timelines=True,
-                backfill_persist_recovery=False,
                 store_sync_tokens=False,
             ),
         )
@@ -2317,19 +935,13 @@ class TestClass:
             nonlocal calls
             calls += 1
             if calls == 1:
-                if transport == "classic":
-                    return SyncResponse.from_dict(
-                        {
-                            "next_batch": "s1",
-                            "rooms": {"join": {}, "invite": {}, "leave": {}},
-                        }
-                    )
-                return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
+                return SyncResponse.from_dict(
+                    {
+                        "next_batch": "s1",
+                        "rooms": {"join": {}, "invite": {}, "leave": {}},
+                    }
+                )
 
-            request_id = issue_sync_request(
-                client._sync_reset_fence,
-                (transport, None),
-            )
             request_started.set()
             try:
                 await asyncio.Event().wait()
@@ -2338,18 +950,13 @@ class TestClass:
                 await release_cancelled_request.wait()
                 raise
             finally:
-                finish_sync_request(client._sync_reset_fence, request_id)
                 request_finished.set()
 
         async def send_to_device_messages():
             await asyncio.Event().wait()
 
-        if transport == "classic":
-            client.sync = request
-            loop = asyncio.create_task(client.sync_forever())
-        else:
-            client.sliding_sync = request
-            loop = asyncio.create_task(client.sliding_sync_forever())
+        client.sync = request
+        loop = asyncio.create_task(client.sync_forever())
         client.send_to_device_messages = send_to_device_messages
 
         await request_started.wait()
@@ -2363,8 +970,6 @@ class TestClass:
             await request_finished.wait()
             await asyncio.gather(loop, return_exceptions=True)
 
-        assert not client._sync_reset_fence.active_request_ids
-        await client.reset_classic_sync_state()
         await client.close()
 
     async def test_sync_forever_retries_initial_full_state_after_sync_error(
@@ -2419,102 +1024,6 @@ class TestClass:
             (0, {"room": {"timeline": {"limit": 1}}}, "s0", True, "offline"),
             (0, {"room": {"timeline": {"limit": 1}}}, "s0", True, "offline"),
         ]
-        await client.close()
-
-    async def test_sliding_sync_forever_restarts_after_close(self, tempdir):
-        client = AsyncClient(
-            "https://example.org",
-            "ephemeral",
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(encryption_enabled=False),
-        )
-        await client.receive_response(
-            LoginResponse.from_dict(
-                {
-                    "user_id": ALICE_ID,
-                    "device_id": "DEVICEID",
-                    "access_token": "token",
-                }
-            )
-        )
-        requests = 0
-        old_request_started = asyncio.Event()
-        release_old_request = asyncio.Event()
-
-        async def sliding_sync(**_kwargs):
-            nonlocal requests
-            requests += 1
-            if requests == 1:
-                old_request_started.set()
-                await release_old_request.wait()
-            else:
-                client.stop_sync_forever()
-            return SlidingSyncResponse.from_dict({"pos": "p1", "rooms": {}})
-
-        client.sliding_sync = sliding_sync
-
-        old_loop = asyncio.create_task(client.sliding_sync_forever())
-        await old_request_started.wait()
-        client.stop_sync_forever()
-        await client.close()
-        release_old_request.set()
-        await asyncio.wait_for(old_loop, 1)
-
-        assert requests == 1
-        await asyncio.wait_for(client.sliding_sync_forever(), 1)
-
-        assert requests == 2
-        await client.close()
-
-    async def test_close_replaces_sync_generation_without_waiting_old_request(
-        self, tempdir, monkeypatch
-    ):
-        client = AsyncClient(
-            "https://example.org",
-            "ephemeral",
-            "DEVICEID",
-            tempdir,
-            config=AsyncClientConfig(
-                encryption_enabled=False,
-                backfill_limited_timelines=True,
-            ),
-        )
-        await client.receive_response(
-            LoginResponse.from_dict(
-                {
-                    "user_id": ALICE_ID,
-                    "device_id": "DEVICEID",
-                    "access_token": "token",
-                }
-            )
-        )
-        old_started = asyncio.Event()
-        release_old = asyncio.Event()
-        request_count = 0
-
-        async def send(*_args, **_kwargs):
-            nonlocal request_count
-            request_count += 1
-            token = "old" if request_count == 1 else "new"
-            if token == "old":
-                old_started.set()
-                await release_old.wait()
-            response = SyncResponse.from_dict({"next_batch": token, "rooms": {}})
-            await client.receive_response(response)
-            return response
-
-        monkeypatch.setattr(client, "_send", send)
-
-        old = asyncio.create_task(client.sync())
-        await old_started.wait()
-        await client.close()
-        await asyncio.wait_for(client.sync(), 1)
-        assert client.next_batch == "new"
-
-        release_old.set()
-        await asyncio.wait_for(old, 1)
-        assert client.next_batch == "new"
         await client.close()
 
     async def test_sync_notification_counts(self, async_client, aioresponse):
@@ -4266,6 +2775,34 @@ class TestClass:
         )
         resp = await async_client.download(mxc=mxc)
         assert isinstance(resp, DownloadError)
+
+    async def test_download_without_filename_requires_explicit_disk_path(
+        self, async_client, aioresponse, tmp_path
+    ):
+        download_directory = tmp_path / "downloads"
+        download_directory.mkdir()
+        mxc = "mxc://example.org/ascERGshawAWawugaAcauga"
+        url = (
+            f"{BASE_MEDIA_URL}/download/example.org/ascERGshawAWawugaAcauga"
+            "?allow_remote=true"
+        )
+        aioresponse.get(
+            url,
+            status=200,
+            content_type="image/png",
+            body=self.file_response,
+            repeat=True,
+        )
+
+        with pytest.raises(ValueError, match="filename"):
+            await async_client.download(mxc=mxc, save_to=download_directory)
+        assert list(download_directory.iterdir()) == []
+
+        destination = download_directory / "downloaded-media"
+        response = await async_client.download(mxc=mxc, save_to=destination)
+        assert isinstance(response, DownloadResponse)
+        assert response.body == destination
+        assert destination.read_bytes() == self.file_response
 
     async def test_thumbnail(self, async_client, aioresponse):
         server_name = "example.org"
@@ -6356,11 +4893,11 @@ class TestClass:
     async def test_async_mockable(self):
         mock = AsyncMock(spec=AsyncClient)
 
-        assert asyncio.iscoroutinefunction(
+        assert inspect.iscoroutinefunction(
             mock.room_send
         ), "logged_in method should be awaitable"
 
-        assert not asyncio.iscoroutinefunction(
+        assert not inspect.iscoroutinefunction(
             mock.restore_login
         ), "not logged_in method should not be awaitable"
 
@@ -6740,6 +5277,36 @@ class TestClass:
         response = await async_client.has_permission(TEST_ROOM_ID, "kick")
         assert response is False
 
+    async def test_has_permission_returns_whoami_error(self, async_client, aioresponse):
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401,
+            payload={"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"},
+        )
+
+        response = await async_client.has_permission(TEST_ROOM_ID, "kick")
+
+        assert isinstance(response, WhoamiError)
+        assert len(aioresponse.requests) == 1
+        assert all(method == "GET" for method, _url in aioresponse.requests)
+
+    async def test_has_event_permission_returns_whoami_error(
+        self, async_client, aioresponse
+    ):
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401,
+            payload={"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"},
+        )
+
+        response = await async_client.has_event_permission(
+            TEST_ROOM_ID, "m.room.tombstone", "state"
+        )
+
+        assert isinstance(response, WhoamiError)
+        assert len(aioresponse.requests) == 1
+        assert all(method == "GET" for method, _url in aioresponse.requests)
+
     async def test_has_permission__roomv12_creator_does(
         self, async_client, aioresponse
     ):
@@ -6934,3 +5501,97 @@ class TestClass:
 
         await async_client.room_upgrade(TEST_ROOM_ID, "12")
         assert room_create_called.is_set()
+
+    @pytest.mark.parametrize(
+        "second_whoami_fails",
+        [
+            pytest.param(True, id="whoami-error"),
+            pytest.param(False, id="missing-power-levels"),
+        ],
+    )
+    async def test_room_upgrade_to_v12_stops_before_writes_on_invalid_state(
+        self, async_client, aioresponse, second_whoami_fails
+    ):
+        room_create_event_dict = {
+            "event_id": "$create_event_id",
+            "origin_server_ts": 1,
+            "type": "m.room.create",
+            "sender": ALICE_ID,
+            "state_key": "",
+            "content": {"room_version": "11"},
+        }
+        room_create_event = RoomCreateEvent.from_dict(room_create_event_dict)
+        state = [room_create_event_dict]
+        sync_state = [room_create_event]
+        power_levels_event_content = {
+            "users": {ALICE_ID: 100},
+            "state_default": 50,
+        }
+        if second_whoami_fails:
+            power_levels_event_dict = {
+                "event_id": "$power_levels_event_id",
+                "origin_server_ts": 1,
+                "type": "m.room.power_levels",
+                "sender": ALICE_ID,
+                "state_key": "",
+                "content": power_levels_event_content,
+            }
+            state.append(power_levels_event_dict)
+            sync_state.append(PowerLevelsEvent.from_dict(power_levels_event_dict))
+
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=200,
+            payload={"device_id": ALICE_DEVICE_ID, "user_id": ALICE_ID},
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.power_levels",
+            status=200,
+            payload=power_levels_event_content,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state",
+            status=200,
+            payload=state,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=401 if second_whoami_fails else 200,
+            payload=(
+                {"errcode": "M_UNKNOWN_TOKEN", "error": "Invalid token"}
+                if second_whoami_fails
+                else {"device_id": ALICE_DEVICE_ID, "user_id": ALICE_ID}
+            ),
+        )
+        await async_client.receive_response(
+            SyncResponse(
+                next_batch="sync_next_batch",
+                rooms=Rooms(
+                    invite={},
+                    join={
+                        TEST_ROOM_ID: RoomInfo(
+                            timeline=Timeline(
+                                events=[], limited=False, prev_batch="room_prev_batch"
+                            ),
+                            state=sync_state,
+                            ephemeral=[],
+                            account_data=[],
+                        )
+                    },
+                    leave={},
+                ),
+                device_key_count=DeviceOneTimeKeyCount(
+                    curve25519=None, signed_curve25519=None
+                ),
+                device_list=DeviceList(changed=[], left=[]),
+                to_device_events=[],
+                presence_events=[],
+            )
+        )
+
+        response = await async_client.room_upgrade(TEST_ROOM_ID, "12")
+
+        assert isinstance(response, RoomUpgradeError)
+        assert not any(
+            method in {"POST", "PUT", "DELETE"} for method, _url in aioresponse.requests
+        )

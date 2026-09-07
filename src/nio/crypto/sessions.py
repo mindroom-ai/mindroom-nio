@@ -17,12 +17,19 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import vodozemac
 
 from .._compat import package_installed
 from ..exceptions import EncryptionError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    type _InboundGroupSessionFromLibolm = Callable[
+        [str, bytes], vodozemac.InboundGroupSession
+    ]
 
 
 def derive_pickle_key(passphrase: str = "") -> bytes:
@@ -111,7 +118,7 @@ class OlmAccount:
         self,
         identity_key: str,
         message: vodozemac.PreKeyMessage | vodozemac.AnyOlmMessage,
-    ) -> vodozemac.Session:
+    ) -> tuple[vodozemac.Session, bytes]:
         if isinstance(message, vodozemac.AnyOlmMessage):
             pre_key_message = message.to_pre_key()
             assert pre_key_message
@@ -325,9 +332,11 @@ class InboundGroupSession:
             )
         except vodozemac.PickleException:
             pickle_key = passphrase.encode()
-            _session = vodozemac.InboundGroupSession.from_libolm_pickle(
-                pickle.decode(), pickle_key
+            from_libolm_pickle = cast(
+                "_InboundGroupSessionFromLibolm",
+                getattr(vodozemac.InboundGroupSession, "from_libolm_pickle"),
             )
+            _session = from_libolm_pickle(pickle.decode(), pickle_key)
             upgrade_pickle = True
         session = InboundGroupSession(
             session_key="",
