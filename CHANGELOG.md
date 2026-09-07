@@ -2,10 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 1.0.0
 
 ### Breaking changes
 
+- Require Python 3.12 or newer; Python 3.10 and 3.11 are no longer supported.
 - Replace the fork-specific recovery/admission path and prototype ingestion
   interfaces with the batch API in `nio.durable`: `open_durable_sync`,
   `DurableSync`, `DurableSyncConfig`, `SyncBatch`, `SyncRecord`, and `RecordKind`.
@@ -94,8 +95,8 @@ All notable changes to this project will be documented in this file.
 
 ### Cutover requirements
 
-- This is a breaking change relative to 0.40.0; select the release version before
-  publishing. Companion integration and dependency pins require cutover testing.
+- Version 1.0.0 is a breaking change relative to 0.40.0. Companion integrations
+  must use the durable batch API and update their dependency pins together.
 - Durable SQLite uses WAL with `synchronous=FULL`, selected after measured
   comparison with NORMAL. Process-crash recovery is tested with killed processes;
   power-loss durability relies on SQLite and storage honoring flushes. The
