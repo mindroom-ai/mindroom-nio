@@ -232,13 +232,15 @@ class Olm:
         # encrypted messages. This is a dict holding a tuple of the
         # sender_key, the session id and message index as the key and a tuple
         # of the event_id and origin server timestamp as the dict values.
-        self.message_index_store = LRUCache(self._message_index_store_size)
+        self.message_index_store: LRUCache[
+            tuple[str | None, str | None, int], tuple[str, int]
+        ] = LRUCache(self._message_index_store_size)
 
         self.store = store
 
         # Try to load an account for this user_id/device id tuple from the
         # store.
-        account = self.store.load_account()  # type: ignore
+        account = self.store.load_account()
 
         # If no account was found for this user/device create a new one.
         # Otherwise load all the Olm/Megolm sessions and other relevant account
@@ -439,7 +441,12 @@ class Olm:
         elif isinstance(event, RoomKeyRequestCancellation):
             # Let us first remove key requests that just arrived. Those don't
             # need anything special.
-            self.received_key_requests.pop(event.request_id, None)
+            queued = self.received_key_requests.get(event.request_id)
+            if queued is not None and (queued.sender, queued.requesting_device_id) == (
+                event.sender,
+                event.requesting_device_id,
+            ):
+                self.received_key_requests.pop(event.request_id)
 
             # Now come the key requests that are waiting for an Olm session.
             user_key = (event.sender, event.requesting_device_id)
@@ -456,7 +463,11 @@ class Olm:
 
             # Finally key requests that are waiting for device
             # verification.
-            if event.request_id in self.key_request_from_untrusted:
+            pending = self.key_request_from_untrusted.get(event.request_id)
+            if pending is not None and (
+                pending.sender,
+                pending.requesting_device_id,
+            ) == (event.sender, event.requesting_device_id):
                 # First remove the event from our untrusted queue.
                 self.key_request_from_untrusted.pop(event.request_id)
                 # Since events in the untrusted queue were forwarded to users
@@ -524,6 +535,14 @@ class Olm:
                 f"Failed to re-share key {event.session_id} with {event.sender}: "
                 f"Unknown requesting device {event.requesting_device_id}."
             )
+        # Surface unverified requests during collection, before key claiming.
+        if not device.verified:
+            raise OlmUnverifiedDeviceError(
+                device,
+                f"Failed to re-share key {event.session_id} with {event.sender}: "
+                f"Device {event.requesting_device_id} is not verified",
+            )
+
         session = self.session_store.get(device.curve25519)
 
         if not session:
@@ -541,13 +560,6 @@ class Olm:
 
             raise EncryptionError(
                 f"No Olm session found for {device.user_id} and device {device.id}"
-            )
-
-        if not device.verified:
-            raise OlmUnverifiedDeviceError(
-                device,
-                f"Failed to re-share key {event.session_id} with {event.sender}: "
-                f"Device {event.requesting_device_id} is not verified",
             )
 
         logger.debug(
@@ -1499,7 +1511,7 @@ class Olm:
         new_event.verified = verified
         new_event.sender_key = event.sender_key
         new_event.session_id = event.session_id
-        new_event.room_id = room_id
+        setattr(new_event, "room_id", room_id)
 
         return new_event
 

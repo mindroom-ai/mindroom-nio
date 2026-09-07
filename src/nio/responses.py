@@ -15,14 +15,14 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 from collections.abc import Generator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Self
 
 from jsonschema.exceptions import SchemaError, ValidationError
 
@@ -37,10 +37,6 @@ from .events import (
 )
 from .events.presence import PresenceEvent
 from .http import TransportResponse
-from .recovery_abandonment import (
-    RecoveryAbandonment,
-    normalize_abandonment_reasons,
-)
 from .schemas import Schemas, validate_json
 
 logger = logging.getLogger(__name__)
@@ -198,19 +194,15 @@ def verify(schema, error_class, pass_arguments=True):
         @wraps(f)
         def wrapper(cls, parsed_dict, *args, **kwargs):
             try:
-                logger.debug("Validating response schema %r: %s", schema, parsed_dict)
+                logger.debug("Validating %s", cls.__name__)
                 validate_json(parsed_dict, schema)
             except (SchemaError, ValidationError) as e:
-                # An error body fails the success schema, so report the errcode the
-                # server sent alongside the missing success field. Only these two
-                # fields are logged; the rest of the body may hold user content.
-                body = parsed_dict if isinstance(parsed_dict, dict) else {}
-                # repr escapes controls; precision bounds untrusted server output.
+                # Exception messages and server error fields can contain payloads.
                 logger.warning(
-                    "Error validating response: %s (errcode=%.128r, error=%.512r)",
-                    e.message,
-                    body.get("errcode"),
-                    body.get("error"),
+                    "Error validating %s: %s (rule=%s)",
+                    cls.__name__,
+                    type(e).__name__,
+                    e.validator,
                 )
 
                 if pass_arguments:
@@ -491,7 +483,12 @@ class FileResponse(Response):
             return f"content type: {self.content_type}, location: {self.body}"
 
     @classmethod
-    def from_data(cls, data: bytes | os.PathLike | dict, content_type, filename=None):
+    def from_data(
+        cls,
+        data: bytes | os.PathLike | dict[Any, Any],
+        content_type,
+        filename=None,
+    ):
         """Create a FileResponse from file content returned by the server.
 
         Args:
@@ -551,7 +548,7 @@ class ErrorResponse(Response):
         return f"{self.__class__.__name__}: {e}"
 
     @classmethod
-    def from_dict(cls, parsed_dict: dict[Any, Any]) -> ErrorResponse:
+    def from_dict(cls, parsed_dict: dict[Any, Any]) -> Self:
         try:
             validate_json(parsed_dict, Schemas.error)
         except (SchemaError, ValidationError):
@@ -914,10 +911,10 @@ class RegisterInteractiveResponse(Response):
     stages: list[str] = field()
     params: dict[str, Any] = field()
     session: str = field()
-    completed: list[str] = field()
-    user_id: str = field()
-    device_id: str = field()
-    access_token: str = field()
+    completed: list[str] | None = field()
+    user_id: str | None = field()
+    device_id: str | None = field()
+    access_token: str | None = field()
 
     @classmethod
     @verify(Schemas.register_flows, RegisterInteractiveError)
@@ -1089,7 +1086,7 @@ class DownloadResponse(FileResponse):
     @classmethod
     def from_data(
         cls,
-        data: os.PathLike | bytes,
+        data: os.PathLike | bytes | dict[Any, Any],
         content_type: str,
         filename: str | None = None,
     ) -> DownloadResponse | DownloadError:
@@ -1132,7 +1129,10 @@ class ThumbnailResponse(FileResponse):
 
     @classmethod
     def from_data(
-        cls, data: bytes, content_type: str, filename: str | None = None
+        cls,
+        data: bytes | os.PathLike | dict[Any, Any],
+        content_type: str,
+        filename: str | None = None,
     ) -> ThumbnailResponse | ThumbnailError:
         if not content_type.startswith("image/"):
             return ThumbnailError(f"invalid content type: {content_type}")
@@ -1428,7 +1428,7 @@ class SpaceGetHierarchyResponse(Response):
         rooms: The rooms in the space.
     """
 
-    next_batch: str = field()
+    next_batch: str | None = field()
     rooms: list = field()
 
     @classmethod
@@ -1590,7 +1590,7 @@ class RoomMessagesResponse(Response):
 
     chunk: list[Event | BadEventType] = field()
     start: str = field()
-    end: str = field(default=None)
+    end: str | None = field(default=None)
 
     @classmethod
     @verify(Schemas.room_messages, RoomMessagesError)
@@ -2075,48 +2075,15 @@ class RoomContextResponse(Response):
 
 @dataclass
 class SyncResponse(Response):
-    """A response for a /sync request.
-
-    ``recovered_room_ids`` contains rooms whose limited-timeline gaps nio
-    closed while handling this response after dispatching every recovered
-    event. ``unrecovered_room_ids`` contains rooms with a gap still open or
-    abandoned.
-
-    ``abandoned_rooms`` names the rooms in that second set nio gave up on,
-    mapped to frozen sets of :class:`~nio.RecoveryAbandonment` causes. The
-    two are distinguished because a room whose walk is still running will
-    deliver its events on a later response and an abandoned one will not, and
-    because giving up is not by itself proof that the history is gone: see
-    :class:`~nio.RecoveryAbandonment` for which reasons make that claim. An
-    abandoned room keeps being reported on every response until
-    :meth:`~nio.AsyncClient.acknowledge_unrecovered_rooms` settles it, and it
-    is always named in ``unrecovered_room_ids`` too, so a caller that only
-    cares about degradation can keep reading the union.
-
-    All three fields are populated only when limited-timeline backfill is
-    enabled. They can include rooms absent from ``rooms`` when earlier recovery
-    completes while handling this response. ``timeline.limited`` remains the
-    unmodified server value.
-    """
+    """A response for a /sync request."""
 
     next_batch: str = field()
     rooms: Rooms = field()
     device_key_count: DeviceOneTimeKeyCount = field()
     device_list: DeviceList = field()
-    to_device_events: list[ToDeviceEvent] = field()
+    to_device_events: list[ToDeviceEvent | BadEventType] = field()
     presence_events: list[PresenceEvent] = field()
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
-    recovered_room_ids: frozenset[str] = frozenset()
-    unrecovered_room_ids: frozenset[str] = frozenset()
-    abandoned_rooms: dict[str, frozenset[RecoveryAbandonment]] = field(
-        default_factory=dict
-    )
-
-    def __post_init__(self) -> None:
-        self.abandoned_rooms = {
-            room_id: normalize_abandonment_reasons(reasons)
-            for room_id, reasons in self.abandoned_rooms.items()
-        }
 
     def __str__(self) -> str:
         result = []
@@ -2151,7 +2118,9 @@ class SyncResponse(Response):
         return events
 
     @staticmethod
-    def _get_to_device(parsed_dict: dict[Any, Any]) -> list[ToDeviceEvent]:
+    def _get_to_device(
+        parsed_dict: dict[Any, Any],
+    ) -> list[ToDeviceEvent | BadEventType]:
         return [
             ToDeviceEvent.parse_event(event_dict)
             for event_dict in parsed_dict.get("events", [])
@@ -2262,7 +2231,10 @@ class SyncResponse(Response):
         for room_id, room_dict in parsed_dict.get("leave", {}).items():
             state = SyncResponse._get_state(room_dict.get("state", {}))
             timeline = SyncResponse._get_timeline(room_dict.get("timeline", {}))
-            leave_info = RoomInfo(timeline, state, [], [])
+            account_data = RoomInfo.parse_account_data(
+                room_dict.get("account_data", {}).get("events", [])
+            )
+            leave_info = RoomInfo(timeline, state, [], account_data)
             left_rooms[room_id] = leave_info
 
         for room_id, room_dict in parsed_dict.get("join", {}).items():
@@ -2337,53 +2309,19 @@ class SlidingSyncError(SyncError):
 
 @dataclass
 class SlidingSyncResponse(Response):
-    """A response for a MSC4186 Simplified Sliding Sync request.
+    """A Simplified Sliding Sync response, containing protocol data only.
 
-    Attributes:
-        pos (str): The position token to pass on the next request.
-        lists (Dict[str, SlidingSyncList]): The requested sliding window
-            lists, keyed by list name.
-        rooms (Dict[str, SlidingSyncRoom]): Room data, keyed by room id.
-        extensions (Dict[str, Any]): The raw extensions response object.
-        to_device_events (List[ToDeviceEvent]): Events parsed from the
-            ``to_device`` extension, mirroring
-            ``SyncResponse.to_device_events``.
-        to_device_next_batch (str, optional): The ``to_device`` extension's
-            delivery token; it must be sent back as ``extensions.to_device.
-            since`` on the next request, independently of ``pos``.
-        device_key_count (DeviceOneTimeKeyCount): One-time key counts from
-            the ``e2ee`` extension.
-        device_list (DeviceList): Users whose device lists changed, from the
-            ``e2ee`` extension.
-        account_data_events (List[AccountDataEvent]): Global account data
-            events from the ``account_data`` extension.
-        room_account_data (Dict[str, List[AccountDataEvent]]): Per-room
-            account data events from the ``account_data`` extension, keyed
-            by room id.
-        recovered_room_ids (FrozenSet[str]): Rooms whose limited-window gaps
-            nio closed while handling this response after dispatching every
-            recovered event. The room can be absent from ``rooms`` when
-            earlier recovery completes while handling this response.
-        unrecovered_room_ids (FrozenSet[str]): Rooms with a limited-window gap
-            still open or abandoned.
-        abandoned_rooms (Dict[str, FrozenSet[RecoveryAbandonment]]): The rooms in
-            ``unrecovered_room_ids`` nio gave up on, mapped to every cause. A room
-            still being walked will deliver its events on a later response and
-            an abandoned one will not, and giving up is not by itself proof
-            that the history is gone: see :class:`~nio.RecoveryAbandonment` for
-            which reasons make that claim. An abandoned room is reported on
-            every response until
-            :meth:`~nio.AsyncClient.acknowledge_unrecovered_rooms` settles it.
-
-    Recovery outcomes are populated only when limited-timeline backfill is
-    enabled. The room's ``limited`` field remains the unmodified server value.
+    ``pos`` tracks this connection. ``to_device_next_batch`` independently
+    tracks device delivery and is sent as ``extensions.to_device.since``.
+    Room ``prev_batch`` tokens are pagination boundaries. ``extensions``
+    retains the wire dictionary even when event parsers consume their input.
     """
 
     pos: str = field()
     lists: dict[str, SlidingSyncList] = field(default_factory=dict)
     rooms: dict[str, SlidingSyncRoom] = field(default_factory=dict)
     extensions: dict[str, Any] = field(default_factory=dict)
-    to_device_events: list[ToDeviceEvent] = field(default_factory=list)
+    to_device_events: list[ToDeviceEvent | BadEventType] = field(default_factory=list)
     to_device_next_batch: str | None = None
     device_key_count: DeviceOneTimeKeyCount = field(
         default_factory=lambda: DeviceOneTimeKeyCount(None, None)
@@ -2391,119 +2329,59 @@ class SlidingSyncResponse(Response):
     device_list: DeviceList = field(default_factory=lambda: DeviceList([], []))
     account_data_events: list[AccountDataEvent] = field(default_factory=list)
     room_account_data: dict[str, list[AccountDataEvent]] = field(default_factory=dict)
-    recovered_room_ids: frozenset[str] = frozenset()
-    unrecovered_room_ids: frozenset[str] = frozenset()
-    abandoned_rooms: dict[str, frozenset[RecoveryAbandonment]] = field(
-        default_factory=dict
-    )
-
-    def __post_init__(self) -> None:
-        self.abandoned_rooms = {
-            room_id: normalize_abandonment_reasons(reasons)
-            for room_id, reasons in self.abandoned_rooms.items()
-        }
-
-    @staticmethod
-    def _parse_list(
-        list_name: str, list_dict: dict[Any, Any]
-    ) -> SlidingSyncList | SlidingSyncError:
-        try:
-            return SlidingSyncList.from_dict(list_dict)
-        except (KeyError, TypeError, AttributeError) as exc:
-            return SlidingSyncError(
-                f"Invalid sliding sync list payload for {list_name!r}: {exc}"
-            )
-
-    @staticmethod
-    def _parse_room(
-        room_id: str, room_dict: dict[Any, Any]
-    ) -> SlidingSyncRoom | SlidingSyncError:
-        try:
-            return SlidingSyncRoom.from_dict(room_dict)
-        except (KeyError, TypeError, AttributeError) as exc:
-            return SlidingSyncError(
-                f"Invalid sliding sync room payload for {room_id!r}: {exc}"
-            )
 
     @classmethod
     @verify(Schemas.sliding_sync, SlidingSyncError, False)
     def from_dict(
-        cls,
-        parsed_dict: dict[Any, Any],
+        cls, parsed_dict: dict[Any, Any]
     ) -> SlidingSyncResponse | ErrorResponse:
-        lists: dict[str, SlidingSyncList] = {}
-        for list_name, list_dict in parsed_dict.get("lists", {}).items():
-            sliding_sync_list = cls._parse_list(list_name, list_dict)
-            if isinstance(sliding_sync_list, SlidingSyncError):
-                return sliding_sync_list
-
-            lists[list_name] = sliding_sync_list
-
-        rooms: dict[str, SlidingSyncRoom] = {}
-        for room_id, room_dict in parsed_dict.get("rooms", {}).items():
-            room = cls._parse_room(room_id, room_dict)
-            if isinstance(room, SlidingSyncError):
-                return room
-
-            rooms[room_id] = room
-
-        extensions = parsed_dict.get("extensions", {})
-
-        def copied(event_dict: Any) -> Any:
-            # Several event parsers pop() keys out of their input; parse
-            # copies so the raw extensions payload stays untouched.
-            return (
-                copy.deepcopy(event_dict)
-                if isinstance(event_dict, dict)
-                else event_dict
-            )
-
-        to_device_dict = extensions.get("to_device") or {}
-        to_device_events = [
-            event
-            for event in (
-                ToDeviceEvent.parse_event(copied(event_dict))
-                for event_dict in to_device_dict.get("events", [])
-            )
-            if event is not None
-        ]
-
-        e2ee_dict = extensions.get("e2ee") or {}
-        key_count_dict = e2ee_dict.get("device_one_time_keys_count", {})
-        key_count = DeviceOneTimeKeyCount(
-            key_count_dict.get("curve25519"),
-            key_count_dict.get("signed_curve25519"),
-        )
-        device_list = DeviceList(
-            list(e2ee_dict.get("device_lists", {}).get("changed", [])),
-            list(e2ee_dict.get("device_lists", {}).get("left", [])),
-        )
-
-        account_data_dict = extensions.get("account_data") or {}
-        account_data_events = [
-            AccountDataEvent.parse_event(copied(event_dict))
-            for event_dict in account_data_dict.get("global", [])
-        ]
-        room_account_data = {
-            room_id: [
-                AccountDataEvent.parse_event(copied(event_dict))
-                for event_dict in events
+        try:
+            lists = {
+                name: SlidingSyncList.from_dict(data)
+                for name, data in parsed_dict.get("lists", {}).items()
+            }
+            rooms = {
+                room_id: SlidingSyncRoom.from_dict(data)
+                for room_id, data in parsed_dict.get("rooms", {}).items()
+            }
+            extensions = parsed_dict.get("extensions", {})
+            # Event parsers can remove content or add defaults to nested dictionaries.
+            parsed_extensions = deepcopy(extensions)
+            to_device = parsed_extensions.get("to_device", {})
+            to_device_events = [
+                event
+                for data in to_device.get("events", [])
+                if (event := ToDeviceEvent.parse_event(data)) is not None
             ]
-            for room_id, events in (account_data_dict.get("rooms") or {}).items()
-        }
-
-        return cls(
-            parsed_dict["pos"],
-            lists,
-            rooms,
-            extensions,
-            to_device_events,
-            to_device_dict.get("next_batch"),
-            key_count,
-            device_list,
-            account_data_events,
-            room_account_data,
-        )
+            e2ee = parsed_extensions.get("e2ee", {})
+            counts = e2ee.get("device_one_time_keys_count", {})
+            devices = e2ee.get("device_lists", {})
+            account_data = parsed_extensions.get("account_data", {})
+            return cls(
+                pos=parsed_dict["pos"],
+                lists=lists,
+                rooms=rooms,
+                extensions=extensions,
+                to_device_events=to_device_events,
+                to_device_next_batch=to_device.get("next_batch"),
+                device_key_count=DeviceOneTimeKeyCount(
+                    counts.get("curve25519"), counts.get("signed_curve25519")
+                ),
+                device_list=DeviceList(
+                    devices.get("changed", []), devices.get("left", [])
+                ),
+                account_data_events=RoomInfo.parse_account_data(
+                    account_data.get("global", [])
+                ),
+                room_account_data={
+                    room_id: RoomInfo.parse_account_data(events)
+                    for room_id, events in account_data.get("rooms", {}).items()
+                },
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            # Some event-specific parsers assume fields beyond the envelope schema.
+            logger.warning("Invalid sliding sync event payload: %s", type(exc).__name__)
+            return SlidingSyncError("Invalid sliding sync event payload")
 
 
 class UploadFilterError(ErrorResponse):

@@ -24,7 +24,6 @@ from peewee import (
 )
 
 from ..crypto import TrustState
-from ..recovery_abandonment import RecoveryAbandonment
 
 
 class ByteField(BlobField):
@@ -212,90 +211,6 @@ class SyncTokens(Model):
 
     class Meta:
         constraints = [SQL("UNIQUE(account_id)")]
-
-
-class SyncRecoveryGaps(Model):
-    room_id = TextField()
-    generation = IntegerField()
-    target_token = TextField()
-    cursor_token = TextField(null=True)
-    membership_bound = BooleanField(default=False)
-    account = ForeignKeyField(
-        model=Accounts,
-        on_delete="CASCADE",
-        backref="sync_recovery_gaps",
-    )
-
-    class Meta:
-        constraints = [SQL("UNIQUE(account_id,room_id,generation)")]
-
-
-class SyncRecoveryAbandonedRooms(Model):
-    """Rooms whose limited-timeline gap was given up on.
-
-    Kept apart from ``SyncRecoveryGaps`` because abandonment outlives the gap
-    row it came from: the gap is deleted when the walk is abandoned, and the
-    record that work was lost has to survive that deletion or the room silently
-    reads as healthy on the next response.
-    """
-
-    room_id = TextField()
-    # Why the walk was given up on. A row that reaches the store without one
-    # records a loss whose cause nio never captured, and saying so is honest
-    # where guessing a cause would be indistinguishable from a real finding.
-    reason = TextField(default=RecoveryAbandonment.UNKNOWN.value)
-    account = ForeignKeyField(
-        model=Accounts,
-        on_delete="CASCADE",
-        backref="sync_recovery_abandoned_rooms",
-    )
-
-    class Meta:
-        constraints = [SQL("UNIQUE(account_id,room_id,reason)")]
-
-
-class PendingTimelineEvents(Model):
-    room_id = TextField()
-    generation = IntegerField()
-    sequence = IntegerField()
-    event_id = TextField()
-    event_payload = ByteField()
-    is_live = BooleanField()
-    was_encrypted = BooleanField()
-    was_completed = BooleanField()
-    admission_accepted = BooleanField(default=False)
-    provenance = TextField(default="live")
-    apply_room_state = BooleanField(default=True)
-    account = ForeignKeyField(
-        model=Accounts,
-        on_delete="CASCADE",
-        backref="pending_timeline_events",
-    )
-
-    class Meta:
-        constraints = [SQL("UNIQUE(account_id,room_id,event_id)")]
-
-
-class SlidingWindowTokens(Model):
-    """The /messages token a room's last sliding window handed out.
-
-    Simplified Sliding Sync positions are connection-scoped, so a limited
-    window can only be recovered from the token the room's previous window
-    carried. Keeping it here is what lets a restarted client walk the gap
-    its downtime left behind.
-    """
-
-    room_id = TextField()
-    token = TextField()
-    membership_event_id = TextField()
-    account = ForeignKeyField(
-        model=Accounts,
-        on_delete="CASCADE",
-        backref="sliding_window_tokens",
-    )
-
-    class Meta:
-        constraints = [SQL("UNIQUE(account_id,room_id)")]
 
 
 class TrackedUsers(Model):

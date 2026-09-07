@@ -331,7 +331,8 @@ class TestClass:
             parsed_dict.pop("type")
 
             event = InviteEvent.parse_event(parsed_dict)
-            assert not event
+            assert isinstance(event, UnknownBadEvent)
+            assert "type" not in event.source
 
     def test_invite_events(self):
         for event_type, event_file in [
@@ -342,6 +343,14 @@ class TestClass:
             parsed_dict = TestClass._load_response(f"tests/data/events/{event_file}")
             event = InviteEvent.parse_event(parsed_dict)
             assert isinstance(event, event_type)
+
+    def test_invite_unknown_and_redacted_events_remain_ignored(self):
+        member = TestClass._load_response("tests/data/events/member.json")
+        for extra in (
+            {"type": "org.example.unknown"},
+            {"unsigned": {"redacted_because": {}}},
+        ):
+            assert InviteEvent.parse_event({**member, **extra}) is None
 
     def test_megolm_event(self):
         parsed_dict = TestClass._load_response("tests/data/events/megolm.json")

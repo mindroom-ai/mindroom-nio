@@ -30,6 +30,7 @@ from enum import Enum, unique
 from typing import (
     TYPE_CHECKING,
     Any,
+    cast,
 )
 from uuid import UUID
 
@@ -224,7 +225,7 @@ class Api:
                 else f"https://{url.netloc}"
             ),
             path=Api._build_path(
-                ["download", url.hostname, url.path.lstrip("/")],
+                ["download", cast(str, url.hostname), url.path.lstrip("/")],
                 {"access_token": access_token},
                 base_path=MATRIX_MEDIA_API_PATH,
             ),
@@ -632,20 +633,11 @@ class Api:
         extensions: dict[str, Any] | None = None,
         unstable: bool = True,
     ) -> tuple[str, str, str]:
-        """Build a Simplified Sliding Sync request, as described by MSC4186.
+        """Build a Simplified Sliding Sync request using the deployed wire format.
 
-        Returns the HTTP method, HTTP path and JSON request body for the
-        request. By default this uses the unstable
-        ``org.matrix.simplified_msc3575`` path, which is the only endpoint
-        deployed servers (Synapse, Tuwunel/conduwuit) currently serve; set
-        ``unstable`` to ``False`` to target the proposed stable
-        ``/_matrix/client/v4/sync`` path.
-
-        ``pos``, ``timeout`` and ``set_presence`` are sent as query
-        parameters because that is where deployed servers read them from.
-        The current MSC4186 text moves them into the request body, but no
-        server implements that revision yet; revisit when the endpoint
-        stabilises.
+        Position, timeout and presence are query parameters. Connection ID,
+        lists, subscriptions and extensions form the JSON body. Set
+        ``unstable=False`` to select the proposed v4 endpoint.
         """
         query_parameters = {"access_token": access_token}
         path = ["org.matrix.simplified_msc3575", "sync"]
@@ -734,7 +726,7 @@ class Api:
             suggested_only (bool, optional): Whether to only return
                 rooms that are considered suggested. Defaults to False.
         """
-        query_parameters = {"access_token": access_token}
+        query_parameters: dict[str, str | int | bool] = {"access_token": access_token}
 
         if from_page:
             query_parameters["from"] = from_page
@@ -826,7 +818,10 @@ class Api:
                 the response. Some report traversal capability, while others report
                 the deepest returned event.
         """
-        query_parameters = {"access_token": access_token, "dir": direction.value}
+        query_parameters: dict[str, str | int] = {
+            "access_token": access_token,
+            "dir": direction.value,
+        }
         if recurse:
             query_parameters["recurse"] = "true"
         if paginate_from:
@@ -870,7 +865,10 @@ class Api:
             limit (int, optional): Limit for the maximum thread roots to include per paginated response.
                 Servers will apply a default value, and override this with a maximum value.
         """
-        query_parameters = {"access_token": access_token, "include": include.value}
+        query_parameters: dict[str, str | int] = {
+            "access_token": access_token,
+            "include": include.value,
+        }
         if paginate_from:
             query_parameters["from"] = paginate_from
         if limit:
@@ -1192,7 +1190,7 @@ class Api:
         path = ["createRoom"]
         query_parameters = {"access_token": access_token}
 
-        body = {
+        body: dict[str, Any] = {
             "visibility": visibility.value,
             "creation_content": {"m.federate": federate},
             "is_direct": is_direct,
@@ -1963,10 +1961,10 @@ class Api:
         server: str | None = None,
         since: str | None = None,
         filter_generic_search_term: str | None = None,
-        filter_room_types: list[str | None] = None,
+        filter_room_types: list[str | None] | None = None,
         include_all_networks: bool | None = None,
         third_party_instance_id: str | None = None,
-    ) -> tuple[str, str, dict[str:Any] | None]:
+    ) -> tuple[str, str, str | None]:
         """Lists the public rooms on the server, with optional filters.
         Returns the appropriate HTTP method/query params/body based off of the combination of arguments.
 
@@ -1992,7 +1990,7 @@ class Api:
             method = "POST"
         else:
             method = "GET"
-        query_parameters = {}
+        query_parameters: dict[str, str | int] = {}
         if access_token:
             query_parameters["access_token"] = access_token
         if server:
@@ -2003,23 +2001,22 @@ class Api:
             if since is not None:
                 query_parameters["since"] = since
             return method, Api._build_path(path, query_parameters), None
-        if method == "POST":
-            content: dict[str, Any] = {}
-            if limit:
-                content["limit"] = limit
-            if since is not None:
-                content["since"] = since
-            if filter_generic_search_term is not None:
-                content.setdefault("filter", {})[
-                    "generic_search_term"
-                ] = filter_generic_search_term
-            if filter_room_types:
-                content.setdefault("filter", {})["room_types"] = filter_room_types
-            if include_all_networks is not None:
-                content["include_all_networks"] = include_all_networks
-            if third_party_instance_id:
-                content["third_party_instance_id"] = third_party_instance_id
-            return method, Api._build_path(path, query_parameters), Api.to_json(content)
+        content: dict[str, Any] = {}
+        if limit:
+            content["limit"] = limit
+        if since is not None:
+            content["since"] = since
+        if filter_generic_search_term is not None:
+            content.setdefault("filter", {})[
+                "generic_search_term"
+            ] = filter_generic_search_term
+        if filter_room_types:
+            content.setdefault("filter", {})["room_types"] = filter_room_types
+        if include_all_networks is not None:
+            content["include_all_networks"] = include_all_networks
+        if third_party_instance_id:
+            content["third_party_instance_id"] = third_party_instance_id
+        return method, Api._build_path(path, query_parameters), Api.to_json(content)
 
     @staticmethod
     def room_context(
@@ -2038,7 +2035,7 @@ class Api:
                 context for.
             limit(int, optional): The maximum number of events to request.
         """
-        query_parameters = {"access_token": access_token}
+        query_parameters: dict[str, str | int] = {"access_token": access_token}
 
         if limit:
             query_parameters["limit"] = limit

@@ -1,12 +1,9 @@
-import copy
 import json
 import logging
 from pathlib import Path
 from typing import Type
 
 import pytest
-from hypothesis import given, settings
-from hypothesis import strategies as st
 
 from nio.responses import (
     ChangePasswordError,
@@ -44,9 +41,6 @@ from nio.responses import (
     RoomMessagesError,
     RoomMessagesResponse,
     RoomTypingResponse,
-    SlidingSyncError,
-    SlidingSyncResponse,
-    SlidingSyncStateStub,
     SpaceGetHierarchyResponse,
     SyncError,
     SyncResponse,
@@ -194,290 +188,6 @@ class TestClass:
         response = SyncResponse.from_dict(parsed_dict)
         assert isinstance(response, SyncResponse)
 
-    def test_sliding_sync_fail(self):
-        parsed_dict = {
-            "errcode": "M_UNKNOWN_POS",
-            "error": "Unknown sliding sync pos",
-        }
-        response = SlidingSyncResponse.from_dict(parsed_dict)
-        assert isinstance(response, SlidingSyncError)
-
-    def test_sliding_sync_minimal_response(self):
-        response = SlidingSyncResponse.from_dict({"pos": "s1"})
-
-        assert isinstance(response, SlidingSyncResponse)
-        assert response.pos == "s1"
-        assert response.lists == {}
-        assert response.rooms == {}
-        assert response.extensions == {}
-
-    def test_sliding_sync_malformed_list_returns_error(self):
-        response = SlidingSyncResponse.from_dict({"pos": "s1", "lists": {"main": {}}})
-
-        assert isinstance(response, SlidingSyncError)
-
-    def test_sliding_sync_malformed_room_returns_error(self):
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s1",
-                "rooms": {
-                    "!room:example.org": {
-                        "required_state": [{"type": "m.room.name"}],
-                    },
-                },
-            }
-        )
-
-        assert isinstance(response, SlidingSyncError)
-        assert "!room:example.org" in response.message
-
-    def test_sliding_sync_malformed_num_live_returns_error(self):
-        response = SlidingSyncResponse.from_dict(
-            {
-                "pos": "s1",
-                "rooms": {"!room:example.org": {"num_live": "1"}},
-            }
-        )
-
-        assert isinstance(response, SlidingSyncError)
-        assert "!room:example.org" in response.message
-
-    def test_sliding_sync_parse(self):
-        parsed_dict = {
-            "pos": "s58_224_0_13_10_1_1_16_0_1",
-            "lists": {"main": {"count": 1}},
-            "rooms": {
-                "!room:example.org": {
-                    "name": "Alice and Bob",
-                    "avatar": None,
-                    "heroes": [
-                        {
-                            "user_id": "@alice:example.org",
-                            "displayname": "Alice",
-                            "avatar_url": "mxc://example.org/alice",
-                        }
-                    ],
-                    "is_dm": True,
-                    "initial": True,
-                    "unstable_expanded_timeline": True,
-                    "required_state": [
-                        {"type": "m.room.name", "state_key": ""},
-                        {
-                            "event_id": "$create:example.org",
-                            "sender": "@alice:example.org",
-                            "type": "m.room.create",
-                            "state_key": "",
-                            "origin_server_ts": 1,
-                            "content": {"room_version": "12"},
-                        },
-                    ],
-                    "timeline": [
-                        {
-                            "event_id": "$message:example.org",
-                            "sender": "@alice:example.org",
-                            "type": "m.room.message",
-                            "origin_server_ts": 2,
-                            "content": {"msgtype": "m.text", "body": "hi"},
-                        }
-                    ],
-                    "prev_batch": "t111_222_333",
-                    "limited": True,
-                    "num_live": 1,
-                    "joined_count": 2,
-                    "invited_count": 0,
-                    "notification_count": 11,
-                    "highlight_count": 1,
-                    "membership": "join",
-                    "lists": ["main"],
-                }
-            },
-            "extensions": {"account_data": {"foo": "bar"}},
-        }
-
-        response = SlidingSyncResponse.from_dict(parsed_dict)
-
-        assert isinstance(response, SlidingSyncResponse)
-        assert response.pos == "s58_224_0_13_10_1_1_16_0_1"
-        assert response.lists["main"].count == 1
-        assert response.extensions == {"account_data": {"foo": "bar"}}
-
-        room = response.rooms["!room:example.org"]
-        assert room.name == "Alice and Bob"
-        assert room.avatar is None
-        assert room.heroes[0].user_id == "@alice:example.org"
-        assert room.is_dm
-        assert room.initial
-        assert room.expanded_timeline
-        assert room.membership == "join"
-        assert room.lists == ["main"]
-        assert isinstance(room.required_state[0], SlidingSyncStateStub)
-        assert room.required_state[0].type == "m.room.name"
-        assert room.timeline[0].source["content"]["body"] == "hi"
-        assert room.prev_batch == "t111_222_333"
-        assert room.limited
-        assert room.num_live == 1
-        assert room.joined_count == 2
-        assert room.invited_count == 0
-        assert room.notification_count == 11
-        assert room.highlight_count == 1
-
-    _fuzz_json = st.recursive(
-        st.none()
-        | st.booleans()
-        | st.integers()
-        | st.floats(allow_nan=False)
-        | st.text(max_size=12),
-        lambda children: st.lists(children, max_size=4)
-        | st.dictionaries(st.text(max_size=8), children, max_size=4),
-        max_leaves=12,
-    )
-
-    @given(payload=st.dictionaries(st.text(max_size=12), _fuzz_json, max_size=6))
-    @settings(max_examples=300, deadline=None)
-    def test_sliding_sync_fuzz_never_raises(self, payload):
-        response = SlidingSyncResponse.from_dict(payload)
-        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
-
-    @given(room=_fuzz_json, sync_list=_fuzz_json, extensions=_fuzz_json)
-    @settings(max_examples=300, deadline=None)
-    def test_sliding_sync_fuzz_nested_never_raises(self, room, sync_list, extensions):
-        # A valid envelope forces parsing deep into rooms/lists/extensions.
-        payload = {
-            "pos": "p",
-            "rooms": {"!fuzz:example.org": room},
-            "lists": {"fuzz": sync_list},
-            "extensions": extensions,
-        }
-        response = SlidingSyncResponse.from_dict(payload)
-        assert isinstance(response, (SlidingSyncResponse, ErrorResponse))
-
-    def test_sliding_sync_parse_stripped_state(self):
-        # Deployed servers send invite_state; the current MSC4186 text
-        # renamed it to stripped_state. Both must parse.
-        for wire_key in ("invite_state", "stripped_state"):
-            parsed_dict = {
-                "pos": "s1",
-                "rooms": {
-                    "!invited:example.org": {
-                        "membership": "invite",
-                        wire_key: [
-                            {
-                                "sender": "@alice:example.org",
-                                "state_key": "@bob:example.org",
-                                "type": "m.room.member",
-                                "content": {"membership": "invite"},
-                            }
-                        ],
-                    }
-                },
-            }
-
-            response = SlidingSyncResponse.from_dict(parsed_dict)
-
-            assert isinstance(response, SlidingSyncResponse)
-            room = response.rooms["!invited:example.org"]
-            assert room.membership == "invite"
-            assert room.stripped_state[0].source["type"] == "m.room.member"
-            assert room.stripped_state[0].membership == "invite"
-
-    def test_sliding_sync_extensions_parse(self):
-        parsed_dict = {
-            "pos": "s1",
-            "extensions": {
-                "to_device": {
-                    "next_batch": "td_token_1",
-                    "events": [
-                        {
-                            "sender": "@alice:example.org",
-                            "type": "org.example.custom",
-                            "content": {"body": "ping"},
-                        },
-                        # Empty content parses to None and is dropped.
-                        {
-                            "sender": "@alice:example.org",
-                            "type": "org.example.custom",
-                            "content": {},
-                        },
-                    ],
-                },
-                "e2ee": {
-                    # An explicit zero count must be preserved so a drained
-                    # key pool is replenished.
-                    "device_one_time_keys_count": {"signed_curve25519": 0},
-                    "device_lists": {
-                        "changed": ["@alice:example.org"],
-                        "left": ["@bob:example.org"],
-                    },
-                },
-                "account_data": {
-                    "global": [
-                        {"type": "m.direct", "content": {"@alice:example.org": []}},
-                    ],
-                    "rooms": {
-                        "!room:example.org": [
-                            {
-                                "type": "m.fully_read",
-                                "content": {"event_id": "$read:example.org"},
-                            },
-                        ],
-                    },
-                },
-            },
-        }
-
-        pristine = copy.deepcopy(parsed_dict["extensions"])
-
-        response = SlidingSyncResponse.from_dict(parsed_dict)
-
-        assert isinstance(response, SlidingSyncResponse)
-        assert response.to_device_next_batch == "td_token_1"
-        assert len(response.to_device_events) == 1
-        assert response.to_device_events[0].source["type"] == "org.example.custom"
-        assert response.device_key_count.signed_curve25519 == 0
-        assert response.device_key_count.curve25519 is None
-        assert response.device_list.changed == ["@alice:example.org"]
-        assert response.device_list.left == ["@bob:example.org"]
-        assert len(response.account_data_events) == 1
-        room_events = response.room_account_data["!room:example.org"]
-        assert room_events[0].event_id == "$read:example.org"
-        # The raw extension payload stays available, byte-for-byte
-        # untouched: several event parsers pop() keys from their input and
-        # must only ever see copies.
-        assert response.extensions == pristine
-
-    def test_sliding_sync_extensions_absent(self):
-        response = SlidingSyncResponse.from_dict({"pos": "s1", "extensions": {}})
-
-        assert isinstance(response, SlidingSyncResponse)
-        assert response.to_device_events == []
-        assert response.to_device_next_batch is None
-        assert response.device_key_count.signed_curve25519 is None
-        assert response.device_list.changed == []
-        assert response.device_list.left == []
-        assert response.account_data_events == []
-        assert response.room_account_data == {}
-
-    def test_sliding_sync_malformed_extensions_return_error(self):
-        for extensions in (
-            {"to_device": {"events": "junk"}},
-            {"to_device": "junk"},
-            {"e2ee": {"device_one_time_keys_count": {"signed_curve25519": "50"}}},
-            {"e2ee": {"device_lists": {"changed": [42]}}},
-            {"account_data": {"global": {"not": "a list"}}},
-            {"account_data": {"rooms": {"!room:example.org": "junk"}}},
-            # Scalar items inside otherwise-valid arrays used to crash the
-            # event parsers with a TypeError.
-            {"to_device": {"events": [42]}},
-            {"to_device": {"events": ["junk"]}},
-            {"account_data": {"global": [42]}},
-            {"account_data": {"rooms": {"!room:example.org": [42]}}},
-        ):
-            response = SlidingSyncResponse.from_dict(
-                {"pos": "s1", "extensions": extensions}
-            )
-
-            assert isinstance(response, SlidingSyncError), repr(extensions)
-
     def test_keyshare_request(self):
         parsed_dict = {
             "errcode": "M_LIMIT_EXCEEDED",
@@ -597,11 +307,7 @@ class TestClass:
 
 
 class TestSchemaValidationWarning:
-    """Response bodies are checked against the success schema before anything looks at
-    whether the body is actually an error. A server error body therefore fails success
-    validation, and the warning that gets logged describes the missing success field
-    rather than the error the server reported. These tests pin the warning to the real
-    errcode so a failed request is diagnosable from logs alone."""
+    """Validation diagnostics identify the failure without disclosing server data."""
 
     def _warnings(self, caplog):
         return [
@@ -610,7 +316,7 @@ class TestSchemaValidationWarning:
             if record.name == "nio.responses" and record.levelno == logging.WARNING
         ]
 
-    def test_warning_reports_errcode_from_error_body(self, caplog):
+    def test_error_details_remain_on_response_without_entering_logs(self, caplog):
         parsed_dict = {
             "errcode": "M_FORBIDDEN",
             "error": "You don't have permission to view this room.",
@@ -620,21 +326,23 @@ class TestSchemaValidationWarning:
 
         assert isinstance(response, RoomMessagesError)
         assert response.status_code == "M_FORBIDDEN"
+        assert response.message == parsed_dict["error"]
         warnings = self._warnings(caplog)
         assert len(warnings) == 1
-        assert "M_FORBIDDEN" in warnings[0]
-        assert "You don't have permission to view this room." in warnings[0]
+        assert parsed_dict["error"] not in warnings[0]
 
-    def test_warning_still_names_the_failed_schema_field(self, caplog):
+    def test_warning_names_the_response_exception_and_schema_rule(self, caplog):
         parsed_dict = {"errcode": "M_FORBIDDEN", "error": "denied"}
         with caplog.at_level(logging.WARNING, logger="nio.responses"):
             RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
 
-        assert "chunk" in self._warnings(caplog)[0]
+        warning = self._warnings(caplog)[0]
+        assert "RoomMessagesResponse" in warning
+        assert "ValidationError" in warning
+        assert "required" in warning
 
     def test_warning_omits_unrelated_body_fields(self, caplog):
-        # An error body is not guaranteed to be free of user content, so only the two
-        # documented error fields may be logged.
+        # Even error bodies can carry user content.
         parsed_dict = {
             "errcode": "M_FORBIDDEN",
             "error": "denied",
@@ -645,7 +353,7 @@ class TestSchemaValidationWarning:
 
         assert "must-not-be-logged" not in self._warnings(caplog)[0]
 
-    def test_warning_escapes_server_control_characters(self, caplog):
+    def test_warning_omits_server_control_characters(self, caplog):
         parsed_dict = {
             "errcode": "M_FORBIDDEN\nFORGED",
             "error": "denied\rFORGED",
@@ -656,8 +364,7 @@ class TestSchemaValidationWarning:
         warning = self._warnings(caplog)[0]
         assert "\n" not in warning
         assert "\r" not in warning
-        assert r"\n" in warning
-        assert r"\r" in warning
+        assert "FORGED" not in warning
 
     def test_warning_bounds_server_error_fields(self, caplog):
         parsed_dict = {
@@ -668,6 +375,14 @@ class TestSchemaValidationWarning:
             RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
 
         assert len(self._warnings(caplog)[0]) < 1_000
+
+    def test_debug_does_not_dump_valid_response_body(self, caplog):
+        parsed_dict = {"chunk": [], "start": "payload-secret"}
+        with caplog.at_level(logging.DEBUG, logger="nio.responses"):
+            response = RoomMessagesResponse.from_dict(parsed_dict, TEST_ROOM_ID)
+        assert isinstance(response, RoomMessagesResponse)
+        assert response.start == "payload-secret"
+        assert "payload-secret" not in caplog.text
 
     @pytest.mark.parametrize(
         "parsed_dict",

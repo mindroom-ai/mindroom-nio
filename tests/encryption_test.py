@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from shutil import copyfile
+from uuid import UUID
 
 import pytest
 import vodozemac
@@ -39,8 +40,16 @@ from nio.events import (
     UnknownToDeviceEvent,
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
+from nio.durable.store import DurableStore
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
-from nio.store import DefaultStore, Ed25519Key, Key, KeyStore, SqliteMemoryStore
+from nio.store import (
+    DefaultStore,
+    Ed25519Key,
+    Key,
+    KeyStore,
+    SqliteMemoryStore,
+    SqliteStore,
+)
 
 AliceId = "@alice:example.org"
 Alice_device = "ALDEVICE"
@@ -566,6 +575,127 @@ class TestClass:
         restarted = Olm(AliceId, Alice_device, alice.store)
         device = restarted.device_store[BobId][Bob_device]
         assert device.trust_state == TrustState.blacklisted
+
+    @pytest.mark.parametrize("outcome", ("commit", "rollback"))
+    def test_adopted_rotation_updates_keys_and_trust_atomically(
+        self,
+        monkeypatch,
+        outcome,
+    ):
+        database_name = "journal.db"
+        source_store = DefaultStore(
+            AliceId,
+            Alice_device,
+            self.store_path,
+            PICKLE_KEY,
+            database_name=database_name,
+        )
+        source_olm = Olm(AliceId, Alice_device, source_store)
+
+        def bob_query_response():
+            bob = self._memory_olm(BobId, Bob_device)
+            payload = bob.share_keys()["device_keys"]
+            return KeysQueryResponse.from_dict(
+                {"device_keys": {BobId: {Bob_device: payload}}, "failures": {}}
+            )
+
+        source_olm.handle_response(bob_query_response())
+        old_device = source_olm.device_store[BobId][Bob_device]
+        source_store.verify_device(old_device)
+        source_store.database.close()
+        del source_olm
+
+        sidecar_paths = tuple(
+            Path(self.store_path) / f"{AliceId}_{Alice_device}.{suffix}"
+            for suffix in (
+                "trusted_devices",
+                "blacklisted_devices",
+                "ignored_devices",
+            )
+        )
+        sidecars_before = tuple(
+            path.read_bytes() if path.exists() else None for path in sidecar_paths
+        )
+        owner = DurableStore(
+            Path(self.store_path),
+            source_store_class=DefaultStore,
+            user_id=AliceId,
+            device_id=Alice_device,
+            consumer_id=UUID("22222222-2222-4222-8222-222222222222"),
+            pickle_key=PICKLE_KEY,
+            database_name=database_name,
+        )
+        try:
+            store = owner.matrix
+            alice = Olm(
+                AliceId,
+                Alice_device,
+                store,
+                replace_rotated_device_keys=True,
+            )
+
+            def snapshot():
+                with owner.transaction():
+                    return tuple(
+                        tuple(row)
+                        for row in store.database.execute_sql(
+                            "SELECT d.deleted, d.display_name, k.key_type, k.key, "
+                            "t.state FROM devicekeys AS d "
+                            "JOIN keys AS k ON k.device_id = d.id "
+                            "LEFT JOIN devicetruststate AS t ON t.device_id = d.id "
+                            "WHERE d.user_id = ? AND d.device_id = ? "
+                            "ORDER BY k.key_type",
+                            (BobId, Bob_device),
+                        ).fetchall()
+                    )
+
+            before = snapshot()
+            assert {row[4] for row in before} == {TrustState.verified.value}
+            rotated = bob_query_response()
+            new_keys = rotated.device_keys[BobId][Bob_device]["keys"]
+
+            def forbidden_sidecar_write(_store):
+                raise AssertionError("durable rotation wrote a legacy trust sidecar")
+
+            monkeypatch.setattr(KeyStore, "_save", forbidden_sidecar_write)
+
+            class InjectedFailure(Exception):
+                pass
+
+            if outcome == "rollback":
+                save_device_keys = store.save_device_keys
+
+                def fail_after_key_write(device_keys):
+                    save_device_keys(device_keys)
+                    raise InjectedFailure
+
+                monkeypatch.setattr(store, "save_device_keys", fail_after_key_write)
+
+            if outcome == "rollback":
+                with pytest.raises(InjectedFailure):
+                    with owner.transaction():
+                        alice.handle_response(rotated)
+                assert snapshot() == before
+            else:
+                with owner.transaction():
+                    alice.handle_response(rotated)
+                after = snapshot()
+                assert after != before
+                assert {row[4] for row in after} == {TrustState.unset.value}
+                assert {row[3] for row in after} == {
+                    new_keys[f"curve25519:{Bob_device}"],
+                    new_keys[f"ed25519:{Bob_device}"],
+                }
+
+            assert (
+                tuple(
+                    path.read_bytes() if path.exists() else None
+                    for path in sidecar_paths
+                )
+                == sidecars_before
+            )
+        finally:
+            owner.close()
 
     def test_olm_inbound_session(self, monkeypatch):
         def mocksave(self):
@@ -1697,7 +1827,7 @@ class TestClass:
 
         alice.device_store.add(bob_device)
         bob.device_store.add(alice_device)
-        # bob.verify_device(alice_device)
+        bob.verify_device(alice_device)
 
         bob.create_outbound_group_session(TEST_ROOM)
         session = bob.outbound_group_sessions[TEST_ROOM]
@@ -1821,7 +1951,8 @@ class TestClass:
         # The key request is now waiting to be collected again.
         assert key_request_event in bob.received_key_requests.values()
 
-        # Let us collect it now.
+        # Remove trust before collection to exercise unverified cancellation.
+        bob.unverify_device(alice_device)
         bob.collect_key_requests()
 
         # Still no, device isn't verified.
@@ -1947,3 +2078,97 @@ class TestClass:
         assert not bob.outgoing_to_device_messages
         bob.collect_key_requests()
         assert not bob.outgoing_to_device_messages
+
+
+def test_unverified_own_device_without_session_is_collected_before_claim(
+    alice_account_pair,
+):
+    recipient, sender = alice_account_pair
+    recipient_device = sender.device_store[recipient.user_id][recipient.device_id]
+    sender.unverify_device(recipient_device)
+    sender.create_outbound_group_session(TEST_ROOM)
+    group = sender.outbound_group_sessions[TEST_ROOM]
+    group.shared = True
+    encrypted = sender.group_encrypt(
+        TEST_ROOM,
+        {
+            "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "verified secret"},
+        },
+    )
+    request = RoomKeyRequest.from_dict(
+        {
+            "type": "m.room_key_request",
+            "sender": recipient.user_id,
+            "content": {
+                "action": "request",
+                "request_id": group.id,
+                "requesting_device_id": recipient.device_id,
+                "body": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "room_id": TEST_ROOM,
+                    "session_id": group.id,
+                    "sender_key": sender.account.identity_keys["curve25519"],
+                },
+            },
+        }
+    )
+    sender.handle_to_device_event(request)
+    assert sender.collect_key_requests() == [request]
+    assert sender.get_active_key_requests(recipient.user_id, recipient.device_id) == [
+        request
+    ]
+    cancellation = RoomKeyRequestCancellation(
+        {}, request.sender, request.requesting_device_id, request.request_id
+    )
+    sender.handle_to_device_event(cancellation)
+    assert sender.collect_key_requests() == [cancellation]
+    assert sender.get_active_key_requests(recipient.user_id, recipient.device_id) == []
+    assert sender.key_request_devices_no_session == []
+    assert sender.outgoing_to_device_messages == []
+    sender.handle_to_device_event(request)
+    assert sender.collect_key_requests() == [request]
+    assert not sender.continue_key_share(request)
+    assert sender.key_request_devices_no_session == []
+    assert not any(sender.key_requests_waiting_for_session.values())
+    assert sender.outgoing_to_device_messages == []
+    assert sender.session_store.get(recipient_device.curve25519) is None
+
+    sender.verify_device(recipient_device)
+    assert sender.continue_key_share(request)
+    assert sender.key_request_devices_no_session == [recipient_device]
+    assert sender.outgoing_to_device_messages == []
+    recipient.account.generate_one_time_keys(1)
+    response = KeysClaimResponse.from_dict(
+        {
+            "failures": {},
+            "one_time_keys": {
+                recipient.user_id: {
+                    recipient.device_id: recipient.share_keys()["one_time_keys"]
+                }
+            },
+        }
+    )
+    sender.handle_response(response)
+    assert sender.collect_key_requests() == []
+    assert len(sender.outgoing_to_device_messages) == 1
+    recipient.outgoing_key_requests[group.id] = OutgoingKeyRequest(
+        group.id, group.id, TEST_ROOM, "m.megolm.v1.aes-sha2"
+    )
+    forwarded = ToDeviceEvent.parse_event(
+        TestClass.olm_message_to_event(
+            sender.outgoing_to_device_messages[0].as_dict(), recipient, sender
+        )
+    )
+    assert type(recipient.decrypt_event(forwarded)) is ForwardedRoomKeyEvent
+    event = MegolmEvent.from_dict(
+        {
+            "type": "m.room.encrypted",
+            "sender": sender.user_id,
+            "event_id": "$verified",
+            "origin_server_ts": 1,
+            "room_id": TEST_ROOM,
+            "content": encrypted,
+        }
+    )
+    assert recipient.decrypt_event(event).body == "verified secret"

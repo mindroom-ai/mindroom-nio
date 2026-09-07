@@ -17,12 +17,19 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from Crypto.PublicKey import ECC
 from Crypto.Signature import eddsa
 
 from ..api import Api
+
+if TYPE_CHECKING:
+    from typing import Protocol
+
+    class _EccConstruct(Protocol):
+        def __call__(self, *, curve: str, seed: bytes) -> ECC.EccKey: ...
+
 
 CROSS_SIGNING_SIDECAR_SUFFIX = "_cross_signing.json"
 
@@ -36,7 +43,8 @@ def _b64_to_bytes(data: str) -> bytes:
 
 
 def _signing_key(seed: bytes) -> ECC.EccKey:
-    return ECC.construct(curve="Ed25519", seed=seed)
+    construct = cast("_EccConstruct", ECC.construct)
+    return construct(curve="Ed25519", seed=seed)
 
 
 def _public_key_b64(seed: bytes) -> str:
