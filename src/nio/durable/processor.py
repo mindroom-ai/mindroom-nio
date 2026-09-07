@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from ..client.base_client import _SyncItem
 from ..event_provenance import TimelineEventProvenance
@@ -51,6 +51,11 @@ class Processor:
     def consume(self, items: Iterable[_SyncItem]) -> None:
         session = self.session
         for item in items:
+            if item.route == "encrypted_rooms":
+                session._store.matrix.save_encrypted_rooms(
+                    cast(Iterable[str], item.event)
+                )
+                continue
             if item.route in ("presence", "ephemeral"):
                 continue
             room = item.room

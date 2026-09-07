@@ -38,7 +38,7 @@ from functools import partial, wraps
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from ssl import SSLContext
-from typing import Any, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
@@ -250,6 +250,9 @@ from .base_client import (
     logged_in_async,
     store_loaded,
 )
+
+if TYPE_CHECKING:
+    from ..store import MatrixStore
 
 _ShareGroupSessionT = ShareGroupSessionError | ShareGroupSessionResponse
 
@@ -778,6 +781,28 @@ class AsyncClient(Client):
         for item in self._iter_ordinary_sliding_sync(response):
             if item.route is not None:
                 await self._dispatch_sync_item(item)
+
+    async def _save_encrypted_rooms(self, rooms: Iterable[str]) -> None:
+        store = self.store
+        room_ids = tuple(rooms)
+        if store is None or not room_ids:
+            return
+        if (
+            not store.supports_threaded_encrypted_room_writes
+            or store.database.in_transaction()
+        ):
+            store.save_encrypted_rooms(room_ids)
+            return
+        await _run_to_completion(
+            asyncio.to_thread(self._save_encrypted_rooms_in_thread, store, room_ids)
+        )
+
+    @staticmethod
+    def _save_encrypted_rooms_in_thread(
+        store: MatrixStore, rooms: tuple[str, ...]
+    ) -> None:
+        with store.database.connection_context():
+            store.save_encrypted_rooms(rooms)
 
     async def _collect_key_requests(self):
         for item in self._iter_key_requests():

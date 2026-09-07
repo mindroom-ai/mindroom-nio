@@ -18,7 +18,7 @@ import asyncio
 import inspect
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import wraps
@@ -185,7 +185,7 @@ class ClientCallback:
 
 @dataclass(frozen=True)
 class _SyncItem:
-    """One sync observation, yielded before processing the next event."""
+    """One sync observation or persistence step, consumed before the next event."""
 
     route: str | None = None
     event: object | None = None
@@ -195,7 +195,8 @@ class _SyncItem:
     provenance: TimelineEventProvenance | None = None
 
 
-_SYNC_CALLBACK_HANDLERS = {
+_SYNC_ITEM_HANDLERS = {
+    "encrypted_rooms": "_save_encrypted_rooms",
     "event": "_on_event",
     "invite": "_on_invited_rooms",
     "ephemeral": "_on_ephemeral",
@@ -995,8 +996,8 @@ class Client:
 
         self.encrypted_rooms.update(encrypted_rooms)
 
-        if self.store:
-            self.store.save_encrypted_rooms(encrypted_rooms)
+        if encrypted_rooms and self.store:
+            yield _SyncItem("encrypted_rooms", encrypted_rooms)
 
     def _iter_presence_events(self, response: SyncResponse) -> Iterator[_SyncItem]:
         for event in response.presence_events:
@@ -1028,7 +1029,7 @@ class Client:
             self.invited_rooms.pop(room_id, None)
         self.encrypted_rooms.update(encrypted_rooms)
         if encrypted_rooms and self.store:
-            self.store.save_encrypted_rooms(encrypted_rooms)
+            yield _SyncItem("encrypted_rooms", encrypted_rooms)
 
     def _handle_presence_events(self, response: SyncResponse):
         for item in self._iter_presence_events(response):
@@ -1132,11 +1133,18 @@ class Client:
         for cb in self.to_device_callbacks:
             cb.sync_execute(event)
 
+    def _save_encrypted_rooms(
+        self, rooms: Iterable[str]
+    ) -> None | Coroutine[Any, Any, None]:
+        if self.store:
+            self.store.save_encrypted_rooms(rooms)
+        return None
+
     def _dispatch_sync_item(self, item: _SyncItem) -> Any:
         """Dispatch at the yield so callbacks see the current room state."""
         if item.route is None:
             return None
-        handler = getattr(self, _SYNC_CALLBACK_HANDLERS[item.route])
+        handler = getattr(self, _SYNC_ITEM_HANDLERS[item.route])
         if item.room is not None:
             return handler(item.event, item.room)
         return handler(item.event)

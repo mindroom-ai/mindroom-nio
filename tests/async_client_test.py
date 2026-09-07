@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 from os import path
 from pathlib import Path
+from threading import Event as ThreadingEvent, get_ident
 from typing import Tuple
 from unittest.mock import AsyncMock
 from urllib.parse import urlparse
@@ -47,6 +48,7 @@ from nio import (
     JoinedRoomsResponse,
     JoinResponse,
     KeysClaimResponse,
+    KeysQueryResponse,
     KeysUploadResponse,
     LocalProtocolError,
     LoginError,
@@ -153,8 +155,11 @@ from nio.responses import (
     PublicRoom,
     PublicRoomsResponse,
     RoomUpgradeError,
+    SlidingSyncResponse,
     WhoamiError,
 )
+
+from nio.store import EncryptedRooms, SqliteMemoryStore, SqliteStore
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -1177,6 +1182,254 @@ class TestClass:
 
         await unauthed_async_client.keys_query()
         assert not unauthed_async_client.should_query_keys
+
+    @pytest.mark.parametrize("sliding", [False, True])
+    async def test_encrypted_room_store_write_does_not_block_event_loop(
+        self, async_client, monkeypatch, sliding
+    ):
+        """A slow encrypted-room write must not pause unrelated async work."""
+        assert async_client.store is not None
+        original_save = async_client.store.save_encrypted_rooms
+        write_started = ThreadingEvent()
+        release_write = ThreadingEvent()
+
+        def slow_save(rooms):
+            write_started.set()
+            release_write.wait(timeout=5)
+            original_save(rooms)
+
+        monkeypatch.setattr(async_client.store, "save_encrypted_rooms", slow_save)
+
+        response = self.encryption_sync_response
+        if sliding:
+            response = SlidingSyncResponse.from_dict(
+                {
+                    "pos": "p1",
+                    "rooms": {
+                        TEST_ROOM_ID: {
+                            "initial": True,
+                            "timeline": [],
+                            "required_state": [
+                                {
+                                    "type": "m.room.encryption",
+                                    "state_key": "",
+                                    "sender": ALICE_ID,
+                                    "event_id": "$encrypted",
+                                    "origin_server_ts": 1,
+                                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                                }
+                            ],
+                        }
+                    },
+                }
+            )
+        receive_task = asyncio.create_task(async_client.receive_response(response))
+        try:
+            assert await asyncio.to_thread(write_started.wait, 5)
+            assert not receive_task.done()
+        finally:
+            release_write.set()
+        await receive_task
+        assert TEST_ROOM_ID in async_client.store.load_encrypted_rooms()
+
+    @pytest.mark.parametrize("key_response", ["upload", "query"])
+    async def test_encrypted_room_save_can_overlap_key_response(
+        self, async_client, monkeypatch, key_response
+    ):
+        """Sync and key maintenance must both persist against the same database."""
+        store = async_client.store
+        owner = get_ident()
+        worker_read = ThreadingEvent()
+        main_started = ThreadingEvent()
+        main_wrote = ThreadingEvent()
+        worker_done = ThreadingEvent()
+        original_insert = EncryptedRooms.insert_many
+        original_save = store.save_encrypted_rooms
+        original_execute = store.database.execute_sql
+
+        def pause_after_worker_read(cls, *args, **kwargs):
+            if get_ident() != owner:
+                worker_read.set()
+                assert main_started.wait(5)
+                # Allow the other transaction to start. If SQLite excludes it
+                # before its first write, release this transaction to finish.
+                main_wrote.wait(0.1)
+            return original_insert(*args, **kwargs)
+
+        def finish_worker(rooms):
+            try:
+                return original_save(rooms)
+            finally:
+                worker_done.set()
+
+        def write_from_main(sql, *args, **kwargs):
+            if get_ident() == owner:
+                main_started.set()
+            result = original_execute(sql, *args, **kwargs)
+            if get_ident() == owner and sql.startswith("INSERT"):
+                main_wrote.set()
+                assert worker_done.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            EncryptedRooms, "insert_many", classmethod(pause_after_worker_read)
+        )
+        monkeypatch.setattr(store, "save_encrypted_rooms", finish_worker)
+        monkeypatch.setattr(store.database, "execute_sql", write_from_main)
+        receive_task = asyncio.create_task(
+            async_client.receive_response(self.encryption_sync_response)
+        )
+        try:
+            assert await asyncio.to_thread(worker_read.wait, 5)
+            response = (
+                KeysUploadResponse(0, 50)
+                if key_response == "upload"
+                else KeysQueryResponse.from_dict(self.keys_query_response)
+            )
+            await async_client.receive_response(response)
+        finally:
+            main_started.set()
+            main_wrote.set()
+            await receive_task
+
+        assert TEST_ROOM_ID in store.load_encrypted_rooms()
+        if key_response == "upload":
+            assert store.load_account().shared
+        else:
+            assert list(store.load_device_keys().active_user_devices(ALICE_ID))
+
+    async def test_empty_encrypted_room_save_skips_thread_dispatch(
+        self, async_client, monkeypatch
+    ):
+        """An empty save must not schedule SQLite work on a worker thread."""
+
+        def unexpected_save(*args):
+            raise AssertionError("empty encrypted-room save reached worker thread")
+
+        monkeypatch.setattr(
+            async_client,
+            "_save_encrypted_rooms_in_thread",
+            unexpected_save,
+        )
+
+        await async_client._save_encrypted_rooms(())
+
+    async def test_encrypted_room_store_write_closes_worker_connection(
+        self, async_client, monkeypatch
+    ):
+        """Each off-loop save must release its worker-local SQLite connection."""
+        assert async_client.store is not None
+        connection_closed = ThreadingEvent()
+        original_close = async_client.store.database.close
+
+        def close_connection():
+            result = original_close()
+            connection_closed.set()
+            return result
+
+        monkeypatch.setattr(async_client.store.database, "close", close_connection)
+
+        await async_client.receive_response(self.encryption_sync_response)
+
+        assert connection_closed.is_set()
+
+    async def test_encrypted_room_store_write_finishes_before_cancellation(
+        self, async_client, monkeypatch
+    ):
+        """Cancellation must not abandon an in-flight encrypted-room write."""
+        assert async_client.store is not None
+        original_save = async_client.store.save_encrypted_rooms
+        write_started = ThreadingEvent()
+        release_write = ThreadingEvent()
+        write_finished = ThreadingEvent()
+
+        def slow_save(rooms):
+            write_started.set()
+            release_write.wait(timeout=5)
+            original_save(rooms)
+            write_finished.set()
+
+        monkeypatch.setattr(async_client.store, "save_encrypted_rooms", slow_save)
+
+        receive_task = asyncio.create_task(
+            async_client.receive_response(self.encryption_sync_response)
+        )
+        assert await asyncio.to_thread(write_started.wait, 5)
+        receive_task.cancel()
+        await asyncio.sleep(0)
+
+        try:
+            assert not receive_task.done()
+        finally:
+            release_write.set()
+            assert await asyncio.to_thread(write_finished.wait, 5)
+
+        with pytest.raises(asyncio.CancelledError):
+            await receive_task
+        assert TEST_ROOM_ID in async_client.store.load_encrypted_rooms()
+
+    async def test_encrypted_room_save_supports_in_memory_store(self, tempdir):
+        """In-memory stores must persist on their owning event-loop thread."""
+        client = AsyncClient(
+            "https://example.org",
+            "ephemeral",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=SqliteMemoryStore),
+        )
+        await client.receive_response(LoginResponse.from_dict(self.login_response))
+
+        try:
+            await client.receive_response(self.encryption_sync_response)
+
+            assert client.store is not None
+            assert client.store.load_encrypted_rooms() == {TEST_ROOM_ID}
+        finally:
+            await client.close()
+
+    async def test_custom_store_requires_threaded_write_opt_in(
+        self, tempdir, monkeypatch
+    ):
+        """Custom stores stay on their owning thread unless they explicitly opt in."""
+
+        class CustomSqliteStore(SqliteStore):
+            pass
+
+        client = AsyncClient(
+            "https://example.org",
+            "custom",
+            "DEVICEID",
+            tempdir,
+            config=AsyncClientConfig(store=CustomSqliteStore),
+        )
+        await client.receive_response(LoginResponse.from_dict(self.login_response))
+        assert client.store is not None
+        original_save = client.store.save_encrypted_rooms
+        save_thread_ids = []
+
+        def record_save_thread(rooms):
+            save_thread_ids.append(get_ident())
+            original_save(rooms)
+
+        monkeypatch.setattr(client.store, "save_encrypted_rooms", record_save_thread)
+        owning_thread_id = get_ident()
+
+        try:
+            await client.receive_response(self.encryption_sync_response)
+
+            assert save_thread_ids == [owning_thread_id]
+            assert client.store.load_encrypted_rooms() == {TEST_ROOM_ID}
+        finally:
+            await client.close()
+
+    async def test_encrypted_room_save_preserves_outer_transaction(self, async_client):
+        store = async_client.store
+        with pytest.raises(RuntimeError, match="rollback encrypted room"):
+            with store.database.atomic():
+                await async_client._save_encrypted_rooms({TEST_ROOM_ID})
+                assert TEST_ROOM_ID in store.load_encrypted_rooms()
+                raise RuntimeError("rollback encrypted room")
+        assert TEST_ROOM_ID not in store.load_encrypted_rooms()
 
     async def test_message_sending(self, async_client, aioresponse):
         aioresponse.post(

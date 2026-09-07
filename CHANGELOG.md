@@ -25,6 +25,12 @@ All notable changes to this project will be documented in this file.
 
 ### Durability and compatibility
 
+- Ordinary async clients await encrypted-room disk saves in a worker, keeping
+  the event loop responsive during slow writes. Durable preparation, existing
+  transactions, memory stores and custom stores without explicit opt-in keep
+  their owning-thread behavior. See `docs/design/encrypted-room-persistence.md`.
+  Reserve SQLite's writer before account lookups to avoid lock-upgrade races
+  between encrypted-room saves and concurrent key maintenance.
 - Restore room context on replayed undecrypted Megolm events so callbacks can
   request missing room keys.
 - Return `BadEvent` or `UnknownBadEvent` for malformed invitation envelopes,

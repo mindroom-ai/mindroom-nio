@@ -19,6 +19,50 @@ from .sliding_test import settings, settle, window
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sliding", [False, True])
+async def test_encrypted_room_save_rolls_back_with_durable_preparation(
+    tmp_path, monkeypatch, sliding
+):
+    config = settings() if sliding else None
+    session = open_session(tmp_path, config=config)
+    root = json.loads(window() if sliding else response(messages=0))
+    encryption = {
+        "type": "m.room.encryption",
+        "state_key": "",
+        "sender": USER,
+        "event_id": "$encryption",
+        "origin_server_ts": 1,
+        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+    }
+    state = (
+        root["rooms"][ROOM]["required_state"]
+        if sliding
+        else root["rooms"]["join"][ROOM]["state"]["events"]
+    )
+    state.append(encryption)
+    body = json.dumps(root).encode()
+
+    def fail_projection(*args, **kwargs):
+        assert ROOM in session.client.store.load_encrypted_rooms()
+        raise RuntimeError("projection failure after encryption")
+
+    monkeypatch.setattr(session, "_save_rooms", fail_projection)
+    try:
+        with pytest.raises(RuntimeError, match="projection failure after encryption"):
+            await session._accept_response(body)
+    finally:
+        await session.close()
+    reopened = open_session(tmp_path, config=config)
+    try:
+        assert ROOM not in reopened.client.store.load_encrypted_rooms()
+        assert reopened.cursor is None
+        assert await reopened.next_batch() is None
+        assert reopened._store.input[0] == body
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["rollback", "close"])
 @pytest.mark.parametrize("operation", ["encrypt", "room_send", "send"])
 async def test_disposed_client_cannot_encrypt_or_send(

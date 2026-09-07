@@ -279,7 +279,7 @@ def iter_sliding_sync(
             client.invited_rooms.pop(room_id, None)
     client.encrypted_rooms.update(encrypted_rooms)
     if encrypted_rooms and client.store:
-        client.store.save_encrypted_rooms(encrypted_rooms)
+        yield _SyncItem("encrypted_rooms", encrypted_rooms)
 
     for kind in ("receipts", "typing"):
         for room_id, raw in response.extensions.get(kind, {}).get("rooms", {}).items():
