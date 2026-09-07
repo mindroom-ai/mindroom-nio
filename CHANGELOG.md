@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 
 ### Durability and compatibility
 
+- Restore room context on replayed undecrypted Megolm events so callbacks can
+  request missing room keys.
+- Return `BadEvent` or `UnknownBadEvent` for malformed invitation envelopes,
+  previously dropped as `None`. Durable sync rejects these while retaining input;
+  valid unknown or redacted invitation events remain ignored.
 - Retire durable outbound encryption sessions when refreshed recipients change
   or the previous recipient set is unknown; profile-only updates keep the session.
 - Request fresh Sliding state after recovery loses a joined room's authorization

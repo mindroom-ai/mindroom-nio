@@ -124,6 +124,9 @@ profile and invitation data, not a second power snapshot. A deleted power-state
 tuple must remain deleted after restart; an older member row cannot restore it.
 
 Committed callback events retain their original event data and crypto evidence.
+Replayed undecrypted Megolm events also restore `room_id` from the record's room
+context, as ordinary sync does before dispatch. The retained wire envelope stays
+unchanged; callbacks can request a missing key for the correct room.
 Room callbacks after restart see the restored current room projection; exact
 historical snapshots of every room at every callback are not promised.
 
@@ -263,8 +266,11 @@ and the required membership/create/power/encryption types even if their state ke
 is missing. The preparation transaction rolls back and disposes the client; its
 input remains retained for diagnosis. It must not advance the cursor or emit
 later live grants using stale state. This is a protocol failure, not an automatic
-repair policy. Ordinary parsing and malformed non-state messages keep their
-existing behavior.
+repair policy. Malformed non-state messages keep their existing behavior.
+The shared invitation parser returns `BadEvent` or `UnknownBadEvent` for envelope
+schema failures, matching its existing content-error representation. Such errors
+must reach the durable collector. Valid unknown or redacted invitation events
+remain ignored (`None`); they are not validation failures.
 Token cycles, unavailable history, and oversized single events terminate as
 explicit loss rather than silently advancing a supposedly complete history.
 

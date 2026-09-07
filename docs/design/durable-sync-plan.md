@@ -825,3 +825,35 @@ checks also pass on Python 3.12; zero mypy errors across 60 source files; all
 repository hooks pass. The complete PR is +5,257/-6,482 production lines against
 `5b6de3bc`, or 1,225 fewer lines across 42 files. Fresh whole-PR verdicts for the
 pushed correction are retained with the loop evidence.
+
+## Replay and invitation parser corrections after `a4feac6`
+
+The next independent report identifies two failures at existing boundaries.
+Main-thread regressions reproduce both in Classic and Sliding sync: replayed
+undecrypted events send a room-key request with a null room ID, and malformed
+invitation envelopes disappear before the durable collector can reject them.
+The initial targeted run has 11 failures, including the shared parser's old
+drop-on-error expectation. This expectation must change; valid unknown and
+redacted invitations remain ignored and have a separate passing control.
+
+Restore the encrypted event's room ID in the existing replay codec, without
+changing the retained wire envelope. Use the invitation parser's existing
+`verify` decorator so envelope failures return the same error objects as content
+failures. The collector already rejects those errors and retains the input on
+rollback. This corrects information lost before the existing owners act; no
+additional validation pass, recovery mechanism or guarantee is needed. The
+shared parser compatibility change is documented in the contract and changelog.
+
+The corrections change seven production lines and remove four, adding three
+net lines across two files. Against main `5b6de3bc`, the whole PR is
++5,264/-6,486 across 42 production files, or 1,222 fewer lines. Evidence remains
+under the indexed `native-loop` directory, with the `replay-invite-` prefix.
+Existing performance results retain their original revisions.
+
+Qualification: 922 passed and three skipped in 73.08s on Python 3.14.7; all 88
+tests in the affected parser and boundary files pass on Python 3.12.13. Mypy
+reports zero errors across 60 source files, and all repository hooks pass. The
+12 focused checks cover actual key-request HTTP payloads before and after
+restart, retained malformed input in both transports, and parser controls.
+Refresh the companion wheel and repeat the two-reviewer gate on the pushed head;
+record those results with the same persistent evidence.

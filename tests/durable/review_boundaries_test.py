@@ -7,12 +7,12 @@ import logging
 import pytest
 from aiohttp import web
 
-from nio import TimelineEventProvenance
+from nio import MegolmEvent, TimelineEventProvenance
 from nio.durable.model import RecordKind
 from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, client, open_session, response
-from .crypto_test import publish_account
+from .crypto_test import missing_event, publish_account, queue_dummy
 from .recovery_test import baseline, member, message
 from .runner_test import homeserver
 from .sliding_test import settings, settle, window
@@ -296,5 +296,113 @@ async def test_leave_account_data_is_committed_and_replayed_after_restart(tmp_pa
         assert reopened._metadata[ROOM]["tags"] == tags
         await reopened.ack(batch)
         assert await reopened.next_batch() is None
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sliding", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_replayed_encrypted_callback_requests_key_for_its_room(
+    tmp_path, sliding, restart
+):
+    sent = []
+
+    async def http(request):
+        assert "/sendToDevice/m.room_key_request/" in request.path
+        sent.append(await request.json())
+        return web.json_response({})
+
+    config = settings() if sliding else None
+    async with homeserver(None, membership=http) as (url, _):
+        session = open_session(tmp_path, config=config)
+        session.client.homeserver = url
+        with session._store.transaction():
+            _, device = queue_dummy(session.client.olm)
+            session.client.olm.outgoing_to_device_messages.clear()
+            session._crypto.capture()
+        encrypted = missing_event(session.client.olm, device).source
+        encrypted.pop("room_id")
+        root = json.loads(window() if sliding else response(messages=0))
+        info = root["rooms"][ROOM] if sliding else root["rooms"]["join"][ROOM]
+        timeline = info["timeline"] if sliding else info["timeline"]["events"]
+        timeline.append(encrypted)
+        try:
+            await session._accept_response(json.dumps(root).encode())
+            if restart:
+                await session.close()
+                session = open_session(tmp_path, config=config)
+                session.client.homeserver = url
+
+            async def callback(room, event):
+                assert room.room_id == ROOM
+                await session.client.request_room_key(event)
+
+            session.client.add_event_callback(callback, MegolmEvent)
+            while batch := await session.next_batch():
+                for record in batch.records:
+                    if record.kind is RecordKind.TIMELINE:
+                        assert "room_id" not in record.source
+                        await session.dispatch(record)
+                await session.ack(batch)
+            assert len(sent) == 1
+            request = sent[0]["messages"][USER]["*"]["body"]
+            assert request["room_id"] == ROOM
+            assert request["session_id"] == "missing-session"
+            assert (
+                session.client.outgoing_key_requests["missing-session"].room_id == ROOM
+            )
+        finally:
+            await session.close()
+            await session.client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sliding", [False, True])
+@pytest.mark.parametrize(
+    "malformed", ["content-type", "missing-content", "missing-type"]
+)
+async def test_malformed_invitation_is_retained_and_rejected(
+    tmp_path, sliding, malformed
+):
+    config = settings() if sliding else None
+    session = open_session(tmp_path, config=config)
+    event = {
+        "type": "m.room.member",
+        "sender": USER,
+        "state_key": USER,
+        "content": {"membership": "invite"},
+    }
+    if malformed == "content-type":
+        event["content"] = "invalid-content"
+    elif malformed == "missing-content":
+        event.pop("content")
+    else:
+        event.pop("type")
+    root = (
+        {
+            "pos": "p1",
+            "rooms": {ROOM: {"membership": "invite", "stripped_state": [event]}},
+        }
+        if sliding
+        else {
+            "next_batch": "s1",
+            "rooms": {"invite": {ROOM: {"invite_state": {"events": [event]}}}},
+        }
+    )
+    body = json.dumps(root).encode()
+    try:
+        with pytest.raises(LocalProtocolError, match="malformed durable room state"):
+            await session._accept_response(body)
+    finally:
+        await session.close()
+    reopened = open_session(tmp_path, config=config)
+    try:
+        assert reopened.cursor is None
+        assert await reopened.next_batch() is None
+        assert reopened.client.invited_rooms == {}
+        assert reopened._store.input[0] == body
+        with pytest.raises(LocalProtocolError, match="malformed durable room state"):
+            reopened._prepare_pending()
     finally:
         await reopened.close()

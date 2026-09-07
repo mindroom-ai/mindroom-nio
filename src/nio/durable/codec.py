@@ -13,6 +13,7 @@ from ..events import (
     InviteEvent,
     InviteMemberEvent,
     KeyVerificationCancel,
+    MegolmEvent,
     RoomKeyEvent,
     ToDeviceEvent,
 )
@@ -159,6 +160,8 @@ def restore_event(record: SyncRecord) -> object:
         if record.clear is not None
         else Event.parse_event(payload)
     )
+    if isinstance(event, MegolmEvent) and record.room_id is not None:
+        event.room_id = record.room_id
     if record.crypto is not None and isinstance(event, Event):
         event.decrypted = True
         event.verified = record.crypto.verified  # type: ignore[assignment]

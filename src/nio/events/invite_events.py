@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..schemas import Schemas
-from .misc import BadEventType, verify, verify_or_none
+from .misc import BadEventType, verify
 
 
 @dataclass
@@ -58,7 +58,7 @@ class InviteEvent:
     sender: str = field()
 
     @classmethod
-    @verify_or_none(Schemas.invite_event)
+    @verify(Schemas.invite_event)
     def parse_event(
         cls, event_dict: dict[Any, Any]
     ) -> InviteEvent | BadEventType | None:
@@ -68,8 +68,8 @@ class InviteEvent:
         level event object representing the parsed event.
 
         The event structure is checked for correctness and the event fields are
-        type-checked. If this validation process fails for an event None will
-        be returned.
+        type-checked. Validation failures return a BadEvent or UnknownBadEvent.
+        Valid unknown or redacted events return None.
 
         Args:
             event_dict (dict): The dictionary representation of the event.
