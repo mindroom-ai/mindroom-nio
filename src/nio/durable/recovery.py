@@ -34,11 +34,12 @@ class Recovery:
         self.session = session
         self.response: SyncResponse | SlidingSyncResponse | None = None
         self.resets: set[str] = set()
+        self._complete_state_seen = False
 
     def needs_full_state(self) -> bool:
         session = self.session
         return bool(session.cursor) and (
-            not session._metadata
+            (not session._metadata and not self._complete_state_seen)
             or any(
                 value.get("membership") == "join" and not value.get("baseline")
                 for value in session._metadata.values()
@@ -321,6 +322,9 @@ class Recovery:
         session._store.set_cursor(response.next_batch)
         session._store.save_continuation({"phase": "prepared"})
         session.client.next_batch = response.next_batch
+        if complete_state:
+            # Empty inventories still need discovery once after each restart.
+            self._complete_state_seen = True
 
     def _sliding_tail(
         self, response: SlidingSyncResponse, state: dict[str, Any]

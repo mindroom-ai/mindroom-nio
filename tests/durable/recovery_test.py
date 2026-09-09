@@ -491,6 +491,75 @@ async def test_unknown_adopted_cursor_requests_full_state_and_only_future_tail_i
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("startup", "initial_requests"),
+    [
+        ("fresh", [None, None]),
+        ("filtered", [None, "true", None]),
+        ("restored", ["true", None]),
+    ],
+)
+async def test_empty_account_stops_requesting_full_state_after_complete_sync(
+    tmp_path, startup, initial_requests
+):
+    config = DurableSyncConfig(
+        sync_filter=(
+            {"room": {"timeline": {"limit": 10}}} if startup == "filtered" else None
+        )
+    )
+    if startup == "restored":
+        previous = open_session(tmp_path, config=config)
+        with previous._store.transaction():
+            previous._store.set_cursor("saved")
+        await previous.close()
+
+    # Reopening an empty store must still discover its current room inventory.
+    for reopened in (False, True):
+        requests_seen = []
+        poll_started = asyncio.Event()
+        stop = asyncio.Event()
+        expected = ["true", None] if reopened else initial_requests
+        complete_responses = len(expected) - 1
+
+        async def sync(request):
+            requests_seen.append(dict(request.query))
+            if len(requests_seen) > complete_responses:
+                poll_started.set()
+                await stop.wait()
+            return web.json_response({"next_batch": f"s{len(requests_seen)}"})
+
+        async with homeserver(sync) as (url, _):
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client, config)
+            task = asyncio.create_task(session.run())
+            try:
+                for index in range(complete_responses):
+                    async with asyncio.timeout(5):
+                        await session.wait_for_work()
+                    batch = await session.next_batch()
+                    assert batch.records == ()
+                    assert batch.completes_sync
+                    # Let an incorrectly premature poll reach the HTTP handler.
+                    await asyncio.sleep(0.05)
+                    assert len(requests_seen) == index + 1
+                    assert not poll_started.is_set()
+                    await session.ack(batch)
+                async with asyncio.timeout(5):
+                    await poll_started.wait()
+                assert [r.get("full_state") for r in requests_seen] == expected
+                assert requests_seen[-1]["timeout"] == "30000"
+                assert session.cursor == f"s{complete_responses}"
+                assert not session.client.rooms
+                await session.quiesce()
+                await task
+            finally:
+                stop.set()
+                await session.close()
+                await nio_client.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_continues_after_departure_to_find_rejoin_on_later_page(
     tmp_path,
 ):
@@ -701,7 +770,10 @@ async def test_leave_fallback_is_not_suppressed_by_historical_self_join(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_local_join_empty_projection_never_authorizes_initial_tail(tmp_path):
+@pytest.mark.parametrize("complete_empty_sync", [False, True])
+async def test_local_join_empty_projection_never_authorizes_initial_tail(
+    tmp_path, complete_empty_sync
+):
     from .membership_test import OPERATION
 
     async def sync(request):
@@ -717,6 +789,12 @@ async def test_local_join_empty_projection_never_authorizes_initial_tail(tmp_pat
         with session._store.transaction():
             session._store.set_cursor("before-join")
         try:
+            if complete_empty_sync:
+                await session._accept_response(
+                    b'{"next_batch":"empty"}', full_state=True
+                )
+                with session._store.transaction():
+                    session._store.finish_input()
             assert await session.change_membership(
                 operation_id=OPERATION,
                 room_id=ROOM,
