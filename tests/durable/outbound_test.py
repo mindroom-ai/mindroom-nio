@@ -312,14 +312,22 @@ async def test_outgoing_member_query_cannot_rewrite_recovery_projection(tmp_path
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status, errcode", [(403, "M_FORBIDDEN"), (404, "M_NOT_FOUND")]
+    "status, errcode",
+    [
+        (403, "M_FORBIDDEN"),
+        (404, "M_NOT_FOUND"),
+        (429, "M_LIMIT_EXCEEDED"),
+        (503, "M_UNKNOWN"),
+    ],
 )
 async def test_public_member_query_returns_error_without_reusing_recipients(
     tmp_path, status, errcode
 ):
     async def members(_):
         return web.json_response(
-            {"errcode": errcode, "error": "Room unavailable"}, status=status
+            {"errcode": errcode, "error": "Room unavailable"},
+            status=status,
+            headers={"Retry-After": "0"},
         )
 
     async with homeserver(None, membership=members) as (url, _):

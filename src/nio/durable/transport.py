@@ -70,7 +70,9 @@ class Transport:
                             raise ResponseTooLarge
                     if response.status == 200:
                         return bytes(content)
-                    if response.status not in (408, 429) and response.status < 500:
+                    if (
+                        response.status not in (408, 429) and response.status < 500
+                    ) or attempt == 4:
                         try:
                             code = json.loads(content).get("errcode")
                         except (ValueError, AttributeError):
@@ -78,8 +80,6 @@ class Transport:
                         raise HttpError(
                             response.status, code if isinstance(code, str) else None
                         )
-                    if attempt == 4:
-                        raise HttpError(response.status)
                     try:
                         retry_after = response.headers.get("Retry-After")
                         delay = (
