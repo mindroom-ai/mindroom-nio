@@ -239,9 +239,18 @@ async def test_batch_byte_bound_splits_without_dropping_messages(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_prepared_capacity_failure_retains_input_and_poisons_client(tmp_path):
-    session = open_session(tmp_path, config=DurableSyncConfig(max_batch_bytes=100))
-    with pytest.raises(LocalProtocolError, match="batch bound"):
+@pytest.mark.parametrize(
+    ("config", "bound"),
+    [
+        (DurableSyncConfig(max_batch_bytes=100), "batch bound"),
+        (DurableSyncConfig(max_pending_bytes=100), "pending bound"),
+    ],
+)
+async def test_prepared_capacity_failure_retains_input_and_poisons_client(
+    tmp_path, config, bound
+):
+    session = open_session(tmp_path, config=config)
+    with pytest.raises(LocalProtocolError, match=bound):
         await session._accept_response(response())
     with pytest.raises(LocalProtocolError):
         await session.next_batch()

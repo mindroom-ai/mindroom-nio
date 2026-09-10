@@ -305,6 +305,19 @@ class DurableStore:
             is not None
         )
 
+    @property
+    def pending_bytes(self) -> int:
+        """Count queued payload bytes without loading them on SQLite 3.43+."""
+        self._assert_open()
+        byte_length = (
+            "octet_length(records)"
+            if self.database.server_version >= (3, 43, 0)
+            else "length(CAST(records AS BLOB))"
+        )
+        return self.database.execute_sql(
+            f"SELECT COALESCE(SUM({byte_length}),0) FROM NioDurableBatch"
+        ).fetchone()[0]
+
     def next_batch(self) -> SyncBatch | None:
         self._assert_open()
         row = self.database.execute_sql(

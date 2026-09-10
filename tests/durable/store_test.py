@@ -101,6 +101,52 @@ def test_ack_is_ordered_and_idempotent(tmp_path):
         store.close()
 
 
+@pytest.mark.parametrize("sqlite_version", [(3, 42, 0), (3, 43, 0)])
+def test_pending_bytes_counts_utf8_not_characters(
+    tmp_path, monkeypatch, sqlite_version
+):
+    store = open_store(tmp_path)
+    try:
+        if store.database.server_version < (3, 43, 0) and sqlite_version >= (3, 43, 0):
+            pytest.skip("SQLite lacks octet_length")
+        monkeypatch.setattr(store.database, "server_version", sqlite_version)
+        assert store.pending_bytes == 0
+        with store.transaction():
+            # Nine Unicode characters occupy thirteen UTF-8 bytes.
+            store.database.execute_sql(
+                "INSERT INTO NioDurableBatch(records,completes_sync) VALUES(?,0)",
+                ('["é","😀"]',),
+            )
+            store.publish((), completes_sync=True)
+            assert store.pending_bytes == 15
+    finally:
+        store.close()
+
+
+def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            first = store.publish(())
+        with pytest.raises(RuntimeError, match="interrupted"):
+            with store.transaction():
+                store.publish(())
+                assert store.pending_bytes == 4
+                raise RuntimeError("interrupted")
+        assert store.pending_bytes == 2
+        store.ack(first)
+        assert store.pending_bytes == 0
+        with store.transaction():
+            store.publish(())
+    finally:
+        store.close()
+    reopened = open_store(tmp_path)
+    try:
+        assert reopened.pending_bytes == 2
+    finally:
+        reopened.close()
+
+
 def test_capture_cannot_overwrite_unfinished_response(tmp_path):
     store = open_store(tmp_path)
     try:
