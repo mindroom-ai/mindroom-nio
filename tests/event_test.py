@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from nio.api import PushRuleKind
 from nio.events import (
     AccountDataEvent,
@@ -43,7 +45,10 @@ from nio.events import (
     RoomAliasEvent,
     RoomAvatarEvent,
     RoomCreateEvent,
+    RoomEncryptedAudio,
+    RoomEncryptedFile,
     RoomEncryptedImage,
+    RoomEncryptedVideo,
     RoomEncryptionEvent,
     RoomGuestAccessEvent,
     RoomHistoryVisibilityEvent,
@@ -52,9 +57,13 @@ from nio.events import (
     RoomKeyRequest,
     RoomKeyRequestCancellation,
     RoomMemberEvent,
+    RoomMessageAudio,
     RoomMessageEmote,
+    RoomMessageFile,
+    RoomMessageImage,
     RoomMessageNotice,
     RoomMessageText,
+    RoomMessageVideo,
     RoomNameEvent,
     RoomTopicEvent,
     StickerEvent,
@@ -137,6 +146,22 @@ class TestClass:
         parsed_dict["content"].pop("url")
         event = RoomAvatarEvent.from_dict(parsed_dict)
         assert isinstance(event, RoomAvatarEvent)
+
+    def test_room_avatar_event_null_url(self):
+        parsed_dict = TestClass._load_response("tests/data/events/room_avatar.json")
+        parsed_dict["content"]["url"] = None
+
+        event = Event.parse_event(parsed_dict)
+
+        assert isinstance(event, RoomAvatarEvent)
+        assert event.avatar_url is None
+
+    @pytest.mark.parametrize("url", [1, False, {}, []])
+    def test_room_avatar_event_invalid_url(self, url):
+        parsed_dict = TestClass._load_response("tests/data/events/room_avatar.json")
+        parsed_dict["content"]["url"] = url
+
+        assert isinstance(Event.parse_event(parsed_dict), BadEvent)
 
     def test_tag_event(self):
         parsed_dict = TestClass._load_response("tests/data/events/tag.json")
@@ -554,6 +579,56 @@ class TestClass:
         assert event.thumbnail_hashes
         assert event.thumbnail_iv
         assert event.mimetype
+
+    @pytest.mark.parametrize("parse", [Event.parse_event, Event.parse_decrypted_event])
+    @pytest.mark.parametrize(
+        "msgtype,plain_class,encrypted_class",
+        [
+            ("m.image", RoomMessageImage, RoomEncryptedImage),
+            ("m.audio", RoomMessageAudio, RoomEncryptedAudio),
+            ("m.video", RoomMessageVideo, RoomEncryptedVideo),
+            ("m.file", RoomMessageFile, RoomEncryptedFile),
+        ],
+    )
+    @pytest.mark.parametrize("encrypted", [False, True])
+    def test_media_parsing_uses_attachment_encryption(
+        self, parse, msgtype, plain_class, encrypted_class, encrypted
+    ):
+        parsed_dict = TestClass._load_response(
+            "tests/data/events/room_encrypted_image.json"
+        )
+        content = parsed_dict["content"]
+        content["msgtype"] = msgtype
+        file = content["file"]
+        parsed_dict["unsigned"] = {"transaction_id": "attachment-transaction"}
+        if not encrypted:
+            content["url"] = content.pop("file")["url"]
+
+        event = parse(parsed_dict)
+
+        assert isinstance(event, encrypted_class if encrypted else plain_class)
+        assert event.url == file["url"]
+        assert event.body == content["body"]
+        assert event.transaction_id == "attachment-transaction"
+        if encrypted:
+            assert event.key == file["key"]
+            assert event.iv == file["iv"]
+            assert event.hashes == file["hashes"]
+
+    @pytest.mark.parametrize("parse", [Event.parse_event, Event.parse_decrypted_event])
+    @pytest.mark.parametrize("missing", ["url", "key", "iv", "hashes"])
+    def test_invalid_encrypted_file_does_not_fall_back_to_plain_url(
+        self, parse, missing
+    ):
+        parsed_dict = TestClass._load_response(
+            "tests/data/events/room_encrypted_image.json"
+        )
+        content = parsed_dict["content"]
+        content["msgtype"] = "m.file"
+        content["url"] = content["file"]["url"]
+        del content["file"][missing]
+
+        assert isinstance(parse(parsed_dict), BadEvent)
 
     def test_event_flattening(self):
         parsed_dict = TestClass._load_response(
