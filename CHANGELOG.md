@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.3
+
+- Return `JoinedMembersError` for refused durable `AsyncClient.joined_members()` requests, preserving the Matrix error code and room ID.
+- Preserve the server's Matrix error code after HTTP retry exhaustion while keeping internal recipient refresh fail-closed.
+
 ## 1.0.2
 
 - Avoid rereading queued sync payloads when checking the durable pending-byte limit on SQLite 3.43 and newer.
