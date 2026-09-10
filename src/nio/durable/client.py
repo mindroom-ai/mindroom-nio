@@ -246,10 +246,7 @@ class DurableSync:
             self._publish_records(records[:middle])
             self._publish_records(records[middle:])
             return
-        pending_bytes = self._store.database.execute_sql(
-            "SELECT COALESCE(SUM(length(CAST(records AS BLOB))),0) FROM NioDurableBatch"
-        ).fetchone()[0]
-        if pending_bytes + size > self.config.max_pending_bytes:
+        if self._store.pending_bytes + size > self.config.max_pending_bytes:
             raise LocalProtocolError(
                 "prepared output exceeds the durable pending bound"
             )
