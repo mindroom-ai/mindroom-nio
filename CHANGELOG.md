@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.2
+
+- Avoid rereading queued sync payloads when checking the durable pending-byte limit on SQLite 3.43 and newer.
+- Preserve exact byte accounting on older SQLite drivers without changing the queue format or transaction behavior.
+
 ## 1.0.1
 
 - Parse encrypted image, audio, video, and file attachments in ordinary room events as well as decrypted events, preserving their encryption metadata.
