@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.1
+
+- Parse encrypted image, audio, video, and file attachments in ordinary room events as well as decrypted events, preserving their encryption metadata.
+- Accept a null room avatar URL as an unset avatar while continuing to reject other invalid URL types.
+- Stop requesting full state repeatedly after a successful initial sync for accounts with no joined rooms.
+
 ## 1.0.0
 
 ### Breaking changes
