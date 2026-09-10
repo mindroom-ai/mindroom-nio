@@ -783,7 +783,7 @@ class RoomAvatarEvent(Event):
     """Event holding a picture that is associated with the room.
 
     Attributes:
-        avatar_url (str): The URL to the picture.
+        avatar_url (str | None): The URL to the picture, or None when unset.
 
     """
 
@@ -852,22 +852,25 @@ class RoomMessage(Event):
     @classmethod
     @verify(Schemas.room_message)
     def parse_event(cls, parsed_dict: dict[Any, Any]) -> RoomMessage | BadEventType:
+        """Parse message content using the attachment's encryption metadata."""
         content_dict = parsed_dict["content"]
+        msgtype = content_dict["msgtype"]
+        media_classes = {
+            "m.image": (RoomMessageImage, RoomEncryptedImage),
+            "m.audio": (RoomMessageAudio, RoomEncryptedAudio),
+            "m.video": (RoomMessageVideo, RoomEncryptedVideo),
+            "m.file": (RoomMessageFile, RoomEncryptedFile),
+        }
 
-        if content_dict["msgtype"] == "m.text":
+        if (msg_classes := media_classes.get(msgtype)) is not None:
+            encrypted = "file" in content_dict
+            event = msg_classes[encrypted].from_dict(parsed_dict)
+        elif msgtype == "m.text":
             event = RoomMessageText.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.emote":
+        elif msgtype == "m.emote":
             event = RoomMessageEmote.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.notice":
+        elif msgtype == "m.notice":
             event = RoomMessageNotice.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.image":
-            event = RoomMessageImage.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.audio":
-            event = RoomMessageAudio.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.video":
-            event = RoomMessageVideo.from_dict(parsed_dict)
-        elif content_dict["msgtype"] == "m.file":
-            event = RoomMessageFile.from_dict(parsed_dict)
         else:
             event = RoomMessageUnknown.from_dict(parsed_dict)
 
@@ -877,31 +880,8 @@ class RoomMessage(Event):
 
         return event
 
-    @classmethod
-    @verify(Schemas.room_message)
-    def parse_decrypted_event(
-        cls, parsed_dict: dict[Any, Any]
-    ) -> RoomMessage | BadEventType:
-        msgtype = parsed_dict["content"]["msgtype"]
-
-        media_classes = {
-            "m.image": (RoomMessageImage, RoomEncryptedImage),
-            "m.audio": (RoomMessageAudio, RoomEncryptedAudio),
-            "m.video": (RoomMessageVideo, RoomEncryptedVideo),
-            "m.file": (RoomMessageFile, RoomEncryptedFile),
-        }
-
-        if (msg_classes := media_classes.get(msgtype)) is None:
-            event = RoomMessage.parse_event(parsed_dict)
-        else:
-            encrypted = "file" in parsed_dict["content"]
-            event = msg_classes[encrypted].from_dict(parsed_dict)
-
-        if "unsigned" in parsed_dict:
-            txn_id = parsed_dict["unsigned"].get("transaction_id", None)
-            event.transaction_id = txn_id
-
-        return event
+    # Attachment encryption is independent of the room event's envelope.
+    parse_decrypted_event = parse_event
 
 
 @dataclass

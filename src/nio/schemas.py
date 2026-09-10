@@ -1173,7 +1173,8 @@ class Schemas:
                         "mimetype": {"type", "string"},
                         "size": {"type": "integer"},
                     },
-                    "url": {"type": "string"},
+                    # Some clients clear the avatar with null rather than omitting it.
+                    "url": {"type": ["string", "null"]},
                 },
                 "required": [],
             },
