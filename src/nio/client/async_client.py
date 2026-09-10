@@ -2101,7 +2101,15 @@ class AsyncClient(Client):
                 the joined member list.
         """
         if self._durable_session is not None:
-            return await self._durable_session._outbound.joined_members(room_id)
+            # DurableSync imports AsyncClient, so defer the reverse dependency.
+            from ..durable.transport import HttpError
+
+            try:
+                return await self._durable_session._outbound.joined_members(room_id)
+            except HttpError as error:
+                return JoinedMembersError(
+                    str(error), status_code=error.errcode, room_id=room_id
+                )
         method, path = Api.joined_members(self.access_token, room_id)
 
         return await self._send(

@@ -12,9 +12,15 @@ from unpaddedbase64 import decode_base64
 from nio.crypto import Olm, TrustState
 from nio.store import SqliteMemoryStore
 from nio.durable.codec import restore_event
+from nio.durable.transport import HttpError
 from nio.events import RoomKeyRequest
 from nio.event_builders import ToDeviceMessage
-from nio.exceptions import LocalProtocolError, OlmUnverifiedDeviceError
+from nio.exceptions import (
+    LocalProtocolError,
+    MembersSyncError,
+    OlmUnverifiedDeviceError,
+)
+from nio.responses import JoinedMembersError
 from nio.rooms import MatrixRoom
 
 from .client_test import ROOM, USER, client, open_session
@@ -299,6 +305,56 @@ async def test_outgoing_member_query_cannot_rewrite_recovery_projection(tmp_path
             assert [member.user_id for member in result.members] == ["@new:example.org"]
             assert set(room.users) == {USER}
             assert not room.members_synced
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, errcode",
+    [
+        (403, "M_FORBIDDEN"),
+        (404, "M_NOT_FOUND"),
+        (429, "M_LIMIT_EXCEEDED"),
+        (503, "M_UNKNOWN"),
+    ],
+)
+async def test_public_member_query_returns_error_without_reusing_recipients(
+    tmp_path, status, errcode
+):
+    async def members(_):
+        return web.json_response(
+            {"errcode": errcode, "error": "Room unavailable"},
+            status=status,
+            headers={"Retry-After": "0"},
+        )
+
+    async with homeserver(None, membership=members) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        room = MatrixRoom(ROOM, USER, encrypted=True)
+        room.add_member(USER, "Alice", None)
+        nio_client.rooms[ROOM] = room
+        session._outbound.member_cache[ROOM] = [USER]
+        try:
+            result = await nio_client.joined_members(ROOM)
+            assert isinstance(result, JoinedMembersError)
+            assert result.status_code == errcode
+            assert result.room_id == ROOM
+            assert str(status) in result.message
+            assert set(room.users) == {USER}
+            assert not room.members_synced
+            assert ROOM not in session._outbound.member_cache
+
+            with pytest.raises(HttpError) as failure:
+                await session._outbound.ensure_members(ROOM)
+            assert failure.value.status == status
+            with pytest.raises(MembersSyncError):
+                nio_client.encrypt(
+                    ROOM, "m.room.message", {"msgtype": "m.text", "body": "secret"}
+                )
         finally:
             await session.close()
             await nio_client.close()
