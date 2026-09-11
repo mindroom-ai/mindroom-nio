@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.4
+
+- Avoid repeated pending-queue size scans when preparing membership-heavy durable sync responses.
+- Preserve cumulative queue limits and rollback while reusing the byte total within each synchronous consumption pass and recursive batch split.
+
 ## 1.0.3
 
 - Return `JoinedMembersError` for refused durable `AsyncClient.joined_members()` requests, preserving the Matrix error code and room ID.
