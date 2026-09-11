@@ -43,13 +43,18 @@ class Processor:
         self.oversized_membership: OwnMembership | None = None
         self.processed_records = 0
 
-    def flush(self) -> None:
-        if self.records:
-            self.session._publish_records(tuple(self.records))
-            self.records.clear()
-
     def consume(self, items: Iterable[_SyncItem]) -> None:
         session = self.session
+        pending_bytes: int | None = None
+
+        def flush() -> None:
+            nonlocal pending_bytes
+            if self.records:
+                pending_bytes = session._publish_records(
+                    tuple(self.records), pending_bytes=pending_bytes
+                )
+                self.records.clear()
+
         for item in items:
             if item.route == "encrypted_rooms":
                 session._store.matrix.save_encrypted_rooms(
@@ -162,12 +167,12 @@ class Processor:
                 self.oversized_membership = record.membership
                 break
             if barrier:
-                self.flush()
+                flush()
             self.records.append(record)
             self.processed_records += 1
             if barrier or len(self.records) >= session.config.max_batch_records:
-                self.flush()
-        self.flush()
+                flush()
+        flush()
 
     def save(self) -> None:
         # Rejoin can replace a room while the iterator is running.

@@ -9,7 +9,7 @@ import pytest
 from nio import AsyncClient, AsyncClientConfig, RoomMessageText
 from nio.durable import DurableSyncConfig, open_durable_sync
 from nio.durable.codec import restore_event
-from nio.durable.model import RecordKind
+from nio.durable.model import RecordKind, SyncRecord
 from nio.exceptions import LocalProtocolError
 
 USER = "@alice:example.org"
@@ -106,6 +106,73 @@ async def test_prepare_commits_replayable_messages_without_callbacks(tmp_path):
             "hello 2",
         ]
         assert nio_client.rooms[ROOM].users[USER].display_name == "Alice"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_batches_count_queued_bytes_once(tmp_path, monkeypatch):
+    body = json.loads(response())
+    state = body["rooms"]["join"][ROOM]["state"]["events"]
+    state.extend(
+        dict(
+            state[0],
+            state_key=f"@member-{index}:example.org",
+            event_id=f"$join-{index}",
+        )
+        for index in range(64)
+    )
+    session = open_session(tmp_path)
+    execute_sql = session._store.database.execute_sql
+    aggregate_queries = 0
+
+    def counted_execute(sql, *args, **kwargs):
+        nonlocal aggregate_queries
+        if "SUM(" in sql:
+            aggregate_queries += 1
+        return execute_sql(sql, *args, **kwargs)
+
+    monkeypatch.setattr(session._store.database, "execute_sql", counted_execute)
+    try:
+        await session._accept_response(json.dumps(body).encode())
+        assert aggregate_queries == 1
+        identifiers = []
+        while batch := await session.next_batch():
+            identifiers.extend(record.source["event_id"] for record in batch.records)
+            await session.ack(batch)
+        assert identifiers == [
+            "$join",
+            *(f"$join-{index}" for index in range(64)),
+            "$message-0",
+        ]
+        assert len(session.client.rooms[ROOM].users) == 65
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits",
+    [{"max_batch_records": 2}, {"max_batch_bytes": 1200}],
+    ids=["record-splits", "byte-splits"],
+)
+async def test_recursive_publication_checks_cumulative_pending_bytes(tmp_path, limits):
+    body = json.loads(response(messages=4))
+    events = body["rooms"]["join"][ROOM]["timeline"]["events"]
+    for event in events:
+        event["content"]["body"] = "a" * 600
+    records = tuple(SyncRecord(RecordKind.TIMELINE, ROOM, event) for event in events)
+    session = open_session(
+        tmp_path, config=DurableSyncConfig(max_pending_bytes=2500, **limits)
+    )
+    try:
+        with (
+            pytest.raises(LocalProtocolError, match="pending bound"),
+            session._store.transaction(),
+        ):
+            session._publish_records(records)
+        assert await session.next_batch() is None
+        assert session._store.pending_bytes == 0
     finally:
         await session.close()
 
@@ -244,6 +311,10 @@ async def test_batch_byte_bound_splits_without_dropping_messages(tmp_path):
     [
         (DurableSyncConfig(max_batch_bytes=100), "batch bound"),
         (DurableSyncConfig(max_pending_bytes=100), "pending bound"),
+        (
+            DurableSyncConfig(max_batch_records=1, max_pending_bytes=700),
+            "pending bound",
+        ),
     ],
 )
 async def test_prepared_capacity_failure_retains_input_and_poisons_client(

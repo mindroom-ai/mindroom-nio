@@ -228,13 +228,22 @@ class DurableSync:
         metadata.update(membership=membership, membership_epoch=next_epoch)
         return change
 
-    def _publish_records(self, records: tuple[SyncRecord, ...]) -> None:
-        """Publish bounded observations within the caller's transaction."""
+    def _publish_records(
+        self, records: tuple[SyncRecord, ...], *, pending_bytes: int | None = None
+    ) -> int:
+        """Publish bounded observations and return the transaction's queued bytes.
+
+        Reuse the count only within an uninterrupted publication sequence.
+        """
+        if pending_bytes is None:
+            pending_bytes = self._store.pending_bytes
         if len(records) > self.config.max_batch_records:
             limit = self.config.max_batch_records
             for index in range(0, len(records), limit):
-                self._publish_records(records[index : index + limit])
-            return
+                pending_bytes = self._publish_records(
+                    records[index : index + limit], pending_bytes=pending_bytes
+                )
+            return pending_bytes
         encoded = encode_records(records)
         size = len(encoded.encode())
         if size > self.config.max_batch_bytes:
@@ -243,14 +252,16 @@ class DurableSync:
                     "prepared event exceeds the durable batch bound"
                 )
             middle = len(records) // 2
-            self._publish_records(records[:middle])
-            self._publish_records(records[middle:])
-            return
-        if self._store.pending_bytes + size > self.config.max_pending_bytes:
+            pending_bytes = self._publish_records(
+                records[:middle], pending_bytes=pending_bytes
+            )
+            return self._publish_records(records[middle:], pending_bytes=pending_bytes)
+        if pending_bytes + size > self.config.max_pending_bytes:
             raise LocalProtocolError(
                 "prepared output exceeds the durable pending bound"
             )
         self._store.publish(records, encoded_records=encoded)
+        return pending_bytes + size
 
     def _timeline_room(
         self, room_id: str, room: MatrixRoom, event: object
