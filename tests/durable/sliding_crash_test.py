@@ -72,7 +72,7 @@ async def interrupted(path, boundary):
             os.kill(os.getpid(), signal.SIGKILL)
 
         session._store.capture = capture
-    session._capture_response((path / "sliding.json").read_bytes())
+    await session._capture_response((path / "sliding.json").read_bytes())
     if boundary == "crypto":
         original = session.client._iter_to_device
 
@@ -83,7 +83,7 @@ async def interrupted(path, boundary):
                     os.kill(os.getpid(), signal.SIGKILL)
 
         session.client._iter_to_device = devices
-    session._prepare_pending()
+    await session._prepare_pending()
     os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -105,7 +105,7 @@ async def test_sliding_key_and_message_recover_together_after_process_kill(
         if boundary == "capture":
             assert session._store.input is None
             assert session._sliding.device_cursor is None
-            session._capture_response((tmp_path / "sliding.json").read_bytes())
+            await session._capture_response((tmp_path / "sliding.json").read_bytes())
         elif boundary == "committed":
 
             def no_decrypt(_):
@@ -114,7 +114,7 @@ async def test_sliding_key_and_message_recover_together_after_process_kill(
             client._iter_to_device = no_decrypt
         else:
             assert session._sliding.device_cursor is None
-        session._prepare_pending()
+        await session._prepare_pending()
         records = []
         while batch := await session.next_batch():
             records.extend(batch.records)
@@ -199,13 +199,13 @@ async def test_expanded_window_promotes_ciphertext_before_processed_overlap(tmp_
         raw["rooms"][ROOM].update(initial=True, num_live=0)
         raw["rooms"][ROOM]["timeline"].insert(0, message("$ancient"))
         raw["extensions"]["to_device"]["events"] = keys
-        session._capture_response(json.dumps(raw).encode())
-        session._prepare_pending()
+        await session._capture_response(json.dumps(raw).encode())
+        await session._prepare_pending()
         while batch := await session.next_batch():
             await session.ack(batch)
         # Equal window boundaries need no network page; finish the shared walker.
         await session._recovery.advance()
-        session._prepare_pending()
+        await session._prepare_pending()
         records = await settle(session)
         promoted = next(r for r in records if r.source.get("event_id") == ciphertext_id)
         ancient = next(r for r in records if r.source.get("event_id") == "$ancient")

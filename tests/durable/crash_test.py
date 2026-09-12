@@ -153,7 +153,7 @@ async def receive(mode, path):
 
         client._iter_sync = interrupted_prepare
     if mode == "after_capture":
-        session._capture_response(body)
+        await session._capture_response(body)
         kill_self()
     await session._accept_response(body)
     if mode == "after_prepare":
@@ -185,7 +185,7 @@ async def restart(path):
         assert cursor_before == "s0"
         await session._accept_response((path / "response.json").read_bytes())
     else:
-        session._prepare_pending()
+        await session._prepare_pending()
     received = []
     first_batch = await session.next_batch()
     receipt_path = path / "received.json"

@@ -180,11 +180,11 @@ async def test_recursive_publication_checks_cumulative_pending_bytes(tmp_path, l
 @pytest.mark.asyncio
 async def test_captured_input_is_prepared_after_restart(tmp_path):
     session = open_session(tmp_path)
-    session._capture_response(response())
+    await session._capture_response(response())
     await session.close()
     reopened = open_session(tmp_path)
     try:
-        reopened._prepare_pending()
+        await reopened._prepare_pending()
         events = []
         while batch := await reopened.next_batch():
             events.extend(
@@ -242,7 +242,7 @@ async def test_preparation_failure_discards_mutated_client_and_retains_input(
     reopened = open_session(tmp_path)
     try:
         assert reopened.client.rooms == {}
-        reopened._prepare_pending()
+        await reopened._prepare_pending()
         assert reopened.client.rooms[ROOM].users[USER].display_name == "Alice"
     finally:
         await reopened.close()

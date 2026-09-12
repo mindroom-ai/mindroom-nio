@@ -16,8 +16,8 @@ from .sliding_test import settle
 
 
 async def accept(session, raw):
-    session._capture_response(json.dumps(raw).encode())
-    session._prepare_pending()
+    await session._capture_response(json.dumps(raw).encode())
+    await session._prepare_pending()
     records = []
     async with asyncio.timeout(5):
         while session._store.input[1]["phase"] != "prepared":

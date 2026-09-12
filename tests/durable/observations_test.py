@@ -54,7 +54,7 @@ async def test_fresh_transients_project_and_dispatch_but_never_replay(
     await session.close()
     reopened = open_session(tmp_path)
     try:
-        reopened._prepare_pending()
+        await reopened._prepare_pending()
         assert reopened.client.rooms[ROOM].typing_users == []
         assert len(seen) == 2
         assert await reopened.next_batch() is not None

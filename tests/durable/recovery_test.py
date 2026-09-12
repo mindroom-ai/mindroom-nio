@@ -88,7 +88,7 @@ async def test_recovery_orders_tenures_and_resets_rejoin_projection(tmp_path):
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited())
+        await session._capture_response(limited())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -147,7 +147,7 @@ async def test_recovery_drains_page_before_fetch_and_restarts_at_committed_token
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited())
+        await session._capture_response(limited())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -217,7 +217,7 @@ async def test_recovery_reaches_exclusive_boundary_by_tail_overlap(tmp_path, res
         runner = None
         try:
             await baseline(session)
-            session._capture_response(
+            await session._capture_response(
                 limited(state=[member("$old-return", "join", "@old:example.org")])
             )
             await session._recovery.advance()
@@ -349,7 +349,7 @@ async def test_recovery_boundaries_and_loss_fence(tmp_path, mode):
             ),
         )
         await baseline(session)
-        session._capture_response(limited())
+        await session._capture_response(limited())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -403,7 +403,7 @@ async def test_authoritative_tail_state_overlap_does_not_duplicate_member_observ
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(
+        await session._capture_response(
             limited(state=[member("$newer", "join", "@old:example.org")])
         )
         session._quiescing = True
@@ -433,7 +433,7 @@ async def test_leave_section_fallback_follows_recovered_and_retained_messages(tm
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited(section="leave"))
+        await session._capture_response(limited(section="leave"))
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -585,7 +585,7 @@ async def test_recovery_continues_after_departure_to_find_rejoin_on_later_page(
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited())
+        await session._capture_response(limited())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -623,8 +623,8 @@ async def test_committed_prologue_key_decrypts_history_after_restart(
         session._store.finish_input()
     body = json.loads(limited())
     body["to_device"] = encrypted_sync["to_device"]
-    session._capture_response(json.dumps(body).encode())
-    session._prepare_pending()
+    await session._capture_response(json.dumps(body).encode())
+    await session._prepare_pending()
     assert session.cursor == "s1"
     assert session._store.input[1]["phase"] == "recover"
     assert any(
@@ -689,8 +689,8 @@ async def test_interrupted_transaction_restores_old_cursor_and_projection(
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited())
-        session._prepare_pending()
+        await session._capture_response(limited())
+        await session._prepare_pending()
         original = (
             nio_client._iter_room_timeline
             if boundary == "page"
@@ -756,7 +756,7 @@ async def test_leave_fallback_is_not_suppressed_by_historical_self_join(tmp_path
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(limited(section="leave"))
+        await session._capture_response(limited(section="leave"))
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -835,7 +835,7 @@ async def test_tail_state_rejoin_resets_projection_before_full_state(tmp_path):
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(
+        await session._capture_response(
             limited(state=[member("$current-join", "join")]), full_state=True
         )
         session._quiescing = True
@@ -893,7 +893,7 @@ async def test_rejoin_restores_full_state_overlap_without_duplicate_observations
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
-        session._capture_response(
+        await session._capture_response(
             limited(state=[bob_join, power, member("$rejoin", "join")]), full_state=True
         )
         await session._recovery.advance()
@@ -975,7 +975,7 @@ async def test_frozen_recovered_record_overflow_commits_loss_and_resumes_tail(
             tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
         )
         await baseline(session)
-        session._capture_response(limited())
+        await session._capture_response(limited())
         try:
             await session._recovery.advance()
             batch = await session.next_batch()
@@ -1050,7 +1050,7 @@ async def test_oversized_state_covered_by_loss_is_not_published_again_at_tail(
             tmp_path, nio_client, DurableSyncConfig(max_batch_bytes=1024)
         )
         await baseline(session)
-        session._capture_response(limited(state=[oversized, suffix]))
+        await session._capture_response(limited(state=[oversized, suffix]))
         records = []
         try:
             await session._recovery.advance()
