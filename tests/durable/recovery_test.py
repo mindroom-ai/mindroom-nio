@@ -1086,3 +1086,507 @@ async def test_oversized_state_covered_by_loss_is_not_published_again_at_tail(
         finally:
             await session.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous", ["invite", "leave"])
+@pytest.mark.parametrize("limited_timeline", [False, True])
+@pytest.mark.parametrize("restart", [None, "intent", "captured"])
+async def test_known_nonjoined_room_recovers_without_account_full_state(
+    tmp_path, monkeypatch, previous, limited_timeline, restart
+):
+    from .membership_test import OPERATION
+
+    joined = "!joined:example.org"
+    bob = "@bob:example.org"
+    config = DurableSyncConfig(sync_filter={"room": {"state": {"types": []}}})
+    requests_seen = []
+    captured = asyncio.Event()
+    next_poll = asyncio.Event()
+    stop = asyncio.Event()
+    initial = json.loads(response(messages=0))
+    initial["rooms"][previous] = {
+        joined: (
+            {"invite_state": {"events": [member("$invite", "invite")]}}
+            if previous == "invite"
+            else {
+                "state": {"events": [member("$leave", "leave")]},
+                "timeline": {"events": []},
+            }
+        )
+    }
+    power = {
+        "type": "m.room.power_levels",
+        "state_key": "",
+        "sender": USER,
+        "event_id": "$power",
+        "origin_server_ts": 1,
+        "content": {"users": {USER: 100, bob: 75}},
+    }
+    recovered = json.loads(response(token="s2"))
+    recovered["rooms"]["join"][joined] = {
+        "state": {
+            "events": [
+                member("$joined", "join"),
+                member("$bob", "join", bob),
+                power,
+                {
+                    "type": "m.room.encryption",
+                    "state_key": "",
+                    "sender": USER,
+                    "event_id": "$encryption",
+                    "origin_server_ts": 1,
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                },
+            ]
+        },
+        "timeline": {
+            "limited": limited_timeline,
+            "prev_batch": "joined-tail",
+            "events": [message("$joined-history")],
+        },
+    }
+    other = recovered["rooms"]["join"][ROOM]
+    # State resolution can supply a delta even without a limited timeline.
+    other["state"]["events"] = [power]
+    other["timeline"] = {
+        "limited": limited_timeline,
+        "prev_batch": "other-tail",
+        "events": [message("$other-live")],
+    }
+
+    async def sync(request):
+        requests_seen.append(dict(request.query))
+        if len(requests_seen) > 1:
+            next_poll.set()
+            await stop.wait()
+        return web.json_response(recovered)
+
+    async def membership(request):
+        if request.path.endswith("/messages"):
+            assert joined not in request.path
+            assert request.query["from"] == "s1"
+            return web.json_response(
+                {
+                    "start": "s1",
+                    "end": "other-tail",
+                    "chunk": [message("$other-missed"), message("$other-live")],
+                }
+            )
+        return web.json_response({"room_id": joined})
+
+    async def query(request):
+        return web.json_response({"device_keys": {USER: {}, bob: {}}})
+
+    async with homeserver(sync, membership=membership, query=query) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, config)
+        await session._accept_response(json.dumps(initial).encode(), full_state=True)
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        with session._store.transaction():
+            session._store.finish_input()
+        assert await session.change_membership(
+            operation_id=OPERATION,
+            room_id=joined,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        local = await session.next_batch()
+        assert local.records[0].membership.current_epoch == 0
+        await session.ack(local)
+        if restart == "intent":
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client, config)
+        if restart == "captured":
+
+            async def pause_after_capture(response=None):
+                captured.set()
+                await stop.wait()
+
+            monkeypatch.setattr(session, "_prepare_pending", pause_after_capture)
+        runner = asyncio.create_task(session.run())
+        try:
+            if restart == "captured":
+                async with asyncio.timeout(5):
+                    await captured.wait()
+                assert session.cursor == "s1"
+                await session.close()
+                await nio_client.close()
+                nio_client = client()
+                nio_client.homeserver = url
+                session = open_session(tmp_path, nio_client, config)
+                runner = asyncio.create_task(session.run())
+            records = await drain_sync(session)
+            async with asyncio.timeout(5):
+                await next_poll.wait()
+            assert "full_state" not in requests_seen[0]
+            assert "filter" not in requests_seen[0]
+            assert requests_seen[0]["since"] == "s1"
+            assert "full_state" not in requests_seen[1]
+            assert json.loads(requests_seen[1]["filter"]) == config.sync_filter
+            assert requests_seen[1]["since"] == "s2"
+            assert session.cursor == "s2"
+            assert session._metadata[joined]["baseline"]
+            assert session._metadata[ROOM]["baseline"]
+            assert session._metadata[joined]["membership_epoch"] == 0
+            assert not [r for r in records if r.membership]
+            timeline = {
+                r.source["event_id"]: r
+                for r in records
+                if r.kind is RecordKind.TIMELINE
+            }
+            assert (
+                timeline["$joined-history"].provenance
+                is TimelineEventProvenance.HISTORY
+            )
+            assert timeline["$other-live"].provenance is TimelineEventProvenance.LIVE
+            if limited_timeline:
+                assert (
+                    timeline["$other-missed"].provenance
+                    is TimelineEventProvenance.RECOVERED
+                )
+            assert set(nio_client.rooms[joined].users) == {USER, bob}
+            assert nio_client.rooms[joined].encrypted
+            assert bob in nio_client.olm.tracked_users
+            assert nio_client.rooms[joined].power_levels.users[bob] == 75
+            assert nio_client.rooms[ROOM].power_levels.users[bob] == 75
+            await session.wait_for_membership_idle()
+            await session.quiesce()
+            await runner
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+    reopened = open_session(tmp_path, config=config)
+    try:
+        assert reopened._metadata[joined]["baseline"]
+        assert reopened.client.rooms[joined].power_levels.users[bob] == 75
+        assert set(reopened.client.rooms[joined].users) == {USER, bob}
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", ["unknown", "adopted", "repeat", "other_loss", "cursor_changed"]
+)
+async def test_local_join_keeps_full_state_without_exclusive_cursor_proof(
+    tmp_path, reason
+):
+    from .membership_test import OPERATION
+
+    joined = ROOM if reason == "repeat" else "!joined:example.org"
+    requests_seen = []
+    requested = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def sync(request):
+        requests_seen.append(dict(request.query))
+        requested.set()
+        await stop.wait()
+        return web.json_response({"next_batch": "unused"})
+
+    async def membership(request):
+        return web.json_response({"room_id": joined})
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        config = DurableSyncConfig(sync_filter={"room": {"state": {"types": []}}})
+        session = open_session(tmp_path, nio_client, config)
+        if reason == "adopted":
+            with session._store.transaction():
+                session._store.set_cursor("adopted")
+        else:
+            initial = json.loads(response(messages=0))
+            if reason in ("other_loss", "cursor_changed"):
+                initial["rooms"]["invite"] = {
+                    joined: {"invite_state": {"events": [member("$invite", "invite")]}}
+                }
+            await session._accept_response(
+                json.dumps(initial).encode(), full_state=True
+            )
+            while batch := await session.next_batch():
+                await session.ack(batch)
+            with session._store.transaction():
+                session._store.finish_input()
+            if reason == "other_loss":
+                session._metadata[ROOM]["baseline"] = False
+        assert await session.change_membership(
+            operation_id=OPERATION,
+            room_id=joined,
+            previous_membership="join" if reason == "repeat" else "leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        await session.ack(await session.next_batch())
+        if reason == "cursor_changed":
+            # A response which omitted the joined room consumes the proof's cursor.
+            await session._accept_response(b'{"next_batch":"later"}')
+            with session._store.transaction():
+                session._store.finish_input()
+        runner = asyncio.create_task(session.run())
+        try:
+            async with asyncio.timeout(5):
+                await requested.wait()
+            assert requests_seen[0]["full_state"] == "true"
+            assert "filter" not in requests_seen[0]
+            assert not session._metadata[joined]["baseline"]
+            await session.quiesce()
+            await runner
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_join_cursor_proof_precedes_uncertain_http_and_survives_retry(tmp_path):
+    from .membership_test import OPERATION
+
+    attempted = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    requests_seen = []
+
+    async def membership(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            attempted.set()
+            await release.wait()
+        return web.json_response({"room_id": ROOM})
+
+    async def sync(request):
+        requests_seen.append(dict(request.query))
+        if len(requests_seen) > 1:
+            await release.wait()
+        return web.Response(body=response(token="after-join"))
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        invitation = {
+            "next_batch": "invited",
+            "rooms": {
+                "invite": {
+                    ROOM: {"invite_state": {"events": [member("$invite", "invite")]}}
+                }
+            },
+        }
+        await session._accept_response(json.dumps(invitation).encode())
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        with session._store.transaction():
+            session._store.finish_input()
+        operation = asyncio.create_task(
+            session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            )
+        )
+        try:
+            async with asyncio.timeout(5):
+                await attempted.wait()
+            # The HTTP response can disappear after the server has joined us.
+            # The original cursor proof must already be durable at that point.
+            assert session._read_local_intent()["join_baseline_cursor"] == "invited"
+            assert "sequence" not in session._read_local_intent()
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            await session.close()
+            await nio_client.close()
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            async with asyncio.timeout(5):
+                await session.wait_for_work()
+            local = await session.next_batch()
+            assert local.records[0].membership.source == "local"
+            assert session._read_local_intent()["join_baseline_cursor"] == "invited"
+            await session.ack(local)
+            records = await drain_sync(session)
+            assert calls == 2
+            assert requests_seen[0]["since"] == "invited"
+            assert "full_state" not in requests_seen[0]
+            assert session._metadata[ROOM]["baseline"]
+            assert {r.provenance for r in records if r.kind is RecordKind.TIMELINE} == {
+                TimelineEventProvenance.HISTORY
+            }
+            await session.quiesce()
+            await runner
+        finally:
+            release.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous", ["invite", "leave"])
+@pytest.mark.parametrize("advance_cursor", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_nonjoined_join_proof_uses_observed_cursor(
+    tmp_path, previous, advance_cursor, restart
+):
+    from .membership_test import OPERATION
+
+    bob = "@bob:example.org"
+    requests_seen = []
+    stop = asyncio.Event()
+    config = DurableSyncConfig(sync_filter={"room": {"rooms": []}})
+    initial = {
+        "next_batch": "observed",
+        "rooms": {
+            previous: {
+                ROOM: (
+                    {"invite_state": {"events": [member("$invite", "invite")]}}
+                    if previous == "invite"
+                    else {
+                        "state": {"events": [member("$leave", "leave")]},
+                        "timeline": {"events": []},
+                    }
+                )
+            }
+        },
+    }
+
+    async def sync(request):
+        requests_seen.append(dict(request.query))
+        if len(requests_seen) > 1:
+            await stop.wait()
+        body = json.loads(response(token="after-join"))
+        # An external join hidden by the intervening filter makes local join
+        # idempotent; incremental sync then has no initial state to return.
+        body["rooms"]["join"][ROOM]["state"]["events"] = (
+            [member("$join", "join"), member("$bob", "join", bob)]
+            if not advance_cursor or request.query.get("full_state") == "true"
+            else []
+        )
+        return web.json_response(body)
+
+    async def membership(request):
+        return web.json_response({"room_id": ROOM})
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, config)
+        await session._accept_response(json.dumps(initial).encode(), full_state=True)
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        with session._store.transaction():
+            session._store.finish_input()
+        if advance_cursor:
+            await session._accept_response(b'{"next_batch":"filtered"}')
+            with session._store.transaction():
+                session._store.finish_input()
+        if restart:
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client, config)
+        assert await session.change_membership(
+            operation_id=OPERATION,
+            room_id=ROOM,
+            previous_membership="leave",
+            previous_epoch=0,
+            current_membership="join",
+        )
+        await session.ack(await session.next_batch())
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            assert requests_seen[0].get("full_state") == (
+                "true" if advance_cursor else None
+            )
+            assert "filter" not in requests_seen[0]
+            assert set(nio_client.rooms[ROOM].users) == {USER, bob}
+            assert session._metadata[ROOM]["baseline"]
+            assert {r.provenance for r in records if r.kind is RecordKind.TIMELINE} == {
+                TimelineEventProvenance.HISTORY
+            }
+            await session.quiesce()
+            await runner
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("section", ["join", "leave"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_nonjoined_cursor_comes_from_final_boundary_not_recovered_cycle(
+    tmp_path, section, restart
+):
+    async def sync(request):
+        raise AssertionError("retained input must finish without polling")
+
+    async def history(request):
+        return web.json_response(
+            {
+                "start": "s1",
+                "end": "tail",
+                "chunk": [
+                    member("$leave-one", "leave"),
+                    member("$rejoin", "join"),
+                    member("$leave-two", "leave"),
+                ],
+            }
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        body = json.loads(limited(section=section, state=[member("$current", "join")]))
+        if section == "leave":
+            body["rooms"][section][ROOM]["timeline"]["events"].append(
+                member("$final-leave", "leave")
+            )
+        await session._capture_response(json.dumps(body).encode())
+        await session._recovery.advance()
+        assert session.cursor == "s1"
+        assert session._metadata[ROOM]["membership"] == "leave"
+        assert session._metadata[ROOM].get("nonjoined_cursor") is None
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        if restart:
+            await session.close()
+            await nio_client.close()
+            nio_client = client()
+            nio_client.homeserver = url
+            session = open_session(tmp_path, nio_client)
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            await runner
+            assert session.cursor == "s2"
+            assert session._metadata[ROOM]["membership"] == section
+            assert session._metadata[ROOM].get("nonjoined_cursor") == (
+                "s2" if section == "leave" else None
+            )
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
