@@ -150,7 +150,7 @@ async def test_expanded_window_keeps_older_membership_context_historical(tmp_pat
             message("$old"),
             message("$warm"),
         ]
-        session._capture_response(json.dumps(wider).encode())
+        await session._capture_response(json.dumps(wider).encode())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -208,7 +208,7 @@ async def test_linked_live_profile_updates_preserve_limited_window_recovery(tmp_
             num_live=3,
             timeline=[profile, avatar, message("$fresh")],
         )
-        session._capture_response(json.dumps(raw).encode())
+        await session._capture_response(json.dumps(raw).encode())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -371,7 +371,7 @@ async def test_restart_recovers_downtime_without_reapplying_previous_window(tmp_
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client, settings())
-        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        await session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -560,13 +560,13 @@ async def test_subscription_replacement_retains_accepted_input_and_removes_stick
         ),
     )
     try:
-        session._capture_response(window("$accepted"))
+        await session._capture_response(window("$accepted"))
         body = session._store.input[0]
         subscriptions = {ROOM: {"timeline_limit": 20}}
         await session.update_sliding_subscriptions(subscriptions)
         subscriptions[ROOM]["timeline_limit"] = 99
         assert session._store.input[0] == body
-        session._prepare_pending()
+        await session._prepare_pending()
         records = await settle(session)
         assert any(r.source.get("event_id") == "$accepted" for r in records)
         request = json.loads(session._sliding.request()[2])
@@ -615,7 +615,7 @@ async def test_sliding_overlap_does_not_bypass_the_bounded_history_walk(tmp_path
         session = open_session(tmp_path, nio_client, settings())
         await session._accept_response(window("$old"))
         await settle(session)
-        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        await session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:
@@ -657,7 +657,7 @@ async def test_gap_restart_replays_committed_batch_then_resumes_next_page(tmp_pa
         session = open_session(tmp_path, nio_client, settings())
         await session._accept_response(window("$old"))
         await settle(session)
-        session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
+        await session._capture_response(window("$tail", pos="p2", prev_batch="w2"))
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         async with asyncio.timeout(5):

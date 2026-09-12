@@ -184,27 +184,32 @@ class DurableSync:
         except (ValueError, TypeError, KeyError) as error:
             raise LocalProtocolError("malformed durable sync response") from error
 
-    def _capture_response(
+    async def _capture_response(
         self, body: bytes, *, full_state: bool = False
     ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
-        self._assert_active()
-        response = self._decode_response(body)
-        with self._store.transaction():
-            self._store.capture(body)
-            self._store.save_continuation(
-                {
-                    "full_state": full_state,
-                    "transport": "sliding" if self._sliding else "classic",
-                }
-            )
-        self._recovery.response = response[0]
-        if self._sliding is not None:
-            self._sliding.accepted_generation = self._sliding.generation
-        return response
+        # A local join/leave must not overtake input being decoded for capture.
+        # Only parsing runs in the worker; projection and SQLite stay on the loop.
+        async with self._local_lock:
+            self._assert_active()
+            generation = self._sliding.generation if self._sliding is not None else 0
+            response = await asyncio.to_thread(self._decode_response, body)
+            self._assert_active()
+            with self._store.transaction():
+                self._store.capture(body)
+                self._store.save_continuation(
+                    {
+                        "full_state": full_state,
+                        "transport": "sliding" if self._sliding else "classic",
+                    }
+                )
+            self._recovery.response = response[0]
+            if self._sliding is not None:
+                self._sliding.accepted_generation = generation
+            return response
 
     async def _accept_response(self, body: bytes, *, full_state: bool = False) -> None:
-        response, transients = self._capture_response(body, full_state=full_state)
-        self._prepare_pending(response)
+        response, transients = await self._capture_response(body, full_state=full_state)
+        await self._prepare_pending(response)
         await deliver_transients(self.client, transients)
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
@@ -300,11 +305,11 @@ class DurableSync:
         )
         return room
 
-    def _prepare_pending(
+    async def _prepare_pending(
         self, response: SyncResponse | SlidingSyncResponse | None = None
     ) -> None:
         self._assert_active()
-        self._recovery.prepare(response)
+        await self._recovery.prepare(response)
 
     def _save_rooms(
         self, rooms: dict[str, MatrixRoom], members: set[tuple[str, str]]
@@ -580,6 +585,7 @@ class DurableSync:
         }
         await self.wait_for_membership_idle()
         async with self._local_lock:
+            self._assert_active()
             if not self._local_position_matches(intent):
                 return False
             if self._read_local_intent() is not None:

@@ -447,6 +447,6 @@ async def test_malformed_invitation_is_retained_and_rejected(
         assert reopened.client.invited_rooms == {}
         assert reopened._store.input[0] == body
         with pytest.raises(LocalProtocolError, match="malformed durable room state"):
-            reopened._prepare_pending()
+            await reopened._prepare_pending()
     finally:
         await reopened.close()

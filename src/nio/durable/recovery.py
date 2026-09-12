@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -171,7 +172,7 @@ class Recovery:
             )
         return reset
 
-    def prepare(
+    async def prepare(
         self, response: SyncResponse | SlidingSyncResponse | None = None
     ) -> None:
         session = self.session
@@ -181,7 +182,9 @@ class Recovery:
         if response is not None:
             self.response = response
         if self.response is None:
-            self.response = session._decode_response(pending[0])[0]
+            decoded, _ = await asyncio.to_thread(session._decode_response, pending[0])
+            session._assert_active()
+            self.response = decoded
         state = pending[1]
         if state.get("phase") == "recover":
             return
@@ -403,7 +406,7 @@ class Recovery:
         session._store.save_continuation({"phase": "prepared"})
 
     async def advance(self) -> None:
-        self.prepare()
+        await self.prepare()
         session = self.session
         pending = session._store.input
         assert pending is not None

@@ -340,7 +340,7 @@ async def test_local_leave_ignores_membership_cycle_before_final_boundary(tmp_pa
             member("$earlier-rejoin", "join"),
             member("$final-leave", "leave"),
         ]
-        session._capture_response(json.dumps(body).encode())
+        await session._capture_response(json.dumps(body).encode())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
         try:

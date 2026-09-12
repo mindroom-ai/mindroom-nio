@@ -152,7 +152,7 @@ async def test_local_join_discards_sliding_proof_with_room_projection(
                 )
             )
             body["rooms"][ROOM]["limited"] = limited
-            session._capture_response(json.dumps(body).encode())
+            await session._capture_response(json.dumps(body).encode())
             session._quiescing = True
             runner = asyncio.create_task(session.run())
             records = await drain_sync(session)
