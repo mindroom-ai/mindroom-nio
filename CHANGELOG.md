@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.5
+
+- Decode fresh and replayed durable Classic and Sliding Sync responses off the event loop.
+- Preserve durable capture and membership ordering, subscription updates, and cancellation and shutdown safety while decoding.
+
 ## 1.0.4
 
 - Avoid repeated pending-queue size scans when preparing membership-heavy durable sync responses.
