@@ -37,15 +37,36 @@ class Recovery:
         self.resets: set[str] = set()
         self._complete_state_seen = False
 
-    def needs_full_state(self) -> bool:
+    def needs_full_state(self, *, excluding: str | None = None) -> bool:
         session = self.session
         return bool(session.cursor) and (
             (not session._metadata and not self._complete_state_seen)
             or any(
-                value.get("membership") == "join" and not value.get("baseline")
-                for value in session._metadata.values()
+                room_id != excluding
+                and value.get("membership") == "join"
+                and not value.get("baseline")
+                for room_id, value in session._metadata.items()
             )
         )
+
+    def newly_joined_room(self) -> str | None:
+        session = self.session
+        intent = session._read_local_intent()
+        if (
+            not session.cursor
+            or intent is None
+            or "sequence" not in intent
+            or intent.get("observed")
+            or intent["current_membership"] != "join"
+            or intent.get("join_baseline_cursor") != session.cursor
+            or session._metadata.get(intent["room_id"], {}).get("nonjoined_cursor")
+            != session.cursor
+            or self.needs_full_state(excluding=intent["room_id"])
+        ):
+            return None
+        # Incremental sync includes initial state for a room joined since the
+        # cursor. An own join event alone cannot prove that boundary.
+        return intent["room_id"]
 
     def _rooms(self) -> list[tuple[str, RoomInfo, str]]:
         assert self.response is not None
@@ -301,7 +322,8 @@ class Recovery:
         )
         for room_id, _, section in self._rooms():
             metadata = session._metadata.setdefault(room_id, {})
-            if section == "join" and complete_state and room_id not in self.resets:
+            room_complete = complete_state or state.get("newly_joined_room") == room_id
+            if section == "join" and room_complete and room_id not in self.resets:
                 metadata["baseline"] = metadata.get("membership") == "join"
             if room_id in session.client.rooms:
                 processor.rooms[room_id] = session.client.rooms[room_id]
@@ -313,8 +335,13 @@ class Recovery:
                 processor.members = {
                     member for member in processor.members if member[0] != room_id
                 }
+            # Recovered departures belong to earlier positions; only the final
+            # response section can prove nonjoined membership at next_batch.
+            if section == "leave" and metadata.get("membership") in ("leave", "ban"):
+                metadata["nonjoined_cursor"] = response.next_batch
         for room_id in response.rooms.invite:
             self._reconcile_membership_boundary(room_id, "invite")
+            session._metadata[room_id]["nonjoined_cursor"] = response.next_batch
         processor.save()
         # Pre-boundary joined history must not restore a locally revoked room.
         for room_id in processor.rooms:

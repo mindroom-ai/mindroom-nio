@@ -185,7 +185,11 @@ class DurableSync:
             raise LocalProtocolError("malformed durable sync response") from error
 
     async def _capture_response(
-        self, body: bytes, *, full_state: bool = False
+        self,
+        body: bytes,
+        *,
+        full_state: bool = False,
+        newly_joined_room: str | None = None,
     ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
         # A local join/leave must not overtake input being decoded for capture.
         # Only parsing runs in the worker; projection and SQLite stay on the loop.
@@ -199,6 +203,7 @@ class DurableSync:
                 self._store.save_continuation(
                     {
                         "full_state": full_state,
+                        "newly_joined_room": newly_joined_room,
                         "transport": "sliding" if self._sliding else "classic",
                     }
                 )
@@ -207,8 +212,16 @@ class DurableSync:
                 self._sliding.accepted_generation = generation
             return response
 
-    async def _accept_response(self, body: bytes, *, full_state: bool = False) -> None:
-        response, transients = await self._capture_response(body, full_state=full_state)
+    async def _accept_response(
+        self,
+        body: bytes,
+        *,
+        full_state: bool = False,
+        newly_joined_room: str | None = None,
+    ) -> None:
+        response, transients = await self._capture_response(
+            body, full_state=full_state, newly_joined_room=newly_joined_room
+        )
         await self._prepare_pending(response)
         await deliver_transients(self.client, transients)
 
@@ -329,6 +342,7 @@ class DurableSync:
                 members_complete=room.members_synced,
             )
             metadata["baseline"] = prior.get("baseline", False)
+            metadata["nonjoined_cursor"] = prior.get("nonjoined_cursor")
             self._metadata[room_id] = metadata
             database.execute_sql(
                 "INSERT INTO NioDurableRoom(room_id,metadata) VALUES(?,?) "
@@ -453,7 +467,16 @@ class DurableSync:
                     continue
                 if self._quiescing or self._closed:
                     return
-                full_state = self._sliding is None and self._recovery.needs_full_state()
+                newly_joined_room = (
+                    self._recovery.newly_joined_room()
+                    if self._sliding is None
+                    else None
+                )
+                full_state = (
+                    self._sliding is None
+                    and newly_joined_room is None
+                    and self._recovery.needs_full_state()
+                )
                 request_body = None
                 if self._sliding is not None:
                     method, path, request_body = self._sliding.request()
@@ -462,7 +485,11 @@ class DurableSync:
                         "",
                         self.cursor,
                         self.config.sync_timeout_ms,
-                        None if full_state else self.config.sync_filter,
+                        (
+                            None
+                            if full_state or newly_joined_room
+                            else self.config.sync_filter
+                        ),
                         full_state=full_state or None,
                     )
                 self._poll = asyncio.create_task(
@@ -501,7 +528,9 @@ class DurableSync:
                     raise
                 finally:
                     self._poll = None
-                await self._accept_response(body, full_state=full_state)
+                await self._accept_response(
+                    body, full_state=full_state, newly_joined_room=newly_joined_room
+                )
         finally:
             self._running = None
             self._changed.set()
@@ -619,6 +648,22 @@ class DurableSync:
             return False
         room_id = intent["room_id"]
         target = intent["current_membership"]
+        if target == "join" and "join_baseline_cursor" not in intent:
+            # A filtered sync can advance cursor without updating membership.
+            # Only a nonjoined observation at this exact boundary proves a join.
+            # Save the proof before HTTP; an uncertain retry must not refresh it.
+            metadata = self._metadata.get(room_id, {})
+            intent["join_baseline_cursor"] = (
+                self.cursor
+                if metadata.get("membership") in ("invite", "leave", "ban")
+                and metadata.get("nonjoined_cursor") == self.cursor
+                else None
+            )
+            with self._store.transaction():
+                self._store.database.execute_sql(
+                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
+                    (encode_json(intent),),
+                )
         method, path = (
             Api.join("", room_id) if target == "join" else Api.room_leave("", room_id)
         )
