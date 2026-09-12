@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.6
+
+- Avoid account-wide full-state sync after local joins when fresh cursor-bound membership evidence proves the room was newly joined.
+- Preserve conservative recovery for stale or missing evidence, unrelated room state, durable ordering, and initial-history provenance.
+
 ## 1.0.5
 
 - Decode fresh and replayed durable Classic and Sliding Sync responses off the event loop.
