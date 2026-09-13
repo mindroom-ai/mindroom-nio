@@ -153,10 +153,7 @@ class Recovery:
         ):
             return False
         intent["observed"] = True
-        session._store.database.execute_sql(
-            "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
-            (encode_json(intent),),
-        )
+        session._store.save_local_intent(intent)
         change = (
             None
             if membership == intent["current_membership"]
@@ -197,16 +194,17 @@ class Recovery:
         self, response: SyncResponse | SlidingSyncResponse | None = None
     ) -> None:
         session = self.session
-        pending = session._store.input
-        if pending is None or pending[1].get("phase") == "prepared":
+        state = session._store.continuation
+        if state is None or state.get("phase") == "prepared":
             return
         if response is not None:
             self.response = response
         if self.response is None:
+            pending = session._store.input
+            assert pending is not None
             decoded, _ = await asyncio.to_thread(session._decode_response, pending[0])
             session._assert_active()
             self.response = decoded
-        state = pending[1]
         if state.get("phase") == "recover":
             return
         try:
@@ -435,11 +433,10 @@ class Recovery:
     async def advance(self) -> None:
         await self.prepare()
         session = self.session
-        pending = session._store.input
-        assert pending is not None
-        if session._store.has_batches() or pending[1].get("phase") != "recover":
+        state = session._store.continuation
+        assert state is not None
+        if session._store.has_batches() or state.get("phase") != "recover":
             return
-        state = pending[1]
         room_id, info, section = self._candidates()[state["room_index"]]
         target = info.timeline.prev_batch
         error = None
