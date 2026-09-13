@@ -6,6 +6,7 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -82,6 +83,10 @@ class DurableStore:
         self.path = store_path / (database_name or f"{user_id}_{device_id}.db")
         self._closed = False
         self._pid = os.getpid()
+        self._room_metadata: dict[str, str] | None = None
+        self._transaction_depth = 0
+        self._intent_cached = False
+        self._local_intent: dict[str, Any] | None = None
         self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
@@ -227,8 +232,77 @@ class DurableStore:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         self._assert_open()
-        with self.database.atomic("IMMEDIATE"):
-            yield
+        self._transaction_depth += 1
+        self._invalidate_local_intent()
+        try:
+            with self.database.atomic("IMMEDIATE"):
+                yield
+        except BaseException:
+            # A failed commit or nested rollback invalidates speculative writes.
+            # Reload from this connection before comparing another projection.
+            self._room_metadata = None
+            raise
+        finally:
+            self._transaction_depth -= 1
+            self._invalidate_local_intent()
+
+    def load_room_metadata(self) -> dict[str, str]:
+        self._assert_open()
+        if self._room_metadata is None:
+            self._room_metadata = dict(
+                self.database.execute_sql("SELECT room_id,metadata FROM NioDurableRoom")
+            )
+        return self._room_metadata.copy()
+
+    def save_room_metadata(self, room_id: str, metadata: str) -> None:
+        self._require_transaction()
+        if self._room_metadata is None:
+            self.load_room_metadata()
+        assert self._room_metadata is not None
+        if self._room_metadata.get(room_id) == metadata:
+            return
+        self.database.execute_sql(
+            "INSERT INTO NioDurableRoom(room_id,metadata) VALUES(?,?) "
+            "ON CONFLICT(room_id) DO UPDATE SET metadata=excluded.metadata",
+            (room_id, metadata),
+        )
+        self._room_metadata[room_id] = metadata
+
+    def _invalidate_local_intent(self) -> None:
+        self._intent_cached = False
+        self._local_intent = None
+
+    def read_local_intent(self) -> dict[str, Any] | None:
+        self._assert_open()
+        if not self._intent_cached:
+            row = self.database.execute_sql(
+                "SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'"
+            ).fetchone()
+            self._local_intent = json.loads(row[0]) if row else None
+            self._intent_cached = self._transaction_depth > 0
+        # Callers edit their intent before explicitly saving it.
+        return deepcopy(self._local_intent)
+
+    def save_local_intent(
+        self, intent: dict[str, Any], *, create: bool = False
+    ) -> None:
+        self._require_transaction()
+        self.database.execute_sql(
+            (
+                "INSERT INTO NioDurableCrypto(kind,key,body) VALUES('membership','current',?)"
+                if create
+                else "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'"
+            ),
+            (encode_json(intent),),
+        )
+        self._invalidate_local_intent()
+
+    def delete_local_intent(self) -> None:
+        self._require_transaction()
+        self.database.execute_sql(
+            "DELETE FROM NioDurableCrypto WHERE kind='membership'"
+        )
+        self._invalidate_local_intent()
 
     @property
     def cursor(self) -> str | None:
@@ -251,10 +325,31 @@ class DurableStore:
         ).fetchone()
         if row is None:
             return None
-        continuation = json.loads(row[1])
+        return bytes(row[0]), self._decode_continuation(row[1])
+
+    def has_input(self) -> bool:
+        self._assert_open()
+        return (
+            self.database.execute_sql(
+                "SELECT 1 FROM NioDurableInput WHERE id=1"
+            ).fetchone()
+            is not None
+        )
+
+    @property
+    def continuation(self) -> dict[str, Any] | None:
+        self._assert_open()
+        row = self.database.execute_sql(
+            "SELECT continuation FROM NioDurableInput WHERE id=1"
+        ).fetchone()
+        return self._decode_continuation(row[0]) if row else None
+
+    @staticmethod
+    def _decode_continuation(encoded: str) -> dict[str, Any]:
+        continuation = json.loads(encoded)
         if not isinstance(continuation, dict):
             raise LocalProtocolError("invalid stored continuation")
-        return bytes(row[0]), continuation
+        return continuation
 
     def capture(self, body: bytes) -> None:
         self._require_transaction()

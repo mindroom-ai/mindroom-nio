@@ -111,9 +111,7 @@ class DurableSync:
         self._recovery = Recovery(self)
 
     def _restore_rooms(self) -> None:
-        for room_id, encoded in self._store.database.execute_sql(
-            "SELECT room_id,metadata FROM NioDurableRoom"
-        ):
+        for room_id, encoded in self._store.load_room_metadata().items():
             metadata = json.loads(encoded)
             members = {
                 user_id: json.loads(member)
@@ -344,11 +342,7 @@ class DurableSync:
             metadata["baseline"] = prior.get("baseline", False)
             metadata["nonjoined_cursor"] = prior.get("nonjoined_cursor")
             self._metadata[room_id] = metadata
-            database.execute_sql(
-                "INSERT INTO NioDurableRoom(room_id,metadata) VALUES(?,?) "
-                "ON CONFLICT(room_id) DO UPDATE SET metadata=excluded.metadata",
-                (room_id, encode_json(metadata)),
-            )
+            self._store.save_room_metadata(room_id, encode_json(metadata))
         for room_id, user_id in members:
             member = encode_member(rooms[room_id], user_id)
             if member is None:
@@ -432,11 +426,11 @@ class DurableSync:
                     self._changed.clear()
                     await self._changed.wait()
                     continue
-                if self._store.input is not None:
+                if self._store.has_input():
                     await self._recovery.advance()
                     if (
                         self._store.has_batches()
-                        or self._store.input[1].get("phase") != "prepared"
+                        or (self._store.continuation or {}).get("phase") != "prepared"
                     ):
                         continue
                     await self._maintain_crypto()
@@ -557,10 +551,7 @@ class DurableSync:
         self._changed.set()
 
     def _read_local_intent(self) -> dict[str, Any] | None:
-        row = self._store.database.execute_sql(
-            "SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'"
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        return self._store.read_local_intent()
 
     def _local_position_matches(self, intent: dict[str, Any]) -> bool:
         metadata = self._metadata.get(intent["room_id"], {})
@@ -579,9 +570,7 @@ class DurableSync:
                 ).fetchone()[0]
                 if intent["sequence"] <= acked and intent.get("observed"):
                     with self._store.transaction():
-                        self._store.database.execute_sql(
-                            "DELETE FROM NioDurableCrypto WHERE kind='membership'"
-                        )
+                        self._store.delete_local_intent()
                     return
             self._changed.clear()
             await self._changed.wait()
@@ -620,16 +609,13 @@ class DurableSync:
             if self._read_local_intent() is not None:
                 raise LocalProtocolError("another local membership command is pending")
             with self._store.transaction():
-                self._store.database.execute_sql(
-                    "INSERT INTO NioDurableCrypto(kind,key,body) VALUES('membership','current',?)",
-                    (encode_json(intent),),
-                )
+                self._store.save_local_intent(intent, create=True)
             self._source_ready.clear()
             if self._poll is not None:
                 self._poll.cancel()
                 self._poll = None
             try:
-                while self._store.input is not None:
+                while self._store.has_input():
                     self._changed.clear()
                     await self._changed.wait()
                     self._assert_active()
@@ -641,9 +627,7 @@ class DurableSync:
     async def _apply_local_intent(self, intent: dict[str, Any]) -> bool:
         if not self._local_position_matches(intent):
             with self._store.transaction():
-                self._store.database.execute_sql(
-                    "DELETE FROM NioDurableCrypto WHERE kind='membership'"
-                )
+                self._store.delete_local_intent()
             self._changed.set()
             return False
         room_id = intent["room_id"]
@@ -660,10 +644,7 @@ class DurableSync:
                 else None
             )
             with self._store.transaction():
-                self._store.database.execute_sql(
-                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
-                    (encode_json(intent),),
-                )
+                self._store.save_local_intent(intent)
         method, path = (
             Api.join("", room_id) if target == "join" else Api.room_leave("", room_id)
         )
@@ -671,9 +652,7 @@ class DurableSync:
             await self._transport.request(method, path, "{}")
         except HttpError:
             with self._store.transaction():
-                self._store.database.execute_sql(
-                    "DELETE FROM NioDurableCrypto WHERE kind='membership'"
-                )
+                self._store.delete_local_intent()
             self._changed.set()
             return False
         self._assert_active()
@@ -721,10 +700,7 @@ class DurableSync:
                     )
                 )
                 intent["sequence"] = batch.sequence
-                self._store.database.execute_sql(
-                    "UPDATE NioDurableCrypto SET body=? WHERE kind='membership' AND key='current'",
-                    (encode_json(intent),),
-                )
+                self._store.save_local_intent(intent)
             self._changed.set()
             return True
         except BaseException:
