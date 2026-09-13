@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.8
+
+- Stop repeated full-state syncs when another client forgets a room before its departure is observed.
+- Reconcile missing rooms through existing membership handling, preserving replay, departure epochs, and encryption invalidation.
+
 ## 1.0.7
 
 - Avoid loading captured sync payloads for status checks and reuse membership intent within each durable transaction.
