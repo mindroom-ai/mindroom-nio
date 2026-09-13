@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.7
+
+- Avoid loading captured sync payloads for status checks and reuse membership intent within each durable transaction.
+- Skip unchanged room metadata writes while preserving member updates, rollback invalidation, and durability ordering.
+
 ## 1.0.6
 
 - Avoid account-wide full-state sync after local joins when fresh cursor-bound membership evidence proves the room was newly joined.
