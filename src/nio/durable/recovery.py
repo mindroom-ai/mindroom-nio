@@ -7,6 +7,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from ..api import Api, MessageDirection
+from ..client.base_client import _SyncItem
 from ..client.sliding_sync import iter_sliding_sync
 from ..event_provenance import TimelineEventProvenance
 from ..events import BadEvent, RoomMemberEvent, UnknownBadEvent
@@ -340,6 +341,24 @@ class Recovery:
         for room_id in response.rooms.invite:
             self._reconcile_membership_boundary(room_id, "invite")
             session._metadata[room_id]["nonjoined_cursor"] = response.next_batch
+        if state.get("full_state"):
+            # Another client can leave and forget a room before we sync its
+            # departure. Full-state requests are unfiltered; use their captured
+            # flag, not configuration that may have changed since capture.
+            present = (
+                response.rooms.join.keys()
+                | response.rooms.leave.keys()
+                | response.rooms.invite.keys()
+            )
+            for room_id, metadata in session._metadata.items():
+                if metadata.get("membership") != "join" or room_id in present:
+                    continue
+                self._loss(room_id, state, "joined room absent from complete sync")
+                processor.consume(
+                    (_SyncItem(room=session.client.rooms[room_id], section="leave"),)
+                )
+                self._reconcile_membership_boundary(room_id, "leave")
+                metadata["nonjoined_cursor"] = response.next_batch
         processor.save()
         # Pre-boundary joined history must not restore a locally revoked room.
         for room_id in processor.rooms:

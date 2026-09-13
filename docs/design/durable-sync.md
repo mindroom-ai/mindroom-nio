@@ -370,6 +370,14 @@ iterator handles that event, clearing stale members. A section-only departure
 follows its final timeline event. OwnMembership remains metadata on its original
 state, timeline, or lifecycle observation; it does not create duplicate carriers.
 
+An unfiltered full-state Classic response also reconciles cached joined rooms
+absent from every returned room section. Another client may have left and
+forgotten a room before its departure reached this stream. Emit a loss for the
+missing interval and a section-only departure through the existing membership
+processor, committing the ended tenure with the new cursor. The captured
+full-state request flag supplies the proof; incremental responses, Sliding
+windows, and current filter settings cannot prove a room's absence.
+
 When a Sliding tail leaves a joined room without an authorization baseline,
 the source drops that room's checkpoint and resets its connection position in
 the tail transaction, after pagination ends. The next request obtains fresh
