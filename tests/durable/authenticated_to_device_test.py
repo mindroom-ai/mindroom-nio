@@ -1,5 +1,6 @@
 """Custom event identity is captured at decryption, never inferred from JSON."""
 
+from base64 import b64encode
 from copy import deepcopy
 from dataclasses import replace
 
@@ -187,3 +188,100 @@ def test_authenticated_replay_rejects_malformed_clear_shapes(peers, field, value
     payload[field] = value
     with pytest.raises(ValueError, match="identity"):
         restore_event(replace(record, clear=payload))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "captured_device",
+        "captured_signing_key",
+        "clear_device",
+        "null_device",
+        "clear_signing_key",
+        "missing_keys",
+        "null_keys",
+        "list_keys",
+        "missing_signing_key",
+    ],
+)
+def test_authenticated_replay_rejects_inconsistent_signed_device_metadata(
+    peers, change
+):
+    """Persisted clear metadata must agree with the identity captured by Olm."""
+    sender, recipient = peers
+    encrypted = custom_event(sender, recipient)
+    clear = recipient.olm.decrypt_event(encrypted)
+    record = freeze_event(_SyncItem("to_device", clear, source=encrypted.source))
+    payload = deepcopy(record.clear)
+    if change == "captured_device":
+        identity = replace(record.crypto.authenticated_sender, device_id="OTHER")
+        record = replace(
+            record, crypto=replace(record.crypto, authenticated_sender=identity)
+        )
+    elif change == "captured_signing_key":
+        identity = replace(record.crypto.authenticated_sender, ed25519="different")
+        record = replace(
+            record, crypto=replace(record.crypto, authenticated_sender=identity)
+        )
+    elif change == "clear_device":
+        payload["sender_device"] = "OTHER"
+    elif change == "null_device":
+        payload["sender_device"] = None
+    elif change == "clear_signing_key":
+        payload["keys"]["ed25519"] = "different"
+    elif change == "missing_keys":
+        del payload["keys"]
+    elif change == "null_keys":
+        payload["keys"] = None
+    elif change == "list_keys":
+        payload["keys"] = []
+    else:
+        payload["keys"] = {}
+    record = replace(record, clear=payload)
+    (stored,) = decode_records(encode_records((record,)))
+    with pytest.raises(ValueError, match="identity"):
+        restore_event(stored)
+
+
+def test_custom_event_without_optional_sender_device_replays(peers):
+    """Valid Olm payloads may omit sender_device while their signing key binds identity."""
+    sender, recipient = peers
+    recipient.olm.account.generate_one_time_keys(1)
+    key = next(iter(recipient.olm.account.one_time_keys["curve25519"].values()))
+    recipient_keys = recipient.olm.account.identity_keys
+    session = sender.olm.create_session(key, recipient_keys["curve25519"])
+    payload = {
+        "sender": sender.user_id,
+        "keys": {"ed25519": sender.olm.account.identity_keys["ed25519"]},
+        "recipient": recipient.user_id,
+        "recipient_keys": {"ed25519": recipient_keys["ed25519"]},
+        "type": "org.example.notice",
+        "content": {"value": 1},
+    }
+    message_type, ciphertext = session.encrypt(nio.Api.to_json(payload)).to_parts()
+    encrypted = nio.ToDeviceEvent.parse_event(
+        {
+            "sender": sender.user_id,
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": "m.olm.v1.curve25519-aes-sha2",
+                "sender_key": sender.olm.account.identity_keys["curve25519"],
+                "ciphertext": {
+                    recipient_keys["curve25519"]: {
+                        "type": message_type,
+                        "body": b64encode(ciphertext).decode().rstrip("="),
+                    }
+                },
+            },
+        }
+    )
+    clear = recipient.olm.decrypt_event(encrypted)
+    assert isinstance(clear, nio.AuthenticatedToDeviceEvent)
+    assert "sender_device" not in clear.source
+    record = freeze_event(_SyncItem("to_device", clear, source=encrypted.source))
+    (stored,) = decode_records(encode_records((record,)))
+    recipient.olm.device_store[sender.user_id].clear()
+    restored = restore_event(stored)
+    assert isinstance(restored, nio.AuthenticatedToDeviceEvent)
+    assert restored.authenticated_sender == clear.authenticated_sender
+    assert restored.source == clear.source

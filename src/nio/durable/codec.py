@@ -163,6 +163,7 @@ def restore_event(record: SyncRecord) -> object:
             # treats empty content as redacted, neither of which may rewrite
             # authenticated capture history.
             envelope = record.source.get("content")
+            sender_keys = payload.get("keys")
             if (
                 record.clear is None
                 or not isinstance(payload.get("sender"), str)
@@ -174,6 +175,12 @@ def restore_event(record: SyncRecord) -> object:
                 or envelope.get("algorithm") != "m.olm.v1.curve25519-aes-sha2"
                 or envelope.get("sender_key") != identity.curve25519
                 or payload["sender"] != identity.user_id
+                # Live Olm authentication permits an omitted sender_device,
+                # but requires any supplied ID and signing key to agree.
+                or payload.get("sender_device", identity.device_id)
+                != identity.device_id
+                or not isinstance(sender_keys, dict)
+                or sender_keys.get("ed25519") != identity.ed25519
                 or record.crypto is None
                 or record.crypto.sender_key != identity.curve25519
             ):
