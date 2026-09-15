@@ -32,6 +32,9 @@ enable end-to-end encryption (E2EE).
 Documentation
 -------------
 
+Fork-specific [authenticated custom to-device transport](doc/custom-to-device.md)
+supports pinned application messages and durable device-only consumers.
+
 The full API documentation for nio can be found at
 [https://matrix-nio.readthedocs.io](https://matrix-nio.readthedocs.io/en/latest/#api-documentation)
 

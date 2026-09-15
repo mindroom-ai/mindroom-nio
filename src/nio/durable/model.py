@@ -9,6 +9,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from ..event_provenance import TimelineEventProvenance
+from ..events import AuthenticatedDevice
 
 
 class RecordKind(StrEnum):
@@ -26,6 +27,7 @@ class CryptoEvidence:
     verified: bool | None
     sender_key: str
     session_id: str | None = None
+    authenticated_sender: AuthenticatedDevice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +119,13 @@ def decode_records(encoded: str) -> tuple[SyncRecord, ...]:
             ):
                 raise ValueError("stored session ID must be a string or null")
             try:
+                identity = crypto.get("authenticated_sender")
+                if identity is not None:
+                    if not isinstance(identity, dict):
+                        raise ValueError(
+                            "stored authenticated identity must be an object"
+                        )
+                    crypto["authenticated_sender"] = AuthenticatedDevice(**identity)
                 value["crypto"] = CryptoEvidence(**crypto)
             except TypeError as error:
                 raise ValueError("invalid stored crypto evidence") from error

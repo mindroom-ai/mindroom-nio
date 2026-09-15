@@ -536,3 +536,34 @@ class UnknownToDeviceEvent(ToDeviceEvent):
             event_dict["sender"],
             event_dict["type"],
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedDevice:
+    """Signed device identity matched to an Olm sender at decryption time.
+
+    This evidence is independent of current local verification/blacklist policy.
+    Applications must apply their own authorization to the captured identity.
+    """
+
+    user_id: str
+    device_id: str
+    curve25519: str
+    ed25519: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value
+            for value in (self.user_id, self.device_id, self.curve25519, self.ed25519)
+        ):
+            raise ValueError("authenticated device identity requires nonempty strings")
+
+
+@dataclass
+class AuthenticatedToDeviceEvent(UnknownToDeviceEvent):
+    """Custom event decrypted from one signed device identity.
+
+    Wire parsers never create this type from plaintext event fields.
+    """
+
+    authenticated_sender: AuthenticatedDevice

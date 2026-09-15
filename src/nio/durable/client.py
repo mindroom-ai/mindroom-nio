@@ -52,8 +52,15 @@ class DurableSyncConfig:
     recovery_page_size: int = 100
     max_recovery_pages: int = 1_000
     sliding: SlidingSyncConfig | None = None
+    to_device_only: bool = False
 
     def __post_init__(self) -> None:
+        if self.to_device_only and (
+            self.sync_filter is not None or self.sliding is not None
+        ):
+            raise ValueError(
+                "to-device-only sync cannot use a custom filter or Sliding Sync"
+            )
         if (
             min(
                 self.max_response_bytes,
@@ -94,7 +101,11 @@ class DurableSync:
         self._outbound = OutboundCrypto(self)
         self._metadata: dict[str, dict[str, Any]] = {}
         self._restore_rooms()
-        mode = "sliding" if config.sliding is not None else "classic"
+        mode = (
+            "to_device"
+            if config.to_device_only
+            else "sliding" if config.sliding is not None else "classic"
+        )
         source = store.database.execute_sql(
             "SELECT body FROM NioDurableCrypto WHERE kind='sync_source' AND key='current'"
         ).fetchone()
@@ -143,6 +154,11 @@ class DurableSync:
             root = json.loads(body)
             if not isinstance(root, dict):
                 raise ValueError("response is not an object")
+            if self.config.to_device_only:
+                # This source owns no room or account observations, even if a
+                # server unexpectedly includes them despite its sync filter.
+                for section in ("rooms", "presence", "account_data"):
+                    root.pop(section, None)
             if self._sliding is not None:
                 transients: TransientSections = []
                 extensions = root.get("extensions", {})
@@ -482,7 +498,15 @@ class DurableSync:
                         (
                             None
                             if full_state or newly_joined_room
-                            else self.config.sync_filter
+                            else (
+                                {
+                                    "room": {"rooms": []},
+                                    "presence": {"types": []},
+                                    "account_data": {"types": []},
+                                }
+                                if self.config.to_device_only
+                                else self.config.sync_filter
+                            )
                         ),
                         full_state=full_state or None,
                     )
@@ -587,6 +611,8 @@ class DurableSync:
     ) -> bool:
         """Retain a local join/leave before HTTP; consumer draining must continue."""
         self._assert_active()
+        if self.config.to_device_only:
+            raise LocalProtocolError("to-device-only sync cannot own room membership")
         if (
             not room_id
             or current_membership not in ("join", "leave")

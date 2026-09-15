@@ -512,6 +512,10 @@ class AsyncClient(Client):
 
         self.synced = AsyncioEvent()
         self.response_callbacks: list[ClientCallback] = []
+        self._encrypted_to_device_lock = asyncio.Lock()
+        self._pending_encrypted_to_device: tuple[str, str, ToDeviceMessage] | None = (
+            None
+        )
         self._event_callback_scope: ContextVar[_CallbackScope | None] = ContextVar(
             f"nio_event_callback_scope_{id(self)}", default=None
         )
@@ -1722,6 +1726,89 @@ class AsyncClient(Client):
         return await self.to_device(message, tx_id)
 
     @logged_in_async
+    @store_loaded
+    async def encrypted_to_device(
+        self,
+        message: ToDeviceMessage,
+        *,
+        recipient_ed25519: str,
+        tx_id: str | None = None,
+    ) -> ToDeviceResponse | ToDeviceError:
+        """Encrypt and send a custom event to one exact pinned device.
+
+        Every new operation queries fresh signed device keys and claims an Olm
+        key when needed. A pin authorizes this send without changing global
+        device trust. Invalid/unavailable identities raise LocalProtocolError.
+
+        With DurableSync, encryption and retained HTTP work commit atomically;
+        cancellation/restart retries the exact ciphertext. Ordinary clients
+        retain pending ciphertext only in memory, without crash durability.
+        Durable transport failures raise the durable transport exception;
+        ordinary send failures return ToDeviceError or raise a transport error.
+
+        An explicit tx_id identifies one pending operation: changed content
+        under that ID is rejected. Use a fresh ID after successful completion;
+        completed IDs are not retained. Omitting it lets nio own retry IDs.
+        Application request IDs, not Matrix transaction IDs, deduplicate new
+        logical delivery attempts after a previously successful send.
+        """
+        from ..crypto.to_device import EncryptedToDevice
+
+        if tx_id is not None and (not isinstance(tx_id, str) or not tx_id):
+            raise LocalProtocolError("transaction ID must be a nonempty string")
+        assert self.device_id
+        operation = EncryptedToDevice.prepare(
+            message, recipient_ed25519, self.user_id, self.device_id
+        )
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.encrypted_to_device(
+                operation, tx_id
+            )
+        assert self.olm
+        async with self._encrypted_to_device_lock:
+            pending = self._pending_encrypted_to_device
+            if pending is not None:
+                previous_id, fingerprint, encrypted = pending
+                if tx_id == previous_id and fingerprint != operation.fingerprint:
+                    raise LocalProtocolError(
+                        "transaction ID belongs to different encrypted content"
+                    )
+                response = await self.to_device(encrypted, previous_id)
+                if isinstance(response, ToDeviceError):
+                    return response
+                self._pending_encrypted_to_device = None
+                if tx_id == previous_id or (
+                    tx_id is None and fingerprint == operation.fingerprint
+                ):
+                    return response
+            query = await self.keys_query({operation.message.recipient})
+            device = operation.resolve(self.olm, query)
+            if self.olm.session_store.get(device.curve25519) is None:
+                claim = await self.keys_claim({device.user_id: [device.id]})
+                if not isinstance(claim, KeysClaimResponse):
+                    raise LocalProtocolError("encrypted to-device key claim failed")
+            device = operation.resolve(self.olm, query)
+            if self.olm.session_store.get(device.curve25519) is None:
+                raise LocalProtocolError(
+                    "encrypted to-device key claim supplied no valid session"
+                )
+            request_id = tx_id or str(uuid4())
+            try:
+                encrypted = operation.encrypt(self.olm, device)
+            except BaseException:
+                self._dispose()
+                raise
+            self._pending_encrypted_to_device = (
+                request_id,
+                operation.fingerprint,
+                encrypted,
+            )
+            response = await self.to_device(encrypted, request_id)
+            if isinstance(response, ToDeviceResponse):
+                self._pending_encrypted_to_device = None
+            return response
+
+    @logged_in_async
     async def to_device(
         self,
         message: ToDeviceMessage,
@@ -1947,11 +2034,14 @@ class AsyncClient(Client):
 
     @logged_in_async
     @store_loaded
-    async def keys_query(self) -> KeysQueryResponse | KeysQueryError:
+    async def keys_query(
+        self, user_set: Iterable[str] | None = None
+    ) -> KeysQueryResponse | KeysQueryError:
         """Query the server for user keys.
 
-        This queries the server for device keys of users with which we share an
-        encrypted room.
+        With no arguments, query users whose device lists need refreshing.
+        An explicit user set discovers all devices of those users, including
+        users with whom this client shares no encrypted room.
 
         Automatically called by sync_forever() and room_send().
 
@@ -1960,10 +2050,16 @@ class AsyncClient(Client):
         Raises LocalProtocolError if the client isn't logged in, if the session
         store isn't loaded or if no key query needs to be performed.
         """
-        if self._durable_session is not None:
-            return await self._durable_session._outbound.keys_query()
-        user_list = self.users_for_key_query
+        user_list = set(self.users_for_key_query if user_set is None else user_set)
 
+        if (user_set is not None and not user_list) or any(
+            not isinstance(user, str) or not user for user in user_list
+        ):
+            raise LocalProtocolError("No key query required.")
+        if self._durable_session is not None:
+            return await self._durable_session._outbound.keys_query(
+                None if user_set is None else user_list
+            )
         if not user_list:
             raise LocalProtocolError("No key query required.")
 
@@ -1971,7 +2067,20 @@ class AsyncClient(Client):
         # our need for a key query.
         method, path, data = Api.keys_query(self.access_token, user_list)
 
-        return await self._send(KeysQueryResponse, method, path, data)
+        assert self.olm
+        self.olm.users_for_key_query.difference_update(user_list)
+        try:
+            response = await self._send(
+                KeysQueryResponse, method, path, data, response_data=(user_list,)
+            )
+        except BaseException:
+            self.olm.users_for_key_query.update(user_list)
+            raise
+        if isinstance(response, KeysQueryResponse):
+            self.olm.users_for_key_query.update(user_list - response.device_keys.keys())
+        else:
+            self.olm.users_for_key_query.update(user_list)
+        return response
 
     @logged_in_async
     async def devices(self) -> DevicesResponse | DevicesError:

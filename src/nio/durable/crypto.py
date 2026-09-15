@@ -240,12 +240,17 @@ class CryptoMaintenance:
         if data is None:
             return None
         request = CryptoRequest(**data["request"])
+        fingerprint = self.encrypted_fingerprint()
         if (
             not all(isinstance(value, str) for value in asdict(request).values())
             or request.kind not in ("upload", "query", "claim", "to_device")
             or not isinstance(json.loads(request.body), dict)
         ):
             raise LocalProtocolError("invalid stored crypto request")
+        if fingerprint is not None and request.kind != "to_device":
+            raise LocalProtocolError(
+                "encrypted fingerprint belongs to non-message request"
+            )
         message_id = data["message_id"]
         if message_id is not None and (
             request.kind != "to_device"
@@ -255,12 +260,37 @@ class CryptoMaintenance:
             raise LocalProtocolError("invalid stored crypto message reference")
         return request, message_id
 
-    def _retain_request(self, kind, api_result, request_id=None, message_id=None):
+    def encrypted_fingerprint(self) -> str | None:
+        data = self._read("request")
+        value = data.get("encrypted_fingerprint") if data else None
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise LocalProtocolError("invalid retained encrypted operation fingerprint")
+        return value
+
+    def _retain_request(
+        self,
+        kind,
+        api_result,
+        request_id=None,
+        message_id=None,
+        encrypted_fingerprint=None,
+    ):
         method, path, body = api_result
         request = CryptoRequest(
             request_id or str(uuid4()), kind, method, path.split("?", 1)[0], body
         )
-        self._write("request", {"request": asdict(request), "message_id": message_id})
+        self._write(
+            "request",
+            {
+                "request": asdict(request),
+                "message_id": message_id,
+                "encrypted_fingerprint": encrypted_fingerprint,
+            },
+        )
         self.capture()
         return request
 
@@ -290,11 +320,11 @@ class CryptoMaintenance:
             "upload", Api.keys_upload("", self.olm.share_keys())
         )
 
-    def enqueue_query(self) -> CryptoRequest:
+    def enqueue_query(self, user_set: set[str] | None = None) -> CryptoRequest:
         self.store._require_transaction()
-        users = sorted(self.olm.users_for_key_query)
+        users = sorted(self.olm.users_for_key_query if user_set is None else user_set)
         # New sync invalidations are distinguishable from this query.
-        self.olm.users_for_key_query.clear()
+        self.olm.users_for_key_query.difference_update(users)
         return self._retain_request(
             "query", Api.keys_query("", users, self.store.cursor)
         )
@@ -304,7 +334,11 @@ class CryptoMaintenance:
         return self._retain_request("claim", Api.keys_claim("", users))
 
     def enqueue_message(
-        self, message: ToDeviceMessage, *, request_id: str | None = None
+        self,
+        message: ToDeviceMessage,
+        *,
+        request_id: str | None = None,
+        encrypted_fingerprint: str | None = None,
     ) -> CryptoRequest:
         self.store._require_transaction()
         retained = next(
@@ -326,6 +360,7 @@ class CryptoMaintenance:
             Api.to_device("", message.type, message.as_dict(), retained),
             retained,
             retained,
+            encrypted_fingerprint,
         )
 
     def enqueue_to_device(
@@ -358,7 +393,9 @@ class CryptoMaintenance:
         elif request.kind == "upload":
             response = KeysUploadResponse.from_dict(body)
         elif request.kind == "query":
-            response = KeysQueryResponse.from_dict(body)
+            response = KeysQueryResponse.from_dict(
+                body, set(json.loads(request.body)["device_keys"])
+            )
         else:
             response = KeysClaimResponse.from_dict(body)
         if isinstance(response, ErrorResponse):

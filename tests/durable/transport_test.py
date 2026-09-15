@@ -3,9 +3,9 @@
 import asyncio
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientConnectionError, ClientPayloadError, web
 
-from nio.durable.transport import Transport
+from nio.durable.transport import ConnectionRetriesExhausted, Transport
 from nio.exceptions import LocalProtocolError
 
 from .client_test import client
@@ -82,3 +82,36 @@ async def test_retry_delay_is_cancellable():
                 await task
         finally:
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type", [ClientConnectionError, ClientPayloadError, TimeoutError]
+)
+async def test_connection_exhaustion_is_typed_and_preserves_cause(
+    monkeypatch, error_type
+):
+    """Supervisors can distinguish exhausted transient failures from invalid state."""
+    failure = error_type("offline")
+    requests = []
+
+    class OfflineClient:
+        access_token = "test-token"
+
+        async def send(self, method, path, body, **kwargs):
+            requests.append((method, path, body))
+            raise failure
+
+    async def no_delay(_delay):
+        pass
+
+    monkeypatch.setattr("nio.durable.transport.asyncio.sleep", no_delay)
+    with pytest.raises(ConnectionRetriesExhausted) as caught:
+        await Transport(OfflineClient(), 1024).request(
+            "PUT", "/sync", '{"exact":"body"}'
+        )
+
+    assert isinstance(caught.value, LocalProtocolError)
+    assert str(caught.value) == "durable HTTP connection retries exhausted"
+    assert caught.value.__cause__ is failure
+    assert requests == [("PUT", "/sync", '{"exact":"body"}')] * 5

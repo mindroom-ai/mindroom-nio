@@ -1705,6 +1705,7 @@ class KeysUploadResponse(Response):
 class KeysQueryResponse(Response):
     device_keys: dict = field()
     failures: dict = field()
+    queried_users: set[str] | None = None
     changed: dict[str, dict[str, Any]] = field(
         init=False,
         default_factory=dict,
@@ -1713,12 +1714,18 @@ class KeysQueryResponse(Response):
     @classmethod
     @verify(Schemas.keys_query, KeysQueryError)
     def from_dict(
-        cls, parsed_dict: dict[Any, Any]
+        cls, parsed_dict: dict[Any, Any], user_set: set[str] | None = None
     ) -> KeysQueryResponse | ErrorResponse:
         device_keys = parsed_dict["device_keys"]
         failures = parsed_dict.get("failures", {})
+        if user_set is not None:
+            device_keys = {
+                user: devices
+                for user, devices in device_keys.items()
+                if user in user_set and user.partition(":")[2] not in failures
+            }
 
-        return cls(device_keys, failures)
+        return cls(device_keys, failures, user_set)
 
 
 @dataclass

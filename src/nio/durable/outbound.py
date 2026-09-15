@@ -28,6 +28,7 @@ from .codec import freeze_event
 from .crypto import CryptoRequest
 
 if TYPE_CHECKING:
+    from ..crypto.to_device import EncryptedToDevice
     from .client import DurableSync
 
 
@@ -132,6 +133,43 @@ class OutboundCrypto:
             assert isinstance(response, ToDeviceResponse)
             return response
 
+    async def encrypted_to_device(
+        self, operation: EncryptedToDevice, tx_id: str | None
+    ) -> ToDeviceResponse:
+        async with self.session._crypto_lock:
+            pending = self.crypto._pending()
+            if pending is not None:
+                fingerprint = self.crypto.encrypted_fingerprint()
+                same_id = pending[0].request_id == tx_id
+                if same_id and fingerprint != operation.fingerprint:
+                    raise LocalProtocolError(
+                        "transaction ID belongs to different encrypted content"
+                    )
+                if same_id or (tx_id is None and fingerprint == operation.fingerprint):
+                    response = await self._send(pending[0])
+                    assert isinstance(response, ToDeviceResponse)
+                    return response
+            query = await self._keys_query({operation.message.recipient})
+            device = operation.resolve(self.crypto.olm, query)
+            if self.crypto.olm.session_store.get(device.curve25519) is None:
+                await self._keys_claim({device.user_id: [device.id]})
+            device = operation.resolve(self.crypto.olm, query)
+            if self.crypto.olm.session_store.get(device.curve25519) is None:
+                raise LocalProtocolError(
+                    "encrypted to-device key claim supplied no valid session"
+                )
+            with self.transaction():
+                device = operation.resolve(self.crypto.olm, query)
+                message = operation.encrypt(self.crypto.olm, device)
+                request = self.crypto.enqueue_message(
+                    message,
+                    request_id=tx_id,
+                    encrypted_fingerprint=operation.fingerprint,
+                )
+            response = await self._send(request)
+            assert isinstance(response, ToDeviceResponse)
+            return response
+
     async def keys_upload(self) -> KeysUploadResponse:
         async with self.session._crypto_lock:
             response = await self._finish_pending()
@@ -145,27 +183,35 @@ class OutboundCrypto:
             assert isinstance(response, KeysUploadResponse)
             return response
 
-    async def keys_query(self) -> KeysQueryResponse:
+    async def keys_query(self, user_set: set[str] | None = None) -> KeysQueryResponse:
         async with self.session._crypto_lock:
-            response = await self._finish_pending()
-            if isinstance(response, KeysQueryResponse):
-                return response
-            if not self.crypto.olm.users_for_key_query:
-                raise LocalProtocolError("No key query required.")
-            with self.transaction():
-                request = self.crypto.enqueue_query()
-            response = await self._send(request)
-            assert isinstance(response, KeysQueryResponse)
+            return await self._keys_query(user_set)
+
+    async def _keys_query(self, user_set: set[str] | None = None) -> KeysQueryResponse:
+        response = await self._finish_pending()
+        if user_set is None and isinstance(response, KeysQueryResponse):
             return response
+        if not (self.crypto.olm.users_for_key_query if user_set is None else user_set):
+            raise LocalProtocolError("No key query required.")
+        with self.transaction():
+            request = self.crypto.enqueue_query(user_set)
+        response = await self._send(request)
+        assert isinstance(response, KeysQueryResponse)
+        return response
 
     async def keys_claim(self, users: Mapping[str, Iterable[str]]) -> KeysClaimResponse:
         async with self.session._crypto_lock:
-            await self._finish_pending()
-            with self.transaction():
-                request = self.crypto.enqueue_claim(dict(users))
-            response = await self._send(request)
-            assert isinstance(response, KeysClaimResponse)
-            return response
+            return await self._keys_claim(users)
+
+    async def _keys_claim(
+        self, users: Mapping[str, Iterable[str]]
+    ) -> KeysClaimResponse:
+        await self._finish_pending()
+        with self.transaction():
+            request = self.crypto.enqueue_claim(dict(users))
+        response = await self._send(request)
+        assert isinstance(response, KeysClaimResponse)
+        return response
 
     async def joined_members(self, room_id: str) -> JoinedMembersResponse:
         async with self.session._crypto_lock:
