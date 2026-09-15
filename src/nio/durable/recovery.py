@@ -40,6 +40,8 @@ class Recovery:
 
     def needs_full_state(self, *, excluding: str | None = None) -> bool:
         session = self.session
+        if session.config.to_device_only:
+            return False
         return bool(session.cursor) and (
             (not session._metadata and not self._complete_state_seen)
             or any(

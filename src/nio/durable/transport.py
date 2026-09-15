@@ -22,6 +22,13 @@ class HttpError(LocalProtocolError):
         super().__init__(f"durable HTTP request failed: status={status}")
 
 
+class ConnectionRetriesExhausted(LocalProtocolError):
+    """A transient network failure outlasted the bounded HTTP retry budget."""
+
+    def __init__(self):
+        super().__init__("durable HTTP connection retries exhausted")
+
+
 class ResponseTooLarge(LocalProtocolError):
     def __init__(self):
         super().__init__("HTTP response exceeds the durable input bound")
@@ -94,10 +101,8 @@ class Transport:
                         pass
                 finally:
                     response.release()
-            except (ClientConnectionError, ClientPayloadError, TimeoutError):
+            except (ClientConnectionError, ClientPayloadError, TimeoutError) as exc:
                 if attempt == 4:
-                    raise LocalProtocolError(
-                        "durable HTTP connection retries exhausted"
-                    ) from None
+                    raise ConnectionRetriesExhausted from exc
             await asyncio.sleep(max(0, min(delay, 30)))
         raise AssertionError("unreachable retry state")

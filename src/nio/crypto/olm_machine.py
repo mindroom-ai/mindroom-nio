@@ -30,6 +30,8 @@ from ..api import Api
 from ..crypto.sessions import Session
 from ..event_builders import DummyMessage, RoomKeyRequestMessage, ToDeviceMessage
 from ..events import (
+    AuthenticatedDevice,
+    AuthenticatedToDeviceEvent,
     BadEvent,
     BadEventType,
     DummyEvent,
@@ -720,10 +722,8 @@ class Olm:
         changed: defaultdict[str, dict[str, OlmDevice]] = defaultdict(dict)
 
         for user_id, device_dict in response.device_keys.items():
-            try:
-                self.users_for_key_query.remove(user_id)
-            except KeyError:
-                pass
+            if response.queried_users is None:
+                self.users_for_key_query.discard(user_id)
 
             self.tracked_users.add(user_id)
 
@@ -1311,7 +1311,28 @@ class Olm:
             logger.info(
                 f"Passing through Olm event of unsupported type {payload['type']}"
             )
-            return UnknownToDeviceEvent.from_dict(payload)
+            event = UnknownToDeviceEvent.from_dict(payload)
+            matching = [
+                device
+                for device in self.device_store.active_user_devices(sender)
+                if device.curve25519 == sender_key
+            ]
+            if len(matching) == 1:
+                device = matching[0]
+                if (
+                    payload.get("sender_device", device.id) == device.id
+                    and payload.get("keys", {}).get("ed25519") == device.ed25519
+                ):
+                    return AuthenticatedToDeviceEvent(
+                        event.source,
+                        event.sender,
+                        event.type,
+                        AuthenticatedDevice(
+                            sender, device.id, sender_key, device.ed25519
+                        ),
+                    )
+            self.users_for_key_query.add(sender)
+            return event
 
     def message_index_ok(self, message_index: int, event: MegolmEvent) -> bool:
         """Check that the message index corresponds to a known message.
@@ -1927,7 +1948,7 @@ class Olm:
             message = Api.to_canonical_json(json).encode()
             user_key.verify_signature(message, signature)
             success = True
-        except vodozemac.SignatureException:
+        except (vodozemac.SignatureException, vodozemac.KeyException):
             success = False
 
         json["signatures"] = signatures

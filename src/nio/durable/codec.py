@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..events import (
     AccountDataEvent,
+    AuthenticatedToDeviceEvent,
     DummyEvent,
     Event,
     ForwardedRoomKeyEvent,
@@ -16,6 +17,7 @@ from ..events import (
     MegolmEvent,
     RoomKeyEvent,
     ToDeviceEvent,
+    UnknownToDeviceEvent,
 )
 from ..responses import SlidingSyncStateStub
 from .model import CryptoEvidence, RecordKind, SyncRecord
@@ -67,7 +69,10 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     encrypted_envelope = (
         item.source is not None
         and item.source.get("type") == "m.room.encrypted"
-        and event_source.get("type") != "m.room.encrypted"
+        and (
+            event_source.get("type") != "m.room.encrypted"
+            or isinstance(event, AuthenticatedToDeviceEvent)
+        )
     )
     crypto = None
     if decrypted or isinstance(event, (RoomKeyEvent, DummyEvent)) or encrypted_envelope:
@@ -77,6 +82,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
             getattr(event, "sender_key", None)
             or envelope_content.get("sender_key", ""),
             getattr(event, "session_id", None),
+            getattr(event, "authenticated_sender", None),
         )
     # Plaintext observations normally share the parsed event source. Detach
     # that tree only once, without comparing potentially large event bodies.
@@ -150,6 +156,32 @@ def restore_event(record: SyncRecord) -> object:
     if record.codec is not None:
         raise ValueError(f"unsupported stored event codec: {record.codec}")
     if record.kind == RecordKind.TO_DEVICE:
+        identity = record.crypto.authenticated_sender if record.crypto else None
+        if identity is not None:
+            # Reconstruct the exact wrapper produced by Olm decryption. The
+            # ordinary parser can recognize reserved names differently and
+            # treats empty content as redacted, neither of which may rewrite
+            # authenticated capture history.
+            envelope = record.source.get("content")
+            if (
+                record.clear is None
+                or not isinstance(payload.get("sender"), str)
+                or not isinstance(payload.get("type"), str)
+                or not isinstance(payload.get("content"), dict)
+                or record.source.get("type") != "m.room.encrypted"
+                or record.source.get("sender") != identity.user_id
+                or not isinstance(envelope, dict)
+                or envelope.get("algorithm") != "m.olm.v1.curve25519-aes-sha2"
+                or envelope.get("sender_key") != identity.curve25519
+                or payload["sender"] != identity.user_id
+                or record.crypto is None
+                or record.crypto.sender_key != identity.curve25519
+            ):
+                raise ValueError("stored authenticated identity does not match event")
+            event = UnknownToDeviceEvent.from_dict(payload)
+            return AuthenticatedToDeviceEvent(
+                event.source, event.sender, event.type, identity
+            )
         return ToDeviceEvent.parse_event(payload)
     if record.kind in (RecordKind.ROOM_ACCOUNT_DATA, RecordKind.GLOBAL_ACCOUNT_DATA):
         return AccountDataEvent.parse_event(payload)
