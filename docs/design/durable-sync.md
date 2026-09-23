@@ -198,8 +198,11 @@ outside storage transactions. It restores the committed event unless the
 application supplies its authenticated extension event. The consumer decides
 whether receipt/semantic novelty warrants dispatch and acknowledges separately.
 Callback failure leaves the batch available; it does not poison committed state.
-`progress_generation` exposes the highest committed batch sequence, including
-acknowledged batches, and `cursor` exposes the last prepared Matrix position.
+`progress_generation` is an opaque monotonic value that advances on committed batch publication and acknowledgement, including while a prepared backlog drains.
+It sums the published high-water mark (the highest queued or acknowledged sequence) and the acknowledged sequence, using existing durable state without a separate counter.
+Duplicate acknowledgements and rolled-back writes leave it unchanged, and reopening the same stream preserves it.
+Compare generations to detect progress; the value is not a batch sequence or a count of events.
+`cursor` exposes the last prepared Matrix position.
 
 `change_membership(operation_id, room_id, previous_membership, previous_epoch,
 current_membership)` accepts keyword arguments and returns success as a boolean.
