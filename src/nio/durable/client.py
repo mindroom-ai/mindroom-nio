@@ -385,9 +385,11 @@ class DurableSync:
 
     @property
     def progress_generation(self) -> int:
+        """Monotonic progress from committed publication and acknowledgement."""
         self._assert_active()
         return self._store.database.execute_sql(
-            "SELECT MAX(acked_sequence, COALESCE((SELECT MAX(sequence) FROM NioDurableBatch),0)) "
+            "SELECT acked_sequence + "
+            "MAX(acked_sequence, COALESCE((SELECT MAX(sequence) FROM NioDurableBatch),0)) "
             "FROM NioDurableMeta WHERE id=1"
         ).fetchone()[0]
 
