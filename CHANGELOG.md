@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.1
+
+- Advance durable ingestion progress when queued batches are acknowledged, so health monitors recognize backlog consumption.
+- Preserve progress across reopening without additional counters or schema changes; duplicate acknowledgements and rolled-back writes do not advance it.
+
 ## 1.0.8
 
 - Stop repeated full-state syncs when another client forgets a room before its departure is observed.
