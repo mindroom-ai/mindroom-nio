@@ -18,6 +18,7 @@ from nio.responses import (
     JoinedMembersResponse,
     JoinResponse,
     KeysClaimResponse,
+    KeysQueryError,
     KeysQueryResponse,
     KeysUploadResponse,
     LoginError,
@@ -106,6 +107,20 @@ class TestClass:
         parsed_dict = _load_response("tests/data/keys_query.json")
         response = KeysQueryResponse.from_dict(parsed_dict)
         assert isinstance(response, KeysQueryResponse)
+
+    def test_keys_query_without_device_keys(self):
+        response = KeysQueryResponse.from_dict(
+            {"failures": {"example.org": {}}}, {"@alice:example.org"}
+        )
+        assert isinstance(response, KeysQueryResponse)
+        assert response.device_keys == {}
+        assert response.failures == {"example.org": {}}
+
+    def test_invalid_keys_query_with_user_set_is_an_error_response(self):
+        response = KeysQueryResponse.from_dict(
+            {"device_keys": []}, {"@alice:example.org"}
+        )
+        assert isinstance(response, KeysQueryError)
 
     def test_keys_claim(self):
         parsed_dict = _load_response("tests/data/keys_claim.json")

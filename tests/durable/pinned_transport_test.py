@@ -111,9 +111,17 @@ async def test_explicit_query_does_not_return_unrelated_pending_query(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durable", [False, True])
-async def test_explicit_query_keeps_missing_user_dirty(tmp_path, durable):
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"device_keys": {}, "failures": {"example.org": {}}},
+        # Servers may omit device_keys when every queried server failed.
+        {"failures": {"example.org": {}}},
+    ],
+)
+async def test_explicit_query_keeps_missing_user_dirty(tmp_path, durable, body):
     async def query(request):
-        return web.json_response({"device_keys": {}, "failures": {"example.org": {}}})
+        return web.json_response(body)
 
     async with homeserver(None, query=query) as (url, _):
         async with transport_client(tmp_path, url, durable) as (nio_client, _):
