@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.2
+
+- Accept `/keys/query` responses that omit `device_keys`, which homeservers may do when every queried server failed.
+- Return `KeysQueryError` for invalid key-query responses instead of raising `TypeError` when a user set is supplied.
+
 ## 1.1.1
 
 - Advance durable ingestion progress when queued batches are acknowledged, so health monitors recognize backlog consumption.
