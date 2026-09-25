@@ -1517,7 +1517,6 @@ class Schemas:
             },
             "failures": {"type": "object"},
         },
-        "required": ["device_keys"],
     }
 
     keys_claim = {

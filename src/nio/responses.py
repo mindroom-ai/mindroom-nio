@@ -1712,11 +1712,12 @@ class KeysQueryResponse(Response):
     )
 
     @classmethod
-    @verify(Schemas.keys_query, KeysQueryError)
+    @verify(Schemas.keys_query, KeysQueryError, pass_arguments=False)
     def from_dict(
         cls, parsed_dict: dict[Any, Any], user_set: set[str] | None = None
     ) -> KeysQueryResponse | ErrorResponse:
-        device_keys = parsed_dict["device_keys"]
+        # device_keys is optional; servers may omit it when every queried server failed.
+        device_keys = parsed_dict.get("device_keys", {})
         failures = parsed_dict.get("failures", {})
         if user_set is not None:
             device_keys = {
