@@ -96,6 +96,19 @@ def chunks(lst, n):
         yield lst[i : i + n]
 
 
+def _parse_decrypted_json(plaintext: str) -> Any:
+    """Parse a decrypted payload as strict JSON.
+
+    The sender controls the plaintext, and Python's parser also accepts
+    unpaired surrogate escapes and NaN or Infinity. Those values cannot be
+    written back as UTF-8 JSON, so reject them here instead of handing every
+    later consumer an event it cannot store or forward.
+    """
+    parsed = json.loads(plaintext)
+    json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode()
+    return parsed
+
+
 class KeyShareError(Exception):
     pass
 
@@ -1498,8 +1511,8 @@ class Olm:
                     verified = True
 
         try:
-            parsed_dict: dict[Any, Any] = json.loads(plaintext)
-        except JSONDecodeError as e:
+            parsed_dict: dict[Any, Any] = _parse_decrypted_json(plaintext)
+        except ValueError as e:
             raise EncryptionError(f"Error parsing payload: {str(e)}")
 
         bad = validate_or_badevent(parsed_dict, Schemas.room_megolm_decrypted)
@@ -1629,8 +1642,8 @@ class Olm:
 
         # The plaintext should be valid json, let's parse it and verify it.
         try:
-            parsed_payload = json.loads(plaintext)
-        except JSONDecodeError as e:
+            parsed_payload = _parse_decrypted_json(plaintext)
+        except ValueError as e:
             # Failed parsing the payload, return early.
             logger.error(f"Failed to parse Olm message payload: {str(e)}")
             return None

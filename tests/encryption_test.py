@@ -979,6 +979,37 @@ class TestClass:
         assert event.type == "io.element.call.encryption_keys"
         assert event.source["content"]["keys"]["index"] == 0
 
+    @pytest.mark.parametrize("value", ["\ud800", float("nan")])
+    def test_olm_decryption_rejects_payload_that_is_not_strict_json(
+        self, olm_account, bob_account, value
+    ):
+        alice = olm_account
+        bob = bob_account
+        bob_device = OlmDevice(bob.user_id, bob.device_id, bob.account.identity_keys)
+        alice.device_store.add(bob_device)
+        bob.device_store.add(
+            OlmDevice(alice.user_id, alice.device_id, alice.account.identity_keys)
+        )
+        bob.account.generate_one_time_keys(1)
+        one_time = list(bob.account.one_time_keys["curve25519"].values())[0]
+        bob.account.mark_keys_as_published()
+        alice.create_session(one_time, bob_device.curve25519)
+        session = alice.session_store.get(bob_device.curve25519)
+
+        olm_content = alice._olm_encrypt(
+            session, bob_device, "m.dummy", {"value": value}
+        )
+        event = ToDeviceEvent.parse_event(
+            {
+                "sender": alice.user_id,
+                "type": "m.room.encrypted",
+                "content": olm_content,
+            }
+        )
+
+        assert isinstance(event, OlmEvent)
+        assert bob.decrypt_event(event) is None
+
     def test_user_verification_status(self, monkeypatch):
         def mocksave(self):
             return
@@ -1055,6 +1086,65 @@ class TestClass:
         event = olm.decrypt_event(megolm_event)
         assert isinstance(event, RoomMessageText)
         assert event.decrypted
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            {"msgtype": "m.text", "body": "hi \ud800"},
+            {"msgtype": "m.text", "body": "hi", "count": float("nan")},
+        ],
+    )
+    def test_group_decryption_rejects_payload_that_is_not_strict_json(self, content):
+        olm = self.ephemeral_olm
+        olm.create_outbound_group_session(TEST_ROOM)
+        olm.outbound_group_sessions[TEST_ROOM].shared = True
+        encrypted_dict = olm.group_encrypt(
+            TEST_ROOM, {"type": "m.room.message", "content": content}
+        )
+        megolm_event = MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "1",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": encrypted_dict,
+            }
+        )
+
+        with pytest.raises(EncryptionError, match="Error parsing payload"):
+            olm.decrypt_megolm_event(megolm_event)
+        assert olm.decrypt_event(megolm_event) is None
+
+    def test_group_decryption_replaces_invalid_utf8(self):
+        olm = self.ephemeral_olm
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        plaintext = (
+            b'{"type":"m.room.message","room_id":"' + TEST_ROOM.encode() + b'",'
+            b'"content":{"msgtype":"m.text","body":"hi \xff"}}'
+        )
+        megolm_event = MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "1",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "sender_key": olm.account.identity_keys["curve25519"],
+                    "ciphertext": session._session.encrypt(plaintext).to_base64(),
+                    "session_id": session.id,
+                    "device_id": olm.device_id,
+                },
+            }
+        )
+
+        event = olm.decrypt_event(megolm_event)
+
+        assert isinstance(event, RoomMessageText)
+        assert event.body == "hi \ufffd"
 
     def test_key_sharing(self):
         olm = self.ephemeral_olm
