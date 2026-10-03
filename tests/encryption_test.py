@@ -1116,6 +1116,36 @@ class TestClass:
             olm.decrypt_megolm_event(megolm_event)
         assert olm.decrypt_event(megolm_event) is None
 
+    def test_group_decryption_replaces_invalid_utf8(self):
+        olm = self.ephemeral_olm
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        plaintext = (
+            b'{"type":"m.room.message","room_id":"' + TEST_ROOM.encode() + b'",'
+            b'"content":{"msgtype":"m.text","body":"hi \xff"}}'
+        )
+        megolm_event = MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "1",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "sender_key": olm.account.identity_keys["curve25519"],
+                    "ciphertext": session._session.encrypt(plaintext).to_base64(),
+                    "session_id": session.id,
+                    "device_id": olm.device_id,
+                },
+            }
+        )
+
+        event = olm.decrypt_event(megolm_event)
+
+        assert isinstance(event, RoomMessageText)
+        assert event.body == "hi \ufffd"
+
     def test_key_sharing(self):
         olm = self.ephemeral_olm
 

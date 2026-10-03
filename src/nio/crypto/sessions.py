@@ -354,7 +354,10 @@ class InboundGroupSession:
 
     def decrypt(self, message: str, unicode_errors="replace") -> tuple[str, int]:
         decrypted = self._session.decrypt(vodozemac.MegolmMessage.from_base64(message))
-        return (decrypted.plaintext.decode(), decrypted.message_index)
+        return (
+            decrypted.plaintext.decode(errors=unicode_errors),
+            decrypted.message_index,
+        )
 
 
 class OutboundGroupSession:
