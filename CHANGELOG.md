@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.3
+
+- Treat decrypted Megolm payloads that are not strict JSON (unpaired surrogate escapes, `NaN`, or `Infinity`) as undecryptable, and drop such Olm payloads, instead of passing on events that cannot be stored or forwarded as UTF-8 JSON.
+- Replace invalid UTF-8 in decrypted Megolm plaintext with U+FFFD instead of raising, as Olm decryption already did.
+
 ## 1.1.2
 
 - Accept `/keys/query` responses that omit `device_keys`, which homeservers may do when every queried server failed.
