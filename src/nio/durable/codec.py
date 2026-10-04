@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from .._json_copy import copy_json
 from ..events import (
     AccountDataEvent,
     AuthenticatedToDeviceEvent,
@@ -38,7 +38,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
         )
 
     event_source = getattr(event, "source", {})
-    payload = deepcopy(event_source)
+    payload = copy_json(event_source)
     codec = None
     if isinstance(event, SlidingSyncStateStub):
         codec = "state_stub"
@@ -46,7 +46,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     elif isinstance(event, InviteEvent):
         codec = "invite"
         if isinstance(event, InviteMemberEvent):
-            payload["content"] = deepcopy(event.content)
+            payload["content"] = copy_json(event.content)
     elif isinstance(event, ForwardedRoomKeyEvent):
         codec = "forwarded_room_key"
     elif isinstance(event, RoomKeyEvent):
@@ -89,7 +89,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     source = (
         payload
         if item.source is None or item.source is event_source
-        else deepcopy(item.source)
+        else copy_json(item.source)
     )
     clear = (
         payload
@@ -122,7 +122,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
 
 def restore_event(record: SyncRecord) -> object:
     """Reconstruct a committed event without consulting mutable crypto state."""
-    payload: dict[str, Any] = deepcopy(
+    payload: dict[str, Any] = copy_json(
         record.clear if record.clear is not None else record.source
     )
     if record.codec in ("room_key", "forwarded_room_key", "dummy"):

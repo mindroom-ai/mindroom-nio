@@ -40,6 +40,9 @@ from nio.events import (
     UnknownToDeviceEvent,
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
+from nio.client.base_client import _SyncItem
+from nio.durable.codec import freeze_event
+from nio.durable.model import decode_records, encode_records
 from nio.durable.store import DurableStore
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
 from nio.store import (
@@ -1115,6 +1118,55 @@ class TestClass:
         with pytest.raises(EncryptionError, match="Error parsing payload"):
             olm.decrypt_megolm_event(megolm_event)
         assert olm.decrypt_event(megolm_event) is None
+
+    def _megolm_event_with_nested_list(self, olm, depth):
+        """Encrypt a message whose content holds a list nested depth levels deep."""
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        plaintext = (
+            '{"type":"m.room.message","room_id":"' + TEST_ROOM + '",'
+            '"content":{"msgtype":"m.text","body":"hi","nested":'
+            + "[" * depth
+            + "]" * depth
+            + "}}"
+        )
+        return MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "1",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "sender_key": olm.account.identity_keys["curve25519"],
+                    "ciphertext": session._session.encrypt(
+                        plaintext.encode()
+                    ).to_base64(),
+                    "session_id": session.id,
+                    "device_id": olm.device_id,
+                },
+            }
+        )
+
+    # The payload object and its content add two levels to the nested list.
+    @pytest.mark.parametrize("depth", [127, 100_000])
+    def test_group_decryption_rejects_payload_nested_too_deeply(self, depth):
+        olm = self.ephemeral_olm
+        megolm_event = self._megolm_event_with_nested_list(olm, depth)
+
+        with pytest.raises(EncryptionError, match="nested too deeply"):
+            olm.decrypt_megolm_event(megolm_event)
+
+    def test_group_decryption_payload_at_the_nesting_cap_is_stored(self):
+        olm = self.ephemeral_olm
+        megolm_event = self._megolm_event_with_nested_list(olm, 126)
+
+        event = olm.decrypt_event(megolm_event)
+
+        assert isinstance(event, RoomMessageText)
+        record = freeze_event(_SyncItem("event", event))
+        assert decode_records(encode_records((record,)))[0].source == event.source
 
     def test_group_decryption_replaces_invalid_utf8(self):
         olm = self.ephemeral_olm

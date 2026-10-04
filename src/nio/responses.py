@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Generator
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
@@ -26,6 +25,7 @@ from typing import Any, Self
 
 from jsonschema.exceptions import SchemaError, ValidationError
 
+from ._json_copy import copy_json
 from .event_builders import ToDeviceMessage
 from .events import (
     AccountDataEvent,
@@ -2354,7 +2354,7 @@ class SlidingSyncResponse(Response):
             }
             extensions = parsed_dict.get("extensions", {})
             # Event parsers can remove content or add defaults to nested dictionaries.
-            parsed_extensions = deepcopy(extensions)
+            parsed_extensions = copy_json(extensions)
             to_device = parsed_extensions.get("to_device", {})
             to_device_events = [
                 event
