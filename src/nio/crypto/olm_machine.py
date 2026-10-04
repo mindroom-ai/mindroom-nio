@@ -96,20 +96,44 @@ def chunks(lst, n):
         yield lst[i : i + n]
 
 
+# Rust Matrix stacks parse with serde_json, which refuses deeper nesting.
+_MAX_DECRYPTED_NESTING = 128
+
+
+def _nesting_exceeds(value: Any, limit: int) -> bool:
+    """Return whether containers in a JSON tree nest deeper than limit, without recursion."""
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            children = list(item.values())
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _parse_decrypted_json(plaintext: str) -> Any:
     """Parse a decrypted payload as strict JSON.
 
     The sender controls the plaintext, and Python's parser also accepts
     unpaired surrogate escapes and NaN or Infinity. Those values cannot be
     written back as UTF-8 JSON, so reject them here instead of handing every
-    later consumer an event it cannot store or forward. Nesting deep enough to
-    exhaust the parser's recursion is rejected the same way.
+    later consumer an event it cannot store or forward. Nesting is capped well
+    below interpreter recursion limits for the same reason.
     """
+    nested_too_deeply = "payload is nested too deeply"
     try:
         parsed = json.loads(plaintext)
-        json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode()
     except RecursionError as error:
-        raise ValueError("payload is nested too deeply") from error
+        raise ValueError(nested_too_deeply) from error
+    if _nesting_exceeds(parsed, _MAX_DECRYPTED_NESTING):
+        raise ValueError(nested_too_deeply)
+    json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode()
     return parsed
 
 
