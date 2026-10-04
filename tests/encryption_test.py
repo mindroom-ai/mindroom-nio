@@ -1116,6 +1116,40 @@ class TestClass:
             olm.decrypt_megolm_event(megolm_event)
         assert olm.decrypt_event(megolm_event) is None
 
+    def test_group_decryption_rejects_payload_nested_too_deeply(self):
+        olm = self.ephemeral_olm
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        depth = 100_000
+        plaintext = (
+            '{"type":"m.room.message","room_id":"' + TEST_ROOM + '",'
+            '"content":{"msgtype":"m.text","body":"hi","nested":'
+            + "[" * depth
+            + "]" * depth
+            + "}}"
+        )
+        megolm_event = MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "1",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "sender_key": olm.account.identity_keys["curve25519"],
+                    "ciphertext": session._session.encrypt(
+                        plaintext.encode()
+                    ).to_base64(),
+                    "session_id": session.id,
+                    "device_id": olm.device_id,
+                },
+            }
+        )
+
+        with pytest.raises(EncryptionError, match="nested too deeply"):
+            olm.decrypt_megolm_event(megolm_event)
+
     def test_group_decryption_replaces_invalid_utf8(self):
         olm = self.ephemeral_olm
         olm.create_outbound_group_session(TEST_ROOM)

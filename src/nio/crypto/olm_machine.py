@@ -102,10 +102,14 @@ def _parse_decrypted_json(plaintext: str) -> Any:
     The sender controls the plaintext, and Python's parser also accepts
     unpaired surrogate escapes and NaN or Infinity. Those values cannot be
     written back as UTF-8 JSON, so reject them here instead of handing every
-    later consumer an event it cannot store or forward.
+    later consumer an event it cannot store or forward. Nesting deep enough to
+    exhaust the parser's recursion is rejected the same way.
     """
-    parsed = json.loads(plaintext)
-    json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode()
+    try:
+        parsed = json.loads(plaintext)
+        json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode()
+    except RecursionError as error:
+        raise ValueError("payload is nested too deeply") from error
     return parsed
 
 

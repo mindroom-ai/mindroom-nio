@@ -237,6 +237,25 @@ def test_plaintext_timeline_membership_and_provenance_metadata_survive_disk():
     assert type(restore_event(decoded)) is RoomMessageText
 
 
+def test_deeply_nested_event_survives_freeze_encode_and_restore():
+    nested = 1
+    for _ in range(2000):
+        nested = {"a": nested}
+    event = Event.parse_event(
+        {
+            "type": "m.room.message",
+            "sender": "@alice:x",
+            "event_id": "$e:x",
+            "origin_server_ts": 1,
+            "content": {"msgtype": "m.text", "body": "hello", "nested": nested},
+        }
+    )
+    record, restored = roundtrip(_SyncItem("event", event))
+    assert restored.body == "hello"
+    assert record.source == event.source
+    assert record.source is not event.source
+
+
 def test_generic_decrypted_to_device_freezes_envelope_sender_key_evidence():
     from nio.events import UnknownToDeviceEvent
 

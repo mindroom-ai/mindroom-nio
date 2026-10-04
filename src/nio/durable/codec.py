@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
+import json
 from typing import TYPE_CHECKING, Any
 
 from ..events import (
@@ -20,10 +20,19 @@ from ..events import (
     UnknownToDeviceEvent,
 )
 from ..responses import SlidingSyncStateStub
-from .model import CryptoEvidence, RecordKind, SyncRecord
+from .model import CryptoEvidence, RecordKind, SyncRecord, encode_json
 
 if TYPE_CHECKING:
     from ..client.base_client import _SyncItem
+
+
+def _detached(value: Any) -> Any:
+    """Copy a JSON event tree through the C codec.
+
+    Event trees come from other users and can nest deeper than deepcopy's
+    Python-level recursion allows, which would fail the whole durable stream.
+    """
+    return json.loads(encode_json(value))
 
 
 def freeze_event(item: _SyncItem) -> SyncRecord:
@@ -38,7 +47,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
         )
 
     event_source = getattr(event, "source", {})
-    payload = deepcopy(event_source)
+    payload = _detached(event_source)
     codec = None
     if isinstance(event, SlidingSyncStateStub):
         codec = "state_stub"
@@ -46,7 +55,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     elif isinstance(event, InviteEvent):
         codec = "invite"
         if isinstance(event, InviteMemberEvent):
-            payload["content"] = deepcopy(event.content)
+            payload["content"] = _detached(event.content)
     elif isinstance(event, ForwardedRoomKeyEvent):
         codec = "forwarded_room_key"
     elif isinstance(event, RoomKeyEvent):
@@ -89,7 +98,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     source = (
         payload
         if item.source is None or item.source is event_source
-        else deepcopy(item.source)
+        else _detached(item.source)
     )
     clear = (
         payload
@@ -122,7 +131,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
 
 def restore_event(record: SyncRecord) -> object:
     """Reconstruct a committed event without consulting mutable crypto state."""
-    payload: dict[str, Any] = deepcopy(
+    payload: dict[str, Any] = _detached(
         record.clear if record.clear is not None else record.source
     )
     if record.codec in ("room_key", "forwarded_room_key", "dummy"):
