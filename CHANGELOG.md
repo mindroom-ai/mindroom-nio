@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.4
+
+- Copy event trees received from other users through the C JSON codec instead of `deepcopy`, so deeply nested event content no longer stops durable sync.
+- Treat decrypted payloads nested deeper than 128 levels as undecryptable.
+
 ## 1.1.3
 
 - Treat decrypted Megolm payloads that are not strict JSON (unpaired surrogate escapes, `NaN`, or `Infinity`) as undecryptable, and drop such Olm payloads, instead of passing on events that cannot be stored or forwarded as UTF-8 JSON.
