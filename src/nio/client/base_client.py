@@ -28,6 +28,7 @@ from typing import (
     TypeVar,
 )
 
+from .._json_copy import copy_json
 from ..crypto import ENCRYPTION_ENABLED, DeviceStore, OutgoingKeyRequest
 from ..event_provenance import TimelineEventProvenance
 from ..events import (
@@ -798,7 +799,7 @@ class Client:
 
         for index, to_device_event in enumerate(response.to_device_events):
             source = (
-                deepcopy(to_device_event.source)
+                copy_json(to_device_event.source)
                 if isinstance(to_device_event, OlmEvent)
                 else to_device_event.source
             )
@@ -951,7 +952,7 @@ class Client:
             if apply_state and self._durable_session is not None:
                 room = self._durable_session._timeline_room(room_id, room, event)
             source = (
-                deepcopy(event.source)
+                copy_json(event.source)
                 if isinstance(event, MegolmEvent)
                 else event.source
             )

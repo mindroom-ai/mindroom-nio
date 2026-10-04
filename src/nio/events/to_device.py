@@ -24,10 +24,10 @@ of a user.
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+from .._json_copy import copy_json
 from ..schemas import Schemas
 from .common import (
     KeyVerificationAcceptMixin,
@@ -460,7 +460,7 @@ class RoomKeyEvent(ToDeviceEvent):
     @classmethod
     @verify(Schemas.room_key_event)
     def from_dict(cls, event_dict, sender, sender_key):
-        event_dict = deepcopy(event_dict)
+        event_dict = copy_json(event_dict)
         event_dict.pop("keys")
 
         content = event_dict["content"]
@@ -500,7 +500,7 @@ class ForwardedRoomKeyEvent(RoomKeyEvent):
             sender (str): The sender of the event.
             sender_key (str): The key of the sender that sent the event.
         """
-        event_dict = deepcopy(event_dict)
+        event_dict = copy_json(event_dict)
         content = event_dict["content"]
         content.pop("session_key")
 

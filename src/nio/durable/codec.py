@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Any
 
+from .._json_copy import copy_json
 from ..events import (
     AccountDataEvent,
     AuthenticatedToDeviceEvent,
@@ -20,19 +20,10 @@ from ..events import (
     UnknownToDeviceEvent,
 )
 from ..responses import SlidingSyncStateStub
-from .model import CryptoEvidence, RecordKind, SyncRecord, encode_json
+from .model import CryptoEvidence, RecordKind, SyncRecord
 
 if TYPE_CHECKING:
     from ..client.base_client import _SyncItem
-
-
-def _detached(value: Any) -> Any:
-    """Copy a JSON event tree through the C codec.
-
-    Event trees come from other users and can nest deeper than deepcopy's
-    Python-level recursion allows, which would fail the whole durable stream.
-    """
-    return json.loads(encode_json(value))
 
 
 def freeze_event(item: _SyncItem) -> SyncRecord:
@@ -47,7 +38,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
         )
 
     event_source = getattr(event, "source", {})
-    payload = _detached(event_source)
+    payload = copy_json(event_source)
     codec = None
     if isinstance(event, SlidingSyncStateStub):
         codec = "state_stub"
@@ -55,7 +46,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     elif isinstance(event, InviteEvent):
         codec = "invite"
         if isinstance(event, InviteMemberEvent):
-            payload["content"] = _detached(event.content)
+            payload["content"] = copy_json(event.content)
     elif isinstance(event, ForwardedRoomKeyEvent):
         codec = "forwarded_room_key"
     elif isinstance(event, RoomKeyEvent):
@@ -98,7 +89,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
     source = (
         payload
         if item.source is None or item.source is event_source
-        else _detached(item.source)
+        else copy_json(item.source)
     )
     clear = (
         payload
@@ -131,7 +122,7 @@ def freeze_event(item: _SyncItem) -> SyncRecord:
 
 def restore_event(record: SyncRecord) -> object:
     """Reconstruct a committed event without consulting mutable crypto state."""
-    payload: dict[str, Any] = _detached(
+    payload: dict[str, Any] = copy_json(
         record.clear if record.clear is not None else record.source
     )
     if record.codec in ("room_key", "forwarded_room_key", "dummy"):
