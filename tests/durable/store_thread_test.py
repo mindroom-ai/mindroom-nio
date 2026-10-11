@@ -1,13 +1,13 @@
-"""BEGIN and COMMIT run on the store's thread while the event loop keeps running."""
+"""COMMIT runs on the store's thread while the event loop keeps running."""
 
 import asyncio
-import sqlite3
 import threading
 import time
 
 import pytest
 from aiohttp import web
 
+from nio.crypto import InboundGroupSession, OlmAccount, OutboundGroupSession
 from nio.event_builders import ToDeviceMessage
 from nio.exceptions import LocalProtocolError
 from nio.rooms import MatrixRoom
@@ -89,32 +89,11 @@ async def test_slow_commit_runs_on_store_thread_while_loop_keeps_running(tmp_pat
         assert await ticker.stop() < RESPONSIVE
         assert elapsed >= SLOW
         by_statement = {sql.split()[0]: name for sql, name in threads}
-        assert by_statement["BEGIN"].startswith("nio-durable-store")
         assert by_statement["COMMIT"].startswith("nio-durable-store")
+        assert by_statement["BEGIN"] == threading.current_thread().name
         assert by_statement["INSERT"] == threading.current_thread().name
         assert store.next_batch() is not None
     finally:
-        store.close()
-
-
-@pytest.mark.asyncio
-async def test_begin_waits_for_another_writer_off_the_loop(tmp_path):
-    store = open_store(tmp_path)
-    writer = sqlite3.connect(store.path, check_same_thread=False)
-    try:
-        writer.execute("BEGIN IMMEDIATE")
-        release = threading.Timer(SLOW, writer.rollback)
-        release.start()
-        ticker = Ticker()
-        started = time.monotonic()
-        async with store.transaction():
-            store.publish((message(),))
-        assert time.monotonic() - started >= SLOW * 0.9
-        assert await ticker.stop() < RESPONSIVE
-        assert store.has_batches()
-        release.join()
-    finally:
-        writer.close()
         store.close()
 
 
@@ -147,13 +126,10 @@ async def test_status_reads_return_committed_values_during_slow_commit(tmp_path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
-async def test_cancelled_transaction_completes_before_releasing_store(
-    tmp_path, statement
-):
+async def test_cancelled_transaction_completes_before_releasing_store(tmp_path):
     store = open_store(tmp_path)
     try:
-        started, _ = slow_statement(store, statement)
+        started, _ = slow_statement(store, "COMMIT")
         progress = []
 
         async def publish():
@@ -182,33 +158,27 @@ async def test_cancelled_transaction_completes_before_releasing_store(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_rollback_and_lock_wait_leave_store_usable(tmp_path):
+async def test_cancelled_lock_waiter_keeps_its_place_and_commits(tmp_path):
     store = open_store(tmp_path)
     try:
-        started, _ = slow_statement(store, "ROLLBACK")
+        started, _ = slow_statement(store, "COMMIT")
 
-        async def fail():
+        async def publish(event_id):
             async with store.transaction():
-                store.publish((message(),))
-                raise RuntimeError("rollback")
+                store.publish((message(event_id),))
 
-        async def wait_for_lock():
-            async with store.transaction():
-                store.publish((message("$waited"),))
-
-        failing = asyncio.create_task(fail())
+        holding = asyncio.create_task(publish("$first"))
         await until(started)
-        waiting = asyncio.create_task(wait_for_lock())
+        waiting = asyncio.create_task(publish("$waited"))
         await asyncio.sleep(0)
-        failing.cancel()
         waiting.cancel()
-        with pytest.raises(RuntimeError, match="rollback"):
-            await failing
+        await holding
         with pytest.raises(asyncio.CancelledError):
             await waiting
-        # The waiter kept its place, committed, then saw its cancellation.
-        batch = store.next_batch()
-        assert batch.records[0].source["event_id"] == "$waited"
+        # The waiter committed after the holder, then saw its cancellation.
+        first = store.next_batch()
+        await store.ack(first)
+        assert store.next_batch().records[0].source["event_id"] == "$waited"
         assert not store._lock.locked()
     finally:
         store.close()
@@ -257,30 +227,10 @@ async def test_close_waits_for_inflight_commit_and_reaps_thread(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_close_discards_begun_transaction_before_its_body(tmp_path):
-    store = open_store(tmp_path)
-    started, _ = slow_statement(store, "BEGIN IMMEDIATE")
-    body = []
-
-    async def publish():
-        async with store.transaction():
-            body.append(True)
-
-    task = asyncio.create_task(publish())
-    await until(started)
-    store.close()
-    with pytest.raises(LocalProtocolError, match="closed"):
-        await task
-    assert not body
-    assert not store_threads(store)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
-async def test_blocking_transaction_waits_out_inflight_boundary(tmp_path, statement):
+async def test_blocking_transaction_waits_for_inflight_commit(tmp_path):
     store = open_store(tmp_path)
     try:
-        started, _ = slow_statement(store, statement)
+        started, _ = slow_statement(store, "COMMIT")
 
         async def publish():
             async with store.transaction():
@@ -297,17 +247,62 @@ async def test_blocking_transaction_waits_out_inflight_boundary(tmp_path, statem
         first = store.next_batch()
         await store.ack(first)
         second = store.next_batch()
-        await store.ack(second)
-        order = [batch.records[0].source["event_id"] for batch in (first, second)]
-        # A begun transaction's body has not run, so the blocking work commits first.
-        assert order == (
-            ["$blocking", "$async"]
-            if statement == "BEGIN IMMEDIATE"
-            else ["$async", "$blocking"]
-        )
-        assert store.next_batch() is None
+        assert [batch.records[0].source["event_id"] for batch in (first, second)] == [
+            "$async",
+            "$blocking",
+        ]
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_fails", [False, True])
+async def test_matrix_store_write_during_commit_gets_its_own_transaction(
+    tmp_path, monkeypatch, commit_fails
+):
+    store = open_store(tmp_path)
+    try:
+        async with store.transaction():
+            store.matrix.save_account(OlmAccount())
+        started = threading.Event()
+        commit = store.database.commit
+
+        def slow_commit():
+            if threading.current_thread().name.startswith("nio-durable-store"):
+                started.set()
+                time.sleep(SLOW)
+                if commit_fails:
+                    raise RuntimeError("injected commit failure")
+            return commit()
+
+        monkeypatch.setattr(store.database, "commit", slow_commit)
+
+        async def publish():
+            async with store.transaction():
+                store.publish((message(),))
+
+        task = asyncio.create_task(publish())
+        await until(started)
+        # Key import writes through the MatrixStore outside the store lock.
+        key = InboundGroupSession(
+            OutboundGroupSession().session_key, "ed25519", "curve25519", ROOM
+        )
+        store.matrix.save_inbound_group_session(key)
+        if commit_fails:
+            with pytest.raises(RuntimeError, match="injected"):
+                await task
+        else:
+            await task
+    finally:
+        store.close()
+    reopened = open_store(tmp_path)
+    try:
+        assert reopened.matrix.load_inbound_group_sessions().get(
+            ROOM, "curve25519", key.id
+        )
+        assert reopened.has_batches() is not commit_fails
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio

@@ -76,7 +76,7 @@ For each response:
 2. In one SQLite transaction, run shared nio processing synchronously on the
    event loop and freeze durable observations at their event-time yield points.
    Commit crypto writes, room changes, output batches, pending crypto work, and
-   preparation progress together. BEGIN and COMMIT run on the store's thread; no
+   preparation progress together. COMMIT runs on the store's thread; no
    application callback or network await occurs in this transaction.
 3. Expose the oldest committed batch with a read. Delivery does not claim, lease,
    hash, or rewrite the records. Acknowledgement deletes that batch transactionally.
@@ -317,21 +317,26 @@ to synchronize admission before acknowledging nio; MindRoom already uses FULL
 for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
 consumer databases.
 
-Each durable store owns one thread for transaction boundaries. MindRoom measured
-event-loop stalls of 340 to 1017 ms in BEGIN IMMEDIATE and COMMIT on the loop,
-which also carries live call audio. One asyncio lock now serializes the store:
-BEGIN, COMMIT and ROLLBACK run on the store thread, where SQLite releases the GIL
-while it waits for locks and fsync, and transaction bodies, which mutate live nio
-objects, stay on the loop and never await. Outside a body, status reads (cursor,
-retained input, queued batches, membership intent, retained crypto request and
-progress) return values captured after the last commit, so they never wait for
-an in-flight commit. Another task can see a body's in-memory changes before its
-COMMIT returns, but anything it persists or sends waits for the store lock.
-Opening and synchronous trust and key-share calls use a blocking transaction on
-the calling thread. In a benchmark of four stores sharing one loop, the worst
-loop gap fell from 185 to 5 ms on an idle disk and from 554 to 5 ms under
-competing fsync load. No database queue, serializer dependency, or generic retry
-framework is introduced. Whole-response JSON is decoded once per
+Each durable store owns one thread for COMMIT. MindRoom measured event-loop
+stalls of 340 to 1017 ms in durable transactions on the loop, which also carries
+live call audio. One asyncio lock now serializes the store's transactions.
+COMMIT waits for fsync, so it runs on the store thread, where SQLite releases the
+GIL. BEGIN IMMEDIATE cannot wait for a lock, because the store's lease leaves its
+connection as the only one, and a WAL ROLLBACK does not fsync, so both stay on
+the loop with the body, which mutates live nio objects and never awaits. Outside
+a body, status reads (cursor, retained input, queued batches, membership intent,
+retained crypto request and progress) return values captured after the last
+commit, so they never wait for an in-flight commit. Another task can see a
+body's in-memory changes before its COMMIT returns, but anything it persists or
+sends waits for the store lock. Opening, synchronous trust and key-share calls,
+and nio store writes such as key import wait for an in-flight COMMIT and then
+commit their own transaction on the loop. nio store reads outside the lock, such
+as device trust checks while decrypting, share the connection, so serialized
+SQLite still makes them wait for the rest of an in-flight COMMIT, as every
+commit did before. In a benchmark of four stores sharing one loop, the worst
+loop gap fell from between 81 and 1394 ms to at most 6 ms, on an idle disk and
+under competing fsync load. No database queue, serializer dependency, or
+generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 Response-validation logs contain the response class, exception class and schema
@@ -366,8 +371,8 @@ would defeat this design. Publish no release or merge as part of implementation.
 Recovery stores one continuation on the retained input: prologue, current room
 and forward pagination position, then tail. The decoded sync stays in memory
 between pages; restart decodes the retained body once. Each page commits its
-observations, crypto, room changes, and continuation in one synchronous
-transaction. Output acknowledgement gates the next page. Only the tail advances
+observations, crypto, room changes, and continuation in one transaction.
+Output acknowledgement gates the next page. Only the tail advances
 the global cursor; crypto maintenance retains the original input until completion.
 
 Both limited joined and left rooms use the old sync cursor as `from` and their

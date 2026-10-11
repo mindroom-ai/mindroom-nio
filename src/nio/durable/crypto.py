@@ -58,11 +58,6 @@ class CryptoMaintenance:
         self._messages: list[tuple[str, ToDeviceMessage]] = []
 
     def _read(self, kind: str) -> Any:
-        if kind == "request":
-            # Status checks outside a transaction read the committed request.
-            body = self.store.read_crypto_request()
-            return json.loads(body) if body else None
-        self.store._check_connection()
         row = self.store.database.execute_sql(
             "SELECT body FROM NioDurableCrypto WHERE kind=? AND key='current'",
             (kind,),
@@ -241,9 +236,11 @@ class CryptoMaintenance:
         olm.save_account()
 
     def _pending(self) -> tuple[CryptoRequest, str | None] | None:
-        data = self._read("request")
-        if data is None:
+        # Outside a transaction this is the committed request.
+        body = self.store.read_crypto_request()
+        if body is None:
             return None
+        data = json.loads(body)
         request = CryptoRequest(**data["request"])
         fingerprint = self.encrypted_fingerprint()
         if (
@@ -266,7 +263,8 @@ class CryptoMaintenance:
         return request, message_id
 
     def encrypted_fingerprint(self) -> str | None:
-        data = self._read("request")
+        body = self.store.read_crypto_request()
+        data = json.loads(body) if body else None
         value = data.get("encrypted_fingerprint") if data else None
         if value is not None and (
             not isinstance(value, str)
