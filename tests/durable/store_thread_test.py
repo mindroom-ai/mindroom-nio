@@ -8,10 +8,13 @@ import time
 import pytest
 from aiohttp import web
 
+from nio.event_builders import ToDeviceMessage
 from nio.exceptions import LocalProtocolError
 from nio.rooms import MatrixRoom
 
-from .client_test import ROOM, USER, client, open_session
+from .client_test import ROOM, USER, client, open_session, response
+from .crypto_test import publish_account, queue_dummy
+from .recovery_test import baseline, member
 from .runner_test import homeserver
 from .store_test import message, open_store
 
@@ -24,14 +27,18 @@ def store_threads(store):
     return [thread for thread in store._thread._threads if thread.is_alive()]
 
 
-def slow_statement(store, statement):
-    """Delay one statement inside SQLite, recording which thread ran each one."""
+def slow_statement(store, statement, *, skip=0):
+    """Delay a statement inside SQLite, recording which thread ran each one."""
     started = threading.Event()
     threads = []
 
     def trace(sql):
+        nonlocal skip
         threads.append((sql, threading.current_thread().name))
         if sql == statement:
+            if skip:
+                skip -= 1
+                return
             started.set()
             time.sleep(SLOW)
 
@@ -325,6 +332,87 @@ async def test_member_lookup_does_not_overwrite_invalidation_during_commit(tmp_p
                 await lookup
             assert ROOM not in session._outbound.member_cache
             session._assert_active()
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_group_share_rechecks_membership_after_transaction_starts(tmp_path):
+    import json
+
+    departed = "@old:example.org"
+    sent = []
+
+    async def send(request):
+        sent.append(await request.json())
+        return web.json_response({})
+
+    async with homeserver(None, membership=send) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            await baseline(session)
+            room = nio_client.rooms[ROOM]
+            room.encrypted = True
+            room.members_synced = True
+            async with session._store.transaction():
+                publish_account(nio_client.olm)
+                _, device = queue_dummy(nio_client.olm, user_id=departed)
+                nio_client.olm.outgoing_to_device_messages.clear()
+                nio_client.verify_device(device)
+                session._crypto.capture()
+            body = json.loads(response(token="s2", messages=0))
+            body["rooms"]["join"][ROOM]["state"]["events"] = []
+            body["rooms"]["join"][ROOM]["timeline"]["events"] = [
+                member("$departure", "leave", departed)
+            ]
+            await session._capture_response(json.dumps(body).encode())
+            # Preparation takes the store first and removes the member while
+            # sharing waits to start its transaction.
+            prepared, shared = await asyncio.gather(
+                session._prepare_pending(),
+                nio_client.share_group_session(ROOM),
+                return_exceptions=True,
+            )
+            assert prepared is None
+            assert isinstance(shared, LocalProtocolError)
+            assert "membership changed" in str(shared)
+            assert departed not in room.users
+            assert sent == []
+            session._assert_active()
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_status_check_tolerates_send_whose_commit_is_running(tmp_path):
+    async def send(_):
+        return web.json_response({})
+
+    async with homeserver(None, membership=send) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            async with session._store.transaction():
+                publish_account(nio_client.olm)
+                session._crypto.capture()
+            # The first COMMIT retains the request; the second applies the response.
+            started, _ = slow_statement(session._store, "COMMIT", skip=1)
+            sending = asyncio.create_task(
+                nio_client.to_device(
+                    ToDeviceMessage("org.example.notice", USER, "OTHER", {"value": 1}),
+                    "stable-send",
+                )
+            )
+            await until(started)
+            session._quiescing = True
+            await session.run()
+            assert (await sending).__class__.__name__ == "ToDeviceResponse"
+            assert session._crypto._pending() is None
         finally:
             await session.close()
             await nio_client.close()

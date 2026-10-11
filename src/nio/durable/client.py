@@ -456,7 +456,10 @@ class DurableSync:
                     continue
                 if (
                     self._outbound.maintenance_due
-                    or self._crypto._pending()
+                    # Only the committed request: live crypto state can run
+                    # ahead of another task's commit. Maintenance validates
+                    # the request under the crypto lock.
+                    or self._store.read_crypto_request() is not None
                     or self.client.outgoing_to_device_messages
                 ):
                     await self._maintain_crypto()

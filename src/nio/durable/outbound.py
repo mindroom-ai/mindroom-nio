@@ -303,15 +303,6 @@ class OutboundCrypto:
                 await self.keys_claim(missing)
             async with self.session._crypto_lock:
                 await self._finish_pending()
-                if (
-                    self.client.rooms.get(room_id) is not room
-                    or (
-                        not room.members_synced
-                        and self.member_cache.get(room_id) is not users
-                    )
-                    or (room.members_synced and users != list(room.users))
-                ):
-                    raise LocalProtocolError("room membership changed before sharing")
                 olm = self.crypto.olm
                 shared_with: set[tuple[str, str]] = set()
                 chunks = olm.share_group_session_parallel(
@@ -319,24 +310,47 @@ class OutboundCrypto:
                 )
                 group = None
                 while True:
-                    trust_error = None
+                    error: Exception | None = None
                     async with self.transaction():
-                        try:
-                            chunk = next(chunks, None)
-                        except OlmUnverifiedDeviceError as error:
-                            # nio checks recipients before encrypting any chunk.
-                            # Keep the newly created local group session; no
-                            # ratchet mutation or send needs rolling back.
-                            trust_error = error
+                        # Starting the transaction yields, so sync may have
+                        # changed membership or replaced the group meanwhile.
+                        if group is None and (
+                            self.client.rooms.get(room_id) is not room
+                            or (
+                                not room.members_synced
+                                and self.member_cache.get(room_id) is not users
+                            )
+                            or (room.members_synced and users != list(room.users))
+                        ):
+                            error = LocalProtocolError(
+                                "room membership changed before sharing"
+                            )
+                        elif (
+                            group is not None
+                            and olm.outbound_group_sessions.get(room_id) is not group
+                        ):
+                            error = LocalProtocolError(
+                                "outbound group session changed while sharing"
+                            )
                         else:
-                            group = group or olm.outbound_group_sessions[room_id]
-                            if chunk is not None:
-                                recipients, content = chunk
-                                request = self.crypto.enqueue_to_device(
-                                    "m.room.encrypted", content
-                                )
-                    if trust_error is not None:
-                        raise trust_error
+                            try:
+                                chunk = next(chunks, None)
+                            except OlmUnverifiedDeviceError as trust_error:
+                                # nio checks recipients before encrypting any
+                                # chunk. Keep the newly created local group
+                                # session; no ratchet mutation or send needs
+                                # rolling back.
+                                error = trust_error
+                            else:
+                                group = group or olm.outbound_group_sessions[room_id]
+                                if chunk is not None:
+                                    recipients, content = chunk
+                                    request = self.crypto.enqueue_to_device(
+                                        "m.room.encrypted", content
+                                    )
+                    # An error raised inside the transaction disposes the client.
+                    if error is not None:
+                        raise error
                     if chunk is None:
                         break
                     assert group is not None
