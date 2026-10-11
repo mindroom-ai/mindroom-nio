@@ -73,10 +73,11 @@ For each response:
 
 1. Retain its bounded raw body before making any request acknowledging its
    `next_batch`. Until commit, the previous token remains authoritative.
-2. In a synchronous SQLite transaction, run shared nio processing and freeze
-   durable observations at their event-time yield points. Commit crypto writes,
-   room changes, output batches, pending crypto work, and preparation progress
-   together. No application callback or network await occurs in this transaction.
+2. In one SQLite transaction, run shared nio processing synchronously on the
+   event loop and freeze durable observations at their event-time yield points.
+   Commit crypto writes, room changes, output batches, pending crypto work, and
+   preparation progress together. BEGIN and COMMIT run on the store's thread; no
+   application callback or network await occurs in this transaction.
 3. Expose the oldest committed batch with a read. Delivery does not claim, lease,
    hash, or rewrite the records. Acknowledgement deletes that batch transactionally.
 4. MindRoom atomically inserts a batch receipt and its admission effects, applies
@@ -86,7 +87,9 @@ For each response:
 On any failure after in-memory crypto or room mutation but before confirmed
 commit, discard the live client/store instance. SQLite rollback does not roll
 back Python objects. Reopening restores the last committed state. Cancellation
-obeys the same rule. Never retry preparation on the mutated instance.
+cannot split a begun transaction: it commits or rolls back first, and the task
+sees the cancellation at its next await. Never retry preparation on the mutated
+instance.
 Attached public device-trust changes use this same transaction/disposal boundary:
 verification held only in a rolled-back Python object must never authorize a
 later incoming key request. Ordinary clients retain their existing trust path.
@@ -312,8 +315,23 @@ and storage honor synchronization. Process-kill tests verify crash atomicity;
 they do not simulate hardware failure. Application handoff requires its journal
 to synchronize admission before acknowledging nio; MindRoom already uses FULL
 for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
-consumer databases. No new writer thread, database queue, serializer dependency,
-or generic retry framework is introduced. Whole-response JSON is decoded once per
+consumer databases.
+
+Each durable store owns one thread for transaction boundaries. MindRoom measured
+event-loop stalls of 340 to 1017 ms in BEGIN IMMEDIATE and COMMIT on the loop,
+which also carries live call audio. One asyncio lock now serializes the store:
+BEGIN, COMMIT and ROLLBACK run on the store thread, where SQLite releases the GIL
+while it waits for locks and fsync, and transaction bodies, which mutate live nio
+objects, stay on the loop and never await. Outside a body, status reads (cursor,
+retained input, queued batches, membership intent, retained crypto request and
+progress) return values captured after the last commit, so they never wait for
+an in-flight commit. Another task can see a body's in-memory changes before its
+COMMIT returns, but anything it persists or sends waits for the store lock.
+Opening and synchronous trust and key-share calls use a blocking transaction on
+the calling thread. In a benchmark of four stores sharing one loop, the worst
+loop gap fell from 185 to 5 ms on an idle disk and from 554 to 5 ms under
+competing fsync load. No database queue, serializer dependency, or generic retry
+framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 Response-validation logs contain the response class, exception class and schema

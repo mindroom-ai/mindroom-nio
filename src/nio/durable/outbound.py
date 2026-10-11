@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from ..api import Api
@@ -53,20 +53,34 @@ class OutboundCrypto:
             ):
                 self.client.invalidate_outbound_session(room_id)
 
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def _poison(self) -> None:
+        self.client._dispose()
+        self.store.close()
+        self.session._changed.set()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
         self.session._assert_active()
         try:
-            with self.store.transaction():
+            async with self.store.transaction():
                 yield
         except BaseException:
-            self.client._dispose()
-            self.store.close()
-            self.session._changed.set()
+            self._poison()
+            raise
+
+    @contextmanager
+    def blocking_transaction(self) -> Iterator[None]:
+        """Serve synchronous public crypto calls; blocks the loop until COMMIT."""
+        self.session._assert_active()
+        try:
+            with self.store.blocking_transaction():
+                yield
+        except BaseException:
+            self._poison()
             raise
 
     def change_key_share(self, event: RoomKeyRequest, cancel: bool = False) -> bool:
-        with self.transaction():
+        with self.blocking_transaction():
             changed = self.crypto.change_key_share(event, cancel=cancel)
         if changed:
             self.maintenance_due = True
@@ -80,7 +94,7 @@ class OutboundCrypto:
             request.method, request.path, request.body
         )
         decoded = json.loads(body)
-        with self.transaction():
+        async with self.transaction():
             response, observations = self.crypto.apply(request, decoded)
             if isinstance(response, ErrorResponse):
                 raise LocalProtocolError("invalid durable crypto response")
@@ -104,7 +118,7 @@ class OutboundCrypto:
             self.maintenance_due = False
             completed: set[str] = set()
             while True:
-                with self.transaction():
+                async with self.transaction():
                     request = self.crypto.next_request(completed=completed)
                 if request is None:
                     return
@@ -127,7 +141,7 @@ class OutboundCrypto:
                 assert isinstance(response, ToDeviceResponse)
                 return response
             await self._finish_pending()
-            with self.transaction():
+            async with self.transaction():
                 request = self.crypto.enqueue_message(message, request_id=tx_id)
             response = await self._send(request)
             assert isinstance(response, ToDeviceResponse)
@@ -158,7 +172,7 @@ class OutboundCrypto:
                 raise LocalProtocolError(
                     "encrypted to-device key claim supplied no valid session"
                 )
-            with self.transaction():
+            async with self.transaction():
                 device = operation.resolve(self.crypto.olm, query)
                 message = operation.encrypt(self.crypto.olm, device)
                 request = self.crypto.enqueue_message(
@@ -177,7 +191,7 @@ class OutboundCrypto:
                 return response
             if not self.client.should_upload_keys:
                 raise LocalProtocolError("No key upload needed.")
-            with self.transaction():
+            async with self.transaction():
                 request = self.crypto.enqueue_upload()
             response = await self._send(request)
             assert isinstance(response, KeysUploadResponse)
@@ -193,7 +207,7 @@ class OutboundCrypto:
             return response
         if not (self.crypto.olm.users_for_key_query if user_set is None else user_set):
             raise LocalProtocolError("No key query required.")
-        with self.transaction():
+        async with self.transaction():
             request = self.crypto.enqueue_query(user_set)
         response = await self._send(request)
         assert isinstance(response, KeysQueryResponse)
@@ -207,7 +221,7 @@ class OutboundCrypto:
         self, users: Mapping[str, Iterable[str]]
     ) -> KeysClaimResponse:
         await self._finish_pending()
-        with self.transaction():
+        async with self.transaction():
             request = self.crypto.enqueue_claim(dict(users))
         response = await self._send(request)
         assert isinstance(response, KeysClaimResponse)
@@ -230,7 +244,7 @@ class OutboundCrypto:
             if room_id not in self.member_cache:
                 raise LocalProtocolError("room membership changed during lookup")
             users = [member.user_id for member in response.members]
-            with self.transaction():
+            async with self.transaction():
                 if previous is None or set(previous) != set(users):
                     self.client.invalidate_outbound_session(room_id)
                 if room_id in self.client.encrypted_rooms or (
@@ -241,6 +255,9 @@ class OutboundCrypto:
                         set(users) - self.crypto.olm.tracked_users
                     )
                     self.crypto.capture()
+            # Sync can also invalidate the room while the commit runs.
+            if room_id not in self.member_cache:
+                raise LocalProtocolError("room membership changed during lookup")
             self.member_cache[room_id] = users
             return response
         finally:
@@ -303,7 +320,7 @@ class OutboundCrypto:
                 group = None
                 while True:
                     trust_error = None
-                    with self.transaction():
+                    async with self.transaction():
                         try:
                             chunk = next(chunks, None)
                         except OlmUnverifiedDeviceError as error:

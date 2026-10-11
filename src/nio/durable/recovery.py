@@ -203,7 +203,8 @@ class Recovery:
         if response is not None:
             self.response = response
         if self.response is None:
-            pending = session._store.input
+            async with session._store.locked():
+                pending = session._store.input
             assert pending is not None
             decoded, _ = await asyncio.to_thread(session._decode_response, pending[0])
             session._assert_active()
@@ -211,7 +212,7 @@ class Recovery:
         if state.get("phase") == "recover":
             return
         try:
-            with session._store.transaction():
+            async with session._store.transaction():
                 if "phase" not in state:
                     state.update(
                         phase="tail",
@@ -239,7 +240,6 @@ class Recovery:
                         processor.save()
                         session._crypto.capture()
                         session._store.save_continuation(state)
-                        session._changed.set()
                         return
                     if session.cursor or session._sliding:
                         for room_id in state["unknown_rooms"]:
@@ -248,7 +248,9 @@ class Recovery:
         except BaseException:
             self._poison()
             raise
-        session._changed.set()
+        finally:
+            # Waiters read committed status, so wake them only after COMMIT.
+            session._changed.set()
 
     def _next_room(self, state: dict[str, Any], index: int) -> None:
         candidates = self._candidates()
@@ -464,12 +466,12 @@ class Recovery:
         page = None
         if room_id in state["unknown_rooms"]:
             # Already reported at capture; current state cannot fill this interval.
-            self._commit_page(state, room_id, section, [], None, done=True)
+            await self._commit_page(state, room_id, section, [], None, done=True)
             return
         if not isinstance(target, str) or not target or len(target) > 8192:
             error = "missing or oversized history boundary"
         elif state["from"] == target:
-            self._commit_page(state, room_id, section, [], None, done=True)
+            await self._commit_page(state, room_id, section, [], None, done=True)
             return
         elif state["pages"] >= min(session.config.max_recovery_pages, 1000):
             error = "history page limit exhausted"
@@ -518,14 +520,16 @@ class Recovery:
             except ResponseTooLarge:
                 if state["limit"] > 1:
                     state["limit"] = max(1, state["limit"] // 2)
-                    with session._store.transaction():
+                    async with session._store.transaction():
                         session._store.save_continuation(state)
                     return
                 error = "oversized history event"
             except (LocalProtocolError, ValueError, TypeError, KeyError):
                 error = "history unavailable or malformed"
         if error is not None:
-            self._commit_page(state, room_id, section, [], None, done=True, loss=error)
+            await self._commit_page(
+                state, room_id, section, [], None, done=True, loss=error
+            )
             return
         assert isinstance(page, RoomMessagesResponse)
         tail_ids = {event.source.get("event_id") for event in info.timeline.events}
@@ -564,7 +568,7 @@ class Recovery:
             state["applied_ids"][room_id] = previous_ids
             error = "history continuation bound exhausted"
             events = []
-        self._commit_page(
+        await self._commit_page(
             state,
             room_id,
             section,
@@ -574,7 +578,7 @@ class Recovery:
             loss=error,
         )
 
-    def _commit_page(
+    async def _commit_page(
         self,
         state: dict[str, Any],
         room_id: str,
@@ -587,7 +591,7 @@ class Recovery:
     ) -> None:
         session = self.session
         try:
-            with session._store.transaction():
+            async with session._store.transaction():
                 processor = Processor(
                     session,
                     state["history_rooms"],

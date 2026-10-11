@@ -631,7 +631,7 @@ class Client:
         if session is None:
             changed = change(device)
         else:
-            with session._outbound.transaction():
+            with session._outbound.blocking_transaction():
                 changed = change(device)
         if changed:
             self._invalidate_outbound_sessions(device)

@@ -206,13 +206,13 @@ class DurableSync:
         newly_joined_room: str | None = None,
     ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
         # A local join/leave must not overtake input being decoded for capture.
-        # Only parsing runs in the worker; projection and SQLite stay on the loop.
+        # Parsing runs in a worker; SQLite commits run on the store thread.
         async with self._local_lock:
             self._assert_active()
             generation = self._sliding.generation if self._sliding is not None else 0
             response = await asyncio.to_thread(self._decode_response, body)
             self._assert_active()
-            with self._store.transaction():
+            async with self._store.transaction():
                 self._store.capture(body)
                 self._store.save_continuation(
                     {
@@ -375,7 +375,8 @@ class DurableSync:
 
     async def next_batch(self) -> SyncBatch | None:
         self._assert_active()
-        return self._store.next_batch()
+        async with self._store.locked():
+            return self._store.next_batch()
 
     @property
     def cursor(self) -> str | None:
@@ -387,11 +388,7 @@ class DurableSync:
     def progress_generation(self) -> int:
         """Monotonic progress from committed publication and acknowledgement."""
         self._assert_active()
-        return self._store.database.execute_sql(
-            "SELECT acked_sequence + "
-            "MAX(acked_sequence, COALESCE((SELECT MAX(sequence) FROM NioDurableBatch),0)) "
-            "FROM NioDurableMeta WHERE id=1"
-        ).fetchone()[0]
+        return self._store.progress_generation
 
     async def dispatch(
         self, record: SyncRecord, *, event: object | None = None
@@ -406,13 +403,12 @@ class DurableSync:
                 record.room_id
             ) or self.client.invited_rooms.get(record.room_id)
             if room is None:
-                members = {
-                    user_id: json.loads(member)
-                    for user_id, member in self._store.database.execute_sql(
+                async with self._store.locked():
+                    rows = self._store.database.execute_sql(
                         "SELECT user_id,member FROM NioDurableMember WHERE room_id=?",
                         (record.room_id,),
-                    )
-                }
+                    ).fetchall()
+                members = {user_id: json.loads(member) for user_id, member in rows}
                 room = restore_room(
                     record.room_id, self._metadata[record.room_id], members
                 )
@@ -452,7 +448,7 @@ class DurableSync:
                     ):
                         continue
                     await self._maintain_crypto()
-                    with self._store.transaction():
+                    async with self._store.transaction():
                         self._store.finish_input()
                         self._recovery.response = None
                         self._store.publish((), completes_sync=True)
@@ -591,11 +587,9 @@ class DurableSync:
         self._assert_active()
         while intent := self._read_local_intent():
             if "sequence" in intent:
-                acked = self._store.database.execute_sql(
-                    "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
-                ).fetchone()[0]
+                acked = self._store.acked_sequence
                 if intent["sequence"] <= acked and intent.get("observed"):
-                    with self._store.transaction():
+                    async with self._store.transaction():
                         self._store.delete_local_intent()
                     return
             self._changed.clear()
@@ -636,13 +630,15 @@ class DurableSync:
                 return False
             if self._read_local_intent() is not None:
                 raise LocalProtocolError("another local membership command is pending")
-            with self._store.transaction():
-                self._store.save_local_intent(intent, create=True)
+            # Take the source before the commit yields, so the runner discards
+            # a poll that completed before this command.
             self._source_ready.clear()
             if self._poll is not None:
                 self._poll.cancel()
                 self._poll = None
             try:
+                async with self._store.transaction():
+                    self._store.save_local_intent(intent, create=True)
                 while self._store.has_input():
                     self._changed.clear()
                     await self._changed.wait()
@@ -654,7 +650,7 @@ class DurableSync:
 
     async def _apply_local_intent(self, intent: dict[str, Any]) -> bool:
         if not self._local_position_matches(intent):
-            with self._store.transaction():
+            async with self._store.transaction():
                 self._store.delete_local_intent()
             self._changed.set()
             return False
@@ -671,7 +667,7 @@ class DurableSync:
                 and metadata.get("nonjoined_cursor") == self.cursor
                 else None
             )
-            with self._store.transaction():
+            async with self._store.transaction():
                 self._store.save_local_intent(intent)
         method, path = (
             Api.join("", room_id) if target == "join" else Api.room_leave("", room_id)
@@ -679,13 +675,13 @@ class DurableSync:
         try:
             await self._transport.request(method, path, "{}")
         except HttpError:
-            with self._store.transaction():
+            async with self._store.transaction():
                 self._store.delete_local_intent()
             self._changed.set()
             return False
         self._assert_active()
         try:
-            with self._store.transaction():
+            async with self._store.transaction():
                 previous, epoch = (
                     intent["previous_membership"],
                     intent["previous_epoch"],
@@ -749,7 +745,7 @@ class DurableSync:
 
     async def ack(self, batch: SyncBatch) -> None:
         self._assert_active()
-        self._store.ack(batch)
+        await self._store.ack(batch)
         self._changed.set()
 
     async def wait_for_work(self) -> None:
@@ -812,7 +808,7 @@ def open_durable_sync(
         source_store_class=source_store_class,
     )
     try:
-        with store.transaction():
+        with store.blocking_transaction():
             client.store = store.matrix
             client.store_path = str(store_path)
             if client.config.encryption_enabled:

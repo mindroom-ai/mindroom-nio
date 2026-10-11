@@ -19,7 +19,7 @@ async def test_to_device_source_keeps_filter_after_cursor_and_restart(tmp_path):
     config = DurableSyncConfig(to_device_only=True)
     session = open_session(tmp_path, config=config)
     await session._accept_response(b'{"next_batch":"s1"}')
-    with session._store.transaction():
+    async with session._store.transaction():
         session._store.finish_input()
     await session.close()
     await session.client.close()

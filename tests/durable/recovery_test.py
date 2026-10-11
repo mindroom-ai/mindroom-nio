@@ -56,7 +56,7 @@ async def baseline(session):
     await session._accept_response(json.dumps(body).encode())
     while batch := await session.next_batch():
         await session.ack(batch)
-    with session._store.transaction():
+    async with session._store.transaction():
         session._store.finish_input()
 
 
@@ -468,7 +468,7 @@ async def test_unknown_adopted_cursor_requests_full_state_and_only_future_tail_i
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.set_cursor("adopted")
         runner = asyncio.create_task(session.run())
         try:
@@ -509,7 +509,7 @@ async def test_empty_account_stops_requesting_full_state_after_complete_sync(
     )
     if startup == "restored":
         previous = open_session(tmp_path, config=config)
-        with previous._store.transaction():
+        async with previous._store.transaction():
             previous._store.set_cursor("saved")
         await previous.close()
 
@@ -619,7 +619,7 @@ async def test_committed_prologue_key_decrypts_history_after_restart(
     await session._accept_response(json.dumps(initial).encode(), full_state=True)
     while batch := await session.next_batch():
         await session.ack(batch)
-    with session._store.transaction():
+    async with session._store.transaction():
         session._store.finish_input()
     body = json.loads(limited())
     body["to_device"] = encrypted_sync["to_device"]
@@ -786,14 +786,14 @@ async def test_local_join_empty_projection_never_authorizes_initial_tail(
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.set_cursor("before-join")
         try:
             if complete_empty_sync:
                 await session._accept_response(
                     b'{"next_batch":"empty"}', full_state=True
                 )
-                with session._store.transaction():
+                async with session._store.transaction():
                     session._store.finish_input()
             assert await session.change_membership(
                 operation_id=OPERATION,
@@ -1185,7 +1185,7 @@ async def test_known_nonjoined_room_recovers_without_account_full_state(
         await session._accept_response(json.dumps(initial).encode(), full_state=True)
         while batch := await session.next_batch():
             await session.ack(batch)
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.finish_input()
         assert await session.change_membership(
             operation_id=OPERATION,
@@ -1302,7 +1302,7 @@ async def test_local_join_keeps_full_state_without_exclusive_cursor_proof(
         config = DurableSyncConfig(sync_filter={"room": {"state": {"types": []}}})
         session = open_session(tmp_path, nio_client, config)
         if reason == "adopted":
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.set_cursor("adopted")
         else:
             initial = json.loads(response(messages=0))
@@ -1315,7 +1315,7 @@ async def test_local_join_keeps_full_state_without_exclusive_cursor_proof(
             )
             while batch := await session.next_batch():
                 await session.ack(batch)
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.finish_input()
             if reason == "other_loss":
                 session._metadata[ROOM]["baseline"] = False
@@ -1330,7 +1330,7 @@ async def test_local_join_keeps_full_state_without_exclusive_cursor_proof(
         if reason == "cursor_changed":
             # A response which omitted the joined room consumes the proof's cursor.
             await session._accept_response(b'{"next_batch":"later"}')
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.finish_input()
         runner = asyncio.create_task(session.run())
         try:
@@ -1386,7 +1386,7 @@ async def test_join_cursor_proof_precedes_uncertain_http_and_survives_retry(tmp_
         await session._accept_response(json.dumps(invitation).encode())
         while batch := await session.next_batch():
             await session.ack(batch)
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.finish_input()
         operation = asyncio.create_task(
             session.change_membership(
@@ -1490,11 +1490,11 @@ async def test_nonjoined_join_proof_uses_observed_cursor(
         await session._accept_response(json.dumps(initial).encode(), full_state=True)
         while batch := await session.next_batch():
             await session.ack(batch)
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.finish_input()
         if advance_cursor:
             await session._accept_response(b'{"next_batch":"filtered"}')
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.finish_input()
         if restart:
             await session.close()

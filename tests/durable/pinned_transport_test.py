@@ -101,7 +101,7 @@ async def test_explicit_query_does_not_return_unrelated_pending_query(tmp_path):
 
     async with homeserver(None, query=query) as (url, _):
         async with transport_client(tmp_path, url, True) as (nio_client, owner):
-            with owner._store.transaction():
+            async with owner._store.transaction():
                 nio_client.olm.users_for_key_query.add(USER)
                 owner._crypto.enqueue_query()
             response = await nio_client.keys_query(user_set={PEER})
@@ -219,7 +219,7 @@ async def test_encrypted_send_never_uses_stale_or_unauthorized_cached_identity(
     async with homeserver(None, query=query, membership=send) as (url, _):
         async with transport_client(tmp_path, url, durable) as (nio_client, owner):
             if owner is not None:
-                with owner._store.transaction():
+                async with owner._store.transaction():
                     nio_client._handle_olm_response(
                         KeysQueryResponse.from_dict(query_body(keys))
                     )
@@ -320,7 +320,7 @@ async def test_no_argument_query_can_resume_pending_request_without_dirty_users(
 
     async with homeserver(None, query=query) as (url, _):
         async with transport_client(tmp_path, url, True) as (nio_client, owner):
-            with owner._store.transaction():
+            async with owner._store.transaction():
                 owner._crypto.enqueue_query({PEER})
             assert not nio_client.olm.users_for_key_query
             response = await nio_client.keys_query()
@@ -334,7 +334,7 @@ def saved_session(owner):
 
 
 async def seed_session(nio_client, owner, keys):
-    with owner._store.transaction():
+    async with owner._store.transaction():
         nio_client._handle_olm_response(KeysQueryResponse.from_dict(query_body(keys)))
         device = nio_client.olm.device_store[PEER]["OTHER"]
         key = next(iter(keys["one_time_keys"].values()))["key"]
@@ -572,7 +572,7 @@ async def test_process_kill_preserves_atomic_encryption_and_exact_replay(
 @pytest.mark.asyncio
 async def test_corrupt_encrypted_fingerprint_fails_durable_restore(tmp_path):
     async with transport_client(tmp_path, "https://example.org", True) as (_, owner):
-        with owner._store.transaction():
+        async with owner._store.transaction():
             owner._crypto.enqueue_message(notice(), encrypted_fingerprint="invalid")
     with pytest.raises(LocalProtocolError, match="fingerprint"):
         async with transport_client(tmp_path, "https://example.org", True):

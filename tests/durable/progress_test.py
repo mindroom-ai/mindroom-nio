@@ -31,7 +31,7 @@ async def test_progress_advances_while_prepared_backlog_drains(tmp_path):
             acknowledged += 1
         assert acknowledged > 1
         assert session.progress_generation == previous
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.publish((message("$later"),))
         assert session.progress_generation > previous
     finally:
@@ -45,7 +45,7 @@ async def test_progress_survives_reopening_after_acknowledgement(
 ):
     session = open_session(tmp_path)
     try:
-        with session._store.transaction():
+        async with session._store.transaction():
             batches = [session._store.publish((message(),)) for _ in range(2)]
         for batch in batches[:acknowledged]:
             await session.ack(batch)
@@ -72,7 +72,7 @@ async def test_rejected_or_rolled_back_work_does_not_advance_progress(
 ):
     session = open_session(tmp_path)
     try:
-        with session._store.transaction():
+        async with session._store.transaction():
             first = session._store.publish((message(),))
             second = session._store.publish((message("$two"),))
         progress = session.progress_generation
@@ -80,7 +80,7 @@ async def test_rejected_or_rolled_back_work_does_not_advance_progress(
             await session.ack(second)
         assert session.progress_generation == progress
         with pytest.raises(RuntimeError, match="rollback"):
-            with session._store.transaction():
+            async with session._store.transaction():
                 if operation == "publish":
                     session._store.publish((message("$three"),))
                 else:

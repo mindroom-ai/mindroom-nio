@@ -58,6 +58,11 @@ class CryptoMaintenance:
         self._messages: list[tuple[str, ToDeviceMessage]] = []
 
     def _read(self, kind: str) -> Any:
+        if kind == "request":
+            # Status checks outside a transaction read the committed request.
+            body = self.store.read_crypto_request()
+            return json.loads(body) if body else None
+        self.store._check_connection()
         row = self.store.database.execute_sql(
             "SELECT body FROM NioDurableCrypto WHERE kind=? AND key='current'",
             (kind,),

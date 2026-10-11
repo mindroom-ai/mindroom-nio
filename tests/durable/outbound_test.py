@@ -34,7 +34,7 @@ async def test_public_key_share_decision_survives_owned_runner_restart(
     tmp_path, cancel
 ):
     session = open_session(tmp_path)
-    with session._store.transaction():
+    async with session._store.transaction():
         publish_account(session.client.olm)
         peer, device = queue_dummy(session.client.olm)
         session.client.olm.outgoing_to_device_messages.clear()
@@ -167,7 +167,7 @@ async def test_unverified_group_share_leaves_session_usable(tmp_path):
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             _, device = queue_dummy(nio_client.olm)
             nio_client.olm.outgoing_to_device_messages.clear()
@@ -204,7 +204,7 @@ async def test_failed_verification_commit_prevents_later_key_forward(
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             _, device = queue_dummy(nio_client.olm)
             nio_client.olm.outgoing_to_device_messages.clear()
@@ -257,7 +257,7 @@ async def test_failed_public_trust_commit_discards_client_and_restores_from_sqli
 ):
     nio_client = client()
     session = open_session(tmp_path, nio_client)
-    with session._store.transaction():
+    async with session._store.transaction():
         publish_account(nio_client.olm)
         _, device = queue_dummy(nio_client.olm)
     if initial_change is not None:
@@ -377,7 +377,7 @@ async def test_group_ciphertext_survives_cancel_and_restart(tmp_path):
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             peer, device = queue_dummy(nio_client.olm)
             nio_client.olm.outgoing_to_device_messages.clear()
@@ -430,7 +430,7 @@ async def test_invalidation_during_group_http_prevents_completion(tmp_path):
     async with homeserver(None, membership=send) as (url, _):
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             _, device = queue_dummy(nio_client.olm)
             nio_client.olm.outgoing_to_device_messages.clear()
@@ -491,7 +491,7 @@ async def test_public_key_calls_retain_requests_before_http(tmp_path):
             nio_client.olm.users_for_key_query.add(USER)
             await nio_client.keys_query()
             await nio_client.keys_claim({USER: ["OTHER"]})
-            with session._store.transaction():
+            async with session._store.transaction():
                 _, device = queue_dummy(nio_client.olm)
                 nio_client.olm.outgoing_to_device_messages.clear()
                 session._crypto.capture()
@@ -555,7 +555,7 @@ async def test_approval_wakes_idle_long_poll_to_send_key(
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             if existing_session:
                 peer, device = queue_dummy(nio_client.olm)
@@ -621,7 +621,7 @@ async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revo
         nio_client.homeserver = url
         nio_client.config = replace(nio_client.config, replace_rotated_device_keys=True)
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             _, device = queue_dummy(nio_client.olm, user_id=recipient)
             nio_client.olm.outgoing_to_device_messages.clear()
@@ -727,7 +727,7 @@ async def test_sync_device_change_queries_cached_recipient_after_successful_quer
         nio_client.homeserver = url
         nio_client.config = replace(nio_client.config, replace_rotated_device_keys=True)
         session = open_session(tmp_path, nio_client)
-        with session._store.transaction():
+        async with session._store.transaction():
             publish_account(nio_client.olm)
             peer, device = queue_dummy(nio_client.olm, user_id=recipient)
             nio_client.olm.outgoing_to_device_messages.clear()

@@ -41,7 +41,8 @@ async def test_decoded_input_is_not_loaded_again_for_prepare_or_progress(
         await session.close()
 
 
-def test_input_status_preserves_validation_and_rollback_without_loading_body(
+@pytest.mark.asyncio
+async def test_input_status_preserves_validation_and_rollback_without_loading_body(
     tmp_path, monkeypatch
 ):
     store = open_store(tmp_path)
@@ -49,20 +50,21 @@ def test_input_status_preserves_validation_and_rollback_without_loading_body(
         statements = observe_sql(monkeypatch, store)
         assert not store.has_input()
         assert store.continuation is None
-        with store.transaction():
+        async with store.transaction():
             store.capture(b"x" * 1024 * 1024)
             store.save_continuation({"phase": "prepared"})
         assert store.has_input()
         assert store.continuation == {"phase": "prepared"}
         with pytest.raises(RuntimeError, match="rollback"):
-            with store.transaction():
+            async with store.transaction():
                 store.finish_input()
                 assert not store.has_input()
                 raise RuntimeError("rollback")
         assert store.continuation == {"phase": "prepared"}
-        store.database.execute_sql(
-            "UPDATE NioDurableInput SET continuation='[]' WHERE id=1"
-        )
+        async with store.transaction():
+            store.database.execute_sql(
+                "UPDATE NioDurableInput SET continuation='[]' WHERE id=1"
+            )
         with pytest.raises(LocalProtocolError, match="continuation"):
             _ = store.continuation
         assert not any("SELECT body,continuation" in sql for sql in statements)
@@ -88,18 +90,24 @@ async def test_room_inventory_reads_membership_intent_once_per_transaction(
         await session._accept_response(json.dumps(body).encode())
         assert set(session.client.rooms) == set(room_ids)
         assert session.cursor == "s1"
+        # Committed-status refreshes after each commit are not intent reads.
         reads = [
-            sql for sql in statements if "SELECT body" in sql and "'membership'" in sql
+            sql
+            for sql in statements
+            if sql.startswith("SELECT body") and "'membership'" in sql
         ]
         assert len(reads) == 1
     finally:
         await session.close()
 
 
-def test_membership_intent_cache_tracks_writes_deletion_and_nested_rollback(tmp_path):
+@pytest.mark.asyncio
+async def test_membership_intent_cache_tracks_writes_deletion_and_nested_rollback(
+    tmp_path,
+):
     store = open_store(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             assert store.read_local_intent() is None
             store.save_local_intent({"room_id": ROOM, "observed": False}, create=True)
             intent = store.read_local_intent()
@@ -108,18 +116,18 @@ def test_membership_intent_cache_tracks_writes_deletion_and_nested_rollback(tmp_
             store.save_local_intent(intent)
             assert store.read_local_intent()["observed"] is True
             with pytest.raises(RuntimeError, match="rollback"):
-                with store.transaction():
+                async with store.transaction():
                     store.delete_local_intent()
                     assert store.read_local_intent() is None
                     raise RuntimeError("rollback")
             assert store.read_local_intent()["observed"] is True
         with pytest.raises(RuntimeError, match="rollback"):
-            with store.transaction():
+            async with store.transaction():
                 store.delete_local_intent()
                 assert store.read_local_intent() is None
                 raise RuntimeError("rollback")
         assert store.read_local_intent()["observed"] is True
-        with store.transaction():
+        async with store.transaction():
             store.delete_local_intent()
             assert store.read_local_intent() is None
         assert store.read_local_intent() is None
@@ -139,14 +147,14 @@ async def test_unchanged_room_projection_skips_write_but_persists_mutated_metada
         session = open_session(tmp_path)
     statements = observe_sql(monkeypatch, session._store)
     try:
-        with session._store.transaction():
+        async with session._store.transaction():
             session._save_rooms({ROOM: session.client.rooms[ROOM]}, set())
         assert not any(
             sql.startswith("INSERT INTO NioDurableRoom") for sql in statements
         )
         # Membership code mutates the live dictionary before persistence.
         session._metadata[ROOM]["baseline"] = False
-        with session._store.transaction():
+        async with session._store.transaction():
             session._save_rooms({ROOM: session.client.rooms[ROOM]}, set())
         stored = session._store.database.execute_sql(
             "SELECT metadata FROM NioDurableRoom WHERE room_id=?", (ROOM,)
@@ -169,7 +177,7 @@ async def test_member_delta_is_saved_when_room_metadata_is_unchanged(
     try:
         room = session.client.rooms[ROOM]
         room.users[USER].display_name = "New name"
-        with session._store.transaction():
+        async with session._store.transaction():
             session._save_rooms({ROOM: room}, {(ROOM, USER)})
         assert not any(
             sql.startswith("INSERT INTO NioDurableRoom") for sql in statements
@@ -195,21 +203,21 @@ async def test_rolled_back_room_projection_is_not_reused(tmp_path, nested):
         session._save_rooms({ROOM: room}, set())
 
     try:
-        with session._store.transaction():
+        async with session._store.transaction():
             save_topic("committed")
         if nested:
-            with session._store.transaction():
+            async with session._store.transaction():
                 save_topic("outer")
                 with pytest.raises(RuntimeError, match="rollback"):
-                    with session._store.transaction():
+                    async with session._store.transaction():
                         save_topic("retry")
                         raise RuntimeError("rollback")
         else:
             with pytest.raises(RuntimeError, match="rollback"):
-                with session._store.transaction():
+                async with session._store.transaction():
                     save_topic("retry")
                     raise RuntimeError("rollback")
-        with session._store.transaction():
+        async with session._store.transaction():
             save_topic("retry")
     finally:
         await session.close()

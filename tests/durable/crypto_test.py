@@ -49,9 +49,10 @@ def queue_dummy(olm, *, user_id=USER):
     return peer, device
 
 
-def test_upload_retains_private_keys_and_publication_across_restart(tmp_path):
+@pytest.mark.asyncio
+async def test_upload_retains_private_keys_and_publication_across_restart(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         request = maintenance.next_request()
     assert request.kind == "upload"
     assert "test-token" not in request.path
@@ -71,7 +72,7 @@ def test_upload_retains_private_keys_and_publication_across_restart(tmp_path):
             peer.identity_keys["curve25519"], outbound.encrypt(b"private key survived")
         )
         assert clear == b"private key survived"
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == request
             response, observations = maintenance.apply(
                 request,
@@ -85,15 +86,18 @@ def test_upload_retains_private_keys_and_publication_across_restart(tmp_path):
     try:
         assert olm.account.shared
         assert olm.account.one_time_keys["curve25519"] == {}
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() is None
     finally:
         store.close()
 
 
-def test_encrypted_output_and_transaction_id_survive_capture_and_restart(tmp_path):
+@pytest.mark.asyncio
+async def test_encrypted_output_and_transaction_id_survive_capture_and_restart(
+    tmp_path,
+):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         queue_dummy(olm)
         maintenance.capture()
@@ -105,7 +109,7 @@ def test_encrypted_output_and_transaction_id_survive_capture_and_restart(tmp_pat
     store.close()
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == request
             maintenance.apply(request, {})
             assert maintenance.next_request() is None
@@ -114,9 +118,10 @@ def test_encrypted_output_and_transaction_id_survive_capture_and_restart(tmp_pat
         store.close()
 
 
-def test_query_response_preserves_newer_invalidation_after_restart(tmp_path):
+@pytest.mark.asyncio
+async def test_query_response_preserves_newer_invalidation_after_restart(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         olm.users_for_key_query.add(USER)
         request = maintenance.next_request()
@@ -125,7 +130,7 @@ def test_query_response_preserves_newer_invalidation_after_restart(tmp_path):
     store.close()
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             maintenance.apply(request, {"device_keys": {USER: {}}})
             following = maintenance.next_request()
         assert following.kind == "query"
@@ -135,11 +140,12 @@ def test_query_response_preserves_newer_invalidation_after_restart(tmp_path):
         store.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("body", [{}, {"errcode": "M_FORBIDDEN", "error": "denied"}])
-def test_failed_upload_response_retains_pending_request(tmp_path, body):
+async def test_failed_upload_response_retains_pending_request(tmp_path, body):
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             request = maintenance.next_request()
             response, observations = maintenance.apply(request, body)
             assert isinstance(response, ErrorResponse)
@@ -150,12 +156,13 @@ def test_failed_upload_response_retains_pending_request(tmp_path, body):
         store.close()
 
 
-def test_rollback_requires_discarding_live_crypto_and_restores_pending(tmp_path):
+@pytest.mark.asyncio
+async def test_rollback_requires_discarding_live_crypto_and_restores_pending(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         request = maintenance.next_request()
     with pytest.raises(RuntimeError, match="rollback"):
-        with store.transaction():
+        async with store.transaction():
             maintenance.apply(
                 request, {"one_time_key_counts": {"signed_curve25519": 100}}
             )
@@ -164,7 +171,7 @@ def test_rollback_requires_discarding_live_crypto_and_restores_pending(tmp_path)
     store, olm, maintenance = open_crypto(tmp_path)
     try:
         assert not olm.account.shared
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == request
     finally:
         store.close()
@@ -179,22 +186,23 @@ def test_crypto_mutation_requires_outer_transaction(tmp_path):
         store.close()
 
 
-def test_idle_crypto_poll_and_pending_retry_do_not_write_sqlite(tmp_path):
+@pytest.mark.asyncio
+async def test_idle_crypto_poll_and_pending_retry_do_not_write_sqlite(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             publish_account(olm)
             maintenance.capture()
         connection = store.database.connection()
         before = connection.total_changes
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() is None
         assert connection.total_changes == before
-        with store.transaction():
+        async with store.transaction():
             olm.users_for_key_query.add(USER)
             pending = maintenance.next_request()
         before = connection.total_changes
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == pending
         assert connection.total_changes == before
     finally:
@@ -220,9 +228,12 @@ def missing_event(olm, device):
     )
 
 
-def test_dummy_ack_retains_rerequest_and_its_subtype_effect_after_restart(tmp_path):
+@pytest.mark.asyncio
+async def test_dummy_ack_retains_rerequest_and_its_subtype_effect_after_restart(
+    tmp_path,
+):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         peer, device = queue_dummy(olm)
         event = missing_event(olm, device)
@@ -231,7 +242,7 @@ def test_dummy_ack_retains_rerequest_and_its_subtype_effect_after_restart(tmp_pa
         dummy = maintenance.next_request()
     store.close()
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         maintenance.apply(dummy, {})
         following = maintenance.next_request()
     assert (
@@ -242,7 +253,7 @@ def test_dummy_ack_retains_rerequest_and_its_subtype_effect_after_restart(tmp_pa
     store, olm, maintenance = open_crypto(tmp_path)
     try:
         assert isinstance(olm.outgoing_to_device_messages[0], RoomKeyRequestMessage)
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == following
             maintenance.apply(following, {})
         assert (
@@ -283,12 +294,13 @@ def room_key_request(olm):
     return request, group
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
-def test_interactive_share_survives_restart_and_encrypts_for_verified_device(
+async def test_interactive_share_survives_restart_and_encrypts_for_verified_device(
     tmp_path, cancel
 ):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         peer, device = queue_dummy(olm)
         olm.outgoing_to_device_messages.clear()
@@ -300,7 +312,7 @@ def test_interactive_share_survives_restart_and_encrypts_for_verified_device(
         maintenance.capture()
     store.close()
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         assert olm.get_active_key_requests(USER, "OTHER") == [request]
         assert not maintenance.change_key_share(request)  # Still untrusted.
         olm.verify_device(olm.device_store[USER]["OTHER"])
@@ -328,14 +340,15 @@ def test_interactive_share_survives_restart_and_encrypts_for_verified_device(
     store, olm, maintenance = open_crypto(tmp_path)
     try:
         assert olm.get_active_key_requests(USER, "OTHER") == []
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == outgoing
     finally:
         store.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("trusted", [True, False])
-def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
+async def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
     store, olm, maintenance = open_crypto(tmp_path)
     peer = OlmAccount()
     peer.generate_one_time_keys(1)
@@ -346,7 +359,7 @@ def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
     signed_key["signatures"] = {
         USER: {"ed25519:OTHER": peer.sign(Api.to_canonical_json(signed_key))}
     }
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         device = OlmDevice(USER, "OTHER", peer.identity_keys)
         olm.device_store.add(device)
@@ -363,7 +376,7 @@ def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
         assert olm.key_requests_waiting_for_session[(USER, "OTHER")] == {
             request.request_id: request
         }
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == claim
             if not trusted:
                 olm.unverify_device(olm.device_store[USER]["OTHER"])
@@ -388,6 +401,7 @@ def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
         store.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -397,9 +411,11 @@ def test_waiting_share_and_signed_claim_survive_restart(tmp_path, trusted):
         ("waiting", [[[USER], []]]),
     ],
 )
-def test_malformed_stored_authorization_facts_fail_on_restore(tmp_path, field, value):
+async def test_malformed_stored_authorization_facts_fail_on_restore(
+    tmp_path, field, value
+):
     store, olm, maintenance = open_crypto(tmp_path)
-    with store.transaction():
+    async with store.transaction():
         maintenance.capture()
         encoded = store.database.execute_sql(
             "SELECT body FROM NioDurableCrypto WHERE kind='facts'"
@@ -417,10 +433,11 @@ def test_malformed_stored_authorization_facts_fail_on_restore(tmp_path, field, v
         store.close()
 
 
-def test_prebuilt_group_body_and_explicit_message_keep_exact_ids(tmp_path):
+@pytest.mark.asyncio
+async def test_prebuilt_group_body_and_explicit_message_keep_exact_ids(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
     content = {"messages": {USER: {"OTHER": {"ciphertext": "already encrypted"}}}}
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         request = maintenance.enqueue_to_device(
             "m.room.encrypted", content, request_id="group-tx"
@@ -429,7 +446,7 @@ def test_prebuilt_group_body_and_explicit_message_keep_exact_ids(tmp_path):
     store.close()
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() == request
             assert (
                 json.loads(request.body)["messages"][USER]["OTHER"]["ciphertext"]
@@ -449,10 +466,11 @@ def test_prebuilt_group_body_and_explicit_message_keep_exact_ids(tmp_path):
         store.close()
 
 
-def test_pending_request_with_missing_message_fails_during_restore(tmp_path):
+@pytest.mark.asyncio
+async def test_pending_request_with_missing_message_fails_during_restore(tmp_path):
     store, olm, maintenance = open_crypto(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             queue_dummy(olm)
             maintenance.next_request()
             encoded = store.database.execute_sql(
@@ -470,8 +488,9 @@ def test_pending_request_with_missing_message_fails_during_restore(tmp_path):
         store.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("previous_empty_queue", [False, True])
-def test_unknown_device_cancellation_does_not_block_restart(
+async def test_unknown_device_cancellation_does_not_block_restart(
     tmp_path, previous_empty_queue
 ):
     store, olm, maintenance = open_crypto(tmp_path)
@@ -486,7 +505,7 @@ def test_unknown_device_cancellation_does_not_block_restart(
             },
         }
     )
-    with store.transaction():
+    async with store.transaction():
         publish_account(olm)
         olm.handle_to_device_event(cancellation)
         assert olm.collect_key_requests() == []
@@ -508,7 +527,7 @@ def test_unknown_device_cancellation_does_not_block_restart(
     try:
         assert not olm.key_requests_waiting_for_session
         assert not olm.key_request_devices_no_session
-        with store.transaction():
+        async with store.transaction():
             assert maintenance.next_request() is None
     finally:
         store.close()

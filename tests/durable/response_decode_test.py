@@ -103,7 +103,7 @@ async def test_reopened_input_decode_allows_loop_progress(
     session = open_session(tmp_path, config=config)
     body = window("$message-0") if sliding else response()
     # Reproduce a process stopping after raw input was durably captured.
-    with session._store.transaction():
+    async with session._store.transaction():
         session._store.capture(body)
         session._store.save_continuation(
             {"transport": "sliding" if sliding else "classic"}
@@ -227,7 +227,7 @@ async def test_stopping_during_decode_preserves_replayable_cursor(
     session = open_session(tmp_path)
     body = response()
     if replay:
-        with session._store.transaction():
+        async with session._store.transaction():
             session._store.capture(body)
         await session.close()
         session = open_session(tmp_path)

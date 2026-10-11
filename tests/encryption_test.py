@@ -638,7 +638,7 @@ class TestClass:
             )
 
             def snapshot():
-                with owner.transaction():
+                with owner.blocking_transaction():
                     return tuple(
                         tuple(row)
                         for row in store.database.execute_sql(
@@ -676,11 +676,11 @@ class TestClass:
 
             if outcome == "rollback":
                 with pytest.raises(InjectedFailure):
-                    with owner.transaction():
+                    with owner.blocking_transaction():
                         alice.handle_response(rotated)
                 assert snapshot() == before
             else:
-                with owner.transaction():
+                with owner.blocking_transaction():
                     alice.handle_response(rotated)
                 after = snapshot()
                 assert after != before

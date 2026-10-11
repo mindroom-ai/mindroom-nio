@@ -77,7 +77,7 @@ def durable_binding_stores(tmp_path):
             )
             owners.append(owner)
             store = owner.matrix
-            with owner.transaction():
+            with owner.blocking_transaction():
                 stores.append((store, None, _seed_store(store, None)))
         yield tuple(stores)
     finally:

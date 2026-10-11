@@ -411,6 +411,8 @@ async def test_local_leave_reconciles_authoritative_rejoin_once(tmp_path):
             await session.quiesce()
             await runner
         finally:
+            # The runner may already poll again while commits run off the loop.
+            queue.put_nowait(response(token="unused"))
             await session.close()
             await nio_client.close()
             await asyncio.gather(runner, return_exceptions=True)
@@ -461,7 +463,7 @@ async def test_local_leave_reconciles_reinvite_before_next_local_join(tmp_path):
             while batch := await session.next_batch():
                 records.extend(batch.records)
                 await session.ack(batch)
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.finish_input()
             changes = [record.membership for record in records if record.membership]
             assert [
@@ -561,7 +563,11 @@ async def test_local_command_discards_completed_poll_before_acceptance(
     runner = asyncio.create_task(session.run())
     try:
         await asyncio.wait_for(http_started.wait(), 5)
-        await asyncio.sleep(0)
+        if delay_http:
+            await asyncio.sleep(0)
+        else:
+            # The command's final transaction commits off the loop.
+            await asyncio.wait_for(asyncio.shield(command), 5)
         assert session.cursor == "s1"
         assert session._store.input is None
         assert session._metadata[ROOM]["membership"] == (

@@ -139,7 +139,7 @@ async def test_recipient_refresh_rotates_only_for_changed_or_unknown_members(
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
-        with session._outbound.transaction():
+        async with session._outbound.transaction():
             publish_account(nio_client.olm)
             peers = {}
             for user in (first, second):

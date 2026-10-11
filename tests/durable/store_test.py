@@ -34,10 +34,13 @@ def message(event_id="$one"):
     )
 
 
-def test_retained_input_and_batch_survive_reopen_without_delivery_writes(tmp_path):
+@pytest.mark.asyncio
+async def test_retained_input_and_batch_survive_reopen_without_delivery_writes(
+    tmp_path,
+):
     store = open_store(tmp_path)
     stream_id = store.stream_id
-    with store.transaction():
+    async with store.transaction():
         store.capture(b'{"next_batch":"s1"}')
         batch = store.publish((message(),), completes_sync=True)
         store.set_cursor("s1")
@@ -60,14 +63,15 @@ def test_retained_input_and_batch_survive_reopen_without_delivery_writes(tmp_pat
         reopened.close()
 
 
-def test_crypto_and_output_rollback_together(tmp_path):
+@pytest.mark.asyncio
+async def test_crypto_and_output_rollback_together(tmp_path):
     store = open_store(tmp_path)
     account = OlmAccount()
-    with store.transaction():
+    async with store.transaction():
         store.matrix.save_account(account)
     identity = account.identity_keys
     with pytest.raises(RuntimeError, match="transaction interrupted"):
-        with store.transaction():
+        async with store.transaction():
             store.matrix.save_account(OlmAccount())
             store.publish((message(),))
             store.set_cursor("lost")
@@ -83,26 +87,28 @@ def test_crypto_and_output_rollback_together(tmp_path):
         reopened.close()
 
 
-def test_ack_is_ordered_and_idempotent(tmp_path):
+@pytest.mark.asyncio
+async def test_ack_is_ordered_and_idempotent(tmp_path):
     store = open_store(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             first = store.publish((message(),))
             second = store.publish((message("$two"),))
         with pytest.raises(LocalProtocolError, match="oldest"):
-            store.ack(second)
+            await store.ack(second)
         assert store.next_batch() == first
-        store.ack(first)
-        store.ack(first)
+        await store.ack(first)
+        await store.ack(first)
         assert store.next_batch() == second
-        store.ack(second)
+        await store.ack(second)
         assert store.next_batch() is None
     finally:
         store.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("sqlite_version", [(3, 42, 0), (3, 43, 0)])
-def test_pending_bytes_counts_utf8_not_characters(
+async def test_pending_bytes_counts_utf8_not_characters(
     tmp_path, monkeypatch, sqlite_version
 ):
     store = open_store(tmp_path)
@@ -111,7 +117,7 @@ def test_pending_bytes_counts_utf8_not_characters(
             pytest.skip("SQLite lacks octet_length")
         monkeypatch.setattr(store.database, "server_version", sqlite_version)
         assert store.pending_bytes == 0
-        with store.transaction():
+        async with store.transaction():
             # Nine Unicode characters occupy thirteen UTF-8 bytes.
             store.database.execute_sql(
                 "INSERT INTO NioDurableBatch(records,completes_sync) VALUES(?,0)",
@@ -123,20 +129,21 @@ def test_pending_bytes_counts_utf8_not_characters(
         store.close()
 
 
-def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
+@pytest.mark.asyncio
+async def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
     store = open_store(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             first = store.publish(())
         with pytest.raises(RuntimeError, match="interrupted"):
-            with store.transaction():
+            async with store.transaction():
                 store.publish(())
                 assert store.pending_bytes == 4
                 raise RuntimeError("interrupted")
         assert store.pending_bytes == 2
-        store.ack(first)
+        await store.ack(first)
         assert store.pending_bytes == 0
-        with store.transaction():
+        async with store.transaction():
             store.publish(())
     finally:
         store.close()
@@ -147,13 +154,14 @@ def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
         reopened.close()
 
 
-def test_capture_cannot_overwrite_unfinished_response(tmp_path):
+@pytest.mark.asyncio
+async def test_capture_cannot_overwrite_unfinished_response(tmp_path):
     store = open_store(tmp_path)
     try:
-        with store.transaction():
+        async with store.transaction():
             store.capture(b'{"next_batch":"s1"}')
         with pytest.raises(LocalProtocolError, match="unfinished"):
-            with store.transaction():
+            async with store.transaction():
                 store.capture(b'{"next_batch":"s2"}')
         assert store.input == (b'{"next_batch":"s1"}', {})
     finally:

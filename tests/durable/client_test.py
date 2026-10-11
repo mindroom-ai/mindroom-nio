@@ -166,11 +166,9 @@ async def test_recursive_publication_checks_cumulative_pending_bytes(tmp_path, l
         tmp_path, config=DurableSyncConfig(max_pending_bytes=2500, **limits)
     )
     try:
-        with (
-            pytest.raises(LocalProtocolError, match="pending bound"),
-            session._store.transaction(),
-        ):
-            session._publish_records(records)
+        with pytest.raises(LocalProtocolError, match="pending bound"):
+            async with session._store.transaction():
+                session._publish_records(records)
         assert await session.next_batch() is None
         assert session._store.pending_bytes == 0
     finally:

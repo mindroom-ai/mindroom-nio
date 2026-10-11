@@ -48,7 +48,7 @@ async def settle(session):
     while batch := await session.next_batch():
         records.extend(batch.records)
         await session.ack(batch)
-    with session._store.transaction():
+    async with session._store.transaction():
         session._store.finish_input()
     session._recovery.response = None
     return records

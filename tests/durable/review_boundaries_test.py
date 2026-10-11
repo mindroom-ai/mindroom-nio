@@ -95,7 +95,7 @@ async def test_disposed_client_cannot_encrypt_or_send(
                 with monkeypatch.context() as failing:
                     failing.setattr(session._store.database, "commit", fail_commit)
                     with pytest.raises(RuntimeError, match="commit failed"):
-                        with session._outbound.transaction():
+                        async with session._outbound.transaction():
                             room.users[USER].display_name = "uncommitted"
 
             with pytest.raises(LocalProtocolError, match="poisoned"):
@@ -167,7 +167,7 @@ async def test_disposal_during_send_preparation_prevents_later_http(tmp_path):
 async def test_quiesce_discards_a_completed_but_unaccepted_poll(tmp_path, monkeypatch):
     session = open_session(tmp_path)
     await baseline(session)
-    with session._store.transaction():
+    async with session._store.transaction():
         publish_account(session.client.olm)
         session.client.olm.users_for_key_query.clear()
         session._crypto.capture()
@@ -361,7 +361,7 @@ async def test_replayed_encrypted_callback_requests_key_for_its_room(
     async with homeserver(None, membership=http) as (url, _):
         session = open_session(tmp_path, config=config)
         session.client.homeserver = url
-        with session._store.transaction():
+        async with session._store.transaction():
             _, device = queue_dummy(session.client.olm)
             session.client.olm.outgoing_to_device_messages.clear()
             session._crypto.capture()

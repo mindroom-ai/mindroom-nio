@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
 from peewee import SqliteDatabase
@@ -25,6 +27,59 @@ from ..store import (
 )
 from ..store._sqlite_lease import FileLease
 from .model import SyncBatch, SyncRecord, decode_records, encode_json, encode_records
+
+_COMMITTED = (
+    "SELECT cursor, acked_sequence, "
+    "(SELECT continuation FROM NioDurableInput WHERE id=1), "
+    "(SELECT MIN(sequence) FROM NioDurableBatch), "
+    "(SELECT MAX(sequence) FROM NioDurableBatch), "
+    "(SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'), "
+    "(SELECT body FROM NioDurableCrypto WHERE kind='request' AND key='current') "
+    "FROM NioDurableMeta WHERE id=1"
+)
+
+
+class _Committed(NamedTuple):
+    """Status that other tasks read while a transaction is in flight."""
+
+    cursor: str | None
+    acked_sequence: int
+    continuation: str | None
+    oldest_batch: int | None
+    newest_batch: int | None
+    local_intent: str | None
+    crypto_request: str | None
+
+
+def _current_task() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+async def _finish[T](future: asyncio.Future[T]) -> T:
+    """Await to completion, delivering cancellation at the next suspension point.
+
+    A transaction must not stop between BEGIN and COMMIT or ROLLBACK, and its
+    caller must not see an interruption inside a boundary that it could not
+    see while transactions were synchronous.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    deferred: list[Any] = []
+    try:
+        while True:
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError as error:
+                if future.cancelled():
+                    raise
+                deferred.append(error.args[0] if error.args else None)
+    finally:
+        for message in deferred:
+            task.uncancel()
+            task.cancel(message)
 
 
 class _Database(SqliteDatabase):
@@ -57,10 +112,16 @@ class _MatrixStore(SqliteStore):
 
 
 class DurableStore:
-    """Synchronous persistence used by one durable sync session.
+    """Persistence used by one durable sync session.
 
     Mutations other than acknowledgement require an enclosing transaction so
     they can commit with the ordinary MatrixStore's crypto changes.
+
+    One asyncio lock serializes transactions. BEGIN, COMMIT and ROLLBACK run on
+    the store's own thread, so lock waits and fsync do not stall the event
+    loop. Transaction bodies run on the loop and never await. Outside a body,
+    status reads return the last committed values without using SQLite; other
+    reads belong inside a transaction or under locked().
     """
 
     def __init__(
@@ -84,14 +145,21 @@ class DurableStore:
         self._closed = False
         self._pid = os.getpid()
         self._room_metadata: dict[str, str] | None = None
-        self._transaction_depth = 0
         self._intent_cached = False
         self._local_intent: dict[str, Any] | None = None
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._blocking = 0
+        self._job: Future[Any] | None = None
+        self._thread = ThreadPoolExecutor(1, thread_name_prefix="nio-durable-store")
         self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
             pragmas={"foreign_keys": 1, "secure_delete": "fast"},
             timeout=5,
+            # The loop and the store thread use this connection in turn.
+            check_same_thread=False,
+            thread_safe=False,
         )
         try:
             self.database.connect()
@@ -139,6 +207,7 @@ class DurableStore:
                         self._adopt_trust(user_id, device_id)
             self.database.execute_sql("PRAGMA journal_mode=WAL")
             self.database.execute_sql("PRAGMA synchronous=FULL")
+            self._committed = self._read_committed()
         except BaseException:
             self.close()
             raise
@@ -224,31 +293,160 @@ class DurableStore:
                 "durable store is closed or belongs to another process"
             )
 
+    def _owns_connection(self) -> bool:
+        """Whether code running now may use the connection on this thread."""
+        return (
+            self._blocking > 0 or self._owner is None or self._owner is _current_task()
+        )
+
+    def _in_transaction(self) -> bool:
+        return self._owns_connection() and self.database.in_transaction()
+
+    def _check_connection(self) -> None:
+        """Prepare to read on this thread outside the caller's own transaction.
+
+        Production paths read under locked() or inside a transaction. Other
+        synchronous readers block until another task's BEGIN or COMMIT ends.
+        """
+        self._assert_open()
+        if not self._owns_connection() and self._job is not None:
+            wait((self._job,))
+            self._assert_open()
+
     def _require_transaction(self) -> None:
         self._assert_open()
-        if not self.database.in_transaction():
+        if not self._in_transaction():
             raise LocalProtocolError("durable mutation requires a transaction")
 
+    def _read_committed(self) -> _Committed:
+        return _Committed(*self.database.execute_sql(_COMMITTED).fetchone())
+
     @contextmanager
-    def transaction(self) -> Iterator[None]:
-        self._assert_open()
-        self._transaction_depth += 1
+    def _body(self) -> Iterator[None]:
         self._invalidate_local_intent()
         try:
-            with self.database.atomic("IMMEDIATE"):
-                yield
+            yield
         except BaseException:
             # A failed commit or nested rollback invalidates speculative writes.
             # Reload from this connection before comparing another projection.
             self._room_metadata = None
             raise
         finally:
-            self._transaction_depth -= 1
             self._invalidate_local_intent()
+
+    async def _on_thread[T](self, function: Callable[..., T], *args: Any) -> T:
+        job = self._thread.submit(function, *args)
+        self._job = job
+        try:
+            return await _finish(asyncio.wrap_future(job))
+        finally:
+            self._job = None
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Hold the store for one IMMEDIATE transaction; the body must not await.
+
+        Once entered, the transaction commits or rolls back even if the task
+        is cancelled, and the store stays usable. The cancellation is then
+        delivered at the task's next suspension point.
+        """
+        self._assert_open()
+        if self._in_transaction():
+            # Nested in this task's own transaction: a savepoint on the loop.
+            with self._body(), self.database.atomic():
+                yield
+            return
+        # A separate acquiring task keeps this place in the queue if the
+        # caller is cancelled while waiting.
+        await _finish(asyncio.ensure_future(self._lock.acquire()))
+        self._owner = asyncio.current_task()
+        try:
+            self._assert_open()
+            transaction = self.database.transaction("IMMEDIATE")
+            await self._on_thread(transaction.__enter__)
+            # close() may have discarded this transaction while BEGIN ran.
+            self._assert_open()
+            with self._body():
+                try:
+                    yield
+                except BaseException as error:
+                    if not self._closed:
+                        await self._on_thread(
+                            transaction.__exit__,
+                            type(error),
+                            error,
+                            error.__traceback__,
+                        )
+                    raise
+                self._assert_open()
+                await self._on_thread(transaction.__exit__, None, None, None)
+            if not self._closed:
+                self._committed = self._read_committed()
+        finally:
+            self._owner = None
+            self._lock.release()
+
+    @contextmanager
+    def blocking_transaction(self) -> Iterator[None]:
+        """Run one transaction on the calling thread, blocking it until COMMIT.
+
+        This serves opening and synchronous public APIs. It waits for another
+        task's BEGIN or COMMIT. If that task has begun a transaction whose body
+        has not run yet, this work commits first inside it and the transaction
+        is reopened for that task.
+        """
+        self._assert_open()
+        if self._in_transaction():
+            with self._body(), self.database.atomic():
+                yield
+            return
+        if self._job is not None:
+            wait((self._job,))
+            self._assert_open()
+        borrowed = self.database.in_transaction()
+        self._blocking += 1
+        try:
+            with self._body():
+                with self.database.atomic("IMMEDIATE"):
+                    yield
+                if borrowed:
+                    self._commit_borrowed()
+            self._committed = self._read_committed()
+        finally:
+            self._blocking -= 1
+
+    def _commit_borrowed(self) -> None:
+        try:
+            self.database.commit()
+        except BaseException:
+            self.database.rollback()
+            raise
+        finally:
+            try:
+                self.database.begin("IMMEDIATE")
+            except BaseException:
+                # The waiting task must not run its body outside a transaction.
+                self.close()
+                raise
+
+    @asynccontextmanager
+    async def locked(self) -> AsyncIterator[None]:
+        """Hold the store for reads outside a transaction; do not await inside."""
+        if self._owner is not None and self._owner is _current_task():
+            yield
+            return
+        async with self._lock:
+            self._owner = asyncio.current_task()
+            try:
+                self._assert_open()
+                yield
+            finally:
+                self._owner = None
 
     def load_room_metadata(self) -> dict[str, str]:
         self._assert_open()
         if self._room_metadata is None:
+            self._check_connection()
             self._room_metadata = dict(
                 self.database.execute_sql("SELECT room_id,metadata FROM NioDurableRoom")
             )
@@ -274,12 +472,16 @@ class DurableStore:
 
     def read_local_intent(self) -> dict[str, Any] | None:
         self._assert_open()
+        if not self._in_transaction():
+            # Decoding returns a fresh copy for callers that edit it.
+            body = self._committed.local_intent
+            return json.loads(body) if body else None
         if not self._intent_cached:
             row = self.database.execute_sql(
                 "SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'"
             ).fetchone()
             self._local_intent = json.loads(row[0]) if row else None
-            self._intent_cached = self._transaction_depth > 0
+            self._intent_cached = True
         # Callers edit their intent before explicitly saving it.
         return deepcopy(self._local_intent)
 
@@ -307,6 +509,8 @@ class DurableStore:
     @property
     def cursor(self) -> str | None:
         self._assert_open()
+        if not self._in_transaction():
+            return self._committed.cursor
         return self.database.execute_sql(
             "SELECT cursor FROM NioDurableMeta WHERE id=1"
         ).fetchone()[0]
@@ -319,7 +523,7 @@ class DurableStore:
 
     @property
     def input(self) -> tuple[bytes, dict[str, Any]] | None:
-        self._assert_open()
+        self._check_connection()
         row = self.database.execute_sql(
             "SELECT body,continuation FROM NioDurableInput WHERE id=1"
         ).fetchone()
@@ -329,6 +533,8 @@ class DurableStore:
 
     def has_input(self) -> bool:
         self._assert_open()
+        if not self._in_transaction():
+            return self._committed.continuation is not None
         return (
             self.database.execute_sql(
                 "SELECT 1 FROM NioDurableInput WHERE id=1"
@@ -339,10 +545,14 @@ class DurableStore:
     @property
     def continuation(self) -> dict[str, Any] | None:
         self._assert_open()
-        row = self.database.execute_sql(
-            "SELECT continuation FROM NioDurableInput WHERE id=1"
-        ).fetchone()
-        return self._decode_continuation(row[0]) if row else None
+        if not self._in_transaction():
+            encoded = self._committed.continuation
+        else:
+            row = self.database.execute_sql(
+                "SELECT continuation FROM NioDurableInput WHERE id=1"
+            ).fetchone()
+            encoded = row[0] if row else None
+        return None if encoded is None else self._decode_continuation(encoded)
 
     @staticmethod
     def _decode_continuation(encoded: str) -> dict[str, Any]:
@@ -393,6 +603,8 @@ class DurableStore:
 
     def has_batches(self) -> bool:
         self._assert_open()
+        if not self._in_transaction():
+            return self._committed.oldest_batch is not None
         return (
             self.database.execute_sql(
                 "SELECT 1 FROM NioDurableBatch LIMIT 1"
@@ -401,9 +613,36 @@ class DurableStore:
         )
 
     @property
+    def acked_sequence(self) -> int:
+        self._assert_open()
+        if not self._in_transaction():
+            return self._committed.acked_sequence
+        return self.database.execute_sql(
+            "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
+        ).fetchone()[0]
+
+    @property
+    def progress_generation(self) -> int:
+        """Monotonic progress from committed publication and acknowledgement."""
+        self._assert_open()
+        committed = self._committed
+        acked = committed.acked_sequence
+        return acked + max(acked, committed.newest_batch or 0)
+
+    def read_crypto_request(self) -> str | None:
+        """Return the retained crypto request body, as committed outside a body."""
+        self._assert_open()
+        if not self._in_transaction():
+            return self._committed.crypto_request
+        row = self.database.execute_sql(
+            "SELECT body FROM NioDurableCrypto WHERE kind='request' AND key='current'"
+        ).fetchone()
+        return row[0] if row else None
+
+    @property
     def pending_bytes(self) -> int:
         """Count queued payload bytes without loading them on SQLite 3.43+."""
-        self._assert_open()
+        self._check_connection()
         byte_length = (
             "octet_length(records)"
             if self.database.server_version >= (3, 43, 0)
@@ -414,7 +653,7 @@ class DurableStore:
         ).fetchone()[0]
 
     def next_batch(self) -> SyncBatch | None:
-        self._assert_open()
+        self._check_connection()
         row = self.database.execute_sql(
             "SELECT sequence,records,completes_sync FROM NioDurableBatch ORDER BY sequence LIMIT 1"
         ).fetchone()
@@ -427,11 +666,11 @@ class DurableStore:
         except (ValueError, TypeError, KeyError) as error:
             raise LocalProtocolError("invalid stored durable batch") from error
 
-    def ack(self, batch: SyncBatch) -> None:
+    async def ack(self, batch: SyncBatch) -> None:
         self._assert_open()
         if batch.stream_id != self.stream_id:
             raise LocalProtocolError("batch belongs to another durable stream")
-        with self.transaction():
+        async with self.transaction():
             acked = self.database.execute_sql(
                 "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
             ).fetchone()[0]
@@ -453,8 +692,13 @@ class DurableStore:
     def close(self) -> None:
         if self._closed:
             return
+        self._closed = True
+        # Let an in-flight BEGIN or COMMIT finish, then stop the store thread.
+        self._thread.shutdown(wait=True)
+        # Closing rolls back a transaction begun for a task that has not resumed.
+        while self.database.in_transaction():
+            self.database.pop_transaction()
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True
-        self._closed = True
         self._lease.close()

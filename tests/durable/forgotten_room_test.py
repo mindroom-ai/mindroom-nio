@@ -152,7 +152,7 @@ async def test_forgotten_local_join_releases_pending_membership_intent(tmp_path)
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         try:
-            with session._store.transaction():
+            async with session._store.transaction():
                 session._store.set_cursor("before-join")
             assert await session.change_membership(
                 operation_id=OPERATION,
