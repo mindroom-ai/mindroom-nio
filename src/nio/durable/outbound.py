@@ -53,11 +53,6 @@ class OutboundCrypto:
             ):
                 self.client.invalidate_outbound_session(room_id)
 
-    def _poison(self) -> None:
-        self.client._dispose()
-        self.store.close()
-        self.session._changed.set()
-
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
         self.session._assert_active()
@@ -65,7 +60,7 @@ class OutboundCrypto:
             async with self.store.transaction():
                 yield
         except BaseException:
-            self._poison()
+            self.session._poison()
             raise
 
     @contextmanager
@@ -76,7 +71,7 @@ class OutboundCrypto:
             with self.store.blocking_transaction():
                 yield
         except BaseException:
-            self._poison()
+            self.session._poison()
             raise
 
     def change_key_share(self, event: RoomKeyRequest, cancel: bool = False) -> bool:

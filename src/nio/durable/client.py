@@ -145,6 +145,12 @@ class DurableSync:
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
 
+    def _poison(self) -> None:
+        """Discard live state that a failed transaction may have mutated."""
+        self.client._dispose()
+        self._store.close()
+        self._changed.set()
+
     def _decode_response(
         self, body: bytes
     ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
@@ -731,9 +737,7 @@ class DurableSync:
             self._changed.set()
             return True
         except BaseException:
-            self.client._dispose()
-            self._store.close()
-            self._changed.set()
+            self._poison()
             raise
 
     async def quiesce(self) -> None:

@@ -31,7 +31,6 @@ from .model import SyncBatch, SyncRecord, decode_records, encode_json, encode_re
 _COMMITTED = (
     "SELECT cursor, acked_sequence, "
     "(SELECT continuation FROM NioDurableInput WHERE id=1), "
-    "(SELECT MIN(sequence) FROM NioDurableBatch), "
     "(SELECT MAX(sequence) FROM NioDurableBatch), "
     "(SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'), "
     "(SELECT body FROM NioDurableCrypto WHERE kind='request' AND key='current') "
@@ -45,7 +44,6 @@ class _Committed(NamedTuple):
     cursor: str | None
     acked_sequence: int
     continuation: str | None
-    oldest_batch: int | None
     newest_batch: int | None
     local_intent: str | None
     crypto_request: str | None
@@ -534,7 +532,7 @@ class DurableStore:
     def has_batches(self) -> bool:
         """Whether committed batches await acknowledgement."""
         self._assert_open()
-        return self._committed.oldest_batch is not None
+        return self._committed.newest_batch is not None
 
     @property
     def acked_sequence(self) -> int:

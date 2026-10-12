@@ -115,11 +115,6 @@ class Recovery:
             if info.timeline.limited
         ]
 
-    def _poison(self) -> None:
-        self.session.client._dispose()
-        self.session._store.close()
-        self.session._changed.set()
-
     def _loss(
         self,
         room_id: str,
@@ -246,7 +241,7 @@ class Recovery:
                             self._loss(room_id, state, "unknown authorization baseline")
                 self._tail(state)
         except BaseException:
-            self._poison()
+            self.session._poison()
             raise
         finally:
             # Waiters read committed status, so wake them only after COMMIT.
@@ -651,6 +646,6 @@ class Recovery:
                     state["from"] = end
                 session._store.save_continuation(state)
         except BaseException:
-            self._poison()
+            self.session._poison()
             raise
         session._changed.set()
