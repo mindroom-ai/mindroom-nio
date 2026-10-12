@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -89,12 +89,9 @@ class _Database(SqliteDatabase):
         # failed COMMIT, live state may hold rolled-back changes until that
         # task disposes the client, so nothing else may persist it.
         job = self.commit_job
-        if job is not None:
-            wait((job,))
-            if job.exception() is not None:
-                raise LocalProtocolError(
-                    "durable store commit failed"
-                ) from job.exception()
+        # exception() blocks until that COMMIT finishes.
+        if job is not None and (error := job.exception()) is not None:
+            raise LocalProtocolError("durable store commit failed") from error
         return super().atomic(*args, **kwargs)
 
 
