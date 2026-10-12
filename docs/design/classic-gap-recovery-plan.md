@@ -554,7 +554,7 @@ unsafe: `turn_controller.py` uses that key to select context and reply targeting
 and room-level media promotion depends on the absent thread ID.
 
 The subsequent authorized scheduling change is specified in MindRoom's
-`docs/dev/root-preparation-scheduling.md`. Closed independent roots retain their
+`docs/dev/2026-09-07-root-preparation-scheduling.md`. Closed independent roots retain their
 semantic key and may prepare concurrently, with eight tasks per gate owner;
 explicit threads and single-conversation rooms remain serial. Tests block root
 A while root B prepares and cover grouping, source ownership, failure and drain.

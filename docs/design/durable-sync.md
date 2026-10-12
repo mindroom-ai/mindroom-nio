@@ -524,6 +524,6 @@ Completion p95 improves from about 83.3 seconds to 75.9–76.1 seconds, includin
 The same committed source passes the Synapse control with 54.219 seconds of overlap and the same correctness and drain checks.
 The previously recorded Tuwunel startup-capacity limitation is resolved for this workload, without qualifying 1,000 concurrent replies or a universal latency bound.
 
-The consumer's `docs/dev/ledger-write-ownership.md` records the architecture, twenty new SQLite/Postgres cases, calibrated traces, failed diagnostic prototypes and exact-source controls.
+The consumer's `docs/dev/2026-09-07-ledger-write-ownership.md` records the architecture, twenty new SQLite/Postgres cases, calibrated traces, failed diagnostic prototypes and exact-source controls.
 Its full suite passes 15,542 tests with 22 skipped; all repository hooks pass.
 Future performance work should keep this distinction between actual conflict ownership and unrelated queue waits, and justify any new writer, codec or durability change with its own measured evidence.

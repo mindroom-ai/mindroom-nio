@@ -469,7 +469,7 @@ Neither setting is adopted.
 A final normal control passes every unchanged 200-root predicate with 12.083 seconds of initial reply spread, 49.817 seconds of full overlap, all three fence principals, zero retained producer/application/outbox work and clean shutdown.
 A native-sampling run is retained only as diagnostic evidence: profiler overhead increases latency and its parent exits with a child-reaping error after application shutdown.
 
-The consumer's `docs/dev/ledger-write-ownership.md` records timing denominators, native-symbol limitations, negative experiments and the next bounded SQL-level investigation.
+The consumer's `docs/dev/2026-09-07-ledger-write-ownership.md` records timing denominators, native-symbol limitations, negative experiments and the next bounded SQL-level investigation.
 No producer or consumer production code, dependency, durability policy or concurrency setting changes in this follow-up; 1,000 concurrent replies remain unqualified.
 
 ## Membership-query trial
@@ -478,7 +478,7 @@ A nine-line consumer candidate removed one duplicate membership-version SELECT p
 Two alternating actual-source comparisons show no worthwhile startup improvement: baseline initial reply spreads are 12.090/12.153 seconds, versus 12.229/12.436 seconds for the candidate.
 All four runs pass every unchanged 200-root acceptance predicate, including three-principal fences, zero retained debt, source verification and clean shutdown.
 The production candidate is withdrawn; useful membership-transition coverage and a projection-progress test timing correction remain.
-The consumer's `docs/dev/ledger-write-ownership.md` records the controls, rejected query optimization and remaining writer-time breakdown.
+The consumer's `docs/dev/2026-09-07-ledger-write-ownership.md` records the controls, rejected query optimization and remaining writer-time breakdown.
 The largest combined category is delivery/outbox work (4.407 seconds of the 13.357-second traced startup); admission, ledger writes, hydration and settlement account for the rest.
 This identifies which operations occupy the writer, while the exact low-level synchronization owners remain partly unresolved.
 No Nio production change or weaker durability guarantee follows from this trial.
@@ -496,7 +496,7 @@ A diagnostic event-loop writer gives 11.768 seconds of initial spread but a wors
 That policy is rejected; keep the existing consumer writer, FULL durability and eight preparations.
 No producer/consumer production code or dependency changes in this investigation, and 1,000 concurrent replies remain unqualified.
 
-MindRoom's `docs/dev/durable-ingestion-performance.md` is the evidence entry point, with a tracked JSON measurement summary, a transaction-boundary map in `docs/dev/ledger-write-ownership.md`, and a persistent checksummed reproduction package.
+MindRoom's `docs/dev/2026-09-07-durable-ingestion-performance.md` is the evidence entry point, with a tracked JSON measurement summary, the ledger decision record `docs/dev/2026-09-07-ledger-write-ownership.md`, and a persistent checksummed reproduction package.
 The package retains historical probe variants, helper scripts, native symbols and metadata for portable re-analysis; fresh SQL replay requires regenerating the synthetic workload because SQL parameters/results were intentionally not retained.
 It also indexes the rejected query, pool-size, thread-switch and inline-writer experiments so they are not repeated without new evidence.
 
@@ -652,7 +652,7 @@ Portable evidence is retained in the capacity workspace as
 `535f54ef93f610b865b5a31eeacf4c46d2b7c5d18399961fc1f3c8ad0f79a92b`.
 All 25 manifested files verify, and standalone reanalysis reproduces the four
 cohorts and ABBA comparison exactly. The archive README and the consumer's
-`docs/dev/durable-ingestion-performance.md` describe fresh reproduction and the
+`docs/dev/2026-09-07-durable-ingestion-performance.md` describe fresh reproduction and the
 frozen companion harness dependency; raw logs, keys and databases are excluded.
 
 ## Room lifecycle review corrections at `6143e8a`

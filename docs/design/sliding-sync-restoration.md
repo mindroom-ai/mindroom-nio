@@ -273,7 +273,7 @@ code and do not change the capacity workload; all 130 harness tests pass.
 Failed attempts remain in the evidence, including the pre-fix two-second health
 timeout whose cause was not established and the sampled run that could not
 confirm clean shutdown. Passing later runs do not explain the earlier timeout.
-MindRoom's tracked `docs/dev/durable-ingestion-performance.md` and adjacent JSON
+MindRoom's tracked `docs/dev/2026-09-07-durable-ingestion-performance.md` and adjacent JSON
 preserve the full run mapping, actual metrics, failure explanations, source
 revisions and portable reproduction archive. No merge, release or deployment
 was performed by this qualification.
