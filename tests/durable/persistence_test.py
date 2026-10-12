@@ -58,7 +58,6 @@ async def test_input_status_preserves_validation_and_rollback_without_loading_bo
         with pytest.raises(RuntimeError, match="rollback"):
             async with store.transaction():
                 store.finish_input()
-                assert not store.has_input()
                 raise RuntimeError("rollback")
         assert store.continuation == {"phase": "prepared"}
         async with store.transaction():

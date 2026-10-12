@@ -54,9 +54,9 @@ class _Committed(NamedTuple):
 async def _finish[T](future: asyncio.Future[T]) -> T:
     """Await to completion, delivering cancellation at the next suspension point.
 
-    A transaction must not stop before COMMIT or ROLLBACK, and its caller must
-    not see an interruption inside a boundary that it could not see while
-    transactions were synchronous.
+    A transaction must not stop before COMMIT or ROLLBACK. Callers dispose the
+    client on any exception raised from a transaction, so cancellation must not
+    be raised at the lock wait or at COMMIT.
     """
     task = asyncio.current_task()
     assert task is not None
@@ -150,8 +150,6 @@ class DurableStore:
         self._intent_cached = False
         self._local_intent: dict[str, Any] | None = None
         self._lock = asyncio.Lock()
-        self._owner: asyncio.Task[Any] | None = None
-        self._blocking = 0
         self._thread = ThreadPoolExecutor(1, thread_name_prefix="nio-durable-store")
         self._lease = FileLease(self.path)
         self.database = _Database(
@@ -296,16 +294,10 @@ class DurableStore:
                 "durable store is closed or belongs to another process"
             )
 
-    def _owns_connection(self) -> bool:
-        """Whether code running now may use the connection on this thread."""
-        return (
-            self._blocking > 0
-            or self._owner is None
-            or self._owner is asyncio.current_task()
-        )
-
     def _in_transaction(self) -> bool:
-        return self._owns_connection() and self.database.in_transaction()
+        # While COMMIT runs on the store thread, other tasks read committed state.
+        job = self.database.commit_job
+        return (job is None or job.done()) and self.database.in_transaction()
 
     def _require_transaction(self) -> None:
         self._assert_open()
@@ -354,7 +346,6 @@ class DurableStore:
         # A separate acquiring task keeps this place in the queue if the
         # caller is cancelled while waiting.
         await _finish(asyncio.ensure_future(self._lock.acquire()))
-        self._owner = asyncio.current_task()
         try:
             self._assert_open()
             transaction = self.database.transaction("IMMEDIATE")
@@ -369,7 +360,6 @@ class DurableStore:
             if not self._closed:
                 self._committed = self._read_committed()
         finally:
-            self._owner = None
             self._lock.release()
 
     @contextmanager
@@ -384,24 +374,16 @@ class DurableStore:
             with self._body(), self.database.atomic():
                 yield
             return
-        self._blocking += 1
-        try:
-            with self._body(), self.database.atomic("IMMEDIATE"):
-                yield
-            self._committed = self._read_committed()
-        finally:
-            self._blocking -= 1
+        with self._body(), self.database.atomic("IMMEDIATE"):
+            yield
+        self._committed = self._read_committed()
 
     @asynccontextmanager
     async def locked(self) -> AsyncIterator[None]:
         """Hold the store for reads outside a transaction; do not await inside."""
         async with self._lock:
-            self._owner = asyncio.current_task()
-            try:
-                self._assert_open()
-                yield
-            finally:
-                self._owner = None
+            self._assert_open()
+            yield
 
     def load_room_metadata(self) -> dict[str, str]:
         self._assert_open()
@@ -491,15 +473,9 @@ class DurableStore:
         return bytes(row[0]), self._decode_continuation(row[1])
 
     def has_input(self) -> bool:
+        """Whether committed input awaits preparation or completion."""
         self._assert_open()
-        if not self._in_transaction():
-            return self._committed.continuation is not None
-        return (
-            self.database.execute_sql(
-                "SELECT 1 FROM NioDurableInput WHERE id=1"
-            ).fetchone()
-            is not None
-        )
+        return self._committed.continuation is not None
 
     @property
     def continuation(self) -> dict[str, Any] | None:

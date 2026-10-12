@@ -319,7 +319,7 @@ consumer databases.
 
 Each durable store owns one thread for COMMIT. MindRoom measured event-loop
 stalls of 340 to 1017 ms in durable transactions on the loop, which also carries
-live call audio. One asyncio lock now serializes the store's transactions.
+live call audio. One asyncio lock serializes the store's transactions.
 COMMIT waits for fsync, so it runs on the store thread, where SQLite releases the
 GIL. BEGIN IMMEDIATE cannot wait for a lock, because the store's lease leaves its
 connection as the only one, and a WAL ROLLBACK does not fsync, so both stay on

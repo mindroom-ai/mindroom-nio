@@ -1,6 +1,7 @@
 """COMMIT runs on the store's thread while the event loop keeps running."""
 
 import asyncio
+import json
 import threading
 import time
 
@@ -334,8 +335,6 @@ async def test_member_lookup_does_not_overwrite_invalidation_during_commit(tmp_p
 
 @pytest.mark.asyncio
 async def test_group_share_rechecks_membership_after_transaction_starts(tmp_path):
-    import json
-
     departed = "@old:example.org"
     sent = []
 
