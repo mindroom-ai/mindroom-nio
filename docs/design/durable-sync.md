@@ -327,10 +327,11 @@ the loop with the body, which mutates live nio objects and never awaits. Outside
 a body, status reads (cursor, retained input, queued batches, membership intent,
 retained crypto request and progress) return values captured after the last
 commit, so they never wait for an in-flight commit. Another task can see a
-body's in-memory changes before its COMMIT returns, but anything it persists or
-sends waits for the store lock. Opening, synchronous trust and key-share calls,
-and nio store writes such as key import wait for an in-flight COMMIT and then
-commit their own transaction on the loop. nio store reads outside the lock, such
+body's in-memory changes before its COMMIT returns, but anything it persists is
+ordered after that COMMIT: transactions and crypto sends take the store lock,
+and opening, synchronous trust and key-share calls, and nio store writes such as
+key import wait for the in-flight COMMIT and then commit their own transaction
+on the loop. nio store reads outside the lock, such
 as device trust checks while decrypting, share the connection, so serialized
 SQLite still makes them wait for the rest of an in-flight COMMIT, as every
 commit did before. In a benchmark of four stores sharing one loop, the worst
