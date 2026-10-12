@@ -85,9 +85,16 @@ class _Database(SqliteDatabase):
 
     def atomic(self, *args, **kwargs):
         # A MatrixStore write outside the store lock, such as a key import,
-        # must not join or interleave with another task's COMMIT.
-        if self.commit_job is not None:
-            wait((self.commit_job,))
+        # must not join or interleave with another task's COMMIT. After a
+        # failed COMMIT, live state may hold rolled-back changes until that
+        # task disposes the client, so nothing else may persist it.
+        job = self.commit_job
+        if job is not None:
+            wait((job,))
+            if job.exception() is not None:
+                raise LocalProtocolError(
+                    "durable store commit failed"
+                ) from job.exception()
         return super().atomic(*args, **kwargs)
 
 

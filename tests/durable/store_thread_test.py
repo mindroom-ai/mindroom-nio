@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 
@@ -14,7 +15,7 @@ from nio.exceptions import LocalProtocolError
 from nio.rooms import MatrixRoom
 
 from .client_test import ROOM, USER, client, open_session, response
-from .crypto_test import publish_account, queue_dummy
+from .crypto_test import publish_account, queue_dummy, room_key_request
 from .recovery_test import baseline, member
 from .runner_test import homeserver
 from .store_test import message, open_store
@@ -274,23 +275,27 @@ async def test_blocking_transaction_waits_for_inflight_commit(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("commit_fails", [False, True])
-async def test_matrix_store_write_during_commit_gets_its_own_transaction(
+async def test_matrix_store_write_waits_for_inflight_commit(
     tmp_path, monkeypatch, commit_fails
 ):
     store = open_store(tmp_path)
     try:
         async with store.transaction():
             store.matrix.save_account(OlmAccount())
-        started = threading.Event()
+        started, finished = threading.Event(), threading.Event()
         commit = store.database.commit
 
         def slow_commit():
-            if threading.current_thread().name.startswith("nio-durable-store"):
-                started.set()
-                time.sleep(SLOW)
+            if not threading.current_thread().name.startswith("nio-durable-store"):
+                return commit()
+            started.set()
+            time.sleep(SLOW)
+            try:
                 if commit_fails:
                     raise RuntimeError("injected commit failure")
-            return commit()
+                return commit()
+            finally:
+                finished.set()
 
         monkeypatch.setattr(store.database, "commit", slow_commit)
 
@@ -304,19 +309,23 @@ async def test_matrix_store_write_during_commit_gets_its_own_transaction(
         key = InboundGroupSession(
             OutboundGroupSession().session_key, "ed25519", "curve25519", ROOM
         )
-        store.matrix.save_inbound_group_session(key)
         if commit_fails:
+            # The failed transaction's task will dispose the client.
+            with pytest.raises(LocalProtocolError, match="commit failed"):
+                store.matrix.save_inbound_group_session(key)
             with pytest.raises(RuntimeError, match="injected"):
                 await task
         else:
+            store.matrix.save_inbound_group_session(key)
+            # The write started its own transaction after that COMMIT.
+            assert finished.is_set()
             await task
     finally:
         store.close()
     reopened = open_store(tmp_path)
     try:
-        assert reopened.matrix.load_inbound_group_sessions().get(
-            ROOM, "curve25519", key.id
-        )
+        saved = reopened.matrix.load_inbound_group_sessions()
+        assert (saved.get(ROOM, "curve25519", key.id) is None) is commit_fails
         assert reopened.has_batches() is not commit_fails
     finally:
         reopened.close()
@@ -426,3 +435,60 @@ async def test_runner_status_check_tolerates_send_whose_commit_is_running(tmp_pa
         finally:
             await session.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_synchronous_key_share_refuses_to_persist_after_failed_commit(
+    tmp_path, monkeypatch
+):
+    async def send(_):
+        return web.json_response({})
+
+    async with homeserver(None, membership=send) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            async with session._store.transaction():
+                publish_account(nio_client.olm)
+                request, _ = room_key_request(nio_client.olm)
+                session._crypto.capture()
+            started = threading.Event()
+            commit = session._store.database.commit
+            commits = 0
+
+            def fail_second_commit():
+                nonlocal commits
+                if threading.current_thread().name.startswith("nio-durable-store"):
+                    commits += 1
+                    if commits == 2:
+                        started.set()
+                        time.sleep(SLOW)
+                        raise sqlite3.OperationalError("disk I/O error")
+                return commit()
+
+            monkeypatch.setattr(session._store.database, "commit", fail_second_commit)
+            # The first COMMIT retains the request; the second applies the response.
+            sending = asyncio.create_task(
+                nio_client.to_device(
+                    ToDeviceMessage("org.example.notice", USER, "OTHER", {"value": 1}),
+                    "stable-send",
+                )
+            )
+            await until(started)
+            # The failed body already removed the sent message from live state.
+            with pytest.raises(LocalProtocolError, match="commit failed"):
+                nio_client.cancel_key_share(request)
+            with pytest.raises(sqlite3.OperationalError):
+                await sending
+        finally:
+            await session.close()
+            await nio_client.close()
+    reopened = open_session(tmp_path)
+    try:
+        pending = reopened._crypto._pending()
+        assert pending is not None
+        assert pending[0].request_id == "stable-send"
+    finally:
+        await reopened.close()
+        await reopened.client.close()

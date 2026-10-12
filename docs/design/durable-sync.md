@@ -331,7 +331,9 @@ body's in-memory changes before its COMMIT returns, but anything it persists is
 ordered after that COMMIT: transactions and crypto sends take the store lock,
 and opening, synchronous trust and key-share calls, and nio store writes such as
 key import wait for the in-flight COMMIT and then commit their own transaction
-on the loop. nio store reads outside the lock, such
+on the loop. If that COMMIT failed, they raise instead, because live state still
+holds the rolled-back changes until the failed task disposes the client. nio
+store reads outside the lock, such
 as device trust checks while decrypting, share the connection, so serialized
 SQLite still makes them wait for the rest of an in-flight COMMIT, as every
 commit did before. In a benchmark of four stores sharing one loop, the worst
