@@ -41,7 +41,7 @@ type AsyncDataT = (
     | AsyncBufferedReader
 )
 
-type _EncryptedReturnT = AsyncGenerator[bytes | dict[str, Any], None]
+type _EncryptedReturnT = AsyncGenerator[bytes | dict[str, Any]]
 
 
 async def async_encrypt_attachment(data: AsyncDataT) -> _EncryptedReturnT:
@@ -98,7 +98,7 @@ async def async_encrypt_attachment(data: AsyncDataT) -> _EncryptedReturnT:
 async def async_generator_from_data(
     data: AsyncDataT,
     chunk_size: int = 4 * 1024,
-) -> AsyncGenerator[bytes, None]:
+) -> AsyncGenerator[bytes]:
     aio_opened = False
     if isinstance(data, (str, Path)):
         data = await aiofiles.open(data, "rb")

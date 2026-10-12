@@ -2274,7 +2274,7 @@ class SyncResponse(Response):
     @staticmethod
     def _get_account_data(
         parsed_dict: dict[str, Any],
-    ) -> Generator[AccountDataEvent, None, None]:
+    ) -> Generator[AccountDataEvent]:
         for ev_dict in parsed_dict.get("account_data", {}).get("events", []):
             yield AccountDataEvent.parse_event(ev_dict)
 

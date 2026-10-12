@@ -202,6 +202,22 @@ async def test_timeout_during_commit_raises_timeout_after_commit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_timeout_ending_at_transaction_does_not_leak_cancellation(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        slow_statement(store, "COMMIT")
+        # The transaction is the block's last await, so the deferred
+        # cancellation must not outlive the timeout that requested it.
+        async with asyncio.timeout(SLOW / 3):
+            async with store.transaction():
+                store.publish((message(),))
+        await asyncio.sleep(0)
+        assert store.has_batches()
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_close_waits_for_inflight_commit_and_reaps_thread(tmp_path):
     store = open_store(tmp_path)
     started, _ = slow_statement(store, "COMMIT")

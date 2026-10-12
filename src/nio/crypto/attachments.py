@@ -94,7 +94,7 @@ def encrypt_attachment(plaintext: bytes) -> tuple[bytes, dict[str, Any]]:
 
 def encrypted_attachment_generator(
     data: DataT,
-) -> Generator[bytes | dict[str, Any], None, None]:
+) -> Generator[bytes | dict[str, Any]]:
     """Generator to encrypt data in order to send it as an encrypted
     attachment.
 
