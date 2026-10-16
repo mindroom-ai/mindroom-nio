@@ -495,8 +495,9 @@ async def test_synchronous_key_share_refuses_to_persist_after_failed_commit(
 
 
 @pytest.mark.asyncio
-async def test_close_during_runner_commit_cancels_the_runner(tmp_path):
+async def test_close_during_runner_commit_cancels_the_runner_once(tmp_path):
     stop = asyncio.Event()
+    cancellations = 0
 
     async def sync(request):
         if request.query.get("since"):
@@ -507,13 +508,25 @@ async def test_close_during_runner_commit_cancels_the_runner(tmp_path):
         nio_client = client()
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
+
+        async def supervise():
+            nonlocal cancellations
+            try:
+                await session.run()
+            except asyncio.CancelledError:
+                cancellations += 1
+            # Cleanup after the runner must not receive a second cancellation.
+            await asyncio.sleep(0)
+            return "cleaned up"
+
         try:
             started, _ = slow_statement(session._store, "COMMIT")
-            runner = asyncio.create_task(session.run())
+            supervisor = asyncio.create_task(supervise())
             # close() cancels the runner while its capture COMMIT runs.
             await until(started)
             await session.close()
-            assert runner.cancelled()
+            assert await supervisor == "cleaned up"
+            assert cancellations == 1
         finally:
             stop.set()
             await session.close()
@@ -561,3 +574,4 @@ async def test_room_send_waits_for_the_commit_that_establishes_its_baseline(
         finally:
             await session.close()
             await nio_client.close()
+
