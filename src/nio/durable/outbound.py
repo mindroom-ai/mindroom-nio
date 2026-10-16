@@ -167,14 +167,25 @@ class OutboundCrypto:
                 raise LocalProtocolError(
                     "encrypted to-device key claim supplied no valid session"
                 )
+            error: LocalProtocolError | None = None
             async with self.transaction():
-                device = operation.resolve(self.crypto.olm, query)
-                message = operation.encrypt(self.crypto.olm, device)
-                request = self.crypto.enqueue_message(
-                    message,
-                    request_id=tx_id,
-                    encrypted_fingerprint=operation.fingerprint,
-                )
+                # Starting the transaction yields, so another caller may have
+                # blocked the recipient meanwhile. resolve() and encrypt()
+                # raise LocalProtocolError only before mutating the ratchet.
+                try:
+                    device = operation.resolve(self.crypto.olm, query)
+                    message = operation.encrypt(self.crypto.olm, device)
+                except LocalProtocolError as check_error:
+                    error = check_error
+                else:
+                    request = self.crypto.enqueue_message(
+                        message,
+                        request_id=tx_id,
+                        encrypted_fingerprint=operation.fingerprint,
+                    )
+            # An error raised inside the transaction disposes the client.
+            if error is not None:
+                raise error
             response = await self._send(request)
             assert isinstance(response, ToDeviceResponse)
             return response

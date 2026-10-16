@@ -23,6 +23,7 @@ from nio.store import SqliteMemoryStore
 
 from .client_test import CONSUMER, USER, client, open_session
 from .runner_test import homeserver
+from .store_thread_test import slow_statement, until
 
 PEER = "@peer:example.org"
 
@@ -461,6 +462,49 @@ async def test_encrypted_send_rechecks_blacklist_after_claim_await(
                     notice(),
                     recipient_ed25519=peer_olm.account.identity_keys["ed25519"],
                 )
+
+
+@pytest.mark.asyncio
+async def test_encrypted_send_blocked_while_waiting_for_store_keeps_session(
+    tmp_path, peer
+):
+    peer_olm, keys = peer
+
+    async def query(request):
+        return web.json_response(query_body(keys))
+
+    async def send(request):
+        pytest.fail("blocked recipient reached HTTP")
+
+    async with homeserver(None, query=query, membership=send) as (url, _):
+        async with transport_client(tmp_path, url, True) as (nio_client, owner):
+            await seed_session(nio_client, owner, keys)
+            device = nio_client.olm.device_store[PEER]["OTHER"]
+            # The first COMMIT retains the query; the second applies its response.
+            started, _ = slow_statement(owner._store, "COMMIT", skip=1)
+            sending = asyncio.create_task(
+                nio_client.encrypted_to_device(
+                    notice(),
+                    recipient_ed25519=peer_olm.account.identity_keys["ed25519"],
+                )
+            )
+            await until(started)
+            holding = asyncio.Event()
+
+            async def hold():
+                # Queued behind the query response, so the send passes its
+                # checks and then waits for this transaction.
+                async with owner._store.transaction():
+                    holding.set()
+
+            holder = asyncio.create_task(hold())
+            await until(holding)
+            # Another caller blocks the recipient during that wait.
+            nio_client.blacklist_device(device)
+            with pytest.raises(LocalProtocolError, match="unavailable or blocked"):
+                await sending
+            await holder
+            owner._assert_active()
 
 
 KILLED_SEND_WORKER = """
