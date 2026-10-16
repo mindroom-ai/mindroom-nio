@@ -2304,15 +2304,6 @@ class AsyncClient(Client):
             except KeyError:
                 raise LocalProtocolError(f"No such room with id {room_id} found.")
 
-            if (
-                self._durable_session is not None
-                and not room.encrypted
-                and not self._durable_session._metadata[room_id].get("baseline")
-            ):
-                raise LocalProtocolError(
-                    "room state must be established before plaintext sending"
-                )
-
             if room.encrypted:
                 if not room.members_synced:
                     if self._durable_session is not None:
@@ -2332,10 +2323,43 @@ class AsyncClient(Client):
                             ignore_unverified_devices=ignore_unverified_devices,
                         )
 
-                # Reactions do not support encryption yet.
-                # https://github.com/matrix-org/matrix-doc/pull/1849
-                if message_type != "m.reaction":
-                    message_type, content = self.encrypt(room_id, message_type, content)
+            if self._durable_session is not None:
+                # Durable bodies mutate live rooms before their COMMIT returns,
+                # so authorize and encrypt only while no COMMIT is in flight.
+                self._durable_session._assert_active()
+                async with self._durable_session._store.locked():
+                    return self._room_send_request(
+                        room_id, message_type, content, tx_id
+                    )
+            return self._room_send_request(room_id, message_type, content, tx_id)
+
+        return Api.room_send(self.access_token, room_id, message_type, content, tx_id)
+
+    def _room_send_request(
+        self,
+        room_id: str,
+        message_type: str,
+        content: dict[Any, Any],
+        tx_id: str | UUID,
+    ) -> tuple[str, str, str]:
+        try:
+            room = self.rooms[room_id]
+        except KeyError:
+            raise LocalProtocolError(f"No such room with id {room_id} found.")
+
+        if (
+            self._durable_session is not None
+            and not room.encrypted
+            and not self._durable_session._metadata[room_id].get("baseline")
+        ):
+            raise LocalProtocolError(
+                "room state must be established before plaintext sending"
+            )
+
+        # Reactions do not support encryption yet.
+        # https://github.com/matrix-org/matrix-doc/pull/1849
+        if room.encrypted and message_type != "m.reaction":
+            message_type, content = self.encrypt(room_id, message_type, content)
 
         return Api.room_send(self.access_token, room_id, message_type, content, tx_id)
 

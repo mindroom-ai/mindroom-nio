@@ -519,3 +519,45 @@ async def test_close_during_runner_commit_cancels_the_runner(tmp_path):
             await session.close()
             await nio_client.close()
 
+
+@pytest.mark.asyncio
+async def test_room_send_waits_for_the_commit_that_establishes_its_baseline(
+    tmp_path, monkeypatch
+):
+    sent = []
+
+    async def send(request):
+        sent.append(await request.json())
+        return web.json_response({"event_id": "$sent"})
+
+    async with homeserver(None, membership=send) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            await session._capture_response(response(messages=0))
+            started = threading.Event()
+
+            def fail_commit():
+                started.set()
+                time.sleep(SLOW)
+                raise sqlite3.OperationalError("disk I/O error")
+
+            monkeypatch.setattr(session._store.database, "commit", fail_commit)
+            # Preparation establishes the room's plaintext baseline, then
+            # fails to commit it.
+            preparing = asyncio.create_task(session._prepare_pending())
+            await until(started)
+            sending = asyncio.create_task(
+                nio_client.room_send(
+                    ROOM, "m.room.message", {"msgtype": "m.text", "body": "early"}
+                )
+            )
+            with pytest.raises(sqlite3.OperationalError):
+                await preparing
+            with pytest.raises(LocalProtocolError):
+                await sending
+            assert sent == []
+        finally:
+            await session.close()
+            await nio_client.close()
