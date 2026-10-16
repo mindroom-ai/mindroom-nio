@@ -575,3 +575,64 @@ async def test_room_send_waits_for_the_commit_that_establishes_its_baseline(
             await session.close()
             await nio_client.close()
 
+
+@pytest.mark.asyncio
+async def test_encrypted_send_queued_behind_member_event_still_sends(tmp_path):
+    departed = "@old:example.org"
+    sent = []
+
+    async def http(request):
+        if "/send/m.room.encrypted/" in request.path:
+            sent.append(await request.json())
+            return web.json_response({"event_id": f"$sent-{len(sent)}"})
+        return web.json_response({})
+
+    async with homeserver(None, membership=http) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        olm = nio_client.olm
+        try:
+            await baseline(session)
+            room = nio_client.rooms[ROOM]
+            room.encrypted = True
+            room.members_synced = True
+            async with session._store.transaction():
+                publish_account(olm)
+                _, device = queue_dummy(olm, user_id=departed)
+                olm.outgoing_to_device_messages.clear()
+                nio_client.verify_device(device)
+                session._crypto.capture()
+            olm.users_for_key_query.clear()
+            await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "first"}
+            )
+            rename = member("$rename", "join", departed)
+            rename["content"]["displayname"] = "Renamed"
+            body = json.loads(response(token="s2", messages=0))
+            body["rooms"]["join"][ROOM]["state"]["events"] = []
+            body["rooms"]["join"][ROOM]["timeline"]["events"] = [rename]
+            await session._capture_response(json.dumps(body).encode())
+            started, _ = slow_statement(session._store, "COMMIT")
+
+            async def hold():
+                async with session._store.transaction():
+                    session._crypto.capture()
+
+            holder = asyncio.create_task(hold())
+            await until(started)
+            # Preparation of the member event, which invalidates the group
+            # session, queues behind another task's COMMIT; the send arrives
+            # while its group session is still shared.
+            preparing = asyncio.create_task(session._prepare_pending())
+            await asyncio.sleep(0.01)
+            reply = await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "second"}
+            )
+            assert reply.event_id == "$sent-2"
+            await asyncio.gather(holder, preparing)
+            session._assert_active()
+        finally:
+            await session.close()
+            await nio_client.close()
+

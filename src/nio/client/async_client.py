@@ -2322,10 +2322,11 @@ class AsyncClient(Client):
                             room_id,
                             ignore_unverified_devices=ignore_unverified_devices,
                         )
-
-            if self._durable_session is not None:
+            elif self._durable_session is not None:
                 # Durable bodies mutate live rooms before their COMMIT returns,
-                # so authorize and encrypt only while no COMMIT is in flight.
+                # so authorize plaintext only while no COMMIT is in flight. A
+                # body that changes recipients invalidates the group session,
+                # and sharing it again waits for that COMMIT.
                 self._durable_session._assert_active()
                 async with self._durable_session._store.locked():
                     return self._room_send_request(

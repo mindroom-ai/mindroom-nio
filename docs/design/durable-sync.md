@@ -328,15 +328,19 @@ a body, status reads (cursor, retained input, queued batches, membership intent,
 retained crypto request and progress) return values captured after the last
 commit, so they never wait for an in-flight commit. Another task can see a
 body's in-memory changes before its COMMIT returns, but anything it persists or
-sends is ordered after that COMMIT: transactions, crypto sends and room sends
-take the store lock, and opening, synchronous trust and key-share calls, and nio
-store writes such as key import wait for the in-flight COMMIT and then commit
-their own transaction on the loop. If that COMMIT failed, they raise instead,
-because live state still holds the rolled-back changes until the failed task
-disposes the client. nio store reads outside the lock, such as device trust
-checks while decrypting, share the connection, so serialized SQLite still makes
-them wait for the rest of an in-flight COMMIT, as every commit did before. In a
-benchmark of four stores sharing one loop, the worst
+sends is ordered after that COMMIT: transactions, crypto sends and plaintext
+room sends take the store lock, an encrypted room send first shares again a
+group session that a body invalidated, and opening, synchronous trust and
+key-share calls, and nio store writes such as key import wait for the in-flight
+COMMIT and then commit their own transaction on the loop. If that COMMIT failed,
+they raise instead, because live state still holds the rolled-back changes until
+the failed task disposes the client. Because starting a transaction yields, code
+that checks state before one repeats the check inside the body and raises its
+failure after the transaction, since an exception inside a body disposes the
+client. nio store reads outside the lock, such as device trust checks while
+decrypting, share the connection, so serialized SQLite still makes them wait for
+the rest of an in-flight COMMIT, as every commit did before. In a benchmark of
+four stores sharing one loop, the worst
 loop gap fell from between 81 and 1394 ms to at most 6 ms, on an idle disk and
 under competing fsync load. No database queue, serializer dependency, or
 generic retry framework is introduced. Whole-response JSON is decoded once per
