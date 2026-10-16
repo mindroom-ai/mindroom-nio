@@ -195,10 +195,17 @@ class OutboundCrypto:
             response = await self._finish_pending()
             if isinstance(response, KeysUploadResponse):
                 return response
-            if not self.client.should_upload_keys:
-                raise LocalProtocolError("No key upload needed.")
+            error: LocalProtocolError | None = None
             async with self.transaction():
-                request = self.crypto.enqueue_upload()
+                # Starting the transaction yields, so sync may have applied a
+                # fresher one-time key count meanwhile.
+                if self.client.should_upload_keys:
+                    request = self.crypto.enqueue_upload()
+                else:
+                    error = LocalProtocolError("No key upload needed.")
+            # An error raised inside the transaction disposes the client.
+            if error is not None:
+                raise error
             response = await self._send(request)
             assert isinstance(response, KeysUploadResponse)
             return response

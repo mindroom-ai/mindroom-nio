@@ -636,3 +636,37 @@ async def test_encrypted_send_queued_behind_member_event_still_sends(tmp_path):
             await session.close()
             await nio_client.close()
 
+
+@pytest.mark.asyncio
+async def test_key_upload_after_fresher_key_count_fails_without_disposal(tmp_path):
+    nio_client = client()
+    session = open_session(tmp_path, nio_client)
+    olm = nio_client.olm
+    try:
+        async with session._outbound.transaction():
+            publish_account(olm)
+            olm.uploaded_key_count = 0
+            session._crypto.capture()
+        started, _ = slow_statement(session._store, "COMMIT")
+
+        async def hold():
+            async with session._store.transaction():
+                session._crypto.capture()
+
+        async def apply_count():
+            # Sync preparation applies the server's one-time key count.
+            async with session._outbound.transaction():
+                olm.uploaded_key_count = olm.account.max_one_time_keys
+                session._crypto.capture()
+
+        holder = asyncio.create_task(hold())
+        await until(started)
+        counting = asyncio.create_task(apply_count())
+        await asyncio.sleep(0.01)
+        with pytest.raises(LocalProtocolError, match="No key upload needed"):
+            await nio_client.keys_upload()
+        await asyncio.gather(holder, counting)
+        session._assert_active()
+    finally:
+        await session.close()
+        await nio_client.close()
