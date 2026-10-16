@@ -492,3 +492,30 @@ async def test_synchronous_key_share_refuses_to_persist_after_failed_commit(
     finally:
         await reopened.close()
         await reopened.client.close()
+
+
+@pytest.mark.asyncio
+async def test_close_during_runner_commit_cancels_the_runner(tmp_path):
+    stop = asyncio.Event()
+
+    async def sync(request):
+        if request.query.get("since"):
+            await stop.wait()
+        return web.Response(body=response())
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            started, _ = slow_statement(session._store, "COMMIT")
+            runner = asyncio.create_task(session.run())
+            # close() cancels the runner while its capture COMMIT runs.
+            await until(started)
+            await session.close()
+            assert runner.cancelled()
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+

@@ -556,6 +556,13 @@ class DurableSync:
                 await self._accept_response(
                     body, full_state=full_state, newly_joined_room=newly_joined_room
                 )
+        except LocalProtocolError:
+            # close() cancels the runner, but a transaction delivers that
+            # cancellation only after its COMMIT, so a check can see the
+            # closed session first.
+            if self._closed and running.cancelling():
+                raise asyncio.CancelledError from None
+            raise
         finally:
             self._running = None
             self._changed.set()
