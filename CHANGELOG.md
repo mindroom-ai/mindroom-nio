@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.5
+
+- Answer the durable sync loop's routine polls (pending batches, retained input, cursor, acknowledgement and membership intent) from state the store mirrors from its own writes, so a Classic sync issues about half as many SQLite statements on the event loop.
+- Require durable writes to run inside the store's own transaction, and refuse to start a store transaction inside one it did not open.
+
 ## 1.1.4
 
 - Copy event trees received from other users through the C JSON codec instead of `deepcopy`, so deeply nested event content no longer stops durable sync.
