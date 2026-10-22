@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +36,23 @@ class _Database(SqliteDatabase):
         if self.revoked:
             raise LocalProtocolError("durable store is closed")
         return super().connect(reuse_if_open)
+
+
+@dataclass(slots=True)
+class _LoopState:
+    """Rows the sync loop polls, mirrored from the store's own connection.
+
+    Every SQLite call releases the GIL, and an event loop that releases it
+    waits for any busy thread to hand it back, so each skipped poll saves a
+    wait. Only DurableStore methods write these rows.
+    """
+
+    cursor: str | None
+    acked_sequence: int
+    continuation: str | None
+    """The retained input's encoded continuation, or None without input."""
+    pending: deque[int]
+    """Published batch sequences, oldest first."""
 
 
 class _MatrixStore(SqliteStore):
@@ -87,6 +106,7 @@ class DurableStore:
         self._transaction_depth = 0
         self._intent_cached = False
         self._local_intent: dict[str, Any] | None = None
+        self._loop_state: _LoopState | None = None
         self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
@@ -241,6 +261,7 @@ class DurableStore:
             # A failed commit or nested rollback invalidates speculative writes.
             # Reload from this connection before comparing another projection.
             self._room_metadata = None
+            self._loop_state = None
             raise
         finally:
             self._transaction_depth -= 1
@@ -279,7 +300,8 @@ class DurableStore:
                 "SELECT body FROM NioDurableCrypto WHERE kind='membership' AND key='current'"
             ).fetchone()
             self._local_intent = json.loads(row[0]) if row else None
-            self._intent_cached = self._transaction_depth > 0
+            # Writes need a transaction, and every transaction boundary invalidates this.
+            self._intent_cached = True
         # Callers edit their intent before explicitly saving it.
         return deepcopy(self._local_intent)
 
@@ -304,45 +326,66 @@ class DurableStore:
         )
         self._invalidate_local_intent()
 
+    def _state(self) -> _LoopState:
+        self._assert_open()
+        if self._loop_state is None:
+            cursor, acked_sequence = self.database.execute_sql(
+                "SELECT cursor,acked_sequence FROM NioDurableMeta WHERE id=1"
+            ).fetchone()
+            row = self.database.execute_sql(
+                "SELECT continuation FROM NioDurableInput WHERE id=1"
+            ).fetchone()
+            pending = deque(
+                sequence
+                for (sequence,) in self.database.execute_sql(
+                    "SELECT sequence FROM NioDurableBatch ORDER BY sequence"
+                )
+            )
+            self._loop_state = _LoopState(
+                cursor, acked_sequence, row[0] if row else None, pending
+            )
+        return self._loop_state
+
     @property
     def cursor(self) -> str | None:
-        self._assert_open()
-        return self.database.execute_sql(
-            "SELECT cursor FROM NioDurableMeta WHERE id=1"
-        ).fetchone()[0]
+        return self._state().cursor
 
     def set_cursor(self, cursor: str) -> None:
         self._require_transaction()
+        state = self._state()
         self.database.execute_sql(
             "UPDATE NioDurableMeta SET cursor=? WHERE id=1", (cursor,)
         )
+        state.cursor = cursor
+
+    @property
+    def acked_sequence(self) -> int:
+        return self._state().acked_sequence
+
+    @property
+    def progress_generation(self) -> int:
+        """Monotonic progress from committed publication and acknowledgement."""
+        state = self._state()
+        newest = state.pending[-1] if state.pending else 0
+        return state.acked_sequence + max(state.acked_sequence, newest)
 
     @property
     def input(self) -> tuple[bytes, dict[str, Any]] | None:
-        self._assert_open()
+        if not self.has_input():
+            return None
         row = self.database.execute_sql(
             "SELECT body,continuation FROM NioDurableInput WHERE id=1"
         ).fetchone()
-        if row is None:
-            return None
         return bytes(row[0]), self._decode_continuation(row[1])
 
     def has_input(self) -> bool:
-        self._assert_open()
-        return (
-            self.database.execute_sql(
-                "SELECT 1 FROM NioDurableInput WHERE id=1"
-            ).fetchone()
-            is not None
-        )
+        return self._state().continuation is not None
 
     @property
     def continuation(self) -> dict[str, Any] | None:
-        self._assert_open()
-        row = self.database.execute_sql(
-            "SELECT continuation FROM NioDurableInput WHERE id=1"
-        ).fetchone()
-        return self._decode_continuation(row[0]) if row else None
+        # Decode a fresh value each time; callers edit it before saving it.
+        encoded = self._state().continuation
+        return self._decode_continuation(encoded) if encoded is not None else None
 
     @staticmethod
     def _decode_continuation(encoded: str) -> dict[str, Any]:
@@ -353,22 +396,29 @@ class DurableStore:
 
     def capture(self, body: bytes) -> None:
         self._require_transaction()
-        if self.database.execute_sql("SELECT 1 FROM NioDurableInput").fetchone():
+        state = self._state()
+        if state.continuation is not None:
             raise LocalProtocolError("cannot replace unfinished durable response")
         self.database.execute_sql(
             "INSERT INTO NioDurableInput(id,body) VALUES(1,?)", (body,)
         )
+        state.continuation = "{}"
 
     def save_continuation(self, continuation: dict[str, Any]) -> None:
         self._require_transaction()
+        state = self._state()
+        encoded = encode_json(continuation)
         self.database.execute_sql(
-            "UPDATE NioDurableInput SET continuation=? WHERE id=1",
-            (encode_json(continuation),),
+            "UPDATE NioDurableInput SET continuation=? WHERE id=1", (encoded,)
         )
+        if state.continuation is not None:
+            state.continuation = encoded
 
     def finish_input(self) -> None:
         self._require_transaction()
+        state = self._state()
         self.database.execute_sql("DELETE FROM NioDurableInput WHERE id=1")
+        state.continuation = None
 
     def publish(
         self,
@@ -378,6 +428,7 @@ class DurableStore:
         encoded_records: str | None = None,
     ) -> SyncBatch:
         self._require_transaction()
+        state = self._state()
         cursor = self.database.execute_sql(
             "INSERT INTO NioDurableBatch(records,completes_sync) VALUES(?,?)",
             (
@@ -389,16 +440,11 @@ class DurableStore:
                 completes_sync,
             ),
         )
+        state.pending.append(cursor.lastrowid)
         return SyncBatch(self.stream_id, cursor.lastrowid, records, completes_sync)
 
     def has_batches(self) -> bool:
-        self._assert_open()
-        return (
-            self.database.execute_sql(
-                "SELECT 1 FROM NioDurableBatch LIMIT 1"
-            ).fetchone()
-            is not None
-        )
+        return bool(self._state().pending)
 
     @property
     def pending_bytes(self) -> int:
@@ -414,7 +460,8 @@ class DurableStore:
         ).fetchone()[0]
 
     def next_batch(self) -> SyncBatch | None:
-        self._assert_open()
+        if not self.has_batches():
+            return None
         row = self.database.execute_sql(
             "SELECT sequence,records,completes_sync FROM NioDurableBatch ORDER BY sequence LIMIT 1"
         ).fetchone()
@@ -431,17 +478,12 @@ class DurableStore:
         self._assert_open()
         if batch.stream_id != self.stream_id:
             raise LocalProtocolError("batch belongs to another durable stream")
+        state = self._state()
+        if batch.sequence <= state.acked_sequence:
+            return
+        if not state.pending or batch.sequence != state.pending[0]:
+            raise LocalProtocolError("acknowledgement must name the oldest batch")
         with self.transaction():
-            acked = self.database.execute_sql(
-                "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
-            ).fetchone()[0]
-            if batch.sequence <= acked:
-                return
-            oldest = self.database.execute_sql(
-                "SELECT sequence FROM NioDurableBatch ORDER BY sequence LIMIT 1"
-            ).fetchone()
-            if oldest is None or batch.sequence != oldest[0]:
-                raise LocalProtocolError("acknowledgement must name the oldest batch")
             self.database.execute_sql(
                 "DELETE FROM NioDurableBatch WHERE sequence=?", (batch.sequence,)
             )
@@ -449,6 +491,8 @@ class DurableStore:
                 "UPDATE NioDurableMeta SET acked_sequence=? WHERE id=1",
                 (batch.sequence,),
             )
+            state.pending.popleft()
+            state.acked_sequence = batch.sequence
 
     def close(self) -> None:
         if self._closed:
@@ -457,4 +501,5 @@ class DurableStore:
             self.database.close()
         self.database.revoked = True
         self._closed = True
+        self._loop_state = None
         self._lease.close()

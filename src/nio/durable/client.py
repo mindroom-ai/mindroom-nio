@@ -387,11 +387,7 @@ class DurableSync:
     def progress_generation(self) -> int:
         """Monotonic progress from committed publication and acknowledgement."""
         self._assert_active()
-        return self._store.database.execute_sql(
-            "SELECT acked_sequence + "
-            "MAX(acked_sequence, COALESCE((SELECT MAX(sequence) FROM NioDurableBatch),0)) "
-            "FROM NioDurableMeta WHERE id=1"
-        ).fetchone()[0]
+        return self._store.progress_generation
 
     async def dispatch(
         self, record: SyncRecord, *, event: object | None = None
@@ -591,10 +587,9 @@ class DurableSync:
         self._assert_active()
         while intent := self._read_local_intent():
             if "sequence" in intent:
-                acked = self._store.database.execute_sql(
-                    "SELECT acked_sequence FROM NioDurableMeta WHERE id=1"
-                ).fetchone()[0]
-                if intent["sequence"] <= acked and intent.get("observed"):
+                if intent["sequence"] <= self._store.acked_sequence and intent.get(
+                    "observed"
+                ):
                     with self._store.transaction():
                         self._store.delete_local_intent()
                     return

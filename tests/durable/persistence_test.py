@@ -1,6 +1,7 @@
 """Reduce repeated persistence work without changing committed observations."""
 
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -8,7 +9,7 @@ from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, open_session, response
 from .recovery_test import baseline
-from .store_test import open_store
+from .store_test import message, open_store
 
 
 def observe_sql(monkeypatch, store):
@@ -60,18 +61,104 @@ def test_input_status_preserves_validation_and_rollback_without_loading_body(
                 assert not store.has_input()
                 raise RuntimeError("rollback")
         assert store.continuation == {"phase": "prepared"}
+        assert not any("SELECT body,continuation" in sql for sql in statements)
         store.database.execute_sql(
             "UPDATE NioDurableInput SET continuation='[]' WHERE id=1"
         )
+        # The store mirrors only its own writes, so the damaged row is read on reopen.
+        store.close()
+        store = open_store(tmp_path)
         with pytest.raises(LocalProtocolError, match="continuation"):
             _ = store.continuation
-        assert not any("SELECT body,continuation" in sql for sql in statements)
     finally:
         store.close()
     with pytest.raises(LocalProtocolError, match="closed"):
         store.has_input()
     with pytest.raises(LocalProtocolError, match="closed"):
         _ = store.continuation
+
+
+def loop_view(store):
+    return (
+        store.has_batches(),
+        store.has_input(),
+        store.cursor,
+        store.continuation,
+        store.acked_sequence,
+        store.progress_generation,
+        store.read_local_intent(),
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_sync_loop_polls_read_no_sql_and_follow_commits_and_rollbacks(
+    tmp_path, monkeypatch, nested
+):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            store.capture(b'{"next_batch":"s1"}')
+            store.set_cursor("s1")
+            first = store.publish((message(),))
+        statements = observe_sql(monkeypatch, store)
+        for _ in range(3):
+            assert loop_view(store) == (True, True, "s1", {}, 0, 1, None)
+        # Only the membership intent is read again, once after each transaction.
+        assert len(statements) == 1
+        assert "'membership'" in statements[0]
+
+        with pytest.raises(RuntimeError, match="rollback"):
+            with store.transaction() if nested else nullcontext():
+                with store.transaction():
+                    store.publish(())
+                    store.set_cursor("lost")
+                    store.save_continuation({"phase": "lost"})
+                    store.finish_input()
+                    assert loop_view(store)[:4] == (True, False, "lost", None)
+                    raise RuntimeError("rollback")
+        assert loop_view(store) == (True, True, "s1", {}, 0, 1, None)
+
+        store.ack(first)
+        with store.transaction():
+            store.save_continuation({"phase": "prepared"})
+            second = store.publish(())
+        statements.clear()
+        assert loop_view(store) == (True, True, "s1", {"phase": "prepared"}, 1, 3, None)
+        assert store.next_batch() == second
+        store.ack(second)
+        assert store.next_batch() is None
+        assert not any(
+            sql.startswith("SELECT") and "NioDurableMeta" in sql for sql in statements
+        )
+        expected = loop_view(store)
+    finally:
+        store.close()
+    reopened = open_store(tmp_path)
+    try:
+        assert loop_view(reopened) == expected
+    finally:
+        reopened.close()
+
+
+def test_failed_ack_commit_reloads_pending_batches(tmp_path, monkeypatch):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            batch = store.publish((message(),))
+        commit = store.database.commit
+
+        def fail():
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(store.database, "commit", fail)
+        with pytest.raises(RuntimeError, match="disk full"):
+            store.ack(batch)
+        monkeypatch.setattr(store.database, "commit", commit)
+        assert store.has_batches()
+        assert store.acked_sequence == 0
+        assert store.next_batch() == batch
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio
