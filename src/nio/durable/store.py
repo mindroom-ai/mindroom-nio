@@ -246,12 +246,18 @@ class DurableStore:
 
     def _require_transaction(self) -> None:
         self._assert_open()
-        if not self.database.in_transaction():
+        # Only a failed transaction() resets the mirrored loop state, so no other
+        # transaction on this connection may carry durable mutations.
+        if not self._transaction_depth:
             raise LocalProtocolError("durable mutation requires a transaction")
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
         self._assert_open()
+        if not self._transaction_depth and self.database.in_transaction():
+            raise LocalProtocolError(
+                "durable transaction cannot join another transaction"
+            )
         self._transaction_depth += 1
         self._invalidate_local_intent()
         try:

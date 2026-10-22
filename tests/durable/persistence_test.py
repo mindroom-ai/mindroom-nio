@@ -140,6 +140,46 @@ def test_sync_loop_polls_read_no_sql_and_follow_commits_and_rollbacks(
         reopened.close()
 
 
+def test_caught_inner_failure_keeps_the_outer_transactions_writes(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            store.capture(b"{}")
+            store.set_cursor("outer")
+            store.publish((message(),))
+            with pytest.raises(RuntimeError, match="inner"):
+                with store.transaction():
+                    store.publish(())
+                    store.set_cursor("inner")
+                    store.finish_input()
+                    raise RuntimeError("inner")
+            assert loop_view(store) == (True, True, "outer", {}, 0, 1, None)
+        expected = loop_view(store)
+        assert expected == (True, True, "outer", {}, 0, 1, None)
+    finally:
+        store.close()
+    reopened = open_store(tmp_path)
+    try:
+        assert loop_view(reopened) == expected
+    finally:
+        reopened.close()
+
+
+def test_durable_writes_need_the_stores_own_transaction(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.database.atomic():
+            with pytest.raises(LocalProtocolError, match="requires a transaction"):
+                store.publish(())
+            with pytest.raises(LocalProtocolError, match="another transaction"):
+                with store.transaction():
+                    pass
+        assert not store.has_batches()
+        assert store.next_batch() is None
+    finally:
+        store.close()
+
+
 def test_failed_ack_commit_reloads_pending_batches(tmp_path, monkeypatch):
     store = open_store(tmp_path)
     try:
