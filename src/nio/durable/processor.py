@@ -67,16 +67,30 @@ class Processor:
             room_id = room.room_id if room else None
             change = None
             historical = item.provenance is TimelineEventProvenance.HISTORY
+            # Matrix never encrypts state, so plaintext decrypted from an
+            # m.room.encrypted event is never membership or room state.
+            decrypted = (
+                item.source is not None
+                and item.source.get("type") == "m.room.encrypted"
+            )
+            member = (
+                isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
+                and not decrypted
+            )
             if room is not None and room_id is not None:
-                if isinstance(item.event, (BadEvent, UnknownBadEvent)) and (
-                    item.route in (None, "invite")
-                    or "state_key" in item.event.source
-                    or item.event.source.get("type")
-                    in (
-                        "m.room.member",
-                        "m.room.create",
-                        "m.room.power_levels",
-                        "m.room.encryption",
+                if (
+                    not decrypted
+                    and isinstance(item.event, (BadEvent, UnknownBadEvent))
+                    and (
+                        item.route in (None, "invite")
+                        or "state_key" in item.event.source
+                        or item.event.source.get("type")
+                        in (
+                            "m.room.member",
+                            "m.room.create",
+                            "m.room.power_levels",
+                            "m.room.encryption",
+                        )
                     )
                 ):
                     raise LocalProtocolError("malformed durable room state")
@@ -100,10 +114,8 @@ class Processor:
                     change = session._change_membership(room_id, item.section)
                     if change is None:
                         continue
-                if (
-                    isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
-                    and not historical
-                ):
+                if member and not historical:
+                    assert isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
                     self.members.add((room_id, item.event.state_key))
                     if item.event.state_key == session.client.user_id:
                         self.explicit_memberships.add(room_id)
@@ -124,11 +136,7 @@ class Processor:
                     session._metadata[room_id]["baseline"] = False
                     if room_id not in self.history_rooms:
                         self.history_rooms.append(room_id)
-                if not historical and (
-                    member_deleted
-                    or change is not None
-                    or isinstance(item.event, (RoomMemberEvent, InviteMemberEvent))
-                ):
+                if not historical and (member_deleted or change is not None or member):
                     session.client.invalidate_outbound_session(room_id)
                     session._outbound.member_cache.pop(room_id, None)
                 if item.event is not None and getattr(item.event, "source", {}).get(
@@ -153,9 +161,7 @@ class Processor:
                         else record.provenance
                     ),
                 )
-            barrier = change is not None or isinstance(
-                item.event, (RoomMemberEvent, InviteMemberEvent)
-            )
+            barrier = change is not None or member
             if (
                 self.stop_on_oversized
                 and len(encode_records((record,)).encode())

@@ -6,7 +6,13 @@ from uuid import UUID
 
 import pytest
 
-from nio import AsyncClient, AsyncClientConfig, RoomMessageText
+from nio import (
+    AsyncClient,
+    AsyncClientConfig,
+    Event,
+    RoomMessageText,
+    TimelineEventProvenance,
+)
 from nio.durable import DurableSyncConfig, open_durable_sync
 from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind, SyncRecord
@@ -403,3 +409,80 @@ async def test_started_ordinary_sync_rejects_durable_attachment(
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
         await nio_client.close()
+
+
+def _encrypted_response(token):
+    body = json.loads(response(token=token, messages=1))
+    room = body["rooms"]["join"][ROOM]
+    room["state"]["events"] = []
+    room["timeline"]["events"].insert(
+        0,
+        {
+            "type": "m.room.encrypted",
+            "sender": "@mallory:example.org",
+            "event_id": "$cipher",
+            "origin_server_ts": 5,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "sender_key": "mallory-key",
+                "ciphertext": "AgAAAA",
+                "session_id": "session",
+                "device_id": "MALLORY",
+            },
+        },
+    )
+    return json.dumps(body).encode()
+
+
+async def _drain(session):
+    records = []
+    while batch := await session.next_batch():
+        records.extend(batch.records)
+        await session.ack(batch)
+    return records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plaintext",
+    [
+        {"state_key": USER, "content": {"membership": "leave"}},
+        {"state_key": "@bob:example.org", "content": {"membership": 5}},
+    ],
+    ids=["own-leave", "malformed-state"],
+)
+async def test_decrypted_state_never_changes_durable_membership(tmp_path, plaintext):
+    """Matrix never encrypts state, so state-shaped Megolm plaintext is just a message."""
+    session = open_session(tmp_path)
+    client = session.client
+    try:
+        await session._accept_response(response(messages=0))
+        await _drain(session)
+        with session._store.transaction():
+            session._store.finish_input()
+        source = {
+            "type": "m.room.member",
+            "event_id": "$cipher",
+            "sender": "@mallory:example.org",
+            "origin_server_ts": 5,
+            **plaintext,
+        }
+        forged = Event.parse_event(source)
+        forged.decrypted = isinstance(forged, Event)
+        client._decrypt_timeline_event = lambda event, _room_id: (
+            forged if event.event_id == "$cipher" else None
+        )
+
+        await session._accept_response(_encrypted_response("s2"))
+        records = await _drain(session)
+
+        assert ROOM in client.rooms
+        assert not [record.membership for record in records if record.membership]
+        assert not [
+            record
+            for record in records
+            if record.kind is RecordKind.TIMELINE
+            and record.provenance is TimelineEventProvenance.HISTORY
+        ]
+    finally:
+        await session.close()

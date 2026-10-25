@@ -927,7 +927,7 @@ class Client:
         else:
             room.handle_event(event)
 
-        return decrypted_event
+        return None
 
     def _decrypt_timeline_event(
         self, event: Event | BadEventType, room_id: str

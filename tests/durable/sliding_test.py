@@ -2,12 +2,13 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from aiohttp import web
 
-from nio import TimelineEventProvenance
+from nio import Event, TimelineEventProvenance
 from nio.durable import DurableSyncConfig, SlidingSyncConfig
 from nio.durable.model import RecordKind
 from nio.exceptions import LocalProtocolError
@@ -861,3 +862,27 @@ async def test_incremental_hero_profile_survives_restart(tmp_path):
         )
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_decrypted_own_membership_never_proves_or_breaks_tenure(tmp_path):
+    """Matrix never encrypts state, so a decrypted own leave in the live timeline is ignored."""
+    session = open_session(tmp_path, client(), settings())
+    try:
+        joined = Event.parse_event(member("$join", "join"))
+        forged = Event.parse_event(member("$forged", "leave"))
+        forged.decrypted = True
+        session._sliding.baselines[ROOM] = {"membership": "$join", "event_ids": []}
+        room = SimpleNamespace(
+            num_live=1,
+            initial=False,
+            expanded_timeline=False,
+            timeline=[forged],
+            required_state=[joined],
+            membership="join",
+            stripped_state=[],
+        )
+
+        assert session._sliding.membership(ROOM, room) == ("$join", True)
+    finally:
+        await session.close()

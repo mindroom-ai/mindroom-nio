@@ -134,6 +134,7 @@ class SlidingSource:
             event
             for event in (*room.required_state, *live)
             if isinstance(event, (RoomMemberEvent, SlidingSyncStateStub))
+            and not (isinstance(event, RoomMemberEvent) and event.decrypted)
             and event.state_key == self.session.client.user_id
             and (
                 not isinstance(event, SlidingSyncStateStub)
@@ -143,8 +144,10 @@ class SlidingSource:
         continuous_proof = held.get("membership")
         new_join = False
         for candidate in live:
-            if not isinstance(candidate, RoomMemberEvent) or (
-                candidate.state_key != self.session.client.user_id
+            if (
+                not isinstance(candidate, RoomMemberEvent)
+                or candidate.decrypted
+                or candidate.state_key != self.session.client.user_id
             ):
                 continue
             unsigned = candidate.source.get("unsigned", {})
