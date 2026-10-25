@@ -49,6 +49,17 @@ def message_event(event_id):
     }
 
 
+def member_event(event_id, user_id, membership):
+    return {
+        "type": "m.room.member",
+        "event_id": event_id,
+        "sender": user_id,
+        "origin_server_ts": 1,
+        "state_key": user_id,
+        "content": {"membership": membership},
+    }
+
+
 def sync_response(*, state=(), timeline=(), section="join"):
     response = SyncResponse.from_dict(
         {
@@ -104,6 +115,32 @@ async def test_callback_observes_event_time_room_state(client):
         ("$rename2", "Second"),
         ("$second", "Second"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_decrypted_plaintext_never_changes_room_state(client, monkeypatch):
+    """Matrix never encrypts state, so state inside decrypted plaintext is ignored."""
+    forged = [
+        Event.parse_event(member_event("$leave", "@bob:example.org", "leave")),
+        Event.parse_event(name_event("$name", "Forged")),
+    ]
+    for event in forged:
+        event.decrypted = True
+    decrypted = iter(forged)
+    monkeypatch.setattr(
+        client, "_decrypt_timeline_event", lambda _event, _room_id: next(decrypted)
+    )
+    state = [
+        member_event("$join", "@bob:example.org", "join"),
+        name_event("$n", "Real"),
+    ]
+    timeline = [message_event("$e1"), message_event("$e2")]
+
+    await receive(client, sync_response(state=state, timeline=timeline))
+
+    room = client.rooms[ROOM_ID]
+    assert "@bob:example.org" in room.users
+    assert room.name == "Real"
 
 
 @pytest.mark.asyncio
