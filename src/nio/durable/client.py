@@ -597,6 +597,35 @@ class DurableSync:
             await self._changed.wait()
             self._assert_active()
 
+    def _room_ready(self, room_id: str) -> bool:
+        # Without complete room state the client cannot know whether a room is
+        # encrypted, so it sends plaintext only to rooms whose state is complete.
+        room = self.client.rooms.get(room_id)
+        return room is not None and (
+            room.encrypted or self._metadata.get(room_id, {}).get("baseline", False)
+        )
+
+    async def wait_for_room_ready(self, room_id: str) -> bool:
+        """Wait until the client can send messages to a joined room.
+
+        A room this client joins, by ``change_membership()`` or as sync first
+        reports it, has no established state until a sync delivers the room's
+        complete state, and ``room_send()`` refuses plaintext there until then.
+
+        Return True once the client can send to the room, at once if it
+        already can. Return False as soon as the client's own membership in
+        the room is not join, including when it is not join at the call.
+        Raise ``LocalProtocolError`` if the session closes while waiting.
+        """
+        self._assert_active()
+        while self._metadata.get(room_id, {}).get("membership") == "join":
+            if self._room_ready(room_id):
+                return True
+            self._changed.clear()
+            await self._changed.wait()
+            self._assert_active()
+        return False
+
     async def change_membership(
         self,
         *,

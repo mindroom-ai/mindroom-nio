@@ -442,9 +442,11 @@ window. A room with no retained projection cannot recover or become ready from
 an old checkpoint. A fresh initial/full-state response establishes only a future
 baseline. A new room whose encryption state is not yet known cannot send
 plaintext while waiting for that baseline; known encrypted rooms may use fresh
-recipient lookup. Recovery keeps its current input's pagination plan stable while
-draining; any checkpoint invalidation required by a tail reset happens after
-that input's Sliding commit.
+recipient lookup. `wait_for_room_ready(room_id)` applies the same rule, so a
+caller can wait for a joined room to accept sends; it returns False when the
+client's own membership is not join. Recovery keeps its current input's
+pagination plan stable while draining; any checkpoint invalidation required by
+a tail reset happens after that input's Sliding commit.
 
 An invitation replaces the joined-room cache entry and its persisted member
 snapshot with the current invited projection. Joined member writes remain

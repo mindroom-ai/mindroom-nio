@@ -7,6 +7,7 @@ import pytest
 from aiohttp import web
 
 from nio import TimelineEventProvenance
+from nio.durable import DurableSyncConfig
 from nio.durable.model import RecordKind
 from nio.exceptions import LocalProtocolError
 
@@ -65,6 +66,181 @@ async def test_new_local_join_waits_for_room_state_before_plaintext_send(tmp_pat
         finally:
             await session.close()
             await nio_client.close()
+
+
+async def unestablished_join(session):
+    """Let an incremental sync first report the room as joined."""
+    await session._accept_response(json.dumps({"next_batch": "s0"}).encode())
+    await settle(session)
+    await session._accept_response(response(messages=0))
+    await settle(session)
+    assert session._metadata[ROOM]["membership"] == "join"
+    assert not session._metadata[ROOM]["baseline"]
+
+
+@pytest.mark.asyncio
+async def test_join_before_filtered_first_sync_waits_for_complete_room_state(
+    tmp_path,
+):
+    release = asyncio.Event()
+    stop = asyncio.Event()
+    sent = []
+
+    async def sync(request):
+        if request.query.get("full_state") == "true":
+            await release.wait()
+            return web.Response(body=response(token="s2", messages=0))
+        if request.query.get("since"):
+            await stop.wait()
+        return web.Response(body=response(messages=0))
+
+    async def endpoint(request):
+        if "/send/" in request.path:
+            sent.append(await request.json())
+            return web.json_response({"event_id": "$sent"})
+        return web.json_response({})
+
+    async with homeserver(sync, membership=endpoint) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        config = DurableSyncConfig(sync_filter={"room": {"timeline": {"limit": 1}}})
+        session = open_session(tmp_path, nio_client, config)
+        runner = None
+        try:
+            assert await session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership=None,
+                previous_epoch=0,
+                current_membership="join",
+            )
+            ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
+            runner = asyncio.create_task(session.run())
+            # The first sync observes the join, but a filtered one is not
+            # complete room state.
+            await drain_sync(session)
+            assert session._read_local_intent()["observed"]
+            assert not ready.done()
+            with pytest.raises(LocalProtocolError, match="room state"):
+                await nio_client.room_send(
+                    ROOM, "m.room.message", {"msgtype": "m.text", "body": "early"}
+                )
+            release.set()
+            async with asyncio.timeout(5):
+                assert await ready
+            await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "ready"}
+            )
+            assert sent == [{"msgtype": "m.text", "body": "ready"}]
+        finally:
+            release.set()
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            if runner is not None:
+                await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_room_first_reported_by_incremental_sync_waits_for_complete_state(
+    tmp_path,
+):
+    sent = []
+
+    async def endpoint(request):
+        sent.append(await request.json())
+        return web.json_response({"event_id": "$sent"})
+
+    async with homeserver(None, membership=endpoint) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            await unestablished_join(session)
+            ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
+            await asyncio.sleep(0)
+            assert not ready.done()
+            with pytest.raises(LocalProtocolError, match="room state"):
+                await nio_client.room_send(
+                    ROOM, "m.room.message", {"msgtype": "m.text", "body": "early"}
+                )
+            await session._accept_response(
+                response(token="s2", messages=0), full_state=True
+            )
+            await settle(session)
+            async with asyncio.timeout(5):
+                assert await ready
+            await nio_client.room_send(
+                ROOM, "m.room.message", {"msgtype": "m.text", "body": "ready"}
+            )
+            assert sent == [{"msgtype": "m.text", "body": "ready"}]
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("room", ["established", "encrypted"])
+async def test_room_ready_wait_returns_at_once_for_sendable_room(tmp_path, room):
+    async def endpoint(request):
+        return web.json_response({})
+
+    async with homeserver(None, membership=endpoint) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            body = json.loads(response(messages=0))
+            if room == "encrypted":
+                body["rooms"]["join"][ROOM]["state"]["events"].append(
+                    {
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "sender": USER,
+                        "event_id": "$encryption",
+                        "origin_server_ts": 1,
+                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                    }
+                )
+            await session._accept_response(json.dumps(body).encode())
+            await settle(session)
+            if room == "encrypted":
+                # A rejoin resets the room's state but keeps its known encryption.
+                await local_membership(session, "join")
+                assert not session._metadata[ROOM]["baseline"]
+            async with asyncio.timeout(5):
+                assert await session.wait_for_room_ready(ROOM)
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["leave", "close"])
+async def test_room_ready_wait_ends_with_membership_or_session(tmp_path, end):
+    session = open_session(tmp_path)
+    try:
+        async with asyncio.timeout(5):
+            assert await session.wait_for_room_ready(ROOM) is False
+            await unestablished_join(session)
+            ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
+            await asyncio.sleep(0)
+            assert not ready.done()
+            if end == "close":
+                await session.close()
+                with pytest.raises(LocalProtocolError):
+                    await ready
+                return
+            leave = {"state": {"events": []}, "timeline": {"events": []}}
+            leave["timeline"]["events"] = [member("$leave", "leave")]
+            await session._accept_response(
+                json.dumps(
+                    {"next_batch": "s2", "rooms": {"leave": {ROOM: leave}}}
+                ).encode()
+            )
+            assert await ready is False
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
