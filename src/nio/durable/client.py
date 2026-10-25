@@ -614,7 +614,8 @@ class DurableSync:
         The runner must keep running and consumer draining must continue while
         this waits: the runner does not poll while a batch is unacknowledged,
         so awaiting this while holding one, such as from a callback run by
-        ``dispatch()``, never returns.
+        ``dispatch()``, does not return until the session closes unless the
+        room can already accept sends.
 
         Return True once the client can send to the room, at once if it
         already can. Return False as soon as the client's own membership in

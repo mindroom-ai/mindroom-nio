@@ -448,7 +448,10 @@ caller can wait for a joined room to accept sends; it returns False when the
 client's own membership, as the session has recorded it, is not join, which
 includes a room sync has not reported yet. Consumer draining must continue
 while it waits: the runner does not poll over an unacknowledged batch, so a
-wait from a callback that holds one never returns. Recovery keeps its current
+wait from a callback that holds one does not return until the session closes,
+unless the room can already accept sends.
+
+Recovery keeps its current
 input's pagination plan stable while draining; any checkpoint invalidation
 required by a tail reset happens after that input's Sliding commit.
 
