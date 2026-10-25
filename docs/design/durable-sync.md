@@ -180,7 +180,8 @@ later departure. `completes_sync` marks the final chunk, including an empty
 response, only after required restoration and crypto maintenance.
 
 The session offers `run()`, `next_batch()`, `ack(batch)`, `wait_for_work()`,
-`quiesce()`, `close()`, durable progress, and serialized local membership changes.
+`quiesce()`, `close()`, durable progress, serialized local membership changes,
+and `wait_for_room_ready()`.
 Local changes retain an intent before HTTP, expected membership/epoch, and an
 ordered result. They must not resurrect authorization through a stale echo.
 
@@ -444,9 +445,12 @@ baseline. A new room whose encryption state is not yet known cannot send
 plaintext while waiting for that baseline; known encrypted rooms may use fresh
 recipient lookup. `wait_for_room_ready(room_id)` applies the same rule, so a
 caller can wait for a joined room to accept sends; it returns False when the
-client's own membership is not join. Recovery keeps its current input's
-pagination plan stable while draining; any checkpoint invalidation required by
-a tail reset happens after that input's Sliding commit.
+client's own membership, as the session has recorded it, is not join, which
+includes a room sync has not reported yet. Consumer draining must continue
+while it waits: the runner does not poll over an unacknowledged batch, so a
+wait from a callback that holds one never returns. Recovery keeps its current
+input's pagination plan stable while draining; any checkpoint invalidation
+required by a tail reset happens after that input's Sliding commit.
 
 An invitation replaces the joined-room cache entry and its persisted member
 snapshot with the current invited projection. Joined member writes remain

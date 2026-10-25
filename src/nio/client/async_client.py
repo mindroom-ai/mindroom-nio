@@ -2312,8 +2312,8 @@ class AsyncClient(Client):
 
             if room.encrypted:
                 if not room.members_synced:
-                    if self._durable_session is not None:
-                        await self._durable_session._outbound.ensure_members(room_id)
+                    if durable is not None:
+                        await durable._outbound.ensure_members(room_id)
                     else:
                         await self.joined_members(room_id)
                     if self.should_query_keys:

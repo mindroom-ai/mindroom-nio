@@ -611,10 +611,17 @@ class DurableSync:
         A room this client joins, by ``change_membership()`` or as sync first
         reports it, has no established state until a sync delivers the room's
         complete state, and ``room_send()`` refuses plaintext there until then.
+        The runner must keep running and consumer draining must continue while
+        this waits: the runner does not poll while a batch is unacknowledged,
+        so awaiting this while holding one, such as from a callback run by
+        ``dispatch()``, never returns.
 
         Return True once the client can send to the room, at once if it
         already can. Return False as soon as the client's own membership in
-        the room is not join, including when it is not join at the call.
+        the room, as this session has recorded it from sync or
+        ``change_membership()``, is not join, including at the call: a room
+        sync has not reported yet, such as one just made with
+        ``room_create()``, returns False at once.
         Raise ``LocalProtocolError`` if the session closes while waiting.
         """
         self._assert_active()

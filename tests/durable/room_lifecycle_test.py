@@ -216,7 +216,7 @@ async def test_room_ready_wait_returns_at_once_for_sendable_room(tmp_path, room)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("end", ["leave", "close"])
+@pytest.mark.parametrize("end", ["leave", "ban", "invite", "close"])
 async def test_room_ready_wait_ends_with_membership_or_session(tmp_path, end):
     session = open_session(tmp_path)
     try:
@@ -231,12 +231,15 @@ async def test_room_ready_wait_ends_with_membership_or_session(tmp_path, end):
                 with pytest.raises(LocalProtocolError):
                     await ready
                 return
-            leave = {"state": {"events": []}, "timeline": {"events": []}}
-            leave["timeline"]["events"] = [member("$leave", "leave")]
+            if end == "invite":
+                invite = {"invite_state": {"events": [member("$invite", "invite")]}}
+                rooms = {"invite": {ROOM: invite}}
+            else:
+                section = {"state": {"events": []}, "timeline": {"events": []}}
+                section["timeline"]["events"] = [member(f"${end}", end)]
+                rooms = {"leave": {ROOM: section}}
             await session._accept_response(
-                json.dumps(
-                    {"next_batch": "s2", "rooms": {"leave": {ROOM: leave}}}
-                ).encode()
+                json.dumps({"next_batch": "s2", "rooms": rooms}).encode()
             )
             assert await ready is False
     finally:
