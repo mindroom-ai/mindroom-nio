@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.1.6
+
+- Never treat decrypted Megolm plaintext as room state or membership: a state event or membership change inside an `m.room.encrypted` event no longer changes `MatrixRoom` (members, power levels, creators), durable membership or the sliding membership proof, and malformed state-shaped plaintext no longer stops durable sync.
+
 ## 1.1.5
 
 - Answer the durable sync loop's routine polls (pending batches, retained input, cursor, acknowledgement and membership intent) from state the store mirrors from its own writes, so a Classic sync issues about half as many SQLite statements on the event loop.
