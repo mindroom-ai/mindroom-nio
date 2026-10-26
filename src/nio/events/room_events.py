@@ -177,6 +177,7 @@ class Event(BaseEvent):
         return UnknownEncryptedEvent.from_dict(event_dict)
 
     @classmethod
+    @verify(Schemas.room_megolm_decrypted)
     def parse_decrypted_event(cls, event_dict: dict[Any, Any]) -> Event | BadEventType:
         """Parse a decrypted event and create a higher level event object.
 

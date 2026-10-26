@@ -446,6 +446,67 @@ async def _drain(session):
 @pytest.mark.parametrize(
     "plaintext",
     [
+        {
+            "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "hi"},
+            "unsigned": 5,
+        },
+        {
+            "type": "m.room.member",
+            "state_key": USER,
+            "content": {"membership": "join"},
+            "unsigned": {"prev_content": 5},
+        },
+        {
+            "type": "m.room.message",
+            "event_id": "$forged",
+            "sender": "@forged:example.org",
+            "origin_server_ts": "1",
+        },
+        {"content": {"msgtype": "m.text", "body": "hi"}},
+        5,
+    ],
+    ids=["unsigned", "prev-content", "plaintext-timestamp", "no-type", "not-an-object"],
+)
+async def test_malformed_megolm_plaintext_never_stops_durable_sync(tmp_path, plaintext):
+    """Any room member chooses the Megolm plaintext, so it must settle, not raise."""
+    session = open_session(tmp_path)
+    olm = session.client.olm
+    try:
+        await session._accept_response(response(messages=0))
+        await _drain(session)
+        with session._store.transaction():
+            session._store.finish_input()
+        olm.create_outbound_group_session(ROOM)
+        group = olm.outbound_group_sessions[ROOM]
+        body = json.loads(_encrypted_response("s2"))
+        cipher = body["rooms"]["join"][ROOM]["timeline"]["events"][0]
+        cipher["content"].update(
+            sender_key=olm.account.identity_keys["curve25519"],
+            session_id=group.id,
+            ciphertext=group._session.encrypt(
+                json.dumps(plaintext).encode()
+            ).to_base64(),
+        )
+
+        await session._accept_response(json.dumps(body).encode())
+        records = await _drain(session)
+
+        restored = [
+            restore_event(record)
+            for record in records
+            if record.kind is RecordKind.TIMELINE
+        ]
+        assert len(restored) == 2
+        assert restored[1].body == "hello 0"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plaintext",
+    [
         {"state_key": USER, "content": {"membership": "leave"}},
         {"state_key": "@bob:example.org", "content": {"membership": 5}},
     ],

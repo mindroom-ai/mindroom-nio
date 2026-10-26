@@ -1539,9 +1539,17 @@ class Olm:
                     verified = True
 
         try:
-            parsed_dict: dict[Any, Any] = _parse_decrypted_json(plaintext)
+            parsed_dict = _parse_decrypted_json(plaintext)
         except ValueError as e:
             raise EncryptionError(f"Error parsing payload: {str(e)}")
+
+        if not isinstance(parsed_dict, dict):
+            raise EncryptionError("Error parsing payload: not a JSON object")
+
+        # The homeserver supplies these fields on the wire event. The sender's
+        # copies are not part of the Megolm payload and are never trusted.
+        for key in ("event_id", "sender", "origin_server_ts", "unsigned"):
+            parsed_dict.pop(key, None)
 
         bad = validate_or_badevent(parsed_dict, Schemas.room_megolm_decrypted)
 
