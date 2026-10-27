@@ -144,6 +144,35 @@ async def test_decrypted_plaintext_never_changes_room_state(client, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_unsigned_inside_megolm_plaintext_never_stops_sync(crypto_client):
+    """The homeserver adds unsigned data, so the sender's copy is ignored."""
+    client = crypto_client
+    client.olm.create_outbound_group_session(ROOM_ID)
+    client.olm.outbound_group_sessions[ROOM_ID].shared = True
+    plaintext = {
+        "type": "m.room.message",
+        "content": {"msgtype": "m.text", "body": "$cipher"},
+        "unsigned": 5,
+    }
+    cipher = {
+        "type": "m.room.encrypted",
+        "event_id": "$cipher",
+        "sender": "@bob:example.org",
+        "origin_server_ts": 1,
+        "content": client.olm.group_encrypt(ROOM_ID, plaintext),
+    }
+    observed = []
+    client.add_event_callback(lambda room, event: observed.append(event), Event)
+
+    await receive(client, sync_response(timeline=[cipher, message_event("$after")]))
+
+    assert [(event.decrypted, event.body) for event in observed] == [
+        (True, "$cipher"),
+        (False, "$after"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_callback_exception_stops_later_projection(client):
     response = sync_response(
         timeline=[name_event("$first", "First"), name_event("$second", "Second")]

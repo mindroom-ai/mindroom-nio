@@ -34,6 +34,7 @@ from nio.events import (
     RoomKeyEvent,
     RoomKeyRequest,
     RoomKeyRequestCancellation,
+    RoomMemberEvent,
     RoomMessageText,
     ToDeviceEvent,
     UnknownBadEvent,
@@ -41,7 +42,7 @@ from nio.events import (
 )
 from nio.exceptions import EncryptionError, GroupEncryptionError, OlmTrustError
 from nio.client.base_client import _SyncItem
-from nio.durable.codec import freeze_event
+from nio.durable.codec import freeze_event, restore_event
 from nio.durable.model import decode_records, encode_records
 from nio.durable.store import DurableStore
 from nio.responses import KeysClaimResponse, KeysQueryResponse, KeysUploadResponse
@@ -1197,6 +1198,149 @@ class TestClass:
 
         assert isinstance(event, RoomMessageText)
         assert event.body == "hi \ufffd"
+
+    def _megolm_event_with_plaintext(self, olm, plaintext, **wire):
+        """Encrypt any JSON value as the Megolm payload of a room event."""
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        return MegolmEvent.from_dict(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "$cipher",
+                "sender": "@ephemeral:example.org",
+                "origin_server_ts": 0,
+                "room_id": TEST_ROOM,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "sender_key": olm.account.identity_keys["curve25519"],
+                    "ciphertext": session._session.encrypt(
+                        json.dumps(plaintext).encode()
+                    ).to_base64(),
+                    "session_id": session.id,
+                    "device_id": olm.device_id,
+                },
+                **wire,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("plaintext", "parsed"),
+        [
+            ({"type": "m.room.message", "unsigned": 5}, RoomMessageText),
+            ({"type": "m.room.message", "unsigned": []}, RoomMessageText),
+            ({"type": "m.room.message", "unsigned": "s"}, RoomMessageText),
+            (
+                {"type": "m.room.message", "unsigned": {"transaction_id": "forged"}},
+                RoomMessageText,
+            ),
+            (
+                {
+                    "type": "m.room.message",
+                    "unsigned": {
+                        "redacted_because": {
+                            "sender": "@ephemeral:example.org",
+                            "content": {},
+                        }
+                    },
+                },
+                RoomMessageText,
+            ),
+            (
+                {
+                    "type": "m.room.member",
+                    "state_key": "@ephemeral:example.org",
+                    "content": {"membership": "join"},
+                    "unsigned": {"prev_content": 5},
+                },
+                RoomMemberEvent,
+            ),
+        ],
+        ids=[
+            "int",
+            "list",
+            "string",
+            "transaction-id",
+            "redacted-because",
+            "prev-content",
+        ],
+    )
+    def test_group_decryption_ignores_unsigned_from_the_sender(self, plaintext, parsed):
+        """The homeserver adds unsigned data, so a copy in the ciphertext is ignored."""
+        olm = self.ephemeral_olm
+        payload = {
+            "room_id": TEST_ROOM,
+            "content": {"msgtype": "m.text", "body": "hi"},
+            **plaintext,
+        }
+        megolm_event = self._megolm_event_with_plaintext(olm, payload)
+
+        event = olm.decrypt_megolm_event(megolm_event)
+
+        assert type(event) is parsed
+        assert event.decrypted
+        assert "unsigned" not in event.source
+        assert event.transaction_id is None
+
+    def test_group_decryption_keeps_the_servers_transaction_id(self):
+        olm = self.ephemeral_olm
+        payload = {
+            "type": "m.room.message",
+            "room_id": TEST_ROOM,
+            "content": {"msgtype": "m.text", "body": "hi"},
+            "unsigned": 5,
+        }
+        megolm_event = self._megolm_event_with_plaintext(
+            olm, payload, unsigned={"transaction_id": "txn"}
+        )
+
+        event = olm.decrypt_megolm_event(megolm_event)
+
+        assert isinstance(event, RoomMessageText)
+        assert event.transaction_id == "txn"
+        assert event.source["unsigned"] == {"transaction_id": "txn"}
+
+    @pytest.mark.parametrize("plaintext", [5, [], "s", None])
+    def test_group_decryption_rejects_payload_that_is_not_an_object(self, plaintext):
+        olm = self.ephemeral_olm
+        megolm_event = self._megolm_event_with_plaintext(olm, plaintext)
+
+        with pytest.raises(EncryptionError, match="Error parsing payload"):
+            olm.decrypt_megolm_event(megolm_event)
+        assert olm.decrypt_event(megolm_event) is None
+
+    @pytest.mark.parametrize(
+        "plaintext",
+        [
+            {
+                "type": "m.room.message",
+                "event_id": "$forged",
+                "sender": "@forged:example.org",
+                "origin_server_ts": "1",
+            },
+            {
+                "type": "m.room.message",
+                "event_id": ["$forged"],
+                "sender": ["@forged:example.org"],
+                "origin_server_ts": 1,
+            },
+            {"content": {"msgtype": "m.text", "body": "hi"}},
+        ],
+        ids=["string-timestamp", "list-envelope", "no-type"],
+    )
+    def test_undecodable_group_payload_settles_as_a_bad_event(self, plaintext):
+        """Only the wire event supplies the event ID, sender and timestamp."""
+        olm = self.ephemeral_olm
+        megolm_event = self._megolm_event_with_plaintext(
+            olm, {"room_id": TEST_ROOM, **plaintext}
+        )
+
+        event = olm.decrypt_megolm_event(megolm_event)
+
+        assert isinstance(event, UnknownBadEvent)
+        assert not {"event_id", "sender", "origin_server_ts"} & event.source.keys()
+        record = freeze_event(_SyncItem("event", event, source=megolm_event.source))
+        restored = restore_event(decode_records(encode_records((record,)))[0])
+        assert isinstance(restored, UnknownBadEvent)
 
     def test_key_sharing(self):
         olm = self.ephemeral_olm

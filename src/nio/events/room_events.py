@@ -183,6 +183,12 @@ class Event(BaseEvent):
         Args:
             event_dict (dict): The dictionary representation of the event.
         """
+        # Validated here rather than with @verify, which only reads a
+        # positional event_dict.
+        bad = validate_or_badevent(event_dict, Schemas.room_megolm_decrypted)
+        if bad:
+            return bad
+
         if "unsigned" in event_dict:
             if "redacted_because" in event_dict["unsigned"]:
                 return RedactedEvent.from_dict(event_dict)

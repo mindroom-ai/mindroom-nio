@@ -580,6 +580,15 @@ class TestClass:
         assert event.thumbnail_iv
         assert event.mimetype
 
+    def test_parse_decrypted_event_accepts_event_dict_by_keyword(self):
+        parsed_dict = TestClass._load_response(
+            "tests/data/events/room_encrypted_image.json"
+        )
+
+        event = Event.parse_decrypted_event(event_dict=parsed_dict)
+
+        assert isinstance(event, RoomEncryptedImage)
+
     @pytest.mark.parametrize("parse", [Event.parse_event, Event.parse_decrypted_event])
     @pytest.mark.parametrize(
         "msgtype,plain_class,encrypted_class",
