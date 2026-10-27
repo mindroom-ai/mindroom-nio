@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.2.1
+
+- Never let decrypted Megolm plaintext override what the homeserver supplies or stop sync: the plaintext's `event_id`, `sender`, `origin_server_ts` and `unsigned` are ignored (the client's own messages still get the wire `transaction_id`), so a room member can no longer forge a transaction ID, a redaction or a member's `prev_content`; plaintext that is not a JSON object leaves the event an undecrypted `MegolmEvent`; and `Event.parse_decrypted_event` checks the decrypted-event schema first, so a stored undecodable payload no longer raises `KeyError` when the durable store replays a batch.
+
 ## 1.2.0
 
 - Add `DurableSync.wait_for_room_ready(room_id)`, which waits until a joined room accepts sends (returning at once when it already does), returns False when the client's recorded membership is not join, and raises `LocalProtocolError` if the session closes; `room_send()` refuses plaintext by the same readiness rule. The runner must keep running and consumed batches must keep being acknowledged while it waits, so do not await it from a callback that holds an unacknowledged batch.
