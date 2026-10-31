@@ -5125,6 +5125,59 @@ class TestClass:
         )
         return requests
 
+    async def test_room_encrypt_shares_itself_when_the_share_it_waited_on_is_cancelled(
+        self, async_client_pair, aioresponse
+    ):
+        """A caller waiting on another caller's share checks again once it ends, instead of encrypting unshared."""
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        share = bob.share_group_session
+        shares = []
+        never = asyncio.Event()
+
+        async def first_share_hangs(room_id, **kwargs):
+            shares.append(room_id)
+            if len(shares) > 1:
+                return await share(room_id, **kwargs)
+            bob.sharing_session[room_id] = asyncio.Event()
+            try:
+                await never.wait()
+            finally:
+                bob.sharing_session.pop(room_id).set()
+
+        bob.share_group_session = first_share_hangs
+        first = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+            )
+        )
+        while TEST_ROOM_ID not in bob.sharing_session:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 1},
+                ignore_unverified_devices=True,
+            )
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        first.cancel()
+
+        encrypted = await second
+
+        assert shares == [TEST_ROOM_ID, TEST_ROOM_ID]
+        assert len(requests["to_device"]) == 1
+        assert (
+            encrypted["session_id"] == bob.olm.outbound_group_sessions[TEST_ROOM_ID].id
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
     async def test_room_encrypt_shares_session_first(
         self, async_client_pair, aioresponse
     ):

@@ -2341,7 +2341,9 @@ class AsyncClient(Client):
                 if self.should_query_keys:
                     await self.keys_query()
 
-            if self.olm.should_share_group_session(room_id):
+            # A share another caller started may end without sharing, for
+            # example when that caller is cancelled, so check again after it.
+            while self.olm.should_share_group_session(room_id):
                 try:
                     event = self.sharing_session[room_id]
                     await event.wait()
