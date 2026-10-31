@@ -56,6 +56,7 @@ from nio import (
     LoginResponse,
     LogoutError,
     LogoutResponse,
+    MatrixRoom,
     MegolmEvent,
     OlmTrustError,
     PowerLevelsEvent,
@@ -4937,6 +4938,231 @@ class TestClass:
 
         assert event.body == "It's a secret to everybody."
         assert cb_ran
+
+    async def _bob_room_with_alice(self, alice, bob, aioresponse):
+        """Let Bob encrypt for Alice in a shared room and record his requests."""
+        await alice.receive_response(self.sync_response_for(alice.user_id, bob.user_id))
+        await bob.receive_response(self.sync_response_for(bob.user_id, alice.user_id))
+        alice.olm.device_store.add(
+            OlmDevice(bob.user_id, bob.device_id, bob.olm.account.identity_keys)
+        )
+        bob.olm.device_store.add(
+            OlmDevice(alice.user_id, alice.device_id, alice.olm.account.identity_keys)
+        )
+        key_id, one_time_key = next(
+            iter(alice.olm.share_keys()["one_time_keys"].items())
+        )
+        requests = {"to_device": [], "room_send": []}
+
+        def record(kind, payload):
+            def callback(url, data, **kwargs):
+                requests[kind].append(json.loads(data))
+                return CallbackResult(status=200, payload=payload)
+
+            return callback
+
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/joined_members",
+            status=200,
+            payload=self.joined_members_response,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query", status=200, payload=self.keys_query_response
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/claim",
+            status=200,
+            payload={
+                "one_time_keys": {
+                    alice.user_id: {alice.device_id: {key_id: one_time_key}}
+                },
+                "failures": {},
+            },
+        )
+        aioresponse.put(
+            re.compile(
+                rf"^{re.escape(BASE_URL_V3)}/sendToDevice/m\.room\.encrypted/[^/]+$"
+            ),
+            callback=record("to_device", {}),
+            repeat=True,
+        )
+        aioresponse.put(
+            re.compile(
+                rf"^{re.escape(BASE_URL_V3)}/rooms/{TEST_ROOM_ID}"
+                rf"/send/m\.room\.encrypted/[^/]+$"
+            ),
+            callback=record("room_send", {"event_id": "$event"}),
+            repeat=True,
+        )
+        return requests
+
+    async def test_room_encrypt_shares_session_first(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        content = {
+            "v": 1,
+            "reply": "$reply",
+            "seq": 0,
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+        }
+
+        encrypted = await bob.room_encrypt(
+            TEST_ROOM_ID,
+            "io.mindroom.live",
+            content,
+            ignore_unverified_devices=True,
+        )
+
+        assert len(requests["to_device"]) == 1
+        assert requests["room_send"] == []
+        assert set(encrypted) == {
+            "algorithm",
+            "sender_key",
+            "ciphertext",
+            "session_id",
+            "device_id",
+        }
+        assert encrypted["algorithm"] == "m.megolm.v1.aes-sha2"
+        assert encrypted["session_id"] == bob.olm.outbound_group_sessions[
+            TEST_ROOM_ID
+        ].id
+
+        aioresponse.get(
+            re.compile(rf"^https://example\.org{MATRIX_API_PATH_V3}/sync"),
+            status=200,
+            payload=self.sync_with_to_device_events(
+                self.olm_message_to_event(requests["to_device"][0], alice, bob)
+            ),
+        )
+        await alice.sync()
+
+        inbound = alice.olm.inbound_group_store.get(
+            TEST_ROOM_ID, encrypted["sender_key"], encrypted["session_id"]
+        )
+        assert inbound is not None
+        plaintext, _ = inbound.decrypt(encrypted["ciphertext"])
+        assert json.loads(plaintext) == {
+            "type": "io.mindroom.live",
+            "content": content,
+            "room_id": TEST_ROOM_ID,
+        }
+
+    async def test_room_encrypt_uncounted_does_not_rotate(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+
+        session_ids = set()
+        for seq in range(101):
+            encrypted = await bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": seq},
+                ignore_unverified_devices=True,
+                count_toward_rotation=False,
+            )
+            session_ids.add(encrypted["session_id"])
+
+        session = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert session_ids == {session.id}
+        assert session.message_count == 0
+        assert session.message_index == 101
+        assert len(requests["to_device"]) == 1
+
+    async def test_room_encrypt_and_room_send_interleave_around_rotation(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+
+        async def send(number):
+            await bob.room_send(
+                TEST_ROOM_ID,
+                "m.room.message",
+                {"msgtype": "m.text", "body": str(number)},
+                str(number),
+                ignore_unverified_devices=True,
+            )
+
+        async def encrypt():
+            encrypted = await bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+                count_toward_rotation=False,
+            )
+            return encrypted["session_id"]
+
+        for number in range(99):
+            await send(number)
+        first = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert {await encrypt() for _ in range(5)} == {first.id}
+        await send(99)
+
+        assert bob.olm.outbound_group_sessions[TEST_ROOM_ID] is first
+        assert first.message_count == first.max_messages
+        assert len(requests["to_device"]) == 1
+
+        await send(100)
+
+        second = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert second.id != first.id
+        assert len(requests["to_device"]) == 2
+        assert [event["session_id"] for event in requests["room_send"]] == [
+            first.id
+        ] * 100 + [second.id]
+        assert await encrypt() == second.id
+        assert second.message_count == 1
+
+    @pytest.mark.parametrize("expiry", ["count", "age"])
+    async def test_room_encrypt_uncounted_rotates_expired_session(
+        self, async_client_pair, aioresponse, expiry
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        await bob.room_send(
+            TEST_ROOM_ID,
+            "m.room.message",
+            {"msgtype": "m.text", "body": "first"},
+            "1",
+            ignore_unverified_devices=True,
+        )
+        first = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        if expiry == "count":
+            first.message_count = first.max_messages
+        else:
+            first.creation_time = datetime.now() - timedelta(days=8)
+
+        encrypted = await bob.room_encrypt(
+            TEST_ROOM_ID,
+            "io.mindroom.live",
+            {"seq": 0},
+            ignore_unverified_devices=True,
+            count_toward_rotation=False,
+        )
+
+        second = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert second.id != first.id
+        assert encrypted["session_id"] == second.id
+        assert len(requests["to_device"]) == 2
+
+    @pytest.mark.parametrize("room", ["unknown", "unencrypted"])
+    async def test_room_encrypt_refuses_unencrypted_room(
+        self, async_client_pair, aioresponse, room
+    ):
+        _, bob = async_client_pair
+        if room == "unencrypted":
+            bob.rooms[TEST_ROOM_ID] = MatrixRoom(TEST_ROOM_ID, bob.user_id)
+
+        with pytest.raises(LocalProtocolError):
+            await bob.room_encrypt(TEST_ROOM_ID, "io.mindroom.live", {"seq": 0})
+
+        assert aioresponse.requests == {}
+        assert TEST_ROOM_ID not in bob.olm.outbound_group_sessions
 
     async def test_connect_wrapper(self, async_client, aioresponse, monkeypatch):
         aioresponse.post(

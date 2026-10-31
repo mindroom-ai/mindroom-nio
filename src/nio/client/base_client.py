@@ -1519,6 +1519,30 @@ class Client:
         Returns a tuple containing the new message type and the new encrypted
         content.
         """
+        encrypted_content = self._group_encrypt(room_id, message_type, content)
+
+        # The relationship needs to be sent unencrypted, so put it in the
+        # unencrypted content.
+        if "m.relates_to" in content:
+            encrypted_content["m.relates_to"] = content["m.relates_to"]
+
+        message_type = "m.room.encrypted"
+
+        return message_type, encrypted_content
+
+    @store_loaded
+    def _group_encrypt(
+        self,
+        room_id: str,
+        event_type: str,
+        content: dict[Any, Any],
+        *,
+        count: bool = True,
+    ) -> dict[str, str]:
+        """Megolm-encrypt an event with the room's shared group session.
+
+        Returns the ``m.megolm.v1.aes-sha2`` content of the event.
+        """
         assert self.olm
 
         try:
@@ -1539,19 +1563,11 @@ class Client:
                 "The room is encrypted and the members " "aren't fully synced."
             )
 
-        encrypted_content = self.olm.group_encrypt(
+        return self.olm.group_encrypt(
             room_id,
-            {"content": content, "type": message_type},
+            {"content": content, "type": event_type},
+            count=count,
         )
-
-        # The relationship needs to be sent unencrypted, so put it in the
-        # unencrypted content.
-        if "m.relates_to" in content:
-            encrypted_content["m.relates_to"] = content["m.relates_to"]
-
-        message_type = "m.room.encrypted"
-
-        return message_type, encrypted_content
 
     def add_event_callback(
         self,

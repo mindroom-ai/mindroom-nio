@@ -2299,42 +2299,97 @@ class AsyncClient(Client):
         ignore_unverified_devices: bool,
     ) -> tuple[str, str, str]:
         if self.olm:
-            try:
-                room = self.rooms[room_id]
-            except KeyError:
-                raise LocalProtocolError(f"No such room with id {room_id} found.")
+            room = await self._prepare_room_encryption(
+                room_id, ignore_unverified_devices
+            )
 
-            durable = self._durable_session
-            if durable is not None and not durable._room_ready(room_id):
-                raise LocalProtocolError(
-                    "room state must be established before plaintext sending"
-                )
-
-            if room.encrypted:
-                if not room.members_synced:
-                    if durable is not None:
-                        await durable._outbound.ensure_members(room_id)
-                    else:
-                        await self.joined_members(room_id)
-                    if self.should_query_keys:
-                        await self.keys_query()
-
-                if self.olm.should_share_group_session(room_id):
-                    try:
-                        event = self.sharing_session[room_id]
-                        await event.wait()
-                    except KeyError:
-                        await self.share_group_session(
-                            room_id,
-                            ignore_unverified_devices=ignore_unverified_devices,
-                        )
-
-                # Reactions do not support encryption yet.
-                # https://github.com/matrix-org/matrix-doc/pull/1849
-                if message_type != "m.reaction":
-                    message_type, content = self.encrypt(room_id, message_type, content)
+            # Reactions do not support encryption yet.
+            # https://github.com/matrix-org/matrix-doc/pull/1849
+            if room.encrypted and message_type != "m.reaction":
+                message_type, content = self.encrypt(room_id, message_type, content)
 
         return Api.room_send(self.access_token, room_id, message_type, content, tx_id)
+
+    async def _prepare_room_encryption(
+        self, room_id: str, ignore_unverified_devices: bool
+    ) -> MatrixRoom:
+        """Make the room's group session ready for encrypting a room event.
+
+        In an encrypted room, sync the members, query their keys and share
+        the group session when it is missing, unshared or expired.
+        """
+        assert self.olm
+        try:
+            room = self.rooms[room_id]
+        except KeyError:
+            raise LocalProtocolError(f"No such room with id {room_id} found.")
+
+        durable = self._durable_session
+        if durable is not None and not durable._room_ready(room_id):
+            raise LocalProtocolError(
+                "room state must be established before plaintext sending"
+            )
+
+        if room.encrypted:
+            if not room.members_synced:
+                if durable is not None:
+                    await durable._outbound.ensure_members(room_id)
+                else:
+                    await self.joined_members(room_id)
+                if self.should_query_keys:
+                    await self.keys_query()
+
+            if self.olm.should_share_group_session(room_id):
+                try:
+                    event = self.sharing_session[room_id]
+                    await event.wait()
+                except KeyError:
+                    await self.share_group_session(
+                        room_id,
+                        ignore_unverified_devices=ignore_unverified_devices,
+                    )
+
+        return room
+
+    @logged_in_async
+    @store_loaded
+    async def room_encrypt(
+        self,
+        room_id: str,
+        event_type: str,
+        content: dict[str, Any],
+        *,
+        ignore_unverified_devices: bool = False,
+        count_toward_rotation: bool = True,
+    ) -> dict[str, str]:
+        """Encrypt a room event for the members of an encrypted room.
+
+        This prepares the room's group session exactly as `room_send()` does,
+        syncing members, querying keys and sharing the session first when
+        needed, and then encrypts ``{"type": event_type, "content": content,
+        "room_id": room_id}`` without sending it. Unlike `room_send()`, no
+        ``m.relates_to`` is copied to the unencrypted content.
+
+        Args:
+            room_id (str): The room id of the encrypted room.
+            event_type (str): The type of the event to encrypt.
+            content (Dict[str, Any]): The content of the event to encrypt.
+            ignore_unverified_devices (bool): Mark unverified devices as
+                ignored when sharing the group session, as `room_send()` does.
+            count_toward_rotation (bool): Whether this encryption counts
+                toward the group session's message-count rotation limit. An
+                uncounted encryption still advances the Megolm message index,
+                and the session still rotates by age and membership changes.
+
+        Returns the ``m.megolm.v1.aes-sha2`` content of the encrypted event.
+
+        Raises `LocalProtocolError` if the client isn't logged in, encryption
+        isn't enabled, the room is unknown or the room isn't encrypted.
+        """
+        await self._prepare_room_encryption(room_id, ignore_unverified_devices)
+        return self._group_encrypt(
+            room_id, event_type, content, count=count_toward_rotation
+        )
 
     @logged_in_async
     @client_session
