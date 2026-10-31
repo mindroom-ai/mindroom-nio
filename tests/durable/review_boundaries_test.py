@@ -64,7 +64,7 @@ async def test_encrypted_room_save_rolls_back_with_durable_preparation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["rollback", "close"])
-@pytest.mark.parametrize("operation", ["encrypt", "room_send", "send"])
+@pytest.mark.parametrize("operation", ["encrypt", "room_encrypt", "room_send", "send"])
 async def test_disposed_client_cannot_encrypt_or_send(
     tmp_path, monkeypatch, end, operation
 ):
@@ -80,7 +80,7 @@ async def test_disposed_client_cannot_encrypt_or_send(
         session = open_session(tmp_path, nio_client)
         await baseline(session)
         room = nio_client.rooms[ROOM]
-        room.encrypted = operation == "encrypt"
+        room.encrypted = operation in ("encrypt", "room_encrypt")
         room.members_synced = True
         nio_client.olm.create_outbound_group_session(ROOM)
         nio_client.olm.outbound_group_sessions[ROOM].shared = True
@@ -101,6 +101,10 @@ async def test_disposed_client_cannot_encrypt_or_send(
             with pytest.raises(LocalProtocolError, match="poisoned"):
                 if operation == "encrypt":
                     nio_client.encrypt(ROOM, "m.room.message", {"body": "secret"})
+                elif operation == "room_encrypt":
+                    await nio_client.room_encrypt(
+                        ROOM, "m.room.message", {"body": "secret"}
+                    )
                 elif operation == "room_send":
                     await nio_client.room_send(
                         ROOM, "m.room.message", {"body": "secret"}
@@ -120,7 +124,10 @@ async def test_disposed_client_cannot_encrypt_or_send(
 
 
 @pytest.mark.asyncio
-async def test_disposal_during_send_preparation_prevents_later_http(tmp_path):
+@pytest.mark.parametrize("operation", ["room_send", "room_encrypt"])
+async def test_disposal_during_send_preparation_prevents_later_http(
+    tmp_path, operation
+):
     sent = []
 
     async def http(request):
@@ -145,18 +152,24 @@ async def test_disposal_during_send_preparation_prevents_later_http(tmp_path):
         room.encrypted = room.members_synced = True
         sharing = ShareBarrier()
         nio_client.sharing_session[ROOM] = sharing
-        task = asyncio.create_task(
-            nio_client.room_send(ROOM, "m.reaction", {"body": "secret"})
-        )
+        if operation == "room_send":
+            preparation = nio_client.room_send(ROOM, "m.reaction", {"body": "secret"})
+        else:
+            preparation = nio_client.room_encrypt(
+                ROOM, "io.mindroom.live", {"body": "secret"}
+            )
+        task = asyncio.create_task(preparation)
         try:
             async with asyncio.timeout(5):
                 await sharing.waiting.wait()
                 await session.close()
-                sharing.set()
+                # Released as a real share releases it: popped, then set.
+                nio_client.sharing_session.pop(ROOM).set()
                 with pytest.raises(LocalProtocolError, match="poisoned"):
                     await task
             assert sent == []
         finally:
+            nio_client.sharing_session.pop(ROOM, None)
             sharing.set()
             await asyncio.gather(task, return_exceptions=True)
             await session.close()

@@ -19,7 +19,10 @@ from .runner_test import homeserver
 
 
 @pytest.mark.asyncio
-async def test_room_send_uses_fresh_recipients_without_replacing_room_members(tmp_path):
+@pytest.mark.parametrize("operation", ["room_send", "room_encrypt"])
+async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
+    tmp_path, operation
+):
     recipient = "@peer:example.org"
     peer = Olm(recipient, "OTHER", SqliteMemoryStore(recipient, "OTHER"))
     keys = peer.share_keys()
@@ -68,15 +71,25 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(tm
         room.add_member("@old:example.org", "Old", None)
         nio_client.rooms[ROOM] = room
         try:
-            result = await nio_client.room_send(
-                ROOM,
-                "m.room.message",
-                {"msgtype": "m.text", "body": "fresh recipient secret"},
-                tx_id="fresh-send",
-                ignore_unverified_devices=True,
-            )
-            assert isinstance(result, RoomSendResponse)
-            assert result.event_id == "$sent"
+            if operation == "room_send":
+                result = await nio_client.room_send(
+                    ROOM,
+                    "m.room.message",
+                    {"msgtype": "m.text", "body": "fresh recipient secret"},
+                    tx_id="fresh-send",
+                    ignore_unverified_devices=True,
+                )
+                assert isinstance(result, RoomSendResponse)
+                assert result.event_id == "$sent"
+            else:
+                sent.append(
+                    await nio_client.room_encrypt(
+                        ROOM,
+                        "m.room.message",
+                        {"msgtype": "m.text", "body": "fresh recipient secret"},
+                        ignore_unverified_devices=True,
+                    )
+                )
             assert not room.members_synced
             assert set(room.users) == {"@old:example.org"}
             assert len(shared) == len(sent) == 1

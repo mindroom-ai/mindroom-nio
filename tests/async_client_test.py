@@ -56,6 +56,7 @@ from nio import (
     LoginResponse,
     LogoutError,
     LogoutResponse,
+    MatrixRoom,
     MegolmEvent,
     OlmTrustError,
     PowerLevelsEvent,
@@ -113,6 +114,8 @@ from nio import (
     RoomRedactResponse,
     RoomResolveAliasResponse,
     Rooms,
+    RoomSendEphemeralError,
+    RoomSendEphemeralResponse,
     RoomSendResponse,
     RoomSummary,
     RoomTypingResponse,
@@ -138,6 +141,7 @@ from nio import (
     UploadResponse,
 )
 from nio.api import (
+    MATRIX_API_PATH_UNSTABLE,
     MATRIX_API_PATH_V1,
     MATRIX_API_PATH_V3,
     MATRIX_LEGACY_MEDIA_API_PATH,
@@ -2495,6 +2499,133 @@ class TestClass:
         )
         resp = await async_client.room_typing(room_id, typing_state=True)
         assert isinstance(resp, RoomTypingResponse)
+
+    @property
+    def ephemeral_url(self):
+        return (
+            f"https://example.org{MATRIX_API_PATH_UNSTABLE}/org.matrix.msc2477/rooms/"
+            f"{TEST_ROOM_ID}/ephemeral/io.mindroom.live"
+        )
+
+    async def test_room_send_ephemeral(self, async_client, aioresponse):
+        sent = []
+
+        def record(url, data, **kwargs):
+            sent.append(
+                (str(url), kwargs["headers"]["Authorization"], json.loads(data))
+            )
+            return CallbackResult(status=200, payload={})
+
+        aioresponse.put(f"{self.ephemeral_url}/txn1", callback=record)
+        aioresponse.put(
+            re.compile(rf"^{re.escape(self.ephemeral_url)}/[0-9a-f-]{{36}}$"),
+            callback=record,
+        )
+        content = {"v": 1, "reply": "$reply", "seq": 0}
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", content, "txn1"
+        )
+        assert isinstance(resp, RoomSendEphemeralResponse)
+        assert resp.room_id == TEST_ROOM_ID
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", content
+        )
+        assert isinstance(resp, RoomSendEphemeralResponse)
+
+        assert [(authorization, body) for _, authorization, body in sent] == [
+            (f"Bearer {async_client.access_token}", content)
+        ] * 2
+        assert "access_token" not in sent[0][0]
+
+    async def test_room_send_ephemeral_retries_rate_limit_by_default(
+        self, async_client, aioresponse
+    ):
+        sent = []
+
+        def record(status, payload):
+            def callback(url, data, **kwargs):
+                sent.append(json.loads(data))
+                return CallbackResult(status=status, payload=payload)
+
+            return callback
+
+        url = f"{self.ephemeral_url}/txn1"
+        aioresponse.put(
+            url,
+            callback=record(
+                429,
+                {
+                    "errcode": "M_LIMIT_EXCEEDED",
+                    "error": "Too many requests",
+                    "retry_after_ms": 1,
+                },
+            ),
+        )
+        aioresponse.put(url, callback=record(200, {}))
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralResponse)
+        assert sent == [{"seq": 0}, {"seq": 0}]
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (
+                429,
+                {
+                    "errcode": "M_LIMIT_EXCEEDED",
+                    "error": "Too many requests",
+                    "retry_after_ms": 200,
+                },
+            ),
+            (404, {"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"}),
+            (403, {"errcode": "M_FORBIDDEN", "error": "Not joined"}),
+        ],
+    )
+    async def test_room_send_ephemeral_error(
+        self, async_client, aioresponse, status, body
+    ):
+        async_client.config = AsyncClientConfig(max_limit_exceeded=0)
+        aioresponse.put(f"{self.ephemeral_url}/txn1", status=status, payload=body)
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralError)
+        assert resp.status_code == body["errcode"]
+        assert resp.retry_after_ms == body.get("retry_after_ms")
+        assert resp.room_id == TEST_ROOM_ID
+
+    @pytest.mark.parametrize(
+        ("status", "body", "content_type"),
+        [(502, "<html>Bad Gateway</html>", "text/html"), (403, "", "application/json")],
+        ids=["proxy-html-502", "empty-403"],
+    )
+    async def test_room_send_ephemeral_failure_without_matrix_error(
+        self, async_client, aioresponse, status, body, content_type
+    ):
+        """A failed send whose body is no Matrix error is still an error, never a delivered event."""
+        aioresponse.put(
+            f"{self.ephemeral_url}/txn1",
+            status=status,
+            body=body,
+            content_type=content_type,
+        )
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralError)
+        assert resp.message == f"HTTP {status}"
+        assert resp.room_id == TEST_ROOM_ID
+        assert resp.transport_response.status == status
 
     async def test_update_receipt_marker(self, async_client: AsyncClient, aioresponse):
         room_id = TEST_ROOM_ID
@@ -4937,6 +5068,321 @@ class TestClass:
 
         assert event.body == "It's a secret to everybody."
         assert cb_ran
+
+    async def _bob_room_with_alice(self, alice, bob, aioresponse):
+        """Let Bob encrypt for Alice in a shared room and record his requests."""
+        await alice.receive_response(self.sync_response_for(alice.user_id, bob.user_id))
+        await bob.receive_response(self.sync_response_for(bob.user_id, alice.user_id))
+        alice.olm.device_store.add(
+            OlmDevice(bob.user_id, bob.device_id, bob.olm.account.identity_keys)
+        )
+        bob.olm.device_store.add(
+            OlmDevice(alice.user_id, alice.device_id, alice.olm.account.identity_keys)
+        )
+        key_id, one_time_key = next(
+            iter(alice.olm.share_keys()["one_time_keys"].items())
+        )
+        requests = {"to_device": [], "room_send": []}
+
+        def record(kind, payload):
+            def callback(url, data, **kwargs):
+                requests[kind].append(json.loads(data))
+                return CallbackResult(status=200, payload=payload)
+
+            return callback
+
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/joined_members",
+            status=200,
+            payload=self.joined_members_response,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query", status=200, payload=self.keys_query_response
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/claim",
+            status=200,
+            payload={
+                "one_time_keys": {
+                    alice.user_id: {alice.device_id: {key_id: one_time_key}}
+                },
+                "failures": {},
+            },
+        )
+        aioresponse.put(
+            re.compile(
+                rf"^{re.escape(BASE_URL_V3)}/sendToDevice/m\.room\.encrypted/[^/]+$"
+            ),
+            callback=record("to_device", {}),
+            repeat=True,
+        )
+        aioresponse.put(
+            re.compile(
+                rf"^{re.escape(BASE_URL_V3)}/rooms/{TEST_ROOM_ID}"
+                rf"/send/m\.room\.encrypted/[^/]+$"
+            ),
+            callback=record("room_send", {"event_id": "$event"}),
+            repeat=True,
+        )
+        return requests
+
+    async def test_room_encrypt_cancelled_during_key_claim_releases_the_sharing_slot(
+        self, async_client_pair, aioresponse
+    ):
+        """A caller cancelled while its share claims keys leaves no sharing slot that would block later sends."""
+        alice, bob = async_client_pair
+        claim_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def hang(url, **kwargs):
+            claim_started.set()
+            await never.wait()
+
+        aioresponse.post(f"{BASE_URL_V3}/keys/claim", callback=hang)
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        first = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+            )
+        )
+        await claim_started.wait()
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # Left registered, the slot would make every later share wait forever.
+        assert TEST_ROOM_ID not in bob.sharing_session
+        assert requests["to_device"] == []
+
+    async def test_room_encrypt_shares_itself_when_the_share_it_waited_on_is_cancelled(
+        self, async_client_pair, aioresponse
+    ):
+        """A caller waiting on another caller's share checks again once it ends, instead of encrypting unshared."""
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        share = bob.share_group_session
+        shares = []
+        never = asyncio.Event()
+        waiting = asyncio.Event()
+
+        class SharingEvent(asyncio.Event):
+            async def wait(self):
+                waiting.set()
+                return await super().wait()
+
+        async def first_share_hangs(room_id, **kwargs):
+            shares.append(room_id)
+            if len(shares) > 1:
+                return await share(room_id, **kwargs)
+            bob.sharing_session[room_id] = SharingEvent()
+            try:
+                await never.wait()
+            finally:
+                bob.sharing_session.pop(room_id).set()
+
+        bob.share_group_session = first_share_hangs
+        first = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+            )
+        )
+        while TEST_ROOM_ID not in bob.sharing_session:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 1},
+                ignore_unverified_devices=True,
+            )
+        )
+        await asyncio.wait_for(waiting.wait(), 5)
+        first.cancel()
+
+        encrypted = await second
+
+        assert shares == [TEST_ROOM_ID, TEST_ROOM_ID]
+        assert len(requests["to_device"]) == 1
+        assert (
+            encrypted["session_id"] == bob.olm.outbound_group_sessions[TEST_ROOM_ID].id
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+    async def test_room_encrypt_shares_session_first(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        content = {
+            "v": 1,
+            "reply": "$reply",
+            "seq": 0,
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+        }
+
+        encrypted = await bob.room_encrypt(
+            TEST_ROOM_ID,
+            "io.mindroom.live",
+            content,
+            ignore_unverified_devices=True,
+        )
+
+        assert len(requests["to_device"]) == 1
+        assert requests["room_send"] == []
+        assert set(encrypted) == {
+            "algorithm",
+            "sender_key",
+            "ciphertext",
+            "session_id",
+            "device_id",
+        }
+        assert encrypted["algorithm"] == "m.megolm.v1.aes-sha2"
+        assert (
+            encrypted["session_id"] == bob.olm.outbound_group_sessions[TEST_ROOM_ID].id
+        )
+
+        aioresponse.get(
+            re.compile(rf"^https://example\.org{MATRIX_API_PATH_V3}/sync"),
+            status=200,
+            payload=self.sync_with_to_device_events(
+                self.olm_message_to_event(requests["to_device"][0], alice, bob)
+            ),
+        )
+        await alice.sync()
+
+        inbound = alice.olm.inbound_group_store.get(
+            TEST_ROOM_ID, encrypted["sender_key"], encrypted["session_id"]
+        )
+        assert inbound is not None
+        plaintext, _ = inbound.decrypt(encrypted["ciphertext"])
+        assert json.loads(plaintext) == {
+            "type": "io.mindroom.live",
+            "content": content,
+            "room_id": TEST_ROOM_ID,
+        }
+
+    async def test_room_encrypt_uncounted_does_not_rotate(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+
+        session_ids = set()
+        for seq in range(101):
+            encrypted = await bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": seq},
+                ignore_unverified_devices=True,
+                count_toward_rotation=False,
+            )
+            session_ids.add(encrypted["session_id"])
+
+        session = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert session_ids == {session.id}
+        assert session.message_count == 0
+        assert session.message_index == 101
+        assert len(requests["to_device"]) == 1
+
+    async def test_room_encrypt_and_room_send_interleave_around_rotation(
+        self, async_client_pair, aioresponse
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+
+        async def send(number):
+            await bob.room_send(
+                TEST_ROOM_ID,
+                "m.room.message",
+                {"msgtype": "m.text", "body": str(number)},
+                str(number),
+                ignore_unverified_devices=True,
+            )
+
+        async def encrypt():
+            encrypted = await bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+                count_toward_rotation=False,
+            )
+            return encrypted["session_id"]
+
+        for number in range(99):
+            await send(number)
+        first = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert {await encrypt() for _ in range(5)} == {first.id}
+        await send(99)
+
+        assert bob.olm.outbound_group_sessions[TEST_ROOM_ID] is first
+        assert first.message_count == first.max_messages
+        assert len(requests["to_device"]) == 1
+
+        await send(100)
+
+        second = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert second.id != first.id
+        assert len(requests["to_device"]) == 2
+        assert [event["session_id"] for event in requests["room_send"]] == [
+            first.id
+        ] * 100 + [second.id]
+        assert await encrypt() == second.id
+        assert second.message_count == 1
+
+    @pytest.mark.parametrize("expiry", ["count", "age"])
+    async def test_room_encrypt_uncounted_rotates_expired_session(
+        self, async_client_pair, aioresponse, expiry
+    ):
+        alice, bob = async_client_pair
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        await bob.room_send(
+            TEST_ROOM_ID,
+            "m.room.message",
+            {"msgtype": "m.text", "body": "first"},
+            "1",
+            ignore_unverified_devices=True,
+        )
+        first = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        if expiry == "count":
+            first.message_count = first.max_messages
+        else:
+            first.creation_time = datetime.now() - timedelta(days=8)
+
+        encrypted = await bob.room_encrypt(
+            TEST_ROOM_ID,
+            "io.mindroom.live",
+            {"seq": 0},
+            ignore_unverified_devices=True,
+            count_toward_rotation=False,
+        )
+
+        second = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert second.id != first.id
+        assert encrypted["session_id"] == second.id
+        assert len(requests["to_device"]) == 2
+
+    @pytest.mark.parametrize("room", ["unknown", "unencrypted"])
+    async def test_room_encrypt_refuses_unencrypted_room(
+        self, async_client_pair, aioresponse, room
+    ):
+        _, bob = async_client_pair
+        if room == "unencrypted":
+            bob.rooms[TEST_ROOM_ID] = MatrixRoom(TEST_ROOM_ID, bob.user_id)
+
+        with pytest.raises(LocalProtocolError):
+            await bob.room_encrypt(TEST_ROOM_ID, "io.mindroom.live", {"seq": 0})
+
+        assert aioresponse.requests == {}
+        assert TEST_ROOM_ID not in bob.olm.outbound_group_sessions
 
     async def test_connect_wrapper(self, async_client, aioresponse, monkeypatch):
         aioresponse.post(

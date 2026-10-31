@@ -68,6 +68,39 @@ async def test_new_local_join_waits_for_room_state_before_plaintext_send(tmp_pat
             await nio_client.close()
 
 
+@pytest.mark.asyncio
+async def test_new_local_join_waits_for_room_state_before_room_encrypt(tmp_path):
+    async def endpoint(request):
+        return web.json_response({})
+
+    async with homeserver(None, membership=endpoint) as (url, requests):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            assert await session.change_membership(
+                operation_id=OPERATION,
+                room_id=ROOM,
+                previous_membership=None,
+                previous_epoch=0,
+                current_membership="join",
+            )
+            await session.ack(await session.next_batch())
+            before = list(requests)
+            with pytest.raises(LocalProtocolError, match="room state"):
+                await nio_client.room_encrypt(ROOM, "io.mindroom.live", {"seq": 0})
+            assert requests == before
+            await session._accept_response(response(messages=0), full_state=True)
+            await settle(session)
+            before = list(requests)
+            with pytest.raises(LocalProtocolError, match="not encrypted"):
+                await nio_client.room_encrypt(ROOM, "io.mindroom.live", {"seq": 0})
+            assert requests == before
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
 async def unestablished_join(session):
     """Let an incremental sync first report the room as joined."""
     await session._accept_response(json.dumps({"next_batch": "s0"}).encode())

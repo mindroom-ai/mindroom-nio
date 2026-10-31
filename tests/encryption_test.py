@@ -1091,6 +1091,30 @@ class TestClass:
         assert isinstance(event, RoomMessageText)
         assert event.decrypted
 
+    def test_group_encrypt_uncounted_decrypts(self):
+        olm = self.ephemeral_olm
+        olm.create_outbound_group_session(TEST_ROOM)
+        session = olm.outbound_group_sessions[TEST_ROOM]
+        session.shared = True
+        content = {"v": 1, "reply": "$reply", "seq": 0}
+
+        encrypted_dict = olm.group_encrypt(
+            TEST_ROOM, {"type": "io.mindroom.live", "content": content}, count=False
+        )
+
+        assert session.message_count == 0
+        inbound = olm.inbound_group_store.get(
+            TEST_ROOM, encrypted_dict["sender_key"], encrypted_dict["session_id"]
+        )
+        assert inbound is not None
+        plaintext, message_index = inbound.decrypt(encrypted_dict["ciphertext"])
+        assert message_index == 0
+        assert json.loads(plaintext) == {
+            "type": "io.mindroom.live",
+            "content": content,
+            "room_id": TEST_ROOM,
+        }
+
     @pytest.mark.parametrize(
         "content",
         [

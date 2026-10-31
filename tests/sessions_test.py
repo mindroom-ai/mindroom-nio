@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pytest
 from unpaddedbase64 import encode_base64
 
@@ -159,6 +161,25 @@ class TestClass:
 
         with pytest.raises(EncryptionError):
             session.encrypt("Hello")
+
+    def test_outbound_encrypt_uncounted_keeps_message_count(self):
+        session = OutboundGroupSession()
+        session.mark_as_shared()
+
+        for _ in range(150):
+            session.encrypt("Hello", count=False)
+
+        assert session.message_count == 0
+        assert not session.expired
+        assert session.message_index == 150
+
+    def test_outbound_encrypt_uncounted_still_expires_by_age(self):
+        session = OutboundGroupSession()
+        session.mark_as_shared()
+        session.creation_time = datetime.now() - timedelta(days=8)
+
+        with pytest.raises(EncryptionError):
+            session.encrypt("Hello", count=False)
 
     @pytest.mark.skipif(not package_installed("olm"), reason="requires olm")
     def test_libolm_compatible_group_session_encryption(self):

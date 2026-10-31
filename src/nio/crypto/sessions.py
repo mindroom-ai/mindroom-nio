@@ -424,12 +424,22 @@ class OutboundGroupSession:
             return True
         return False
 
-    def encrypt(self, plaintext):
+    def encrypt(self, plaintext: str, *, count: bool = True) -> str:
+        """Encrypt a plaintext with this session.
+
+        Args:
+            plaintext (str): The plaintext to encrypt.
+            count (bool): Whether the message counts toward the
+                ``max_messages`` rotation limit. An uncounted message still
+                advances the Megolm message index, and age expiry still
+                applies.
+        """
         if not self.shared:
             raise EncryptionError("Error, session is not shared")
 
         if self.expired:
             raise EncryptionError("Error, session is has expired")
 
-        self.message_count += 1
+        if count:
+            self.message_count += 1
         return self._session.encrypt(plaintext.encode()).to_base64()
