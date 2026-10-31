@@ -2511,7 +2511,9 @@ class TestClass:
         sent = []
 
         def record(url, data, **kwargs):
-            sent.append((str(url), kwargs["headers"]["Authorization"], json.loads(data)))
+            sent.append(
+                (str(url), kwargs["headers"]["Authorization"], json.loads(data))
+            )
             return CallbackResult(status=200, payload={})
 
         aioresponse.put(f"{self.ephemeral_url}/txn1", callback=record)
@@ -5128,9 +5130,9 @@ class TestClass:
             "device_id",
         }
         assert encrypted["algorithm"] == "m.megolm.v1.aes-sha2"
-        assert encrypted["session_id"] == bob.olm.outbound_group_sessions[
-            TEST_ROOM_ID
-        ].id
+        assert (
+            encrypted["session_id"] == bob.olm.outbound_group_sessions[TEST_ROOM_ID].id
+        )
 
         aioresponse.get(
             re.compile(rf"^https://example\.org{MATRIX_API_PATH_V3}/sync"),

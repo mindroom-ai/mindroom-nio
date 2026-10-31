@@ -35,6 +35,10 @@ Documentation
 Fork-specific [authenticated custom to-device transport](doc/custom-to-device.md)
 supports pinned application messages and durable device-only consumers.
 
+Fork-specific [room payload encryption and ephemeral events](doc/ephemeral-events.md)
+let an application encrypt a room event without sending it and send MSC2477
+ephemeral room events.
+
 The full API documentation for nio can be found at
 [https://matrix-nio.readthedocs.io](https://matrix-nio.readthedocs.io/en/latest/#api-documentation)
 
