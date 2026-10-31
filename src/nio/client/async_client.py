@@ -204,6 +204,8 @@ from ..responses import (
     RoomRedactResponse,
     RoomResolveAliasError,
     RoomResolveAliasResponse,
+    RoomSendEphemeralError,
+    RoomSendEphemeralResponse,
     RoomSendError,
     RoomSendResponse,
     RoomThreadsResponse,
@@ -3496,6 +3498,42 @@ class AsyncClient(Client):
 
         return await self._send(
             RoomTypingResponse, method, path, data, response_data=(room_id,)
+        )
+
+    @logged_in_async
+    async def room_send_ephemeral(
+        self,
+        room_id: str,
+        event_type: str,
+        content: dict[str, Any],
+        tx_id: str | None = None,
+    ) -> RoomSendEphemeralResponse | RoomSendEphemeralError:
+        """Send an MSC2477 ephemeral event to a room.
+
+        The server relays the event to the room's members through sync
+        without storing it in the room. The content is sent as given; use
+        `room_encrypt()` first for an encrypted room.
+
+        Calls receive_response() to update the client state if necessary.
+
+        Returns either a `RoomSendEphemeralResponse` if the request was
+        successful or a `RoomSendEphemeralError` if there was an error with
+        the request.
+
+        Args:
+            room_id (str): The room id of the room the event is sent to.
+            event_type (str): The type of the event, which must not start
+                with ``m.``.
+            content (Dict[str, Any]): The content of the event.
+            tx_id (str, optional): The transaction ID of this event. Defaults
+                to a new random ID.
+        """
+        method, path, data = Api.room_send_ephemeral(
+            self.access_token, room_id, event_type, content, tx_id or uuid4()
+        )
+
+        return await self._send(
+            RoomSendEphemeralResponse, method, path, data, response_data=(room_id,)
         )
 
     @logged_in_async

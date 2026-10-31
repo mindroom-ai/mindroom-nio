@@ -41,6 +41,8 @@ from nio.responses import (
     RoomLeaveResponse,
     RoomMessagesError,
     RoomMessagesResponse,
+    RoomSendEphemeralError,
+    RoomSendEphemeralResponse,
     RoomTypingResponse,
     SpaceGetHierarchyResponse,
     SyncError,
@@ -299,6 +301,26 @@ class TestClass:
     def test_room_typing(self):
         response = RoomTypingResponse.from_dict({}, TEST_ROOM_ID)
         assert isinstance(response, RoomTypingResponse)
+
+    @pytest.mark.parametrize("body", [{}, {"extra": "field"}])
+    def test_room_send_ephemeral(self, body):
+        response = RoomSendEphemeralResponse.from_dict(body, TEST_ROOM_ID)
+        assert isinstance(response, RoomSendEphemeralResponse)
+        assert response.room_id == TEST_ROOM_ID
+
+    def test_room_send_ephemeral_error(self):
+        response = RoomSendEphemeralResponse.from_dict(
+            {
+                "errcode": "M_LIMIT_EXCEEDED",
+                "error": "Too many requests",
+                "retry_after_ms": 200,
+            },
+            TEST_ROOM_ID,
+        )
+        assert isinstance(response, RoomSendEphemeralError)
+        assert response.status_code == "M_LIMIT_EXCEEDED"
+        assert response.retry_after_ms == 200
+        assert response.room_id == TEST_ROOM_ID
 
     def test_login_info(self):
         parsed_dict = _load_response("tests/data/login_info.json")

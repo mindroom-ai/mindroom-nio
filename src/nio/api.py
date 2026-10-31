@@ -1624,6 +1624,42 @@ class Api:
         return "PUT", Api._build_path(path, query_parameters), Api.to_json(content)
 
     @staticmethod
+    def room_send_ephemeral(
+        access_token: str,
+        room_id: str,
+        event_type: str,
+        body: dict[str, Any],
+        tx_id: str | UUID,
+    ) -> tuple[str, str, str]:
+        """Send an MSC2477 ephemeral event to a room.
+
+        Returns the HTTP method, HTTP path and data for the request.
+
+        Args:
+            access_token (str): The access token to be used with the request.
+            room_id (str): The room id of the room the event is sent to.
+            event_type (str): The type of the event, which must not start
+                with ``m.``.
+            body (Dict[str, Any]): The content of the event.
+            tx_id (str | UUID): The transaction ID of this event.
+        """
+        path = [
+            "org.matrix.msc2477",
+            "rooms",
+            room_id,
+            "ephemeral",
+            event_type,
+            str(tx_id),
+        ]
+        query_parameters = {"access_token": access_token}
+
+        return (
+            "PUT",
+            Api._build_path(path, query_parameters, MATRIX_API_PATH_UNSTABLE),
+            Api.to_json(body),
+        )
+
+    @staticmethod
     def update_receipt_marker(
         access_token: str,
         room_id: str,

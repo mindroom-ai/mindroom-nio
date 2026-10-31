@@ -114,6 +114,8 @@ from nio import (
     RoomRedactResponse,
     RoomResolveAliasResponse,
     Rooms,
+    RoomSendEphemeralError,
+    RoomSendEphemeralResponse,
     RoomSendResponse,
     RoomSummary,
     RoomTypingResponse,
@@ -139,6 +141,7 @@ from nio import (
     UploadResponse,
 )
 from nio.api import (
+    MATRIX_API_PATH_UNSTABLE,
     MATRIX_API_PATH_V1,
     MATRIX_API_PATH_V3,
     MATRIX_LEGACY_MEDIA_API_PATH,
@@ -2496,6 +2499,106 @@ class TestClass:
         )
         resp = await async_client.room_typing(room_id, typing_state=True)
         assert isinstance(resp, RoomTypingResponse)
+
+    @property
+    def ephemeral_url(self):
+        return (
+            f"https://example.org{MATRIX_API_PATH_UNSTABLE}/org.matrix.msc2477/rooms/"
+            f"{TEST_ROOM_ID}/ephemeral/io.mindroom.live"
+        )
+
+    async def test_room_send_ephemeral(self, async_client, aioresponse):
+        sent = []
+
+        def record(url, data, **kwargs):
+            sent.append((str(url), kwargs["headers"]["Authorization"], json.loads(data)))
+            return CallbackResult(status=200, payload={})
+
+        aioresponse.put(f"{self.ephemeral_url}/txn1", callback=record)
+        aioresponse.put(
+            re.compile(rf"^{re.escape(self.ephemeral_url)}/[0-9a-f-]{{36}}$"),
+            callback=record,
+        )
+        content = {"v": 1, "reply": "$reply", "seq": 0}
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", content, "txn1"
+        )
+        assert isinstance(resp, RoomSendEphemeralResponse)
+        assert resp.room_id == TEST_ROOM_ID
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", content
+        )
+        assert isinstance(resp, RoomSendEphemeralResponse)
+
+        assert [(authorization, body) for _, authorization, body in sent] == [
+            (f"Bearer {async_client.access_token}", content)
+        ] * 2
+        assert "access_token" not in sent[0][0]
+
+    async def test_room_send_ephemeral_retries_rate_limit_by_default(
+        self, async_client, aioresponse
+    ):
+        sent = []
+
+        def record(status, payload):
+            def callback(url, data, **kwargs):
+                sent.append(json.loads(data))
+                return CallbackResult(status=status, payload=payload)
+
+            return callback
+
+        url = f"{self.ephemeral_url}/txn1"
+        aioresponse.put(
+            url,
+            callback=record(
+                429,
+                {
+                    "errcode": "M_LIMIT_EXCEEDED",
+                    "error": "Too many requests",
+                    "retry_after_ms": 1,
+                },
+            ),
+        )
+        aioresponse.put(url, callback=record(200, {}))
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralResponse)
+        assert sent == [{"seq": 0}, {"seq": 0}]
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (
+                429,
+                {
+                    "errcode": "M_LIMIT_EXCEEDED",
+                    "error": "Too many requests",
+                    "retry_after_ms": 200,
+                },
+            ),
+            (404, {"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"}),
+            (403, {"errcode": "M_FORBIDDEN", "error": "Not joined"}),
+        ],
+    )
+    async def test_room_send_ephemeral_error(
+        self, async_client, aioresponse, status, body
+    ):
+        async_client.config = AsyncClientConfig(max_limit_exceeded=0)
+        aioresponse.put(f"{self.ephemeral_url}/txn1", status=status, payload=body)
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralError)
+        assert resp.status_code == body["errcode"]
+        assert resp.retry_after_ms == body.get("retry_after_ms")
+        assert resp.room_id == TEST_ROOM_ID
 
     async def test_update_receipt_marker(self, async_client: AsyncClient, aioresponse):
         room_id = TEST_ROOM_ID

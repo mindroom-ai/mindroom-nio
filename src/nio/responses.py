@@ -150,6 +150,8 @@ __all__ = [
     "UpdateDeviceError",
     "RoomTypingResponse",
     "RoomTypingError",
+    "RoomSendEphemeralResponse",
+    "RoomSendEphemeralError",
     "RoomReadMarkersResponse",
     "RoomReadMarkersError",
     "UploadResponse",
@@ -664,6 +666,12 @@ class RoomThreadsError(ErrorResponse):
 
 class RoomTypingError(_ErrorWithRoomId):
     """A response representing an unsuccessful room typing request."""
+
+    pass
+
+
+class RoomSendEphemeralError(_ErrorWithRoomId):
+    """A response representing an unsuccessful ephemeral event send."""
 
     pass
 
@@ -1547,6 +1555,19 @@ class RoomTypingResponse(_EmptyResponseWithRoomId):
     @staticmethod
     def create_error(parsed_dict, room_id):
         return RoomTypingError.from_dict(parsed_dict, room_id)
+
+
+class RoomSendEphemeralResponse(_EmptyResponseWithRoomId):
+    """A response representing a successful ephemeral event send."""
+
+    @classmethod
+    def from_dict(
+        cls, parsed_dict: dict[Any, Any], room_id: str
+    ) -> RoomSendEphemeralResponse | RoomSendEphemeralError:
+        # The success body is empty, but servers may add fields to it.
+        if "errcode" in parsed_dict:
+            return RoomSendEphemeralError.from_dict(parsed_dict, room_id)
+        return cls(room_id)
 
 
 class UpdateReceiptMarkerResponse(EmptyResponse):

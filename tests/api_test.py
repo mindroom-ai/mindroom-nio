@@ -81,6 +81,24 @@ class TestClass:
 
         assert resp == ("PUT", expected_path, expected_data)
 
+    def test_room_send_ephemeral(self) -> None:
+        """Test that room_send_ephemeral builds the MSC2477 request."""
+        token = "SECRET_TOKEN"
+
+        expected_path = (
+            "/_matrix/client/unstable/org.matrix.msc2477/rooms/"
+            "%21testroom%3Aexample.org/ephemeral/io.mindroom.live/txn1"
+        )
+        resp = Api.room_send_ephemeral(
+            token, "!testroom:example.org", "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert resp == (
+            "PUT",
+            f"{expected_path}?access_token={token}",
+            '{"seq":0}',
+        )
+
     def test_change_password(self) -> None:
         """Test that change_password returns the right request data."""
         api = Api()
