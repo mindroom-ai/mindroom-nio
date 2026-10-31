@@ -5,8 +5,8 @@ All notable changes to this project will be documented in this file.
 ## 1.3.0
 
 - Add `AsyncClient.room_encrypt(room_id, event_type, content, *, ignore_unverified_devices=False, count_toward_rotation=True)`, which shares the room's group session the way `room_send` does and returns the encrypted content without sending it; `count_toward_rotation=False` keeps a message from advancing count-based Megolm rotation, while age and membership rotation still apply.
-- Add `AsyncClient.room_send_ephemeral(room_id, event_type, content, tx_id=None)` for MSC2477 custom ephemeral room events, returning `RoomSendEphemeralResponse`, or `RoomSendEphemeralError`, also for a non-2xx reply without a Matrix error (its `transport_response` keeps the status).
-- Group-session sharing checks again whether it must share after waiting on another caller's share, and releases its sharing slot when a share is cancelled while claiming one-time keys.
+- Add `AsyncClient.room_send_ephemeral(room_id, event_type, content, tx_id=None)` for MSC2477 custom ephemeral room events, returning `RoomSendEphemeralResponse` on success and `RoomSendEphemeralError` otherwise, including a non-2xx reply without a Matrix error (its `transport_response` keeps the HTTP status).
+- A send to an encrypted room no longer waits forever after a group-session share was cancelled while claiming one-time keys, and no longer raises `GroupEncryptionError` when another caller's share ended without sharing.
 
 ## 1.2.1
 
