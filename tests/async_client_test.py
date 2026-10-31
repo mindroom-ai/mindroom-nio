@@ -5203,7 +5203,7 @@ class TestClass:
                 ignore_unverified_devices=True,
             )
         )
-        await waiting.wait()
+        await asyncio.wait_for(waiting.wait(), 5)
         first.cancel()
 
         encrypted = await second
