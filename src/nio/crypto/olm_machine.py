@@ -1735,6 +1735,8 @@ class Olm:
         self,
         room_id: str,
         plaintext_dict: dict[Any, Any],
+        *,
+        count: bool = True,
     ) -> dict[str, str]:
         if room_id not in self.outbound_group_sessions:
             self.create_outbound_group_session(room_id)
@@ -1749,7 +1751,7 @@ class Olm:
             raise GroupEncryptionError(f"Group session for room {room_id} not shared.")
 
         plaintext_dict["room_id"] = room_id
-        ciphertext = session.encrypt(Api.to_json(plaintext_dict))
+        ciphertext = session.encrypt(Api.to_json(plaintext_dict), count=count)
 
         payload_dict = {
             "algorithm": self._megolm_algorithm,
