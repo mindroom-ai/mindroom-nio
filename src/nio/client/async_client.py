@@ -3532,9 +3532,17 @@ class AsyncClient(Client):
             self.access_token, room_id, event_type, content, tx_id or uuid4()
         )
 
-        return await self._send(
+        response = await self._send(
             RoomSendEphemeralResponse, method, path, data, response_data=(room_id,)
         )
+        # A failure whose body is not a Matrix error, such as a proxy's HTML
+        # 502, parses to an empty object; only the HTTP status tells it apart.
+        transport = response.transport_response
+        if isinstance(response, RoomSendEphemeralResponse) and (
+            transport is not None and not transport.ok
+        ):
+            return RoomSendEphemeralError(f"HTTP {transport.status}", room_id=room_id)
+        return response
 
     @logged_in_async
     async def update_receipt_marker(

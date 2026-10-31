@@ -2602,6 +2602,30 @@ class TestClass:
         assert resp.retry_after_ms == body.get("retry_after_ms")
         assert resp.room_id == TEST_ROOM_ID
 
+    @pytest.mark.parametrize(
+        ("status", "body", "content_type"),
+        [(502, "<html>Bad Gateway</html>", "text/html"), (403, "", "application/json")],
+        ids=["proxy-html-502", "empty-403"],
+    )
+    async def test_room_send_ephemeral_failure_without_matrix_error(
+        self, async_client, aioresponse, status, body, content_type
+    ):
+        """A failed send whose body is no Matrix error is still an error, never a delivered event."""
+        aioresponse.put(
+            f"{self.ephemeral_url}/txn1",
+            status=status,
+            body=body,
+            content_type=content_type,
+        )
+
+        resp = await async_client.room_send_ephemeral(
+            TEST_ROOM_ID, "io.mindroom.live", {"seq": 0}, "txn1"
+        )
+
+        assert isinstance(resp, RoomSendEphemeralError)
+        assert resp.message == f"HTTP {status}"
+        assert resp.room_id == TEST_ROOM_ID
+
     async def test_update_receipt_marker(self, async_client: AsyncClient, aioresponse):
         room_id = TEST_ROOM_ID
         event_id = "$event1:test.org"
