@@ -1565,7 +1565,7 @@ class RoomSendEphemeralResponse(_EmptyResponseWithRoomId):
         cls, parsed_dict: dict[Any, Any], room_id: str
     ) -> RoomSendEphemeralResponse | RoomSendEphemeralError:
         # The success body is empty, but servers may add fields to it; an
-        # empty or unparsable body reaches here as None.
+        # empty body reaches here as None, an unparsable one as {}.
         if isinstance(parsed_dict, dict) and "errcode" in parsed_dict:
             return RoomSendEphemeralError.from_dict(parsed_dict, room_id)
         return cls(room_id)
