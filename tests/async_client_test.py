@@ -5167,12 +5167,18 @@ class TestClass:
         share = bob.share_group_session
         shares = []
         never = asyncio.Event()
+        waiting = asyncio.Event()
+
+        class SharingEvent(asyncio.Event):
+            async def wait(self):
+                waiting.set()
+                return await super().wait()
 
         async def first_share_hangs(room_id, **kwargs):
             shares.append(room_id)
             if len(shares) > 1:
                 return await share(room_id, **kwargs)
-            bob.sharing_session[room_id] = asyncio.Event()
+            bob.sharing_session[room_id] = SharingEvent()
             try:
                 await never.wait()
             finally:
@@ -5197,8 +5203,7 @@ class TestClass:
                 ignore_unverified_devices=True,
             )
         )
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await waiting.wait()
         first.cancel()
 
         encrypted = await second
