@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.3.0
+
+- Add `AsyncClient.room_encrypt(room_id, event_type, content, *, ignore_unverified_devices=False, count_toward_rotation=True)`, which shares the room's group session the way `room_send` does and returns the encrypted content without sending it; `count_toward_rotation=False` keeps a message from advancing count-based Megolm rotation, while age and membership rotation still apply.
+- Add `AsyncClient.room_send_ephemeral(room_id, event_type, content, tx_id=None)` for MSC2477 custom ephemeral room events, returning `RoomSendEphemeralResponse`, or `RoomSendEphemeralError`, also for a non-2xx reply without a Matrix error (its `transport_response` keeps the status).
+- Group-session sharing checks again whether it must share after waiting on another caller's share, and releases its sharing slot when a share is cancelled while claiming one-time keys.
+
 ## 1.2.1
 
 - Never let decrypted Megolm plaintext override what the homeserver supplies or stop sync: the plaintext's `event_id`, `sender`, `origin_server_ts` and `unsigned` are ignored (the client's own messages still get the wire `transaction_id`), so a room member can no longer forge a transaction ID, a redaction or a member's `prev_content`; plaintext that is not a JSON object leaves the event an undecrypted `MegolmEvent`; and `Event.parse_decrypted_event` checks the decrypted-event schema first, so a stored undecodable payload no longer raises `KeyError` when the durable store replays a batch.
