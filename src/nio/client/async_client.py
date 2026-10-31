@@ -2877,15 +2877,16 @@ class AsyncClient(Client):
             raise LocalProtocolError(f"Already sharing a group session for {room_id}")
 
         self.sharing_session[room_id] = AsyncioEvent()
-
-        missing_sessions = self.get_missing_sessions(room_id)
-
-        if missing_sessions:
-            await self.keys_claim(missing_sessions)
-
         shared_with = set()
 
+        # The claim is inside the try, so a caller cancelled while it runs
+        # still releases the room's sharing slot for the next sender.
         try:
+            missing_sessions = self.get_missing_sessions(room_id)
+
+            if missing_sessions:
+                await self.keys_claim(missing_sessions)
+
             requests = []
 
             for sharing_with, to_device_dict in self.olm.share_group_session_parallel(
@@ -3543,7 +3544,9 @@ class AsyncClient(Client):
         if isinstance(response, RoomSendEphemeralResponse) and (
             transport is not None and not transport.ok
         ):
-            return RoomSendEphemeralError(f"HTTP {transport.status}", room_id=room_id)
+            error = RoomSendEphemeralError(f"HTTP {transport.status}", room_id=room_id)
+            error.transport_response = transport
+            return error
         return response
 
     @logged_in_async

@@ -2625,6 +2625,7 @@ class TestClass:
         assert isinstance(resp, RoomSendEphemeralError)
         assert resp.message == f"HTTP {status}"
         assert resp.room_id == TEST_ROOM_ID
+        assert resp.transport_response.status == status
 
     async def test_update_receipt_marker(self, async_client: AsyncClient, aioresponse):
         room_id = TEST_ROOM_ID
@@ -5124,6 +5125,38 @@ class TestClass:
             repeat=True,
         )
         return requests
+
+    async def test_room_encrypt_cancelled_during_key_claim_releases_the_sharing_slot(
+        self, async_client_pair, aioresponse
+    ):
+        """A caller cancelled while its share claims keys leaves no sharing slot that would block later sends."""
+        alice, bob = async_client_pair
+        claim_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def hang(url, **kwargs):
+            claim_started.set()
+            await never.wait()
+
+        aioresponse.post(f"{BASE_URL_V3}/keys/claim", callback=hang)
+        requests = await self._bob_room_with_alice(alice, bob, aioresponse)
+        first = asyncio.create_task(
+            bob.room_encrypt(
+                TEST_ROOM_ID,
+                "io.mindroom.live",
+                {"seq": 0},
+                ignore_unverified_devices=True,
+            )
+        )
+        await claim_started.wait()
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # Left registered, the slot would make every later share wait forever.
+        assert TEST_ROOM_ID not in bob.sharing_session
+        assert requests["to_device"] == []
 
     async def test_room_encrypt_shares_itself_when_the_share_it_waited_on_is_cancelled(
         self, async_client_pair, aioresponse

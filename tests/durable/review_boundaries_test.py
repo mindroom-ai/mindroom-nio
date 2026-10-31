@@ -163,11 +163,13 @@ async def test_disposal_during_send_preparation_prevents_later_http(
             async with asyncio.timeout(5):
                 await sharing.waiting.wait()
                 await session.close()
-                sharing.set()
+                # Released as a real share releases it: popped, then set.
+                nio_client.sharing_session.pop(ROOM).set()
                 with pytest.raises(LocalProtocolError, match="poisoned"):
                     await task
             assert sent == []
         finally:
+            nio_client.sharing_session.pop(ROOM, None)
             sharing.set()
             await asyncio.gather(task, return_exceptions=True)
             await session.close()
